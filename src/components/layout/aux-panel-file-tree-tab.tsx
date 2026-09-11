@@ -3151,6 +3151,14 @@ export function FileTreeTab() {
                       >
                         {t("reloadFromDisk")}
                       </ContextMenuItem>
+                      <ContextMenuCheckboxItem
+                        checked={showIgnored}
+                        onCheckedChange={(checked) =>
+                          setShowIgnored(checked === true)
+                        }
+                      >
+                        {t("showIgnoredFiles")}
+                      </ContextMenuCheckboxItem>
                       <ContextMenuSub>
                         <ContextMenuSubTrigger>
                           {t("openIn")}

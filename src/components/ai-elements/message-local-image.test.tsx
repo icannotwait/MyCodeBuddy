@@ -53,8 +53,8 @@ describe("inline local images in real chat Markdown", () => {
       "/repo",
       "My Images/preview.png",
     ],
-    ["![Preview](./images/preview.png)", "/repo", "images/preview.png"],
-    ["![Preview](images/preview.png)", "/repo", "images/preview.png"],
+    ["![Preview](./shots/preview.png)", "/repo", "shots/preview.png"],
+    ["![Preview](shots/preview.png)", "/repo", "shots/preview.png"],
     [
       "![Preview](<C:/My Project/_tmp/preview.png>)",
       "C:/My Project",
@@ -71,9 +71,9 @@ describe("inline local images in real chat Markdown", () => {
       "images/preview.png",
     ],
     [
-      "![Preview][shot]\n\n[shot]: ./images/preview.png",
+      "![Preview][shot]\n\n[shot]: ./shots/preview.png",
       "/repo",
-      "images/preview.png",
+      "shots/preview.png",
     ],
   ])(
     "renders %s without an Image blocked placeholder",

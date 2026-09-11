@@ -87,7 +87,10 @@ describe("fork sendSystemNotification desktop payload", () => {
       conversationId: 42,
       dedupeKey: null,
     })
-    const args = mocks.transportCall.mock.calls[0]![1] as Record<string, unknown>
+    const args = mocks.transportCall.mock.calls[0]![1] as Record<
+      string,
+      unknown
+    >
     expect(args).not.toHaveProperty("action_id")
     expect(args).not.toHaveProperty("conversation_id")
     expect(args).not.toHaveProperty("dedupe_key")
@@ -329,7 +332,9 @@ describe("upstream openSystemNotificationSettings", () => {
 
   it("calls the local command on desktop", async () => {
     await openSystemNotificationSettings()
-    expect(mocks.shellCall).toHaveBeenCalledWith("open_system_notification_settings")
+    expect(mocks.shellCall).toHaveBeenCalledWith(
+      "open_system_notification_settings"
+    )
   })
 
   it("refuses in a browser, where no page may open the permission UI", async () => {

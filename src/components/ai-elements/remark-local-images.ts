@@ -1,6 +1,7 @@
 import type { Definition, Image, ImageReference, Node, Root } from "mdast"
 import { SKIP, visit } from "unist-util-visit"
 import { localImagePath } from "@/lib/markdown-local-image"
+import { parseGrokSessionImageRef } from "@/lib/markdown/grok-session-image"
 
 /** `\` + ASCII punctuation — the escape CommonMark has already applied by the
  *  time this plugin sees a destination. */
@@ -82,6 +83,9 @@ export function remarkLocalImages() {
           ? image
           : definitions.get(image.identifier.toUpperCase())
       if (!origin?.url || !localImagePath(origin.url)) return
+      // Grok session refs belong to the scoped rehype pipeline. Claiming them
+      // here would load them as ordinary workspace images outside that scope.
+      if (parseGrokSessionImageRef(origin.url)) return
       const source = origin.url
       if (separatorMayBeLost(origin, document)) return
       image.data = {

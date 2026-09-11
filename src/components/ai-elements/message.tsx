@@ -506,6 +506,23 @@ const remarkPluginsWithLocalPaths = [
   remarkTrimCjkAutolinkTail,
 ]
 
+// Grok session images are retagged in rehype after harden. remarkLocalImages
+// would consume those nodes first and the scoped pipeline would never see them.
+const remarkPluginsForGrokSessionImages = [
+  ...Object.values(defaultRemarkPlugins),
+  remarkRestoreWindowsPaths,
+  remarkRewriteFileUriLinks,
+  remarkTrimCjkAutolinkTail,
+]
+
+const remarkPluginsForGrokSessionImagesWithLocalPaths = [
+  ...Object.values(defaultRemarkPlugins),
+  remarkAutolinkLocalPaths,
+  remarkRestoreWindowsPaths,
+  remarkRewriteFileUriLinks,
+  remarkTrimCjkAutolinkTail,
+]
+
 // Streamdown's default rehype pipeline strips `codeg://` reference hrefs in
 // sanitization (rendering them as "[blocked]"); re-derive it so they survive to
 // MarkdownLink → ReferenceBadge. See rehype-allow-codeg for the full rationale.
@@ -661,7 +678,13 @@ function MessageResponseImpl({
         // App-selected remark plugins are authoritative so a caller's
         // remarkPlugins array cannot disable autolinkLocalPaths opt-in.
         remarkPlugins={
-          autolinkLocalPaths ? remarkPluginsWithLocalPaths : remarkPlugins
+          grokScope
+            ? autolinkLocalPaths
+              ? remarkPluginsForGrokSessionImagesWithLocalPaths
+              : remarkPluginsForGrokSessionImages
+            : autolinkLocalPaths
+              ? remarkPluginsWithLocalPaths
+              : remarkPlugins
         }
         mode={mode}
         parseIncompleteMarkdown={parseIncompleteMarkdown}

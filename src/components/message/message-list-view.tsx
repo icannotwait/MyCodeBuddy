@@ -1290,21 +1290,19 @@ const HistoricalMessageGroup = memo(function HistoricalMessageGroup({
           forkDisabled={forkDisabled || forkPointUnnamed}
           forkDisabledReason={forkPointUnnamed ? "unnamed" : "busy"}
           onForkFromHere={
-            // Gated on a settled turn — forking mid-stream would name a message
-            // the agent is still writing.
+            // Gated on a settled, agent-resolvable turn — forking mid-stream
+            // would name a message the agent is still writing, and an id the
+            // backend cannot resolve (live-*, unsupported agent, Claude
+            // without agent_message_id) would silently tail-fork.
             //
-            // Prefer a parser-named / agent-supported id. At the thread tail an
-            // unnamed live id is still offered: the backend's tail fork is the
-            // intended landing. Anywhere before the tail, unnamed live ids stay
-            // gated by `forkPointUnnamed`.
+            // `forkPointUnnamed` still withholds a live-named reply that is
+            // not the thread tail, even if a parser id later appears.
             onForkFromTurn &&
             isResponseComplete &&
-            forkPoint &&
+            forkTurnId &&
             !forkPointUnnamed
               ? () => {
-                  onForkFromTurn(
-                    forkTurnId ?? forkPoint.source_turn_id ?? forkPoint.id
-                  )
+                  onForkFromTurn(forkTurnId)
                 }
               : undefined
           }

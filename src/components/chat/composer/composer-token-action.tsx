@@ -9,6 +9,7 @@ import {
   useOpenLinkOrFile,
 } from "@/components/ai-elements/link-safety"
 import { ContextMenuItem } from "@/components/ui/context-menu"
+import { isBareRelativeWorkspacePathLike } from "@/lib/markdown/local-path-links"
 import type { TextToken } from "@/lib/text-token-at"
 
 /**
@@ -33,6 +34,9 @@ export function composerTokenOpenTarget(
   // protocol-relative `//cdn.example.com/app.js` is classified as a path here,
   // and the opener would happily load it as https — behind an "Open file" label.
   if (token.kind === "path") {
+    // Transcript badges can resolve a bare `src/x.ts` against a folder.
+    // A half-typed composer draft cannot, so do not offer an open row.
+    if (isBareRelativeWorkspacePathLike(token.value)) return null
     return parseLocalFileTarget(token.value) ? token.value : null
   }
   // The rest carry a canonical uri (`mailto:` for an address, an `https://`

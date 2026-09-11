@@ -73,7 +73,7 @@ function ids(): string[] {
 
 /** What the reopen shortcut does with the entry it pops: hand the store the
  *  identity AND the slot the tab was closed from. */
-function reopen(closed: ClosedWorkspaceTab | null) {
+async function reopen(closed: ClosedWorkspaceTab | null) {
   if (!closed || closed.kind !== "conversation") {
     throw new Error("expected a closed conversation tab")
   }
@@ -84,7 +84,8 @@ function reopen(closed: ClosedWorkspaceTab | null) {
     })
     return
   }
-  store.openTab(
+  // openTab awaits the pop-out focus probe before inserting a main tab.
+  await store.openTab(
     closed.folderId,
     closed.conversationId,
     closed.agentType,
@@ -94,8 +95,8 @@ function reopen(closed: ClosedWorkspaceTab | null) {
   )
 }
 
-function reopenLast() {
-  reopen(popClosedTab())
+async function reopenLast() {
+  await reopen(popClosedTab())
 }
 
 beforeEach(() => {
@@ -110,17 +111,17 @@ afterEach(() => {
 })
 
 describe("where reopen-last-closed-tab puts the tab back", () => {
-  it("restores the tab at the slot it was closed from", () => {
+  it("restores the tab at the slot it was closed from", async () => {
     seedTabs([conversationTab(1), conversationTab(2), conversationTab(3)])
     useTabStore.getState().closeTab(tabId(2))
     expect(ids()).toEqual([tabId(1), tabId(3)])
 
-    reopenLast()
+    await reopenLast()
     expect(ids()).toEqual([tabId(1), tabId(2), tabId(3)])
     expect(useTabStore.getState().activeTabId).toBe(tabId(2))
   })
 
-  it("clamps the slot to the strip when it has shrunk since", () => {
+  it("clamps the slot to the strip when it has shrunk since", async () => {
     seedTabs([
       conversationTab(1),
       conversationTab(2),
@@ -132,11 +133,11 @@ describe("where reopen-last-closed-tab puts the tab back", () => {
     useTabStore.getState().closeTab(tabId(3), { recordForReopen: false })
     expect(ids()).toEqual([tabId(1)])
 
-    reopenLast()
+    await reopenLast()
     expect(ids()).toEqual([tabId(1), tabId(4)])
   })
 
-  it("puts tabs closed one at a time back in reverse, each where it was", () => {
+  it("puts tabs closed one at a time back in reverse, each where it was", async () => {
     seedTabs([
       conversationTab(1),
       conversationTab(2),
@@ -148,16 +149,16 @@ describe("where reopen-last-closed-tab puts the tab back", () => {
     useTabStore.getState().closeTab(tabId(4))
     expect(ids()).toEqual([tabId(1), tabId(3), tabId(5)])
 
-    reopenLast()
+    await reopenLast()
     expect(ids()).toEqual([tabId(1), tabId(3), tabId(4), tabId(5)])
-    reopenLast()
+    await reopenLast()
     expect(ids()).toEqual([tabId(1), tabId(2), tabId(3), tabId(4), tabId(5)])
   })
 
   // "Close other tabs" records every tab against the same strip. Reopening
   // walks the stack newest-first, so each entry has to carry the slot the tab
   // would have had if the batch had closed one tab at a time.
-  it("walks a close-others batch back into its original order", () => {
+  it("walks a close-others batch back into its original order", async () => {
     seedTabs(
       [
         conversationTab(1),
@@ -170,23 +171,23 @@ describe("where reopen-last-closed-tab puts the tab back", () => {
     useTabStore.getState().closeOtherTabs(tabId(2))
     expect(ids()).toEqual([tabId(2)])
 
-    reopenLast()
+    await reopenLast()
     expect(ids()).toEqual([tabId(2), tabId(4)])
-    reopenLast()
+    await reopenLast()
     expect(ids()).toEqual([tabId(2), tabId(3), tabId(4)])
-    reopenLast()
+    await reopenLast()
     expect(ids()).toEqual([tabId(1), tabId(2), tabId(3), tabId(4)])
   })
 
-  it("rebuilds a closed-all strip ahead of the draft that replaced it", () => {
+  it("rebuilds a closed-all strip ahead of the draft that replaced it", async () => {
     seedTabs([conversationTab(1), conversationTab(2), conversationTab(3)])
     useTabStore.getState().closeAllTabs()
     const [draft] = ids()
     expect(useTabStore.getState().rawTabs[0].conversationId).toBeNull()
 
-    reopenLast()
-    reopenLast()
-    reopenLast()
+    await reopenLast()
+    await reopenLast()
+    await reopenLast()
     expect(ids()).toEqual([tabId(1), tabId(2), tabId(3), draft])
   })
 
@@ -194,37 +195,37 @@ describe("where reopen-last-closed-tab puts the tab back", () => {
   // resolves to (per-group draft singleton), so it has to take the closed
   // draft's slot — otherwise the strip comes back with the draft shunted to
   // the end.
-  it("rebuilds a closed-all strip that held a draft", () => {
+  it("rebuilds a closed-all strip that held a draft", async () => {
     seedTabs([conversationTab(1), draftTab("new-1"), conversationTab(3)])
     useTabStore.getState().closeAllTabs()
     const [draft] = ids()
 
-    reopenLast()
-    reopenLast()
-    reopenLast()
+    await reopenLast()
+    await reopenLast()
+    await reopenLast()
     expect(ids()).toEqual([tabId(1), draft, tabId(3)])
   })
 
-  it("restores a closed draft at its slot", () => {
+  it("restores a closed draft at its slot", async () => {
     seedTabs([conversationTab(1), draftTab("new-1"), conversationTab(3)])
     useTabStore.getState().closeTab("new-1")
     expect(ids()).toEqual([tabId(1), tabId(3)])
 
-    reopenLast()
+    await reopenLast()
     const { rawTabs, activeTabId } = useTabStore.getState()
     expect(rawTabs.map((tab) => tab.conversationId)).toEqual([1, null, 3])
     expect(rawTabs[1].workingDir).toBe("/repo")
     expect(activeTabId).toBe(rawTabs[1].id)
   })
 
-  it("keeps a reopened kept tab out of the group's preview slot", () => {
+  it("keeps a reopened kept tab out of the group's preview slot", async () => {
     seedTabs(
       [conversationTab(1), conversationTab(2), conversationTab(3, false)],
       tabId(2)
     )
     useTabStore.getState().closeTab(tabId(2))
 
-    reopenLast()
+    await reopenLast()
     const { rawTabs, previewReplacedTabIds } = useTabStore.getState()
     expect(rawTabs.map((tab) => [tab.id, tab.isPinned])).toEqual([
       [tabId(1), true],
@@ -234,14 +235,14 @@ describe("where reopen-last-closed-tab puts the tab back", () => {
     expect(previewReplacedTabIds).toEqual([])
   })
 
-  it("lands a reopened preview at its slot when the group has no preview", () => {
+  it("lands a reopened preview at its slot when the group has no preview", async () => {
     seedTabs(
       [conversationTab(1), conversationTab(2, false), conversationTab(3)],
       tabId(2)
     )
     useTabStore.getState().closeTab(tabId(2))
 
-    reopenLast()
+    await reopenLast()
     expect(
       useTabStore.getState().rawTabs.map((tab) => [tab.id, tab.isPinned])
     ).toEqual([
@@ -254,16 +255,16 @@ describe("where reopen-last-closed-tab puts the tab back", () => {
   // A group holds one preview. A reopened preview still takes that slot when
   // another preview opened in the meantime; the slot only decides where a tab
   // that needs a NEW slot goes.
-  it("lets a reopened preview replace the preview that took its place", () => {
+  it("lets a reopened preview replace the preview that took its place", async () => {
     seedTabs(
       [conversationTab(1), conversationTab(2, false), conversationTab(3)],
       tabId(2)
     )
     useTabStore.getState().closeTab(tabId(2))
-    useTabStore.getState().openTab(1, 4, "claude_code", false)
+    await useTabStore.getState().openTab(1, 4, "claude_code", false)
     expect(ids()).toEqual([tabId(1), tabId(3), tabId(4)])
 
-    reopenLast()
+    await reopenLast()
     const { rawTabs, previewReplacedTabIds } = useTabStore.getState()
     expect(rawTabs.map((tab) => [tab.id, tab.isPinned])).toEqual([
       [tabId(1), true],
@@ -273,15 +274,15 @@ describe("where reopen-last-closed-tab puts the tab back", () => {
     expect(previewReplacedTabIds).toEqual([tabId(4)])
   })
 
-  it("focuses a conversation that is open again rather than adding a tab", () => {
+  it("focuses a conversation that is open again rather than adding a tab", async () => {
     seedTabs([conversationTab(1), conversationTab(2), conversationTab(3)])
     useTabStore.getState().closeTab(tabId(2))
     // Reopened from the sidebar in the meantime (which does not pop).
-    useTabStore.getState().openTab(1, 2, "claude_code", true)
+    await useTabStore.getState().openTab(1, 2, "claude_code", true)
     useTabStore.getState().switchTab(tabId(1))
     expect(ids()).toEqual([tabId(1), tabId(3), tabId(2)])
 
-    reopenLast()
+    await reopenLast()
     expect(ids()).toEqual([tabId(1), tabId(3), tabId(2)])
     expect(useTabStore.getState().activeTabId).toBe(tabId(2))
   })
@@ -296,7 +297,7 @@ describe("where reopen-last-closed-tab puts the tab back", () => {
     seedTabs([conversationTab(1), conversationTab(2), conversationTab(3)])
     useTabStore.setState({ tabsHydrated: true })
     useTabStore.getState().closeTab(tabId(2))
-    reopenLast()
+    await reopenLast()
 
     useTabStore.getState().runSaveEffect()
     await vi.advanceTimersByTimeAsync(500)

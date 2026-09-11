@@ -871,6 +871,13 @@ function retireCoveredBackgroundTurns(
  */
 function persistIdentityKey(turn: MessageTurn): string | null {
   if (!turn.timestamp) return null
+  // User turns: timestamp + role alone collides across rounds that share a
+  // clock second. Content keeps an earlier local "continue" from replacing
+  // this round's persisted prompt. Assistant turns stay timestamp-only so a
+  // live launch ack can still align to the parser's folded background card.
+  if (turn.role === "user") {
+    return `${turn.role}\0${turn.timestamp}\0${userTurnContentKey(turn)}`
+  }
   return `${turn.role}\0${turn.timestamp}`
 }
 
