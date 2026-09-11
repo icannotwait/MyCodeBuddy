@@ -8029,10 +8029,16 @@ describe("AcpConnectionsProvider frame transactions (raw order)", () => {
             {
               connection_id: "owner-conn",
               seq: 1,
+              type: "session_started",
+              session_id: "sess-1",
+            },
+            {
+              connection_id: "owner-conn",
+              seq: 2,
               type: "status_changed",
               status: "prompting",
             },
-            content("owner-conn", 2, "first content"),
+            content("owner-conn", 3, "first content"),
           ])
         )
         h.runAnimationFrame()
@@ -8049,7 +8055,7 @@ describe("AcpConnectionsProvider frame transactions (raw order)", () => {
           batch(2, [
             {
               connection_id: "owner-conn",
-              seq: 3,
+              seq: 4,
               type: "turn_complete",
               session_id: "sess-1",
               stop_reason: "end_turn",

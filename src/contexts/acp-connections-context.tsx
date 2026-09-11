@@ -5235,11 +5235,26 @@ function admitTurnComplete(
       runtime.externalId != null
         ? runtime.externalId === event.session_id
         : snapshot.sessionId === event.session_id
-    // Live-message identity is sufficient: a draft/virtual runtime can keep a
-    // stale persisted `externalId` (detail refetch / conversation://changed)
-    // while this connection's current ACP session emitted end_turn. Requiring
-    // both left status stuck on Prompting after a real TurnComplete.
-    if (!runtimeLiveMatches && !sessionMatches) continue
+    // Live-message identity owns this in-flight turn once the *connection*
+    // session is known (top guard already matched it). A draft/virtual
+    // runtime can keep a stale persisted `externalId` after a detail refetch
+    // / conversation://changed; requiring runtime.externalId === session_id
+    // dropped end_turn and left Prompting stuck.
+    //
+    // When connection.sessionId is still unset, do not let a live match
+    // override a concrete runtime.externalId mismatch — that is the
+    // wrong-session turn_complete case.
+    if (runtimeLiveMatches) {
+      if (
+        snapshot.sessionId == null &&
+        runtime.externalId != null &&
+        !sessionMatches
+      ) {
+        continue
+      }
+    } else if (!sessionMatches) {
+      continue
+    }
     if (runtime.liveMessage != null && !runtimeLiveMatches) {
       continue
     }
