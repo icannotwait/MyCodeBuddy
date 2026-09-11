@@ -5843,7 +5843,7 @@ fn redact_mcp_secret_value(key: &str, value: &str) -> String {
     let len = value.chars().count();
     let prefix: String = value.chars().take(8).collect();
     if len == 0 {
-        return format!("(len=0)");
+        return "(len=0)".to_string();
     }
     format!("{prefix}…(len={len})")
 }
@@ -5859,7 +5859,14 @@ fn value_looks_like_secret(value: &str) -> bool {
     // Long random hex / base64-ish blobs (tokens, keys).
     let alnum: String = trimmed
         .chars()
-        .filter(|c| c.is_ascii_alphanumeric() || *c == '+' || *c == '/' || *c == '=' || *c == '-' || *c == '_')
+        .filter(|c| {
+            c.is_ascii_alphanumeric()
+                || *c == '+'
+                || *c == '/'
+                || *c == '='
+                || *c == '-'
+                || *c == '_'
+        })
         .collect();
     if alnum.len() >= 32 && alnum.len() * 10 >= trimmed.len() * 9 {
         let hexish = alnum.chars().all(|c| c.is_ascii_hexdigit());
@@ -5938,7 +5945,10 @@ fn redacted_mcp_server_json(server: &McpServer) -> serde_json::Value {
                 "command".into(),
                 serde_json::Value::String(s.command.display().to_string()),
             );
-            obj.insert("args".into(), serde_json::Value::Array(redact_mcp_args(&s.args)));
+            obj.insert(
+                "args".into(),
+                serde_json::Value::Array(redact_mcp_args(&s.args)),
+            );
             obj.insert("env".into(), serde_json::Value::Object(env));
             // Surface --features from args when present (handy for diagnosis).
             if let Some(idx) = s.args.iter().position(|a| a == "--features") {
@@ -5990,7 +6000,6 @@ fn redacted_mcp_server_json(server: &McpServer) -> serde_json::Value {
         _ => serde_json::json!({ "unsupported": "unknown McpServer variant" }),
     }
 }
-
 
 /// Compact INFO dump of mcpServers with secrets redacted.
 fn log_redacted_mcp_servers_dump(servers: &[McpServer], context: &str) {
