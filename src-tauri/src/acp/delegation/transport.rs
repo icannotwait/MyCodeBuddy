@@ -490,6 +490,9 @@ pub enum BrokerMessage {
     GetWorkflowState(BrokerGetWorkflowStateRequest),
     RequestRecoveryAuthorization(BrokerRecoveryAuthorizationRequest),
     RecoverWorkflow(BrokerRecoverWorkflowRequest),
+    /// Untokened liveness probe. The listener answers `{"ok": true}` without
+    /// touching the broker, DB, or token registry.
+    Ping,
 }
 
 /// The wrapped outcome the main process returns over the same socket.
@@ -814,6 +817,15 @@ pub async fn client_recover_workflow_round_trip(
     req: &BrokerRecoverWorkflowRequest,
 ) -> io::Result<BrokerResponse> {
     message_round_trip(socket_path, &BrokerMessage::RecoverWorkflow(req.clone())).await
+}
+
+/// Probe the listener: write a [`BrokerMessage::Ping`] and read the
+/// `{"ok": true}` answer back. Used by the codeg-mcp service-status indicator
+/// to tell "listening" from "socket file exists but nobody is accepting".
+/// Callers should wrap this in their own timeout — a socket whose peer accepts
+/// but never answers would otherwise park here.
+pub async fn client_ping(socket_path: &str) -> io::Result<BrokerResponse> {
+    message_round_trip(socket_path, &BrokerMessage::Ping).await
 }
 
 /// Total budget for `open()` retries on Windows named pipes. Has to be

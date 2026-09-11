@@ -480,10 +480,11 @@ async fn async_main() -> ExitCode {
         &chat_authoring_config,
     )
     .await;
-    // Keep ACP model terminal fallbacks aligned with the same default-shell
-    // preference used by the built-in terminal before accepting connections.
+    // Before accepting connections: keep ACP model terminal fallbacks aligned
+    // with the same default-shell preference the built-in terminal uses, and
+    // seed the command-color opt-in that every launch env is built from.
     let terminal_shell_config = state.connection_manager.terminal_shell_config();
-    codeg_lib::commands::system_settings::apply_persisted_terminal_shell_config(
+    codeg_lib::commands::system_settings::apply_persisted_terminal_settings(
         &state.db.conn,
         &terminal_shell_config,
     )
@@ -520,9 +521,14 @@ async fn async_main() -> ExitCode {
                 state.emitter.clone(),
             );
         let socket = stack.socket_path.clone();
+        let service = codeg_lib::acp::delegation::service::DelegationService::new(
+            listener,
+            socket,
+        );
+        codeg_lib::acp::delegation::service::install(service.clone());
         tokio::spawn(async move {
-            if let Err(e) = listener.run(socket).await {
-                tracing::info!("[delegation] listener exited: {e}");
+            if let Err(e) = service.start().await {
+                tracing::error!("[delegation] listener failed to start: {e}");
             }
         });
     }

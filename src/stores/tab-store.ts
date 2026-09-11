@@ -41,7 +41,11 @@ import {
   sweepOrphanDraftKeys,
 } from "@/lib/message-input-draft"
 import { discardAskSelectionPrompts } from "@/lib/ask-selection-handoff"
-import { pushClosedTab, snapshotConversationTab } from "@/lib/closed-tab-stack"
+import {
+  batchCloseSlots,
+  pushClosedTab,
+  snapshotConversationTab,
+} from "@/lib/closed-tab-stack"
 import type {
   AgentType,
   ConversationChange,
@@ -244,7 +248,14 @@ export interface TabStoreState {
     conversationId: number,
     agentType: AgentType,
     pin?: boolean,
-    title?: string
+    title?: string,
+    opts?: {
+      /** rawTabs slot for a tab that needs a NEW slot (clamped); omitted =
+       *  append. Reopening a closed tab passes the slot it was closed from. A
+       *  conversation that is already open is focused where it is, and a
+       *  preview still replaces the group's current preview in place. */
+      index?: number
+    }
   ) => Promise<boolean>
   detachTab: (tabId: string) => DetachTabResult
   restoreDetachedTab: (token: DetachRestoreToken) => void
@@ -305,6 +316,11 @@ export interface TabStoreState {
        *  agent (e.g. "ask about this selection" continues the conversation the
        *  text came from), not merely suggest one. */
       forceAgent?: AgentType
+      /** rawTabs slot for the draft (clamped); omitted = append / leave put.
+       *  Reopening a closed draft passes the slot it was closed from — and
+       *  since the per-group singleton may hand it the group's EXISTING draft
+       *  instead of a new tab, that draft is moved to the slot. */
+      index?: number
     }
   ) => OpenedDraftTarget
   openChatModeTab: (options?: {
@@ -632,6 +648,40 @@ function findTabIndexForConversation(
       t.conversationId === conversationId &&
       t.agentType === agentType
   )
+}
+
+/** A requested slot clamped to a strip of `length`. */
+function clampSlot(index: number, length: number): number {
+  return Math.max(0, Math.min(index, length))
+}
+
+/** `tabs` with `tab` inserted at `index`, clamped to the array, or appended
+ *  when no index is given. Reopening a closed tab passes the slot it was
+ *  closed from, so it goes back where it was rather than to the end. */
+function insertTab(
+  tabs: TabItemInternal[],
+  tab: TabItemInternal,
+  index: number | undefined
+): TabItemInternal[] {
+  const at = index == null ? tabs.length : clampSlot(index, tabs.length)
+  return [...tabs.slice(0, at), tab, ...tabs.slice(at)]
+}
+
+/** `tabs` with the tab already at `tabId` moved to `index` (clamped) — the same
+ *  array back when it is absent or already there, so callers can skip the write.
+ *  Reopening a closed DRAFT lands here: the per-group draft singleton hands the
+ *  reopen an existing draft instead of a new tab, and that draft still has to
+ *  take the closed one's slot. */
+function moveTabToSlot(
+  tabs: TabItemInternal[],
+  tabId: string,
+  index: number
+): TabItemInternal[] {
+  const from = tabs.findIndex((t) => t.id === tabId)
+  if (from < 0) return tabs
+  const without = tabs.filter((t) => t.id !== tabId)
+  if (clampSlot(index, without.length) === from) return tabs
+  return insertTab(without, tabs[from], index)
 }
 
 /** Field-wise equality for derived tab items. Backs the cross-derive reuse in
@@ -1293,7 +1343,14 @@ function initialTabState() {
 export const useTabStore = create<TabStoreState>()((set, get) => ({
   ...initialTabState(),
 
-  openTab: async (folderId, conversationId, agentType, pin = false, title) => {
+  openTab: async (
+    folderId,
+    conversationId,
+    agentType,
+    pin = false,
+    title,
+    opts
+  ) => {
     // Workspace `conversations` is root-only (delegation children never land
     // there). Root/parent sessions always open pinned so a later preview open
     // (e.g. subagent child via openDelegatedChildSession) cannot replace them.
@@ -1427,7 +1484,7 @@ export const useTabStore = create<TabStoreState>()((set, get) => ({
     }
 
     if (pin) {
-      const next = [...prevState.rawTabs, newTab]
+      const next = insertTab(prevState.rawTabs, newTab, opts?.index)
       const keep = buildTabLimitKeepIds(next, [tabId])
       const { tabs: limited } = evictTabsToLimit(next, { keepTabIds: keep })
       set({
@@ -1442,7 +1499,7 @@ export const useTabStore = create<TabStoreState>()((set, get) => ({
     }
 
     // Preview replacement stays within the focused group — a preview parked in
-    // another group is left alone (the new tab appends instead).
+    // another group is left alone (the new tab gets a slot of its own instead).
     const previewIndex = prevState.rawTabs.findIndex(
       (t) =>
         !t.isPinned &&
@@ -1468,7 +1525,7 @@ export const useTabStore = create<TabStoreState>()((set, get) => ({
       return true
     }
 
-    const next = [...prevState.rawTabs, newTab]
+    const next = insertTab(prevState.rawTabs, newTab, opts?.index)
     const keep = buildTabLimitKeepIds(next, [tabId])
     const { tabs: limited } = evictTabsToLimit(next, { keepTabIds: keep })
     set({
@@ -1490,7 +1547,7 @@ export const useTabStore = create<TabStoreState>()((set, get) => ({
     if (index >= 0) {
       const closingTab = prevState.rawTabs[index]
       if (options?.recordForReopen !== false) {
-        pushClosedTab(snapshotConversationTab(closingTab))
+        pushClosedTab(snapshotConversationTab(closingTab, index))
       }
       const next = prevState.rawTabs.filter((t) => t.id !== tabId)
       const leftFolderId = isDraftLeaveFromFolder(closingTab)
@@ -1745,9 +1802,12 @@ export const useTabStore = create<TabStoreState>()((set, get) => ({
     }
     const leftFolderIds = new Set<number>()
     const keepIds = new Set(keep.map((tab) => tab.id))
-    for (const tab of prevState.rawTabs) {
-      if (keepIds.has(tab.id)) continue
-      pushClosedTab(snapshotConversationTab(tab))
+    const closing = batchCloseSlots(
+      prevState.rawTabs,
+      (tab) => !keepIds.has(tab.id)
+    )
+    for (const [tab, slot] of closing) {
+      pushClosedTab(snapshotConversationTab(tab, slot))
       const left = isDraftLeaveFromFolder(tab)
       if (left != null) leftFolderIds.add(left)
     }
@@ -1768,8 +1828,8 @@ export const useTabStore = create<TabStoreState>()((set, get) => ({
       if (prevState.rawTabs.length === 0 && prevState.activeTabId == null) {
         return
       }
-      for (const tab of prevState.rawTabs) {
-        pushClosedTab(snapshotConversationTab(tab))
+      for (const [tab, slot] of batchCloseSlots(prevState.rawTabs)) {
+        pushClosedTab(snapshotConversationTab(tab, slot))
       }
       set({ rawTabs: [], activeTabId: null })
       recomputeTabs()
@@ -1782,8 +1842,8 @@ export const useTabStore = create<TabStoreState>()((set, get) => ({
       prevState.rawTabs.find((t) => t.id === prevState.activeTabId) ??
       prevState.rawTabs[0]
     const replacementTab = makeReplacementDraftTab(seedTab)
-    for (const tab of prevState.rawTabs) {
-      pushClosedTab(snapshotConversationTab(tab))
+    for (const [tab, slot] of batchCloseSlots(prevState.rawTabs)) {
+      pushClosedTab(snapshotConversationTab(tab, slot))
     }
     set({
       rawTabs: stampActiveTab([replacementTab], replacementTab.id),
@@ -2164,7 +2224,7 @@ export const useTabStore = create<TabStoreState>()((set, get) => ({
         workingDir,
         agentTypeProvisional: provisional,
       }
-      const next = [...prevState.rawTabs, newTab]
+      const next = insertTab(prevState.rawTabs, newTab, options?.index)
       const keep = buildTabLimitKeepIds(next, [tabId])
       const { tabs: limited } = evictTabsToLimit(next, { keepTabIds: keep })
       set({
@@ -2184,8 +2244,20 @@ export const useTabStore = create<TabStoreState>()((set, get) => ({
     const provisionalChanged =
       (existingTab.agentTypeProvisional ?? false) !== provisional
 
+    // The singleton means a reopened draft resolves to THIS draft rather than a
+    // tab of its own, so the slot it was closed from has to move this one — a
+    // close-all walked back would otherwise leave the draft shunted to the end
+    // of the strip it is meant to rebuild. Only the reopen path passes an
+    // index, and drafts never reach `buildPersistItems`, so no save fires.
+    const nextRawTabs =
+      options?.index == null
+        ? prevState.rawTabs
+        : moveTabToSlot(prevState.rawTabs, existingTab.id, options.index)
+    const moved = nextRawTabs !== prevState.rawTabs
+
     if (folderChanged || agentChanged) {
       set({
+        ...(moved ? { rawTabs: nextRawTabs } : {}),
         draftRetargetRequests: [
           ...prevState.draftRetargetRequests,
           {
@@ -2199,16 +2271,22 @@ export const useTabStore = create<TabStoreState>()((set, get) => ({
         ],
       })
       focusTab(existingTab.id)
+      if (moved) recomputeTabs()
     } else if (workingDirChanged || provisionalChanged) {
-      const updated = prevState.rawTabs.map((tab) =>
-        tab.id === existingTab.id
-          ? { ...tab, workingDir, agentTypeProvisional: provisional }
-          : tab
-      )
       set({
-        rawTabs: stampActiveTab(updated, existingTab.id),
+        rawTabs: stampActiveTab(
+          nextRawTabs.map((tab) =>
+            tab.id === existingTab.id
+              ? { ...tab, workingDir, agentTypeProvisional: provisional }
+              : tab
+          ),
+          existingTab.id
+        ),
         activeTabId: existingTab.id,
       })
+      recomputeTabs()
+    } else if (moved) {
+      set({ rawTabs: nextRawTabs, activeTabId: existingTab.id })
       recomputeTabs()
     } else {
       focusTab(existingTab.id)

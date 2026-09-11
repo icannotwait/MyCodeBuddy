@@ -35,6 +35,7 @@ import type {
   OpenedTab,
   OpenedTabsSnapshot,
   SaveTabsOutcome,
+  GitBlobBase64,
   GitStatusEntry,
   GitBranchList,
   GitHeadInfo,
@@ -1028,6 +1029,20 @@ export async function gitShowFile(
   })
 }
 
+export async function gitShowFileBase64(
+  path: string,
+  file: string,
+  refName?: string,
+  maxBytes?: number
+): Promise<GitBlobBase64> {
+  return invoke("git_show_file_base64", {
+    path,
+    file,
+    refName: refName ?? null,
+    maxBytes: maxBytes ?? null,
+  })
+}
+
 export async function gitIsTracked(
   path: string,
   file: string
@@ -1114,6 +1129,7 @@ export async function openCommitWindow(folderId: number): Promise<void> {
 }
 
 export type SettingsSection =
+  | "general"
   | "appearance"
   | "agents"
   | "mcp"

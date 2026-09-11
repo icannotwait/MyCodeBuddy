@@ -29,7 +29,7 @@ pub const PINNED_GROK_VERSION: &str = "0.2.103";
 /// treated as available on **any** installed host version — newer builds are
 /// assumed to keep the same flag contract. This constant is not an exclusive
 /// capability gate.
-pub const PINNED_CODEBUDDY_VERSION: &str = "2.148.0";
+pub const PINNED_CODEBUDDY_VERSION: &str = "2.149.0";
 /// Recommended Claude Code product version for smoke/docs and missing-install
 /// fallback.
 ///

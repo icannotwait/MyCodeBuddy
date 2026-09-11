@@ -47,10 +47,14 @@ interface TurnStatsProps {
    * session has no live connection, the agent has no `session/fork`, or this
    * surface doesn't own the conversation. */
   onForkFromHere?: () => void
-  /** Forking is possible here but not right now (a turn is in flight). The
-   * button stays in place, greyed out, and says why on hover — it used to
-   * vanish for the length of every reply, which moved the whole icon row. */
+  /** Forking is possible here but not right now. The button stays in place,
+   * greyed out, and says why on hover — it used to vanish for the length of
+   * every reply, which moved the whole icon row. */
   forkDisabled?: boolean
+  /** Why it is greyed out: a turn is in flight (`busy`), or this reply has no
+   * name the backend can resolve yet (`unnamed` — the post-turn reparse fills
+   * it in a moment later). Only read while `forkDisabled`. */
+  forkDisabledReason?: "busy" | "unnamed"
 }
 
 const iconButtonClass =
@@ -72,6 +76,7 @@ export function TurnStats({
   agentType,
   onForkFromHere,
   forkDisabled = false,
+  forkDisabledReason = "busy",
 }: TurnStatsProps) {
   const locale = useLocale()
   const t = useTranslations("Folder.chat.messageList")
@@ -254,7 +259,11 @@ export function TurnStats({
               </button>
             </TooltipTrigger>
             <TooltipContent side="top">
-              {forkDisabled ? t("forkBusy") : t("forkFromHere")}
+              {forkDisabled
+                ? forkDisabledReason === "unnamed"
+                  ? t("forkNotReady")
+                  : t("forkBusy")
+                : t("forkFromHere")}
             </TooltipContent>
           </Tooltip>
         )}

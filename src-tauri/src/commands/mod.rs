@@ -15,6 +15,7 @@ pub mod conversations;
 pub mod custom_agents;
 pub mod custom_skills;
 pub mod delegate_access;
+pub mod deepseek_settings;
 pub mod delegation;
 pub mod document_translate;
 pub mod experts;
@@ -29,6 +30,7 @@ pub mod grok_session_image;
 pub mod history_window;
 pub mod logging;
 pub mod mcp;
+pub mod mcp_service;
 pub mod model_provider;
 #[cfg(feature = "tauri-runtime")]
 pub mod notification;

@@ -13,9 +13,10 @@ export type RehypeAllowCodegOptions = {
   grokSessionImages?: boolean
 }
 
-/** Minimal view of rehype-sanitize's schema — only the protocol allow-list we widen. */
+/** Minimal view of the protocol and inert-attribute allow-lists we extend. */
 type SanitizeSchema = {
   protocols?: Record<string, string[]>
+  attributes?: Record<string, unknown[]>
   [key: string]: unknown
 }
 
@@ -164,7 +165,17 @@ function wrapHardenPreservingLocalPaths(
  *
  * Only the `sanitize` and `harden` entries are rewritten; every other plugin is
  * passed through in its original position (mirroring how Streamdown builds the
- * default list via `Object.values`).
+ * default list via `Object.values`), so the pipeline stays correct if upstream
+ * adds plugins.
+ * The two span attributes carry local-image references to the confined reader;
+ * they never become browser image URLs or widen the src protocol allow-list.
+ * Both spellings are listed on purpose: `remarkLocalImages` emits the dashed
+ * attribute names, but sanitize matches against the *hast property* name, and
+ * today that is the camelCased one only because Streamdown runs `rehype-raw`
+ * ahead of sanitize (hast-util-raw serializes to HTML and re-parses, which
+ * runs the names through property-information). Without `raw` in front the
+ * dashed key reaches sanitize verbatim; allowing both keeps local images
+ * working either way instead of silently degrading them to alt text.
  */
 export function rehypePluginsAllowingCodeg(
   defaults: Record<string, RehypePlugin>,
@@ -181,6 +192,16 @@ export function rehypePluginsAllowingCodeg(
     const href = schema?.protocols?.href ?? []
     const next: SanitizeSchema = {
       ...schema,
+      attributes: {
+        ...schema?.attributes,
+        span: [
+          ...(schema?.attributes?.span ?? []),
+          "dataCodegLocalImage",
+          "dataCodegImageLinked",
+          "data-codeg-local-image",
+          "data-codeg-image-linked",
+        ],
+      },
       protocols: {
         ...schema?.protocols,
         href: href.includes("codeg") ? href : [...href, "codeg"],

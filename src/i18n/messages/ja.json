@@ -196,7 +196,33 @@
       "panelOpacityHint": "サイドバー・パネル・タブバーの不透明度です。低いほど画像が透けて見えます。",
       "errorTooLarge": "画像が大きすぎます（最大 16 MB）。",
       "errorUnsupportedFormat": "対応していない画像形式です。PNG・JPEG・WebP・GIF から選んでください。",
-      "errorUploadFailed": "背景画像の設定に失敗しました。"
+      "errorUploadFailed": "背景画像の設定に失敗しました。",
+      "market": {
+        "open": "壁紙マーケット",
+        "title": "壁紙マーケット",
+        "description": "Wallhaven の公開ギャラリーを閲覧し、クリックでダウンロードして適用。",
+        "searchPlaceholder": "壁紙を検索…",
+        "categories": {
+          "all": "すべて",
+          "general": "風景",
+          "anime": "アニメ",
+          "people": "人物"
+        },
+        "pageInfo": "{page} / {lastPage} ページ",
+        "prevPage": "前へ",
+        "nextPage": "次へ",
+        "refresh": "更新",
+        "empty": "一致する壁紙がありません。",
+        "error": "壁紙マーケットの読み込みに失敗しました。",
+        "retry": "再試行",
+        "cardLabel": "壁紙 {id} を適用",
+        "applied": "使用中",
+        "unavailable": "利用不可",
+        "tooLarge": "背景に使うには大きすぎます：{actual}（上限 {limit}）",
+        "downloadFailed": "ダウンロードに失敗しました。再試行してください。",
+        "appliedToast": "壁紙を適用しました",
+        "credit": "画像提供 wallhaven.cc · SFW のみ"
+      }
     }
   },
   "SystemSettings": {
@@ -304,6 +330,10 @@
     "gitlabDescription": "認証用の GitLab アカウントを管理します。トークンはローカルに保存されます。",
     "gitlabTokenHint": "GitLab → Preferences → Access tokens で api スコープ付きのパーソナルアクセストークンを作成してください。",
     "gitlabNoAccounts": "GitLab アカウントがまだありません",
+    "giteaTitle": "Gitea アカウント",
+    "giteaDescription": "認証用の Gitea（および Forgejo）アカウントを管理します。トークンはローカルに保存されます。",
+    "giteaTokenHint": "Gitea → Settings → Applications で write:repository、write:issue、read:user スコープ付きのアクセストークンを作成してください。",
+    "giteaNoAccounts": "Gitea アカウントがまだありません",
     "noAccounts": "GitHub アカウントが設定されていません。",
     "addAccount": "アカウントを追加",
     "serverUrl": "サーバー URL",
@@ -336,7 +366,7 @@
     "loadFailed": "設定の読み込みに失敗しました：{message}",
     "gitAccount": {
       "sectionTitle": "Git サーバーアカウント",
-      "sectionDescription": "GitHub 以外の Git サーバーの認証情報を管理します（GitLab、Bitbucket、セルフホストなど）。",
+      "sectionDescription": "専用のセクションがない Git サーバーの認証情報を管理します（Bitbucket、自己ホスト型など）。",
       "noAccounts": "Git サーバーアカウントが設定されていません。",
       "addAccount": "アカウントを追加",
       "addTitle": "Git アカウントを追加",
@@ -682,6 +712,13 @@
     "emptyNoAgent": "利用可能なエージェントがありません。",
     "configManagement": "設定管理",
     "envVars": "環境変数",
+    "adapterChannel": {
+      "label": "アダプターのバージョン",
+      "description": "インストールとアップグレードは、codeg がレビューして固定したバージョンを使用します。「最新版」を選ぶと、その時点で最新の npm リリースをインストールします。最新版のインストールに失敗した場合は固定バージョンにフォールバックし、インストールログにその旨を記録します。",
+      "pinned": "固定バージョン（推奨）",
+      "latest": "最新版（未レビュー）",
+      "latestWarning": "最新リリースは未レビューのため、codeg でこのエージェントが動かなくなることがあります。まれに既知の不具合を含むリリースが最新版になっていることもあります。実際にインストールされたバージョンはバージョン状態に表示されます。"
+    },
     "hostTools": {
       "label": "ファイルとコマンドをエージェント自身に処理させる",
       "description": "codeg がファイルアクセスとターミナルコマンドを代行しなくなり、エージェントが自身のプロセスで実行します。そうすることで初めて、エージェント自身のサンドボックスと権限ルールが適用されます。他のエージェントへの委任も無効になります（同じ処理が codeg 経由に戻ってしまうため）。codeg 自体はサンドボックスを提供しないため、エージェント側でサンドボックスを設定済みの場合にのみ有効にしてください。"
@@ -755,6 +792,7 @@
       "saveCodexConfig": "Codex設定を保存",
       "saveGeminiConfig": "Gemini設定を保存",
       "saveOpenCodeConfig": "OpenCode設定を保存",
+      "saveOpenClawConfig": "OpenClaw設定を保存",
       "saveConfigManagement": "設定管理を保存",
       "saveCurrentProvider": "現在のプロバイダーを保存",
       "showApiKey": "APIキーを表示",
@@ -948,6 +986,13 @@
         "failed": "サインインが完了しませんでした。",
         "startFailed": "サインインを開始できませんでした",
         "credentialHint": "トークンはここにキャッシュされます。このファイルを別のデスクトップなしマシンにコピーすれば、そちらもサインイン済みになります。"
+      },
+      "signOut": {
+        "title": "間違ったアカウントでサインインしましたか？",
+        "description": "Antigravity はサインインした Google アカウントをキャッシュして黙って再利用するため、再度サインインしても別のアカウントには切り替わりません。サインアウトすると保存された認証情報が破棄されます。実行中の Antigravity セッションは先に終了します。そのままだと古いアカウントが書き戻されるためです。",
+        "action": "サインアウト",
+        "done": "サインアウトしました。サインインし直すと別のアカウントを選べます。",
+        "failed": "サインアウトできませんでした"
       }
     },
     "deepseek": {
@@ -1162,6 +1207,14 @@
         }
       }
     },
+    "openClaw": {
+      "gatewayConfig": "Gateway 設定",
+      "gatewayDescription": "OpenClaw Gateway 接続を設定します。ローカルまたはリモートの gateway をサポートします。",
+      "gatewayUrlHint": "空欄の場合はローカル openclaw 設定の gateway.remote.url を使用します。",
+      "gatewayTokenPlaceholder": "Gateway 認証トークン",
+      "gatewayTokenHint": "可能な場合は平文トークンではなく token-file の使用を推奨します。openclaw CLI で設定してください。",
+      "sessionKeyHint": "任意。gateway の session key を指定します。空欄の場合は分離されたセッションが自動割り当てされます。"
+    },
     "hermes": {
       "configManagement": "Hermes 設定",
       "configDescription": "Hermes は認証情報を ~/.hermes/.env に、設定を ~/.hermes/config.yaml に独自に管理します。プロバイダーを選択し、API キーとモデルを設定してください。codeg が両方のファイルを書き込みます。",
@@ -1361,6 +1414,8 @@
       "openCodeConfigSynced": "OpenCode config と auth JSON が同期されました。",
       "openCodeSaved": "OpenCode設定を保存しました",
       "saveOpenCodeFailed": "OpenCode設定の保存に失敗しました",
+      "openClawSaved": "OpenClaw設定を保存しました",
+      "saveOpenClawFailed": "OpenClaw設定の保存に失敗しました",
       "configSaved": "設定を保存しました",
       "configSavedHint": "既存のセッションは再度開く必要があります",
       "saveConfigManagementFailed": "設定管理の保存に失敗しました",
@@ -1411,6 +1466,7 @@
       "upgradeAvailable": "{versionText}。アップグレード可能です。",
       "remoteUnavailable": "{versionText}。現在リモートバージョンは取得できません。",
       "latest": "{versionText}。すでに最新です。",
+      "latestChannel": "{versionText}。最新版チャンネルが有効です。アップグレードで最新リリースをインストールします。",
       "bundled": "内蔵バージョン: {version}",
       "bundledMissing": "内蔵アダプターがありません。DrawCode を再インストールまたは更新してください。"
     },
@@ -1494,6 +1550,7 @@
       "installing": "インストール中…",
       "recheck": "再確認",
       "configDirSkillsNote": "カスタム設定ディレクトリを指定すると、設定画面で管理するスキル・エキスパート・オフィスツールはこの pi に適用されません。スキルはそのフォルダー内で直接管理してください。",
+      "dirHistoryNote": "これらのディレクトリは pi プロセスにのみ適用されます。codeg の会話履歴は pi の既定の場所を読むため、カスタムディレクトリに書き込まれたセッションは一覧に表示されません。",
       "projectTrustTitle": "プロジェクトの信頼",
       "projectTrustDescription": "pi にプロジェクトファイルの読み込みを許可したフォルダーです。信頼したフォルダーでは、そのリポジトリの .pi/extensions が pi の起動時にコードを実行します。配下のすべてのフォルダーに適用され、ターミナルで pi を実行するときにも使われます。",
       "projectTrustLoading": "読み込み中…",
@@ -1571,7 +1628,7 @@
   "GeneralSettings": {
     "loading": "読み込み中...",
     "sectionTitle": "一般",
-    "sectionDescription": "デフォルトターミナル、レンダリング高速化、マルチエージェント委譲などの共通設定をここで一括管理します。",
+    "sectionDescription": "デフォルトターミナル、レンダリング高速化、通知と通知音、マルチエージェント委譲などの共通設定をここで一括管理します。",
     "terminalTitle": "デフォルトターミナル",
     "terminalDescription": "新しいターミナルタブと新しい ACP エージェントのツール実行で使うシェルを選択します。実行中のターミナルと ACP 接続は現在のシェルを維持し、再接続後に変更が適用されます。",
     "terminalSystemDefault": "システムデフォルト",
@@ -1587,7 +1644,9 @@
     "terminalShellNotInstalled": "未インストール",
     "terminalShellNotFoundWarning": "このパスはホスト上に存在しません。",
     "terminalCurrentShell": "新しいターミナルと ACP 接続で有効なシェル: {path}",
-    "renderingDescription": "アプリで黒画面や描画不具合が発生する場合（一部の AMD GPU や Intel 内蔵 GPU で報告あり）、ハードウェアアクセラレーションを無効化してください。Windows デスクトップ版のみ有効です。",
+    "colorizeCommandOutput": "コマンド出力に色を付ける",
+    "colorizeCommandOutputDescription": "エージェントが実行するコマンドに ANSI カラーを強制し、その出力をトランスクリプト上でプレーンテキストではなくカラーで表示します。新しいセッションから有効になります。",
+    "renderingDescription": "アプリで黒画面や描画不具合が発生する場合（Windows では一部の AMD GPU や Intel 内蔵 GPU、Linux では NVIDIA プロプライエタリドライバーで報告あり）、ハードウェアアクセラレーションを無効化してください。Windows と Linux のデスクトップ版のみ有効です。",
     "disableHardwareAcceleration": "ハードウェアアクセラレーションを無効化",
     "renderingSaveFailed": "レンダリング設定の保存に失敗しました: {message}",
     "restartRequired": "保存しました。再起動後に反映されます。",
@@ -1680,6 +1739,9 @@
     "searchPlaceholder": "タイトルまたはパスを検索…",
     "allAgents": "すべてのエージェント",
     "onlyImportable": "インポート可能のみ",
+    "includeDeleted": "削除済みを含める",
+    "includeDeletedWithCount": "削除済みを含める（{count}）",
+    "includeDeletedHint": "codeg でセッションを削除しても非表示になるだけで、会話と履歴は残っています。オンにすると削除済みセッションを選択して元の場所に復元できます。",
     "selectAll": "すべて選択",
     "clearSelection": "クリア",
     "expandAll": "すべて展開",
@@ -1692,6 +1754,7 @@
     "toggleSessionAria": "セッション {title} を選択",
     "statusImported": "インポート済み",
     "statusDeleted": "削除済み",
+    "statusDeletedRestorable": "削除済み — インポートすると元の会話が復元されます",
     "untitled": "無題のセッション",
     "messageCount": "{count} 件のメッセージ",
     "selectedCount": "{count} 件選択中",
@@ -1700,6 +1763,7 @@
     "close": "閉じる",
     "doneTitle": "インポート完了",
     "doneImported": "インポート",
+    "doneRestored": "復元済み",
     "doneUpdated": "更新済み",
     "doneSkipped": "スキップ",
     "doneCreatedFolders": "作成フォルダー",
@@ -2067,6 +2131,49 @@
         },
         "showPet": "ペットを表示"
       },
+      "mcp": {
+        "title": "codeg-mcp サービス",
+        "state": {
+          "running": "実行中",
+          "stopped": "停止中",
+          "disabled": "ツール無効",
+          "unavailable": "コンパニオン未検出",
+          "unknown": "不明"
+        },
+        "hint": {
+          "running": "ここから起動したエージェントは codeg のツールを使えます。",
+          "stopped": "Broker ソケットが応答していません。",
+          "disabled": "すべてのツールグループが無効です。",
+          "unavailable": "codeg-mcp の実行ファイルが見つかりません。",
+          "unknown": "状態を読み取れませんでした。"
+        },
+        "socketPath": "アドレス",
+        "binary": "コンパニオン",
+        "binaryMissing": "見つかりません",
+        "sessions": "セッション",
+        "activeDelegations": "委任",
+        "depthLimit": "深さ上限",
+        "tools": "ツール",
+        "groupDelegation": "委任",
+        "descDelegation": "タスクを別のエージェントに任せます。",
+        "groupFeedback": "ライブフィードバック",
+        "descFeedback": "実行を止めずに補足を送れます。",
+        "groupAsk": "ユーザーに質問",
+        "descAsk": "判断に迷ったら質問させます。",
+        "groupSessions": "セッション参照",
+        "descSessions": "過去のセッションと結果を調べます。",
+        "groupAutomations": "自動化を作成",
+        "descAutomations": "定期自動化を作成・管理します。",
+        "groupTaskboard": "タスクを作成",
+        "descTaskboard": "作業タスクを作成・管理します。",
+        "start": "サービスを起動",
+        "starting": "起動中…",
+        "actionFailed": "操作に失敗しました: {message}",
+        "lastError": "前回のエラー: {message}",
+        "loadFailed": "状態を取得できませんでした: {message}",
+        "openSettings": "詳細設定を開く",
+        "refresh": "更新"
+      },
       "sessionModel": {
         "tooltipModel": "モデル: {model}",
         "tooltipThinking": "思考レベル: {thinking}",
@@ -2146,6 +2253,25 @@
       "closeAll": "すべて閉じる",
       "hideTerminal": "ターミナルを隠す ({shortcut})",
       "openFolderFirst": "先にフォルダを開いてください",
+      "keybar": {
+        "label": "仮想ターミナルキー",
+        "show": "仮想キーを表示",
+        "hide": "仮想キーを隠す",
+        "esc": "ESC",
+        "tab": "TAB",
+        "ctrl": "CTRL",
+        "alt": "ALT",
+        "slash": "/",
+        "dash": "-",
+        "home": "HOME",
+        "end": "END",
+        "pgup": "PGUP",
+        "pgdn": "PGDN",
+        "up": "↑",
+        "down": "↓",
+        "left": "←",
+        "right": "→"
+      },
       "confirmCloseTitle": "ターミナルが実行中です",
       "confirmCloseRunning": "「{title}」ではプロセスがまだ実行中です。閉じてプロセスを終了しますか？",
       "confirmCloseRunningCount": "{count, plural, other {# 個のターミナルでプロセスが実行中です。すべて閉じて終了しますか？}}",
@@ -2258,6 +2384,17 @@
       "officeWatchRetry": "再試行",
       "officeServerInstallHint": "OfficeCLI はサーバーホストにインストールする必要があります。サーバーで次のコマンドを実行してから再試行してください：",
       "officeRemoteDesktopUnsupported": "リモートデスクトップウィンドウではライブプレビューを利用できません。Office ファイルをプレビューするには、サーバーの Web UI でこのワークスペースを開いてください。"
+    },
+    "fileViewer": {
+      "title": "ファイルプレビュー",
+      "description": "この会話で参照されたファイルを横に開きます。",
+      "openInWorkspace": "ワークスペースで開く",
+      "back": "戻る",
+      "preview": "プレビュー",
+      "source": "ソース",
+      "loading": "読み込み中...",
+      "cannotResolve": "このファイルパスを解決できません。",
+      "tooLargeToPreview": "このファイルは大きすぎてここではプレビューできません。ワークスペースで開いてください。"
     },
     "branchDropdown": {
       "toasts": {
@@ -2662,6 +2799,7 @@
       "openInTerminal": "ターミナル",
       "openInCode": "VS Code",
       "linkedFolder": "リンク済みフォルダー",
+      "moreActions": "その他のアクション",
       "copyPath": "パスをコピー",
       "upload": "ファイル/フォルダをアップロード",
       "download": "ファイルをダウンロード",
@@ -2877,6 +3015,7 @@
           "turnFailedMaxTokens": "{agent} がこのターンの最大トークン数に達しました。",
           "turnFailedMaxTurnRequests": "{agent} がこのターンで許可された最大リクエスト数に達しました。",
           "turnFailedUnknown": "{agent} が不明な停止理由でターンを終了しました。",
+          "turnFailedAuthRequired": "{agent} はこのターンを実行する前に再度のサインインを必要としています。設定からサインインしてから、メッセージを送り直してください。",
           "grokModelSwitchIncompatibleAgent": "{agent} は既存の会話ではこのモデルに切り替えられません。新しいセッションを開始して使用してください。",
           "turnFailedEmpty": "{agent} は応答を生成せずにターンを終了しました。",
           "turnFailedEmptyProtocol": "{agent} の出力を codeg が解析できませんでした。エージェントのバージョンがプロトコルと一致していない可能性があります。",
@@ -2897,6 +3036,8 @@
         "eventErrorTitle": "エージェントエラー",
         "notificationTurnComplete": "{agent} の応答が完了しました",
         "notificationError": "{agent} エラー：{message}",
+        "notificationQuestion": "{agent} が回答を待っています",
+        "notificationErrorRedacted": "{agent} でエラーが発生しました",
         "claudeApiRetry": {
           "fallbackError": "authentication_failed",
           "retryingWithMax": "再試行中 {attempt}/{max}",
@@ -2948,6 +3089,8 @@
         "askAnything": "何でも質問してください...",
         "removeAttachmentAria": "{name} を削除",
         "attachFiles": "ファイルを添付",
+        "attachLocalUpload": "ローカルファイルを添付",
+        "attachServerFile": "サーバーファイルを添付",
         "addActions": "追加",
         "quickMessages": "クイックメッセージ",
         "quickMessagesEmpty": "クイックメッセージはありません",
@@ -2956,6 +3099,9 @@
         "cut": "切り取り",
         "copy": "コピー",
         "selectAll": "すべて選択",
+        "openLink": "リンクを開く",
+        "openFile": "ファイルを開く",
+        "sendEmail": "メールを送信",
         "pasteUnavailable": "クリップボードを読み取れませんでした。Ctrl/⌘V で貼り付けてください。",
         "clipboardWriteFailed": "クリップボードに書き込めませんでした。キーボードショートカットをご利用ください。",
         "quickMessageUntitled": "無題",
@@ -2977,8 +3123,10 @@
         "forkAndSend": "フォークして送信",
         "queueMessage": "キューに追加",
         "steerIntoTurn": "現在のターンに挿入",
+        "steerAsNote": "次の確認用にメモを送信",
         "steerQueuedInstead": "代わりにキューに追加しました。次のターンで送信されます。",
         "steerFailed": "現在のターンに挿入できませんでした",
+        "steerNoteFailed": "メモを送信できませんでした",
         "steerAttachmentsUnsupported": "テキストのみ対応です。添付ファイル付きの下書きはキューをご利用ください。",
         "slashCommands": "スラッシュコマンド",
         "slashSearchPlaceholder": "コマンドを検索...",
@@ -2987,8 +3135,6 @@
         "experts": "エキスパート",
         "office": "日常業務",
         "research": "科学研究",
-        "attachLocalUpload": "ローカルファイルを添付",
-        "attachServerFile": "サーバーファイルを添付",
         "attachUploadTooLarge": "{names} は {limit}MB のアップロード上限を超えたためスキップしました。",
         "attachUploadFailed": "{names} のアップロードに失敗しました。",
         "attachUploadNotAFile": "{names} は通常ファイルではなく（ディレクトリまたは特殊ファイル）、スキップされました。",
@@ -3247,9 +3393,12 @@
         "openInFileManager": "ファイルマネージャーで開く",
         "copyRelativePath": "相対パスをコピー",
         "copyAbsolutePath": "絶対パスをコピー",
+        "download": "ファイルをダウンロード",
         "pathCopied": "パスをコピーしました",
         "copyPathFailed": "パスのコピーに失敗しました",
-        "openFailed": "ローカルファイルを開けませんでした"
+        "openFailed": "ローカルファイルを開けませんでした",
+        "downloadSaved": "{name} をダウンロードしました",
+        "downloadFailed": "{name} のダウンロードに失敗しました"
       },
       "messageList": {
         "attachedResources": "添付リソース",
@@ -3267,6 +3416,7 @@
         "copyMessage": "コピー",
         "forkFromHere": "ここから分岐",
         "forkBusy": "ターンの実行中は分岐できません",
+        "forkNotReady": "この返信からはまだ分岐できません。少し待ってからお試しください",
         "copied": "コピー済み",
         "selectionActions": "選択範囲の操作",
         "selectionCopy": "テキストをコピー",
@@ -3382,6 +3532,7 @@
             "child_max_tokens": "サブエージェント: トークン上限",
             "child_max_turn_requests": "サブエージェント: 要求上限",
             "child_empty": "サブエージェント応答なし",
+            "child_auth_required": "サブエージェント要サインイン",
             "child_unknown": "サブエージェント: エラー",
             "unknown": "不明なタスク",
             "delegation_correlation_missing": "相関欠落",
@@ -3474,7 +3625,10 @@
         "agentSessionLoading": "サブエージェントの記録を読み込んでいます…",
         "agentSessionEmpty": "サブエージェントはまだ何も書き込んでいません。",
         "agentFallbackTitle": "サブエージェント起動中…",
-        "agentCodexLaunchOnly": "起動しました。Codex はこのサブエージェントの進捗をこれ以上通知しません。結果はこの会話のメッセージとして届きます。",
+        "agentCodexLaunchOnly": "起動しました。Codex はこのサブエージェントの結末をまだ報告していません。セッションを開くと作業を追えます。",
+        "agentSubagentDone": "完了",
+        "agentSubagentInterrupted": "中断",
+        "agentSubagentUnknown": "結果不明",
         "agentStatsBash": "コマンド",
         "agentStatsRead": "ファイル読取",
         "agentStatsSearch": "検索",
@@ -3828,13 +3982,16 @@
         "opSpawn": "サブエージェントを起動中",
         "opWait": "サブエージェントの結果を取得中",
         "opClose": "サブエージェントを終了中",
-        "opResume": "サブエージェントを再開中"
+        "opResume": "サブエージェントを再開中",
+        "opList": "サブエージェント一覧"
       },
       "contextCompaction": {
         "compacting": "コンテキストを圧縮しています…",
         "compacted": "コンテキストを圧縮しました",
         "compactedTokens": "コンテキストを圧縮 · {before} → {after} トークン",
-        "failed": "コンテキストの圧縮に失敗しました"
+        "failed": "コンテキストの圧縮に失敗しました",
+        "triggerManual": "手動で実行",
+        "triggerAutomatic": "自動で実行"
       },
       "sessionFailure": {
         "category": {
@@ -3858,6 +4015,8 @@
       },
       "backgroundTasks": {
         "settledFallback": "バックグラウンドタスクが終了しました（{status}）",
+        "notifySettledOne": "{agent}：バックグラウンドタスクが完了しました",
+        "notifySettledMany": "{agent}：{count} 件のバックグラウンドタスクが完了しました",
         "cardRunning": "バックグラウンドで実行中",
         "cardLaunchedPending": "バックグラウンドタスクを開始しました",
         "cardCompleted": "バックグラウンドタスクが完了しました",
@@ -3952,6 +4111,33 @@
         "dependencies": "依存関係",
         "dependenciesToggle": "依存関係（{count}）",
         "moreCurrentNodes": "+{count}",
+        "completionResolved": "解決済み",
+        "completionNeedsDecision": "判断が必要",
+        "completionBlocked": "ブロック済み",
+        "completionEvidenceValidated": "証拠を検証済み",
+        "completionReportFile": "レポート: {file}",
+        "completionRetryArtifact": "成果物を再試行",
+        "completionStale": "この判断は古くなりました。ワークフローを再読み込みしてください。",
+        "completionConflict": "別の結果がすでに確定されています。",
+        "completionLegacyReadOnly": "旧形式のワークフローは読み取り専用です",
+        "completionLegacySource": "旧形式の元ワークフロー #{conversation}",
+        "completionLegacySuccessor": "後続ワークフロー #{conversation}",
+        "completionAutomaticWake": "ルートオーケストレーションは自動的に再開されました",
+        "completionOutcome": {
+          "approve": "承認",
+          "approve_with_minors": "軽微な修正付きで承認",
+          "request_changes": "変更を要求",
+          "block": "ブロック",
+          "done": "完了",
+          "done_with_concerns": "懸念ありで完了",
+          "blocked": "ブロック済み"
+        },
+        "completionSource": {
+          "complete_work": "完了ツール",
+          "assistant_conclusion": "アシスタントの結論",
+          "report": "検証済みレポート",
+          "user_adjudication": "ユーザー判断"
+        },
         "phase": {
           "design": "設計",
           "plan": "計画",
@@ -3989,34 +4175,7 @@
           "waiting_review": "レビュー待ち",
           "waiting_adjudication": "裁定待ち",
           "superseded": "置換済み"
-        },
-        "completionResolved": "解決済み",
-        "completionNeedsDecision": "判断が必要",
-        "completionBlocked": "ブロック済み",
-        "completionEvidenceValidated": "証拠を検証済み",
-        "completionRetryArtifact": "成果物を再試行",
-        "completionStale": "この判断は古くなりました。ワークフローを再読み込みしてください。",
-        "completionConflict": "別の結果がすでに確定されています。",
-        "completionLegacyReadOnly": "旧形式のワークフローは読み取り専用です",
-        "completionLegacySource": "旧形式の元ワークフロー #{conversation}",
-        "completionLegacySuccessor": "後続ワークフロー #{conversation}",
-        "completionAutomaticWake": "ルートオーケストレーションは自動的に再開されました",
-        "completionOutcome": {
-          "approve": "承認",
-          "approve_with_minors": "軽微な修正付きで承認",
-          "request_changes": "変更を要求",
-          "block": "ブロック",
-          "done": "完了",
-          "done_with_concerns": "懸念ありで完了",
-          "blocked": "ブロック済み"
-        },
-        "completionSource": {
-          "complete_work": "完了ツール",
-          "assistant_conclusion": "アシスタントの結論",
-          "report": "検証済みレポート",
-          "user_adjudication": "ユーザー判断"
-        },
-        "completionReportFile": "レポート: {file}"
+        }
       },
       "delegationRoute": {
         "menuLabel": "委任ルート",
@@ -4065,6 +4224,16 @@
       "viewMode": {
         "split": "左右分割ビューに切り替え",
         "unified": "インラインビューに切り替え"
+      },
+      "binaryFile": "バイナリファイル — 内容は表示されません",
+      "image": {
+        "sideBySide": "左右分割ビューに切り替え",
+        "swipe": "スワイプ比較ビューに切り替え",
+        "swipeHandle": "画像比較スライダー",
+        "noImage": "このリビジョンに画像はありません",
+        "unavailable": "この側を読み込めませんでした",
+        "tooLarge": "画像が大きすぎてプレビューできません（{size}）",
+        "loading": "画像を読み込み中..."
       }
     },
     "conversationContextBar": {
@@ -4224,6 +4393,18 @@
     "emptyDirectory": "このディレクトリは空です",
     "errorLoadingDir": "ディレクトリの読み込みに失敗しました",
     "permissionDenied": "アクセス権がありません"
+  },
+  "ServerFileBrowser": {
+    "title": "サーバーファイルを選択",
+    "pathPlaceholder": "ディレクトリパスを入力...",
+    "goHome": "ホームディレクトリへ",
+    "navigateUp": "上の階層へ",
+    "select": "選択",
+    "cancel": "キャンセル",
+    "loading": "読み込み中...",
+    "emptyDirectory": "このディレクトリは空です",
+    "errorLoadingDir": "ディレクトリの読み込みに失敗しました",
+    "selectedCount": "{count} 件選択中"
   },
   "ChatChannelSettings": {
     "loading": "読み込み中...",
@@ -4812,18 +4993,6 @@
     "connectionLoadFailed": "Failed to load remote connection: {message}",
     "connectionExpired": "Remote connection \"{name}\" is expired. Update its token and reload this window."
   },
-  "ServerFileBrowser": {
-    "title": "サーバーファイルを選択",
-    "pathPlaceholder": "ディレクトリパスを入力...",
-    "goHome": "ホームディレクトリへ",
-    "navigateUp": "上の階層へ",
-    "select": "選択",
-    "cancel": "キャンセル",
-    "loading": "読み込み中...",
-    "emptyDirectory": "このディレクトリは空です",
-    "errorLoadingDir": "ディレクトリの読み込みに失敗しました",
-    "selectedCount": "{count} 件選択中"
-  },
   "BackupSettings": {
     "title": "バックアップと復元",
     "description": "codeg データのポータブルなバックアップを書き出すか、バックアップから復元します。",
@@ -4843,7 +5012,15 @@
       "button": "バックアップを書き出す",
       "inProgress": "バックアップを作成中…",
       "success": "バックアップを作成しました。",
-      "started": "バックアップのダウンロードを開始しました。"
+      "started": "バックアップのダウンロードを開始しました。",
+      "degradedTitle": "一部のエージェントのセッションデータベースは特別な処理が必要でした",
+      "degradedHint": "これらのエージェントはセッションを SQLite に保存します。下記に別段の記載がない限り、バックアップには含まれています。",
+      "degradedMore": "…ほか {count} 件。",
+      "degradedLevel": {
+        "recoveredOnCopy": "専用のコピー上で復旧済み — 完全です",
+        "bareFileOnly": "先行書き込みログなしで保存 — 最新のメッセージが欠けている可能性があります",
+        "notArchived": "バックアップに含まれていません — コピー中に変化し続けたため"
+      }
     },
     "restore": {
       "selectFile": "バックアップファイルを選択",
@@ -4881,11 +5058,37 @@
         "scanning": "競合を確認中…",
         "noConflicts": "既存のファイルは上書きされません。",
         "conflictCount": "既存のファイル {count} 件が影響を受けます。",
-        "conflictSkipNote": "上書きを有効にしない限り、既存ファイルは保持（スキップ）されます。"
+        "conflictSkipNote": "上書きを有効にしない限り、既存ファイルは保持（スキップ）されます。",
+        "agentsRunning": "{count} 個のエージェントが実行中です（{agents}）。先に終了してください。そうしないと、記録は元の場所に書き戻されず別フォルダーに保存されます。"
       },
-      "restartFailed": "復元は準備できましたが、サーバーを再起動できませんでした。手動で再起動して復元を適用してください。"
+      "restartFailed": "復元は準備できましたが、サーバーを再起動できませんでした。手動で再起動して復元を適用してください。",
+      "discardPending": "保留中の復元を破棄",
+      "discarded": "保留中の復元を破棄しました。",
+      "pendingBlockedHint": "再起動を待っている復元がすでにあります。別のものを準備するには、これを破棄してください。",
+      "result": {
+        "title": "復元を準備しました",
+        "needsRestart": "次回の起動時に適用されます。現在のデータは先にスナップショットが取られます。",
+        "downgraded": "{agents} が実行中だったため、会話の記録は元の場所に書き戻されず {path} に保存されました。",
+        "skipped": "既存のファイル {count} 件をそのまま残しました",
+        "refused": "{count} 件のセッションデータベースは書き戻されませんでした",
+        "refusedHint": "古いバックアップのもので、データベースと先行書き込みログが別々に保存されており、両者が対応することを証明できません。既存のデータベースは変更していません — 別フォルダーへの復元を選べば元のファイルを取得できます。",
+        "restartNow": "今すぐ再起動",
+        "later": "あとで"
+      }
     },
-    "remoteUnsupported": "バックアップと復元は codeg を実行しているマシンのデータを対象とします。現在リモートワークスペースに接続中です。そのサーバー上で直接バックアップを管理してください。"
+    "remoteUnsupported": "バックアップと復元は codeg を実行しているマシンのデータを対象とします。現在リモートワークスペースに接続中です。そのサーバー上で直接バックアップを管理してください。",
+    "progress": {
+      "cancel": "キャンセル"
+    },
+    "snapshots": {
+      "title": "復元前のスナップショット",
+      "hint": "復元のたびに現在のデータのスナップショットを取り、新しい 2 件を保持します。",
+      "empty": "スナップショットはまだありません。",
+      "rollback": "これに戻す",
+      "unsupported": "閲覧のみ",
+      "rollbackConfirmTitle": "このスナップショットに戻しますか？",
+      "rollbackConfirmBody": "現在のデータをこのスナップショットで置き換えて再起動します。置き換えられるデータは先にスナップショットが取られます。"
+    }
   },
   "backup": {
     "restore": {
@@ -4947,6 +5150,45 @@
     "saved": "ツール設定を保存しました",
     "saveFailed": "ツール設定の保存に失敗しました",
     "loadFailed": "読み込みに失敗しました: {detail}"
+  },
+  "DesktopNotificationSettings": {
+    "title": "デスクトップ通知",
+    "description": "エージェントが応答を待っているときに OS 通知を表示します。設定はデバイスごとで、別のブラウザやマシンとは独立しています。",
+    "permissionTitle": "通知の許可",
+    "permissionGranted": "許可済み",
+    "permissionDenied": "ブロック中",
+    "permissionDefault": "未リクエスト",
+    "permissionUnsupported": "利用できません",
+    "permissionManagedByOs": "システムが管理",
+    "permissionGrantedHint": "このブラウザは Codeg の通知を表示します。",
+    "permissionDeniedHint": "このブラウザは Codeg の通知をブロックしています。解除できるのはブラウザのサイト設定だけで、ページから再度要求することはできません。",
+    "permissionDefaultHint": "このブラウザにはまだ確認していません。許可するまで通知は届きません。",
+    "permissionUnsupportedHint": "通知にはセキュアコンテキストが必要です。HTTPS または localhost 経由でアクセスしてください。",
+    "permissionManagedByOsHint": "デスクトップ版はシステムの通知センター経由で送信しますが、Codeg が許可されているかを OS は返しません。テスト送信で確かめてください。",
+    "identityTitle": "配信元アプリ",
+    "identityHint": "システムはこれらの通知をこのアプリのものとして扱います。実際に効くのはそのアプリ自身の通知スイッチです。",
+    "identityDegradedHint": "Codeg 自身の識別子を取得できなかったため、システムは {bundleId} として配信し、そのアプリの通知スイッチが適用されます。Codeg をアプリケーションフォルダにインストールすると元に戻ります。",
+    "requestPermission": "通知を許可",
+    "permissionGrantedToast": "通知を許可しました。",
+    "permissionDeniedToast": "通知がブロックされました。ブラウザのサイト設定から再度有効にしてください。",
+    "openSystemSettings": "システム設定を開く",
+    "openSystemSettingsFailed": "システムの通知設定を開けませんでした。",
+    "sendTest": "テスト送信",
+    "testTitle": "Codeg",
+    "testBody": "デスクトップ通知は正常に動作しています。",
+    "testSent": "テスト通知を送信しました。",
+    "testFailed": "テスト通知を送信できませんでした。",
+    "whenTitle": "通知するタイミング",
+    "whenHint": "サブモニターのウィンドウは見えていてもフォーカスされていません。通知が届かない場合は「ウィンドウが未フォーカスのとき」を選んでください。",
+    "whenAlways": "常に",
+    "whenUnfocused": "ウィンドウが未フォーカスのとき",
+    "whenHidden": "ウィンドウが見えていないとき",
+    "hideBody": "通知の本文を隠す",
+    "hideBodyHint": "エージェントの出力の代わりに汎用の一文を表示します。通知センターは内容をアプリの外に保持し、会話を閉じても残ります。どのウィンドウに戻ればよいか分かるよう、タイトルにはフォルダー名が残ります。",
+    "eventsTitle": "イベント",
+    "eventsHint": "邪魔してほしくないイベントをオフにします。数秒以内の同じイベントは 1 つにまとめられます。",
+    "eventBackgroundTask": "バックグラウンドタスク",
+    "eventWorkTask": "ワークタスク"
   },
   "NotificationSoundSettings": {
     "title": "通知音",
@@ -5259,6 +5501,8 @@
     "errorView": "表示",
     "notifyReview": "レビュー待ち: {title}",
     "notifyFailed": "タスクが失敗しました: {title}",
+    "notifyReviewRedacted": "レビュー待ちのタスクがあります",
+    "notifyFailedRedacted": "タスクが失敗しました",
     "createFromMessage": "このメッセージからタスクを作成",
     "detailTokens": "合計トークン",
     "editorTitleNew": "新規タスク",
@@ -5273,6 +5517,7 @@
     "phaseRetry": "再実行",
     "phaseReturn": "追加指示",
     "phaseMerge": "マージ",
+    "phaseCompact": "コンテキスト圧縮",
     "titleLabel": "タイトル",
     "titlePlaceholder": "何をしますか？",
     "promptLabel": "タスクの説明",
@@ -5303,6 +5548,7 @@
     "mergeDeleteWorktree": "マージ後に worktree を削除",
     "mergeSubmit": "マージ",
     "mergeSubmitQueue": "マージ待ちに追加",
+    "mergeSubmitting": "開始中…",
     "mergeQueuedToast": "マージ待ちに追加しました。実行中のマージが終わり次第開始します。",
     "completeTitle": "タスクを完了",
     "completeDescription": "このタスクはファイルを変更していないため、マージするものはありません。そのまま完了にします。",
@@ -5324,6 +5570,7 @@
     "settingsMaxConcurrentHint": "0 = 無制限",
     "settingsAutoCompact": "自動コンパクトのしきい値",
     "settingsAutoCompactHint": "フォローアップ・再試行・マージの前に、コンテキストウィンドウの使用率がこの値以上ならセッションを圧縮してから送信します。0 で無効。",
+    "compactingNote": "セッションのコンテキストを圧縮中…",
     "settingsCompactCommand": "コンパクトコマンド",
     "settingsCompactCommandHint": "空欄ならエージェントが提供するコマンド（または既知の既定値）を自動で使います。",
     "settingsCompactCommandPlaceholder": "/compact",
@@ -5568,6 +5815,47 @@
     "fieldDescription": "説明",
     "baseInstructions": "システムプロンプト（base_instructions）"
   },
+  "DeepSeekModelEditor": {
+    "title": "モデル一覧",
+    "description": "DeepSeek セッションで切り替えられるモデルです。harness の設定ドキュメントに保存され、エージェントは起動時に読み込みます——保存後に開始されたセッションから反映されます。",
+    "inheritedBadge": "エージェント既定",
+    "inheritedHint": "まだ一覧が保存されていないため、これはエージェント内蔵のモデルです。保存すると固定され、以降のエージェント更新でも自動では変わりません。ファイル：",
+    "storedHint": "harness の設定ドキュメントに保存されています。この一覧の外にあるキーと、その周りのコメントはそのまま残ります。ファイル：",
+    "unreadable": "この設定ドキュメントは、既存の内容を失わずにここから編集することができません。手動で編集してください。",
+    "invalidStored": "保存されているこの一覧はエージェントに拒否されています。直すまでセッションは内蔵モデルで動きます：",
+    "loading": "設定ドキュメントを読み込み中…",
+    "loadFailed": "設定ドキュメントを読み込めませんでした。",
+    "empty": "モデルがありません。追加するか、そのまま保存してエージェント内蔵の一覧に戻してください。",
+    "addModel": "モデルを追加",
+    "remove": "モデルを削除",
+    "advanced": "詳細",
+    "save": "モデル一覧を保存",
+    "saving": "保存中…",
+    "restoreDefaults": "エージェント既定を使う",
+    "fieldId": "モデル id",
+    "fieldName": "表示名",
+    "fieldContextWindow": "コンテキストウィンドウ",
+    "fieldDescription": "説明",
+    "fieldMaxTokens": "最大出力トークン",
+    "fieldAcceptsImages": "画像を受け付ける",
+    "fieldImagePixelBudget": "画像ピクセル上限",
+    "imageBudgetPixels": "ピクセル数",
+    "imageBudgetLow": "低精細（512×512）",
+    "fieldImageMaxBytes": "画像バイト上限",
+    "placeholderId": "deepseek-flash",
+    "placeholderName": "選択時に表示される名前",
+    "placeholderInherit": "エージェント既定",
+    "errorMissingId": "すべてのモデルに id が必要です。",
+    "errorDuplicateId": "「{id}」という id のモデルが 2 つあります。",
+    "errorBadContextWindow": "「{id}」のコンテキストウィンドウは 0 より大きい整数にしてください。",
+    "errorBadMaxTokens": "「{id}」の最大出力トークンは 0 より大きい整数にしてください。",
+    "errorBadImageLimit": "「{id}」の画像上限は 0 より大きい整数にしてください。",
+    "warnSingleModel": "モデルが 1 つだけの場合、エージェントはモデル選択そのものを表示しなくなります。",
+    "warnLaunchModelMissing": "新しいセッションは「{model}」で開始されますが、この一覧にありません。追加するか、上の環境変数で {variable} を設定してください。",
+    "toastSaved": "モデル一覧を保存しました",
+    "toastRestored": "エージェント内蔵のモデル一覧を使用します",
+    "toastSaveFailed": "モデル一覧を保存できませんでした"
+  },
   "DiagnosticsSettings": {
     "title": "環境診断",
     "description": "このアプリが自身のプロセス内でエージェントの CLI をどう解決するかを確認します（ターミナルとは異なる場合があります）。",
@@ -5735,7 +6023,7 @@
     "noRemote": "このフォルダには認識できるリモート（origin）がありません",
     "errors": {
       "noAccount": "{host} の {provider} アカウントが設定されていません。「設定 → バージョン管理」で追加するとこのリポジトリを読み込めます。",
-      "unsupportedHost": "リポジトリパネルは GitHub と GitLab にのみ対応しており、{host} はそのどちらとしても認識できません。自己ホスト型の GitHub Enterprise または GitLab インスタンスであれば、「設定 → バージョン管理」でアカウントを追加してください。",
+      "unsupportedHost": "リポジトリパネルは GitHub、GitLab、Gitea にのみ対応しており、{host} はそのいずれとしても認識できません。自己ホスト型の GitHub Enterprise、GitLab、Gitea、Forgejo インスタンスであれば、「設定 → バージョン管理」でアカウントを追加してください。",
       "wrongForge": "{host} は {provider} でした。別のフォージとして扱われていましたが、判定を修正しました。再読み込みしてください。"
     },
     "addAccount": "アカウントを追加",
@@ -6051,6 +6339,23 @@
     "confirmDeleteCancel": "キャンセル",
     "confirmDeleteConfirm": "削除",
     "canvasActions": "キャンバス操作",
-    "mergeIntoNewRegion": "新しい領域"
+    "mergeIntoNewRegion": "新しい領域",
+    "addFileCard": "ファイルカード",
+    "addTerminalCard": "ターミナルカード",
+    "searchFiles": "ファイルを検索…",
+    "searchFilesIn": "{folder} 内を検索…",
+    "searchingFiles": "検索中…",
+    "noFiles": "ファイルが見つかりません",
+    "noOpenFiles": "開いているファイルはありません — 入力して検索",
+    "browseForFile": "参照…",
+    "filePreview": "プレビュー",
+    "fileSource": "ソース",
+    "reloadFile": "再読み込み",
+    "removeFileCard": "ファイルカードを削除",
+    "restartTerminal": "ターミナルを再起動",
+    "removeTerminalCard": "ターミナルカードを削除",
+    "terminalNoDirectory": "このカードには作業ディレクトリがありません",
+    "confirmDeleteTerminals": "実行中のターミナル {count} 個が閉じられ、そのプロセスも終了します。",
+    "confirmDeleteNotesAndTerminals": "書き込んだメモ {notes} 件が完全に削除され、実行中のターミナル {terminals} 個も終了します。"
   }
 }

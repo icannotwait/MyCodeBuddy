@@ -57,6 +57,7 @@ pub mod route;
 pub mod run_identity;
 pub mod run_store;
 pub mod runtime_stats;
+pub mod service;
 pub mod spawner;
 pub mod store;
 pub mod supervisor;

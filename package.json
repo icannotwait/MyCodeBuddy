@@ -1,7 +1,7 @@
 {
   "name": "codeg",
   "private": true,
-  "version": "0.30.2-mycodebuddy.1",
+  "version": "0.30.7-mycodebuddy.1",
   "license": "Apache-2.0",
   "repository": {
     "type": "git",
@@ -111,6 +111,7 @@
     "@testing-library/jest-dom": "^6.6.3",
     "@testing-library/react": "^16.1.0",
     "@testing-library/user-event": "^14.5.2",
+    "@types/mdast": "^4.0.4",
     "@types/node": "25.2.2",
     "@types/react": "^19.1.8",
     "@types/react-dom": "^19.1.6",
