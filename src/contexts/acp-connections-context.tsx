@@ -2570,7 +2570,12 @@ function reduceSingleAction(
         return next
       }
 
-      const hydratedLiveMessage = action.patch.liveMessage
+      const hydratedLiveMessage = retainInFlightLiveMessageIdentity(
+        current.liveMessage,
+        current.status,
+        action.patch.liveMessage,
+        action.patch.status
+      )
       const hydratedPendingPermission = mergePendingPermissionWithLiveMessage(
         action.patch.pendingPermission,
         hydratedLiveMessage ?? current.liveMessage
@@ -5200,6 +5205,136 @@ function resolveKnownConnectionSessionId(
   )
 }
 
+function liveBlockCompatible(
+  left: LiveContentBlock,
+  right: LiveContentBlock
+): boolean {
+  if (left.type !== right.type) return false
+  switch (left.type) {
+    case "text":
+    case "thinking":
+      return (
+        right.type === left.type &&
+        (right.text.startsWith(left.text) || left.text.startsWith(right.text))
+      )
+    case "plan":
+      return true
+    case "tool_call":
+      return (
+        right.type === "tool_call" &&
+        left.info.tool_call_id === right.info.tool_call_id
+      )
+  }
+}
+
+/**
+ * Frontend `STATUS_CHANGED(prompting)` mints `acp:{connectionId}:{seq}`.
+ * Backend `ensure_live_message` mints `live-{uuid}`. A mid-turn snapshot
+ * hydrate (sequence-gap recovery, reconnect, canvas re-entry) used to
+ * replace the client id wholesale, so `runtime.liveMessage.id ===
+ * snapshot.liveMessage.id` failed and `admitTurnComplete` dropped end_turn.
+ * Treat a rebase of the same in-flight content as the same turn.
+ */
+function liveMessageOwnsSameTurn(
+  runtimeLive: LiveMessage | null | undefined,
+  snapshotLive: LiveMessage
+): boolean {
+  if (runtimeLive == null) return false
+  if (runtimeLive.id === snapshotLive.id) return true
+  const [shorter, longer] =
+    runtimeLive.content.length <= snapshotLive.content.length
+      ? [runtimeLive, snapshotLive]
+      : [snapshotLive, runtimeLive]
+  for (let index = 0; index < shorter.content.length; index += 1) {
+    const left = shorter.content[index]
+    const right = longer.content[index]
+    if (left == null || right == null || !liveBlockCompatible(left, right)) {
+      return false
+    }
+  }
+  return true
+}
+
+function adoptLiveMessageIdentity(
+  identity: LiveMessage,
+  content: LiveMessage
+): LiveMessage {
+  if (identity.id === content.id && identity.startedAt === content.startedAt) {
+    return content
+  }
+  return {
+    ...content,
+    id: identity.id,
+    startedAt: identity.startedAt,
+  }
+}
+
+/** Keep the client-minted in-flight id when a snapshot brings backend `live-`. */
+function retainInFlightLiveMessageIdentity(
+  current: LiveMessage | null,
+  currentStatus: ConnectionState["status"],
+  incoming: LiveMessage | null,
+  incomingStatus: ConnectionState["status"]
+): LiveMessage | null {
+  if (
+    current == null ||
+    incoming == null ||
+    currentStatus !== "prompting" ||
+    incomingStatus !== "prompting" ||
+    current.id === incoming.id
+  ) {
+    return incoming
+  }
+  return adoptLiveMessageIdentity(current, incoming)
+}
+
+function connectionIsIdleWithoutLive(connection: ConnectionState): boolean {
+  return (
+    connection.liveMessage == null &&
+    connection.status !== "prompting" &&
+    connection.status !== "connecting"
+  )
+}
+
+function shouldSettleIdleLiveRuntimes(
+  previous: ConnectionState | undefined,
+  next: ConnectionState | undefined
+): next is ConnectionState {
+  if (!next || !connectionIsIdleWithoutLive(next)) return false
+  if (previous == null) return true
+  return previous.status === "prompting" || previous.status === "connecting"
+}
+
+function mappedRuntimeOwnsConnection(
+  runtime: {
+    externalId: string | null
+    conversationId: number
+    dbConversationId: number | null
+  },
+  connection: ConnectionState,
+  sessionId: string | null
+): boolean {
+  return (
+    (sessionId != null && runtime.externalId === sessionId) ||
+    (connection.conversationId != null &&
+      (runtime.conversationId === connection.conversationId ||
+        runtime.dbConversationId === connection.conversationId))
+  )
+}
+
+function settleIdleLiveRuntimes(connection: ConnectionState): void {
+  if (!connectionIsIdleWithoutLive(connection)) return
+  const sessionId = resolveKnownConnectionSessionId(connection)
+  for (const [
+    runtimeConversationId,
+    runtime,
+  ] of useConversationRuntimeStore.getState().byConversationId) {
+    if (runtime.liveMessage == null) continue
+    if (!mappedRuntimeOwnsConnection(runtime, connection, sessionId)) continue
+    completeLiveTranscriptTurn(runtimeConversationId, runtime.liveMessage)
+  }
+}
+
 function admitTurnComplete(
   snapshot: ConnectionState,
   event: TurnCompleteEnvelope,
@@ -5220,8 +5355,10 @@ function admitTurnComplete(
     runtimeConversationId,
     runtime,
   ] of useConversationRuntimeStore.getState().byConversationId) {
-    const runtimeLiveMatches =
-      runtime.liveMessage?.id === snapshot.liveMessage.id
+    const runtimeLiveMatches = liveMessageOwnsSameTurn(
+      runtime.liveMessage,
+      snapshot.liveMessage
+    )
     const mappedToConnection =
       runtime.externalId === event.session_id ||
       (snapshot.conversationId != null &&
@@ -5296,8 +5433,10 @@ function admitSuspensionCheckpoint(snapshot: ConnectionState): number[] {
     runtimeConversationId,
     runtime,
   ] of useConversationRuntimeStore.getState().byConversationId) {
-    const runtimeLiveMatches =
-      runtime.liveMessage?.id === snapshot.liveMessage.id
+    const runtimeLiveMatches = liveMessageOwnsSameTurn(
+      runtime.liveMessage,
+      snapshot.liveMessage
+    )
     const mappedToConnection =
       (knownSessionId != null && runtime.externalId === knownSessionId) ||
       (snapshot.conversationId != null &&
@@ -6868,7 +7007,10 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
       }
       conn = retainedMatch ?? undefined
     }
-    if (conn?.liveMessage == null) return
+    if (conn?.liveMessage == null) {
+      if (conn) settleIdleLiveRuntimes(conn)
+      return
+    }
 
     const isLive = conn.status === "prompting"
     const runtime =
@@ -6879,7 +7021,7 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
             .byConversationId.get(runtimeConversationId)
     const runtimeOwnsAnotherMessage =
       runtime?.liveMessage != null &&
-      runtime.liveMessage.id !== conn.liveMessage.id
+      !liveMessageOwnsSameTurn(runtime.liveMessage, conn.liveMessage)
     const settledReplayAccepted =
       conn.acceptedCompletionMessageId === conn.liveMessage.id &&
       runtimeConversationId != null &&
@@ -7116,7 +7258,10 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
                     if (!runtime) return false
                     if (
                       finalLiveMessage != null &&
-                      runtime.liveMessage?.id === finalLiveMessage.id
+                      liveMessageOwnsSameTurn(
+                        runtime.liveMessage,
+                        finalLiveMessage
+                      )
                     ) {
                       return true
                     }
@@ -7207,18 +7352,25 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
             const runtime = runtimeState.byConversationId.get(
               runtimeConversationId
             )
-            if (runtime?.liveMessage?.id !== finalLiveMessage.id) continue
+            if (
+              !liveMessageOwnsSameTurn(runtime?.liveMessage, finalLiveMessage)
+            ) {
+              continue
+            }
+            const checkpointSource = runtime.liveMessage
+              ? adoptLiveMessageIdentity(runtime.liveMessage, finalLiveMessage)
+              : finalLiveMessage
             if (
               liveStageAlreadyInRuntime(
                 runtime,
                 runtimeConversationId,
-                finalLiveMessage
+                checkpointSource
               )
             ) {
               for (const key of sinkKeys) {
                 const sinks = liveSinksRef.current.get(key)
                 if (sinks?.runtimeConversationId === runtimeConversationId) {
-                  sinks.transcript?.clear(finalLiveMessage.id)
+                  sinks.transcript?.clear(checkpointSource.id)
                 }
               }
               useConversationRuntimeStore
@@ -7232,7 +7384,7 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
                 checkpointUserTurn
               )
             }
-            completeLiveTranscriptTurn(runtimeConversationId, finalLiveMessage)
+            completeLiveTranscriptTurn(runtimeConversationId, checkpointSource)
           }
         }
 
@@ -7323,7 +7475,7 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
             (turn) => !queuedIds.has(turn.id)
           )
           const ownsCompletedTurn = runtime.liveMessage
-            ? runtime.liveMessage.id === finalLiveMessage.id
+            ? liveMessageOwnsSameTurn(runtime.liveMessage, finalLiveMessage)
             : runtime.syncState === "awaiting_persist" || hasInFlightOptimistic
           if (!ownsCompletedTurn) continue
           completionOwnerRuntimeConversationIds.add(runtimeConversationId)
@@ -7404,7 +7556,10 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
             .byConversationId.get(runtimeConversationId)
           if (!runtime) continue
 
-          completeLiveTranscriptTurn(runtimeConversationId, finalLiveMessage)
+          const completionSource = runtime.liveMessage
+            ? adoptLiveMessageIdentity(runtime.liveMessage, finalLiveMessage)
+            : finalLiveMessage
+          completeLiveTranscriptTurn(runtimeConversationId, completionSource)
           const completedRuntime = useConversationRuntimeStore
             .getState()
             .byConversationId.get(runtimeConversationId)
@@ -7416,6 +7571,16 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
         }
       }
       for (const effect of prepared.afterCommit) effect()
+      for (const step of prepared.connectionSteps) {
+        if (
+          shouldSettleIdleLiveRuntimes(
+            step.previousConnection,
+            step.nextConnection
+          )
+        ) {
+          settleIdleLiveRuntimes(step.nextConnection)
+        }
+      }
       for (const connection of prepared.renderChangedConnections) {
         notifyConnectionKeys(connection.contextKey)
       }
@@ -7464,12 +7629,17 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
 
       const mirrorLiveMessage = (key: string) => {
         const stateKey = observerAliasesRef.current.get(key) ?? key
+        const previousConnection = prev.get(stateKey)
+        const nextConnection = next.get(stateKey)
         mirrorLiveMessageForCanonical(
           stateKey,
-          prev.get(stateKey),
-          next.get(stateKey),
+          previousConnection,
+          nextConnection,
           []
         )
+        if (shouldSettleIdleLiveRuntimes(previousConnection, nextConnection)) {
+          settleIdleLiveRuntimes(nextConnection)
+        }
       }
 
       if (action.type === "REMOVE_ALL") {

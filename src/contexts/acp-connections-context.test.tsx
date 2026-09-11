@@ -7157,6 +7157,122 @@ describe("HYDRATE_FROM_SNAPSHOT last_error recovery", () => {
   })
 })
 
+describe("HYDRATE_FROM_SNAPSHOT live message identity", () => {
+  function promptingConnection(
+    liveMessage: LiveMessage | null
+  ): ConnectionState {
+    return {
+      connectionId: "spawned-conn",
+      contextKey: "k1",
+      agentType: "claude_code",
+      workingDir: "/tmp",
+      status: "prompting",
+      promptCapabilities: {
+        image: false,
+        audio: false,
+        embedded_context: false,
+      },
+      supportsFork: false,
+      selectorsReady: true,
+      sessionId: "sess-1",
+      modes: null,
+      configOptions: null,
+      availableCommands: null,
+      usage: null,
+      liveMessage,
+      pendingPermission: null,
+      pendingUserMessage: null,
+      pendingQuestion: null,
+      pendingAskQuestion: null,
+      pendingPlanApproval: null,
+      claudeApiRetry: null,
+      sessionFailures: [],
+      asyncTasks: [],
+      error: null,
+      loadError: null,
+      loadErrorCode: null,
+      loadErrorCommand: null,
+      lastAppliedSeq: 19,
+      isDelegationChild: false,
+      parentToolUseId: null,
+      parentConnectionId: null,
+      isViewer: false,
+      configStale: false,
+      configStaleKind: null,
+      configStaleDismissed: false,
+      backgroundOutstanding: 0,
+      backgroundSettleSyncingSince: null,
+      outOfTurnToolCalls: null,
+      waitingForSubagents: null,
+      toolWatchdogProjections: {},
+      sharedSession: null,
+      conversationId: 7,
+    }
+  }
+
+  it("keeps the client-minted acp: id when a prompting snapshot brings live-{uuid}", () => {
+    const currentLive: LiveMessage = {
+      id: "acp:68d7d9f2-9f58-457f-b10c-f64f7c53e458:19",
+      role: "assistant",
+      content: [{ type: "text", text: "first content" }],
+      startedAt: 1_700_000_000_000,
+    }
+    const next = __connectionsReducerForTests(
+      new Map([["k1", promptingConnection(currentLive)]]),
+      {
+        type: "HYDRATE_FROM_SNAPSHOT",
+        contextKey: "k1",
+        patch: estimatorSnapshotPatch({
+          connectionId: "spawned-conn",
+          conversationId: 7,
+          status: "prompting",
+          sessionId: "sess-1",
+          eventSeq: 40,
+          liveMessage: {
+            id: "live-1b6f1fef-9df2-4aff-aed3-99839aa2e29a",
+            role: "assistant",
+            content: [{ type: "text", text: "first content and more" }],
+            startedAt: 1_700_000_000_500,
+          },
+        }),
+      }
+    ).get("k1")!
+
+    expect(next.liveMessage?.id).toBe(currentLive.id)
+    expect(next.liveMessage?.startedAt).toBe(currentLive.startedAt)
+    expect(next.liveMessage?.content).toEqual([
+      { type: "text", text: "first content and more" },
+    ])
+  })
+
+  it("adopts a snapshot live id when the client has no in-flight message", () => {
+    const incoming: LiveMessage = {
+      id: "live-1b6f1fef-9df2-4aff-aed3-99839aa2e29a",
+      role: "assistant",
+      content: [{ type: "text", text: "mid-turn attach" }],
+      startedAt: 1_700_000_000_500,
+    }
+    const next = __connectionsReducerForTests(
+      new Map([["k1", promptingConnection(null)]]),
+      {
+        type: "HYDRATE_FROM_SNAPSHOT",
+        contextKey: "k1",
+        patch: estimatorSnapshotPatch({
+          connectionId: "spawned-conn",
+          conversationId: 7,
+          status: "prompting",
+          sessionId: "sess-1",
+          eventSeq: 40,
+          liveMessage: incoming,
+        }),
+      }
+    ).get("k1")!
+
+    expect(next.liveMessage?.id).toBe(incoming.id)
+    expect(next.liveMessage?.content).toEqual(incoming.content)
+  })
+})
+
 // ── Task 7: one store transaction per browser frame ──
 
 function batch(
@@ -8089,6 +8205,303 @@ describe("AcpConnectionsProvider frame transactions (raw order)", () => {
         useConversationRuntimeStore.getState().byConversationId.get(7)
           ?.liveMessage
       ).toBeNull()
+    } finally {
+      resetConversationRuntimeStore()
+    }
+  })
+
+  it("settles end_turn after a mid-turn liveMessage id remap", async () => {
+    const { useConversationRuntimeStore, resetConversationRuntimeStore } =
+      await import("@/stores/conversation-runtime-store")
+    resetConversationRuntimeStore()
+    const runtimeActions = useConversationRuntimeStore.getState().actions
+    // Production 2026-09-11 conversation 7: frontend minted
+    // `acp:{conn}:{seq}` at prompting, then milestones switched to the
+    // backend `live-{uuid}` from ensure_live_message / snapshot hydrate.
+    // admitTurnComplete required exact id equality and dropped end_turn.
+    const virtualConversationId = -1049581191
+    runtimeActions.setExternalId(virtualConversationId, "stale-persisted-sess")
+    runtimeActions.setDbConversationId(virtualConversationId, 7)
+    runtimeActions.appendOptimisticTurn(
+      virtualConversationId,
+      {
+        id: "user-remap",
+        role: "user",
+        blocks: [{ type: "text", text: "cursor remap turn" }],
+        timestamp: "2026-09-11T05:27:00.000Z",
+      },
+      "user-remap"
+    )
+    runtimeActions.setExternalId(7, "sess-1")
+
+    try {
+      await mountDesktopOwner("owner-conn", TAB, "sess-1", 7)
+      h.actions!.registerLiveSinks(TAB, {
+        runtimeConversationId: virtualConversationId,
+        canonical: (message, isLive) => {
+          runtimeActions.setLiveMessage(virtualConversationId, message, isLive)
+          return (
+            useConversationRuntimeStore
+              .getState()
+              .byConversationId.get(virtualConversationId)?.liveMessage ===
+            message
+          )
+        },
+      })
+
+      act(() => {
+        h.emitDesktopBatch(
+          batch(1, [
+            {
+              connection_id: "owner-conn",
+              seq: 1,
+              type: "session_started",
+              session_id: "sess-1",
+            },
+            {
+              connection_id: "owner-conn",
+              seq: 2,
+              type: "status_changed",
+              status: "prompting",
+            },
+            content("owner-conn", 3, "first content"),
+          ])
+        )
+        h.runAnimationFrame()
+      })
+
+      const streamed = useConversationRuntimeStore
+        .getState()
+        .byConversationId.get(virtualConversationId)?.liveMessage
+      expect(streamed?.id).toMatch(/^acp:owner-conn:/)
+      expect(h.store!.getConnection(TAB)?.liveMessage?.id).toBe(streamed?.id)
+
+      // Runtime keeps the client-minted id; connection already shows the
+      // backend `live-` id (snapshot hydrate / canvas re-entry rebase).
+      act(() => {
+        runtimeActions.setLiveMessage(
+          virtualConversationId,
+          {
+            ...streamed!,
+            id: "acp:68d7d9f2-9f58-457f-b10c-f64f7c53e458:19",
+          },
+          true
+        )
+      })
+
+      act(() => {
+        h.emitDesktopBatch(
+          batch(2, [
+            {
+              connection_id: "owner-conn",
+              seq: 4,
+              type: "turn_complete",
+              session_id: "sess-1",
+              stop_reason: "end_turn",
+              mark_awaiting_reply: true,
+            },
+          ])
+        )
+        h.runAnimationFrame()
+      })
+
+      expect(h.store!.getConnection(TAB)?.status).toBe("connected")
+      const virtual = useConversationRuntimeStore
+        .getState()
+        .byConversationId.get(virtualConversationId)
+      expect(virtual?.liveMessage).toBeNull()
+      expect(virtual?.syncState).toBe("idle")
+      expect(
+        virtual?.localTurns.map((turn) => ({
+          role: turn.role,
+          blocks: turn.blocks,
+        }))
+      ).toEqual([
+        {
+          role: "user",
+          blocks: [{ type: "text", text: "cursor remap turn" }],
+        },
+        {
+          role: "assistant",
+          blocks: [{ type: "text", text: "first content" }],
+        },
+      ])
+    } finally {
+      resetConversationRuntimeStore()
+    }
+  })
+
+  it("settles a remapped live turn when reconnect flips Prompting to connected", async () => {
+    const { useConversationRuntimeStore, resetConversationRuntimeStore } =
+      await import("@/stores/conversation-runtime-store")
+    resetConversationRuntimeStore()
+    const runtimeActions = useConversationRuntimeStore.getState().actions
+    const virtualConversationId = -1049581191
+    runtimeActions.setExternalId(virtualConversationId, "stale-persisted-sess")
+    runtimeActions.setDbConversationId(virtualConversationId, 7)
+    runtimeActions.appendOptimisticTurn(
+      virtualConversationId,
+      {
+        id: "user-reconnect",
+        role: "user",
+        blocks: [{ type: "text", text: "stuck after reconnect" }],
+        timestamp: "2026-09-11T06:27:00.000Z",
+      },
+      "user-reconnect"
+    )
+    runtimeActions.setExternalId(7, "sess-1")
+
+    try {
+      await mountDesktopOwner("owner-conn", TAB, "sess-1", 7)
+      h.actions!.registerLiveSinks(TAB, {
+        runtimeConversationId: virtualConversationId,
+        canonical: (message, isLive) => {
+          runtimeActions.setLiveMessage(virtualConversationId, message, isLive)
+          return (
+            useConversationRuntimeStore
+              .getState()
+              .byConversationId.get(virtualConversationId)?.liveMessage ===
+            message
+          )
+        },
+      })
+
+      act(() => {
+        h.emitDesktopBatch(
+          batch(1, [
+            {
+              connection_id: "owner-conn",
+              seq: 1,
+              type: "session_started",
+              session_id: "sess-1",
+            },
+            status("owner-conn", 2, "prompting"),
+            content("owner-conn", 3, "partial reply"),
+          ])
+        )
+        h.runAnimationFrame()
+      })
+
+      const streamed = useConversationRuntimeStore
+        .getState()
+        .byConversationId.get(virtualConversationId)?.liveMessage
+      expect(streamed).toBeTruthy()
+      act(() => {
+        runtimeActions.setLiveMessage(
+          virtualConversationId,
+          {
+            ...streamed!,
+            id: "live-1b6f1fef-9df2-4aff-aed3-99839aa2e29a",
+          },
+          true
+        )
+      })
+
+      // session/load drain ends Connected with no turn_complete for the
+      // already-CAS'd end_turn. Same-turn remapped live must still settle.
+      act(() => {
+        h.emitDesktopBatch(batch(2, [status("owner-conn", 4, "connected")]))
+        h.runAnimationFrame()
+      })
+
+      expect(h.store!.getConnection(TAB)?.status).toBe("connected")
+      const virtual = useConversationRuntimeStore
+        .getState()
+        .byConversationId.get(virtualConversationId)
+      expect(virtual?.liveMessage).toBeNull()
+      expect(virtual?.syncState).toBe("idle")
+      expect(
+        virtual?.localTurns.some(
+          (turn) =>
+            turn.role === "assistant" &&
+            turn.blocks.some(
+              (block) => block.type === "text" && block.text === "partial reply"
+            )
+        )
+      ).toBe(true)
+    } finally {
+      resetConversationRuntimeStore()
+    }
+  })
+
+  it("promotes leftover live runtime when a reconnect lands Connected with no liveMessage", async () => {
+    const { useConversationRuntimeStore, resetConversationRuntimeStore } =
+      await import("@/stores/conversation-runtime-store")
+    resetConversationRuntimeStore()
+    const runtimeActions = useConversationRuntimeStore.getState().actions
+    const leftover: LiveMessage = {
+      id: "acp:68d7d9f2-9f58-457f-b10c-f64f7c53e458:19",
+      role: "assistant",
+      content: [{ type: "text", text: "already finished on the backend" }],
+      startedAt: Date.parse("2026-09-11T05:33:51.000Z"),
+    }
+    runtimeActions.setExternalId(42, "sess-1")
+    runtimeActions.appendOptimisticTurn(
+      42,
+      {
+        id: "user-leftover",
+        role: "user",
+        blocks: [{ type: "text", text: "finished before reconnect" }],
+        timestamp: "2026-09-11T05:27:00.000Z",
+      },
+      "user-leftover"
+    )
+    runtimeActions.setLiveMessage(42, leftover, true)
+
+    try {
+      await mountDesktopOwner("owner-conn", TAB, "sess-1", 42)
+      h.actions!.registerLiveSinks(TAB, {
+        runtimeConversationId: 42,
+        canonical: (message, isLive) => {
+          runtimeActions.setLiveMessage(42, message, isLive)
+          return (
+            useConversationRuntimeStore.getState().byConversationId.get(42)
+              ?.liveMessage === message
+          )
+        },
+      })
+      expect(
+        useConversationRuntimeStore.getState().byConversationId.get(42)
+          ?.liveMessage
+      ).toBe(leftover)
+
+      act(() => {
+        h.emitDesktopBatch(
+          batch(1, [
+            {
+              connection_id: "owner-conn",
+              seq: 1,
+              type: "session_started",
+              session_id: "sess-1",
+            },
+            status("owner-conn", 2, "connected"),
+          ])
+        )
+        h.runAnimationFrame()
+      })
+
+      const runtime = useConversationRuntimeStore
+        .getState()
+        .byConversationId.get(42)
+      expect(h.store!.getConnection(TAB)?.status).toBe("connected")
+      expect(h.store!.getConnection(TAB)?.liveMessage).toBeNull()
+      expect(runtime?.liveMessage).toBeNull()
+      expect(runtime?.syncState).toBe("idle")
+      expect(
+        runtime?.localTurns.map((turn) => ({
+          role: turn.role,
+          blocks: turn.blocks,
+        }))
+      ).toEqual([
+        {
+          role: "user",
+          blocks: [{ type: "text", text: "finished before reconnect" }],
+        },
+        {
+          role: "assistant",
+          blocks: [{ type: "text", text: "already finished on the backend" }],
+        },
+      ])
     } finally {
       resetConversationRuntimeStore()
     }
