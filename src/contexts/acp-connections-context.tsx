@@ -5443,7 +5443,12 @@ function admitSuspensionCheckpoint(snapshot: ConnectionState): number[] {
         (runtime.conversationId === snapshot.conversationId ||
           runtime.dbConversationId === snapshot.conversationId))
     if (!mappedToConnection && !runtimeLiveMatches) continue
+    // Same stale-externalId exception as admitTurnComplete: a draft/virtual
+    // runtime can keep a persisted id after conversation://changed while
+    // the live sink still owns this turn. Reconnect Connected must still
+    // checkpoint that owner or the composer stays Prompting.
     if (
+      !runtimeLiveMatches &&
       knownSessionId != null &&
       runtime.externalId != null &&
       runtime.externalId !== knownSessionId
