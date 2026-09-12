@@ -1008,11 +1008,6 @@ earlier terminal context records.\n\
             "recovery must open only the winning api_conversation_history.json"
         );
     }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
 
     /// The whole message Cline writes for one user turn: the wrapper, then the
     /// environment block it appends. Everything here reaches

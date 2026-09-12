@@ -774,7 +774,10 @@ mod tests {
     #[test]
     fn gitea_api_base_is_v1_under_the_instance() {
         let gt = ForgeProvider::Gitea;
-        assert_eq!(api_base_for(gt, "gitea.com", ""), "https://gitea.com/api/v1");
+        assert_eq!(
+            api_base_for(gt, "gitea.com", ""),
+            "https://gitea.com/api/v1"
+        );
         assert_eq!(
             api_base_for(gt, "codeberg.org", "https://codeberg.org/"),
             "https://codeberg.org/api/v1"
@@ -970,8 +973,14 @@ mod tests {
         // claims the same client. `codeberg.org` deliberately does NOT — this
         // is a rule about what a name SAYS, not a list of instances we happen
         // to know about, and the probe identifies that one anyway.
-        assert_eq!(provider_from_host_name("gitea.corp.com"), Some(ForgeProvider::Gitea));
-        assert_eq!(provider_from_host_name("forgejo.example"), Some(ForgeProvider::Gitea));
+        assert_eq!(
+            provider_from_host_name("gitea.corp.com"),
+            Some(ForgeProvider::Gitea)
+        );
+        assert_eq!(
+            provider_from_host_name("forgejo.example"),
+            Some(ForgeProvider::Gitea)
+        );
         assert_eq!(provider_from_host_name("codeberg.org"), None);
         assert_eq!(provider_from_host_name("giteaish.dev"), None);
     }
@@ -1441,7 +1450,10 @@ mod tests {
             get(move || async move {
                 (
                     axum::http::StatusCode::OK,
-                    [(axum::http::header::CONTENT_TYPE, "application/json;charset=utf-8")],
+                    [(
+                        axum::http::header::CONTENT_TYPE,
+                        "application/json;charset=utf-8",
+                    )],
                     body,
                 )
             }),
@@ -1457,7 +1469,10 @@ mod tests {
         let host = "probe-serves-v1.test";
         forget_forge(host);
         let origin = mock_gitea("{\"version\":\"1.23.4\"}").await;
-        assert_eq!(detect_forge(host, &origin).await, Some(ForgeProvider::Gitea));
+        assert_eq!(
+            detect_forge(host, &origin).await,
+            Some(ForgeProvider::Gitea)
+        );
         // The guess this overrode would have been GitHub, and with it /api/v3.
         assert_eq!(guess_provider(host), ForgeProvider::GitHub);
         assert_eq!(recall_forge(host), Some(ForgeProvider::Gitea));

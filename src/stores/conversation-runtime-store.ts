@@ -40,7 +40,6 @@ import type {
   AgentType,
   ContentBlock,
   AgentTranscriptEntry,
-  ContentBlock,
   ConversationTurnsPage,
   DbConversationDetail,
   DelegationActivityView,

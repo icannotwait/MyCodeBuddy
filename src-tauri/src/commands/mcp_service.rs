@@ -136,8 +136,8 @@ pub async fn codeg_mcp_service_status_core(
         None => Default::default(),
     };
 
-    let binary_path = crate::acp::connection::locate_codeg_mcp_binary()
-        .map(|p| p.to_string_lossy().to_string());
+    let binary_path =
+        crate::acp::connection::locate_codeg_mcp_binary().map(|p| p.to_string_lossy().to_string());
 
     let delegation_cfg = sources.broker.config_snapshot().await;
     let authoring_cfg = sources.authoring.snapshot().await;
@@ -663,20 +663,14 @@ mod tests {
             f.tokens
                 .register(
                     token.into(),
-                    TokenEntry {
-                        parent_connection_id: "conn-a".into(),
-                        working_dir: std::path::PathBuf::from("/tmp"),
-                    },
+                    TokenEntry::legacy("conn-a", std::path::PathBuf::from("/tmp")),
                 )
                 .await;
         }
         f.tokens
             .register(
                 "t3".into(),
-                TokenEntry {
-                    parent_connection_id: "conn-b".into(),
-                    working_dir: std::path::PathBuf::from("/tmp"),
-                },
+                TokenEntry::legacy("conn-b", std::path::PathBuf::from("/tmp")),
             )
             .await;
 

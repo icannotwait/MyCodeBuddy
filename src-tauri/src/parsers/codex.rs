@@ -1722,13 +1722,12 @@ fn completed_mcp_call(payload: &serde_json::Value) -> Option<CompletedMcpCall> {
     let stated_is_error = result
         .and_then(|result| result.get("isError"))
         .and_then(serde_json::Value::as_bool);
-    let claimed_failed =
-        stated_is_error == Some(true)
-            || stated_error.is_some()
-            || item
-                .get("status")
-                .and_then(serde_json::Value::as_str)
-                .is_some_and(is_failed_status);
+    let claimed_failed = stated_is_error == Some(true)
+        || stated_error.is_some()
+        || item
+            .get("status")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(is_failed_status);
     let claimed_ok = stated_is_error == Some(false)
         || item.get("status").and_then(serde_json::Value::as_str) == Some("completed");
     Some(CompletedMcpCall {
@@ -3793,10 +3792,7 @@ impl CodexParser {
                                     } else {
                                         continue;
                                     };
-                                    completed_mcp_by_exec
-                                        .entry(exec_id)
-                                        .or_default()
-                                        .push(call);
+                                    completed_mcp_by_exec.entry(exec_id).or_default().push(call);
                                     continue;
                                 }
                                 // Plan mode's finished plan document. This is the
@@ -4099,8 +4095,7 @@ impl CodexParser {
                                     codex_inter_agent_final_answer(payload)
                                 {
                                     if let Some(thread_id) = agent_path_to_thread_id.get(author) {
-                                        agent_fallback_results
-                                            .insert(thread_id.clone(), body);
+                                        agent_fallback_results.insert(thread_id.clone(), body);
                                     }
                                 }
                             }
@@ -4448,9 +4443,7 @@ impl CodexParser {
                                         note: collected.note,
                                     };
                                     let semantic = (parsed.status == ScriptStatus::Completed)
-                                        .then(|| {
-                                            completed_mcp_by_exec.remove(&deferred.call_id)
-                                        })
+                                        .then(|| completed_mcp_by_exec.remove(&deferred.call_id))
                                         .flatten();
                                     let (uses, results) = semantic
                                         .and_then(|calls| {
@@ -4575,12 +4568,14 @@ impl CodexParser {
                                     // spawn capsule's own result on the strength
                                     // of a `list_agents` the model happened to
                                     // call would lose the report entirely.
-                                    let capsule = parse_codex_json_output(payload).and_then(
-                                        |output_obj| {
+                                    let capsule =
+                                        parse_codex_json_output(payload).and_then(|output_obj| {
                                             if is_list {
                                                 return build_collab_list_input(&output_obj);
                                             }
-                                            match output_obj.get("status").and_then(|s| s.as_object())
+                                            match output_obj
+                                                .get("status")
+                                                .and_then(|s| s.as_object())
                                             {
                                                 Some(status) => {
                                                     // Mark returned agents so the spawn
@@ -4601,8 +4596,7 @@ impl CodexParser {
                                                 }
                                                 None => native_team_wait_input(&output_obj),
                                             }
-                                        },
-                                    );
+                                        });
                                     if let Some((collab_input, is_error)) = capsule {
                                         messages.push(UnifiedMessage {
                                             id: format!("tool-{}", messages.len()),
@@ -6942,15 +6936,11 @@ mod tests {
     use std::collections::HashMap;
 
     use super::codex_parent_thread_id;
+    use super::completed_mcp_call;
     use super::extract_codex_title_candidate;
     use super::extract_context_window_used_tokens_from_token_count_info;
     use super::extract_response_item_user_image_blocks;
     use super::extract_turn_usage_from_codex_usage;
-    use super::completed_mcp_call;
-    use super::serialize_preview;
-    use super::truncate_str;
-    use super::BudgetedSink;
-    use super::MCP_RESULT_FALLBACK_CAP;
     use super::is_encrypted_envelope;
     use super::merge_codex_context_window_stats;
     use super::merge_codex_total_usage_stats;
@@ -6958,17 +6948,21 @@ mod tests {
     use super::parse_codex_subagent_stats;
     use super::redact_encrypted_args;
     use super::resolve_codex_home_dir_from;
-    use super::trim_subagent_replay_prefix;
-    use super::CODEX_SUBAGENT_STATE_KEY;
+    use super::serialize_preview;
     use super::should_skip_duplicate_user_message;
     use super::strip_blocked_resource_mentions;
+    use super::trim_subagent_replay_prefix;
+    use super::truncate_str;
     use super::AgentParser;
+    use super::BudgetedSink;
     use super::CodexParser;
     use super::CODEX_PLAN_APPROVAL_PROMPT;
     use super::CODEX_PLAN_APPROVED_OUTPUT;
     use super::CODEX_SCRIPT_TOOL_NAME;
     use super::CODEX_SUBAGENT_LAUNCH_KEY;
+    use super::CODEX_SUBAGENT_STATE_KEY;
     use super::COLLAB_OP_KEY;
+    use super::MCP_RESULT_FALLBACK_CAP;
     use crate::models::message::AutonomousTurnOrigin;
     use crate::models::{
         ContentBlock, MessageRole, MessageTurn, SessionStats, TurnRole, TurnUsage, UnifiedMessage,
@@ -11006,7 +11000,10 @@ earlier terminal context records.\n\
         // stream showed vanished on reload and nothing could resolve the
         // child's own rollout.
         let sealed = format!("gAAAAAB{}", "qgWsi0g7gOInVU3UTzqL".repeat(30));
-        let path = write_temp_rollout("nativeteam0153", &native_team_0153_lines("MESSAGE", &sealed));
+        let path = write_temp_rollout(
+            "nativeteam0153",
+            &native_team_0153_lines("MESSAGE", &sealed),
+        );
         let detail = CodexParser::new()
             .parse_conversation_detail(&path, "parent")
             .expect("parse ok");
@@ -11162,7 +11159,10 @@ earlier terminal context records.\n\
             })
             .expect("roster renders as a collab capsule, not a generic tool card");
         let parsed: serde_json::Value = serde_json::from_str(input).expect("collab input is JSON");
-        assert_eq!(parsed.get(COLLAB_OP_KEY).and_then(|v| v.as_str()), Some("list"));
+        assert_eq!(
+            parsed.get(COLLAB_OP_KEY).and_then(|v| v.as_str()),
+            Some("list")
+        );
         let states = parsed
             .get("agentsStates")
             .and_then(|v| v.as_object())
@@ -11812,12 +11812,9 @@ earlier terminal context records.\n\
                 {"type":"input_text","text":"{\"a\":{},\"b\":{}}"},
             ]),
         );
-        for (offset, (id, task_id, task)) in [
-            ("exec-b", "task-b", "B"),
-            ("exec-a", "task-a", "A"),
-        ]
-        .into_iter()
-        .enumerate()
+        for (offset, (id, task_id, task)) in [("exec-b", "task-b", "B"), ("exec-a", "task-a", "A")]
+            .into_iter()
+            .enumerate()
         {
             lines.insert(
                 2 + offset,
@@ -11872,8 +11869,14 @@ earlier terminal context records.\n\
                 .map(|(id, output, _)| (id, output))
                 .collect::<Vec<_>>(),
             vec![
-                ("exec-b".into(), Some("Delegation successful. task_id=task-b.".into())),
-                ("exec-a".into(), Some("Delegation successful. task_id=task-a.".into())),
+                (
+                    "exec-b".into(),
+                    Some("Delegation successful. task_id=task-b.".into())
+                ),
+                (
+                    "exec-a".into(),
+                    Some("Delegation successful. task_id=task-a.".into())
+                ),
             ]
         );
     }
@@ -12081,7 +12084,9 @@ earlier terminal context records.\n\
 
         let (native_input, native_result) = spawn_capsule(&detail);
         assert_eq!(
-            native_input.get("agent_id").and_then(|value| value.as_str()),
+            native_input
+                .get("agent_id")
+                .and_then(|value| value.as_str()),
             Some("01a07fc2-db62-78b3-9762-9cb2540216c2"),
             "native activity must keep its own child session id"
         );
@@ -12258,7 +12263,8 @@ earlier terminal context records.\n\
     /// the script card used to show the run.
     #[test]
     fn a_textless_semantic_result_still_says_something() {
-        let script = "const shot=await tools.mcp__shot_srv__capture({url:target});text(\"captured\");";
+        let script =
+            "const shot=await tools.mcp__shot_srv__capture({url:target});text(\"captured\");";
         let mut lines = code_mode_rollout(
             script,
             serde_json::json!([
@@ -12345,7 +12351,11 @@ earlier terminal context records.\n\
             }
             let detail = parse_lines(
                 &lines,
-                if item { "mixed-with-item" } else { "mixed-baseline" },
+                if item {
+                    "mixed-with-item"
+                } else {
+                    "mixed-baseline"
+                },
             );
             (tool_uses(&detail), tool_results(&detail))
         };
@@ -12431,7 +12441,10 @@ earlier terminal context records.\n\
             buf: Vec::new(),
             budget: 8,
         };
-        assert!(sink.write_all(&[b'x'; 5]).is_ok(), "room for the first write");
+        assert!(
+            sink.write_all(&[b'x'; 5]).is_ok(),
+            "room for the first write"
+        );
         assert!(
             sink.write_all(&[b'x'; 100]).is_err(),
             "a write past the budget must fail so serialization aborts"
@@ -12448,7 +12461,10 @@ earlier terminal context records.\n\
     #[test]
     fn a_budgeted_preview_reads_exactly_like_an_unbounded_one() {
         for (name, value) in [
-            ("a small object", serde_json::json!({"a": 1, "b": [true, null]})),
+            (
+                "a small object",
+                serde_json::json!({"a": 1, "b": [true, null]}),
+            ),
             ("empty", serde_json::json!({})),
             ("exactly the cap", serde_json::json!("x".repeat(3998))),
             ("one past the cap", serde_json::json!("x".repeat(3999))),
@@ -13695,11 +13711,11 @@ earlier terminal context records.\n\
         let detail = parse_lines(&lines, "deferred-semantic-mcp");
         assert_eq!(
             tool_uses(&detail),
-            vec![ (
+            vec![(
                 "mcp-deferred-status".into(),
                 "mcp__codeg_mcp__get_delegation_status".into(),
                 Some(r#"{"task_ids":["t1"],"wait_ms":60000}"#.into()),
-            ) ],
+            )],
             "the completed semantic item replaces the parked script card"
         );
         assert_eq!(

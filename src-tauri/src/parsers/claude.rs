@@ -876,9 +876,8 @@ fn compaction_post_tokens(turn: &MessageTurn) -> Option<u64> {
 /// usage.
 fn latest_claude_context_window_used_tokens(turns: &[MessageTurn]) -> Option<u64> {
     turns.iter().rev().find_map(|turn| {
-        compaction_post_tokens(turn).or_else(|| super::latest_turn_prompt_usage_tokens(
-            std::slice::from_ref(turn),
-        ))
+        compaction_post_tokens(turn)
+            .or_else(|| super::latest_turn_prompt_usage_tokens(std::slice::from_ref(turn)))
     })
 }
 
@@ -3064,7 +3063,12 @@ mod tests {
             }),
             duration_ms: None,
             model: None,
+            reasoning_effort: None,
             completed_at: None,
+            outcome: None,
+            autonomous_origin: None,
+            generation_ms: None,
+            generation_tokens: None,
             agent_message_id: Some(id.into()),
         };
         let compaction = |post: u64| MessageTurn {
@@ -3078,7 +3082,12 @@ mod tests {
             usage: None,
             duration_ms: None,
             model: None,
+            reasoning_effort: None,
             completed_at: None,
+            outcome: None,
+            autonomous_origin: None,
+            generation_ms: None,
+            generation_tokens: None,
             agent_message_id: None,
         };
 
@@ -3239,7 +3248,10 @@ mod tests {
         lines.extend(compact_records("1", ""));
         let shapes = turn_shapes(&parse_lines("sess-compact-replay", &lines));
         assert_eq!(
-            shapes.iter().filter(|s| s.as_str() == "User:/compact").count(),
+            shapes
+                .iter()
+                .filter(|s| s.as_str() == "User:/compact")
+                .count(),
             1,
             "got {shapes:?}"
         );

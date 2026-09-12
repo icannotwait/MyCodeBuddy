@@ -1010,12 +1010,10 @@ mod tests {
         // read and every watch join is keyed on, so nothing may rewrite it.
         assert_eq!(file.path.as_deref(), Some("/repo/src/main.rs"));
 
-        let (terminal, _) = create_node(
-            &db.conn,
-            new_node(CanvasNodeKind::Terminal, Some("/repo")),
-        )
-        .await
-        .expect("create terminal node");
+        let (terminal, _) =
+            create_node(&db.conn, new_node(CanvasNodeKind::Terminal, Some("/repo")))
+                .await
+                .expect("create terminal node");
         assert_eq!(terminal.path.as_deref(), Some("/repo"));
     }
 
@@ -1084,10 +1082,9 @@ mod tests {
         }
 
         let db = fresh_in_memory_db().await;
-        let (file, _) =
-            create_node(&db.conn, new_node(CanvasNodeKind::File, Some("/repo/a.rs")))
-                .await
-                .expect("create file node");
+        let (file, _) = create_node(&db.conn, new_node(CanvasNodeKind::File, Some("/repo/a.rs")))
+            .await
+            .expect("create file node");
         // Grid axes are forced to 0 for non-regions, so nothing downstream can
         // read a shape off a card that has no grid.
         assert_eq!((file.grid_columns, file.grid_rows), (0, 0));

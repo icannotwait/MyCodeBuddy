@@ -860,9 +860,9 @@ pub fn antigravity_effective_auth_type(
         .filter(|value| !value.is_empty())
         // The server resolves the legacy spelling before it tests membership,
         // so a caller matching on canonical ids would otherwise miss it.
-        .map(|value| AntigravityAuthType::Declared(
-            canonical_antigravity_auth_method(value).to_string(),
-        ))
+        .map(|value| {
+            AntigravityAuthType::Declared(canonical_antigravity_auth_method(value).to_string())
+        })
         .unwrap_or(AntigravityAuthType::Absent)
 }
 
@@ -4231,9 +4231,8 @@ async fn send_steer_request(
     blocks: &[PromptInputBlock],
 ) -> Result<SteerOutcome, AcpError> {
     let params = build_steer_params(session_id.0.as_ref(), blocks);
-    let untyped_req = UntypedMessage::new("_session/steering", params).map_err(|e| {
-        AcpError::protocol(format!("Failed to build steering request: {e}"))
-    })?;
+    let untyped_req = UntypedMessage::new("_session/steering", params)
+        .map_err(|e| AcpError::protocol(format!("Failed to build steering request: {e}")))?;
     let raw = cx
         .send_request_to(Agent, untyped_req)
         .block_task()
@@ -6076,7 +6075,7 @@ fn redact_mcp_secret_value(key: &str, value: &str) -> String {
     let len = value.chars().count();
     let prefix: String = value.chars().take(8).collect();
     if len == 0 {
-        return format!("(len=0)");
+        return "(len=0)".to_string();
     }
     format!("{prefix}…(len={len})")
 }
@@ -6092,7 +6091,14 @@ fn value_looks_like_secret(value: &str) -> bool {
     // Long random hex / base64-ish blobs (tokens, keys).
     let alnum: String = trimmed
         .chars()
-        .filter(|c| c.is_ascii_alphanumeric() || *c == '+' || *c == '/' || *c == '=' || *c == '-' || *c == '_')
+        .filter(|c| {
+            c.is_ascii_alphanumeric()
+                || *c == '+'
+                || *c == '/'
+                || *c == '='
+                || *c == '-'
+                || *c == '_'
+        })
         .collect();
     if alnum.len() >= 32 && alnum.len() * 10 >= trimmed.len() * 9 {
         let hexish = alnum.chars().all(|c| c.is_ascii_hexdigit());
@@ -6171,7 +6177,10 @@ fn redacted_mcp_server_json(server: &McpServer) -> serde_json::Value {
                 "command".into(),
                 serde_json::Value::String(s.command.display().to_string()),
             );
-            obj.insert("args".into(), serde_json::Value::Array(redact_mcp_args(&s.args)));
+            obj.insert(
+                "args".into(),
+                serde_json::Value::Array(redact_mcp_args(&s.args)),
+            );
             obj.insert("env".into(), serde_json::Value::Object(env));
             // Surface --features from args when present (handy for diagnosis).
             if let Some(idx) = s.args.iter().position(|a| a == "--features") {
@@ -6223,7 +6232,6 @@ fn redacted_mcp_server_json(server: &McpServer) -> serde_json::Value {
         _ => serde_json::json!({ "unsupported": "unknown McpServer variant" }),
     }
 }
-
 
 /// Compact INFO dump of mcpServers with secrets redacted.
 fn log_redacted_mcp_servers_dump(servers: &[McpServer], context: &str) {
@@ -11768,9 +11776,7 @@ async fn finalize_bound_prompt_response(
 ) -> Result<BoundPromptFinalization, sacp::Error> {
     let response = match prompt_result {
         Ok(response) => response,
-        Err(error)
-            if matches!(error.code, sacp::schema::ErrorCode::AuthRequired) =>
-        {
+        Err(error) if matches!(error.code, sacp::schema::ErrorCode::AuthRequired) => {
             // ACP `authRequired` (-32000) is a turn failure, not a dead
             // connection: the session stays addressable so the user can sign
             // in and retry. Ported from upstream's prompt-response arm into
@@ -12481,9 +12487,11 @@ impl TurnOutputProbe {
 enum EmptyTurnCause {
     /// codeg dropped updates it could not parse — the agent may well have
     /// replied; we just couldn't read it.
+    #[allow(dead_code)] // constructed by `diagnose_empty_turn` (unmerged-upstream-helpers)
     ProtocolMismatch,
     /// Only metadata arrived. Observational only: this is NOT proof the turn
     /// was harmless — a real failure can follow a plan or usage update.
+    #[allow(dead_code)] // constructed by `diagnose_empty_turn` (unmerged-upstream-helpers)
     MetadataOnly,
     /// Nothing arrived at all.
     NoOutput,
@@ -15875,6 +15883,7 @@ async fn settle_codex_subagent_launch(
             status: None,
             content: None,
             raw_input: Some(codex_subagent_terminal_input(launch_input, kind)),
+            raw_input_is_model_authored: None,
             raw_output: None,
             raw_output_append: None,
             locations: None,
@@ -18168,8 +18177,7 @@ async fn emit_conversation_update(
             // banner down this same prose channel. It is recognized against the
             // text pi-acp itself reported on the `session/new` response, not by
             // shape — see `pi_take_startup_banner`. No-op for every other agent.
-            let is_pi_startup_banner =
-                pi_take_startup_banner(agent_type, state, &text.text).await;
+            let is_pi_startup_banner = pi_take_startup_banner(agent_type, state, &text.text).await;
             // Drop a CodeBuddy sub-agent's interleaved message text — it belongs
             // to the Agent pill, not the main thread (see
             // `should_suppress_subagent_chunk`). No-op for every other agent.
@@ -18266,19 +18274,20 @@ async fn emit_conversation_update(
             // terminal marker is folded back onto that capsule; the rest stay
             // dropped. See `classify_codex_subagent_activity`.
             let mut codex_subagent_thread = None;
-            let codex_subagent = match classify_codex_subagent_activity(agent_type, tc.meta.as_ref())
-            {
-                CodexSubagentActivity::None => None,
-                CodexSubagentActivity::Started { thread_id, input } => {
-                    codex_subagent_thread = thread_id;
-                    Some(input)
-                }
-                CodexSubagentActivity::Terminal { thread_id, kind } => {
-                    settle_codex_subagent_launch(state, emitter, cb_state, &thread_id, &kind).await;
-                    return;
-                }
-                CodexSubagentActivity::Other => return,
-            };
+            let codex_subagent =
+                match classify_codex_subagent_activity(agent_type, tc.meta.as_ref()) {
+                    CodexSubagentActivity::None => None,
+                    CodexSubagentActivity::Started { thread_id, input } => {
+                        codex_subagent_thread = thread_id;
+                        Some(input)
+                    }
+                    CodexSubagentActivity::Terminal { thread_id, kind } => {
+                        settle_codex_subagent_launch(state, emitter, cb_state, &thread_id, &kind)
+                            .await;
+                        return;
+                    }
+                    CodexSubagentActivity::Other => return,
+                };
             let tool_call_id = tc.tool_call_id.to_string();
             if let (Some(thread_id), Some(input)) = (codex_subagent_thread, codex_subagent.as_ref())
             {
@@ -25025,7 +25034,10 @@ mod tests {
         assert_eq!(params["prompt"][1]["type"], "image");
         assert_eq!(params["prompt"][1]["data"], "aGk=");
         assert_eq!(params["prompt"][1]["mimeType"], "image/png");
-        assert_eq!(params["_meta"]["steering"]["idleBehavior"], "promptRequired");
+        assert_eq!(
+            params["_meta"]["steering"]["idleBehavior"],
+            "promptRequired"
+        );
     }
 
     #[test]
@@ -25747,8 +25759,11 @@ mod tests {
         // whole enum exists for. A caller that treated it as "nothing there"
         // would sign out of a `gemini-api-key` connection, clear nothing, and
         // be told `{}`.
-        std::fs::write(&path, "{\n  // mine\n  \"auth\": {\"type\": \"oauth-personal\"},\n}\n")
-            .unwrap();
+        std::fs::write(
+            &path,
+            "{\n  // mine\n  \"auth\": {\"type\": \"oauth-personal\"},\n}\n",
+        )
+        .unwrap();
         assert_eq!(
             antigravity_effective_auth_type(&home()),
             AntigravityAuthType::Unreadable
@@ -29264,8 +29279,8 @@ mod tests {
             // A future kind, and a future sibling field, must both still parse.
             serde_json::json!({"authStatus": {"kind": "something_new"}, "extra": 1}),
         ] {
-            let notif: AuthStatusUpdateNotification =
-                serde_json::from_value(payload.clone()).unwrap_or_else(|e| {
+            let notif: AuthStatusUpdateNotification = serde_json::from_value(payload.clone())
+                .unwrap_or_else(|e| {
                     panic!("must not reject {payload}: {e}");
                 });
             assert!(notif.auth_status.is_object());
@@ -31962,8 +31977,7 @@ mod tests {
             "main".to_string(),
             None,
         )));
-        state.write().await.pi_startup_banner =
-            pi_startup_banner(AgentType::Pi, Some(&meta));
+        state.write().await.pi_startup_banner = pi_startup_banner(AgentType::Pi, Some(&meta));
 
         assert!(
             !pi_take_startup_banner(AgentType::Pi, &state, "你好，我能帮你做什么？").await,

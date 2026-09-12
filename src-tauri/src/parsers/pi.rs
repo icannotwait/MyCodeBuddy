@@ -595,11 +595,7 @@ fn has_fork(entries: &[SessionRecord], by_id: &HashMap<&str, usize>) -> bool {
 /// Whether a record survives the branch filter. An entry WITHOUT an `id` is
 /// always kept: it has no place in the tree, so dropping it would be pure loss
 /// rather than branch pruning.
-fn keeps_record(
-    active: Option<&HashSet<usize>>,
-    index: usize,
-    record: &SessionRecord,
-) -> bool {
+fn keeps_record(active: Option<&HashSet<usize>>, index: usize, record: &SessionRecord) -> bool {
     match active {
         None => true,
         Some(on_path) => on_path.contains(&index) || entry_id(&record.value).is_none(),
@@ -1457,14 +1453,14 @@ mod tests {
             json!({"type":"model_change","id":"mc1","parentId":"m1","timestamp":"2026-06-27T10:00:01.500Z",
                    "provider":"anthropic","modelId":"claude-sonnet-4-6"}),
             json!({"type":"message","id":"m2","parentId":"mc1","timestamp":"2026-06-27T10:00:02.000Z",
-                   "message":{"role":"assistant","provider":"anthropic","model":"claude-sonnet-4-6","stopReason":"tool_use",
-                     "usage":{"input":1200,"output":80,"cacheRead":4000,"cacheWrite":0,"totalTokens":5280,"cost":0.01},
-                     "content":[
-                       // The REAL on-disk shape: the payload key is `thinking`.
-                       {"type":"thinking","thinking":"check the build first","thinkingSignature":"sig"},
-                       {"type":"text","text":"Running the build now."},
-                       {"type":"toolCall","id":"call_1","name":"bash","arguments":{"command":"pnpm build"}}
-                     ]}}),
+            "message":{"role":"assistant","provider":"anthropic","model":"claude-sonnet-4-6","stopReason":"tool_use",
+              "usage":{"input":1200,"output":80,"cacheRead":4000,"cacheWrite":0,"totalTokens":5280,"cost":0.01},
+              "content":[
+                // The REAL on-disk shape: the payload key is `thinking`.
+                {"type":"thinking","thinking":"check the build first","thinkingSignature":"sig"},
+                {"type":"text","text":"Running the build now."},
+                {"type":"toolCall","id":"call_1","name":"bash","arguments":{"command":"pnpm build"}}
+              ]}}),
             json!({"type":"message","id":"m3","parentId":"m2","timestamp":"2026-06-27T10:00:09.000Z",
                    "message":{"role":"toolResult","toolCallId":"call_1","toolName":"bash",
                      "content":[{"type":"text","text":"Compiled successfully"}],"isError":false}}),
@@ -1863,10 +1859,10 @@ earlier terminal context records.\n\
                 json!({"type":"message","id":"m1","parentId":null,"timestamp":"2026-06-27T10:00:01.000Z",
                        "message":{"role":"user","content":"go"}}),
                 json!({"type":"message","id":"m2","parentId":"m1","timestamp":"2026-06-27T10:00:02.000Z",
-                       "message":{"role":"assistant","model":"m","content":[
-                         {"type":"thinking","thinking":"weighing the options","thinkingSignature":"abc"},
-                         {"type":"text","text":"done"}
-                       ]}}),
+                "message":{"role":"assistant","model":"m","content":[
+                  {"type":"thinking","thinking":"weighing the options","thinkingSignature":"abc"},
+                  {"type":"text","text":"done"}
+                ]}}),
             ],
             id,
         );
@@ -1885,9 +1881,9 @@ earlier terminal context records.\n\
             &[
                 header(id),
                 json!({"type":"message","id":"m1","parentId":null,"timestamp":"2026-06-27T10:00:01.000Z",
-                       "message":{"role":"assistant","model":"m","content":[
-                         {"type":"thinking","text":"legacy shape"}
-                       ]}}),
+                "message":{"role":"assistant","model":"m","content":[
+                  {"type":"thinking","text":"legacy shape"}
+                ]}}),
             ],
             id,
         );
@@ -2337,10 +2333,14 @@ earlier terminal context records.\n\
             Some(&json!("automatic"))
         );
         assert!(
-            detail.turns.iter().flat_map(|t| &t.blocks).any(|b| matches!(
-                b,
-                ContentBlock::ToolResult { tool_use_id: Some(id), .. } if id == "c1"
-            )),
+            detail
+                .turns
+                .iter()
+                .flat_map(|t| &t.blocks)
+                .any(|b| matches!(
+                    b,
+                    ContentBlock::ToolResult { tool_use_id: Some(id), .. } if id == "c1"
+                )),
             "the pair must settle or the card reads as still running"
         );
     }

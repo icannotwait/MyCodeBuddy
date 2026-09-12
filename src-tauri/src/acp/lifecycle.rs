@@ -377,8 +377,7 @@ async fn handle_turn_complete_internal(
             conversation_service::finish_end_turn_if_in_progress(&txn, cid, mark_awaiting_reply)
                 .await?
         }
-        "refusal" | "max_tokens" | "max_turn_requests" | "unknown" | "empty"
-        | "auth_required" => {
+        "refusal" | "max_tokens" | "max_turn_requests" | "unknown" | "empty" | "auth_required" => {
             conversation_service::update_status_if_with_patch(
                 &txn,
                 cid,
@@ -438,8 +437,7 @@ async fn handle_turn_complete_internal(
     // spinning while logs claim "CAS won".
     let expected_after_cas: Option<ConversationStatus> = match stop_reason {
         "end_turn" if cas_patch.is_some() => Some(ConversationStatus::PendingReview),
-        "refusal" | "max_tokens" | "max_turn_requests" | "unknown" | "empty"
-        | "auth_required"
+        "refusal" | "max_tokens" | "max_turn_requests" | "unknown" | "empty" | "auth_required"
             if cas_patch.is_some() =>
         {
             Some(ConversationStatus::Cancelled)

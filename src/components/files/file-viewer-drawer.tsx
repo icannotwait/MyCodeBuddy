@@ -22,9 +22,10 @@ import {
   useWorkspaceActions,
   useWorkspaceFileTabs,
   type FileWorkspaceTab,
+  type OpenFileSettleResult,
 } from "@/contexts/workspace-context"
 import { useAppWorkspaceStore } from "@/stores/app-workspace-store"
-import { buildFileTabId } from "@/lib/file-tab-id"
+import { buildFileTabId, parseFileTabId } from "@/lib/file-tab-id"
 import {
   findOwningFolder,
   normalizeAbsPath,
@@ -45,6 +46,14 @@ interface ViewerEntry {
 
 function newEntry(request: FileViewerRequest): ViewerEntry {
   return { request, absPath: null, resolved: request.diff != null }
+}
+
+function absPathFromOpenSettle(
+  result: OpenFileSettleResult | null
+): string | null {
+  if (result == null || !result.ok) return null
+  const parts = parseFileTabId(result.tabId)
+  return parts?.kind === "file" ? parts.path : null
 }
 
 function baseName(path: string): string {
@@ -189,8 +198,9 @@ function FileViewerBody({ request }: { request: FileViewerRequest }) {
     // materializes costs exactly one extra call and then stops.
     if (entry.resolved && (entry.absPath === null || hasTab)) return
     let cancelled = false
-    const settle = (absPath: string | null) => {
+    const settle = (result: OpenFileSettleResult | null) => {
       if (cancelled) return
+      const absPath = absPathFromOpenSettle(result)
       setHistory((prev) => {
         const current = prev[depth]
         if (!current) return prev

@@ -12240,56 +12240,49 @@ pub(crate) async fn acp_prepare_npx_agent_core(
                 AgentInstallEventKind::Log,
                 format!("Installing {} ({first_spec})", meta.name),
             );
-            let install_spec = match install_npm_global_package_streaming(
-                &first_spec,
-                &task_id,
-                emitter,
-            )
-            .await
-            {
-                Ok(()) => first_spec,
-                Err(err) => {
-                    // FAIL SAFE TO THE PIN. A latest-channel install can die on
-                    // things the pin does not (npm unreachable, a mirror not yet
-                    // carrying the tag's target, a yanked release), and the user
-                    // asked for "newest when possible", not "nothing unless
-                    // newest". Retry the reviewed pinned spec, saying so in the
-                    // same install log — and let the recorded installed version
-                    // report what actually landed.
-                    let Some(pinned_spec) = fallback_spec else {
-                        return Err(annotate_npm_bootstrap_failure(&first_spec, err));
-                    };
-                    let err = annotate_npm_bootstrap_failure(&first_spec, err);
-                    tracing::warn!(
-                        "[acp] latest install {first_spec} failed ({err}); \
+            let install_spec =
+                match install_npm_global_package_streaming(&first_spec, &task_id, emitter).await {
+                    Ok(()) => first_spec,
+                    Err(err) => {
+                        // FAIL SAFE TO THE PIN. A latest-channel install can die on
+                        // things the pin does not (npm unreachable, a mirror not yet
+                        // carrying the tag's target, a yanked release), and the user
+                        // asked for "newest when possible", not "nothing unless
+                        // newest". Retry the reviewed pinned spec, saying so in the
+                        // same install log — and let the recorded installed version
+                        // report what actually landed.
+                        let Some(pinned_spec) = fallback_spec else {
+                            return Err(annotate_npm_bootstrap_failure(&first_spec, err));
+                        };
+                        let err = annotate_npm_bootstrap_failure(&first_spec, err);
+                        tracing::warn!(
+                            "[acp] latest install {first_spec} failed ({err}); \
                          falling back to pinned {pinned_spec}"
-                    );
-                    emit_agent_install_event(
-                        emitter,
-                        &task_id,
-                        AgentInstallEventKind::Log,
-                        format!("ERROR: installing {first_spec} failed: {err}"),
-                    );
-                    emit_agent_install_event(
-                        emitter,
-                        &task_id,
-                        AgentInstallEventKind::Log,
-                        format!(
-                            "Falling back to the pinned version ({pinned_spec})..."
-                        ),
-                    );
-                    emit_agent_install_event(
-                        emitter,
-                        &task_id,
-                        AgentInstallEventKind::Log,
-                        format!("Installing {} ({pinned_spec})", meta.name),
-                    );
-                    install_npm_global_package_streaming(&pinned_spec, &task_id, emitter)
-                        .await
-                        .map_err(|e| annotate_npm_bootstrap_failure(&pinned_spec, e))?;
-                    pinned_spec
-                }
-            };
+                        );
+                        emit_agent_install_event(
+                            emitter,
+                            &task_id,
+                            AgentInstallEventKind::Log,
+                            format!("ERROR: installing {first_spec} failed: {err}"),
+                        );
+                        emit_agent_install_event(
+                            emitter,
+                            &task_id,
+                            AgentInstallEventKind::Log,
+                            format!("Falling back to the pinned version ({pinned_spec})..."),
+                        );
+                        emit_agent_install_event(
+                            emitter,
+                            &task_id,
+                            AgentInstallEventKind::Log,
+                            format!("Installing {} ({pinned_spec})", meta.name),
+                        );
+                        install_npm_global_package_streaming(&pinned_spec, &task_id, emitter)
+                            .await
+                            .map_err(|e| annotate_npm_bootstrap_failure(&pinned_spec, e))?;
+                        pinned_spec
+                    }
+                };
 
             if npm_package_requires_scripts(&install_spec) {
                 emit_agent_install_event(

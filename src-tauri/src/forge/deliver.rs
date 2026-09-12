@@ -59,7 +59,11 @@ fn git_failure_message(err: AppCommandError) -> String {
         .map(str::trim)
         .filter(|d| !d.is_empty())
     {
-        Some(detail) => format!("{}: {}", err.message, truncate_chars(&redact_userinfo(detail))),
+        Some(detail) => format!(
+            "{}: {}",
+            err.message,
+            truncate_chars(&redact_userinfo(detail))
+        ),
         None => err.message,
     }
 }
@@ -349,9 +353,7 @@ impl ForgeDeliveryApi for ForgeDelivery {
             ForgeProvider::GitLab => {
                 gitlab::find_merge_requests(&auth, ctx.owner_repo, head_branch).await
             }
-            ForgeProvider::Gitea => {
-                gitea::find_pulls(&auth, ctx.owner_repo, head_branch).await
-            }
+            ForgeProvider::Gitea => gitea::find_pulls(&auth, ctx.owner_repo, head_branch).await,
         }
         .map_err(|e| e.to_string())
     }
@@ -364,9 +366,7 @@ impl ForgeDeliveryApi for ForgeDelivery {
         let auth = resolve(ctx).await?;
         match ctx.provider {
             ForgeProvider::GitHub => create_pull(&auth, ctx.owner_repo, req).await,
-            ForgeProvider::GitLab => {
-                gitlab::create_merge_request(&auth, ctx.owner_repo, req).await
-            }
+            ForgeProvider::GitLab => gitlab::create_merge_request(&auth, ctx.owner_repo, req).await,
             ForgeProvider::Gitea => gitea::create_pull(&auth, ctx.owner_repo, req).await,
         }
         .map_err(|e| e.to_string())
@@ -376,9 +376,7 @@ impl ForgeDeliveryApi for ForgeDelivery {
         let auth = resolve(ctx).await?;
         match ctx.provider {
             ForgeProvider::GitHub => get_pull(&auth, ctx.owner_repo, number).await,
-            ForgeProvider::GitLab => {
-                gitlab::get_merge_request(&auth, ctx.owner_repo, number).await
-            }
+            ForgeProvider::GitLab => gitlab::get_merge_request(&auth, ctx.owner_repo, number).await,
             ForgeProvider::Gitea => gitea::get_pull(&auth, ctx.owner_repo, number).await,
         }
         .map_err(|e| e.to_string())
@@ -947,11 +945,13 @@ mod tests {
         let echoed = "fatal: unable to access \
              'https://me:s3cret@git.example.com/team/app.git/': The requested URL returned \
              error: 403";
-        let flattened = git_failure_message(
-            AppCommandError::network("git push failed").with_detail(echoed),
-        );
+        let flattened =
+            git_failure_message(AppCommandError::network("git push failed").with_detail(echoed));
         assert!(!flattened.contains("s3cret"), "{flattened}");
-        assert!(flattened.contains("https://***@git.example.com/team/app.git/"), "{flattened}");
+        assert!(
+            flattened.contains("https://***@git.example.com/team/app.git/"),
+            "{flattened}"
+        );
         // The rest of git's sentence has to survive the scrub intact.
         assert!(flattened.contains("returned error: 403"), "{flattened}");
     }

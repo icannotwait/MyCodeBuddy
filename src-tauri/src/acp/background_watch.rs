@@ -3061,7 +3061,9 @@ mod tests {
         // cron prompt (isMeta + string): initiates with the prompt text.
         let cron: serde_json::Value = serde_json::from_str(&cron_prompt("check weather")).unwrap();
         assert_eq!(
-            turn_initiator_text(&cron).as_ref().map(|text| text.as_str()),
+            turn_initiator_text(&cron)
+                .as_ref()
+                .map(|text| text.as_str()),
             Some("check weather")
         );
 

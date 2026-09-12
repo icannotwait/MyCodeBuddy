@@ -89,10 +89,7 @@ async fn export_download_upload_inspect_stage_roundtrip() {
         .await;
     assert_eq!(ins.status_code(), 200, "prepare: {:?}", ins.text());
     let prepared: Value = ins.json();
-    let source_id = prepared["sourceId"]
-        .as_str()
-        .expect("sourceId")
-        .to_string();
+    let source_id = prepared["sourceId"].as_str().expect("sourceId").to_string();
     assert_eq!(prepared["preview"]["encrypted"], json!(false));
     assert_eq!(
         prepared["preview"]["compatible"],
@@ -131,10 +128,7 @@ async fn export_download_upload_inspect_stage_roundtrip() {
         .await;
     assert_eq!(discarded.status_code(), 200, "{:?}", discarded.text());
     assert_eq!(discarded.json::<Value>(), json!(true));
-    assert!(!data_dir
-        .path()
-        .join(".codeg-restore-pending.json")
-        .exists());
+    assert!(!data_dir.path().join(".codeg-restore-pending.json").exists());
 }
 
 #[tokio::test]
@@ -163,7 +157,11 @@ async fn active_agents_are_reported_for_the_original_locations_advisory() {
         .json(&json!({}))
         .await;
     assert_eq!(resp.status_code(), 200, "{:?}", resp.text());
-    assert_eq!(resp.json::<Value>(), json!([]), "no agents in a fresh state");
+    assert_eq!(
+        resp.json::<Value>(),
+        json!([]),
+        "no agents in a fresh state"
+    );
 }
 
 #[tokio::test]

@@ -154,9 +154,7 @@ pub async fn submit_session_feedback(
         &connection_id,
     )
     .await?;
-    manager
-        .submit_feedback(&connection_id, text, blocks)
-        .await
+    manager.submit_feedback(&connection_id, text, blocks).await
 }
 
 #[cfg(test)]

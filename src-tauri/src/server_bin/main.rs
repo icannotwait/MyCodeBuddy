@@ -521,10 +521,7 @@ async fn async_main() -> ExitCode {
                 state.emitter.clone(),
             );
         let socket = stack.socket_path.clone();
-        let service = codeg_lib::acp::delegation::service::DelegationService::new(
-            listener,
-            socket,
-        );
+        let service = codeg_lib::acp::delegation::service::DelegationService::new(listener, socket);
         codeg_lib::acp::delegation::service::install(service.clone());
         tokio::spawn(async move {
             if let Err(e) = service.start().await {

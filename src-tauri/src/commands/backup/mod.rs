@@ -82,7 +82,9 @@ mod tauri_commands {
     use crate::web::event_bridge::EventEmitter;
     use crate::workspace_transfer::WorkspaceTransferManager;
 
-    use super::core::{create_backup_core, scan_external_conflicts_core, BackupInputs, BackupOptions};
+    use super::core::{
+        create_backup_core, scan_external_conflicts_core, BackupInputs, BackupOptions,
+    };
     use super::external::ExternalConflict;
     use super::manifest::BackupManifest;
     use super::restore::{stage_restore_core, ExternalRestoreMode, StagedRestore};
@@ -158,7 +160,13 @@ mod tauri_commands {
     ) -> Result<PreparedSource, AppCommandError> {
         let data_dir = resolve_data_dir(&app)?;
         // `false`: `src_path` is the user's own file, not ours to consume.
-        prepare_source_core(Path::new(&src_path), &data_dir, passphrase.as_deref(), false).await
+        prepare_source_core(
+            Path::new(&src_path),
+            &data_dir,
+            passphrase.as_deref(),
+            false,
+        )
+        .await
     }
 
     #[tauri::command]
@@ -196,8 +204,7 @@ mod tauri_commands {
         let zip = resolve_prepared_zip(&data_dir, &source_id)?;
         let (op_id, cancel) = transfer.register_transfer().await;
         let emitter = EventEmitter::Tauri(app.clone());
-        let result =
-            stage_restore_core(&zip, &data_dir, &emitter, &op_id, &cancel).await;
+        let result = stage_restore_core(&zip, &data_dir, &emitter, &op_id, &cancel).await;
         transfer.finish_transfer(&op_id).await;
         let mut staged = result?;
         // Dispatched here, not inside the engine: this is the layer that can
@@ -231,13 +238,12 @@ mod tauri_commands {
         app: AppHandle,
     ) -> Result<Vec<super::restore::SafetySnapshot>, AppCommandError> {
         let data_dir = resolve_data_dir(&app)?;
-        tokio::task::spawn_blocking(move || {
-            super::restore::list_safety_snapshots_core(&data_dir)
-        })
-        .await
-        .map_err(|e| {
-            AppCommandError::task_execution_failed("List snapshots failed").with_detail(e.to_string())
-        })
+        tokio::task::spawn_blocking(move || super::restore::list_safety_snapshots_core(&data_dir))
+            .await
+            .map_err(|e| {
+                AppCommandError::task_execution_failed("List snapshots failed")
+                    .with_detail(e.to_string())
+            })
     }
 
     /// Stage a rollback to a safety snapshot; applied on the next startup, so
@@ -261,14 +267,12 @@ mod tauri_commands {
     #[tauri::command]
     pub async fn backup_discard_pending(app: AppHandle) -> Result<bool, AppCommandError> {
         let data_dir = resolve_data_dir(&app)?;
-        tokio::task::spawn_blocking(move || {
-            super::restore::discard_pending_restore_core(&data_dir)
-        })
-        .await
-        .map_err(|e| {
-            AppCommandError::task_execution_failed("Discard pending failed")
-                .with_detail(e.to_string())
-        })?
+        tokio::task::spawn_blocking(move || super::restore::discard_pending_restore_core(&data_dir))
+            .await
+            .map_err(|e| {
+                AppCommandError::task_execution_failed("Discard pending failed")
+                    .with_detail(e.to_string())
+            })?
     }
 
     #[tauri::command]

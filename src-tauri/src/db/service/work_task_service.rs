@@ -207,9 +207,7 @@ pub async fn list(
     if !live_ids.is_empty() {
         let events = work_task_event::Entity::find()
             .filter(work_task_event::Column::TaskId.is_in(live_ids))
-            .filter(
-                work_task_event::Column::Kind.is_in(["agent_progress", "context_compact"]),
-            )
+            .filter(work_task_event::Column::Kind.is_in(["agent_progress", "context_compact"]))
             .order_by_asc(work_task_event::Column::Id)
             .all(conn)
             .await?;
@@ -221,8 +219,7 @@ pub async fn list(
         // for no generation; only currently-live tasks lose anything by that,
         // and only until their next milestone.
         let mut latest: std::collections::HashMap<i32, String> = std::collections::HashMap::new();
-        let mut compacting: std::collections::HashMap<i32, bool> =
-            std::collections::HashMap::new();
+        let mut compacting: std::collections::HashMap<i32, bool> = std::collections::HashMap::new();
         let by_id: std::collections::HashMap<i32, i32> =
             infos.iter().map(|t| (t.id, t.run_seq)).collect();
         for e in events {
@@ -259,8 +256,7 @@ pub async fn list(
                 // guard: the cost is one italic line claiming work that has
                 // finished, on a card whose status is still telling the truth.
                 "context_compact" => {
-                    let started =
-                        payload.get("status").and_then(|s| s.as_str()) == Some("started");
+                    let started = payload.get("status").and_then(|s| s.as_str()) == Some("started");
                     compacting.insert(e.task_id, started);
                 }
                 _ => {}
@@ -2908,7 +2904,9 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(begin_setup(&db.conn, t.id, first).await.unwrap());
-        assert!(mark_running(&db.conn, t.id, first, 7, "conn-1").await.unwrap());
+        assert!(mark_running(&db.conn, t.id, first, 7, "conn-1")
+            .await
+            .unwrap());
         record_event(
             &db.conn,
             t.id,
@@ -2925,7 +2923,9 @@ mod tests {
 
         // A merge is a NEW generation. Its card used to inherit the work
         // round's last milestone and narrate work it is not doing.
-        assert!(settle_review(&db.conn, t.id, first, None, None).await.unwrap());
+        assert!(settle_review(&db.conn, t.id, first, None, None)
+            .await
+            .unwrap());
         let merge = begin_merge(
             &db.conn,
             t.id,
@@ -2939,7 +2939,10 @@ mod tests {
         .unwrap();
         assert_ne!(merge, first);
         let row = one(&list(&db.conn, Some(folder_id)).await.unwrap());
-        assert_eq!(row.latest_progress, None, "the previous round's news is not this one's");
+        assert_eq!(
+            row.latest_progress, None,
+            "the previous round's news is not this one's"
+        );
 
         // The compaction announces itself when the turn goes out…
         let compact = |status: &str| {
@@ -2984,7 +2987,10 @@ mod tests {
         let one = |v: &Vec<WorkTaskInfo>| v.iter().find(|i| i.id == t.id).cloned().unwrap();
         let row = one(&list(&db.conn, Some(folder_id)).await.unwrap());
         assert_eq!(row.status, WorkTaskStatus::Preparing);
-        assert!(row.compacting, "preparing is where a resumed round compacts");
+        assert!(
+            row.compacting,
+            "preparing is where a resumed round compacts"
+        );
 
         // Killed mid-compaction; the sweep hands it back and the next run
         // starts clean.
@@ -3074,7 +3080,9 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(begin_setup(&db.conn, t.id, seq).await.unwrap());
-        assert!(mark_preparing_live(&db.conn, t.id, seq, 42, "conn-1").await.unwrap());
+        assert!(mark_preparing_live(&db.conn, t.id, seq, 42, "conn-1")
+            .await
+            .unwrap());
         let row = get_model(&db.conn, t.id).await.unwrap();
         assert_eq!(row.connection_id.as_deref(), Some("conn-1"));
         assert_eq!(row.conversation_id, Some(42));
@@ -3084,11 +3092,17 @@ mod tests {
         assert!(row.started_at.is_none());
 
         // A stale generation cannot repoint a live row.
-        assert!(!mark_preparing_live(&db.conn, t.id, seq + 1, 99, "conn-stale")
-            .await
-            .unwrap());
+        assert!(
+            !mark_preparing_live(&db.conn, t.id, seq + 1, 99, "conn-stale")
+                .await
+                .unwrap()
+        );
         assert_eq!(
-            get_model(&db.conn, t.id).await.unwrap().connection_id.as_deref(),
+            get_model(&db.conn, t.id)
+                .await
+                .unwrap()
+                .connection_id
+                .as_deref(),
             Some("conn-1")
         );
 
@@ -3099,7 +3113,11 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(begin_setup(&db.conn, t.id, next).await.unwrap());
-        assert!(get_model(&db.conn, t.id).await.unwrap().connection_id.is_none());
+        assert!(get_model(&db.conn, t.id)
+            .await
+            .unwrap()
+            .connection_id
+            .is_none());
     }
 
     #[tokio::test]

@@ -305,10 +305,7 @@ fn pack_sqlite_store(
         }
         Err(reason) => {
             let _ = std::fs::remove_file(&snap);
-            tracing::error!(
-                "[BACKUP] {} not archived: {reason}",
-                live_db.display()
-            );
+            tracing::error!("[BACKUP] {} not archived: {reason}", live_db.display());
             degraded.push(DegradedSqlite {
                 agent: agent.to_string(),
                 archive_path: entry_name.to_string(),
@@ -535,7 +532,12 @@ pub fn restore_external_from_staging(
     policy: ConflictPolicy,
     cancel: &CancellationToken,
 ) -> Result<ExternalRestoreReport, AppCommandError> {
-    restore_external_with_sources(staged_external, &external_transcript_sources(), policy, cancel)
+    restore_external_with_sources(
+        staged_external,
+        &external_transcript_sources(),
+        policy,
+        cancel,
+    )
 }
 
 pub(crate) fn restore_external_with_sources(
@@ -781,7 +783,10 @@ fn publish_sqlite(src: &Path, target: &Path, parent: &Path) -> FileOutcome {
             Ok(()) => dismantled = true,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             Err(e) => {
-                tracing::error!("[RESTORE] external: remove {} failed: {e}", victim.display());
+                tracing::error!(
+                    "[RESTORE] external: remove {} failed: {e}",
+                    victim.display()
+                );
                 return fail_publication(&tmp, target, dismantled);
             }
         }
@@ -802,7 +807,10 @@ fn publish_sqlite(src: &Path, target: &Path, parent: &Path) -> FileOutcome {
     // 5. Single rename — the archive holds exactly one file per store, so
     //    there is no multi-file publication to be interrupted halfway.
     if let Err(e) = std::fs::rename(&tmp, target) {
-        tracing::error!("[RESTORE] external: publish {} failed: {e}", target.display());
+        tracing::error!(
+            "[RESTORE] external: publish {} failed: {e}",
+            target.display()
+        );
         return fail_publication(&tmp, target, dismantled);
     }
     // Past the point of no return: the new database is in place, so a failure
@@ -1072,13 +1080,9 @@ mod tests {
         let cancel = CancellationToken::new();
 
         // SkipExisting: conflict reported + untouched; fresh file restored.
-        let report = restore_external_with_sources(
-            &staged,
-            &sources,
-            ConflictPolicy::SkipExisting,
-            &cancel,
-        )
-        .unwrap();
+        let report =
+            restore_external_with_sources(&staged, &sources, ConflictPolicy::SkipExisting, &cancel)
+                .unwrap();
         assert_eq!(report.skipped_conflicts.len(), 1);
         assert!(report.skipped_conflicts[0].ends_with("exists.jsonl"));
         assert_eq!(
@@ -1585,7 +1589,10 @@ mod tests {
         )
         .unwrap();
 
-        assert!(!sidecar_of(&live_db, "-wal").exists(), "the wal was removed");
+        assert!(
+            !sidecar_of(&live_db, "-wal").exists(),
+            "the wal was removed"
+        );
         let preserved: Vec<PathBuf> = std::fs::read_dir(&live_dir)
             .unwrap()
             .filter_map(|e| e.ok())

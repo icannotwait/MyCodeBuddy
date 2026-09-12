@@ -3824,7 +3824,9 @@ impl TaskEngine {
         // without dispatching (a cancel gate, a lost CAS): the row is still
         // `merging` and nobody failed it, exactly as before this ran off-thread
         // — `recover_merging` settles it from git truth on the next tick.
-        live.await.unwrap_or(Ok(())).map(|()| MergeDispatch::Dispatched)
+        live.await
+            .unwrap_or(Ok(()))
+            .map(|()| MergeDispatch::Dispatched)
     }
 
     /// Settle a finished merge generation from git truth: landed ⟺ the base
@@ -12204,7 +12206,11 @@ mod tests {
         assert!(err.contains("no agent configured"), "{err}");
 
         let task = row(&f.engine, f.task_id).await;
-        assert_eq!(task.status, WorkTaskStatus::Review, "settled before we returned");
+        assert_eq!(
+            task.status,
+            WorkTaskStatus::Review,
+            "settled before we returned"
+        );
         assert!(
             task.last_error
                 .as_deref()

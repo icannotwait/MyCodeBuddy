@@ -1844,8 +1844,14 @@ mod tests {
     /// wrong API with the wrong credentials.
     #[test]
     fn provider_parsing_refuses_what_it_does_not_know() {
-        assert_eq!(ForgeProvider::parse("GitHub").unwrap(), ForgeProvider::GitHub);
-        assert_eq!(ForgeProvider::parse(" gitlab ").unwrap(), ForgeProvider::GitLab);
+        assert_eq!(
+            ForgeProvider::parse("GitHub").unwrap(),
+            ForgeProvider::GitHub
+        );
+        assert_eq!(
+            ForgeProvider::parse(" gitlab ").unwrap(),
+            ForgeProvider::GitLab
+        );
         assert_eq!(ForgeProvider::parse("Gitea").unwrap(), ForgeProvider::Gitea);
         assert!(ForgeProvider::parse("bitbucket").is_err());
         assert!(ForgeProvider::parse("").is_err());
@@ -1923,11 +1929,21 @@ mod tests {
         // Gitea change without adding a remote.
         let gt = ForgeProvider::Gitea;
         assert_eq!(
-            gt.item_url("https://gitea.corp.com", "acme/app", ForgeItemKind::Change, 7),
+            gt.item_url(
+                "https://gitea.corp.com",
+                "acme/app",
+                ForgeItemKind::Change,
+                7
+            ),
             "https://gitea.corp.com/acme/app/pulls/7"
         );
         assert_eq!(
-            gt.item_url("https://gitea.corp.com", "acme/app", ForgeItemKind::Issue, 7),
+            gt.item_url(
+                "https://gitea.corp.com",
+                "acme/app",
+                ForgeItemKind::Issue,
+                7
+            ),
             "https://gitea.corp.com/acme/app/issues/7"
         );
         assert_eq!(gt.change_head_ref(7), "refs/pull/7/head");

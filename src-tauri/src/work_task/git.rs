@@ -1405,10 +1405,7 @@ mod tests {
             "not yours\n",
             "the unrelated checkout keeps its uncommitted work"
         );
-        assert!(
-            elsewhere.join("a.txt").exists(),
-            "and the rest of its tree"
-        );
+        assert!(elsewhere.join("a.txt").exists(), "and the rest of its tree");
         // Asked OF git rather than matched against `worktree list`: that
         // listing prints forward slashes on Windows while the fixture path
         // holds backslashes, and a temp directory can come back short-named,

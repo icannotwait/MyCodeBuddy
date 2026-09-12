@@ -1156,9 +1156,8 @@ pub(crate) async fn import_selected_from_summaries(
         let target_row = folder_index.get(&norm_key).copied();
         let target_folder_id = target_row.map(|row| row.id);
         let existing_parent_id = target_row.and_then(|row| row.parent_id);
-        let target_has_children = target_folder_id.is_some_and(|folder_id| {
-            folder_child_counts.get(&folder_id).copied().unwrap_or(0) > 0
-        });
+        let target_has_children = target_folder_id
+            .is_some_and(|folder_id| folder_child_counts.get(&folder_id).copied().unwrap_or(0) > 0);
         let parent_id = root_key
             .as_ref()
             .and_then(|key| worktree_parents.get(key).copied())
@@ -8734,8 +8733,9 @@ Call get_delegation_status with the returned task_id to collect the result.";
 
     #[tokio::test]
     async fn whole_folder_import_still_never_resurrects_a_deleted_conversation() {
-        use sea_orm::{ActiveModelTrait, ColumnTrait, EntityTrait, IntoActiveModel, QueryFilter,
-            Set};
+        use sea_orm::{
+            ActiveModelTrait, ColumnTrait, EntityTrait, IntoActiveModel, QueryFilter, Set,
+        };
         let db = fresh_in_memory_db().await;
         let folder_id = seed_folder(&db, "/tmp/proj-sweep").await;
         let items = vec![scan_summary(
@@ -9038,14 +9038,13 @@ Call get_delegation_status with the returned task_id to collect the result.";
             scan_summary("s2", AgentType::Codex, Some("/tmp/x"), at(1)),
         ];
 
-        let (tally, updated_ids, failed) =
-            import_service::import_summaries_resilient(
-                &db.conn,
-                999_999,
-                &items,
-                import_service::DeletedPolicy::Skip,
-            )
-            .await;
+        let (tally, updated_ids, failed) = import_service::import_summaries_resilient(
+            &db.conn,
+            999_999,
+            &items,
+            import_service::DeletedPolicy::Skip,
+        )
+        .await;
         assert_eq!(failed, 2, "both rows fail the folder FK and are counted");
         assert_eq!(tally.imported, 0);
         assert_eq!(tally.updated, 0);
@@ -9054,14 +9053,13 @@ Call get_delegation_status with the returned task_id to collect the result.";
         // Same items into a real folder import cleanly — the resilient loop did
         // not corrupt state or leave a half-open transaction.
         let folder_id = seed_folder(&db, "/tmp/x").await;
-        let (tally2, _ids, failed2) =
-            import_service::import_summaries_resilient(
-                &db.conn,
-                folder_id,
-                &items,
-                import_service::DeletedPolicy::Skip,
-            )
-            .await;
+        let (tally2, _ids, failed2) = import_service::import_summaries_resilient(
+            &db.conn,
+            folder_id,
+            &items,
+            import_service::DeletedPolicy::Skip,
+        )
+        .await;
         assert_eq!(failed2, 0);
         assert_eq!(tally2.imported, 2);
     }

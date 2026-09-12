@@ -44,6 +44,30 @@ async fn build_test_server() -> (TestServer, tempfile::TempDir, tempfile::TempDi
     (server, data_dir, static_dir)
 }
 
+async fn build_test_server_with_state() -> (
+    TestServer,
+    Arc<AppState>,
+    tempfile::TempDir,
+    tempfile::TempDir,
+) {
+    let data_dir = tempfile::tempdir().expect("data dir");
+    let static_dir = tempfile::tempdir().expect("static dir");
+
+    let db = fresh_in_memory_db().await;
+    let state = Arc::new(AppState::new_for_test(db, data_dir.path().to_path_buf()));
+    let shutdown = Arc::new(ShutdownSignal::new());
+
+    let router = build_router(
+        Arc::clone(&state),
+        TEST_TOKEN.to_string(),
+        static_dir.path().to_path_buf(),
+        shutdown,
+    );
+
+    let server = TestServer::new(router).expect("test server");
+    (server, state, data_dir, static_dir)
+}
+
 // ────────────────────────────────────────────────────────────────────────────
 // Auth matrix
 // ────────────────────────────────────────────────────────────────────────────
@@ -1221,6 +1245,7 @@ async fn get_folder_conversation_accepts_turn_window_params() {
         folder_id,
         codeg_lib::models::AgentType::ClaudeCode,
         None,
+        None,
     )
     .await
     .expect("create conversation");
@@ -1354,7 +1379,10 @@ async fn deepseek_model_catalog_is_readable_and_shaped_for_the_panel() {
     assert!(body["exists"].is_boolean(), "got {body}");
     assert!(body["configured"].is_boolean(), "got {body}");
     assert!(body["models"].is_array(), "got {body}");
-    assert!(body["error"].is_string() || body["error"].is_null(), "got {body}");
+    assert!(
+        body["error"].is_string() || body["error"].is_null(),
+        "got {body}"
+    );
 }
 
 #[tokio::test]

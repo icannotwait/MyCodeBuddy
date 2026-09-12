@@ -5423,6 +5423,8 @@ function liveBlockCompatible(
         right.type === "tool_call" &&
         left.info.tool_call_id === right.info.tool_call_id
       )
+    case "steering":
+      return right.type === "steering" && left.id === right.id
   }
 }
 

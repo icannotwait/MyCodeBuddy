@@ -20,6 +20,7 @@ import { useWorkbenchRoute } from "@/contexts/workbench-route-context"
 import {
   useWorkspaceActions,
   useWorkspaceFileTabs,
+  type OpenFileSettleResult,
 } from "@/contexts/workspace-context"
 import { buildFileTabId } from "@/lib/file-tab-id"
 import { findOwningFolder, splitAbsPath } from "@/lib/file-open-target"
@@ -96,8 +97,14 @@ export const FileNode = memo(function FileNode({
   useEffect(() => {
     if (!path || hasTab) return
     let cancelled = false
-    const settle = (absPath: string | null) => {
-      if (!cancelled) setUnresolvable(absPath === null)
+    const settle = (result: OpenFileSettleResult | null) => {
+      // A LOAD failure still produces a tab; only a resolve miss (or a
+      // rejected open) leaves the card with nothing to render.
+      if (!cancelled) {
+        setUnresolvable(
+          result == null || (result.ok === false && result.reason === "resolve")
+        )
+      }
     }
     void openFilePreview(path, { background: true }).then(settle, () =>
       settle(null)

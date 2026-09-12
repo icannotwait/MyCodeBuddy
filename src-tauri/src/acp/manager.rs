@@ -1044,11 +1044,9 @@ const DRAIN_GRACE: std::time::Duration = std::time::Duration::from_secs(30);
 /// ago that it cannot be a spawn still in flight.
 fn prune_reaped(draining: &mut DrainingChildren) {
     draining.retain(|c| {
-        c.pid.load(std::sync::atomic::Ordering::SeqCst) != 0
-            || c.parked_at.elapsed() < DRAIN_GRACE
+        c.pid.load(std::sync::atomic::Ordering::SeqCst) != 0 || c.parked_at.elapsed() < DRAIN_GRACE
     });
 }
-
 
 pub struct ConnectionManager {
     pub(crate) connections: Arc<Mutex<HashMap<String, AgentConnection>>>,
@@ -8142,7 +8140,6 @@ impl ConnectionManager {
         disconnected
     }
 
-
     /// End every live connection running `agent_type` and report how many there
     /// were, not returning until this agent's processes — the ones just ended
     /// AND any it already had exiting — have been put past running, as far as
@@ -8206,14 +8203,10 @@ impl ConnectionManager {
                 .collect()
         };
         let removed = self
-            .take_connections_for_disconnect(
-                planned,
-                AcpDisconnectOrigin::LegacyUnspecified,
-            )
+            .take_connections_for_disconnect(planned, AcpDisconnectOrigin::LegacyUnspecified)
             .await;
         let disconnected = removed.len();
         for (_id, conn) in removed {
-            let _ = conn.cmd_tx.try_send(ConnectionCommand::Disconnect);
             let _ = conn.control_tx.try_send(ConnectionControl::Disconnect);
         }
         tracing::info!(
@@ -9029,9 +9022,7 @@ impl ConnectionManager {
     /// Block new connections from being established until the returned guard
     /// is dropped. The caller must enumerate live connections only AFTER
     /// holding this, never before.
-    pub async fn lock_out_new_connections(
-        &self,
-    ) -> tokio::sync::OwnedRwLockWriteGuard<()> {
+    pub async fn lock_out_new_connections(&self) -> tokio::sync::OwnedRwLockWriteGuard<()> {
         self.external_restore_lock.clone().write_owned().await
     }
 
@@ -16873,6 +16864,7 @@ mod tests {
             BTreeMap::new(),
             SystemTerminalSettings {
                 default_shell: Some("missing-shell".into()),
+                colorize_command_output: false,
             },
         );
         let err = mgr
@@ -16928,6 +16920,7 @@ mod tests {
             BTreeMap::new(),
             SystemTerminalSettings {
                 default_shell: Some("missing-shell".into()),
+                colorize_command_output: false,
             },
         );
         let reused = mgr
@@ -21588,6 +21581,7 @@ mod tests {
             BTreeMap::new(),
             SystemTerminalSettings {
                 default_shell: Some("missing-shell".into()),
+                colorize_command_output: false,
             },
         );
         let id = mgr
@@ -21624,6 +21618,7 @@ mod tests {
             BTreeMap::new(),
             SystemTerminalSettings {
                 default_shell: Some("missing-shell".into()),
+                colorize_command_output: false,
             },
         );
         let err = mgr
@@ -21681,6 +21676,7 @@ mod tests {
                 BTreeMap::new(),
                 SystemTerminalSettings {
                     default_shell: Some(path_a.to_string_lossy().into_owned()),
+                    colorize_command_output: false,
                 },
             ),
             AgentType::ClaudeCode,
@@ -21692,6 +21688,7 @@ mod tests {
                 BTreeMap::new(),
                 SystemTerminalSettings {
                     default_shell: Some(path_b.to_string_lossy().into_owned()),
+                    colorize_command_output: false,
                 },
             ),
             AgentType::ClaudeCode,
@@ -21731,6 +21728,7 @@ mod tests {
                     BTreeMap::new(),
                     SystemTerminalSettings {
                         default_shell: Some(path_b.to_string_lossy().into_owned()),
+                        colorize_command_output: false,
                     },
                 ),
                 "test-window".into(),
@@ -23633,7 +23631,10 @@ mod tests {
         // (e.g. its session started before the feature was enabled), even mid-turn.
         let state = mgr.get_state("c1").await.unwrap();
         state.write().await.turn_in_flight = true;
-        let err = mgr.submit_feedback("c1", "note".into(), None).await.unwrap_err();
+        let err = mgr
+            .submit_feedback("c1", "note".into(), None)
+            .await
+            .unwrap_err();
         assert!(matches!(err, AcpError::FeedbackDisabled));
         assert!(state.read().await.feedback.is_empty());
     }
@@ -23645,7 +23646,10 @@ mod tests {
             .await;
         // Tool available but no turn in flight → nothing to steer.
         set_feedback_tool_available(&mgr, "c1").await;
-        let err = mgr.submit_feedback("c1", "note".into(), None).await.unwrap_err();
+        let err = mgr
+            .submit_feedback("c1", "note".into(), None)
+            .await
+            .unwrap_err();
         assert!(matches!(err, AcpError::NoActiveTurn));
         // And nothing was appended.
         let state = mgr.get_state("c1").await.unwrap();
@@ -23689,7 +23693,10 @@ mod tests {
         mark_feedback_ready(&mgr, "c1").await;
         // Empty / whitespace-only → rejected, nothing appended.
         for empty in ["", "   ", "\n\t "] {
-            let err = mgr.submit_feedback("c1", empty.into(), None).await.unwrap_err();
+            let err = mgr
+                .submit_feedback("c1", empty.into(), None)
+                .await
+                .unwrap_err();
             assert!(matches!(err, AcpError::InvalidFeedback(_)));
         }
         // Oversized → rejected.
@@ -23700,7 +23707,11 @@ mod tests {
         let at_bound = "y".repeat(MAX_FEEDBACK_CHARS);
         assert!(mgr.submit_feedback("c1", at_bound, None).await.is_ok());
         let state = mgr.get_state("c1").await.unwrap();
-        assert_eq!(state.read().await.feedback.len(), 1, "only the valid note stuck");
+        assert_eq!(
+            state.read().await.feedback.len(),
+            1,
+            "only the valid note stuck"
+        );
     }
 
     // --- native steering (push channel) ----------------------------------
@@ -23810,7 +23821,10 @@ mod tests {
         set_feedback_tool_available(&mgr, "c1").await;
         let fake_loop = answer_steer(rx, Ok(SteerOutcome::Injected));
 
-        let item = mgr.submit_feedback("c1", "  ship it  ".into(), None).await.unwrap();
+        let item = mgr
+            .submit_feedback("c1", "  ship it  ".into(), None)
+            .await
+            .unwrap();
         assert_eq!(item.status, FeedbackStatus::Delivered);
         assert!(item.delivered_at.is_some());
         assert_eq!(item.text, "ship it");
@@ -24089,6 +24103,9 @@ mod tests {
             session_id: "ext".into(),
             stop_reason: "end_turn".into(),
             agent_type: "claude_code".into(),
+            mark_awaiting_reply: true,
+            termination_source: None,
+            provider_turn_id: None,
         });
         // A next turn re-sets the flag, exactly as `send_prompt_inner` does.
         state.write().await.turn_in_flight = true;
@@ -24135,7 +24152,10 @@ mod tests {
         mark_native_steering_ready(&mgr, "c1").await;
         let fake_loop = answer_steer(rx, Ok(SteerOutcome::PromptRequired));
 
-        let err = mgr.submit_feedback("c1", "note".into(), None).await.unwrap_err();
+        let err = mgr
+            .submit_feedback("c1", "note".into(), None)
+            .await
+            .unwrap_err();
         assert!(matches!(err, AcpError::NoActiveTurn));
         let _ = fake_loop.await;
 
@@ -24159,7 +24179,10 @@ mod tests {
 
         // The adapter ignored the opt-in: content consumed → recorded
         // Delivered (never resent), and the session downgrades to pull.
-        let item = mgr.submit_feedback("c1", "note one".into(), None).await.unwrap();
+        let item = mgr
+            .submit_feedback("c1", "note one".into(), None)
+            .await
+            .unwrap();
         assert_eq!(item.status, FeedbackStatus::Delivered);
         let _ = fake_loop.await;
         let state = mgr.get_state("c1").await.unwrap();
@@ -24171,7 +24194,10 @@ mod tests {
         // The NEXT note rides the pull path: lands Pending, no Steer command
         // (the loop receiver was consumed above — a native attempt would fail
         // on the dead channel, so an Ok(Pending) proves the pull branch ran).
-        let second = mgr.submit_feedback("c1", "note two".into(), None).await.unwrap();
+        let second = mgr
+            .submit_feedback("c1", "note two".into(), None)
+            .await
+            .unwrap();
         assert_eq!(second.status, FeedbackStatus::Pending);
         let pending = mgr.read_pending_feedback("c1").await;
         assert_eq!(pending.len(), 1);
@@ -24204,7 +24230,10 @@ mod tests {
             }
         });
 
-        let item = mgr.submit_feedback("c1", "late note".into(), None).await.unwrap();
+        let item = mgr
+            .submit_feedback("c1", "late note".into(), None)
+            .await
+            .unwrap();
         assert_eq!(item.status, FeedbackStatus::Delivered);
         let _ = fake_loop.await;
         assert_eq!(state.read().await.feedback.len(), 1);
@@ -24286,7 +24315,10 @@ mod tests {
         mark_native_steering_ready(&mgr, "c1").await;
         // feedback_tool_available stays false.
         let fake_loop = answer_steer(rx, Ok(SteerOutcome::Injected));
-        let item = mgr.submit_feedback("c1", "no tool needed".into(), None).await.unwrap();
+        let item = mgr
+            .submit_feedback("c1", "no tool needed".into(), None)
+            .await
+            .unwrap();
         assert_eq!(item.status, FeedbackStatus::Delivered);
         let _ = fake_loop.await;
     }

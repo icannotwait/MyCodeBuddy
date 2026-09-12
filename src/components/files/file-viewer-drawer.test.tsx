@@ -180,7 +180,7 @@ describe("FileViewerDrawer", () => {
     vi.clearAllMocks()
     state.fileTabs = []
     state.previewFileTabIds = new Set()
-    mockOpenFilePreview.mockResolvedValue(ABS_PATH)
+    mockOpenFilePreview.mockResolvedValue({ ok: true, tabId: TAB_ID })
   })
 
   it("opens through the shared file tab and renders the one it created", async () => {
@@ -448,9 +448,10 @@ describe("FileViewerDrawer", () => {
     })
     state.fileTabs = [tab({}), nextTab]
     state.previewFileTabIds = new Set([TAB_ID, nextTab.id])
-    mockOpenFilePreview.mockImplementation(async (raw: string) =>
-      raw.startsWith("/") ? raw : ABS_PATH
-    )
+    mockOpenFilePreview.mockImplementation(async (raw: string) => {
+      const path = raw.startsWith("/") ? raw : ABS_PATH
+      return { ok: true as const, tabId: buildFileTabId({ kind: "file", path }) }
+    })
 
     await open({ path: "docs/plan.md", line: null })
     expect(screen.queryByTitle("back")).not.toBeInTheDocument()

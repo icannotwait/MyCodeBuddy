@@ -470,7 +470,7 @@ export function TerminalView({
       // Spawn the terminal AFTER subscribing to events
       if (!attached) {
         try {
-          await terminalSpawn(workingDir, shell, initialCommand, terminalId)
+          await terminalSpawn(workingDir, initialCommand, terminalId)
           // spawn 成功 ⇒ 这个 id 上此前没有 PTY，缓冲里只可能是我们刚起的这个
           // 进程的头几个字节，没有任何东西需要去重。
           flushReplay(null)
@@ -560,7 +560,7 @@ export function TerminalView({
       cancelled = true
       cleanup?.()
     }
-  }, [terminalId, workingDir, shell, initialCommand, attach])
+  }, [terminalId, workingDir, initialCommand, attach])
 
   // Refit and focus when becoming active or panel becomes visible
   useEffect(() => {
