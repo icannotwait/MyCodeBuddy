@@ -450,7 +450,10 @@ describe("FileViewerDrawer", () => {
     state.previewFileTabIds = new Set([TAB_ID, nextTab.id])
     mockOpenFilePreview.mockImplementation(async (raw: string) => {
       const path = raw.startsWith("/") ? raw : ABS_PATH
-      return { ok: true as const, tabId: buildFileTabId({ kind: "file", path }) }
+      return {
+        ok: true as const,
+        tabId: buildFileTabId({ kind: "file", path }),
+      }
     })
 
     await open({ path: "docs/plan.md", line: null })
