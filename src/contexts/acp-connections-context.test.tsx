@@ -6933,6 +6933,210 @@ describe("out-of-turn wire guard + background activity", () => {
     resetConversationRuntimeStore()
   })
 
+  it("cold-attaches a Cursor leftover live turn by refetching detail", async () => {
+    const { useConversationRuntimeStore, resetConversationRuntimeStore } =
+      await import("@/stores/conversation-runtime-store")
+    resetConversationRuntimeStore()
+
+    const leftover: LiveMessage = {
+      id: "acp:cursor-conn:19",
+      role: "assistant",
+      content: [{ type: "text", text: "stuck after cursor reconnect" }],
+      startedAt: Date.parse("2026-09-11T06:27:00.000Z"),
+    }
+    const actions = useConversationRuntimeStore.getState().actions
+    actions.setExternalId(42, "sess-1")
+    actions.appendOptimisticTurn(
+      42,
+      {
+        id: "user-cursor-cold",
+        role: "user",
+        blocks: [{ type: "text", text: "cursor prompt" }],
+        timestamp: "2026-09-11T06:26:00.000Z",
+      },
+      "user-cursor-cold"
+    )
+    actions.setLiveMessage(42, leftover, true)
+    const refetchDetail = vi
+      .spyOn(actions, "refetchDetail")
+      .mockImplementation(() => {})
+
+    try {
+      h.acpFindConnectionForConversation.mockResolvedValue(null)
+      await mountProvider()
+      await act(async () => {
+        await h.actions!.connect(TAB, "cursor", "/tmp/x", "sess-1", 42)
+      })
+      const handlers = latestAttachHandlers()
+      h.denormalizeSnapshot.mockReturnValueOnce({
+        ...h.denormalizeSnapshot(),
+        connectionId: "spawned-conn",
+        conversationId: 42,
+        status: "connected",
+        sessionId: "sess-1",
+        eventSeq: 5,
+        liveMessage: null,
+        backgroundDetailRevision: 0,
+        backgroundTranscriptGeneration: 0,
+      })
+
+      hydrateSnapshot(handlers, {
+        event_seq: 5,
+      } as unknown as LiveSessionSnapshot)
+
+      expect(refetchDetail).toHaveBeenCalledWith(42, {
+        preserveLive: true,
+      })
+    } finally {
+      refetchDetail.mockRestore()
+      resetConversationRuntimeStore()
+    }
+  })
+
+  it("settles leftover Prompting on Cursor cold attach when the snapshot has no live turn", async () => {
+    const { useConversationRuntimeStore, resetConversationRuntimeStore } =
+      await import("@/stores/conversation-runtime-store")
+    resetConversationRuntimeStore()
+
+    const leftover: LiveMessage = {
+      id: "acp:cursor-conn:19",
+      role: "assistant",
+      content: [{ type: "text", text: "already finished on the backend" }],
+      startedAt: Date.parse("2026-09-11T05:33:51.000Z"),
+    }
+    const actions = useConversationRuntimeStore.getState().actions
+    actions.setExternalId(42, "sess-1")
+    actions.appendOptimisticTurn(
+      42,
+      {
+        id: "user-cursor-prompting",
+        role: "user",
+        blocks: [{ type: "text", text: "finished before reconnect" }],
+        timestamp: "2026-09-11T05:27:00.000Z",
+      },
+      "user-cursor-prompting"
+    )
+    actions.setLiveMessage(42, leftover, true)
+    const refetchDetail = vi
+      .spyOn(actions, "refetchDetail")
+      .mockImplementation(() => {})
+
+    try {
+      h.acpFindConnectionForConversation.mockResolvedValue(null)
+      await mountProvider()
+      await act(async () => {
+        await h.actions!.connect(TAB, "cursor", "/tmp/x", "sess-1", 42)
+      })
+      const handlers = latestAttachHandlers()
+      h.denormalizeSnapshot.mockReturnValueOnce({
+        ...h.denormalizeSnapshot(),
+        connectionId: "spawned-conn",
+        conversationId: 42,
+        status: "prompting",
+        sessionId: "sess-1",
+        eventSeq: 5,
+        liveMessage: null,
+        backgroundDetailRevision: 0,
+        backgroundTranscriptGeneration: 0,
+      })
+
+      hydrateSnapshot(handlers, {
+        event_seq: 5,
+      } as unknown as LiveSessionSnapshot)
+
+      expect(refetchDetail).toHaveBeenCalledWith(42, {
+        preserveLive: true,
+      })
+      expect(h.store!.getConnection(TAB)?.status).toBe("connected")
+      const runtime = useConversationRuntimeStore
+        .getState()
+        .byConversationId.get(42)
+      expect(runtime?.liveMessage).toBeNull()
+      expect(runtime?.syncState).toBe("idle")
+      expect(
+        runtime?.localTurns.some(
+          (turn) =>
+            turn.role === "assistant" &&
+            turn.blocks.some(
+              (block) =>
+                block.type === "text" &&
+                block.text === "already finished on the backend"
+            )
+        )
+      ).toBe(true)
+    } finally {
+      refetchDetail.mockRestore()
+      resetConversationRuntimeStore()
+    }
+  })
+
+  it("does not refetch leftover live on a later snapshot of the same attach", async () => {
+    const { useConversationRuntimeStore, resetConversationRuntimeStore } =
+      await import("@/stores/conversation-runtime-store")
+    resetConversationRuntimeStore()
+
+    const actions = useConversationRuntimeStore.getState().actions
+    actions.setExternalId(42, "sess-1")
+    const refetchDetail = vi
+      .spyOn(actions, "refetchDetail")
+      .mockImplementation(() => {})
+
+    try {
+      h.acpFindConnectionForConversation.mockResolvedValue(null)
+      await mountProvider()
+      await act(async () => {
+        await h.actions!.connect(TAB, "cursor", "/tmp/x", "sess-1", 42)
+      })
+      const handlers = latestAttachHandlers()
+      h.denormalizeSnapshot.mockReturnValue({
+        ...h.denormalizeSnapshot(),
+        connectionId: "spawned-conn",
+        conversationId: 42,
+        status: "connected",
+        sessionId: "sess-1",
+        eventSeq: 5,
+        liveMessage: null,
+        backgroundDetailRevision: 0,
+        backgroundTranscriptGeneration: 0,
+      })
+
+      hydrateSnapshot(handlers, {
+        event_seq: 5,
+      } as unknown as LiveSessionSnapshot)
+      expect(refetchDetail).not.toHaveBeenCalled()
+
+      actions.setLiveMessage(
+        42,
+        {
+          id: "acp:cursor-conn:40",
+          role: "assistant",
+          content: [{ type: "text", text: "later leftover" }],
+          startedAt: Date.now(),
+        },
+        true
+      )
+      h.denormalizeSnapshot.mockReturnValue({
+        ...h.denormalizeSnapshot(),
+        connectionId: "spawned-conn",
+        conversationId: 42,
+        status: "connected",
+        sessionId: "sess-1",
+        eventSeq: 8,
+        liveMessage: null,
+        backgroundDetailRevision: 0,
+        backgroundTranscriptGeneration: 0,
+      })
+      hydrateSnapshot(handlers, {
+        event_seq: 8,
+      } as unknown as LiveSessionSnapshot)
+
+      expect(refetchDetail).not.toHaveBeenCalled()
+    } finally {
+      refetchDetail.mockRestore()
+      resetConversationRuntimeStore()
+    }
+  })
+
   it("does NOT arm the syncing-results hint for a wire-visible (#870-held) settle", async () => {
     const { resetConversationRuntimeStore } =
       await import("@/stores/conversation-runtime-store")
