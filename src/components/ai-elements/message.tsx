@@ -46,12 +46,14 @@ import { remarkTrimCjkAutolinkTail } from "./remark-cjk-autolink-tail"
 import { remarkRewriteFileUriLinks } from "./remark-file-uri-links"
 import {
   detectHeavyPlugins,
+  MATH_FENCE_PAD,
   policyFor,
   type RichContentState,
   useStreamdownPlugins,
 } from "./streamdown-plugins"
 import { remarkRestoreWindowsPaths } from "./remark-windows-paths"
-import { MATH_FENCE_PAD } from "./streamdown-plugins"
+import { remarkLocalImages } from "./remark-local-images"
+import { markdownLocalImageComponents } from "./markdown-local-image"
 
 export type MessageProps = HTMLAttributes<HTMLDivElement> & {
   from: UIMessage["role"]
@@ -487,6 +489,7 @@ const remarkPlugins = [
   ...Object.values(defaultRemarkPlugins),
   // Before remarkRewriteFileUriLinks, which reshapes a drive path's url.
   remarkRestoreWindowsPaths,
+  remarkLocalImages,
   remarkRewriteFileUriLinks,
   remarkTrimCjkAutolinkTail,
 ]
@@ -496,6 +499,24 @@ const remarkPluginsWithLocalPaths = [
   // Link only the tree CommonMark produced. Restore lossy Windows separators
   // afterwards so a repair can improve visible text without turning a path
   // whose markup was already consumed into an unsafe partial link.
+  remarkAutolinkLocalPaths,
+  remarkRestoreWindowsPaths,
+  remarkLocalImages,
+  remarkRewriteFileUriLinks,
+  remarkTrimCjkAutolinkTail,
+]
+
+// Grok session images are retagged in rehype after harden. remarkLocalImages
+// would consume those nodes first and the scoped pipeline would never see them.
+const remarkPluginsForGrokSessionImages = [
+  ...Object.values(defaultRemarkPlugins),
+  remarkRestoreWindowsPaths,
+  remarkRewriteFileUriLinks,
+  remarkTrimCjkAutolinkTail,
+]
+
+const remarkPluginsForGrokSessionImagesWithLocalPaths = [
+  ...Object.values(defaultRemarkPlugins),
   remarkAutolinkLocalPaths,
   remarkRestoreWindowsPaths,
   remarkRewriteFileUriLinks,
@@ -517,6 +538,7 @@ type StreamdownComponents = NonNullable<
 
 const linkComponents = {
   ...markdownLinkComponents,
+  ...markdownLocalImageComponents,
   ...mermaidComponents,
 } as StreamdownComponents
 const grokSessionImageComponents = {
@@ -635,6 +657,17 @@ function MessageResponseImpl({
       <Streamdown
         className={cn(
           "size-full [&>*:first-child]:mt-0 [&>*:last-child]:mb-0 [&_ul]:list-disc [&_ol]:list-decimal [&_ul]:pl-3 [&_ol]:pl-3",
+          // Streamdown gives `blockquote` its own `border-l-4
+          // border-muted-foreground/30 … italic`, but those class names live in
+          // node_modules, which Tailwind v4 does not scan — so the two border
+          // utilities generate no CSS and a quote renders as bare indented text
+          // with no rule (the `pl-4`/`my-4`/`text-muted-foreground` on the same
+          // element only survive because they happen to be used elsewhere in src).
+          // Re-declare the rule here, where it IS scanned; the descendant selector
+          // also outranks Streamdown's plain utility class. No `pl-*` — its `pl-4`
+          // already works and a same-specificity duplicate would be a coin flip.
+          // Upright, not italic: CJK has no true italic, so a browser fakes it by
+          // skewing, which looks broken.
           "[&_blockquote]:border-l-2 [&_blockquote]:border-border [&_blockquote]:not-italic",
           className
         )}
@@ -645,12 +678,18 @@ function MessageResponseImpl({
         // App-selected remark plugins are authoritative so a caller's
         // remarkPlugins array cannot disable autolinkLocalPaths opt-in.
         remarkPlugins={
-          autolinkLocalPaths ? remarkPluginsWithLocalPaths : remarkPlugins
+          grokScope
+            ? autolinkLocalPaths
+              ? remarkPluginsForGrokSessionImagesWithLocalPaths
+              : remarkPluginsForGrokSessionImages
+            : autolinkLocalPaths
+              ? remarkPluginsWithLocalPaths
+              : remarkPlugins
         }
         mode={mode}
         parseIncompleteMarkdown={parseIncompleteMarkdown}
         // Merge after spreading props so a caller can still override other
-        // elements, but app link routing and Mermaid rendering always win.
+        // elements, but app link routing, local images, and Mermaid always win.
         components={components}
       >
         {normalized}

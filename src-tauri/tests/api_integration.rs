@@ -44,6 +44,30 @@ async fn build_test_server() -> (TestServer, tempfile::TempDir, tempfile::TempDi
     (server, data_dir, static_dir)
 }
 
+async fn build_test_server_with_state() -> (
+    TestServer,
+    Arc<AppState>,
+    tempfile::TempDir,
+    tempfile::TempDir,
+) {
+    let data_dir = tempfile::tempdir().expect("data dir");
+    let static_dir = tempfile::tempdir().expect("static dir");
+
+    let db = fresh_in_memory_db().await;
+    let state = Arc::new(AppState::new_for_test(db, data_dir.path().to_path_buf()));
+    let shutdown = Arc::new(ShutdownSignal::new());
+
+    let router = build_router(
+        Arc::clone(&state),
+        TEST_TOKEN.to_string(),
+        static_dir.path().to_path_buf(),
+        shutdown,
+    );
+
+    let server = TestServer::new(router).expect("test server");
+    (server, state, data_dir, static_dir)
+}
+
 // ────────────────────────────────────────────────────────────────────────────
 // Auth matrix
 // ────────────────────────────────────────────────────────────────────────────
@@ -1204,4 +1228,169 @@ async fn close_folder_if_empty_route_returns_false_for_nonempty_without_emit() {
         rx.try_recv().is_err(),
         "non-empty conditional close must not emit"
     );
+}
+
+#[tokio::test]
+async fn get_folder_conversation_accepts_turn_window_params() {
+    let (server, state, _data, _static) = build_test_server_with_state().await;
+    let folder_id = codeg_lib::db::service::folder_service::add_folder(
+        &state.db.conn,
+        "/tmp/codeg-window-param-test",
+    )
+    .await
+    .expect("seed folder")
+    .id;
+    let conv_id = codeg_lib::commands::conversations::create_conversation_core(
+        &state.db.conn,
+        folder_id,
+        codeg_lib::models::AgentType::ClaudeCode,
+        None,
+        None,
+    )
+    .await
+    .expect("create conversation");
+
+    // tailTurns → windowed response: marker fields present even for an empty
+    // transcript (offset/total 0, fingerprint = seed).
+    let resp = server
+        .post("/api/get_folder_conversation")
+        .add_header("authorization", format!("Bearer {TEST_TOKEN}"))
+        .json(&json!({ "conversationId": conv_id, "tailTurns": 50 }))
+        .await;
+    assert_eq!(resp.status_code(), 200);
+    let body = resp.json::<Value>();
+    assert_eq!(body["turns_offset"], 0);
+    assert_eq!(body["turns_total"], 0);
+    assert_eq!(body["assistant_turns_before_offset"], 0);
+    assert!(body["prefix_hash"].is_string());
+
+    // No params → legacy full response: none of the window fields serialize.
+    let resp = server
+        .post("/api/get_folder_conversation")
+        .add_header("authorization", format!("Bearer {TEST_TOKEN}"))
+        .json(&json!({ "conversationId": conv_id }))
+        .await;
+    assert_eq!(resp.status_code(), 200);
+    let body = resp.json::<Value>();
+    assert!(body.get("turns_offset").is_none());
+    assert!(body.get("prefix_hash").is_none());
+
+    // Both selectors → invalid input.
+    let resp = server
+        .post("/api/get_folder_conversation")
+        .add_header("authorization", format!("Bearer {TEST_TOKEN}"))
+        .json(&json!({ "conversationId": conv_id, "tailTurns": 5, "fromIndex": 3 }))
+        .await;
+    assert!(
+        resp.status_code().is_client_error(),
+        "tailTurns+fromIndex must be rejected, got {}",
+        resp.status_code()
+    );
+
+    // Turns page endpoint responds with the seam fields.
+    let resp = server
+        .post("/api/get_folder_conversation_turns")
+        .add_header("authorization", format!("Bearer {TEST_TOKEN}"))
+        .json(&json!({ "conversationId": conv_id, "beforeIndex": 10, "limit": 5 }))
+        .await;
+    assert_eq!(resp.status_code(), 200);
+    let body = resp.json::<Value>();
+    assert_eq!(body["turns_total"], 0);
+    assert!(body["prefix_hash"].is_string());
+    assert!(body["prefix_hash_before_index"].is_string());
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// codeg-mcp service status
+// ────────────────────────────────────────────────────────────────────────────
+
+/// The status endpoint has to answer even in a runtime that never bound a
+/// broker socket — that IS the "not running" case the workspace indicator
+/// exists to show, so a 500 here would blind exactly the situation it reports.
+/// `AppState::new_for_test` installs no service handle, which is that runtime.
+#[tokio::test]
+async fn codeg_mcp_service_status_reports_a_socketless_runtime_as_stopped() {
+    let (server, _data, _static) = build_test_server().await;
+    let resp = server
+        .post("/api/get_codeg_mcp_service_status")
+        .add_header("authorization", format!("Bearer {TEST_TOKEN}"))
+        .json(&json!({}))
+        .await;
+    assert_eq!(resp.status_code(), 200);
+    let body = resp.json::<Value>();
+    assert_eq!(body["state"], "stopped");
+    assert_eq!(body["listening"], false);
+    // No handle ⇒ nothing this process can start; the UI hides its button on
+    // this flag rather than offering one that can only fail.
+    assert_eq!(body["can_start"], false);
+    // The switches ride along regardless of socket health, so the popover can
+    // explain a healthy-but-toolless service without a second round trip.
+    let groups = body["tool_groups"].as_array().expect("tool_groups array");
+    let keys: Vec<&str> = groups.iter().filter_map(|g| g["key"].as_str()).collect();
+    assert!(keys.contains(&"delegation"), "got {keys:?}");
+    assert!(keys.contains(&"feedback"), "got {keys:?}");
+}
+
+/// Starting without a handle must fail loudly rather than report success the
+/// UI would then paint as a running service.
+#[tokio::test]
+async fn starting_codeg_mcp_service_without_a_handle_is_rejected() {
+    let (server, _data, _static) = build_test_server().await;
+    let resp = server
+        .post("/api/start_codeg_mcp_service")
+        .add_header("authorization", format!("Bearer {TEST_TOKEN}"))
+        .json(&json!({}))
+        .await;
+    assert_eq!(resp.status_code(), 422);
+}
+
+#[tokio::test]
+async fn codeg_mcp_service_status_requires_a_token() {
+    let (server, _data, _static) = build_test_server().await;
+    let resp = server
+        .post("/api/get_codeg_mcp_service_status")
+        .json(&json!({}))
+        .await;
+    assert_eq!(resp.status_code(), 401);
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// DeepSeek Harness model catalog
+//
+// Read-only side only: the update route writes the caller's real
+// `$DSH_HOME/settings.yaml`, which a test must never do. The assertions stay
+// content-agnostic for the same reason — the host may or may not have a
+// harness settings document, and either is a valid answer here.
+// ────────────────────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn deepseek_model_catalog_is_readable_and_shaped_for_the_panel() {
+    let (server, _data, _static) = build_test_server().await;
+    let resp = server
+        .post("/api/acp_load_deepseek_model_catalog")
+        .add_header("authorization", format!("Bearer {TEST_TOKEN}"))
+        .json(&json!({}))
+        .await;
+    assert_eq!(resp.status_code(), 200);
+    let body: Value = resp.json();
+    // camelCase on the wire, and every field the panel branches on is present
+    // — a missing document is reported in-band, never as an error status.
+    assert!(body["path"].is_string(), "got {body}");
+    assert!(body["exists"].is_boolean(), "got {body}");
+    assert!(body["configured"].is_boolean(), "got {body}");
+    assert!(body["models"].is_array(), "got {body}");
+    assert!(
+        body["error"].is_string() || body["error"].is_null(),
+        "got {body}"
+    );
+}
+
+#[tokio::test]
+async fn deepseek_model_catalog_requires_a_token() {
+    let (server, _data, _static) = build_test_server().await;
+    let resp = server
+        .post("/api/acp_load_deepseek_model_catalog")
+        .json(&json!({}))
+        .await;
+    assert_eq!(resp.status_code(), 401);
 }

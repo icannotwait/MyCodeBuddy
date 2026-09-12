@@ -50,6 +50,8 @@ pub mod session_title;
 pub mod shared_session;
 pub mod stderr_tail;
 pub mod streaming_performance;
+#[cfg(test)]
+mod sync_invariants;
 pub mod terminal_adapter;
 pub mod terminal_assoc;
 pub mod terminal_context;

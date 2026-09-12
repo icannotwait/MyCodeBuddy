@@ -99,6 +99,35 @@ pub async fn fresh_in_memory_db() -> AppDatabase {
     AppDatabase { conn }
 }
 
+/// Opt a built-in agent in. Fresh `agent_setting` rows start disabled; tests that
+/// spawn hidden title/translate runners or persist a translate agent need this.
+pub async fn enable_agent_for_test(db: &AppDatabase, agent_type: AgentType) {
+    let registry_id = crate::acp::registry::registry_id_for(agent_type).to_string();
+    crate::db::service::agent_setting_service::ensure_defaults(
+        &db.conn,
+        &[
+            crate::db::service::agent_setting_service::AgentDefaultInput {
+                agent_type,
+                registry_id,
+                default_sort_order: 0,
+            },
+        ],
+    )
+    .await
+    .expect("seed agent setting");
+    crate::db::service::agent_setting_service::update(
+        &db.conn,
+        agent_type,
+        crate::db::service::agent_setting_service::AgentSettingsUpdate {
+            enabled: true,
+            env_json: None,
+            model_provider_id: None,
+        },
+    )
+    .await
+    .expect("enable agent");
+}
+
 /// Open a database before v2-only triggers, with current-entity compatibility migrations.
 pub async fn historical_completion_protocol_db_before_v2_only() -> AppDatabase {
     let conn = Database::connect("sqlite::memory:")

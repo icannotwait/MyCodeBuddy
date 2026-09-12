@@ -19,6 +19,9 @@ vi.mock("./status-bar-alerts", () => ({
 vi.mock("./status-bar-update", () => ({
   StatusBarUpdate: () => <span data-testid="status-bar-update" />,
 }))
+vi.mock("./status-bar-mcp", () => ({
+  StatusBarMcp: () => <span data-testid="status-bar-mcp" />,
+}))
 vi.mock("./command-dropdown", () => ({
   CommandDropdown: () => <span data-testid="command-dropdown" />,
 }))

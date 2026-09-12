@@ -2,7 +2,7 @@
 //! Tauri commands in `commands::delegation`.
 //!
 //! Both endpoints share the same core helpers (`load_delegation_settings`,
-//! `set_delegation_settings_core`) so the clamp + persist + broker
+//! `set_delegation_settings_live`) so the clamp + persist + broker
 //! re-apply behavior stays identical across transports.
 
 use std::sync::Arc;
@@ -16,10 +16,10 @@ use crate::app_state::AppState;
 use crate::commands::delegation::{
     get_delegation_run_snapshot_core, load_delegation_profile_catalog, load_delegation_profiles,
     load_delegation_settings, set_delegation_bundle_core, set_delegation_profiles_core,
-    set_delegation_settings_core, DelegationBundle, DelegationRunSnapshot, DelegationSettings,
+    set_delegation_settings_live, DelegationBundle, DelegationRunSnapshot, DelegationSettings,
     DELEGATION_PROFILE_CATALOG_CHANGED_EVENT,
 };
-use crate::web::event_bridge::emit_event;
+use crate::web::event_bridge::{emit_event, DELEGATION_SETTINGS_CHANGED_EVENT};
 
 pub async fn get_delegation_settings(
     Extension(state): Extension<Arc<AppState>>,
@@ -57,7 +57,7 @@ pub async fn set_delegation_settings(
     Extension(state): Extension<Arc<AppState>>,
     Json(params): Json<SetDelegationSettingsParams>,
 ) -> Result<Json<DelegationSettings>, AppCommandError> {
-    let mutation = set_delegation_settings_core(
+    let mutation = set_delegation_settings_live(
         &state.db.conn,
         &state.delegation_broker,
         &state.delegation_runtime_settings,
@@ -69,6 +69,11 @@ pub async fn set_delegation_settings(
         &state.emitter,
         DELEGATION_PROFILE_CATALOG_CHANGED_EVENT,
         mutation.catalog,
+    );
+    emit_event(
+        &state.emitter,
+        DELEGATION_SETTINGS_CHANGED_EVENT,
+        &mutation.value,
     );
     Ok(Json(mutation.value))
 }
@@ -126,6 +131,11 @@ pub async fn set_delegation_bundle(
         &state.emitter,
         DELEGATION_PROFILE_CATALOG_CHANGED_EVENT,
         mutation.catalog,
+    );
+    emit_event(
+        &state.emitter,
+        DELEGATION_SETTINGS_CHANGED_EVENT,
+        &mutation.value.settings,
     );
     Ok(Json(mutation.value))
 }

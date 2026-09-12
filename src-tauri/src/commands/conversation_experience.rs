@@ -1225,6 +1225,7 @@ mod tests {
     async fn independent_setters_preserve_the_other_field_and_advance_revision() {
         with_settings_isolation(async {
             let db = crate::db::test_helpers::fresh_in_memory_db().await;
+            crate::db::test_helpers::enable_agent_for_test(&db, AgentType::ClaudeCode).await;
 
             let first =
                 set_document_translate_agent_persisted_core(&db, Some(AgentType::ClaudeCode))
@@ -1279,6 +1280,7 @@ mod tests {
             let db = crate::db::init_database(temp.path(), "settings-concurrency-test")
                 .await
                 .expect("open pooled WAL database");
+            crate::db::test_helpers::enable_agent_for_test(&db, AgentType::ClaudeCode).await;
 
             let (agent_result, limit_result) = tokio::join!(
                 set_document_translate_agent_persisted_core(&db, Some(AgentType::ClaudeCode)),
@@ -1508,6 +1510,7 @@ mod tests {
     async fn set_document_translate_agent_writes_new_key_not_title_fields() {
         with_settings_isolation(async {
             let db = fresh_in_memory_db().await;
+            crate::db::test_helpers::enable_agent_for_test(&db, AgentType::ClaudeCode).await;
             let saved =
                 set_document_translate_agent_persisted_core(&db, Some(AgentType::ClaudeCode))
                     .await

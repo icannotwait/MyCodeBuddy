@@ -173,13 +173,13 @@ describe("MessageResponse", () => {
     )
     expect(screen.getByTestId("streamdown-root")).toHaveAttribute(
       "data-remark-plugin-count",
-      "3"
+      "4"
     )
 
     rerender(<MessageResponse autolinkLocalPaths>plain</MessageResponse>)
     expect(screen.getByTestId("streamdown-root")).toHaveAttribute(
       "data-remark-plugin-count",
-      "4"
+      "5"
     )
   })
 

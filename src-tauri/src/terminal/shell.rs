@@ -201,6 +201,7 @@ pub(crate) fn resolve_from_candidates(
         return Ok(ResolvedShellSnapshot {
             selection_key: terminal_shell_selection_key(&SystemTerminalSettings {
                 default_shell: Some(value.to_string()),
+                colorize_command_output: false,
             }),
             spec,
         });
@@ -214,6 +215,7 @@ pub(crate) fn resolve_from_candidates(
                 return Ok(ResolvedShellSnapshot {
                     selection_key: terminal_shell_selection_key(&SystemTerminalSettings {
                         default_shell: None,
+                        colorize_command_output: false,
                     }),
                     spec,
                 });
@@ -721,10 +723,12 @@ mod tests {
     fn selection_key_distinguishes_system_and_explicit() {
         assert_ne!(
             terminal_shell_selection_key(&SystemTerminalSettings {
-                default_shell: None
+                default_shell: None,
+                colorize_command_output: false,
             }),
             terminal_shell_selection_key(&SystemTerminalSettings {
                 default_shell: Some("cmd.exe".into()),
+                colorize_command_output: false,
             })
         );
     }

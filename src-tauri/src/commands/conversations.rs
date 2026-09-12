@@ -711,6 +711,10 @@ struct ScanFolderRow {
     path: String,
     name: String,
     deleted: bool,
+    /// The root folder this row was registered under, when it is a worktree
+    /// child. Import reconciliation uses it to flatten and validate new parent
+    /// relationships.
+    parent_id: Option<i32>,
 }
 
 async fn load_folder_rows(
@@ -729,6 +733,7 @@ async fn load_folder_rows(
             path: f.path,
             name: f.name,
             deleted: f.deleted_at.is_some(),
+            parent_id: f.parent_id,
         })
         .collect())
 }
@@ -747,6 +752,47 @@ fn index_folder_rows(rows: &[ScanFolderRow]) -> HashMap<String, &ScanFolderRow> 
         }
     }
     index
+}
+
+/// The main working tree an imported session's cwd belongs to, as a
+/// [`normalize_path_for_matching`] key — `None` when the cwd is not a linked git
+/// worktree (a plain repo, a submodule, a directory that is gone), which is
+/// top-level by definition.
+///
+/// Resolving the ROOT rather than a folder id keeps the "is this a worktree"
+/// question separate from "is that repo a folder codeg has", which the importer
+/// answers later and against folders it may not have created yet.
+fn worktree_root_key(path: &str) -> Option<String> {
+    let root = crate::git_repo::main_worktree_root(std::path::Path::new(path))?;
+    let key = normalize_path_for_matching(&root.to_string_lossy());
+    // Nothing may be its own parent: the sidebar drops a self-parented folder
+    // from the top level and then renders it under itself, i.e. nowhere. Only a
+    // corrupt `commondir` can land here, and the guard costs one compare.
+    (key != normalize_path_for_matching(path)).then_some(key)
+}
+
+/// Normalized path → the candidate root folder id a linked worktree of that
+/// path should hang off. Seeded from the folder rows on disk; the importer adds
+/// the folders it creates as it goes. The write side separately verifies that
+/// the candidate is still a live top-level row.
+///
+/// The id is FLATTENED the way `open_worktree_folder_core` flattens: a repo
+/// folder that is itself recorded as somebody's worktree child hands down its
+/// own root. A two-level chain would be worse than no grouping at all — the
+/// sidebar's worktree merge is single-level, so a grandchild's conversations
+/// bucket under a folder that is itself merged away and stop rendering.
+///
+/// Soft-deleted rows are left out: a deleted repo renders nowhere, and a child
+/// of it would render nowhere either, which is worse than the top-level folder
+/// the user gets today.
+fn worktree_parent_folder_ids(
+    folder_index: &HashMap<String, &ScanFolderRow>,
+) -> HashMap<String, i32> {
+    folder_index
+        .iter()
+        .filter(|(_, row)| !row.deleted)
+        .map(|(key, row)| (key.clone(), row.parent_id.unwrap_or(row.id)))
+        .collect()
 }
 
 /// Pure grouping/reconciliation for the import-picker scan.
@@ -1005,6 +1051,7 @@ pub(crate) async fn import_selected_from_summaries(
         imported: 0,
         updated: 0,
         skipped: 0,
+        restored: 0,
         not_found,
         failed: 0,
         created_folders: 0,
@@ -1013,42 +1060,173 @@ pub(crate) async fn import_selected_from_summaries(
     };
     let mut touched_folder_ids: Vec<i32> = Vec::new();
 
-    // Deterministic folder order (normalized path) so results and tests are
-    // stable regardless of HashMap iteration.
-    let mut ordered: Vec<(String, Vec<(AgentType, ConversationSummary)>)> =
-        groups.into_iter().collect();
-    ordered.sort_by(|a, b| a.0.cmp(&b.0));
+    // Resolve every group's target path and worktree root BEFORE importing any
+    // of them, so the order they are imported in can depend on it.
+    struct PendingImport {
+        norm_key: String,
+        target_path: String,
+        created: bool,
+        /// The main working tree of this cwd, when it is a linked worktree —
+        /// a normalized path, not yet a folder id (see [`worktree_root_key`]).
+        root_key: Option<String>,
+        items: Vec<(AgentType, ConversationSummary)>,
+    }
 
-    for (norm_key, items) in ordered {
-        let row = folder_index.get(&norm_key).copied();
-        // Import into the stored row's exact path when one normalize-matches
-        // (see build_scan_result); otherwise the parser cwd creates the folder.
-        let target_path = row.map(|r| r.path.clone()).unwrap_or_else(|| {
-            items[0]
-                .1
-                .folder_path
-                .as_deref()
-                .map(str::trim)
-                .unwrap_or_default()
-                .to_string()
-        });
-        let created = row.map(|r| r.deleted).unwrap_or(true);
+    let mut ordered: Vec<PendingImport> = groups
+        .into_iter()
+        .map(|(norm_key, items)| {
+            let row = folder_index.get(&norm_key).copied();
+            // Import into the stored row's exact path when one normalize-matches
+            // (see build_scan_result); otherwise the parser cwd creates the folder.
+            let target_path = row.map(|r| r.path.clone()).unwrap_or_else(|| {
+                items[0]
+                    .1
+                    .folder_path
+                    .as_deref()
+                    .map(str::trim)
+                    .unwrap_or_default()
+                    .to_string()
+            });
+            PendingImport {
+                created: row.map(|r| r.deleted).unwrap_or(true),
+                root_key: worktree_root_key(&target_path),
+                norm_key,
+                target_path,
+                items,
+            }
+        })
+        .collect();
+
+    // Deterministic folder order (normalized path) so results and tests are
+    // stable regardless of HashMap iteration — but every plain folder is
+    // imported BEFORE any linked worktree, so a repo and a worktree of it
+    // selected in the same run still group. One pass suffices, no topological
+    // sort: a main working tree is never itself a linked worktree, so a repo can
+    // never be waiting on another group. Without the split, whether the two end
+    // up grouped would come down to which of their paths sorts first.
+    ordered.sort_by(|a, b| {
+        a.root_key
+            .is_some()
+            .cmp(&b.root_key.is_some())
+            .then_with(|| a.norm_key.cmp(&b.norm_key))
+    });
+    let mut worktree_parents = worktree_parent_folder_ids(&folder_index);
+    // Parent ids are not protected by a foreign key. Restrict new writes to
+    // live top-level rows so a stale/dangling id or a pre-existing parent chain
+    // cannot turn this import into a chain or cycle of its own. Plain folders
+    // selected in this batch join the set after `add_folder` revives them.
+    let mut top_level_parent_ids: HashSet<i32> = folder_rows
+        .iter()
+        .filter(|row| !row.deleted && row.parent_id.is_none())
+        .map(|row| row.id)
+        .collect();
+    // Reparenting a folder that already owns children would make those rows
+    // grandchildren. Track counts through this batch so that operation falls
+    // back to Preserve as well.
+    let mut folder_child_counts: HashMap<i32, usize> = HashMap::new();
+    for row in &folder_rows {
+        if let Some(parent_id) = row.parent_id {
+            *folder_child_counts.entry(parent_id).or_default() += 1;
+        }
+    }
+
+    for pending in ordered {
+        let PendingImport {
+            norm_key,
+            target_path,
+            created,
+            root_key,
+            items,
+        } = pending;
 
         // `add_folder` is the only fallible step here — `import_summaries` is
         // resilient (per-row failures are counted, never aborting the group), so
         // a partial failure still commits and reports its good rows and still
         // broadcasts the folder it created.
-        match folder_service::add_folder(conn, &target_path)
-            .await
-            .map_err(AppCommandError::from)
-        {
+        //
+        // A cwd that is a linked worktree of a repo codeg has goes in as a CHILD
+        // of that repo, the way `open_worktree_folder_core` records one. Plain
+        // `add_folder` leaves `parent_id` NULL, which is exactly the sidebar's
+        // test for "top-level folder", so the same worktree lands beside its
+        // repo instead of under it (and the branch-label backfill, which selects
+        // on `parent_id IS NOT NULL`, never reaches it). Falling back to
+        // `add_folder` when nothing resolves keeps `ParentWrite::Preserve` for
+        // every other case, so a reopen can never demote a folder that a
+        // worktree open already parented. See issue #552.
+        let target_row = folder_index.get(&norm_key).copied();
+        let target_folder_id = target_row.map(|row| row.id);
+        let existing_parent_id = target_row.and_then(|row| row.parent_id);
+        let target_has_children = target_folder_id
+            .is_some_and(|folder_id| folder_child_counts.get(&folder_id).copied().unwrap_or(0) > 0);
+        let parent_id = root_key
+            .as_ref()
+            .and_then(|key| worktree_parents.get(key).copied())
+            // A historical top-level worktree can have its main-tree row
+            // recorded underneath it. Flattening through that row points back
+            // at the worktree's own folder id even though their PATHS differ,
+            // so the path-level guard in `worktree_root_key` cannot catch it.
+            .filter(|parent_id| Some(*parent_id) != target_folder_id)
+            .filter(|parent_id| top_level_parent_ids.contains(parent_id))
+            // Moving an existing parent under the repo would strand its current
+            // children one level deeper. Rewriting the same established edge is
+            // harmless; any new edge requires a childless target.
+            .filter(|parent_id| existing_parent_id == Some(*parent_id) || !target_has_children);
+        let add = match parent_id {
+            Some(parent_id) => {
+                folder_service::add_folder_with_parent(conn, &target_path, Some(parent_id)).await
+            }
+            None => folder_service::add_folder(conn, &target_path).await,
+        };
+        match add.map_err(AppCommandError::from) {
             Ok(entry) => {
                 let folder_id = entry.id;
+                // `add_folder_with_parent` sets the resolved parent; the
+                // fallback `add_folder` preserves an existing row's parent and
+                // inserts a new row at the top level. Keep the safety set in
+                // step with that exact persisted state.
+                let persisted_parent_id = parent_id.or(existing_parent_id);
+                if persisted_parent_id != existing_parent_id {
+                    if let Some(old_parent_id) = existing_parent_id {
+                        if let Some(count) = folder_child_counts.get_mut(&old_parent_id) {
+                            *count = count.saturating_sub(1);
+                        }
+                    }
+                    if let Some(new_parent_id) = persisted_parent_id {
+                        *folder_child_counts.entry(new_parent_id).or_default() += 1;
+                    }
+                }
+                if persisted_parent_id.is_none() {
+                    top_level_parent_ids.insert(folder_id);
+                } else {
+                    top_level_parent_ids.remove(&folder_id);
+                }
+                // This folder can now be the repo a LATER group's worktree hangs
+                // off — the sort above put every plain folder ahead of every
+                // worktree precisely so this lands in time. Only plain folders
+                // are recorded: a linked worktree is never anyone's main working
+                // tree. The candidate is flattened by the seed's rule, off the
+                // parent this row actually ended up with.
+                if root_key.is_none() {
+                    let root = persisted_parent_id.unwrap_or(folder_id);
+                    worktree_parents.insert(norm_key, root);
+                }
+                // `DeletedPolicy::Restore`: every item here is a session the
+                // user explicitly checked in the picker, which badges a
+                // soft-deleted row as such — so a deleted one in this list is a
+                // deliberate "bring it back", not a sweep. (The whole-folder
+                // import and the scan's drive-by refresh both stay on `Skip`.)
                 let (tally, _updated_ids, failed_in_group) =
-                    import_service::import_summaries_resilient(conn, folder_id, &items).await;
+                    import_service::import_summaries_resilient(
+                        conn,
+                        folder_id,
+                        &items,
+                        import_service::DeletedPolicy::Restore,
+                    )
+                    .await;
                 result.imported += tally.imported;
                 result.updated += tally.updated;
                 result.skipped += tally.skipped;
+                result.restored += tally.restored;
                 result.failed += failed_in_group;
                 if created {
                     result.created_folders += 1;
@@ -1061,6 +1239,7 @@ pub(crate) async fn import_selected_from_summaries(
                     imported: tally.imported,
                     updated: tally.updated,
                     skipped: tally.skipped,
+                    restored: tally.restored,
                 });
                 if failed_in_group > 0 && result.errors.len() < MAX_ERRORS {
                     result.errors.push(format!(
@@ -1104,8 +1283,12 @@ pub(crate) async fn import_selected_from_summaries(
     }
 
     // One nudge instead of per-row upserts: clients answer with a single full
-    // refetch, which also covers refreshed titles (see the event's doc).
-    if result.imported > 0 || result.updated > 0 {
+    // refetch, which also covers refreshed titles (see the event's doc) and the
+    // rows this run brought back from a soft delete — a restore adds a row to
+    // every open sidebar just like a fresh import does, so it must fire the
+    // event too. (The counts stay faithful to their own tallies; subscribers
+    // read only the channel and answer with a full refetch.)
+    if result.imported > 0 || result.updated > 0 || result.restored > 0 {
         emit_event(
             emitter,
             CONVERSATIONS_BULK_CHANGED_EVENT,
@@ -3917,6 +4100,7 @@ mod tests {
             let mut imported = 0u32;
             let mut updated = 0u32;
             let mut skipped = 0u32;
+            let mut restored = 0u32;
             for (agent_type, summary) in &rows {
                 match import_service::import_one_for_test(
                     &self.db.conn,
@@ -3929,6 +4113,7 @@ mod tests {
                 {
                     import_service::ImportOutcomeForTest::Imported => imported += 1,
                     import_service::ImportOutcomeForTest::Updated(_) => updated += 1,
+                    import_service::ImportOutcomeForTest::Restored => restored += 1,
                     import_service::ImportOutcomeForTest::Skipped => skipped += 1,
                 }
             }
@@ -3936,6 +4121,7 @@ mod tests {
                 imported,
                 updated,
                 skipped,
+                restored,
             }
         }
     }
@@ -7820,12 +8006,14 @@ Call get_delegation_status with the returned task_id to collect the result.";
                 path: "/tmp/proj/".into(),
                 name: "proj-deleted".into(),
                 deleted: true,
+                parent_id: None,
             },
             ScanFolderRow {
                 id: 2,
                 path: "/tmp/proj".into(),
                 name: "proj".into(),
                 deleted: false,
+                parent_id: None,
             },
         ];
         let summaries = vec![scan_summary(
@@ -7850,6 +8038,7 @@ Call get_delegation_status with the returned task_id to collect the result.";
             path: "/tmp/gone".into(),
             name: "gone".into(),
             deleted: true,
+            parent_id: None,
         }];
         let summaries = vec![scan_summary(
             "s1",
@@ -7923,6 +8112,444 @@ Call get_delegation_status with the returned task_id to collect the result.";
         let convs = conversation::Entity::find().all(&db.conn).await.unwrap();
         assert_eq!(convs.len(), 2);
         assert!(convs.iter().all(|c| c.folder_id == folder_rows[0].id));
+    }
+
+    // A session whose cwd is a linked git worktree of an open repo belongs
+    // UNDER that repo. `parent_id` is exactly the sidebar's test for "worktree
+    // of" versus "one more top-level folder", and the branch-label backfill
+    // selects on it too, so leaving it NULL strands the folder twice. #552.
+    #[tokio::test]
+    async fn batch_import_nests_a_worktree_cwd_under_its_repo() {
+        use sea_orm::EntityTrait;
+        let db = fresh_in_memory_db().await;
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = std::fs::canonicalize(temp.path()).expect("canonicalize root");
+        let (repo, worktree) = crate::git_repo::fixture_linked_worktree(&root);
+        let repo_id = seed_folder(&db, &repo.to_string_lossy()).await;
+
+        let summaries = vec![scan_summary(
+            "s1",
+            AgentType::Codex,
+            Some(&worktree.to_string_lossy()),
+            at(0),
+        )];
+        let result = import_selected_from_summaries(
+            &db.conn,
+            &EventEmitter::Noop,
+            summaries,
+            vec![key_of(AgentType::Codex, "s1")],
+        )
+        .await
+        .expect("batch import");
+
+        assert_eq!(result.imported, 1);
+        let rows = crate::db::entities::folder::Entity::find()
+            .all(&db.conn)
+            .await
+            .unwrap();
+        let worktree_row = rows
+            .iter()
+            .find(|r| r.id != repo_id)
+            .expect("worktree folder row");
+        assert_eq!(
+            worktree_row.parent_id,
+            Some(repo_id),
+            "imported worktree must group under the repo it belongs to"
+        );
+    }
+
+    // Selecting a repo's sessions and one of its worktrees' in the SAME import
+    // is the first-time-import shape, and the repo folder it needs exists by the
+    // time the worktree is written — as long as the two are not imported in
+    // whatever order their paths happen to sort in.
+    #[tokio::test]
+    async fn batch_import_nests_a_worktree_under_a_repo_created_in_the_same_run() {
+        use sea_orm::EntityTrait;
+        let db = fresh_in_memory_db().await;
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = std::fs::canonicalize(temp.path()).expect("canonicalize root");
+        let (repo, worktree) = crate::git_repo::fixture_linked_worktree(&root);
+
+        let summaries = vec![
+            scan_summary("s0", AgentType::Codex, Some(&repo.to_string_lossy()), at(0)),
+            scan_summary(
+                "s1",
+                AgentType::Codex,
+                Some(&worktree.to_string_lossy()),
+                at(1),
+            ),
+        ];
+        import_selected_from_summaries(
+            &db.conn,
+            &EventEmitter::Noop,
+            summaries,
+            vec![
+                key_of(AgentType::Codex, "s0"),
+                key_of(AgentType::Codex, "s1"),
+            ],
+        )
+        .await
+        .expect("batch import");
+
+        let rows = crate::db::entities::folder::Entity::find()
+            .all(&db.conn)
+            .await
+            .unwrap();
+        let repo_row = rows
+            .iter()
+            .find(|r| path_eq_for_matching(&r.path, &repo.to_string_lossy()))
+            .expect("repo folder row");
+        let worktree_row = rows
+            .iter()
+            .find(|r| path_eq_for_matching(&r.path, &worktree.to_string_lossy()))
+            .expect("worktree folder row");
+        assert_eq!(repo_row.parent_id, None);
+        assert_eq!(
+            worktree_row.parent_id,
+            Some(repo_row.id),
+            "a repo created earlier in the same run is still the worktree's repo"
+        );
+    }
+
+    // The repo folder a worktree resolves to can itself be recorded as somebody
+    // else's worktree child (`open_worktree_folder_core` writes that whenever the
+    // branch switcher adopts an unregistered checkout). Hanging off it directly
+    // would build a two-level chain, and the sidebar's merge is single-level: the
+    // grandchild's conversations would bucket under a folder that is itself
+    // merged away, and render nowhere. Flatten, exactly as the worktree open does.
+    #[tokio::test]
+    async fn batch_import_flattens_onto_the_repos_own_root() {
+        use sea_orm::EntityTrait;
+        let db = fresh_in_memory_db().await;
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = std::fs::canonicalize(temp.path()).expect("canonicalize root");
+        let (repo, worktree) = crate::git_repo::fixture_linked_worktree(&root);
+        let outer_id = seed_folder(&db, "/tmp/outer-root").await;
+        let repo_id = folder_service::add_folder_with_parent(
+            &db.conn,
+            &repo.to_string_lossy(),
+            Some(outer_id),
+        )
+        .await
+        .expect("seed repo folder")
+        .id;
+
+        let summaries = vec![scan_summary(
+            "s1",
+            AgentType::Codex,
+            Some(&worktree.to_string_lossy()),
+            at(0),
+        )];
+        import_selected_from_summaries(
+            &db.conn,
+            &EventEmitter::Noop,
+            summaries,
+            vec![key_of(AgentType::Codex, "s1")],
+        )
+        .await
+        .expect("batch import");
+
+        let rows = crate::db::entities::folder::Entity::find()
+            .all(&db.conn)
+            .await
+            .unwrap();
+        let worktree_row = rows
+            .iter()
+            .find(|r| r.id != outer_id && r.id != repo_id)
+            .expect("worktree folder row");
+        assert_eq!(worktree_row.parent_id, Some(outer_id));
+    }
+
+    // Before imported worktrees were grouped, one could exist as a top-level
+    // folder while its main working tree was still unregistered. Navigating
+    // from that worktree to a branch checked out in the main tree then recorded
+    // the main-tree row under the worktree. Flattening through that row points
+    // straight back at the import target's own id; refuse it or the sidebar
+    // filters the self-parented folder out completely.
+    #[tokio::test]
+    async fn batch_import_refuses_a_parent_that_flattens_to_the_target() {
+        use sea_orm::EntityTrait;
+        let db = fresh_in_memory_db().await;
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = std::fs::canonicalize(temp.path()).expect("canonicalize root");
+        let (repo, worktree) = crate::git_repo::fixture_linked_worktree(&root);
+        let worktree_id = seed_folder(&db, &worktree.to_string_lossy()).await;
+        let repo_id = folder_service::add_folder_with_parent(
+            &db.conn,
+            &repo.to_string_lossy(),
+            Some(worktree_id),
+        )
+        .await
+        .expect("seed inverted main-tree folder")
+        .id;
+
+        let summaries = vec![scan_summary(
+            "s1",
+            AgentType::Codex,
+            Some(&worktree.to_string_lossy()),
+            at(0),
+        )];
+        let result = import_selected_from_summaries(
+            &db.conn,
+            &EventEmitter::Noop,
+            summaries,
+            vec![key_of(AgentType::Codex, "s1")],
+        )
+        .await
+        .expect("batch import");
+
+        assert_eq!(result.imported, 1);
+        let worktree_row = crate::db::entities::folder::Entity::find_by_id(worktree_id)
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(worktree_row.parent_id, None);
+        let repo_row = crate::db::entities::folder::Entity::find_by_id(repo_id)
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(repo_row.parent_id, Some(worktree_id));
+    }
+
+    // Historical top-level worktrees can also leave a longer inverted chain.
+    // If the main-tree row points at a folder whose own parent is the import
+    // target, using that one-hop "root" would create a two-node cycle. Only an
+    // actual live top-level row is safe to write as a new parent.
+    #[tokio::test]
+    async fn batch_import_refuses_a_flattened_parent_that_is_itself_a_child() {
+        use sea_orm::EntityTrait;
+        let db = fresh_in_memory_db().await;
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = std::fs::canonicalize(temp.path()).expect("canonicalize root");
+        let (repo, worktree) = crate::git_repo::fixture_linked_worktree(&root);
+        let worktree_id = seed_folder(&db, &worktree.to_string_lossy()).await;
+        let middle_id = folder_service::add_folder_with_parent(
+            &db.conn,
+            &root.join("middle").to_string_lossy(),
+            Some(worktree_id),
+        )
+        .await
+        .expect("seed middle folder")
+        .id;
+        let repo_id = folder_service::add_folder_with_parent(
+            &db.conn,
+            &repo.to_string_lossy(),
+            Some(middle_id),
+        )
+        .await
+        .expect("seed chained main-tree folder")
+        .id;
+
+        let summaries = vec![scan_summary(
+            "s1",
+            AgentType::Codex,
+            Some(&worktree.to_string_lossy()),
+            at(0),
+        )];
+        import_selected_from_summaries(
+            &db.conn,
+            &EventEmitter::Noop,
+            summaries,
+            vec![key_of(AgentType::Codex, "s1")],
+        )
+        .await
+        .expect("batch import");
+
+        let worktree_row = crate::db::entities::folder::Entity::find_by_id(worktree_id)
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(worktree_row.parent_id, None);
+        let middle_row = crate::db::entities::folder::Entity::find_by_id(middle_id)
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(middle_row.parent_id, Some(worktree_id));
+        let repo_row = crate::db::entities::folder::Entity::find_by_id(repo_id)
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(repo_row.parent_id, Some(middle_id));
+    }
+
+    // A worktree imported before grouping existed may already be acting as the
+    // root for worktrees created from it. Moving that row under the real repo
+    // without moving its children would create a two-level chain and hide the
+    // children's conversations in the single-level sidebar merge.
+    #[tokio::test]
+    async fn batch_import_does_not_reparent_a_folder_that_already_has_children() {
+        use sea_orm::EntityTrait;
+        let db = fresh_in_memory_db().await;
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = std::fs::canonicalize(temp.path()).expect("canonicalize root");
+        let (repo, worktree) = crate::git_repo::fixture_linked_worktree(&root);
+        let repo_id = seed_folder(&db, &repo.to_string_lossy()).await;
+        let worktree_id = seed_folder(&db, &worktree.to_string_lossy()).await;
+        let child_id = folder_service::add_folder_with_parent(
+            &db.conn,
+            &root.join("child").to_string_lossy(),
+            Some(worktree_id),
+        )
+        .await
+        .expect("seed existing child")
+        .id;
+
+        let summaries = vec![scan_summary(
+            "s1",
+            AgentType::Codex,
+            Some(&worktree.to_string_lossy()),
+            at(0),
+        )];
+        import_selected_from_summaries(
+            &db.conn,
+            &EventEmitter::Noop,
+            summaries,
+            vec![key_of(AgentType::Codex, "s1")],
+        )
+        .await
+        .expect("batch import");
+
+        let worktree_row = crate::db::entities::folder::Entity::find_by_id(worktree_id)
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(worktree_row.parent_id, None);
+        let child_row = crate::db::entities::folder::Entity::find_by_id(child_id)
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(child_row.parent_id, Some(worktree_id));
+        let repo_row = crate::db::entities::folder::Entity::find_by_id(repo_id)
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(repo_row.parent_id, None);
+    }
+
+    // Grouping under a repo codeg has never opened would invent a workspace row
+    // the user did not ask for, so an unknown repo leaves the folder top-level.
+    #[tokio::test]
+    async fn batch_import_leaves_a_worktree_top_level_when_its_repo_is_unopened() {
+        use sea_orm::EntityTrait;
+        let db = fresh_in_memory_db().await;
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = std::fs::canonicalize(temp.path()).expect("canonicalize root");
+        let (_repo, worktree) = crate::git_repo::fixture_linked_worktree(&root);
+
+        let summaries = vec![scan_summary(
+            "s1",
+            AgentType::Codex,
+            Some(&worktree.to_string_lossy()),
+            at(0),
+        )];
+        import_selected_from_summaries(
+            &db.conn,
+            &EventEmitter::Noop,
+            summaries,
+            vec![key_of(AgentType::Codex, "s1")],
+        )
+        .await
+        .expect("batch import");
+
+        let rows = crate::db::entities::folder::Entity::find()
+            .all(&db.conn)
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].parent_id, None);
+    }
+
+    // A soft-deleted repo renders nowhere, so a child of it would render
+    // nowhere either. Top-level is the better of the two.
+    #[tokio::test]
+    async fn batch_import_leaves_a_worktree_top_level_when_its_repo_is_deleted() {
+        use sea_orm::{ActiveModelTrait, EntityTrait, IntoActiveModel, Set};
+        let db = fresh_in_memory_db().await;
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = std::fs::canonicalize(temp.path()).expect("canonicalize root");
+        let (repo, worktree) = crate::git_repo::fixture_linked_worktree(&root);
+        let repo_id = seed_folder(&db, &repo.to_string_lossy()).await;
+
+        let row = crate::db::entities::folder::Entity::find_by_id(repo_id)
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .unwrap();
+        let mut active = row.into_active_model();
+        active.deleted_at = Set(Some(chrono::Utc::now()));
+        active.is_open = Set(false);
+        active.update(&db.conn).await.unwrap();
+
+        let summaries = vec![scan_summary(
+            "s1",
+            AgentType::Codex,
+            Some(&worktree.to_string_lossy()),
+            at(0),
+        )];
+        import_selected_from_summaries(
+            &db.conn,
+            &EventEmitter::Noop,
+            summaries,
+            vec![key_of(AgentType::Codex, "s1")],
+        )
+        .await
+        .expect("batch import");
+
+        let rows = crate::db::entities::folder::Entity::find()
+            .all(&db.conn)
+            .await
+            .unwrap();
+        let worktree_row = rows
+            .iter()
+            .find(|r| r.id != repo_id)
+            .expect("worktree folder row");
+        assert_eq!(worktree_row.parent_id, None);
+    }
+
+    // The fallback stays on `add_folder`'s Preserve semantics, so re-importing
+    // into a folder a worktree open already parented cannot demote it, not even
+    // when the directory is gone from disk and resolves to nothing.
+    #[tokio::test]
+    async fn batch_import_preserves_a_recorded_worktree_parent() {
+        use sea_orm::EntityTrait;
+        let db = fresh_in_memory_db().await;
+        let repo_id = seed_folder(&db, "/tmp/proj-repo").await;
+        folder_service::add_folder_with_parent(&db.conn, "/tmp/proj-wt", Some(repo_id))
+            .await
+            .expect("seed worktree folder");
+
+        let summaries = vec![scan_summary(
+            "s1",
+            AgentType::Codex,
+            Some("/tmp/proj-wt"),
+            at(0),
+        )];
+        import_selected_from_summaries(
+            &db.conn,
+            &EventEmitter::Noop,
+            summaries,
+            vec![key_of(AgentType::Codex, "s1")],
+        )
+        .await
+        .expect("batch import");
+
+        let rows = crate::db::entities::folder::Entity::find()
+            .all(&db.conn)
+            .await
+            .unwrap();
+        let worktree_row = rows
+            .iter()
+            .find(|r| r.path == "/tmp/proj-wt")
+            .expect("worktree folder row");
+        assert_eq!(worktree_row.parent_id, Some(repo_id));
     }
 
     #[tokio::test]
@@ -8047,7 +8674,7 @@ Call get_delegation_status with the returned task_id to collect the result.";
     }
 
     #[tokio::test]
-    async fn batch_import_never_resurrects_a_deleted_conversation() {
+    async fn batch_import_restores_a_deleted_conversation_in_place() {
         use sea_orm::{
             ActiveModelTrait, ColumnTrait, EntityTrait, IntoActiveModel, QueryFilter, Set,
         };
@@ -8076,10 +8703,15 @@ Call get_delegation_status with the returned task_id to collect the result.";
             .await
             .unwrap()
             .unwrap();
+        let original_id = row.id;
         let mut active = row.into_active_model();
         active.deleted_at = Set(Some(chrono::Utc::now()));
         active.update(&db.conn).await.unwrap();
 
+        // Deleting a conversation is a soft delete, so re-picking the session
+        // in the import window brings the ORIGINAL row back rather than
+        // inserting a second one — every selection here is a session the user
+        // checked while it was badged "deleted".
         let again = import_selected_from_summaries(
             &db.conn,
             &EventEmitter::Noop,
@@ -8088,15 +8720,65 @@ Call get_delegation_status with the returned task_id to collect the result.";
         )
         .await
         .unwrap();
-        assert_eq!(again.imported, 0);
-        assert_eq!(again.skipped, 1);
+        assert_eq!(again.imported, 0, "restored, not re-imported");
+        assert_eq!(again.restored, 1);
+        assert_eq!(again.skipped, 0);
+        assert_eq!(again.folders[0].restored, 1);
 
         let rows = conversation::Entity::find().all(&db.conn).await.unwrap();
+        assert_eq!(rows.len(), 1, "no duplicate row");
+        assert_eq!(rows[0].id, original_id);
+        assert!(rows[0].deleted_at.is_none(), "back in the sidebar");
+    }
+
+    #[tokio::test]
+    async fn whole_folder_import_still_never_resurrects_a_deleted_conversation() {
+        use sea_orm::{
+            ActiveModelTrait, ColumnTrait, EntityTrait, IntoActiveModel, QueryFilter, Set,
+        };
+        let db = fresh_in_memory_db().await;
+        let folder_id = seed_folder(&db, "/tmp/proj-sweep").await;
+        let items = vec![scan_summary(
+            "s1",
+            AgentType::ClaudeCode,
+            Some("/tmp/proj-sweep"),
+            at(0),
+        )];
+
+        import_service::import_summaries(
+            &db.conn,
+            folder_id,
+            &items,
+            import_service::DeletedPolicy::Skip,
+        )
+        .await
+        .unwrap();
+        let row = conversation::Entity::find()
+            .filter(conversation::Column::ExternalId.eq("s1"))
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .unwrap();
+        let mut active = row.into_active_model();
+        active.deleted_at = Set(Some(chrono::Utc::now()));
+        active.update(&db.conn).await.unwrap();
+
+        // The legacy sweep imports a whole FOLDER, not sessions the user picked
+        // one by one, so it must not bring back everything they ever deleted
+        // under it.
+        let (tally, _ids) = import_service::import_summaries(
+            &db.conn,
+            folder_id,
+            &items,
+            import_service::DeletedPolicy::Skip,
+        )
+        .await
+        .unwrap();
+        assert_eq!(tally.restored, 0);
+        assert_eq!(tally.skipped, 1);
+        let rows = conversation::Entity::find().all(&db.conn).await.unwrap();
         assert_eq!(rows.len(), 1);
-        assert!(
-            rows[0].deleted_at.is_some(),
-            "a deleted conversation stays deleted"
-        );
+        assert!(rows[0].deleted_at.is_some(), "stays deleted");
     }
 
     #[tokio::test]
@@ -8172,46 +8854,31 @@ Call get_delegation_status with the returned task_id to collect the result.";
 
     #[tokio::test]
     async fn batch_import_closes_folder_left_empty_after_zero_live_import() {
-        // Import can reopen/create a folder via add_folder even when every
-        // selected session is skipped (soft-deleted never resurrects). The
-        // group must not stay open with zero live conversations: flip is_open
-        // and broadcast Close{AutoEmpty} after the folder Upsert.
+        // `add_folder` always opens the row. A picker selection of a session
+        // that already lives in another folder skips/updates that existing row
+        // and adds nothing here — close the reopened empty group with AutoEmpty
+        // after the folder Upsert. (Soft-deleted matches Restore in place; they
+        // are not an empty-group case.)
         use crate::web::event_bridge::{WebEventBroadcaster, FOLDER_CHANGED_EVENT};
         use sea_orm::{ActiveModelTrait, EntityTrait, IntoActiveModel, Set};
         use std::sync::Arc;
         let db = fresh_in_memory_db().await;
-        let folder_id = seed_folder(&db, "/tmp/proj-empty-import").await;
 
-        // First import creates a live conversation, then soft-delete both the
-        // conversation and the folder so the next batch reopens an empty shell.
-        let make = || {
-            vec![scan_summary(
-                "s1",
-                AgentType::ClaudeCode,
-                Some("/tmp/proj-empty-import"),
-                at(0),
-            )]
-        };
         import_selected_from_summaries(
             &db.conn,
             &EventEmitter::Noop,
-            make(),
+            vec![scan_summary(
+                "s1",
+                AgentType::ClaudeCode,
+                Some("/tmp/proj-other-import"),
+                at(0),
+            )],
             vec![key_of(AgentType::ClaudeCode, "s1")],
         )
         .await
-        .expect("seed import");
+        .expect("seed live session in another folder");
 
-        let conv = conversation::Entity::find()
-            .all(&db.conn)
-            .await
-            .unwrap()
-            .into_iter()
-            .next()
-            .expect("seeded conversation");
-        let mut conv_active = conv.into_active_model();
-        conv_active.deleted_at = Set(Some(chrono::Utc::now()));
-        conv_active.update(&db.conn).await.unwrap();
-
+        let folder_id = seed_folder(&db, "/tmp/proj-empty-import").await;
         let folder_row = crate::db::entities::folder::Entity::find_by_id(folder_id)
             .one(&db.conn)
             .await
@@ -8229,14 +8896,24 @@ Call get_delegation_status with the returned task_id to collect the result.";
         let result = import_selected_from_summaries(
             &db.conn,
             &emitter,
-            make(),
+            vec![scan_summary(
+                "s1",
+                AgentType::ClaudeCode,
+                Some("/tmp/proj-empty-import"),
+                at(0),
+            )],
             vec![key_of(AgentType::ClaudeCode, "s1")],
         )
         .await
         .expect("empty-group import");
 
         assert_eq!(result.imported, 0);
-        assert_eq!(result.skipped, 1);
+        assert_eq!(result.restored, 0);
+        assert_eq!(
+            result.skipped + result.updated,
+            1,
+            "existing live row in another folder is skipped or refreshed, not imported"
+        );
         assert_eq!(
             result.created_folders, 1,
             "reopening soft-deleted folder counts as created"
@@ -8356,8 +9033,13 @@ Call get_delegation_status with the returned task_id to collect the result.";
             scan_summary("s2", AgentType::Codex, Some("/tmp/x"), at(1)),
         ];
 
-        let (tally, updated_ids, failed) =
-            import_service::import_summaries_resilient(&db.conn, 999_999, &items).await;
+        let (tally, updated_ids, failed) = import_service::import_summaries_resilient(
+            &db.conn,
+            999_999,
+            &items,
+            import_service::DeletedPolicy::Skip,
+        )
+        .await;
         assert_eq!(failed, 2, "both rows fail the folder FK and are counted");
         assert_eq!(tally.imported, 0);
         assert_eq!(tally.updated, 0);
@@ -8366,8 +9048,13 @@ Call get_delegation_status with the returned task_id to collect the result.";
         // Same items into a real folder import cleanly — the resilient loop did
         // not corrupt state or leave a half-open transaction.
         let folder_id = seed_folder(&db, "/tmp/x").await;
-        let (tally2, _ids, failed2) =
-            import_service::import_summaries_resilient(&db.conn, folder_id, &items).await;
+        let (tally2, _ids, failed2) = import_service::import_summaries_resilient(
+            &db.conn,
+            folder_id,
+            &items,
+            import_service::DeletedPolicy::Skip,
+        )
+        .await;
         assert_eq!(failed2, 0);
         assert_eq!(tally2.imported, 2);
     }
@@ -8386,9 +9073,14 @@ Call get_delegation_status with the returned task_id to collect the result.";
             at(0),
         )];
         assert!(
-            import_service::import_summaries(&db.conn, 999_999, &items)
-                .await
-                .is_err(),
+            import_service::import_summaries(
+                &db.conn,
+                999_999,
+                &items,
+                import_service::DeletedPolicy::Skip
+            )
+            .await
+            .is_err(),
             "a row FK violation must propagate through the strict importer"
         );
     }

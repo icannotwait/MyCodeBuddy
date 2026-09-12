@@ -139,6 +139,26 @@ where
     Ok(visible)
 }
 
+/// What an import does when a parsed session already has a SOFT-DELETED row.
+///
+/// Deleting a conversation in codeg only stamps `deleted_at`; neither the row
+/// nor the agent's session file is destroyed. So "import" has a meaningful
+/// answer for a deleted session — bring it back — but only when the user asked
+/// for that specific session by name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DeletedPolicy {
+    /// Leave it deleted (and untouched). The default for every implicit pass:
+    /// the whole-folder sweep and the scan's drive-by refresh both walk
+    /// sessions the user never picked, and resurrecting a conversation they
+    /// deliberately deleted is not a refresh.
+    Skip,
+    /// Un-delete the existing row in place — see
+    /// [`conversation_service::restore_soft_deleted`]. Only the import picker
+    /// passes this, where every item is a session the user explicitly checked
+    /// while its row was badged as deleted.
+    Restore,
+}
+
 /// Reconcile a batch of parsed summaries into `folder_id` via [`import_one`].
 /// Returns the tally plus the ids of already-imported conversations whose title
 /// was refreshed, so the caller can broadcast a sidebar upsert without
@@ -150,19 +170,22 @@ pub(crate) async fn import_summaries(
     conn: &DatabaseConnection,
     folder_id: i32,
     items: &[(AgentType, ConversationSummary)],
+    deleted: DeletedPolicy,
 ) -> Result<(ImportResult, Vec<i32>), DbError> {
     let mut imported = 0u32;
     let mut updated = 0u32;
     let mut skipped = 0u32;
+    let mut restored = 0u32;
     let mut updated_ids: Vec<i32> = Vec::new();
 
     for (agent_type, summary) in items {
-        match import_one(conn, folder_id, agent_type, summary).await? {
+        match import_one(conn, folder_id, agent_type, summary, deleted).await? {
             ImportOutcome::Imported => imported += 1,
             ImportOutcome::Updated(id) => {
                 updated += 1;
                 updated_ids.push(id);
             }
+            ImportOutcome::Restored => restored += 1,
             ImportOutcome::Skipped => skipped += 1,
         }
     }
@@ -172,6 +195,7 @@ pub(crate) async fn import_summaries(
             imported,
             updated,
             skipped,
+            restored,
         },
         updated_ids,
     ))
@@ -188,20 +212,23 @@ pub(crate) async fn import_summaries_resilient(
     conn: &DatabaseConnection,
     folder_id: i32,
     items: &[(AgentType, ConversationSummary)],
+    deleted: DeletedPolicy,
 ) -> (ImportResult, Vec<i32>, u32) {
     let mut imported = 0u32;
     let mut updated = 0u32;
     let mut skipped = 0u32;
+    let mut restored = 0u32;
     let mut failed = 0u32;
     let mut updated_ids: Vec<i32> = Vec::new();
 
     for (agent_type, summary) in items {
-        match import_one(conn, folder_id, agent_type, summary).await {
+        match import_one(conn, folder_id, agent_type, summary, deleted).await {
             Ok(ImportOutcome::Imported) => imported += 1,
             Ok(ImportOutcome::Updated(id)) => {
                 updated += 1;
                 updated_ids.push(id);
             }
+            Ok(ImportOutcome::Restored) => restored += 1,
             Ok(ImportOutcome::Skipped) => skipped += 1,
             Err(e) => {
                 failed += 1;
@@ -220,6 +247,7 @@ pub(crate) async fn import_summaries_resilient(
             imported,
             updated,
             skipped,
+            restored,
         },
         updated_ids,
         failed,
@@ -229,6 +257,10 @@ pub(crate) async fn import_summaries_resilient(
 /// Import (and refresh the titles of) the local agent sessions under
 /// `folder_path`. Strict: a DB error surfaces to the caller (the legacy
 /// command's back-compat contract).
+///
+/// A whole-folder sweep never restores: [`DeletedPolicy::Skip`], because the
+/// user picked a FOLDER here, not the individual sessions, and every session
+/// they ever deleted under it would come back.
 pub async fn import_local_conversations(
     conn: &DatabaseConnection,
     registry: &InternalAgentSessionRegistry,
@@ -246,7 +278,7 @@ pub async fn import_local_conversations(
         })
         .collect();
 
-    import_summaries(conn, folder_id, &matched).await
+    import_summaries(conn, folder_id, &matched, DeletedPolicy::Skip).await
 }
 
 /// Outcome of reconciling a single parsed session against the DB.
@@ -257,8 +289,14 @@ pub(crate) enum ImportOutcome {
     /// An already-imported conversation had its auto-title refreshed; carries
     /// the row id so the caller can broadcast a sidebar upsert.
     Updated(i32),
-    /// Already imported, title left unchanged (locked, identical, or the parse
-    /// produced no title).
+    /// A soft-deleted conversation was brought back (and then refreshed like
+    /// any other existing row). Counted separately from `Updated` because the
+    /// user is owed a distinct number: "3 restored" is a different fact from
+    /// "3 titles refreshed".
+    Restored,
+    /// Already imported and nothing changed — or the row is one the sidebar
+    /// never shows (a delegation child, or a soft-deleted row under
+    /// [`DeletedPolicy::Skip`]).
     Skipped,
 }
 
@@ -304,10 +342,13 @@ async fn refresh_existing(
     existing: &conversation::Model,
     summary: &ConversationSummary,
 ) -> Result<bool, DbError> {
-    // Rows the sidebar never shows are left completely alone: a soft-deleted
-    // conversation must stay deleted (never resurrected or rewritten), and a
-    // delegation child is not a sidebar row (the upsert broadcast suppresses it
-    // too, which would also desync the `updated` count).
+    // Rows the sidebar never shows are left completely alone: a delegation
+    // child is not a sidebar row (the upsert broadcast suppresses it too, which
+    // would also desync the `updated` count), and a soft-deleted conversation
+    // must stay deleted — a REFRESH never resurrects. (Restoring is a separate,
+    // explicitly-requested step in `import_one`, which un-deletes the row and
+    // updates this model before calling here, so the guard below sees a live
+    // row and the restored conversation still gets its title/activity refresh.)
     if existing.parent_id.is_some() || existing.deleted_at.is_some() {
         return Ok(false);
     }
@@ -400,21 +441,19 @@ pub(crate) async fn import_one_for_test(
     agent_type: &AgentType,
     summary: &ConversationSummary,
 ) -> Result<ImportOutcome, DbError> {
-    import_one(conn, folder_id, agent_type, summary).await
+    import_one(conn, folder_id, agent_type, summary, DeletedPolicy::Skip).await
 }
 
-/// Insert a brand-new conversation, or — when it already exists — refresh its
-/// title from the freshly parsed session file so an AI-generated title that did
-/// not exist at first import is adopted. `refresh_auto_title` is a single
-/// conditional UPDATE that skips locked or unchanged rows and never bumps
-/// `updated_at`, so a re-import neither clobbers a manual rename nor reorders a
-/// recency-sorted sidebar. A missing/empty parsed title leaves the existing
-/// title intact rather than nulling it.
-pub(crate) async fn import_one(
+/// Insert a brand-new conversation, or — when it already exists — refresh it in
+/// place from the freshly parsed session file (see [`refresh_existing`]). A
+/// soft-deleted row is restored first when `deleted` says so (see
+/// [`DeletedPolicy`]), and only then refreshed like any other existing row.
+async fn import_one(
     conn: &DatabaseConnection,
     folder_id: i32,
     agent_type: &AgentType,
     summary: &ConversationSummary,
+    deleted: DeletedPolicy,
 ) -> Result<ImportOutcome, DbError> {
     let at_str = agent_type_db_str(agent_type);
 
@@ -424,21 +463,72 @@ pub(crate) async fn import_one(
         .one(conn)
         .await?;
 
-    if let Some(existing) = exists {
-        // Preserve the original skip for rows the sidebar never shows.
-        if existing.parent_id.is_some() || existing.deleted_at.is_some() {
+    if let Some(mut existing) = exists {
+        // A delegation child is never a sidebar row, so it is left completely
+        // alone whatever the policy — including no token-usage invalidation.
+        if existing.parent_id.is_some() {
             return Ok(ImportOutcome::Skipped);
         }
-        if let Err(error) =
+
+        // Deleted, and the caller did not ask to restore: leave it deleted and
+        // untouched (mirrors the guard inside [`refresh_existing`], so it must
+        // not pick up a token-usage invalidation either).
+        let restoring = existing.deleted_at.is_some();
+        if restoring && deleted == DeletedPolicy::Skip {
+            return Ok(ImportOutcome::Skipped);
+        }
+
+        // Un-delete BEFORE refreshing: both refreshes are conditional UPDATEs
+        // filtered on `deleted_at IS NULL`, so a title/activity refresh run
+        // first would silently no-op and the restored row would come back
+        // stale. A restore that loses the race (the row was un-deleted
+        // concurrently) still falls through to the refresh below, and is
+        // reported as `Updated`/`Skipped` rather than double-counted.
+        let mut won_restore = false;
+        if restoring {
+            won_restore =
+                conversation_service::restore_soft_deleted(conn, existing.id, folder_id).await?;
+            // Bring the in-memory model in line with what the UPDATE just
+            // wrote, so `refresh_existing`'s mirrored guards (which read this
+            // model, not the DB) see a live row and let the title/activity
+            // refresh through. `deleted_at` clears either way: losing the race
+            // means somebody else un-deleted the row, so it is live regardless
+            // — only the two columns THIS call would have written are
+            // conditional on having won.
+            existing.deleted_at = None;
+            if won_restore {
+                existing.folder_id = folder_id;
+                existing.status = conversation::ConversationStatus::PendingReview;
+            }
+        }
+        // The user just pointed at this session's file on disk, which is the
+        // one moment we know its transcript may have grown in the agent's own
+        // CLI since we last read it. `refresh_existing` only bumps `updated_at`
+        // when the parsed activity time is strictly newer, and a title refresh
+        // deliberately never bumps it at all, so the token-usage stamp would
+        // otherwise keep reporting the conversation as already counted. Mark it
+        // for re-parse; a failure is non-fatal (the import is the user's goal,
+        // and "Rebuild all" still recovers).
+        //
+        // This deliberately sits HERE and not inside [`refresh_existing`],
+        // which the whole-machine re-scan also calls: that path's cheapness
+        // rests on a converged conversation costing zero statements, and an
+        // unconditional invalidation would be one write per row per scan.
+        if let Err(e) =
             crate::db::service::token_usage_service::mark_stale_for_reparse(conn, existing.id).await
         {
             tracing::warn!(
                 conversation_id = existing.id,
-                error = %error,
+                error = %e,
                 "import: failed to invalidate the token-usage stamp"
             );
         }
-        return Ok(if refresh_existing(conn, &existing, summary).await? {
+        let wrote = refresh_existing(conn, &existing, summary).await?;
+        // A restore subsumes whatever the refresh did: the row came back, which
+        // is the outcome the user asked for and the one worth reporting.
+        return Ok(if won_restore {
+            ImportOutcome::Restored
+        } else if wrote {
             ImportOutcome::Updated(existing.id)
         } else {
             ImportOutcome::Skipped
@@ -498,7 +588,7 @@ pub(crate) async fn import_one(
 mod tests {
     use super::*;
     use crate::db::test_helpers::{fresh_in_memory_db, seed_folder};
-    use chrono::Utc;
+    use chrono::{DateTime, Duration, Utc};
 
     #[test]
     fn import_parser_omits_deepseek_when_child_home_is_unresolved() {
@@ -514,6 +604,18 @@ mod tests {
 
         assert!(build_parser(AgentType::DeepSeek, &runtime_env).is_none());
         assert!(build_parser(AgentType::ClaudeCode, &runtime_env).is_some());
+    }
+
+    /// [`import_one`] under [`DeletedPolicy::Skip`] — the implicit-pass
+    /// contract (whole-folder sweep, scan drive-by refresh). The restore tests
+    /// call `import_one` directly with [`DeletedPolicy::Restore`].
+    async fn import_one_skip(
+        conn: &DatabaseConnection,
+        folder_id: i32,
+        agent_type: &AgentType,
+        summary: &ConversationSummary,
+    ) -> Result<ImportOutcome, DbError> {
+        import_one(conn, folder_id, agent_type, summary, DeletedPolicy::Skip).await
     }
 
     fn summary(id: &str, title: Option<&str>) -> ConversationSummary {
@@ -532,6 +634,41 @@ mod tests {
             parent_tool_use_id: None,
             delegation_call_id: None,
         }
+    }
+
+    /// A parse of a session whose transcript ends at `ended_at` — what a
+    /// re-scan sees after the user kept working on it in the agent's own CLI.
+    fn timed_summary(
+        id: &str,
+        title: Option<&str>,
+        ended_at: DateTime<Utc>,
+        message_count: u32,
+    ) -> ConversationSummary {
+        ConversationSummary {
+            started_at: ended_at - Duration::hours(1),
+            ended_at: Some(ended_at),
+            message_count,
+            ..summary(id, title)
+        }
+    }
+
+    async fn find_row(conn: &DatabaseConnection, ext: &str) -> conversation::Model {
+        conversation::Entity::find()
+            .filter(conversation::Column::ExternalId.eq(ext))
+            .one(conn)
+            .await
+            .expect("query")
+            .expect("row exists")
+    }
+
+    /// Every conversation carrying an `external_id` — the row set the import
+    /// scan loads and hands to [`sync_imported_sessions`].
+    async fn external_rows(conn: &DatabaseConnection) -> Vec<conversation::Model> {
+        conversation::Entity::find()
+            .filter(conversation::Column::ExternalId.is_not_null())
+            .all(conn)
+            .await
+            .expect("query")
     }
 
     async fn find_id(conn: &DatabaseConnection, ext: &str) -> i32 {
@@ -555,7 +692,7 @@ mod tests {
         let folder = seed_folder(&db, "/tmp/codeg-import-no-enroll").await;
         let at = AgentType::ClaudeCode;
 
-        let outcome = import_one(
+        let outcome = import_one_skip(
             &db.conn,
             folder,
             &at,
@@ -582,7 +719,7 @@ mod tests {
         let folder = seed_folder(&db, "/tmp/codeg-import").await;
         let at = AgentType::ClaudeCode;
 
-        let first = import_one(
+        let first = import_one_skip(
             &db.conn,
             folder,
             &at,
@@ -595,7 +732,7 @@ mod tests {
         let id = find_id(&db.conn, "ext-1").await;
         // The agent generated an AI title only after the first import; a
         // re-import must adopt it.
-        let again = import_one(&db.conn, folder, &at, &summary("ext-1", Some("AI Summary")))
+        let again = import_one_skip(&db.conn, folder, &at, &summary("ext-1", Some("AI Summary")))
             .await
             .expect("re-import");
         assert_eq!(again, ImportOutcome::Updated(id));
@@ -608,13 +745,71 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn reimport_marks_the_conversation_for_a_token_usage_re_parse() {
+        // A re-import is the one moment we learn a transcript may have grown in
+        // the agent's own CLI. Nothing else here bumps `updated_at` (by
+        // design), so without this the dashboard would keep reporting the
+        // conversation as already counted and silently under-report it.
+        use crate::db::service::token_usage_service::{
+            self as usage, replace_conversation_facts, UsageFact,
+        };
+
+        let db = fresh_in_memory_db().await;
+        let folder = seed_folder(&db, "/tmp/codeg-import-usage").await;
+        let at = AgentType::ClaudeCode;
+
+        import_one_skip(&db.conn, folder, &at, &summary("ext-usage", Some("t")))
+            .await
+            .expect("import");
+        let id = find_id(&db.conn, "ext-usage").await;
+        let updated_at = conversation::Entity::find_by_id(id)
+            .one(&db.conn)
+            .await
+            .expect("query")
+            .expect("row")
+            .updated_at;
+
+        replace_conversation_facts(
+            &db.conn,
+            id,
+            updated_at,
+            &[UsageFact {
+                turn_key: "t1".into(),
+                occurred_at: Utc::now(),
+                model: None,
+                input_tokens: 100,
+                output_tokens: 10,
+                cache_creation_tokens: 0,
+                cache_read_tokens: 0,
+                duration_ms: 0,
+            }],
+        )
+        .await
+        .expect("record usage");
+        assert!(!usage::list_sync_candidates(&db.conn).await.expect("c")[0].is_stale());
+
+        // Same title, so the title-refresh path reports `Skipped` — the mark
+        // must land regardless of whether the title moved.
+        let again = import_one_skip(&db.conn, folder, &at, &summary("ext-usage", Some("t")))
+            .await
+            .expect("re-import");
+        assert_eq!(again, ImportOutcome::Skipped);
+
+        let candidate = usage::list_sync_candidates(&db.conn).await.expect("c")[0].clone();
+        assert!(candidate.is_stale());
+        // The stamp row itself survives, so a transcript that turns out to be
+        // unreachable on the re-parse can't erase the facts we already have.
+        assert_eq!(candidate.synced_turn_count, Some(1));
+    }
+
+    #[tokio::test]
     async fn import_inserts_a_pending_review_conversation() {
         let db = fresh_in_memory_db().await;
         let folder = seed_folder(&db, "/tmp/codeg-import-status").await;
         let at = AgentType::ClaudeCode;
 
         assert_eq!(
-            import_one(
+            import_one_skip(
                 &db.conn,
                 folder,
                 &at,
@@ -644,11 +839,13 @@ mod tests {
         let s = summary("ext-1", Some("same title"));
 
         assert_eq!(
-            import_one(&db.conn, folder, &at, &s).await.expect("import"),
+            import_one_skip(&db.conn, folder, &at, &s)
+                .await
+                .expect("import"),
             ImportOutcome::Imported
         );
         assert_eq!(
-            import_one(&db.conn, folder, &at, &s)
+            import_one_skip(&db.conn, folder, &at, &s)
                 .await
                 .expect("re-import"),
             ImportOutcome::Skipped
@@ -661,7 +858,7 @@ mod tests {
         let folder = seed_folder(&db, "/tmp/codeg-import-lock").await;
         let at = AgentType::ClaudeCode;
 
-        import_one(
+        import_one_skip(
             &db.conn,
             folder,
             &at,
@@ -674,7 +871,7 @@ mod tests {
             .await
             .expect("rename");
 
-        let outcome = import_one(&db.conn, folder, &at, &summary("ext-1", Some("AI Summary")))
+        let outcome = import_one_skip(&db.conn, folder, &at, &summary("ext-1", Some("AI Summary")))
             .await
             .expect("re-import");
         assert_eq!(
@@ -695,7 +892,7 @@ mod tests {
         let folder = seed_folder(&db, "/tmp/codeg-import-empty").await;
         let at = AgentType::ClaudeCode;
 
-        import_one(&db.conn, folder, &at, &summary("ext-1", Some("kept title")))
+        import_one_skip(&db.conn, folder, &at, &summary("ext-1", Some("kept title")))
             .await
             .expect("import");
         let id = find_id(&db.conn, "ext-1").await;
@@ -703,13 +900,13 @@ mod tests {
         // A parse that yields no title (or only whitespace) must not null the
         // existing title.
         assert_eq!(
-            import_one(&db.conn, folder, &at, &summary("ext-1", None))
+            import_one_skip(&db.conn, folder, &at, &summary("ext-1", None))
                 .await
                 .expect("none"),
             ImportOutcome::Skipped
         );
         assert_eq!(
-            import_one(&db.conn, folder, &at, &summary("ext-1", Some("   ")))
+            import_one_skip(&db.conn, folder, &at, &summary("ext-1", Some("   ")))
                 .await
                 .expect("blank"),
             ImportOutcome::Skipped
@@ -726,7 +923,7 @@ mod tests {
         let folder = seed_folder(&db, "/tmp/codeg-import-deleted").await;
         let at = AgentType::ClaudeCode;
 
-        import_one(&db.conn, folder, &at, &summary("ext-1", Some("original")))
+        import_one_skip(&db.conn, folder, &at, &summary("ext-1", Some("original")))
             .await
             .expect("import");
         let id = find_id(&db.conn, "ext-1").await;
@@ -735,7 +932,7 @@ mod tests {
             .expect("soft delete");
 
         // A re-import must neither resurrect nor rewrite a deleted conversation.
-        let outcome = import_one(&db.conn, folder, &at, &summary("ext-1", Some("AI Summary")))
+        let outcome = import_one_skip(&db.conn, folder, &at, &summary("ext-1", Some("AI Summary")))
             .await
             .expect("re-import");
         assert_eq!(outcome, ImportOutcome::Skipped);
@@ -750,6 +947,438 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn restore_brings_a_soft_deleted_conversation_back_in_place() {
+        let db = fresh_in_memory_db().await;
+        let folder = seed_folder(&db, "/tmp/codeg-import-restore").await;
+        let at = AgentType::ClaudeCode;
+
+        let first_end = Utc::now() - Duration::hours(5);
+        import_one_skip(
+            &db.conn,
+            folder,
+            &at,
+            &timed_summary("ext-1", Some("original"), first_end, 2),
+        )
+        .await
+        .expect("import");
+        let id = find_id(&db.conn, "ext-1").await;
+        conversation_service::soft_delete(&db.conn, id)
+            .await
+            .expect("soft delete");
+
+        // The user checked this deleted session in the picker. It comes back as
+        // the SAME row (id and all — nothing was ever physically deleted), and
+        // picks up the drift the transcript accumulated while it was gone.
+        let later = first_end + Duration::hours(2);
+        let outcome = import_one(
+            &db.conn,
+            folder,
+            &at,
+            &timed_summary("ext-1", Some("AI Summary"), later, 9),
+            DeletedPolicy::Restore,
+        )
+        .await
+        .expect("restore");
+        assert_eq!(outcome, ImportOutcome::Restored);
+
+        let rows = conversation::Entity::find()
+            .filter(conversation::Column::ExternalId.eq("ext-1"))
+            .all(&db.conn)
+            .await
+            .expect("query");
+        assert_eq!(rows.len(), 1, "restored in place, never re-inserted");
+        assert_eq!(rows[0].id, id, "same row: history, tabs and children hold");
+        assert!(rows[0].deleted_at.is_none(), "back from the dead");
+        assert_eq!(
+            rows[0].status,
+            conversation::ConversationStatus::PendingReview,
+            "restored rows survive the sidebar's default completed filter"
+        );
+        assert_eq!(
+            rows[0].title.as_deref(),
+            Some("AI Summary"),
+            "the refresh runs AFTER the un-delete, not against a deleted row"
+        );
+        assert_eq!(rows[0].updated_at, later, "adopts the newer activity");
+        assert_eq!(rows[0].message_count, 9);
+    }
+
+    #[tokio::test]
+    async fn restore_is_idempotent_and_leaves_a_live_row_alone() {
+        let db = fresh_in_memory_db().await;
+        let folder = seed_folder(&db, "/tmp/codeg-import-restore-twice").await;
+        let at = AgentType::ClaudeCode;
+
+        import_one_skip(&db.conn, folder, &at, &summary("ext-1", Some("kept")))
+            .await
+            .expect("import");
+        let id = find_id(&db.conn, "ext-1").await;
+        conversation_service::soft_delete(&db.conn, id)
+            .await
+            .expect("soft delete");
+
+        assert_eq!(
+            import_one(
+                &db.conn,
+                folder,
+                &at,
+                &summary("ext-1", Some("kept")),
+                DeletedPolicy::Restore
+            )
+            .await
+            .expect("restore"),
+            ImportOutcome::Restored
+        );
+        // A second pass has nothing left to restore: the row is live, so it is
+        // an ordinary already-imported row and must not be counted again.
+        assert_eq!(
+            import_one(
+                &db.conn,
+                folder,
+                &at,
+                &summary("ext-1", Some("kept")),
+                DeletedPolicy::Restore
+            )
+            .await
+            .expect("re-run"),
+            ImportOutcome::Skipped
+        );
+    }
+
+    #[tokio::test]
+    async fn restore_lands_the_conversation_in_the_import_target_folder() {
+        let db = fresh_in_memory_db().await;
+        let old_folder = seed_folder(&db, "/tmp/codeg-restore-old").await;
+        let target = seed_folder(&db, "/tmp/codeg-restore-target").await;
+        let at = AgentType::ClaudeCode;
+
+        import_one_skip(&db.conn, old_folder, &at, &summary("ext-1", Some("t")))
+            .await
+            .expect("import");
+        let id = find_id(&db.conn, "ext-1").await;
+        conversation_service::soft_delete(&db.conn, id)
+            .await
+            .expect("soft delete");
+
+        import_one(
+            &db.conn,
+            target,
+            &at,
+            &summary("ext-1", Some("t")),
+            DeletedPolicy::Restore,
+        )
+        .await
+        .expect("restore");
+
+        // The picker's group folder is the one `add_folder` just made live AND
+        // open; the row's own folder may have been removed or closed since,
+        // and a conversation restored into an invisible folder reads as a
+        // restore that did not work.
+        assert_eq!(find_row(&db.conn, "ext-1").await.folder_id, target);
+    }
+
+    #[tokio::test]
+    async fn restore_never_touches_a_delegation_child() {
+        let db = fresh_in_memory_db().await;
+        let folder = seed_folder(&db, "/tmp/codeg-restore-child").await;
+        let at = AgentType::ClaudeCode;
+
+        import_one_skip(&db.conn, folder, &at, &summary("parent-ext", Some("p")))
+            .await
+            .expect("import parent");
+        let parent_id = find_id(&db.conn, "parent-ext").await;
+
+        let now = Utc::now();
+        conversation::ActiveModel {
+            id: NotSet,
+            folder_id: Set(folder),
+            title: Set(Some("child".to_string())),
+            title_locked: Set(false),
+            auto_title_finalized: Set(false),
+            agent_type: Set(agent_type_db_str(&at)),
+            status: Set(conversation::ConversationStatus::Completed),
+            kind: Set(conversation::ConversationKind::Delegate),
+            model: Set(None),
+            git_branch: Set(None),
+            external_id: Set(Some("child-ext".to_string())),
+            parent_id: Set(Some(parent_id)),
+            parent_tool_use_id: Set(None),
+            delegation_call_id: Set(None),
+            delegation_route_override: Set(None),
+            delegation_task_status: Set(None),
+            delegation_error_code: Set(None),
+            delegation_started_at: Set(None),
+            delegation_finished_at: Set(None),
+            delegation_tool_call_count: Set(None),
+            delegation_edit_tool_call_count: Set(None),
+            delegation_touched_files_json: Set(None),
+            delegation_touched_files_truncated: Set(None),
+            delegation_additions: Set(None),
+            delegation_deletions: Set(None),
+            delegation_line_counts_complete: Set(None),
+            message_count: Set(1),
+            created_at: Set(now),
+            updated_at: Set(now),
+            deleted_at: Set(Some(now)),
+            pinned_at: Set(None),
+            awaiting_reply_token: Set(None),
+            delegation_run_generation: Set(None),
+            last_termination_audit_json: Set(None),
+            origin_cwd: Set(None),
+        }
+        .insert(&db.conn)
+        .await
+        .expect("insert deleted child");
+
+        // A delegation child is not a sidebar row, so "restore" has no meaning
+        // for it — it would surface a sub-session as a root conversation.
+        assert_eq!(
+            import_one(
+                &db.conn,
+                folder,
+                &at,
+                &summary("child-ext", Some("x")),
+                DeletedPolicy::Restore
+            )
+            .await
+            .expect("restore child"),
+            ImportOutcome::Skipped
+        );
+        let child = find_row(&db.conn, "child-ext").await;
+        assert!(child.deleted_at.is_some(), "child stays deleted");
+        assert_eq!(child.title.as_deref(), Some("child"), "child untouched");
+    }
+
+    #[tokio::test]
+    async fn reimport_adopts_newer_transcript_activity() {
+        let db = fresh_in_memory_db().await;
+        let folder = seed_folder(&db, "/tmp/codeg-import-activity").await;
+        let at = AgentType::ClaudeCode;
+
+        let first_end = Utc::now() - Duration::hours(3);
+        import_one_skip(
+            &db.conn,
+            folder,
+            &at,
+            &timed_summary("ext-1", Some("kept"), first_end, 2),
+        )
+        .await
+        .expect("import");
+        let created_at = find_row(&db.conn, "ext-1").await.created_at;
+        let id = find_id(&db.conn, "ext-1").await;
+
+        // The user resumed the session in the agent's own CLI and sent more
+        // messages; a re-scan must move it to the front of a recency-sorted
+        // sidebar and show the transcript's time, not the scan's.
+        let later = first_end + Duration::hours(1);
+        assert_eq!(
+            import_one_skip(
+                &db.conn,
+                folder,
+                &at,
+                &timed_summary("ext-1", Some("kept"), later, 5)
+            )
+            .await
+            .expect("re-import"),
+            ImportOutcome::Updated(id)
+        );
+
+        let row = find_row(&db.conn, "ext-1").await;
+        assert_eq!(row.updated_at, later, "updated_at follows the transcript");
+        assert_eq!(row.message_count, 5);
+        assert_eq!(
+            row.created_at, created_at,
+            "created_at is the original session start and must not move"
+        );
+        assert_eq!(row.title.as_deref(), Some("kept"));
+    }
+
+    #[tokio::test]
+    async fn reimport_never_moves_updated_at_backwards() {
+        let db = fresh_in_memory_db().await;
+        let folder = seed_folder(&db, "/tmp/codeg-import-monotonic").await;
+        let at = AgentType::ClaudeCode;
+
+        let end = Utc::now() - Duration::hours(1);
+        import_one_skip(
+            &db.conn,
+            folder,
+            &at,
+            &timed_summary("ext-1", Some("kept"), end, 4),
+        )
+        .await
+        .expect("import");
+
+        // Re-scanning the same transcript, or one that somehow parses older
+        // (clock skew, a truncated tail), must change nothing at all.
+        for (ended_at, label) in [(end, "identical"), (end - Duration::hours(2), "older")] {
+            assert_eq!(
+                import_one_skip(
+                    &db.conn,
+                    folder,
+                    &at,
+                    &timed_summary("ext-1", Some("kept"), ended_at, 99)
+                )
+                .await
+                .expect("re-import"),
+                ImportOutcome::Skipped,
+                "{label} activity must be a no-op"
+            );
+        }
+
+        let row = find_row(&db.conn, "ext-1").await;
+        assert_eq!(row.updated_at, end);
+        assert_eq!(row.message_count, 4);
+    }
+
+    #[tokio::test]
+    async fn activity_refresh_preserves_pin_status_and_locked_title() {
+        let db = fresh_in_memory_db().await;
+        let folder = seed_folder(&db, "/tmp/codeg-import-preserve").await;
+        let at = AgentType::ClaudeCode;
+
+        import_one_skip(
+            &db.conn,
+            folder,
+            &at,
+            &timed_summary("ext-1", Some("first prompt"), Utc::now(), 2),
+        )
+        .await
+        .expect("import");
+        let id = find_id(&db.conn, "ext-1").await;
+        conversation_service::update_title(&db.conn, id, "User Pick".into())
+            .await
+            .expect("rename");
+        conversation_service::update_pin(&db.conn, id, true)
+            .await
+            .expect("pin");
+        conversation_service::update_status(
+            &db.conn,
+            id,
+            conversation::ConversationStatus::Completed,
+        )
+        .await
+        .expect("status");
+
+        let later = Utc::now() + Duration::hours(1);
+        assert_eq!(
+            import_one_skip(
+                &db.conn,
+                folder,
+                &at,
+                &timed_summary("ext-1", Some("AI Summary"), later, 6)
+            )
+            .await
+            .expect("re-import"),
+            ImportOutcome::Updated(id),
+            "activity alone is enough to report an update"
+        );
+
+        let row = find_row(&db.conn, "ext-1").await;
+        assert_eq!(row.updated_at, later);
+        assert_eq!(row.message_count, 6);
+        assert_eq!(row.title.as_deref(), Some("User Pick"), "rename survives");
+        assert!(row.title_locked);
+        assert!(row.pinned_at.is_some(), "pin survives");
+        assert_eq!(
+            row.status,
+            conversation::ConversationStatus::Completed,
+            "codeg's own status survives"
+        );
+    }
+
+    #[tokio::test]
+    async fn sync_imported_sessions_refreshes_in_place_and_never_inserts() {
+        let db = fresh_in_memory_db().await;
+        let folder = seed_folder(&db, "/tmp/codeg-sync-scan").await;
+        let at = AgentType::ClaudeCode;
+
+        let end = Utc::now() - Duration::hours(2);
+        import_one_skip(
+            &db.conn,
+            folder,
+            &at,
+            &timed_summary("ext-live", Some("first prompt"), end, 2),
+        )
+        .await
+        .expect("import");
+        let live_id = find_id(&db.conn, "ext-live").await;
+
+        // What a re-scan sees: the imported session grew AND got a title, plus
+        // a session the user has never imported.
+        let later = end + Duration::hours(1);
+        let items = vec![
+            (at, timed_summary("ext-live", Some("AI Summary"), later, 5)),
+            (at, timed_summary("ext-never", Some("untouched"), later, 3)),
+        ];
+        let rows = external_rows(&db.conn).await;
+        assert_eq!(
+            sync_imported_sessions(&db.conn, &rows, &items).await,
+            vec![live_id]
+        );
+
+        let row = find_row(&db.conn, "ext-live").await;
+        assert_eq!(row.updated_at, later);
+        assert_eq!(row.message_count, 5);
+        assert_eq!(row.title.as_deref(), Some("AI Summary"));
+
+        assert!(
+            conversation::Entity::find()
+                .filter(conversation::Column::ExternalId.eq("ext-never"))
+                .one(&db.conn)
+                .await
+                .expect("query")
+                .is_none(),
+            "a session the user never imported must stay unimported"
+        );
+
+        // Idempotent: a second scan over the same transcripts writes nothing.
+        let rows = external_rows(&db.conn).await;
+        assert!(sync_imported_sessions(&db.conn, &rows, &items)
+            .await
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn sync_imported_sessions_skips_deleted_rows() {
+        let db = fresh_in_memory_db().await;
+        let folder = seed_folder(&db, "/tmp/codeg-sync-deleted").await;
+        let at = AgentType::ClaudeCode;
+
+        let end = Utc::now() - Duration::hours(2);
+        import_one_skip(
+            &db.conn,
+            folder,
+            &at,
+            &timed_summary("ext-1", Some("original"), end, 2),
+        )
+        .await
+        .expect("import");
+        let id = find_id(&db.conn, "ext-1").await;
+        conversation_service::soft_delete(&db.conn, id)
+            .await
+            .expect("soft delete");
+
+        let items = vec![(
+            at,
+            timed_summary("ext-1", Some("AI Summary"), end + Duration::hours(1), 9),
+        )];
+        let rows = external_rows(&db.conn).await;
+        assert!(
+            sync_imported_sessions(&db.conn, &rows, &items)
+                .await
+                .is_empty(),
+            "a deleted conversation must never be half-resurrected by a scan"
+        );
+
+        let row = find_row(&db.conn, "ext-1").await;
+        assert_eq!(row.updated_at, end, "activity untouched");
+        assert_eq!(row.message_count, 2);
+        assert_eq!(row.title.as_deref(), Some("original"));
+        assert!(row.deleted_at.is_some());
+    }
+
+    #[tokio::test]
     async fn reimport_skips_a_delegation_child() {
         let db = fresh_in_memory_db().await;
         let folder = seed_folder(&db, "/tmp/codeg-import-child").await;
@@ -761,7 +1390,7 @@ mod tests {
             .to_string();
 
         // A root conversation to parent the child.
-        import_one(
+        import_one_skip(
             &db.conn,
             folder,
             &at,
@@ -816,7 +1445,7 @@ mod tests {
         .await
         .expect("insert child");
 
-        let outcome = import_one(
+        let outcome = import_one_skip(
             &db.conn,
             folder,
             &at,

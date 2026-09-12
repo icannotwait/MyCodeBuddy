@@ -51,8 +51,7 @@ use crate::db::entities::delegation_task_run::{
 use crate::db::error::DbError;
 use crate::db::service::app_metadata_service;
 use crate::models::AgentType;
-#[cfg(feature = "tauri-runtime")]
-use crate::web::event_bridge::{emit_event, EventEmitter};
+use crate::web::event_bridge::{emit_event, EventEmitter, DELEGATION_SETTINGS_CHANGED_EVENT};
 
 pub const KEY_DELEGATION_ENABLED: &str = "delegation.enabled";
 pub const KEY_DELEGATION_DEPTH: &str = "delegation.depth_limit";
@@ -370,6 +369,41 @@ pub async fn apply_persisted_config(
     broker.set_config(config).await;
 }
 
+/// Serializes every write to this record within the process. Both writers below
+/// finish by pushing the record onto the broker, and `load_delegation_settings`
+/// reads the four keys in four separate queries — so interleaved writers can
+/// leave the database correct while the broker (which is what actually gates a
+/// delegation) settles on a value neither of them intended.
+static DELEGATION_WRITE_LOCK: std::sync::LazyLock<tokio::sync::Mutex<()>> =
+    std::sync::LazyLock::new(|| tokio::sync::Mutex::new(()));
+
+/// Move only the on/off switch, leaving the depth limit, the cache ceiling and
+/// the per-agent defaults at whatever the database holds.
+///
+/// [`set_delegation_settings_core`] republishes all four keys, which is right
+/// for the settings form and wrong for a caller that only means to flip
+/// `enabled` — the status-bar popover reads the record, flips one bool and
+/// would write the other three back, reverting any concurrent edit to them.
+pub async fn set_delegation_enabled_core(
+    conn: &DatabaseConnection,
+    broker: &DelegationBroker,
+    emitter: &EventEmitter,
+    enabled: bool,
+) -> Result<DelegationSettings, AppCommandError> {
+    let _guard = DELEGATION_WRITE_LOCK.lock().await;
+    app_metadata_service::upsert_value(conn, KEY_DELEGATION_ENABLED, &enabled.to_string())
+        .await
+        .map_err(AppCommandError::from)?;
+    let settings = load_delegation_settings(conn).await;
+    let mut config = settings.clone().into_broker_config();
+    // Fork profiles live on the broker, not in the settings row. Applying the
+    // enabled-only write must not wipe the live profile map.
+    config.profiles = broker.config_snapshot().await.profiles;
+    broker.set_config(config).await;
+    emit_event(emitter, DELEGATION_SETTINGS_CHANGED_EVENT, &settings);
+    Ok(settings)
+}
+
 async fn persist_settings_keys<C: sea_orm::ConnectionTrait>(
     conn: &C,
     clamped: &DelegationSettings,
@@ -512,6 +546,23 @@ pub async fn load_delegation_profile_catalog(
     Ok(catalog)
 }
 
+/// Upstream-shaped full-record writer. The status-bar / `mcp_service` tests
+/// pass an emitter and expect `DelegationSettings` back. Live apply (runtime
+/// watch + route staleness + catalog mutation) stays on
+/// [`set_delegation_settings_live`].
+pub async fn set_delegation_settings_core(
+    conn: &DatabaseConnection,
+    broker: &DelegationBroker,
+    emitter: &EventEmitter,
+    desired: DelegationSettings,
+) -> Result<DelegationSettings, AppCommandError> {
+    let runtime = DelegationRuntimeSettings::default();
+    let manager = crate::acp::manager::ConnectionManager::new();
+    let mutation = set_delegation_settings_live(conn, broker, &runtime, &manager, desired).await?;
+    emit_event(emitter, DELEGATION_SETTINGS_CHANGED_EVENT, &mutation.value);
+    Ok(mutation.value)
+}
+
 /// Persist + apply. Used by both the Tauri command and the HTTP handler so
 /// the clamp / re-apply chain is in exactly one place. Settings keys are
 /// written in one DB transaction so a mid-write failure does not leave a
@@ -519,13 +570,14 @@ pub async fn load_delegation_profile_catalog(
 /// after** a successful commit. Route/enabled changes refresh managed-root
 /// route staleness; a watchdog-only save updates the channel without stale.
 /// Holds the broker configuration mutation gate through write + live apply.
-pub async fn set_delegation_settings_core(
+pub async fn set_delegation_settings_live(
     conn: &DatabaseConnection,
     broker: &DelegationBroker,
     runtime: &DelegationRuntimeSettings,
     manager: &crate::acp::manager::ConnectionManager,
     desired: DelegationSettings,
 ) -> Result<DelegationMutation<DelegationSettings>, AppCommandError> {
+    let _write = DELEGATION_WRITE_LOCK.lock().await;
     let _gate = broker.configuration_mutation_guard().await;
     let before = runtime.snapshot();
     let clamped = desired.clamped();
@@ -577,6 +629,7 @@ pub async fn set_delegation_bundle_core(
     manager: &crate::acp::manager::ConnectionManager,
     desired: DelegationBundle,
 ) -> Result<DelegationMutation<DelegationBundle>, AppCommandError> {
+    let _write = DELEGATION_WRITE_LOCK.lock().await;
     let _gate = broker.configuration_mutation_guard().await;
     let before = runtime.snapshot();
     let clamped = desired.settings.clamped();
@@ -902,7 +955,7 @@ pub async fn set_delegation_settings(
 ) -> Result<DelegationSettings, AppCommandError> {
     #[cfg(feature = "tauri-runtime")]
     {
-        let mutation = set_delegation_settings_core(
+        let mutation = set_delegation_settings_live(
             &db.conn,
             broker.inner(),
             runtime.inner(),
@@ -910,11 +963,13 @@ pub async fn set_delegation_settings(
             settings,
         )
         .await?;
+        let emitter = EventEmitter::Tauri(app);
         emit_event(
-            &EventEmitter::Tauri(app),
+            &emitter,
             DELEGATION_PROFILE_CATALOG_CHANGED_EVENT,
             mutation.catalog,
         );
+        emit_event(&emitter, DELEGATION_SETTINGS_CHANGED_EVENT, &mutation.value);
         Ok(mutation.value)
     }
     #[cfg(not(feature = "tauri-runtime"))]
@@ -998,10 +1053,16 @@ pub async fn set_delegation_bundle(
             bundle,
         )
         .await?;
+        let emitter = EventEmitter::Tauri(app);
         emit_event(
-            &EventEmitter::Tauri(app),
+            &emitter,
             DELEGATION_PROFILE_CATALOG_CHANGED_EVENT,
             mutation.catalog,
+        );
+        emit_event(
+            &emitter,
+            DELEGATION_SETTINGS_CHANGED_EVENT,
+            &mutation.value.settings,
         );
         Ok(mutation.value)
     }
@@ -1190,7 +1251,7 @@ mod tests {
             depth_limit: 3,
             ..DelegationSettings::default()
         };
-        let saved = set_delegation_settings_core(
+        let saved = set_delegation_settings_live(
             &db.conn,
             &broker,
             &runtime,
@@ -1235,7 +1296,7 @@ mod tests {
             agent_defaults: agent_defaults.clone(),
             ..DelegationSettings::default()
         };
-        let saved = set_delegation_settings_core(
+        let saved = set_delegation_settings_live(
             &db.conn,
             &broker,
             &runtime,
@@ -1287,7 +1348,7 @@ mod tests {
         let db = crate::db::test_helpers::fresh_in_memory_db().await;
         let broker = make_broker();
         let runtime = DelegationRuntimeSettings::default();
-        let saved = set_delegation_settings_core(
+        let saved = set_delegation_settings_live(
             &db.conn,
             &broker,
             &runtime,
@@ -1315,7 +1376,7 @@ mod tests {
             completed_cache_max_mb: 8,
             ..DelegationSettings::default()
         };
-        let saved = set_delegation_settings_core(
+        let saved = set_delegation_settings_live(
             &db.conn,
             &broker,
             &runtime,
@@ -1437,7 +1498,7 @@ mod tests {
             completed_cache_max_mb: 512,
         };
 
-        let saved = set_delegation_settings_core(
+        let saved = set_delegation_settings_live(
             &db.conn,
             &broker,
             &runtime,
@@ -1470,7 +1531,7 @@ mod tests {
         let broker = make_broker();
         let runtime = DelegationRuntimeSettings::default();
         let manager = crate::acp::manager::ConnectionManager::new();
-        let settings = set_delegation_settings_core(
+        let settings = set_delegation_settings_live(
             &db.conn,
             &broker,
             &runtime,
@@ -1510,7 +1571,7 @@ mod tests {
         let manager = crate::acp::manager::ConnectionManager::new();
 
         let (settings_result, profiles_result) = tokio::join!(
-            set_delegation_settings_core(
+            set_delegation_settings_live(
                 &db.conn,
                 &broker,
                 &runtime,

@@ -377,7 +377,7 @@ async fn handle_turn_complete_internal(
             conversation_service::finish_end_turn_if_in_progress(&txn, cid, mark_awaiting_reply)
                 .await?
         }
-        "refusal" | "max_tokens" | "max_turn_requests" | "unknown" | "empty" => {
+        "refusal" | "max_tokens" | "max_turn_requests" | "unknown" | "empty" | "auth_required" => {
             conversation_service::update_status_if_with_patch(
                 &txn,
                 cid,
@@ -437,7 +437,7 @@ async fn handle_turn_complete_internal(
     // spinning while logs claim "CAS won".
     let expected_after_cas: Option<ConversationStatus> = match stop_reason {
         "end_turn" if cas_patch.is_some() => Some(ConversationStatus::PendingReview),
-        "refusal" | "max_tokens" | "max_turn_requests" | "unknown" | "empty"
+        "refusal" | "max_tokens" | "max_turn_requests" | "unknown" | "empty" | "auth_required"
             if cas_patch.is_some() =>
         {
             Some(ConversationStatus::Cancelled)
@@ -742,9 +742,23 @@ pub(crate) async fn handle_event(
             // (InProgress → Cancelled, clears token). Emit the existing
             // per-connection status event only when the CAS wins (`Some`),
             // then the global ConversationChange::State with the returned
-            // backend patch. `cancelled` is already written by
-            // `manager.cancel()`; leave it alone. `completed` transitions
-            // remain frontend-driven.
+            // backend patch.
+            // The target status depends on the stop reason: `end_turn` is the
+            // only success case and goes to `PendingReview`. `refusal`,
+            // `max_tokens`, `max_turn_requests`, `unknown`, `empty`, and
+            // `auth_required` indicate the turn failed (often a backend/gateway
+            // error masquerading as `Refusal` per the ACP spec gap, or — common
+            // with OpenCode — a silent EndTurn that produced no output), so
+            // we flip to `Cancelled` and pair the transition with an
+            // `AcpEvent::Error` toast emitted upstream by `connection.rs`.
+            // `auth_required` is the one whose CONNECTION survives (the agent
+            // refused the prompt with ACP's -32000 and wants the user to sign
+            // in), but the turn is just as dead as the others — leaving the row
+            // out of this arm would strand it at InProgress for good.
+            // `cancelled` is already written by `manager.cancel()` (eager
+            // CAS InProgress → Cancelled at the user-cancel entry point), so
+            // we leave it alone here. `completed` transitions remain
+            // frontend-driven.
             let Some((state_arc, emitter)) =
                 manager.get_state_and_emitter(&envelope.connection_id).await
             else {
@@ -813,7 +827,8 @@ pub(crate) async fn handle_event(
                     )
                     .await?
                 }
-                "refusal" | "max_tokens" | "max_turn_requests" | "unknown" | "empty" => {
+                "refusal" | "max_tokens" | "max_turn_requests" | "unknown" | "empty"
+                | "auth_required" => {
                     conversation_service::update_status_if_with_patch(
                         db_conn,
                         cid,
@@ -1040,6 +1055,9 @@ async fn forward_turn_complete_to_broker(
             Some(conversation_id),
         ),
         "empty" => DelegationOutcome::from_err(DelegationError::ChildEmpty, Some(conversation_id)),
+        "auth_required" => {
+            DelegationOutcome::from_err(DelegationError::ChildAuthRequired, Some(conversation_id))
+        }
         other => DelegationOutcome::from_err(
             DelegationError::ChildUnknown(other.to_string()),
             Some(conversation_id),
@@ -4257,12 +4275,17 @@ mod tests {
         // The lifecycle subscriber must flip the conversation to Cancelled
         // for refusal/max_tokens/max_turn_requests/unknown so the user sees
         // a terminal state instead of a misleading PendingReview ("待审查").
+        // `auth_required` is synthesized by `run_conversation_loop` when the
+        // agent rejects the prompt with ACP's -32000: the CONNECTION survives
+        // that one, but the turn did not, so the row must still leave
+        // InProgress — nothing else would ever move it.
         let cases = [
             "refusal",
             "max_tokens",
             "max_turn_requests",
             "unknown",
             "empty",
+            "auth_required",
         ];
         for stop_reason in cases {
             let db = test_helpers::fresh_in_memory_db().await;

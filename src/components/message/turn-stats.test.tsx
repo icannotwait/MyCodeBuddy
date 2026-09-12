@@ -177,4 +177,23 @@ describe("TurnStats fork-from-here gating", () => {
       enMessages.Folder.chat.messageList.forkBusy
     )
   })
+
+  it("says so when the reply has no name to fork at yet", async () => {
+    // The other reason the button greys out: a reply this session streamed is
+    // named `live-…` until the post-turn reparse renames it, and the backend
+    // silently tail-forks such an id. Saying "a turn is running" there would
+    // be a lie about a session that is sitting idle.
+    renderStats(
+      <TurnStats
+        copyText="hello"
+        onForkFromHere={vi.fn()}
+        forkDisabled
+        forkDisabledReason="unnamed"
+      />
+    )
+    await userEvent.hover(screen.getByLabelText(forkLabel))
+    expect(await screen.findByRole("tooltip")).toHaveTextContent(
+      enMessages.Folder.chat.messageList.forkNotReady
+    )
+  })
 })

@@ -10,6 +10,7 @@ import {
   useState,
 } from "react"
 import {
+  isLiveTurnId,
   selectDelegationActivities,
   selectHistoricalTimelineTurns,
   selectTimelineTurns,
@@ -37,7 +38,10 @@ import { CompletedTurnContent } from "./completed-turn-content"
 import { ContextCompactionCard } from "./context-compaction-card"
 import { CollapsibleUserMessage } from "./collapsible-user-message"
 import { CollapsibleSystemMessage } from "./collapsible-system-message"
-import { isContextCompactionMeta } from "@/lib/context-compaction"
+import {
+  contextCompactionPayload,
+  isContextCompactionMeta,
+} from "@/lib/context-compaction"
 import {
   createMessageTurnAdapter,
   groupGoalRuns,
@@ -125,9 +129,13 @@ import { InitialHistoryScrollController } from "./initial-history-scroll-control
 import { extractSessionFilesGrouped } from "@/lib/session-files"
 import { unescapeComposerText } from "@/lib/composer-copy-text"
 import { useStickToBottomContext } from "use-stick-to-bottom"
+import { useAppWorkspaceStore } from "@/stores/app-workspace-store"
+import { MarkdownImageProvider } from "@/components/ai-elements/markdown-local-image"
 
 interface MessageListViewProps {
   conversationId: number
+  /** This transcript's working directory, including new-chat drafts. */
+  imageRoot?: string | null
   agentType: AgentType
   workspaceRootPath?: string | null
   connStatus?: ConnectionStatus | null
@@ -309,6 +317,12 @@ export type ThreadRenderItem =
        *  `armed` flag this is what makes a run "the current round" — see the
        *  fold state below. */
       isLastAssistantRun: boolean
+      /** Nothing follows this item in the thread — not a user message, not a
+       *  compaction divider. Distinct from `isLastAssistantRun`, which is still
+       *  true for a reply the user interrupted at its very end (that promotes
+       *  as assistant then user message, so the newest REPLY is not the tail).
+       *  Read by the fork gate, where the two differ by a wrong fork point. */
+      isThreadTail: boolean
       /** Raw assistant sub-turn(s) that compose this reply — fed to the
        *  per-reply artifacts card so it can list files changed this reply. */
       sourceTurns: MessageTurn[]
@@ -719,6 +733,62 @@ function compactionOnlyMeta(
 }
 
 /**
+ * Identity of a compaction EVENT, or `null` when the payload cannot name one.
+ *
+ * All three counters are required, and that is the point rather than
+ * strictness for its own sake: codex-acp sends a bare `{version: 1}` for every
+ * compaction it performs, so a looser key would fold a session's separate
+ * compactions into one. Together, the token counts either side of the boundary
+ * plus a duration measured in milliseconds identify a single event — two real
+ * compactions agreeing on all three does not happen.
+ */
+function compactionEventKey(
+  meta: Record<string, unknown> | null
+): string | null {
+  const payload = contextCompactionPayload(meta)
+  if (!payload) return null
+  const nums = ["preTokens", "postTokens", "durationMs"].map((k) => {
+    const v = payload[k]
+    return typeof v === "number" && Number.isFinite(v) ? v : null
+  })
+  return nums.some((n) => n === null) ? null : `compaction:${nums.join(":")}`
+}
+
+/**
+ * Drop repeat renderings of one compaction, keeping the first.
+ *
+ * A compaction reaches the timeline through two independent channels that no
+ * id-keyed dedup can join: the live ACP `tool_call` (a `live-…` turn) and the
+ * agent's own transcript, which `parsers::claude` turns into a divider under a
+ * parser id. Mid-turn both are in hand at once — and unlike an ordinary
+ * partial reply, the usual suppressor cannot help here, because the `/compact`
+ * prompt is not persisted until AFTER the boundary, so the backend has no
+ * in-flight user turn to anchor on (`apply_in_flight_message_id`).
+ *
+ * Content is therefore the only usable identity; see [`compactionEventKey`]
+ * for why it is safe. Returns the input array when nothing is dropped, so the
+ * common path allocates nothing.
+ */
+export function dedupeCompactionItems(
+  items: ThreadRenderItem[]
+): ThreadRenderItem[] {
+  const seen = new Set<string>()
+  let dropped = false
+  const kept = items.filter((item) => {
+    if (item.kind !== "compaction") return true
+    const key = compactionEventKey(item.meta)
+    if (key === null) return true
+    if (seen.has(key)) {
+      dropped = true
+      return false
+    }
+    seen.add(key)
+    return true
+  })
+  return dropped ? kept : items
+}
+
+/**
  * Collapse runs of consecutive assistant turn render items into a single
  * synthetic turn so tool-groups straddling a turn boundary fold into one
  * collapsible. Empty (no-content) turn items are treated as transparent and
@@ -1018,6 +1088,52 @@ const UserMessageTaskButton = memo(function UserMessageTaskButton({
   )
 })
 
+/**
+ * Flag the thread's last rendered element, which is where the backend's tail
+ * fork would land — a user message or a compaction divider after the newest
+ * reply means that reply is NOT it. Blocks that render nothing are stepped
+ * over: they occupy an index without occupying the thread.
+ *
+ * Mutates in place, like the loop that resets these flags just before it (a
+ * cached merged item is reset there every render, so a stale `true` cannot
+ * survive). Exported for tests.
+ */
+export function markThreadTail(items: ThreadRenderItem[]): void {
+  for (let idx = items.length - 1; idx >= 0; idx--) {
+    const item = items[idx]
+    if (item.kind === "turn" && isEmptyTurnItem(item)) continue
+    if (item.kind === "turn") item.isThreadTail = true
+    break
+  }
+}
+
+/**
+ * Whether forking at this reply would land somewhere other than where the user
+ * pointed — so the affordance greys out until it wouldn't.
+ *
+ * A turn this session streamed carries a `live-…` id until the post-turn
+ * reparse backfills the parser's name (`source_turn_id`). The backend cannot
+ * resolve such an id and deliberately degrades to a TAIL fork rather than
+ * refusing the click. That is exactly right at the END of the thread — the tail
+ * IS the fork point — and a silent lie anywhere before it.
+ *
+ * Anywhere before it is reachable: a reply the user steered mid-turn promotes
+ * as assistant / user message / assistant, so its first half is a settled
+ * group carrying a fork button while the backfill is a second and a half away.
+ * The exception is therefore the thread TAIL, not the newest assistant reply:
+ * steer at the very end of a turn and the promotion is assistant + user message
+ * with nothing after it, which leaves the newest reply one message short of the
+ * tail — and the parse ending on a user turn means `source_turn_id` never
+ * arrives to correct it (see `computeTurnMetadataPatches`). Exported for tests.
+ */
+export function isForkPointUnnamed(
+  forkPoint: MessageTurn | null,
+  isThreadTail: boolean
+): boolean {
+  if (forkPoint === null || isThreadTail) return false
+  return forkPoint.source_turn_id == null && isLiveTurnId(forkPoint.id)
+}
+
 const HistoricalMessageGroup = memo(function HistoricalMessageGroup({
   group,
   parentConversationId,
@@ -1035,6 +1151,7 @@ const HistoricalMessageGroup = memo(function HistoricalMessageGroup({
   foldEpoch = 0,
   onForkFromTurn,
   forkDisabled = false,
+  isThreadTail = false,
 }: {
   group: ResolvedMessageGroup
   parentConversationId?: number | null
@@ -1052,6 +1169,9 @@ const HistoricalMessageGroup = memo(function HistoricalMessageGroup({
   foldEpoch?: number
   onForkFromTurn?: (turnId: string) => void
   forkDisabled?: boolean
+  /** Whether nothing follows this group in the thread — the one position where
+   *  a turn the backend cannot name still forks where the user pointed. */
+  isThreadTail?: boolean
 }) {
   streamingPerfRecorder.countRender(renderKind)
   const t = useTranslations("Folder.chat.messageList")
@@ -1068,6 +1188,12 @@ const HistoricalMessageGroup = memo(function HistoricalMessageGroup({
   const grokSessionImagePhase =
     agentType === "grok" ? (isResponseComplete ? "complete" : "live") : null
   const forkTurnId = resolvableForkTurnId(sourceTurns?.at(-1), agentType)
+  // The fork point is the group's LAST turn: forking is "up to and including
+  // this reply", and a merged group ends where the reply does.
+  const forkPoint = sourceTurns?.length
+    ? sourceTurns[sourceTurns.length - 1]
+    : null
+  const forkPointUnnamed = isForkPointUnnamed(forkPoint, isThreadTail)
 
   return (
     <div className={dimmed ? "opacity-70" : undefined}>
@@ -1161,17 +1287,23 @@ const HistoricalMessageGroup = memo(function HistoricalMessageGroup({
           isResponseComplete={isResponseComplete}
           copyText={extractTextFromParts(group.parts)}
           completedAt={group.completed_at}
-          forkDisabled={forkDisabled}
+          forkDisabled={forkDisabled || forkPointUnnamed}
+          forkDisabledReason={forkPointUnnamed ? "unnamed" : "busy"}
           onForkFromHere={
-            // The group's LAST turn: forking is "up to and including this
-            // reply", and a merged group ends where the reply does. Gated on a
-            // settled turn — forking mid-stream would name a message the agent
-            // is still writing.
+            // Gated on a settled, agent-resolvable turn — forking mid-stream
+            // would name a message the agent is still writing, and an id the
+            // backend cannot resolve (live-*, unsupported agent, Claude
+            // without agent_message_id) would silently tail-fork.
             //
-            // Only parser-named turns with an agent-supported lookup key can
-            // be offered. Explicit unresolved ids are rejected by the backend.
-            onForkFromTurn && isResponseComplete && forkTurnId
-              ? () => onForkFromTurn(forkTurnId)
+            // `forkPointUnnamed` still withholds a live-named reply that is
+            // not the thread tail, even if a parser id later appears.
+            onForkFromTurn &&
+            isResponseComplete &&
+            forkTurnId &&
+            !forkPointUnnamed
+              ? () => {
+                  onForkFromTurn(forkTurnId)
+                }
               : undefined
           }
         />
@@ -1551,6 +1683,7 @@ const LiveAwareSubAgentOverlay = memo(function LiveAwareSubAgentOverlay({
 
 export function MessageListView({
   conversationId,
+  imageRoot,
   agentType,
   workspaceRootPath = null,
   connStatus,
@@ -1631,6 +1764,16 @@ export function MessageListView({
   const onLoadOlderHistory = useCallback(() => {
     loadOlderHistory(conversationId)
   }, [conversationId, loadOlderHistory])
+  const imageFolderId = useConversationRuntimeStore(
+    useCallback(
+      (s) => s.byConversationId.get(conversationId)?.detail?.summary.folder_id,
+      [conversationId]
+    )
+  )
+  const storedImageRoot = useAppWorkspaceStore(
+    (s) =>
+      s.allFolders.find((folder) => folder.id === imageFolderId)?.path ?? null
+  )
   const { loadOlderTurns } = useConversationRuntimeActions()
   // Narrow selectors: the whole session object changes on live tokens, and
   // subscribing to it would re-render the historical thread during streaming.
@@ -1888,13 +2031,20 @@ export function MessageListView({
         isRoleTransition: false,
         previousUserIndex: null,
         isLastAssistantRun: false,
+        isThreadTail: false,
         sourceTurns: singletonSourceTurns(allTurns[i]),
       }
     })
 
     // Collapse consecutive assistant turn render items into a single rendered
     // turn, so tool-groups straddling a turn boundary fold into one collapsible.
-    const items = mergeConsecutiveAssistantTurns(rawItems, mergedRunCache)
+    // Compaction dividers are deduped FIRST: the live and persisted copies of
+    // one compaction arrive under different ids, and only one of them should
+    // reach the merge.
+    const items = mergeConsecutiveAssistantTurns(
+      dedupeCompactionItems(rawItems),
+      mergedRunCache
+    )
 
     // Compute showStats, isRoleTransition, and previousUserIndex for each turn.
     // previousUserIndex points at the closest preceding user turn (used by the
@@ -1911,6 +2061,7 @@ export function MessageListView({
       item.isRoleTransition = false
       item.previousUserIndex = null
       item.isLastAssistantRun = false
+      item.isThreadTail = false
 
       // isRoleTransition: role differs from previous turn item
       if (idx > 0) {
@@ -1939,6 +2090,7 @@ export function MessageListView({
       lastAssistantItem.isLastAssistantRun = true
       lastAssistantRunning = !lastAssistantItem.isResponseComplete
     }
+    markThreadTail(items)
 
     // Pending typing is a footer concern under incremental live (outside
     // Virtua). Compatibility path keeps the typing virtua item.
@@ -2086,6 +2238,7 @@ export function MessageListView({
                 foldEpoch={fold.epoch}
                 onForkFromTurn={onForkFromTurn}
                 forkDisabled={forkBusy}
+                isThreadTail={item.isThreadTail}
               />
             </div>
           )
@@ -2422,7 +2575,12 @@ export function MessageListView({
     )
   }
 
-  return (
+  const thread = (
+    // The "查看会话" drawers are hosted HERE, not in the cards that offer them:
+    // those live in virtua's rows and take their drawer down with them when
+    // they scroll out of the buffer. This is the nearest ancestor that owns
+    // the virtualizer instead of sitting inside it — and it covers the
+    // top-right SubAgentOverlay's rows too.
     <GrokConversationProvider conversationId={grokConversationId}>
       <SessionViewerHost>
         <div
@@ -2577,5 +2735,13 @@ export function MessageListView({
         </div>
       </SessionViewerHost>
     </GrokConversationProvider>
+  )
+
+  return (
+    <MarkdownImageProvider
+      rootPath={imageRoot === undefined ? storedImageRoot : imageRoot}
+    >
+      {thread}
+    </MarkdownImageProvider>
   )
 }

@@ -1,15 +1,18 @@
-// rehype-harden hard-codes `file:` in its blocked-protocol list and replaces
-// such links with `<span>… [blocked]</span>`. Rewriting `file://` hrefs in
-// the mdast layer (before remark-rehype) sidesteps the block while keeping
-// the link clickable through the existing link-safety + open-file-dialog
-// flow. Image syntax is intentionally left untouched: harden's
-// "[Image blocked: …]" placeholder is more useful than a broken <img src>.
+// Local-file markdown links are otherwise rendered as `… [blocked]`. Two
+// distinct sanitize/harden rules cause this, both sidestepped here in the mdast
+// layer (before remark-rehype) while keeping the link clickable through the
+// existing link-safety + open-file-dialog flow:
 //
-// Bare Windows drive destinations (`D:/…`, `C:\…`) hit the same wall: the
-// parser treats the drive letter as a URL scheme, harden blocks it, and the
-// transcript shows `label [blocked]`. Prefixing `/` yields the same
-// root-relative shape `file://` rewrite already emits (`/D:/…`), which harden
-// allows and `parseLocalFileTarget` understands.
+//   1. `file://` hrefs — rehype-harden hard-codes `file:` in its blocked-
+//      protocol list. Rewritten to a bare local path (POSIX `/…`, `/C:/…` for
+//      Windows drives, or a `\\server\share` UNC form).
+//   2. Bare Windows drive paths (`C:/…`, `C:\…`) — rehype-sanitize reads the
+//      leading `C:` as a URL protocol and strips the href, after which harden
+//      blocks the now-hrefless `<a>`. Rewritten to `/C:/…` so `C:` is no longer
+//      in protocol position (see {@link windowsDrivePathToSafe}).
+//
+// Image destinations are handled by remarkLocalImages, which preserves their
+// original path until the workspace-confined image reader can resolve it.
 
 type MdastNodeLike = {
   type: string

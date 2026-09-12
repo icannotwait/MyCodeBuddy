@@ -106,6 +106,15 @@ pub struct ParentWaitContext {
     pub parent_tool_use_id: Option<String>,
 }
 
+/// The bound-but-not-yet-served socket handed from [`DelegationListener::bind`]
+/// to [`DelegationListener::accept_loop`]. A UDS listener on unix; on Windows,
+/// the first named-pipe server instance (the loop creates each subsequent one
+/// itself).
+#[cfg(unix)]
+pub type BoundSocket = tokio::net::UnixListener;
+#[cfg(windows)]
+pub type BoundSocket = tokio::net::windows::named_pipe::NamedPipeServer;
+
 /// Pluggable "what conversation is this parent currently in?" lookup. The
 /// production impl wraps `ConnectionManager.get_state`; tests use an
 /// in-memory map.
@@ -233,6 +242,31 @@ impl TokenRegistry {
         });
         revoked
     }
+
+    /// How many companions are currently reachable, and across how many
+    /// distinct parent ACP connections. One token is minted per companion
+    /// launch, so `companions` counts injected `codeg-mcp` processes; the two
+    /// numbers differ when a connection was re-injected without its old token
+    /// having been revoked yet. Read-only — used by the service-status
+    /// indicator, never by the wire path.
+    pub async fn stats(&self) -> TokenStats {
+        let map = self.inner.read().await;
+        let parents: std::collections::HashSet<&str> = map
+            .values()
+            .map(|entry| entry.parent_connection_id.as_str())
+            .collect();
+        TokenStats {
+            companions: map.len(),
+            parent_connections: parents.len(),
+        }
+    }
+}
+
+/// Snapshot of [`TokenRegistry`] occupancy. See [`TokenRegistry::stats`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct TokenStats {
+    pub companions: usize,
+    pub parent_connections: usize,
 }
 
 enum ArmStatus {
@@ -523,17 +557,99 @@ impl DelegationListener {
         self.status_release_decision_gate.install().await
     }
 
+    /// Bind the socket, then serve it forever. Kept as the one-call entry
+    /// point for callers that don't need to observe the bind separately;
+    /// [`DelegationService`](super::service::DelegationService) uses the two
+    /// halves so it can report a bind failure to the caller instead of losing
+    /// it inside a detached task.
+    pub async fn run(self: Arc<Self>, socket_path: PathBuf) -> std::io::Result<()> {
+        let bound = Self::bind(&socket_path).await?;
+        self.accept_loop(bound, socket_path).await
+    }
+
+    /// Take ownership of the socket. Split out from [`Self::accept_loop`] so
+    /// the failure every caller actually cares about — the address is taken,
+    /// the directory is gone, permissions are wrong — surfaces synchronously.
+    ///
+    /// Binds a short-lived sibling and `rename`s it onto `socket_path` rather
+    /// than unlinking that path and binding it directly. `rename(2)` replaces
+    /// the destination atomically, so the path never stops naming a bound
+    /// socket, and **a bind that fails leaves whatever was already serving
+    /// there reachable and untouched**.
+    ///
+    /// That invariant is the point. This function is on the recovery path — a
+    /// user pressing "start service" on an indicator that may simply have
+    /// mis-probed — and unlink-then-bind cannot promise it: with the unlink
+    /// done and the bind then failing (fd exhaustion, ENOSPC), a perfectly
+    /// healthy socket would have been destroyed to no purpose, by the very
+    /// action meant to repair it.
+    ///
+    /// No fallback to unlink-then-bind on failure, deliberately: the staged
+    /// path is shorter than the real one (so `sun_path` limits can't reject it
+    /// selectively) and every remaining failure reason — EMFILE, ENOSPC, a
+    /// read-only directory — applies to both, so a fallback would only
+    /// reintroduce the destructive window in exactly the conditions that
+    /// triggered it.
+    #[cfg(unix)]
+    pub async fn bind(socket_path: &Path) -> std::io::Result<BoundSocket> {
+        if let Some(parent) = socket_path.parent() {
+            let _ = tokio::fs::create_dir_all(parent).await;
+        }
+        let staging = Self::staging_socket_path(socket_path);
+        let _ = tokio::fs::remove_file(&staging).await;
+        let listener = tokio::net::UnixListener::bind(&staging)?;
+        if let Err(e) = tokio::fs::rename(&staging, socket_path).await {
+            let _ = tokio::fs::remove_file(&staging).await;
+            return Err(e);
+        }
+        tracing::info!("[delegation] listening on UDS {}", socket_path.display());
+        Ok(listener)
+    }
+
+    /// Sibling path for [`Self::bind`]'s staged socket.
+    ///
+    /// PID-scoped like the socket itself, then salted. The PID is what makes it
+    /// safe: the staging directory is `$TMPDIR`, shared with every other codeg
+    /// process, and two binds that picked the same staged name could interleave
+    /// into real corruption — one process's `remove_file` clearing the other's
+    /// staged entry, then its own bind recreating it under that name, so the
+    /// first process's `rename` publishes the *second* process's socket at its
+    /// path. No two live processes share a PID, so that can't happen across
+    /// processes; the salt covers the only within-process caller that isn't
+    /// already serialized by `DelegationService`'s state lock.
+    ///
+    /// The whole name is deliberately SHORTER than a real socket name
+    /// (`codeg-delegation-<pid>.sock`): `sun_path` caps a unix socket address
+    /// at 104 bytes on macOS, and a staged path longer than the real one could
+    /// fail to bind where the real path would have succeeded — turning a safety
+    /// measure into a startup failure. Replacing the file name rather than
+    /// appending to it keeps the staged path the cheaper of the two.
+    #[cfg(unix)]
+    fn staging_socket_path(socket_path: &Path) -> PathBuf {
+        let salt = uuid::Uuid::new_v4().simple().to_string();
+        socket_path.with_file_name(format!(".stg-{}-{}", std::process::id(), &salt[..8]))
+    }
+
+    #[cfg(windows)]
+    pub async fn bind(socket_path: &Path) -> std::io::Result<BoundSocket> {
+        use tokio::net::windows::named_pipe::ServerOptions;
+        let path_str = socket_path.to_string_lossy().to_string();
+        let server = ServerOptions::new()
+            .first_pipe_instance(true)
+            .create(&path_str)?;
+        tracing::info!("[delegation] listening on named pipe {path_str}");
+        Ok(server)
+    }
+
     /// Run the accept loop until the socket is unbound. Errors on accept are
     /// logged and the loop continues — a single bad connection can't bring
     /// down the listener.
     #[cfg(unix)]
-    pub async fn run(self: Arc<Self>, socket_path: PathBuf) -> std::io::Result<()> {
-        let _ = tokio::fs::remove_file(&socket_path).await;
-        if let Some(parent) = socket_path.parent() {
-            let _ = tokio::fs::create_dir_all(parent).await;
-        }
-        let listener = tokio::net::UnixListener::bind(&socket_path)?;
-        tracing::info!("[delegation] listening on UDS {}", socket_path.display());
+    pub async fn accept_loop(
+        self: Arc<Self>,
+        listener: BoundSocket,
+        _socket_path: PathBuf,
+    ) -> std::io::Result<()> {
         loop {
             match listener.accept().await {
                 Ok((conn, _)) => {
@@ -542,26 +658,26 @@ impl DelegationListener {
                 }
                 Err(e) => {
                     tracing::error!("[delegation] accept failed: {e}");
-                    // Brief backoff so a persistent accept error doesn't pin a core.
                     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                 }
             }
         }
     }
 
-    /// Windows variant: bind a named pipe and follow Tokio's recommended
-    /// accept pattern — wait for a connect, immediately create the *next*
-    /// server instance, then hand the connected instance off to a worker.
-    /// This keeps a pipe instance available at all times, so clients calling
-    /// `ClientOptions::open()` between connections don't see `NotFound`.
+    /// Windows variant: follow Tokio's recommended accept pattern — wait for a
+    /// connect, immediately create the *next* server instance, then hand the
+    /// connected instance off to a worker. This keeps a pipe instance
+    /// available at all times, so clients calling `ClientOptions::open()`
+    /// between connections don't see `NotFound`.
     #[cfg(windows)]
-    pub async fn run(self: Arc<Self>, socket_path: PathBuf) -> std::io::Result<()> {
+    pub async fn accept_loop(
+        self: Arc<Self>,
+        bound: BoundSocket,
+        socket_path: PathBuf,
+    ) -> std::io::Result<()> {
         use tokio::net::windows::named_pipe::ServerOptions;
         let path_str = socket_path.to_string_lossy().to_string();
-        let mut server = ServerOptions::new()
-            .first_pipe_instance(true)
-            .create(&path_str)?;
-        tracing::info!("[delegation] listening on named pipe {path_str}");
+        let mut server = bound;
         loop {
             if let Err(e) = server.connect().await {
                 tracing::error!("[delegation] connect failed: {e}");
@@ -593,6 +709,9 @@ impl DelegationListener {
         }
         let mut foreground_release_owner = None;
         let resp = match msg {
+            BrokerMessage::Ping => BrokerResponse {
+                outcome: serde_json::json!({ "ok": true }),
+            },
             BrokerMessage::Ready(_) => unreachable!("handled above"),
             BrokerMessage::Call(req) => self.report_response(self.process(req).await).await?,
             BrokerMessage::Status(req) => {

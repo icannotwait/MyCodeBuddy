@@ -207,6 +207,24 @@ function getAllowedExternalProtocol(rawUrl: string): string | null {
 }
 
 /**
+ * Whether {@link useOpenLinkOrFile} has anywhere to send `rawUrl`: a local
+ * file, or an external url whose protocol is on the allow-list. Mirrors that
+ * hook's own branch order, so a caller offering an "open" affordance can leave
+ * it out rather than show one that can only end in the unsupported-protocol
+ * toast (`ftp://`, `vscode://`, a bare relative path with no folder to
+ * anchor it).
+ *
+ * A `true` answer is not a promise the open succeeds — a folder-relative path
+ * still needs an active folder, which only the hook can see.
+ */
+export function canOpenLinkOrFile(rawUrl: string): boolean {
+  return (
+    parseLocalFileTarget(rawUrl) !== null ||
+    getAllowedExternalProtocol(rawUrl) !== null
+  )
+}
+
+/**
  * True when `window.open` actually opens something — i.e. a real browser.
  *
  * NOT the same question as `isWebOpenerEnvironment` below. A Tauri window bound
@@ -371,9 +389,11 @@ function DirectLinkOpen({
 
 /**
  * Hook returning an async opener for a link or local-file uri: `file://` (and
- * bare local paths) open in the workspace file panel; http(s)/mailto/tel route
- * to the browser / OS handler. Used by the Streamdown link-safety modal and by
- * standalone clickable file affordances (e.g. user-message resource badges).
+ * bare local paths) open in the workspace file panel — or, where that panel is
+ * covered by a full-page route, in the transcript's own file viewer (see
+ * `useOpenFileTarget`); http(s)/mailto/tel route to the browser / OS handler.
+ * Used by the Streamdown link-safety modal and by standalone clickable file
+ * affordances (e.g. user-message resource badges).
  */
 export function useOpenLinkOrFile() {
   const t = useTranslations("Folder.chat.linkSafety")
@@ -582,7 +602,9 @@ function resolveToolFilePath(rawPath: string): string | null {
 }
 
 /**
- * Clickable file-path label that routes the file into the workspace file panel.
+ * Clickable file-path label that routes the file into the workspace file panel
+ * — or the transcript's own file viewer when that panel is covered by a
+ * full-page route (see `useOpenFileTarget`).
  */
 export function FilePathLink({
   filePath,

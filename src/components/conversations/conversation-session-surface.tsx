@@ -2706,6 +2706,7 @@ export const ConversationSessionSurface = memo(
               ? handleForkFromTurn
               : undefined
           }
+          imageRoot={workingDirForConnection ?? null}
         />
       </GoalControlProvider>
     )
@@ -2733,6 +2734,7 @@ export const ConversationSessionSurface = memo(
       connStatus,
       enabled: feedbackEnabled,
       interactionLocked,
+      steeredMessageIds: conn.steeredMessageIds,
       onResendAsPrompt: resendFeedbackAsPrompt,
       onDelegateViewerOnly: handleDelegateViewerOnlyRejection,
     })
@@ -2815,7 +2817,12 @@ export const ConversationSessionSurface = memo(
         composerBanner={acpLoadErrorBanner}
         feedbackList={
           feedback.showList ? (
-            <FeedbackNotesDisplay notes={feedback.notes} />
+            <FeedbackNotesDisplay
+              notes={feedback.notes}
+              expired={feedback.notesExpired}
+              onResend={feedback.resendNote}
+              onDismiss={feedback.dismissNote}
+            />
           ) : null
         }
         onAddFeedback={
@@ -2869,6 +2876,13 @@ export const ConversationSessionSurface = memo(
             ? handleForkSend
             : undefined
         }
+        onSteer={
+          !interactionLocked && feedback.steerAvailable
+            ? (text, blocks) =>
+                feedback.steer(text, blocks).then(() => undefined)
+            : undefined
+        }
+        steerChannel={feedback.channel}
         waitingForSubagents={conn.waitingForSubagents}
         draftRestore={promptDraftRestore}
         interactionLocked={interactionLocked}

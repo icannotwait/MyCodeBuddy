@@ -713,6 +713,7 @@ earlier terminal context records.\n\
             BTreeMap::from([("COMSPEC".into(), r"C:\Windows\System32\cmd.exe".into())]),
             SystemTerminalSettings {
                 default_shell: Some(path.to_string_lossy().into_owned()),
+                colorize_command_output: false,
             },
         );
         let adapter = FakeAdapter { env: adapter_env };
@@ -766,6 +767,7 @@ earlier terminal context records.\n\
             BTreeMap::from([("COMSPEC".into(), original_comspec.clone())]),
             SystemTerminalSettings {
                 default_shell: None,
+                colorize_command_output: false,
             },
         );
         let adapter = FakeAdapter { env: adapter_env };
@@ -792,6 +794,7 @@ earlier terminal context records.\n\
                     BTreeMap::from([("COMSPEC".into(), original_comspec.clone())]),
                     SystemTerminalSettings {
                         default_shell: Some(path.to_string_lossy().into_owned()),
+                        colorize_command_output: false,
                     },
                 );
                 let mut adapter_env = BTreeMap::new();
@@ -1044,6 +1047,7 @@ earlier terminal context records.\n\
         let db = test_helpers::fresh_in_memory_db().await;
         let settings = SystemTerminalSettings {
             default_shell: Some("missing-shell".into()),
+            colorize_command_output: false,
         };
         let raw = serde_json::to_string(&settings).unwrap();
         app_metadata_service::upsert_value(
@@ -1091,6 +1095,7 @@ earlier terminal context records.\n\
         let path = make_usable_shell(dir.path(), basename);
         let settings = SystemTerminalSettings {
             default_shell: Some(path.to_string_lossy().into_owned()),
+            colorize_command_output: false,
         };
         let raw = serde_json::to_string(&settings).unwrap();
         app_metadata_service::upsert_value(

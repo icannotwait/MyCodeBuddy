@@ -203,7 +203,15 @@ import {
   IDLE_SWEEP_INTERVAL_MS,
 } from "@/lib/constants"
 import { sendSystemNotification } from "@/lib/notification"
-import { primeNotificationSoundOutput } from "@/lib/notification-sound"
+import {
+  notifyDesktop,
+  withDesktopNotificationsSuppressed,
+} from "@/lib/desktop-notification"
+import {
+  playEventSound,
+  primeNotificationSoundOutput,
+  withEventSoundsSuppressed,
+} from "@/lib/notification-sound"
 import {
   getSavedPrefsForConnect,
   saveModePreference,
@@ -317,6 +325,39 @@ export type LiveContentBlock =
   | { type: "thinking"; text: string; parentToolUseId?: string }
   | { type: "plan"; entries: PlanEntryInfo[] }
   | { type: "tool_call"; info: ToolCallInfo }
+  /**
+   * A message the user sent WHILE this turn was running, injected into it via
+   * the native `_session/steering` channel. Not agent output: it marks the
+   * point in the stream where the user interrupted, so
+   * `buildStreamingTurnsFromLiveMessage` can close the assistant turn here,
+   * render the message as its own user turn, and start the reply to it as a
+   * new turn. Mirrors what the transcript projection already does with a
+   * mid-turn `user_message_chunk` (see `parsers/acp_native.rs`), so the live
+   * view and a reload agree. `id` is the feedback note id.
+   *
+   * `createdAt` (ISO, the note's `created_at`) is taken before the backend
+   * hands the text to the agent (`submit_feedback_native`), on the machine the
+   * agent runs on — so it is directly comparable with, and earlier than, the
+   * timestamp the agent writes when it records this message in its own
+   * transcript. That ordering is what lets the runtime store tell the agent's
+   * copy of THIS message from the same words sent in an earlier round (see
+   * `suppressPersistedSteeredPrompts`), and it is the time the message shows.
+   *
+   * `blocks` is what the user actually sent, present only when the draft
+   * carried more than plain text (image attachments). `text` alone cannot
+   * stand in for it: it is the composer's DISPLAY form, which collapses
+   * attachments into words, so a steered image would render as a sentence
+   * about an image until a reload replaced it with the agent's own copy.
+   * Absent for a text-only steer, where the renderer falls back to `text` and
+   * the historical behaviour is unchanged.
+   */
+  | {
+      type: "steering"
+      id: string
+      text: string
+      createdAt: string
+      blocks?: ContentBlock[] | null
+    }
 
 export interface LiveMessage {
   id: string
@@ -354,6 +395,19 @@ export interface ConnectionState {
    *  event or a snapshot's `pending_user_message`. A VIEWER mirrors this into
    *  the runtime as a synthesized user turn; `null` outside an active turn. */
   pendingUserMessage: PendingUserMessage | null
+  /**
+   * Feedback-note ids whose text this turn's `liveMessage` adopted as a
+   * `steering` block, i.e. the mid-turn messages now rendered as user turns in
+   * the transcript. The notes list above the composer reads this to drop their
+   * strips: one message shows in exactly one place. Reset with `liveMessage`
+   * at the start of every turn.
+   *
+   * The reducer is the single decider — a note it could NOT adopt (it arrived
+   * out of turn) is absent here, so its strip stays. Deriving this in the
+   * notes hook instead would race the reducer's own view of the status and
+   * could leave a message showing nowhere at all.
+   */
+  steeredMessageIds: string[]
   pendingQuestion: PendingQuestion | null
   /** Awaiting-answer multiple-choice `ask_user_question` (the codeg-mcp blocking
    *  tool). Set from a `question_request` event or a snapshot's
@@ -1086,6 +1140,17 @@ type Action =
     } & EstimatorActionContext)
   | { type: "TURN_ATTEMPT_ROLLBACK"; contextKey: string }
   | {
+      type: "STEERING_MESSAGE"
+      contextKey: string
+      id: string
+      text: string
+      /** The note's `created_at` (ISO) — see the `steering` block. */
+      createdAt: string
+      /** What the user sent, when it was more than plain text — see the
+       *  `steering` block. Absent for a text-only steer. */
+      blocks?: ContentBlock[] | null
+    }
+  | {
       type: "CLAUDE_API_RETRY"
       contextKey: string
       retry: ClaudeApiRetryState | null
@@ -1729,6 +1794,10 @@ function rollbackLiveMessageAttempt(prev: LiveMessage): LiveMessage {
   return { ...prev, content: prev.content.slice(0, retainedLength) }
 }
 
+/** Shared empty `steeredMessageIds`, so a turn that steers nothing (almost all
+ *  of them) keeps a stable reference through `connRenderEqual`. */
+const EMPTY_STEERED_MESSAGE_IDS: string[] = []
+
 /** Last time an out-of-turn drop was logged — module-level sampling clock. */
 let lastOutOfTurnDropLogAt = 0
 
@@ -2054,6 +2123,7 @@ function reduceSingleAction(
         acceptedCompletionRuntimeConversationIds: null,
         pendingPermission: null,
         pendingUserMessage: null,
+        steeredMessageIds: EMPTY_STEERED_MESSAGE_IDS,
         pendingQuestion: null,
         pendingAskQuestion: null,
         pendingPlanApproval: null,
@@ -2350,6 +2420,7 @@ function reduceSingleAction(
         acceptedCompletionRuntimeConversationIds: null,
         pendingPermission: null,
         pendingUserMessage: null,
+        steeredMessageIds: EMPTY_STEERED_MESSAGE_IDS,
         pendingQuestion: null,
         pendingAskQuestion: null,
         pendingPlanApproval: null,
@@ -2597,6 +2668,24 @@ function reduceSingleAction(
         requestUsage: EMPTY_REQUEST_USAGE,
         generationClockStartedAt: null,
         liveMessage: hydratedLiveMessage,
+        // The snapshot's live message REPLACES the local one, and the wire has
+        // no `steering` block (the backend never records one — see
+        // `snapshot-denormalize`), so every adopted mid-turn message is gone
+        // from the transcript with it. Keeping the adoption ids past that would
+        // hide the strips for messages that are no longer rendered anywhere,
+        // which is the one failure worse than showing them twice. Drop them:
+        // the notes list (hydrated from the same snapshot's `feedback`) shows
+        // those messages as strips again.
+        //
+        // Unconditional, including a null `liveMessage` — where the runtime
+        // mirror keeps the previous one (it never writes null) and the steered
+        // turn is still on screen for now. Holding the ids would be right for
+        // that frame and wrong from the next delta on, which rebuilds the live
+        // message without the block and would leave the message nowhere for
+        // the rest of the turn. The cost is the opposite way round: a message
+        // whose persisted copy the transcript is already showing gets a strip
+        // beside it until the turn ends. Turn-scoped, and visible.
+        steeredMessageIds: EMPTY_STEERED_MESSAGE_IDS,
         pendingPermission: hydratedPendingPermission,
         pendingAskQuestion: action.patch.pendingAskQuestion,
         pendingPlanApproval: action.patch.pendingPlanApproval,
@@ -2803,6 +2892,8 @@ function reduceSingleAction(
         updated.pendingQuestion = null
         updated.claudeApiRetry = null
         updated.error = null
+        // Steering adoptions belong to the turn whose stream they split.
+        updated.steeredMessageIds = EMPTY_STEERED_MESSAGE_IDS
         // Starting a prompt past an active AIR failure acknowledges it —
         // settle EVERYTHING (watermarks retained). A failure that is still
         // real re-arms via a higher revision on the same id.
@@ -3756,6 +3847,40 @@ function reduceSingleAction(
       return next
     }
 
+    case "STEERING_MESSAGE": {
+      const conn = state.get(action.contextKey)
+      if (!conn) return state
+      // Same out-of-turn guard as PLAN_UPDATE / TOOL_CALL / streaming deltas:
+      // there is no running turn to split, and appending would graft the
+      // message onto the PREVIOUS turn's completed liveMessage. The note keeps
+      // its strip in that case (it is absent from `steeredMessageIds`), and
+      // the agent recorded it either way, so a reload still shows it.
+      if (conn.status !== "prompting") return state
+      // Idempotent by note id: the submit broadcast reaches every attached
+      // client, and one client is also the sender.
+      if (conn.steeredMessageIds.includes(action.id)) return state
+      const prev = ensureLiveMessage(conn.liveMessage)
+      const next = writableConnections(state, mutateUnpublished)
+      next.set(action.contextKey, {
+        ...conn,
+        liveMessage: {
+          ...prev,
+          content: [
+            ...prev.content,
+            {
+              type: "steering" as const,
+              id: action.id,
+              text: action.text,
+              createdAt: action.createdAt,
+              blocks: action.blocks ?? null,
+            },
+          ],
+        },
+        steeredMessageIds: [...conn.steeredMessageIds, action.id],
+      })
+      return next
+    }
+
     case "CLAUDE_API_RETRY": {
       const conn = state.get(action.contextKey)
       if (!conn) return state
@@ -4288,7 +4413,8 @@ interface PrepareEnv {
     kind: "error" | "warning",
     title: string,
     message: string,
-    actions?: AlertAction[]
+    actions?: AlertAction[],
+    evidence?: string
   ) => void
 }
 
@@ -4401,6 +4527,9 @@ function prepareMappedEnvelope(
   const actions: FrameAction[] = []
   const afterCommit: Array<() => void> = []
   const e = envelope
+  afterCommit.push(() => {
+    playEventSound(e)
+  })
 
   switch (e.type) {
     case "shared_session_phase_changed":
@@ -4547,6 +4676,15 @@ function prepareMappedEnvelope(
           created_at: new Date().toISOString(),
         },
       })
+      afterCommit.push(() => {
+        const fn = env.folderName
+        void notifyDesktop("question_request", {
+          title: fn ? `${fn} - Codeg` : "Codeg",
+          body: env.t("notificationQuestion", {
+            agent: getAgentLabel(snapshot.agentType),
+          }),
+        })
+      })
       break
     case "question_resolved":
       actions.push({
@@ -4632,17 +4770,31 @@ function prepareMappedEnvelope(
         if (settled && settled.length > 0) {
           const agentLabel = getAgentLabel(agentType)
           const fn = env.folderName
-          const title = fn ? `${fn} - DrawCode` : "DrawCode"
-          for (const item of settled) {
-            const body =
-              item.summary ??
-              env.tChat("backgroundTasks.settledFallback", {
-                status: item.status,
-              })
-            sendSystemNotification(title, `${agentLabel}: ${body}`).catch(
-              () => {}
-            )
-          }
+          const title = fn ? `${fn} - Codeg` : "Codeg"
+          const count = settled.length
+          const many = env.tChat("backgroundTasks.notifySettledMany", {
+            agent: agentLabel,
+            count,
+          })
+          const single = settled[0]!
+          void notifyDesktop("background_task", {
+            body:
+              count === 1
+                ? `${agentLabel}: ${
+                    single.summary ??
+                    env.tChat("backgroundTasks.settledFallback", {
+                      status: single.status,
+                    })
+                  }`
+                : many,
+            redactedBody:
+              count === 1
+                ? env.tChat("backgroundTasks.notifySettledOne", {
+                    agent: agentLabel,
+                  })
+                : many,
+            title,
+          })
           if (conversationId != null) {
             const runtimeActions =
               useConversationRuntimeStore.getState().actions
@@ -4674,11 +4826,11 @@ function prepareMappedEnvelope(
       const agentLabel = getAgentLabel(snapshot.agentType)
       const fn = env.folderName
       afterCommit.push(() => {
-        const title = fn ? `${fn} - DrawCode` : "DrawCode"
-        sendSystemNotification(
+        const title = fn ? `${fn} - Codeg` : "Codeg"
+        void notifyDesktop("permission_request", {
           title,
-          `${agentLabel}: ${env.tChat("permissionDialog.subtitle")}`
-        ).catch(() => {})
+          body: `${agentLabel}: ${env.tChat("permissionDialog.subtitle")}`,
+        })
       })
       break
     }
@@ -4920,11 +5072,11 @@ function prepareMappedEnvelope(
       const agentLabel = getAgentLabel(snapshot.agentType)
       const fn = env.folderName
       afterCommit.push(() => {
-        const title = fn ? `${fn} - DrawCode` : "DrawCode"
-        sendSystemNotification(
+        const title = fn ? `${fn} - Codeg` : "Codeg"
+        void notifyDesktop("turn_complete", {
           title,
-          env.t("notificationTurnComplete", { agent: agentLabel })
-        ).catch(() => {})
+          body: env.t("notificationTurnComplete", { agent: agentLabel }),
+        })
       })
       break
     }
@@ -4973,8 +5125,20 @@ function prepareMappedEnvelope(
             return env.t("backendErrors.turnFailedUnknown", {
               agent: agentLabel,
             })
+          case "turn_failed_auth_required":
+            return env.t("backendErrors.turnFailedAuthRequired", {
+              agent: agentLabel,
+            })
           case "turn_failed_empty":
             return env.t("backendErrors.turnFailedEmpty", { agent: agentLabel })
+          case "turn_failed_empty_protocol":
+            return env.t("backendErrors.turnFailedEmptyProtocol", {
+              agent: agentLabel,
+            })
+          case "turn_failed_empty_metadata":
+            return env.t("backendErrors.turnFailedEmptyMetadata", {
+              agent: agentLabel,
+            })
           case "grok_model_switch_incompatible_agent":
             return env.t("backendErrors.grokModelSwitchIncompatibleAgent", {
               agent: agentLabel,
@@ -4983,18 +5147,31 @@ function prepareMappedEnvelope(
             return e.message
         }
       })()
-      actions.push({ type: "ERROR", contextKey, message: localizedMessage })
+      const evidence = e.details?.trim() || undefined
+      const tooltipMessage = evidence
+        ? `${localizedMessage} ${env.t("backendErrors.detailsInAlerts")}`
+        : localizedMessage
+      actions.push({ type: "ERROR", contextKey, message: tooltipMessage })
       afterCommit.push(() => {
-        env.pushAlert("error", env.t("eventErrorTitle"), localizedMessage)
+        env.pushAlert(
+          "error",
+          env.t("eventErrorTitle"),
+          localizedMessage,
+          undefined,
+          evidence
+        )
         const fn = env.folderName
-        const title = fn ? `${fn} - DrawCode` : "DrawCode"
-        sendSystemNotification(
+        const title = fn ? `${fn} - Codeg` : "Codeg"
+        void notifyDesktop("error", {
           title,
-          env.t("notificationError", {
+          body: env.t("notificationError", {
             agent: agentLabel,
             message: localizedMessage,
-          })
-        ).catch(() => {})
+          }),
+          redactedBody: env.t("notificationErrorRedacted", {
+            agent: agentLabel,
+          }),
+        })
       })
       break
     }
@@ -5084,12 +5261,34 @@ function prepareMappedEnvelope(
     case "delegation_observation_changed":
     case "delegation_runtime_stats_changed":
     case "delegation_attention_changed":
-    case "feedback_submitted":
     case "feedback_consumed":
       // No store mutations; raw subscribers (e.g. DelegationProvider) still run.
       // Do NOT add delegation_availability_changed here — it mutates route
       // availability via DELEGATION_ROUTE_AVAILABILITY above.
       break
+    case "feedback_submitted": {
+      // A note that is ALREADY `delivered` when it is submitted was pushed
+      // into the running turn over the native `_session/steering` channel
+      // (`FeedbackItem::new_delivered` is that path's only producer). The
+      // agent has the text as a user message, so the transcript shows it
+      // as one. A `pending` note is the cooperative pull channel — it is
+      // never a user message and stays on the notes strip.
+      if (e.item.status !== "delivered") break
+      actions.push({
+        type: "STEERING_MESSAGE",
+        contextKey,
+        id: e.item.id,
+        text: e.item.text,
+        createdAt: e.item.created_at,
+        // Present only when the draft carried attachments. Widened through
+        // the same mapping a `user_message` echo uses, so one message
+        // renders identically whichever of the two routes it arrives by.
+        blocks: e.item.blocks
+          ? buildUserTurnFromMessageBlocks(e.item.id, e.item.blocks).blocks
+          : null,
+      })
+      break
+    }
     default: {
       const unknown = envelope as EventEnvelope & { type: string }
       console.warn("[acp-context] unknown ACP event type", {
@@ -5224,6 +5423,8 @@ function liveBlockCompatible(
         right.type === "tool_call" &&
         left.info.tool_call_id === right.info.tool_call_id
       )
+    case "steering":
+      return right.type === "steering" && left.id === right.id
   }
 }
 
@@ -6803,8 +7004,8 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
           params
         ),
       folderName: folderNameRef.current,
-      pushAlert: (kind, title, message, actions) => {
-        pushAlertRef.current(kind, title, message, actions)
+      pushAlert: (kind, title, message, actions, evidence) => {
+        pushAlertRef.current(kind, title, message, actions, evidence)
       },
     }
   }, [t, tChat])
@@ -8270,11 +8471,20 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
           }
         },
         onReplay: (events, _highWaterSeq, resumedFromSeq) => {
-          pushMappedEvents(
-            contextKey,
-            events,
-            resumedFromSeq == null ? "untrusted_replay" : "resume_replay",
-            true
+          // Catching up on a gap (reconnect / lagged detach) re-delivers events
+          // that already happened. They belong in the UI, but replaying them
+          // must not fire a burst of cues for turns that finished minutes ago.
+          // Doubly true of OS notifications, which unlike a tone stay in the
+          // notification centre until the user clears them by hand.
+          withEventSoundsSuppressed(() =>
+            withDesktopNotificationsSuppressed(() => {
+              pushMappedEvents(
+                contextKey,
+                events,
+                resumedFromSeq == null ? "untrusted_replay" : "resume_replay",
+                true
+              )
+            })
           )
         },
         onEvent: (envelope) => {
