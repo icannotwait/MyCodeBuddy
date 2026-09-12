@@ -1787,7 +1787,8 @@ fn read_grok_trailing_assistant_text(chat_history: &Path) -> Option<String> {
     let file = fs::File::open(chat_history).ok()?;
     let mut last_after_tool: Option<String> = None;
     let mut saw_tool_in_turn = false;
-    for line in BufReader::new(file).lines().flatten() {
+    for line in BufReader::new(file).lines() {
+        let Ok(line) = line else { continue };
         if line.trim().is_empty() {
             continue;
         }

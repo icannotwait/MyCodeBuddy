@@ -2903,6 +2903,84 @@ describe("owner overlay retirement without live-* persist ids", () => {
     expect(local.some((t) => t.id === "optimistic-new")).toBe(true)
   })
 
+  it("does not retire a repeated-prompt overlay against an unchanged persist", () => {
+    const persistTs = "2026-08-25T07:30:00.000Z"
+    const settled = [
+      userTurn("parser-user-old", "repeat prompt", persistTs),
+      assistantTurn(
+        "parser-assistant-old",
+        "already persisted full reply",
+        "2026-08-25T07:30:01.000Z"
+      ),
+    ]
+    seedRuntimeSession({
+      detail: detailWithTurns(settled),
+      liveOwnsActiveTurn: true,
+      syncState: "awaiting_persist",
+    })
+    const { actions } = useConversationRuntimeStore.getState()
+    actions.appendOptimisticTurn(
+      CID,
+      userTurn("message-new", "repeat prompt", "2026-08-25T07:31:00.000Z"),
+      "message-new"
+    )
+    actions.completeTurn(
+      CID,
+      liveMessage(
+        "new",
+        "already persisted",
+        Date.parse("2026-08-25T07:31:01.000Z")
+      )
+    )
+
+    const local =
+      useConversationRuntimeStore.getState().byConversationId.get(CID)
+        ?.localTurns ?? []
+    expect(local.some((turn) => turn.id === "message-new")).toBe(true)
+    expect(local.some((turn) => turn.id === `live-${CID}-new`)).toBe(true)
+  })
+
+  it("settled refetch does not retire a repeated-prompt overlay when persist did not grow", async () => {
+    const persistTs = "2026-08-25T07:30:00.000Z"
+    const settled = [
+      userTurn("parser-user-old", "repeat prompt", persistTs),
+      assistantTurn(
+        "parser-assistant-old",
+        "already persisted full reply",
+        "2026-08-25T07:30:01.000Z"
+      ),
+    ]
+    seedRuntimeSession({
+      detail: detailWithTurns(settled),
+      liveOwnsActiveTurn: true,
+      syncState: "awaiting_persist",
+    })
+    const { actions } = useConversationRuntimeStore.getState()
+    actions.appendOptimisticTurn(
+      CID,
+      userTurn("message-new", "repeat prompt", "2026-08-25T07:31:00.000Z"),
+      "message-new"
+    )
+    actions.completeTurn(
+      CID,
+      liveMessage(
+        "new",
+        "already persisted",
+        Date.parse("2026-08-25T07:31:01.000Z")
+      )
+    )
+    mockGetFolderConversation.mockResolvedValueOnce(detailWithTurns(settled))
+    actions.refetchDetail(CID, { preserveLive: true })
+    await Promise.resolve()
+    await Promise.resolve()
+
+    const local =
+      useConversationRuntimeStore.getState().byConversationId.get(CID)
+        ?.localTurns ?? []
+    expect(local.some((turn) => turn.id === "message-new")).toBe(true)
+    expect(local.some((turn) => turn.id === `live-${CID}-new`)).toBe(true)
+  })
+
   it("settled refetch retires a mid-turn stub when persisted assistant is richer", async () => {
     const startedAt = Date.parse("2026-09-12T04:00:00.000Z")
     const persistTs = new Date(startedAt).toISOString()

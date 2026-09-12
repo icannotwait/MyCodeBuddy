@@ -1038,6 +1038,44 @@ function turnVisibleText(turn: MessageTurn): string {
     .join("")
 }
 
+function lastAssistantVisibleText(turns: readonly MessageTurn[]): string {
+  for (let i = turns.length - 1; i >= 0; i -= 1) {
+    const turn = turns[i]
+    if (turn?.role === "assistant") return turnVisibleText(turn)
+  }
+  return ""
+}
+
+/**
+ * Persist only "covers" a live stub after the transcript itself grew.
+ * An unchanged previous turn with the same user prompt (repeated-prompt
+ * resume replay) must not retire the new overlay.
+ */
+function persistTailGrew(
+  previous: readonly MessageTurn[],
+  next: readonly MessageTurn[]
+): boolean {
+  if (next.length === 0) return false
+  if (next.length > previous.length) return true
+  return (
+    lastAssistantVisibleText(next).length >
+    lastAssistantVisibleText(previous).length
+  )
+}
+
+function assistantToolUseIds(turns: readonly MessageTurn[]): Set<string> {
+  const ids = new Set<string>()
+  for (const turn of turns) {
+    if (turn.role !== "assistant") continue
+    for (const block of turn.blocks) {
+      if (block.type === "tool_use" && block.tool_use_id) {
+        ids.add(block.tool_use_id)
+      }
+    }
+  }
+  return ids
+}
+
 /**
  * True when the persisted group is a strictly richer copy of the same live
  * stub — same user prompt, assistant text is a prefix / trailing summary
@@ -1075,7 +1113,18 @@ function turnGroupPersistedCoversLocal(
   const localText = localAssistants.map(turnVisibleText).join("")
   const persistedText = persistedAssistants.map(turnVisibleText).join("")
   if (persistedText.length <= localText.length) return false
-  if (persistedText.startsWith(localText)) return true
+  // Empty local text is a prefix of every persist string; that would retire
+  // a fresh tool-only replay against a previous turn with the same prompt.
+  if (localText.length > 0 && persistedText.startsWith(localText)) return true
+  const localToolIds = assistantToolUseIds(localAssistants)
+  if (localText.length === 0) {
+    if (localToolIds.size === 0) return false
+    const persistedToolIds = assistantToolUseIds(persistedAssistants)
+    for (const id of localToolIds) {
+      if (!persistedToolIds.has(id)) return false
+    }
+    return true
+  }
   // Distinct trailing summary on the same user turn (Grok chat_history after
   // extension turn_completed). Without a matching user, a longer unrelated
   // last assistant must not retire an overlay.
@@ -1340,7 +1389,8 @@ function retireCoveredLocalTurns(
   localTurns: MessageTurn[],
   detail: DbConversationDetail | null,
   batchBoundaryIndex: number | null,
-  batchBoundaryPrefixHash: string | null | undefined
+  batchBoundaryPrefixHash: string | null | undefined,
+  options?: { allowRicherCover?: boolean }
 ): MessageTurn[] {
   if (localTurns.length === 0) return localTurns
   const persisted = detail?.turns ?? []
@@ -1383,7 +1433,10 @@ function retireCoveredLocalTurns(
   }
   const lastLocal = alignment.localGroups.at(-1)
   const lastPersisted = splitTurnGroups(persisted).at(-1)
+  // Richer-cover is only valid after persist itself grew (hydrate). Applying
+  // it on COMPLETE_TURN against the previous turn drops a repeated prompt.
   const dropLastCovered =
+    options?.allowRicherCover === true &&
     lastLocal != null &&
     lastPersisted != null &&
     turnGroupPersistedCoversLocal(
@@ -2920,7 +2973,13 @@ function reducer(
               action.localAlignmentBoundaryIndex ?? current.batchBoundaryIndex,
               action.localAlignmentBoundaryIndex !== undefined
                 ? undefined
-                : current.batchBoundaryPrefixHash
+                : current.batchBoundaryPrefixHash,
+              {
+                allowRicherCover: persistTailGrew(
+                  current.detail?.turns ?? [],
+                  detail.turns
+                ),
+              }
             )
       const retiredLocalPrefix =
         nextLocalTurns.length < current.localTurns.length
@@ -6791,6 +6850,7 @@ export const useConversationRuntimeStore = create<ConversationRuntimeStore>()((
           const lastLocalGroup = splitTurnGroups(cur2.localTurns).at(-1)
           const lastPersistedGroup = splitTurnGroups(detail.turns).at(-1)
           const richer =
+            persistTailGrew(cur2.detail?.turns ?? [], detail.turns) &&
             lastLocalGroup != null &&
             lastPersistedGroup != null &&
             turnGroupPersistedCoversLocal(
