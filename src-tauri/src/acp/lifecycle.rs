@@ -723,6 +723,7 @@ pub(crate) async fn handle_event(
             Ok(())
         }
         AcpEvent::TurnComplete {
+            session_id,
             stop_reason,
             mark_awaiting_reply,
             ..
@@ -760,6 +761,47 @@ pub(crate) async fn handle_event(
             let Some(cid) = conversation_id else {
                 return Ok(());
             };
+            // SessionStarted often fires while conversation_id is still None;
+            // ConversationLinked can fire before external_id is on state. Both
+            // skip the DB write, leaving `external_id=None` / `message_count=0`
+            // so get_folder_conversation cannot find the agent transcript
+            // (Grok ~/.grok/sessions/…, Cursor store, …). By end_turn the
+            // live session id is known — persist it now so a post-turn hydrate
+            // can read the final assistant message off disk.
+            if stop_reason.as_str() == "end_turn" {
+                let (agent_type, live_sid) = {
+                    let snap = state_arc.read().await;
+                    (snap.agent_type, snap.external_id.clone())
+                };
+                let sid = live_sid
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or_else(|| session_id.clone());
+                if !sid.is_empty() {
+                    match conversation_service::get_by_id(db_conn, cid).await {
+                        Ok(row) if row.external_id.is_none() => {
+                            if let Err(e) =
+                                persist_live_external_id(db_conn, &emitter, cid, agent_type, &sid)
+                                    .await
+                            {
+                                tracing::warn!(
+                                    conversation_id = cid,
+                                    session_id = %sid,
+                                    error = %e,
+                                    "[lifecycle] end_turn could not bind unbound external_id"
+                                );
+                            }
+                        }
+                        Ok(_) => {}
+                        Err(e) => {
+                            tracing::warn!(
+                                conversation_id = cid,
+                                error = %e,
+                                "[lifecycle] end_turn skipped unbound-row bind; get_by_id failed"
+                            );
+                        }
+                    }
+                }
+            }
             // Delegate rows: durable task status + sidebar ConversationStatus are
             // owned by the broker store CAS (`settle_task`). A generic
             // ConversationStatus write here would race / obscure the terminal
@@ -3842,6 +3884,63 @@ mod tests {
             },
         };
         handle_event(&db.conn, &mgr, &env, None).await.unwrap();
+        assert_eq!(
+            read_row_status(&db, conv.id).await,
+            ConversationStatus::PendingReview
+        );
+        let reloaded = conversation_service::get_by_id(&db.conn, conv.id)
+            .await
+            .unwrap();
+        assert_eq!(
+            reloaded.external_id.as_deref(),
+            Some("ext-1"),
+            "end_turn must bind the live session id when SessionStarted and \
+             ConversationLinked both skipped the write"
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_event_end_turn_binds_unbound_grok_session() {
+        // Production: conversation 10 stayed external_id=None / message_count=0
+        // after a Grok tool-using turn. The ACP session was live; only the
+        // durable bind was missing, so reopen/hydrate could not find
+        // ~/.grok/sessions/…/chat_history.jsonl.
+        let db = test_helpers::fresh_in_memory_db().await;
+        let folder_id = test_helpers::seed_folder(&db, "/tmp/turn-complete-grok-bind").await;
+        let conv = conversation_service::create(&db.conn, folder_id, AgentType::Grok, None, None)
+            .await
+            .unwrap();
+        assert!(conv.external_id.is_none());
+
+        let mgr = ConnectionManager::new();
+        {
+            let mut map = mgr.connections.lock().await;
+            let conn = fake_connection_with_state("c-grok", Some(conv.id));
+            conn.state.write().await.agent_type = AgentType::Grok;
+            conn.state.write().await.external_id =
+                Some("01a0902e-5e58-7330-baf5-74d8f5b9ea68".into());
+            map.insert("c-grok".to_string(), conn);
+        }
+        let env = EventEnvelope {
+            seq: 1,
+            connection_id: "c-grok".to_string(),
+            payload: AcpEvent::TurnComplete {
+                session_id: "01a0902e-5e58-7330-baf5-74d8f5b9ea68".into(),
+                stop_reason: "end_turn".into(),
+                agent_type: "grok".into(),
+                mark_awaiting_reply: true,
+                termination_source: None,
+                provider_turn_id: None,
+            },
+        };
+        handle_event(&db.conn, &mgr, &env, None).await.unwrap();
+        let reloaded = conversation_service::get_by_id(&db.conn, conv.id)
+            .await
+            .unwrap();
+        assert_eq!(
+            reloaded.external_id.as_deref(),
+            Some("01a0902e-5e58-7330-baf5-74d8f5b9ea68")
+        );
         assert_eq!(
             read_row_status(&db, conv.id).await,
             ConversationStatus::PendingReview

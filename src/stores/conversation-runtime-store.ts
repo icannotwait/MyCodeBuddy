@@ -146,7 +146,8 @@ export interface ConversationTimelineTurn {
    * Only ever set on turns projected from `detail.turns`. A locally promoted
    * turn is complete by construction (`COMPLETE_TURN` fires at TurnComplete),
    * and the marker in `detail` can outlive that completion indefinitely —
-   * `completeTurn` deliberately never refetches, and the live-transcript viewer
+   * `completeTurn` does not refetch on the same tick (and only hydrates a
+   * richer persist after tool-using turns), and the live-transcript viewer
    * has no settle-time refetch — so deriving this from the raw marker over the
    * whole timeline would strand a finished reply as "running" for the life of
    * the view.
@@ -1027,6 +1028,60 @@ function turnGroupsContentEquivalent(
   )
 }
 
+function turnVisibleText(turn: MessageTurn): string {
+  return turn.blocks
+    .filter(
+      (block): block is Extract<ContentBlock, { type: "text" }> =>
+        block.type === "text"
+    )
+    .map((block) => block.text)
+    .join("")
+}
+
+/**
+ * True when the persisted group is a strictly richer copy of the same live
+ * stub — same user prompt, assistant text is a prefix / trailing summary
+ * after tools. Used so a post-`end_turn` hydrate can drop the mid-turn
+ * "正在核对…" overlay once disk has the final assistant message.
+ */
+function turnGroupPersistedCoversLocal(
+  localTurns: readonly MessageTurn[],
+  localGroup: TurnGroup,
+  persisted: readonly MessageTurn[],
+  persistedGroup: TurnGroup
+): boolean {
+  const localSlice = localTurns.slice(localGroup.start, localGroup.end)
+  const persistedSlice = persisted.slice(
+    persistedGroup.start,
+    persistedGroup.end
+  )
+  if (localSlice.length === 0 || persistedSlice.length === 0) return false
+  const localAssistants = localSlice.filter((turn) => turn.role === "assistant")
+  const persistedAssistants = persistedSlice.filter(
+    (turn) => turn.role === "assistant"
+  )
+  if (localAssistants.length === 0 || persistedAssistants.length === 0) {
+    return false
+  }
+  const localUser = localSlice.find((turn) => turn.role === "user")
+  const persistedUser = persistedSlice.find((turn) => turn.role === "user")
+  const usersMatch =
+    localUser != null &&
+    persistedUser != null &&
+    contentBlocksEquivalent(localUser.blocks, persistedUser.blocks)
+  if (localUser && persistedUser && !usersMatch) {
+    return false
+  }
+  const localText = localAssistants.map(turnVisibleText).join("")
+  const persistedText = persistedAssistants.map(turnVisibleText).join("")
+  if (persistedText.length <= localText.length) return false
+  if (persistedText.startsWith(localText)) return true
+  // Distinct trailing summary on the same user turn (Grok chat_history after
+  // extension turn_completed). Without a matching user, a longer unrelated
+  // last assistant must not retire an overlay.
+  return usersMatch && !localText.includes(persistedText)
+}
+
 function uniqueTurnIndexes(
   turns: readonly MessageTurn[],
   keyForTurn: (turn: MessageTurn) => string | null
@@ -1326,9 +1381,27 @@ function retireCoveredLocalTurns(
       break
     }
   }
-  if (retiredGroupCount === 0) return localTurns
-  const firstRetained = alignment.localGroups[retiredGroupCount]?.start
-  return firstRetained === undefined ? [] : localTurns.slice(firstRetained)
+  const lastLocal = alignment.localGroups.at(-1)
+  const lastPersisted = splitTurnGroups(persisted).at(-1)
+  const dropLastCovered =
+    lastLocal != null &&
+    lastPersisted != null &&
+    turnGroupPersistedCoversLocal(
+      localTurns,
+      lastLocal,
+      persisted,
+      lastPersisted
+    )
+  const firstRetained =
+    retiredGroupCount === 0
+      ? 0
+      : (alignment.localGroups[retiredGroupCount]?.start ?? localTurns.length)
+  const lastRetainedEnd = dropLastCovered ? lastLocal.start : localTurns.length
+  if (firstRetained >= lastRetainedEnd) return []
+  if (firstRetained === 0 && lastRetainedEnd === localTurns.length) {
+    return localTurns
+  }
+  return localTurns.slice(firstRetained, lastRetainedEnd)
 }
 
 function batchStartCapture(
@@ -4185,6 +4258,13 @@ export interface RuntimeActions {
    */
   syncViewerDetail: (conversationId: number) => void
   /**
+   * After a tool-using ACP `end_turn`, poll the agent transcript until the
+   * persisted last assistant is strictly richer than the promoted live stub
+   * (Grok writes the final summary to disk after extension `turn_completed`).
+   * Empty / still-stub reads are not committed over `localTurns`.
+   */
+  hydrateSettledTurnFromTranscript: (conversationId: number) => void
+  /**
    * Bounded poll that converges a delegated child's terminal transcript into
    * persisted detail without dropping live/local content mid-window.
    */
@@ -5228,11 +5308,16 @@ function isExactIdViewerUserEcho(
 // trailing USER turn (Claude/Codex append the assistant reply to the JSONL only
 // on completion, so a trailing user turn means the reply is still mid-flush).
 const VIEWER_DETAIL_SYNC_DELAYS_MS = [0, 300, 700, 1500, 2500] as const
+// Owner hydrate after a tool-using end_turn. First tick is delayed so
+// completeTurn's in-memory promote is the first paint (no empty-history
+// wipe), and so SessionStarted/ConversationLinked bind can land.
+const SETTLED_TURN_HYDRATE_DELAYS_MS = [80, 300, 700, 1500, 2500] as const
 
 // Active viewer-sync polls, keyed by conversationId, so a fresh nudge supersedes
 // an in-flight poll (never stacks) and `removeConversation` / store reset can
 // cancel a poll whose tab has closed.
 const viewerDetailSyncCancels = new Map<number, () => void>()
+const settledTurnHydrateCancels = new Map<number, () => void>()
 
 // Separate cancel map so viewer and delegate terminal policies cannot cancel
 // each other's ownership accidentally.
@@ -5267,9 +5352,16 @@ function cancelViewerDetailSync(conversationId: number): void {
   if (cancel) cancel()
 }
 
+function cancelSettledTurnHydrate(conversationId: number): void {
+  const cancel = settledTurnHydrateCancels.get(conversationId)
+  if (cancel) cancel()
+}
+
 function cancelAllDetailSyncs(): void {
   for (const cancel of viewerDetailSyncCancels.values()) cancel()
   viewerDetailSyncCancels.clear()
+  for (const cancel of settledTurnHydrateCancels.values()) cancel()
+  settledTurnHydrateCancels.clear()
   for (const cancel of delegateTerminalSyncCancels.values()) cancel()
   delegateTerminalSyncCancels.clear()
   pendingDelegateTerminalSync.clear()
@@ -6640,6 +6732,119 @@ export const useConversationRuntimeStore = create<ConversationRuntimeStore>()((
     attempt(0)
   }
 
+  const hydrateSettledTurnFromTranscript = (conversationId: number): void => {
+    if (authoritativeFetchGeneration.has(conversationId)) return
+    const session = get().byConversationId.get(conversationId)
+    if (!session) return
+    if (sessionHasPendingCancel(session)) return
+    if (isPureViewerSession(session)) return
+
+    cancelSettledTurnHydrate(conversationId)
+
+    let cancelled = false
+    let timer: ReturnType<typeof setTimeout> | null = null
+    const cancel = (): void => {
+      cancelled = true
+      if (timer) clearTimeout(timer)
+      if (settledTurnHydrateCancels.get(conversationId) === cancel) {
+        settledTurnHydrateCancels.delete(conversationId)
+      }
+    }
+    settledTurnHydrateCancels.set(conversationId, cancel)
+
+    const attempt = (n: number): void => {
+      if (cancelled) return
+      const cur = get().byConversationId.get(conversationId)
+      if (!cur || cur.syncState === "awaiting_persist") {
+        cancel()
+        return
+      }
+      if (isPureViewerSession(cur) || sessionHasPendingCancel(cur)) {
+        cancel()
+        return
+      }
+      const fetchId = cur.dbConversationId ?? conversationId
+      const generation = bumpFetchGeneration(conversationId)
+      getFolderConversation(fetchId, runtimeRefetchHistoryFetchOptions(cur))
+        .then((detail) => {
+          if (cancelled) return
+          const cur2 = get().byConversationId.get(conversationId)
+          if (!cur2 || cur2.syncState === "awaiting_persist") {
+            cancel()
+            return
+          }
+          if (!isLatestGeneration(conversationId, generation)) {
+            if (n + 1 < SETTLED_TURN_HYDRATE_DELAYS_MS.length) {
+              timer = setTimeout(
+                () => attempt(n + 1),
+                SETTLED_TURN_HYDRATE_DELAYS_MS[n + 1]
+              )
+              return
+            }
+            cancel()
+            return
+          }
+          const hasTurns = detail.turns.length > 0
+          const lastLocalAssistant = [...cur2.localTurns]
+            .reverse()
+            .find((turn) => turn.role === "assistant")
+          const lastLocalGroup = splitTurnGroups(cur2.localTurns).at(-1)
+          const lastPersistedGroup = splitTurnGroups(detail.turns).at(-1)
+          const richer =
+            lastLocalGroup != null &&
+            lastPersistedGroup != null &&
+            turnGroupPersistedCoversLocal(
+              cur2.localTurns,
+              lastLocalGroup,
+              detail.turns,
+              lastPersistedGroup
+            )
+          if (hasTurns && (richer || lastLocalAssistant == null)) {
+            if (
+              sessionHasPendingCancel(
+                get().byConversationId.get(conversationId)
+              )
+            ) {
+              cancel()
+              return
+            }
+            dispatch({
+              type: "FETCH_DETAIL_SUCCESS",
+              conversationId,
+              detail,
+              preserveLive: true,
+            })
+            installWorkflowGraphFromDetail(conversationId, detail)
+            if (richer || lastLocalAssistant == null) {
+              cancel()
+              return
+            }
+          }
+          if (n + 1 < SETTLED_TURN_HYDRATE_DELAYS_MS.length) {
+            timer = setTimeout(
+              () => attempt(n + 1),
+              SETTLED_TURN_HYDRATE_DELAYS_MS[n + 1]
+            )
+            return
+          }
+          cancel()
+        })
+        .catch(() => {
+          if (cancelled) return
+          if (n + 1 < SETTLED_TURN_HYDRATE_DELAYS_MS.length) {
+            timer = setTimeout(
+              () => attempt(n + 1),
+              SETTLED_TURN_HYDRATE_DELAYS_MS[n + 1]
+            )
+            return
+          }
+          cancel()
+        })
+    }
+
+    timer = setTimeout(() => attempt(0), SETTLED_TURN_HYDRATE_DELAYS_MS[0])
+  }
+
   const syncDelegateTerminalDetail = (nudgedConversationId: number): void => {
     const conversationId = resolveViewerRuntimeId(
       get().byConversationId,
@@ -7013,34 +7218,30 @@ export const useConversationRuntimeStore = create<ConversationRuntimeStore>()((
     clearCancelReconcile,
     loadOlderTurns,
     syncViewerDetail,
+    hydrateSettledTurnFromTranscript,
     syncDelegateTerminalDetail,
     syncTurnMetadata,
     completeTurn: (conversationId, liveMessage) => {
-      // Deliberately NO refetchDetail here (tried and reverted — see git
-      // history). It used to exist
-      // to fold a held-open turn's (claude-agent-acp v0.59.0's #870) content
-      // into the persisted view, since the backend transcript watcher had no
-      // visibility into what the wire already rendered. That's no longer
-      // needed: `background_watch.rs` suppresses the overlay turn for a held
-      // turn's own launched tasks, and the async sub-agent launch card is now
-      // flipped in-memory from the `settled` event (RESOLVE_BACKGROUND_TASK /
-      // the COMPLETE_TURN drain below) — so there's nothing left for a
-      // post-completion refetch to reconcile. Worse, the refetch actively lost
-      // content: it races the transcript file's own last write against this
-      // very `TurnComplete` event — real hardware evidence showed the final
-      // assistant record's timestamp only 8ms before turn_complete fired, well
-      // inside the file-flush's own margin — and `preserveLive: false`
-      // unconditionally discarded the already-correct `localTurns`/`liveMessage`
-      // in favor of whatever that (sometimes-incomplete) fresh read returned,
-      // visibly dropping the turn's trailing content. The dispatch below already
-      // promotes `liveMessage`/`optimisticTurns` into `localTurns`
-      // synchronously, with no read from disk and therefore no race — that IS
-      // the complete, correct render; a later cold detail fetch (opening the tab
-      // again, etc.) reconciles it against the DB whenever that naturally
-      // happens.
+      // Immediate refetchDetail is still forbidden (tried and reverted — see
+      // git history). A same-tick read races the transcript flush and, with
+      // `preserveLive: false`, used to discard the already-correct promote.
+      // Tool-using ACP turns are the exception that still needs a *later*
+      // hydrate: Grok's extension `turn_completed` settles the live buffer on
+      // the mid-turn stub, while the final assistant lands only on disk.
+      // `hydrateSettledTurnFromTranscript` polls after a delay and commits
+      // only a strictly richer persist (never an empty/stub overwrite).
       const sessionBefore = get().byConversationId.get(conversationId)
+      const sourceLiveMessage =
+        liveMessage !== undefined ? liveMessage : sessionBefore?.liveMessage
+      const hadToolActivity =
+        sourceLiveMessage?.content.some(
+          (block) => block.type === "tool_call"
+        ) ?? false
       dispatch({ type: "COMPLETE_TURN", conversationId, liveMessage })
       persistTurnGenerationFromSession(conversationId, sessionBefore)
+      if (hadToolActivity) {
+        hydrateSettledTurnFromTranscript(conversationId)
+      }
     },
     appendOptimisticTurn: (conversationId, turn, turnToken, options) => {
       // New prompt: cancel coordinator timers + soft fence + bump generation.
@@ -7289,6 +7490,7 @@ export const useConversationRuntimeStore = create<ConversationRuntimeStore>()((
       // also stop it on the next fire, but cancelling now drops the pending
       // timer immediately).
       cancelViewerDetailSync(conversationId)
+      cancelSettledTurnHydrate(conversationId)
       delegateTerminalSyncCancels.get(conversationId)?.()
       pendingDelegateTerminalSync.delete(conversationId)
       dispatch({ type: "REMOVE_CONVERSATION", conversationId })

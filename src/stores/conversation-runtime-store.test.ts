@@ -2902,4 +2902,203 @@ describe("owner overlay retirement without live-* persist ids", () => {
     expect(local.some((t) => t.id === `live-${CID}-fresh`)).toBe(true)
     expect(local.some((t) => t.id === "optimistic-new")).toBe(true)
   })
+
+  it("settled refetch retires a mid-turn stub when persisted assistant is richer", async () => {
+    const startedAt = Date.parse("2026-09-12T04:00:00.000Z")
+    const persistTs = new Date(startedAt).toISOString()
+    const stub = "正在核对计划任务、PR 状态和工作树，确认是否还有未完成项。"
+    const full = `${stub}\n\n22 个任务都做完了。PR #18 仍未合并。`
+    const { actions } = useConversationRuntimeStore.getState()
+
+    seedRuntimeSession({
+      detail: detailWithTurns([]),
+      liveOwnsActiveTurn: false,
+      syncState: "idle",
+    })
+    actions.appendOptimisticTurn(
+      CID,
+      userTurn("user-done", "全部做完了吗", persistTs),
+      "user-done"
+    )
+    actions.completeTurn(CID, liveMessage("stub", stub, startedAt))
+
+    mockGetFolderConversation.mockResolvedValueOnce(
+      detailWithTurns([
+        userTurn("grok-user-0", "全部做完了吗", persistTs),
+        assistantTurn("grok-turn-0", full, persistTs),
+      ])
+    )
+    actions.refetchDetail(CID, { preserveLive: true })
+    await Promise.resolve()
+    await Promise.resolve()
+
+    const session = useConversationRuntimeStore
+      .getState()
+      .byConversationId.get(CID)!
+    expect(session.localTurns.some((t) => t.id === `live-${CID}-stub`)).toBe(
+      false
+    )
+    expect(session.detail?.turns.at(-1)?.blocks).toEqual([
+      { type: "text", text: full },
+    ])
+  })
+
+  it("hydrates a richer persisted assistant after a tool-using completeTurn", async () => {
+    vi.useFakeTimers()
+    const startedAt = Date.parse("2026-09-12T04:05:00.000Z")
+    const persistTs = new Date(startedAt).toISOString()
+    const stub = "正在核对计划任务、PR 状态和工作树，确认是否还有未完成项。"
+    const full = `${stub}\n\n22 个任务都做完了。PR #18 仍未合并。`
+    const { actions } = useConversationRuntimeStore.getState()
+
+    seedRuntimeSession({
+      detail: detailWithTurns([]),
+      liveOwnsActiveTurn: false,
+      syncState: "awaiting_persist",
+    })
+    actions.appendOptimisticTurn(
+      CID,
+      userTurn("user-done", "全部做完了吗", persistTs),
+      "user-done"
+    )
+    const live: LiveMessage = {
+      id: "stub",
+      role: "assistant",
+      content: [
+        { type: "text", text: stub },
+        {
+          type: "tool_call",
+          info: {
+            tool_call_id: "tc-1",
+            title: "bash",
+            kind: "execute",
+            status: "completed",
+            content: null,
+            raw_input: '{"command":"git status"}',
+            raw_output_chunks: ["ok"],
+            raw_output_total_bytes: 2,
+            locations: null,
+            meta: null,
+            images: [],
+          },
+        },
+      ],
+      startedAt,
+    }
+
+    mockGetFolderConversation
+      .mockResolvedValueOnce(detailWithTurns([]))
+      .mockResolvedValueOnce(
+        detailWithTurns([
+          userTurn("grok-user-0", "全部做完了吗", persistTs),
+          assistantTurn("grok-turn-0", full, persistTs),
+        ])
+      )
+
+    try {
+      actions.completeTurn(CID, live)
+      expect(
+        useConversationRuntimeStore
+          .getState()
+          .byConversationId.get(CID)
+          ?.localTurns.some((t) => t.id === `live-${CID}-stub`)
+      ).toBe(true)
+
+      await vi.advanceTimersByTimeAsync(80)
+      await Promise.resolve()
+      await Promise.resolve()
+      expect(
+        useConversationRuntimeStore
+          .getState()
+          .byConversationId.get(CID)
+          ?.localTurns.some((t) => t.id === `live-${CID}-stub`)
+      ).toBe(true)
+
+      await vi.advanceTimersByTimeAsync(300)
+      await Promise.resolve()
+      await Promise.resolve()
+
+      const session = useConversationRuntimeStore
+        .getState()
+        .byConversationId.get(CID)!
+      expect(session.localTurns.some((t) => t.id === `live-${CID}-stub`)).toBe(
+        false
+      )
+      expect(
+        session.detail?.turns
+          .filter((t) => t.role === "assistant")
+          .at(-1)
+          ?.blocks.some(
+            (block) =>
+              block.type === "text" && block.text.includes("22 个任务都做完了")
+          )
+      ).toBe(true)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it("does not replace a promoted stub with an empty hydrate read", async () => {
+    vi.useFakeTimers()
+    const startedAt = Date.parse("2026-09-12T04:06:00.000Z")
+    const persistTs = new Date(startedAt).toISOString()
+    const stub = "正在核对计划任务、PR 状态和工作树，确认是否还有未完成项。"
+    const { actions } = useConversationRuntimeStore.getState()
+
+    seedRuntimeSession({
+      detail: detailWithTurns([]),
+      liveOwnsActiveTurn: false,
+      syncState: "awaiting_persist",
+    })
+    actions.appendOptimisticTurn(
+      CID,
+      userTurn("user-done", "全部做完了吗", persistTs),
+      "user-done"
+    )
+    const live: LiveMessage = {
+      id: "stub",
+      role: "assistant",
+      content: [
+        { type: "text", text: stub },
+        {
+          type: "tool_call",
+          info: {
+            tool_call_id: "tc-1",
+            title: "bash",
+            kind: "execute",
+            status: "completed",
+            content: null,
+            raw_input: "{}",
+            raw_output_chunks: [],
+            raw_output_total_bytes: 0,
+            locations: null,
+            meta: null,
+            images: [],
+          },
+        },
+      ],
+      startedAt,
+    }
+    mockGetFolderConversation.mockResolvedValue(detailWithTurns([]))
+
+    try {
+      actions.completeTurn(CID, live)
+      await vi.advanceTimersByTimeAsync(80)
+      await Promise.resolve()
+      await Promise.resolve()
+      await vi.advanceTimersByTimeAsync(300)
+      await Promise.resolve()
+      await Promise.resolve()
+
+      const session = useConversationRuntimeStore
+        .getState()
+        .byConversationId.get(CID)!
+      expect(session.localTurns.some((t) => t.id === `live-${CID}-stub`)).toBe(
+        true
+      )
+      expect(session.detail?.turns).toEqual([])
+    } finally {
+      vi.useRealTimers()
+    }
+  })
 })
