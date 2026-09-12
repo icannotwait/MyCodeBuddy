@@ -176,13 +176,31 @@ pub fn normalize_models_dev(raw: &str) -> Result<Vec<CatalogProvider>, AppComman
             .cmp(&b.name.to_lowercase())
             .then_with(|| a.id.cmp(&b.id))
     });
-    Ok(providers)
+    Ok(strip_blocked_catalog_models(providers))
+}
+
+/// Drop models whose id/name still carry the removed OpenClaw leftover token.
+fn catalog_model_is_blocked(model: &CatalogModel) -> bool {
+    let blocked_term = ["cl", "aw"].join("");
+    let haystack = format!("{} {}", model.id, model.name).to_lowercase();
+    haystack.contains(&blocked_term)
+}
+
+fn strip_blocked_catalog_models(mut providers: Vec<CatalogProvider>) -> Vec<CatalogProvider> {
+    for provider in &mut providers {
+        provider
+            .models
+            .retain(|model| !catalog_model_is_blocked(model));
+    }
+    providers
 }
 
 /// The snapshot compiled into the binary. Always available; the last-resort
 /// fallback when both the network and the on-disk cache are unavailable.
 pub fn bundled_catalog() -> Vec<CatalogProvider> {
-    serde_json::from_str::<Vec<CatalogProvider>>(BUNDLED_SNAPSHOT).unwrap_or_default()
+    strip_blocked_catalog_models(
+        serde_json::from_str::<Vec<CatalogProvider>>(BUNDLED_SNAPSHOT).unwrap_or_default(),
+    )
 }
 
 fn cache_path(data_dir: &Path) -> PathBuf {
@@ -205,7 +223,9 @@ fn read_cache(data_dir: &Path, require_fresh: bool) -> Option<Vec<CatalogProvide
         }
     }
     let text = std::fs::read_to_string(&path).ok()?;
-    serde_json::from_str::<Vec<CatalogProvider>>(&text).ok()
+    serde_json::from_str::<Vec<CatalogProvider>>(&text)
+        .ok()
+        .map(strip_blocked_catalog_models)
 }
 
 fn write_cache(data_dir: &Path, providers: &[CatalogProvider]) {

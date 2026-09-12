@@ -778,12 +778,16 @@ fn strip_environment_details(text: &str) -> String {
         return String::new();
     }
 
-    // Preserve leading whitespace so pure mandatory-route classification still
-    // sees column-zero correctly (indented user quotations must remain visible).
+    // Preserve leading spaces/tabs so indented mandatory-route quotations stay
+    // visible to column-zero classification. Strip leading newlines inserted by
+    // `<task>\n…` wrappers so ordinary Cline messages still equal the user text.
     if result.trim().is_empty() {
         String::new()
     } else {
-        result.trim_end().to_string()
+        result
+            .trim_end()
+            .trim_start_matches(['\r', '\n'])
+            .to_string()
     }
 }
 

@@ -8854,46 +8854,31 @@ Call get_delegation_status with the returned task_id to collect the result.";
 
     #[tokio::test]
     async fn batch_import_closes_folder_left_empty_after_zero_live_import() {
-        // Import can reopen/create a folder via add_folder even when every
-        // selected session is skipped (soft-deleted never resurrects). The
-        // group must not stay open with zero live conversations: flip is_open
-        // and broadcast Close{AutoEmpty} after the folder Upsert.
+        // `add_folder` always opens the row. A picker selection of a session
+        // that already lives in another folder skips/updates that existing row
+        // and adds nothing here — close the reopened empty group with AutoEmpty
+        // after the folder Upsert. (Soft-deleted matches Restore in place; they
+        // are not an empty-group case.)
         use crate::web::event_bridge::{WebEventBroadcaster, FOLDER_CHANGED_EVENT};
         use sea_orm::{ActiveModelTrait, EntityTrait, IntoActiveModel, Set};
         use std::sync::Arc;
         let db = fresh_in_memory_db().await;
-        let folder_id = seed_folder(&db, "/tmp/proj-empty-import").await;
 
-        // First import creates a live conversation, then soft-delete both the
-        // conversation and the folder so the next batch reopens an empty shell.
-        let make = || {
-            vec![scan_summary(
-                "s1",
-                AgentType::ClaudeCode,
-                Some("/tmp/proj-empty-import"),
-                at(0),
-            )]
-        };
         import_selected_from_summaries(
             &db.conn,
             &EventEmitter::Noop,
-            make(),
+            vec![scan_summary(
+                "s1",
+                AgentType::ClaudeCode,
+                Some("/tmp/proj-other-import"),
+                at(0),
+            )],
             vec![key_of(AgentType::ClaudeCode, "s1")],
         )
         .await
-        .expect("seed import");
+        .expect("seed live session in another folder");
 
-        let conv = conversation::Entity::find()
-            .all(&db.conn)
-            .await
-            .unwrap()
-            .into_iter()
-            .next()
-            .expect("seeded conversation");
-        let mut conv_active = conv.into_active_model();
-        conv_active.deleted_at = Set(Some(chrono::Utc::now()));
-        conv_active.update(&db.conn).await.unwrap();
-
+        let folder_id = seed_folder(&db, "/tmp/proj-empty-import").await;
         let folder_row = crate::db::entities::folder::Entity::find_by_id(folder_id)
             .one(&db.conn)
             .await
@@ -8911,14 +8896,24 @@ Call get_delegation_status with the returned task_id to collect the result.";
         let result = import_selected_from_summaries(
             &db.conn,
             &emitter,
-            make(),
+            vec![scan_summary(
+                "s1",
+                AgentType::ClaudeCode,
+                Some("/tmp/proj-empty-import"),
+                at(0),
+            )],
             vec![key_of(AgentType::ClaudeCode, "s1")],
         )
         .await
         .expect("empty-group import");
 
         assert_eq!(result.imported, 0);
-        assert_eq!(result.skipped, 1);
+        assert_eq!(result.restored, 0);
+        assert_eq!(
+            result.skipped + result.updated,
+            1,
+            "existing live row in another folder is skipped or refreshed, not imported"
+        );
         assert_eq!(
             result.created_folders, 1,
             "reopening soft-deleted folder counts as created"

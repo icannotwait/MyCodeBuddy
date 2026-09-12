@@ -1302,6 +1302,7 @@ mod tests {
                 .expect("registry")
         };
 
+        crate::db::test_helpers::enable_agent_for_test(db.as_ref(), AgentType::Codex).await;
         let manager = ConnectionManager::new();
         let agent = FakeAgent::new(manager, scenario);
         let driver = FakeTitleConnectionDriver::new(Arc::clone(&agent), Arc::clone(&registry));
@@ -1727,6 +1728,19 @@ mod tests {
         // There is no deterministic DB gate for status; StatusConfig cancels
         // immediately pre-run (limitation: does not prove mid-DB cancellation).
         // Spawn/identity/prompt/completion use explicit mid-phase gates.
+        // Bound waits: an unbounded yield loop hangs the whole `cargo test`
+        // process if spawn never starts (CI then dies at the 6h job cap).
+        async fn wait_until(mut ready: impl FnMut() -> bool, what: &str) {
+            let start = std::time::Instant::now();
+            while !ready() {
+                assert!(
+                    start.elapsed() < Duration::from_secs(5),
+                    "{what} not reached within 5s"
+                );
+                tokio::task::yield_now().await;
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        }
         for phase in [
             BlockedPhase::StatusConfig,
             BlockedPhase::Spawn,
@@ -1789,30 +1803,22 @@ mod tests {
             match phase {
                 BlockedPhase::StatusConfig => {}
                 BlockedPhase::Spawn => {
-                    while !agent.spawn_gate.was_entered() {
-                        tokio::task::yield_now().await;
-                    }
+                    wait_until(|| agent.spawn_gate.was_entered(), "spawn gate").await;
                     cancel.cancel();
                     agent.spawn_gate.release();
                 }
                 BlockedPhase::Identity => {
-                    while !agent.identity_gate.was_entered() {
-                        tokio::task::yield_now().await;
-                    }
+                    wait_until(|| agent.identity_gate.was_entered(), "identity gate").await;
                     cancel.cancel();
                     agent.identity_gate.release();
                 }
                 BlockedPhase::PromptSend => {
-                    while !agent.prompt_gate.was_entered() {
-                        tokio::task::yield_now().await;
-                    }
+                    wait_until(|| agent.prompt_gate.was_entered(), "prompt gate").await;
                     cancel.cancel();
                     agent.prompt_gate.release();
                 }
                 BlockedPhase::Completion => {
-                    while agent.prompt_count() == 0 {
-                        tokio::task::yield_now().await;
-                    }
+                    wait_until(|| agent.prompt_count() > 0, "prompt send").await;
                     cancel.cancel();
                     agent.completion_gate.release();
                 }

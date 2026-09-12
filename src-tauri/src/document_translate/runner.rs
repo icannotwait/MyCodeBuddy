@@ -900,6 +900,7 @@ mod tests {
     ) {
         let data_dir = tempfile::tempdir().expect("tempdir");
         let db = Arc::new(crate::db::test_helpers::fresh_in_memory_db().await);
+        crate::db::test_helpers::enable_agent_for_test(db.as_ref(), AgentType::Codex).await;
         let registry =
             InternalAgentSessionRegistry::new_empty_for_test(db.conn.clone(), data_dir.path())
                 .expect("registry");
