@@ -16,9 +16,11 @@ import type {
 } from "@/contexts/acp-connections-context"
 import type {
   AgentType,
+  ContentBlock,
   DelegationActivityView,
   EventEnvelope,
   PlanEntryInfo,
+  UserMessageBlock,
 } from "@/lib/types"
 import {
   appendStreamingMarkdown,
@@ -40,6 +42,14 @@ export type LiveTranscriptSegment =
   | { id: string; type: "tool"; toolCallId: string }
   | { id: string; type: "plan"; entries: PlanEntryInfo[] }
   | { id: string; type: "generated-image"; toolCallId: string }
+  | {
+      id: string
+      type: "steering"
+      noteId: string
+      text: string
+      createdAt: string
+      blocks?: ContentBlock[] | null
+    }
 
 function createTextSegment(
   id: string,
@@ -51,6 +61,36 @@ function createTextSegment(
     text,
     document: appendStreamingMarkdown(createIncrementalStreamBlocks(id), text),
   }
+}
+
+function contentBlocksFromUserMessageBlocks(
+  blocks: UserMessageBlock[] | null | undefined
+): ContentBlock[] | null {
+  if (!blocks?.length) return null
+  return blocks.map((block) =>
+    block.type === "image"
+      ? {
+          type: "image" as const,
+          data: block.data,
+          mime_type: block.mime_type,
+          uri: null,
+        }
+      : { type: "text" as const, text: block.text }
+  )
+}
+
+function steeringSegmentId(messageId: string, noteId: string): string {
+  return `${messageId}:steering:${noteId}`
+}
+
+function snapshotHasSteeringNote(
+  snapshot: LiveTranscriptSnapshot,
+  noteId: string
+): boolean {
+  for (const segment of snapshot.segments.values()) {
+    if (segment.type === "steering" && segment.noteId === noteId) return true
+  }
+  return false
 }
 
 /** Cross-task live projection snapshot. */
@@ -213,6 +253,27 @@ export function projectLiveSnapshot(
         segments.set(id, { id, type: "plan", entries: block.entries })
         break
       }
+      case "steering": {
+        const lastId = segmentIds[segmentIds.length - 1]
+        const last = lastId ? segments.get(lastId) : undefined
+        if (last?.type === "text") {
+          const sealedDoc = sealStreamingMarkdownBoundary(last.document)
+          segments.set(last.id, { ...last, document: sealedDoc })
+        }
+        const id = steeringSegmentId(canonical.id, block.id)
+        if (!segments.has(id)) {
+          segmentIds.push(id)
+          segments.set(id, {
+            id,
+            type: "steering",
+            noteId: block.id,
+            text: block.text,
+            createdAt: block.createdAt,
+            blocks: block.blocks ?? null,
+          })
+        }
+        break
+      }
     }
   }
 
@@ -276,6 +337,31 @@ function sealTrailingText(
   const segments = new Map(snapshot.segments)
   segments.set(last.id, { ...last, document: sealedDoc })
   return cloneSnapshot(snapshot, { segments })
+}
+
+function applySteering(
+  snapshot: LiveTranscriptSnapshot,
+  noteId: string,
+  text: string,
+  createdAt: string,
+  blocks?: ContentBlock[] | null
+): LiveTranscriptSnapshot {
+  if (snapshotHasSteeringNote(snapshot, noteId)) return snapshot
+  const base = sealTrailingText(snapshot)
+  const id = steeringSegmentId(base.messageId, noteId)
+  const segments = new Map(base.segments)
+  segments.set(id, {
+    id,
+    type: "steering",
+    noteId,
+    text,
+    createdAt,
+    blocks: blocks ?? null,
+  })
+  return cloneSnapshot(base, {
+    segmentIds: [...base.segmentIds, id],
+    segments,
+  })
 }
 
 function applyContentDelta(
@@ -598,6 +684,17 @@ export function applyLiveTranscriptEvents(
       case "plan_update":
         current = applyPlanUpdate(current, event.entries)
         break
+      case "feedback_submitted":
+        if (event.item.status === "delivered") {
+          current = applySteering(
+            current,
+            event.item.id,
+            event.item.text,
+            event.item.created_at,
+            contentBlocksFromUserMessageBlocks(event.item.blocks)
+          )
+        }
+        break
       default:
         // status_changed / turn_complete / permissions / etc. — no-op here.
         break
@@ -639,6 +736,15 @@ export function liveTranscriptToCanonicalMessage(
         }
         break
       }
+      case "steering":
+        content.push({
+          type: "steering",
+          id: segment.noteId,
+          text: segment.text,
+          createdAt: segment.createdAt,
+          blocks: segment.blocks ?? null,
+        })
+        break
     }
   }
   return {
@@ -865,6 +971,30 @@ export function applyEventsToCanonicalLiveMessage(
             ...message,
             content: [...nonPlan, { type: "plan", entries: event.entries }],
           }
+        }
+        break
+      }
+      case "feedback_submitted": {
+        if (event.item.status !== "delivered") break
+        if (
+          message.content.some(
+            (block) => block.type === "steering" && block.id === event.item.id
+          )
+        ) {
+          break
+        }
+        message = {
+          ...message,
+          content: [
+            ...message.content,
+            {
+              type: "steering",
+              id: event.item.id,
+              text: event.item.text,
+              createdAt: event.item.created_at,
+              blocks: contentBlocksFromUserMessageBlocks(event.item.blocks),
+            },
+          ],
         }
         break
       }

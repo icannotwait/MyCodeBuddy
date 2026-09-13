@@ -52,6 +52,8 @@ pub async fn set_codeg_mcp_tool_group(
         &state.db.conn,
         CodegMcpToolGroupTargets {
             broker: &state.delegation_broker,
+            runtime: &state.delegation_runtime_settings,
+            manager: &state.connection_manager,
             feedback: &state.feedback_config,
             question: &state.question_config,
             session_info: &state.session_info_config,

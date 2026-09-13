@@ -91,4 +91,44 @@ describe("selectTranscriptApplyEvents", () => {
     )
     expect(projected.map((e) => e.type)).toEqual(["turn_complete"])
   })
+
+  it("projects feedback_submitted while prompting so steering reaches the live transcript", () => {
+    const events: EventEnvelope[] = [
+      delta(1, "hello"),
+      {
+        connection_id: "c1",
+        seq: 2,
+        type: "feedback_submitted",
+        item: {
+          id: "note-1",
+          text: "use the other API",
+          created_at: "2026-05-28T00:05:00.000Z",
+          status: "delivered",
+        },
+      },
+    ]
+    expect(
+      selectTranscriptApplyEvents(events, "prompting").map((e) => e.type)
+    ).toEqual(["content_delta", "feedback_submitted"])
+  })
+
+  it("drops feedback_submitted after the turn leaves prompting", () => {
+    const events: EventEnvelope[] = [
+      turnComplete(1),
+      {
+        connection_id: "c1",
+        seq: 2,
+        type: "feedback_submitted",
+        item: {
+          id: "note-1",
+          text: "too late",
+          created_at: "2026-05-28T00:05:00.000Z",
+          status: "delivered",
+        },
+      },
+    ]
+    expect(
+      selectTranscriptApplyEvents(events, "prompting").map((e) => e.type)
+    ).toEqual(["turn_complete"])
+  })
 })

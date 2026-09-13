@@ -384,24 +384,53 @@ static DELEGATION_WRITE_LOCK: std::sync::LazyLock<tokio::sync::Mutex<()>> =
 /// for the settings form and wrong for a caller that only means to flip
 /// `enabled` — the status-bar popover reads the record, flips one bool and
 /// would write the other three back, reverting any concurrent edit to them.
+///
+/// The write is still a live apply: after committing `enabled` + catalog
+/// revision under the same lock order as [`set_delegation_settings_live`],
+/// runtime watch, broker config, and route-staleness refresh stay in sync
+/// with a settings-page save of the same flag.
 pub async fn set_delegation_enabled_core(
     conn: &DatabaseConnection,
     broker: &DelegationBroker,
+    runtime: &DelegationRuntimeSettings,
+    manager: &crate::acp::manager::ConnectionManager,
     emitter: &EventEmitter,
     enabled: bool,
 ) -> Result<DelegationSettings, AppCommandError> {
-    let _guard = DELEGATION_WRITE_LOCK.lock().await;
-    app_metadata_service::upsert_value(conn, KEY_DELEGATION_ENABLED, &enabled.to_string())
+    let _write = DELEGATION_WRITE_LOCK.lock().await;
+    let _gate = broker.configuration_mutation_guard().await;
+    let before = runtime.snapshot();
+    let mut desired = load_delegation_settings(conn).await;
+    desired.enabled = enabled;
+    let clamped = desired.clamped();
+    let txn = conn
+        .begin()
+        .await
+        .map_err(DbError::from)
+        .map_err(AppCommandError::from)?;
+    advance_catalog_revision_in_txn(&txn).await?;
+    app_metadata_service::upsert_value(&txn, KEY_DELEGATION_ENABLED, &clamped.enabled.to_string())
         .await
         .map_err(AppCommandError::from)?;
-    let settings = load_delegation_settings(conn).await;
-    let mut config = settings.clone().into_broker_config();
-    // Fork profiles live on the broker, not in the settings row. Applying the
-    // enabled-only write must not wipe the live profile map.
-    config.profiles = broker.config_snapshot().await.profiles;
+    let catalog = load_delegation_profile_catalog_from(&txn).await?;
+    txn.commit()
+        .await
+        .map_err(DbError::from)
+        .map_err(AppCommandError::from)?;
+    let after = clamped.to_runtime_snapshot();
+    runtime.set(after.clone());
+    let profiles = broker.config_snapshot().await.profiles;
+    let mut config = clamped.clone().into_broker_config();
+    config.profiles = profiles;
     broker.set_config(config).await;
-    emit_event(emitter, DELEGATION_SETTINGS_CHANGED_EVENT, &settings);
-    Ok(settings)
+    if before.enabled != after.enabled || before.route_policy != after.route_policy {
+        manager
+            .refresh_delegation_route_staleness(after.route_policy, after.enabled)
+            .await;
+    }
+    emit_event(emitter, DELEGATION_PROFILE_CATALOG_CHANGED_EVENT, catalog);
+    emit_event(emitter, DELEGATION_SETTINGS_CHANGED_EVENT, &clamped);
+    Ok(clamped)
 }
 
 async fn persist_settings_keys<C: sea_orm::ConnectionTrait>(
@@ -748,6 +777,7 @@ pub async fn set_delegation_profiles_core(
     broker: &DelegationBroker,
     desired: DelegationProfileDocument,
 ) -> Result<DelegationMutation<DelegationProfileDocument>, AppCommandError> {
+    let _write = DELEGATION_WRITE_LOCK.lock().await;
     let _gate = broker.configuration_mutation_guard().await;
     let normalized = DelegationProfileDocument {
         profiles: normalize_profiles(desired.profiles)?,
@@ -1616,6 +1646,135 @@ mod tests {
         );
 
         // Keep TempDir alive through every assertion.
+        drop(temp);
+    }
+
+    /// Status-bar / mcp-service toggles only `enabled`. That write must still
+    /// land on the same live surfaces a settings-page save uses: runtime watch,
+    /// catalog revision, broker config, and preserved sibling fields/profiles.
+    #[tokio::test]
+    async fn enabled_only_toggle_applies_the_same_live_state_as_settings_save() {
+        let db = crate::db::test_helpers::fresh_in_memory_db().await;
+        let broker = make_broker();
+        let runtime = DelegationRuntimeSettings::default();
+        let manager = crate::acp::manager::ConnectionManager::new();
+        let live = profile("11111111-1111-4111-8111-111111111111", "Live");
+        let saved = set_delegation_settings_live(
+            &db.conn,
+            &broker,
+            &runtime,
+            &manager,
+            DelegationSettings {
+                enabled: false,
+                depth_limit: 4,
+                route_policy: DelegationRoutePolicy::Native,
+                stalled_after_seconds: 120,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let revision_after_settings = saved.catalog.revision;
+        broker
+            .set_profiles(BTreeMap::from([(live.id.clone(), live.clone())]))
+            .await;
+
+        let toggled = set_delegation_enabled_core(
+            &db.conn,
+            &broker,
+            &runtime,
+            &manager,
+            &EventEmitter::Noop,
+            true,
+        )
+        .await
+        .unwrap();
+
+        assert!(toggled.enabled);
+        assert_eq!(toggled.depth_limit, 4);
+        assert_eq!(toggled.route_policy, DelegationRoutePolicy::Native);
+
+        let loaded = load_delegation_settings(&db.conn).await;
+        assert!(loaded.enabled);
+        assert_eq!(loaded.depth_limit, 4);
+        assert_eq!(loaded.route_policy, DelegationRoutePolicy::Native);
+        assert_eq!(loaded.stalled_after_seconds, 120);
+
+        let cfg = broker.config_snapshot().await;
+        assert!(cfg.enabled);
+        assert_eq!(cfg.depth_limit, 4);
+        assert_eq!(
+            cfg.profiles.get(&live.id).map(|p| p.name.as_str()),
+            Some("Live")
+        );
+
+        let live_runtime = runtime.snapshot();
+        assert!(live_runtime.enabled);
+        assert_eq!(live_runtime.route_policy, DelegationRoutePolicy::Native);
+        assert_eq!(live_runtime.stalled_after_seconds, 120);
+
+        let catalog = load_delegation_profile_catalog(&db.conn)
+            .await
+            .expect("catalog");
+        assert!(catalog.delegation_enabled);
+        assert!(
+            catalog.revision > revision_after_settings,
+            "enabled-only write must advance catalog revision, got {} after {}",
+            catalog.revision,
+            revision_after_settings
+        );
+    }
+
+    /// Toggle and profile save must serialize on the same lock order so the
+    /// enabled-only path cannot snapshot stale profiles and write them back
+    /// over a concurrent catalog save.
+    #[tokio::test]
+    async fn concurrent_enabled_toggle_does_not_overwrite_newer_profiles() {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let db = crate::db::init_database(temp.path(), "enabled-profiles-concurrency-test")
+            .await
+            .expect("open pooled WAL database");
+        let broker = make_broker();
+        let runtime = DelegationRuntimeSettings::default();
+        let manager = crate::acp::manager::ConnectionManager::new();
+
+        let (toggle_result, profiles_result) = tokio::join!(
+            set_delegation_enabled_core(
+                &db.conn,
+                &broker,
+                &runtime,
+                &manager,
+                &EventEmitter::Noop,
+                true,
+            ),
+            set_delegation_profiles_core(
+                &db.conn,
+                &broker,
+                DelegationProfileDocument {
+                    profiles: vec![profile("11111111-1111-4111-8111-111111111111", "A")],
+                },
+            ),
+        );
+        toggle_result.expect("toggle");
+        profiles_result.expect("profiles");
+
+        let catalog = load_delegation_profile_catalog(&db.conn)
+            .await
+            .expect("catalog");
+        assert!(catalog.delegation_enabled);
+        assert_eq!(catalog.profiles.len(), 1);
+        assert_eq!(catalog.profiles[0].name, "A");
+
+        let live = broker.config_snapshot().await;
+        assert!(live.enabled);
+        assert_eq!(live.profiles.len(), 1);
+        assert_eq!(
+            live.profiles
+                .get("11111111-1111-4111-8111-111111111111")
+                .map(|p| p.name.as_str()),
+            Some("A")
+        );
+        assert!(runtime.snapshot().enabled);
         drop(temp);
     }
 }

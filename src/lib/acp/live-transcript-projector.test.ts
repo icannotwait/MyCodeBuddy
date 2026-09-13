@@ -483,6 +483,153 @@ describe("live-transcript-projector", () => {
     }
   )
 
+  it("projects a mid-turn steering message as its own user segment", () => {
+    const steerAt = "2026-05-28T00:05:00.000Z"
+    const projection = projectLiveSnapshot(
+      1,
+      "c1",
+      {
+        id: "m",
+        role: "assistant",
+        content: [
+          { type: "text", text: "working" },
+          {
+            type: "steering",
+            id: "note-1",
+            text: "use the other API",
+            createdAt: steerAt,
+          },
+          { type: "text", text: "switched" },
+        ],
+        startedAt: 1,
+      },
+      0
+    )
+    expect(
+      projection.segmentIds.map((id) => projection.segments.get(id)?.type)
+    ).toEqual(["text", "steering", "text"])
+    expect(projection.segments.get(projection.segmentIds[1])).toMatchObject({
+      type: "steering",
+      noteId: "note-1",
+      text: "use the other API",
+      createdAt: steerAt,
+    })
+    expect(liveTranscriptToCanonicalMessage(projection).content).toEqual([
+      { type: "text", text: "working" },
+      {
+        type: "steering",
+        id: "note-1",
+        text: "use the other API",
+        createdAt: steerAt,
+        blocks: null,
+      },
+      { type: "text", text: "switched" },
+    ])
+  })
+
+  it("applies a delivered feedback_submitted event as a steering boundary", () => {
+    const steerAt = "2026-05-28T00:05:00.000Z"
+    const snapshot = liveMessageWithText("working")
+    const events = [
+      envelope(2, "c1", {
+        type: "feedback_submitted",
+        item: {
+          id: "note-1",
+          text: "stop",
+          created_at: steerAt,
+          status: "delivered",
+        },
+      }),
+      envelope(3, "c1", { type: "content_delta", text: " ok" }),
+    ]
+    const canonical = applyEventsToCanonicalLiveMessage(snapshot, events)
+    let projection = projectLiveSnapshot(1, "c1", snapshot, 1)
+    projection = applyLiveTranscriptEvents(projection, events)
+
+    expect(
+      projection.segmentIds.map((id) => projection.segments.get(id)?.type)
+    ).toEqual(["text", "steering", "text"])
+    expect(projection.segments.get(projection.segmentIds[1])).toMatchObject({
+      type: "steering",
+      noteId: "note-1",
+      text: "stop",
+      createdAt: steerAt,
+    })
+    expect(canonical.content.map((block) => block.type)).toEqual([
+      "text",
+      "steering",
+      "text",
+    ])
+    expect(liveTranscriptToCanonicalMessage(projection)).toEqual(canonical)
+  })
+
+  it("does not project a pending pull-channel note as a user turn", () => {
+    let projection = projectLiveSnapshot(
+      1,
+      "c1",
+      liveMessageWithText("working"),
+      1
+    )
+    projection = applyLiveTranscriptEvents(projection, [
+      envelope(2, "c1", {
+        type: "feedback_submitted",
+        item: {
+          id: "note-1",
+          text: "stop",
+          created_at: "2026-05-28T00:05:00.000Z",
+          status: "pending",
+        },
+      }),
+    ])
+    expect(
+      projection.segmentIds.map((id) => projection.segments.get(id)?.type)
+    ).toEqual(["text"])
+  })
+
+  it("round-trips a steered attachment from blocks, not display text", () => {
+    const steerAt = "2026-05-28T00:05:00.000Z"
+    const snapshot: LiveMessage = {
+      id: "msg-1",
+      role: "assistant",
+      content: [
+        { type: "text", text: "look" },
+        {
+          type: "steering",
+          id: "note-1",
+          text: "this colour",
+          createdAt: steerAt,
+          blocks: [
+            { type: "text", text: "this colour" },
+            {
+              type: "image",
+              data: "aGk=",
+              mime_type: "image/png",
+              uri: null,
+            },
+          ],
+        },
+      ],
+      startedAt: 1,
+    }
+    const projection = projectLiveSnapshot(1, "c1", snapshot, 0)
+    const steering = projection.segments.get(projection.segmentIds[1])
+    expect(steering).toMatchObject({
+      type: "steering",
+      noteId: "note-1",
+      text: "this colour",
+      blocks: [
+        { type: "text", text: "this colour" },
+        {
+          type: "image",
+          data: "aGk=",
+          mime_type: "image/png",
+          uri: null,
+        },
+      ],
+    })
+    expect(liveTranscriptToCanonicalMessage(projection)).toEqual(snapshot)
+  })
+
   it("retains original tool fields while projecting native activity alongside", () => {
     let projection = projectLiveSnapshot(
       10,

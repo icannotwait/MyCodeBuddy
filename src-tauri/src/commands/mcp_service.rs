@@ -35,9 +35,11 @@ use crate::acp::delegation::broker::DelegationBroker;
 use crate::acp::delegation::listener::TokenRegistry;
 use crate::acp::delegation::service;
 use crate::acp::feedback::FeedbackRuntimeConfig;
+use crate::acp::manager::ConnectionManager;
 use crate::acp::question::QuestionRuntimeConfig;
 use crate::acp::session_info::SessionInfoRuntimeConfig;
 use crate::app_error::AppCommandError;
+use crate::commands::delegation::DelegationRuntimeSettings;
 use crate::web::event_bridge::EventEmitter;
 
 /// Headline verdict. Ordered by which problem to solve first, not by severity:
@@ -206,6 +208,8 @@ pub async fn codeg_mcp_service_status_core(
 /// event emitter that the read path never touches.
 pub struct CodegMcpToolGroupTargets<'a> {
     pub broker: &'a DelegationBroker,
+    pub runtime: &'a DelegationRuntimeSettings,
+    pub manager: &'a ConnectionManager,
     pub feedback: &'a FeedbackRuntimeConfig,
     pub question: &'a QuestionRuntimeConfig,
     pub session_info: &'a SessionInfoRuntimeConfig,
@@ -239,7 +243,15 @@ pub async fn set_codeg_mcp_tool_group_core(
 
     match key {
         "delegation" => {
-            delegation::set_delegation_enabled_core(conn, targets.broker, emitter, enabled).await?;
+            delegation::set_delegation_enabled_core(
+                conn,
+                targets.broker,
+                targets.runtime,
+                targets.manager,
+                emitter,
+                enabled,
+            )
+            .await?;
         }
         "feedback" => {
             feedback::set_feedback_settings_core(
@@ -345,7 +357,7 @@ pub async fn start_codeg_mcp_service() -> Result<(), AppCommandError> {
     start_codeg_mcp_service_core().await
 }
 
-// Five runtime configs plus the db, the app handle and the two payload fields.
+// Seven runtime configs plus the db, the app handle and the two payload fields.
 // Tauri injects managed state positionally, so these cannot be bundled the way
 // `CodegMcpToolGroupTargets` bundles them for the `_core` helper below.
 #[allow(clippy::too_many_arguments)]
@@ -354,6 +366,8 @@ pub async fn set_codeg_mcp_tool_group(
     #[cfg(feature = "tauri-runtime")] app: tauri::AppHandle,
     #[cfg(feature = "tauri-runtime")] db: tauri::State<'_, crate::db::AppDatabase>,
     #[cfg(feature = "tauri-runtime")] broker: tauri::State<'_, Arc<DelegationBroker>>,
+    #[cfg(feature = "tauri-runtime")] runtime: tauri::State<'_, DelegationRuntimeSettings>,
+    #[cfg(feature = "tauri-runtime")] manager: tauri::State<'_, ConnectionManager>,
     #[cfg(feature = "tauri-runtime")] feedback: tauri::State<'_, FeedbackRuntimeConfig>,
     #[cfg(feature = "tauri-runtime")] question: tauri::State<'_, QuestionRuntimeConfig>,
     #[cfg(feature = "tauri-runtime")] session_info: tauri::State<'_, SessionInfoRuntimeConfig>,
@@ -370,6 +384,8 @@ pub async fn set_codeg_mcp_tool_group(
             &db.conn,
             CodegMcpToolGroupTargets {
                 broker: broker.inner(),
+                runtime: runtime.inner(),
+                manager: manager.inner(),
                 feedback: feedback.inner(),
                 question: question.inner(),
                 session_info: session_info.inner(),
@@ -412,6 +428,8 @@ mod tests {
     struct Fixture {
         broker: Arc<DelegationBroker>,
         tokens: Arc<TokenRegistry>,
+        runtime: DelegationRuntimeSettings,
+        manager: ConnectionManager,
         feedback: FeedbackRuntimeConfig,
         question: QuestionRuntimeConfig,
         session_info: SessionInfoRuntimeConfig,
@@ -426,6 +444,8 @@ mod tests {
                     Arc::new(NoParent) as Arc<dyn ConversationDepthLookup>,
                 )),
                 tokens: Arc::new(TokenRegistry::default()),
+                runtime: DelegationRuntimeSettings::default(),
+                manager: ConnectionManager::new(),
                 feedback: FeedbackRuntimeConfig::new(),
                 question: QuestionRuntimeConfig::new(),
                 session_info: SessionInfoRuntimeConfig::new(),
@@ -458,6 +478,8 @@ mod tests {
                 conn,
                 CodegMcpToolGroupTargets {
                     broker: &self.broker,
+                    runtime: &self.runtime,
+                    manager: &self.manager,
                     feedback: &self.feedback,
                     question: &self.question,
                     session_info: &self.session_info,
@@ -562,6 +584,10 @@ mod tests {
         assert_eq!(saved.depth_limit, 4, "the depth limit must survive it");
         // The broker is re-applied too, so the very next status read agrees.
         assert!(f.broker.config_snapshot().await.enabled);
+        assert!(
+            f.runtime.snapshot().enabled,
+            "status-bar toggle must update the shared runtime watch"
+        );
     }
 
     /// `automations` and `taskboard` share one settings record, so each must

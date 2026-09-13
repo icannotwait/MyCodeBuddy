@@ -20,6 +20,8 @@ import {
 import { GeneratedImagesBlock } from "@/components/message/generated-images-block"
 import { PlanCard } from "@/components/message/plan-card"
 import { StreamingMarkdownDocument } from "@/components/message/streaming-markdown-document"
+import { CollapsibleUserMessage } from "@/components/message/collapsible-user-message"
+import { UserImageAttachments } from "@/components/message/user-image-attachments"
 import {
   Collapsible,
   CollapsibleContent,
@@ -42,11 +44,12 @@ import {
   inferLiveToolName,
   normalizeToolName,
 } from "@/lib/tool-call-normalization"
-import type { AgentType, ToolCallStatus } from "@/lib/types"
+import type { AgentType, ContentBlock, ToolCallStatus } from "@/lib/types"
 import { cn } from "@/lib/utils"
 import { ChevronRightIcon } from "lucide-react"
 import { useTranslations } from "next-intl"
 import { useMessageScroll } from "@/components/message/message-scroll-context"
+import type { LiveTranscriptSegment } from "@/lib/acp/live-transcript-projector"
 import {
   getToolJoinedOutput,
   liveTranscriptStore,
@@ -502,14 +505,96 @@ const LiveTranscriptSegmentView = memo(function LiveTranscriptSegmentView({
           toolCallId={segment.toolCallId}
         />
       )
+    case "steering":
+      return <LiveSteeringSegment segment={segment} />
     default:
       return null
   }
 })
 
+function steeringAdaptedParts(
+  blocks: ContentBlock[] | null | undefined,
+  text: string
+): { parts: AdaptedContentPart[]; images: UserImageDisplay[] } {
+  const source =
+    blocks && blocks.length > 0 ? blocks : [{ type: "text" as const, text }]
+  const parts: AdaptedContentPart[] = []
+  const images: UserImageDisplay[] = []
+  for (const block of source) {
+    if (block.type === "text") {
+      if (block.text.length > 0) parts.push({ type: "text", text: block.text })
+      continue
+    }
+    if (block.type === "image" && block.data && block.mime_type) {
+      images.push({
+        name: block.uri?.trim() ? block.uri : "image",
+        data: block.data,
+        mime_type: block.mime_type,
+        uri: block.uri,
+      })
+    }
+  }
+  if (parts.length === 0 && images.length === 0 && text.length > 0) {
+    parts.push({ type: "text", text })
+  }
+  return { parts, images }
+}
+
+const LiveSteeringSegment = memo(function LiveSteeringSegment({
+  segment,
+}: {
+  segment: Extract<LiveTranscriptSegment, { type: "steering" }>
+}) {
+  const { parts, images } = steeringAdaptedParts(segment.blocks, segment.text)
+  return (
+    <div
+      data-testid="live-steering-message"
+      className="flex w-fit ml-auto max-w-full flex-col items-end gap-1"
+    >
+      {images.length > 0 ? (
+        <UserImageAttachments images={images} className="self-end" />
+      ) : null}
+      {parts.length > 0 ? <CollapsibleUserMessage parts={parts} /> : null}
+    </div>
+  )
+})
+
 export type LiveFooterItem =
   | { kind: "segment"; segmentId: string }
   | { kind: "group"; groupId: string }
+
+type LiveFooterRun =
+  | { role: "assistant"; items: LiveFooterItem[] }
+  | { role: "user"; segmentId: string }
+
+function groupLiveFooterRuns(
+  conversationId: number,
+  items: LiveFooterItem[]
+): LiveFooterRun[] {
+  const runs: LiveFooterRun[] = []
+  let assistant: LiveFooterItem[] = []
+  const flushAssistant = () => {
+    if (assistant.length === 0) return
+    runs.push({ role: "assistant", items: assistant })
+    assistant = []
+  }
+  for (const item of items) {
+    if (item.kind === "segment") {
+      const segment = liveTranscriptStore.getSegment(
+        conversationId,
+        item.segmentId
+      )
+      if (segment?.type === "steering") {
+        flushAssistant()
+        runs.push({ role: "user", segmentId: item.segmentId })
+        continue
+      }
+    }
+    assistant.push(item)
+  }
+  flushAssistant()
+  return runs
+}
 
 /**
  * Collect live delegate/continue tools and merge with historical exact-run
@@ -673,32 +758,59 @@ export const LiveTranscriptRow = memo(function LiveTranscriptRow({
 
   if (items.length === 0) return null
 
+  const runs = groupLiveFooterRuns(conversationId, items)
+
   return (
-    <Message from="assistant" data-testid="live-transcript-row">
-      <MessageContent>
-        <div className="space-y-4">
-          {items.map((item) =>
-            item.kind === "group" ? (
-              <LiveToolGroupCard
-                key={item.groupId}
-                conversationId={conversationId}
-                parentConversationId={parentConversationId}
-                groupId={item.groupId}
-                onToolRender={onToolRender}
-              />
-            ) : (
+    <div className="space-y-4" data-testid="live-transcript-row">
+      {runs.map((run) =>
+        run.role === "user" ? (
+          <Message key={run.segmentId} from="user">
+            <MessageContent>
               <LiveTranscriptSegmentView
-                key={item.segmentId}
                 conversationId={conversationId}
                 parentConversationId={parentConversationId}
-                segmentId={item.segmentId}
+                segmentId={run.segmentId}
                 agentType={agentType}
                 onToolRender={onToolRender}
               />
-            )
-          )}
-        </div>
-      </MessageContent>
-    </Message>
+            </MessageContent>
+          </Message>
+        ) : (
+          <Message
+            key={
+              run.items[0]?.kind === "group"
+                ? `assistant-${run.items[0].groupId}`
+                : `assistant-${run.items[0]?.segmentId}`
+            }
+            from="assistant"
+          >
+            <MessageContent>
+              <div className="space-y-4">
+                {run.items.map((item) =>
+                  item.kind === "group" ? (
+                    <LiveToolGroupCard
+                      key={item.groupId}
+                      conversationId={conversationId}
+                      parentConversationId={parentConversationId}
+                      groupId={item.groupId}
+                      onToolRender={onToolRender}
+                    />
+                  ) : (
+                    <LiveTranscriptSegmentView
+                      key={item.segmentId}
+                      conversationId={conversationId}
+                      parentConversationId={parentConversationId}
+                      segmentId={item.segmentId}
+                      agentType={agentType}
+                      onToolRender={onToolRender}
+                    />
+                  )
+                )}
+              </div>
+            </MessageContent>
+          </Message>
+        )
+      )}
+    </div>
   )
 })

@@ -5974,7 +5974,8 @@ export function selectTranscriptApplyEvents(
       event.type === "tool_call" ||
       event.type === "tool_call_update" ||
       event.type === "plan_update" ||
-      event.type === "turn_attempt_rollback"
+      event.type === "turn_attempt_rollback" ||
+      event.type === "feedback_submitted"
     ) {
       if (status === "prompting") out.push(event)
       continue

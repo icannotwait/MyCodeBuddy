@@ -56,7 +56,12 @@ vi.mock("./content-parts-renderer", () => ({
     parts,
     parentConversationId,
   }: {
-    parts: Array<{ type: string; toolName?: string; toolCallId?: string }>
+    parts: Array<{
+      type: string
+      text?: string
+      toolName?: string
+      toolCallId?: string
+    }>
     parentConversationId?: number | null
   }) => (
     <div
@@ -70,7 +75,7 @@ vi.mock("./content-parts-renderer", () => ({
           data-tool-id={p.toolCallId}
           data-testid={p.toolCallId ? `tool-part-${p.toolCallId}` : undefined}
         >
-          {p.toolName ?? p.type}
+          {p.toolName ?? p.text ?? p.type}
         </div>
       ))}
     </div>
@@ -540,6 +545,36 @@ describe("LiveTranscriptRow", () => {
     renderRow()
     expect(screen.getByTestId("live-transcript-row")).toBeInTheDocument()
     expect(screen.getByTestId("message-response")).toHaveTextContent("hello")
+  })
+
+  it("renders a steering segment as a user message between assistant bubbles", () => {
+    liveTranscriptStore.rebuild(
+      CID,
+      "c1",
+      {
+        id: "steer-live",
+        role: "assistant",
+        content: [
+          { type: "text", text: "working on it" },
+          {
+            type: "steering",
+            id: "n1",
+            text: "use the other API",
+            createdAt: "2026-05-28T00:05:00.000Z",
+          },
+          { type: "text", text: "switched" },
+        ],
+        startedAt: 1,
+      },
+      3
+    )
+    renderRow()
+    expect(screen.getByTestId("live-steering-message")).toHaveTextContent(
+      "use the other API"
+    )
+    expect(
+      screen.getAllByTestId("message").map((node) => node.getAttribute("from"))
+    ).toEqual(["assistant", "user", "assistant"])
   })
 
   it("scopes only Grok live text and excludes tool segments", () => {
