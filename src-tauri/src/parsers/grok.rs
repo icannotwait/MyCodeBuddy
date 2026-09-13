@@ -169,7 +169,8 @@ pub fn resolve_grok_context_window_max_tokens(
 ///         └── <session-uuid>/        # UUIDv7
 ///             ├── summary.json       # metadata index (see below)
 ///             ├── updates.jsonl      # ACP session/update stream — the conversation
-///             ├── chat_history.jsonl # raw model messages (not read here)
+///             ├── chat_history.jsonl # raw model messages (ask answers + trailing
+///             │                      # assistant text after extension turn_completed)
 ///             ├── plan.json          # TODO state
 ///             └── terminal/<id>.log  # full background-command output
 /// ```
@@ -290,6 +291,12 @@ impl GrokParser {
         // transcript, which DOES record the answer as a `tool_result`) and inject
         // them as the tool output. No-op when the file is absent or there's no ask.
         inject_grok_ask_answers(&mut parsed.turns, &session_dir.join("chat_history.jsonl"));
+        // Grok often emits `_x.ai/session/update` `turn_completed` before the
+        // final assistant summary is forwarded as an ACP `agent_message_chunk`.
+        // The model-facing `chat_history.jsonl` still has that trailing text;
+        // fold it into the last assistant turn so a post-turn hydrate is not
+        // stuck on the mid-turn stub ("正在核对…") under 「工作已结束」.
+        inject_grok_trailing_assistant(&mut parsed.turns, &session_dir.join("chat_history.jsonl"));
 
         // Fill assistant turns that carried no in-stream `modelId` with the
         // session model (summary `current_model_id`, else the first in-stream
@@ -1711,6 +1718,109 @@ fn grok_history_answer_to_envelope(content: &str) -> Option<Value> {
         return None;
     }
     Some(serde_json::json!({ "answers": answers, "declined": false }))
+}
+
+/// Fold the last post-tool assistant text from `chat_history.jsonl` into the
+/// last parsed assistant turn when `updates.jsonl` stopped at the mid-turn
+/// stub. Grok's extension `turn_completed` closes the ACP turn before that
+/// summary is written as `agent_message_chunk`.
+fn inject_grok_trailing_assistant(turns: &mut [MessageTurn], chat_history: &Path) {
+    let Some(last) = turns
+        .iter_mut()
+        .rev()
+        .find(|turn| matches!(turn.role, TurnRole::Assistant))
+    else {
+        return;
+    };
+    let Some(trailing) = read_grok_trailing_assistant_text(chat_history) else {
+        return;
+    };
+    let parsed = assistant_visible_text(last);
+    if trailing.is_empty() || trailing == parsed || parsed.contains(&trailing) {
+        return;
+    }
+    if !parsed.is_empty() && trailing.starts_with(&parsed) {
+        let rest = trailing[parsed.len()..].trim_start();
+        if !rest.is_empty() {
+            append_text(last, rest.to_string());
+        }
+        return;
+    }
+    append_text(last, trailing);
+}
+
+fn assistant_visible_text(turn: &MessageTurn) -> String {
+    turn.blocks
+        .iter()
+        .filter_map(|block| match block {
+            ContentBlock::Text { text } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("")
+}
+
+fn grok_history_assistant_text(value: &Value) -> String {
+    match value.get("content") {
+        Some(Value::String(text)) => text.clone(),
+        Some(Value::Array(parts)) => parts
+            .iter()
+            .filter_map(|part| {
+                part.as_str().map(str::to_string).or_else(|| {
+                    if part.get("type").and_then(Value::as_str) == Some("text") {
+                        part.get("text").and_then(Value::as_str).map(str::to_string)
+                    } else {
+                        None
+                    }
+                })
+            })
+            .collect::<Vec<_>>()
+            .join(""),
+        _ => String::new(),
+    }
+}
+
+/// Last assistant `content` that appears after a tool in the current user
+/// turn. That is the final summary Grok writes to `chat_history.jsonl` after
+/// `turn_completed` has already closed `updates.jsonl`.
+fn read_grok_trailing_assistant_text(chat_history: &Path) -> Option<String> {
+    let file = fs::File::open(chat_history).ok()?;
+    let mut last_after_tool: Option<String> = None;
+    let mut saw_tool_in_turn = false;
+    for line in BufReader::new(file).lines() {
+        let Ok(line) = line else { continue };
+        if line.trim().is_empty() {
+            continue;
+        }
+        let Ok(value) = serde_json::from_str::<Value>(&line) else {
+            continue;
+        };
+        let Some(kind) = value.get("type").and_then(Value::as_str) else {
+            continue;
+        };
+        match kind {
+            "user" => {
+                saw_tool_in_turn = false;
+                last_after_tool = None;
+            }
+            "tool_result" => saw_tool_in_turn = true,
+            "assistant" => {
+                if value
+                    .get("tool_calls")
+                    .and_then(Value::as_array)
+                    .is_some_and(|calls| !calls.is_empty())
+                {
+                    saw_tool_in_turn = true;
+                }
+                let text = grok_history_assistant_text(&value);
+                if saw_tool_in_turn && !text.trim().is_empty() {
+                    last_after_tool = Some(text);
+                }
+            }
+            _ => {}
+        }
+    }
+    last_after_tool.filter(|text| !text.trim().is_empty())
 }
 
 fn str_field(v: &Value, key: &str) -> String {
@@ -4183,5 +4293,61 @@ earlier terminal context records.\n\
         let (_tmp, sessions) = fixture(SUMMARY, ASK_UPDATES);
         let detail = ask_detail(sessions);
         assert!(ask_result_output(&detail).is_none());
+    }
+
+    const TRAILING_UPDATES: &str = concat!(
+        r#"{"method":"session/update","params":{"sessionId":"s","update":{"sessionUpdate":"user_message_chunk","content":{"type":"text","text":"全部做完了吗"},"_meta":{"promptIndex":0}}},"timestamp":1783584020}"#,
+        "\n",
+        r#"{"method":"session/update","params":{"sessionId":"s","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"正在核对计划任务、PR 状态和工作树，确认是否还有未完成项。"}}},"timestamp":1783584021}"#,
+        "\n",
+        r#"{"method":"session/update","params":{"sessionId":"s","update":{"sessionUpdate":"tool_call","toolCallId":"call-1","title":"run_terminal_command","rawInput":{"command":"git status"},"_meta":{"x.ai/tool":{"name":"run_terminal_command","kind":"execute"}}}},"timestamp":1783584022}"#,
+        "\n",
+        r#"{"method":"session/update","params":{"sessionId":"s","update":{"sessionUpdate":"tool_call_update","toolCallId":"call-1","status":"completed","content":[{"type":"content","content":{"type":"text","text":"ok"}}]}},"timestamp":1783584023}"#,
+        "\n",
+        r#"{"method":"session/update","params":{"sessionId":"s","update":{"sessionUpdate":"turn_completed","prompt_id":"p0","stop_reason":"end_turn"}},"timestamp":1783584024}"#,
+        "\n",
+    );
+
+    #[test]
+    fn injects_trailing_assistant_from_chat_history_after_tool_turn() {
+        let (_tmp, sessions) = fixture(SUMMARY, TRAILING_UPDATES);
+        write(
+            &ask_session_dir(&sessions),
+            "chat_history.jsonl",
+            concat!(
+                r#"{"type":"user","content":"全部做完了吗"}"#,
+                "\n",
+                r#"{"type":"assistant","content":"正在核对计划任务、PR 状态和工作树，确认是否还有未完成项。","tool_calls":[{"id":"call-1","name":"run_terminal_command","arguments":"{}"}]}"#,
+                "\n",
+                r#"{"type":"tool_result","tool_call_id":"call-1","content":"ok"}"#,
+                "\n",
+                r#"{"type":"assistant","content":"22 个任务都做完了。PR #18 仍未合并。"}"#,
+                "\n",
+            ),
+        );
+        let detail = ask_detail(sessions);
+        let assistant = detail
+            .turns
+            .iter()
+            .rev()
+            .find(|turn| matches!(turn.role, TurnRole::Assistant))
+            .expect("assistant turn");
+        let text = assistant
+            .blocks
+            .iter()
+            .filter_map(|block| match block {
+                ContentBlock::Text { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("");
+        assert!(
+            text.contains("正在核对计划任务"),
+            "mid-turn stub must remain: {text}"
+        );
+        assert!(
+            text.contains("22 个任务都做完了"),
+            "chat_history final summary must be hydrated: {text}"
+        );
     }
 }

@@ -189,6 +189,7 @@ import type {
   SharedActiveTurn,
   SharedQueuedPrompt,
   SharedSessionPhaseView,
+  SnapshotPatch,
 } from "@/lib/snapshot-denormalize"
 import {
   adoptUnknownAsyncTasks,
@@ -5536,6 +5537,55 @@ function settleIdleLiveRuntimes(connection: ConnectionState): void {
   }
 }
 
+/**
+ * Runtimes that still hold an in-flight live bubble after a new ACP
+ * connection hydrates. Cursor has no BackgroundActivity revision, so cold
+ * reconnect must find these explicitly — Grok's snapshot revision gate
+ * already covers the same leftover via refetchDetail.
+ */
+function leftoverLiveRuntimeConversationIds(
+  connection: ConnectionState,
+  sessionId: string | null
+): number[] {
+  const ids: number[] = []
+  for (const [
+    runtimeConversationId,
+    runtime,
+  ] of useConversationRuntimeStore.getState().byConversationId) {
+    if (runtime.liveMessage == null) continue
+    if (!mappedRuntimeOwnsConnection(runtime, connection, sessionId)) continue
+    ids.push(runtimeConversationId)
+  }
+  return ids
+}
+
+function resolveBackgroundHydrateConversationId(
+  patch: SnapshotPatch
+): number | null {
+  return (
+    (patch.sessionId
+      ? getConversationIdByExternalIdFromStore(patch.sessionId)
+      : null) ?? patch.conversationId
+  )
+}
+
+function leftoverLiveRuntimeIdsForHydrate(
+  connection: ConnectionState | undefined,
+  patch: SnapshotPatch
+): number[] {
+  const sessionId = patch.sessionId ?? connection?.sessionId ?? null
+  const conversationId =
+    patch.conversationId ?? connection?.conversationId ?? null
+  if (connection == null && sessionId == null && conversationId == null) {
+    return []
+  }
+  const probe = {
+    conversationId,
+    sessionId,
+  } as ConnectionState
+  return leftoverLiveRuntimeConversationIds(probe, sessionId)
+}
+
 function admitTurnComplete(
   snapshot: ConnectionState,
   event: TurnCompleteEnvelope,
@@ -8401,6 +8451,73 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
   //     consumer doesn't have to think about transient disconnects
   //   - connection_gone: terminal; clean up store entry and let the next
   //     user interaction surface the failure
+  const recoverAfterSnapshotHydrate = useCallback(
+    (
+      contextKey: string,
+      patch: SnapshotPatch,
+      options: {
+        isInitialColdHydrate: boolean
+        recoverBackgroundDetail: boolean
+        resetBackgroundTranscript: boolean
+        leftoverRuntimeIds: readonly number[]
+      }
+    ) => {
+      const applied = storeRef.current.connections.get(contextKey)
+      const leftoverIds = options.leftoverRuntimeIds
+      const shouldRecoverBackground =
+        options.recoverBackgroundDetail || options.resetBackgroundTranscript
+      const shouldRefetch =
+        shouldRecoverBackground ||
+        (options.isInitialColdHydrate && leftoverIds.length > 0)
+      if (!shouldRefetch && leftoverIds.length === 0) return
+
+      const refetchIds = new Set<number>(
+        options.isInitialColdHydrate ? leftoverIds : []
+      )
+      if (shouldRecoverBackground) {
+        const backgroundId = resolveBackgroundHydrateConversationId(patch)
+        if (backgroundId != null) refetchIds.add(backgroundId)
+      }
+
+      if (shouldRefetch && refetchIds.size > 0) {
+        const runtimeActions = useConversationRuntimeStore.getState().actions
+        if (options.resetBackgroundTranscript) {
+          for (const runtimeConversationId of refetchIds) {
+            runtimeActions.applyBackgroundActivity(
+              runtimeConversationId,
+              [],
+              0,
+              true
+            )
+          }
+        }
+        for (const runtimeConversationId of refetchIds) {
+          runtimeActions.refetchDetail(runtimeConversationId, {
+            preserveLive: true,
+          })
+        }
+      }
+
+      // Cursor session/load can land Prompting with no live turn after a
+      // completed end_turn. Flip to connected so PR #16/#17 leftover-live
+      // settle (and the composer) can run. Skip when the snapshot still
+      // carries an in-flight assistant — that is a real mid-turn reconnect.
+      if (
+        options.isInitialColdHydrate &&
+        leftoverIds.length > 0 &&
+        applied?.status === "prompting" &&
+        applied.liveMessage == null
+      ) {
+        dispatch({
+          type: "STATUS_CHANGED",
+          contextKey,
+          status: "connected",
+        })
+      }
+    },
+    [dispatch]
+  )
+
   const setupAttachSubscription = useCallback(
     (
       contextKey: string,
@@ -8415,6 +8532,7 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
       let activeSub: EventStreamSubscription | null = null
       let lastBackgroundDetailRevision = 0
       let lastBackgroundTranscriptGeneration = 0
+      let hasAppliedSnapshot = false
       const handlers: AttachHandlers = {
         onSnapshot: (snapshot) => {
           const record = attachRetryRef.current.get(contextKey)
@@ -8434,6 +8552,14 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
             lastBackgroundTranscriptGeneration,
             transcriptGeneration
           )
+          const isInitialColdHydrate =
+            !hasAppliedSnapshot &&
+            (reconnectMode === "cold" || sinceSeq === undefined)
+          hasAppliedSnapshot = true
+          const leftoverRuntimeIds = leftoverLiveRuntimeIdsForHydrate(
+            storeRef.current.connections.get(contextKey),
+            patch
+          )
           dispatch({ type: "HYDRATE_FROM_SNAPSHOT", contextKey, patch })
           surfaceSnapshotErrorDetailsRef.current(contextKey, patch)
           lastActivityRef.current.set(contextKey, Date.now())
@@ -8449,27 +8575,12 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
               ? applied.lastAppliedSeq
               : patch.eventSeq
           eventIngestorRef.current?.resumeConnection(connectionId, resumeSeq)
-          if (recoverBackgroundDetail || resetBackgroundTranscript) {
-            const runtimeConversationId =
-              (patch.sessionId
-                ? getConversationIdByExternalIdFromStore(patch.sessionId)
-                : null) ?? patch.conversationId
-            if (runtimeConversationId != null) {
-              const runtimeActions =
-                useConversationRuntimeStore.getState().actions
-              if (resetBackgroundTranscript) {
-                runtimeActions.applyBackgroundActivity(
-                  runtimeConversationId,
-                  [],
-                  0,
-                  true
-                )
-              }
-              runtimeActions.refetchDetail(runtimeConversationId, {
-                preserveLive: true,
-              })
-            }
-          }
+          recoverAfterSnapshotHydrate(contextKey, patch, {
+            isInitialColdHydrate,
+            recoverBackgroundDetail,
+            resetBackgroundTranscript,
+            leftoverRuntimeIds,
+          })
         },
         onReplay: (events, _highWaterSeq, resumedFromSeq) => {
           // Catching up on a gap (reconnect / lagged detach) re-delivers events
@@ -8622,6 +8733,7 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
       clearAliasesPointingTo,
       dispatch,
       pushMappedEvents,
+      recoverAfterSnapshotHydrate,
       seedDelegationsFromSnapshot,
     ]
   )
@@ -9697,6 +9809,10 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
         return false
       }
       if (patch) {
+        const leftoverRuntimeIds = leftoverLiveRuntimeIdsForHydrate(
+          storeRef.current.connections.get(connectionId),
+          patch
+        )
         dispatch({
           type: "HYDRATE_FROM_SNAPSHOT",
           contextKey: connectionId,
@@ -9707,6 +9823,13 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
           patch.activeDelegations,
           patch.eventSeq
         )
+        recoverAfterSnapshotHydrate(connectionId, patch, {
+          isInitialColdHydrate: true,
+          recoverBackgroundDetail: (patch.backgroundDetailRevision ?? 0) > 0,
+          resetBackgroundTranscript:
+            (patch.backgroundTranscriptGeneration ?? 0) > 0,
+          leftoverRuntimeIds,
+        })
       }
       reverseMapRef.current.set(connectionId, connectionId)
       for (const env of consumeBufferedEvents(connectionId)) {
@@ -9719,6 +9842,7 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
       bindObserverAlias,
       consumeBufferedEvents,
       dispatch,
+      recoverAfterSnapshotHydrate,
       releaseObserverAlias,
       seedDelegationsFromSnapshot,
       setupAttachSubscription,
@@ -10600,6 +10724,10 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
           }
 
           if (snapshotPatch) {
+            const leftoverRuntimeIds = leftoverLiveRuntimeIdsForHydrate(
+              storeRef.current.connections.get(contextKey),
+              snapshotPatch
+            )
             dispatch({
               type: "HYDRATE_FROM_SNAPSHOT",
               contextKey,
@@ -10615,6 +10743,14 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
               snapshotPatch.activeDelegations,
               snapshotPatch.eventSeq
             )
+            recoverAfterSnapshotHydrate(contextKey, snapshotPatch, {
+              isInitialColdHydrate: true,
+              recoverBackgroundDetail:
+                (snapshotPatch.backgroundDetailRevision ?? 0) > 0,
+              resetBackgroundTranscript:
+                (snapshotPatch.backgroundTranscriptGeneration ?? 0) > 0,
+              leftoverRuntimeIds,
+            })
           }
 
           reverseMapRef.current.set(connectionId, contextKey)
@@ -10723,6 +10859,7 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
       isConnectionReferencedLocally,
       localOwnerKeyOf,
       markConnectionGone,
+      recoverAfterSnapshotHydrate,
       releaseObserverAlias,
       resolveConnectBlockState,
       seedDelegationsFromSnapshot,
