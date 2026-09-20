@@ -4674,7 +4674,9 @@ fn compute_etag(content: &[u8], metadata: &std::fs::Metadata) -> String {
 ///
 /// This is the *strict* rule, reserved for surfaces where the path comes from
 /// something other than a user clicking a row in the file tree — HTML preview
-/// sub-resources and the `codeg-doc:` guest.
+/// sub-resources and the `codeg-doc:` guest. Desktop-only: the only caller is
+/// `browser::doc_guest`, which is `tauri-runtime`.
+#[cfg(feature = "tauri-runtime")]
 pub(crate) fn is_within_workspace(canonical_root: &Path, canonical_target: &Path) -> bool {
     canonical_target.starts_with(canonical_root)
         || crate::folder_links::is_allowed(canonical_root, canonical_target)

@@ -90,6 +90,10 @@ jobs:
   rust:
     name: Rust ${{ matrix.mode }} on ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
+    env:
+      # Ubuntu desktop links the full Tauri + integration-test graph. Parallel
+      # rustc on the 7 GiB runner SIGTERMs (exit 143) after the 0.31.0 merge.
+      CARGO_BUILD_JOBS: ${{ (matrix.os == 'ubuntu-22.04' && matrix.mode == 'desktop') && '1' || '4' }}
     strategy:
       fail-fast: false
       matrix:
