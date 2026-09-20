@@ -548,6 +548,7 @@ mod tests {
             agent_type: Set("deepseek".to_string()),
             registry_id: Set("deepseek".to_string()),
             enabled: Set(true),
+            show_thinking: Set(false),
             sort_order: Set(3),
             installed_version: Set(Some("1.2.3-local".to_string())),
             env_json: Set(Some("{\"FOO\":\"bar\"}".to_string())),

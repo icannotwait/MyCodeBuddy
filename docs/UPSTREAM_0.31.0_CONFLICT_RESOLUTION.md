@@ -185,3 +185,5 @@ cargo test --no-default-features --features server --bin codeg-server --lib
 | `prepareEventEnvelope` 把 streaming 变体拓宽成整份 `EventEnvelope` | 改成 generic `<T extends EventEnvelope>`；flush 窗口里用 `content_delta \| thinking` type guard，再读 `parent_tool_use_id`。 |
 | `browserTabRecord` 缺 fork 的 `hasLoadedSuccessfully` | 冷开 browser tab 写 `false`（与 file-tab 工厂一致）。`BrowserWorkspaceTab` 继承 `FileWorkspaceTabBase`。 |
 | `patchFileTabRef` 对 union `FileWorkspaceTab` 做 `{...tab,...patch}` | `applyFileTabPatch` 保 discriminant；patch 只叠共享字段。 |
+| `antigravity_launch_env` 丢了上游 `scratch` 第二参 | 签名接 `Option<&Path>`，login spawn 传 `scratch.path()`；settings 测试传 `None`。 |
+| fixture 缺 `show_thinking` / `recommended_value` | 测试构造补字段；`OpenCodeParser` 从 `super` 再 import。 |

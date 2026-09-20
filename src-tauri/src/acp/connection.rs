@@ -809,7 +809,13 @@ pub fn sync_antigravity_settings_for_env(
 /// Deliberately does NOT run [`sync_antigravity_settings_file`]: this returns a
 /// value and that writes a file, and the sign-in path wants the report rather
 /// than a silently dropped one. Callers run the sync themselves.
-pub fn antigravity_launch_env(runtime_env: &BTreeMap<String, String>) -> Vec<(String, String)> {
+///
+/// `scratch` is `None` for the settings panel, which builds this env to INSPECT
+/// it and spawns nothing; the sign-in/sign-out path passes its own directory.
+pub fn antigravity_launch_env(
+    runtime_env: &BTreeMap<String, String>,
+    scratch: Option<&Path>,
+) -> Vec<(String, String)> {
     let registry_env: &[(&'static str, &'static str)] =
         match registry::get_agent_meta(AgentType::Antigravity).distribution {
             AgentDistribution::Binary { env, .. } => env,
@@ -818,7 +824,7 @@ pub fn antigravity_launch_env(runtime_env: &BTreeMap<String, String>) -> Vec<(St
             // `runtime_env` carries everything the panel owns.
             _ => &[],
         };
-    let mut merged = merge_agent_env(registry_env, runtime_env, None);
+    let mut merged = merge_agent_env(registry_env, runtime_env, scratch);
     apply_antigravity_env_policy(&mut merged, runtime_env);
     merged
 }
@@ -30345,6 +30351,7 @@ mod tests {
                 options: Vec::new(),
                 groups: Vec::new(),
             }),
+            recommended_value: None,
         };
 
         // The model comes from the `model` selector, not from whichever
@@ -30388,6 +30395,7 @@ mod tests {
                     options: Vec::new(),
                     groups: Vec::new(),
                 }),
+                recommended_value: None,
             },
             SessionConfigOptionInfo {
                 id: "auto_approve".to_string(),
@@ -30397,6 +30405,7 @@ mod tests {
                 kind: SessionConfigKindInfo::Boolean(SessionConfigBooleanInfo {
                     current_value: true,
                 }),
+                recommended_value: None,
             },
         ];
 
@@ -31141,6 +31150,7 @@ mod tests {
                 ],
                 groups: Vec::new(),
             }),
+            recommended_value: None,
         }]
     }
 

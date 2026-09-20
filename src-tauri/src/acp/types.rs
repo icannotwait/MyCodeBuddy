@@ -1727,6 +1727,7 @@ mod envelope_tests {
             kind: SessionConfigKindInfo::Boolean(SessionConfigBooleanInfo {
                 current_value: true,
             }),
+            recommended_value: None,
         };
 
         assert_eq!(

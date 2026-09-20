@@ -1785,8 +1785,9 @@ async fn batch_load_subagent_tool_calls(
 
 #[cfg(test)]
 mod tests {
-    use super::{extract_opencode_file_image, resolve_xdg_data_home};
+    use super::{extract_opencode_file_image, resolve_xdg_data_home, OpenCodeParser};
     use crate::models::ContentBlock;
+    use crate::parsers::AgentParser;
     use std::path::PathBuf;
 
     #[test]

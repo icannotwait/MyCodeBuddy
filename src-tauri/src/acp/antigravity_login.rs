@@ -762,7 +762,10 @@ async fn spawn_agent(
     // because neither emits the `[ACP] spawning connection` line the user
     // counted — the directories were there all the same.
     let scratch = crate::acp::scratch_dir::create();
-    let mut env = crate::acp::connection::antigravity_launch_env(runtime_env);
+    let mut env = crate::acp::connection::antigravity_launch_env(
+        runtime_env,
+        scratch.as_ref().map(|s| s.path()),
+    );
     env.extend(extra_env);
 
     let mut command = crate::process::tokio_command(&binary);

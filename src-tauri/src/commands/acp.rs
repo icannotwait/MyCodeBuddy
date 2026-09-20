@@ -19070,6 +19070,7 @@ model = "gpt"
             agent_type: "cline".to_string(),
             registry_id: "cline".to_string(),
             enabled: true,
+            show_thinking: false,
             sort_order: 0,
             installed_version: None,
             env_json: Some(serde_json::json!({ "CLINE_PROVIDER": "cline-pass" }).to_string()),
