@@ -4668,6 +4668,18 @@ fn compute_etag(content: &[u8], metadata: &std::fs::Metadata) -> String {
     format!("{:016x}", hasher.finish())
 }
 
+/// Whether `canonical_target` may be touched by a workspace operation rooted at
+/// `canonical_root`: either it is inside the root, or it is inside a directory
+/// the user explicitly linked into that root (see [`crate::folder_links`]).
+///
+/// This is the *strict* rule, reserved for surfaces where the path comes from
+/// something other than a user clicking a row in the file tree — HTML preview
+/// sub-resources and the `codeg-doc:` guest.
+pub(crate) fn is_within_workspace(canonical_root: &Path, canonical_target: &Path) -> bool {
+    canonical_target.starts_with(canonical_root)
+        || crate::folder_links::is_allowed(canonical_root, canonical_target)
+}
+
 fn ensure_path_in_workspace(root: &Path, target: &Path) -> Result<(), AppCommandError> {
     let canonical_root = std::fs::canonicalize(root).map_err(AppCommandError::io)?;
     let canonical_target = std::fs::canonicalize(target).map_err(AppCommandError::io)?;

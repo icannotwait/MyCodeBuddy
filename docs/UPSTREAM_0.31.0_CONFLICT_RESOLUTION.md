@@ -188,3 +188,4 @@ cargo test --no-default-features --features server --bin codeg-server --lib
 | `antigravity_launch_env` 丢了上游 `scratch` 第二参 | 签名接 `Option<&Path>`，login spawn 传 `scratch.path()`；settings 测试传 `None`。 |
 | fixture 缺 `show_thinking` / `recommended_value` | 测试构造补字段；`OpenCodeParser` 从 `super` 再 import。 |
 | `folders::open_no_follow` 仅非 unix `doc_guest` 调用 | unix 实现 `#[allow(dead_code)]`，避免 server clippy `-D warnings`。 |
+| `folders::is_within_workspace` 被 TAKE_OURS 丢掉 | 从上游回植：canonical starts_with **或** `folder_links::is_allowed`。desktop `doc_guest` 依赖它。 |
