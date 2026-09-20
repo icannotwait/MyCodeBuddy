@@ -543,7 +543,9 @@ describe("ConversationDetailPanel send-path hardening", () => {
     )
     expect(effectWithDeps).toContain("if (queueSteerInFlight) return")
     // …and as a dependency, so releasing the hold re-runs the flush.
-    expect(effectWithDeps).toContain("queueSteerInFlight])")
+    // Fork flush deps are multiline (sharedSession / waiting / lock / pause);
+    // accept either the upstream one-liner or a trailing-comma last entry.
+    expect(effectWithDeps).toMatch(/queueSteerInFlight\s*,?\s*\]\)/)
 
     const steerStart = source.indexOf("const handleQueueSteer = useCallback")
     expect(steerStart).toBeGreaterThan(-1)

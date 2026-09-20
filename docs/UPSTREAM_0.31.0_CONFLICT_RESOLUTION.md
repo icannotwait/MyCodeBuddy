@@ -181,3 +181,4 @@ cargo test --no-default-features --features server --bin codeg-server --lib
 | `useOpenFileTarget` 多了 `folderId` | 未设时不要把 `folderId: undefined` 传给 `openFilePreview`。 |
 | General / tab-bar / MarkdownLink 测试 | fixture 并上 `BrowserSettings`；`Browser.tab.untitled`；`useOptionalWorkspaceActions` mock。 |
 | `link-classify.ts` 抽走了 fork 的 Windows/`%3A`/bare-relative 解析 | 先对 raw href 切 `:line`；`stripLeadingSlashOnWindows` 看解码前是否真是盘符；bare relative 走共享 `isLocalPathLike`。 |
+| `conversation-session-surface.tsx` 没迁上游 `queueSteerInFlight` | 薄包装仍 TAKE_OURS。把 click-to-insert hold + `handleQueueSteer` 接到真正的 flush 臂（fork 的 `waitingForSubagents` / lock / pause / `sharedSession` 闸门都留下）。依赖数组保持多行；layout 测试认 trailing-comma 最后一项。 |
