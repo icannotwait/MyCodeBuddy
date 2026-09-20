@@ -5206,7 +5206,12 @@ pub async fn read_file_base64(
 /// Open a file for reading, refusing a final-component symlink (unix) so a
 /// path validated by canonicalization cannot be redirected through a symlink
 /// swapped in afterward.
+///
+/// The only in-tree caller today is the non-unix `browser::doc_guest` arm.
+/// Keep the unix implementation anyway so the helper stays available for
+/// confined readers on every host.
 #[cfg(unix)]
+#[allow(dead_code)]
 pub(crate) fn open_no_follow(path: &Path) -> std::io::Result<std::fs::File> {
     use std::os::unix::fs::OpenOptionsExt;
     std::fs::OpenOptions::new()
