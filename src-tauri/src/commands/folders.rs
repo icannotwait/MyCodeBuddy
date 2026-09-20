@@ -4668,6 +4668,20 @@ fn compute_etag(content: &[u8], metadata: &std::fs::Metadata) -> String {
     format!("{:016x}", hasher.finish())
 }
 
+/// Whether `canonical_target` may be touched by a workspace operation rooted at
+/// `canonical_root`: either it is inside the root, or it is inside a directory
+/// the user explicitly linked into that root (see [`crate::folder_links`]).
+///
+/// This is the *strict* rule, reserved for surfaces where the path comes from
+/// something other than a user clicking a row in the file tree — HTML preview
+/// sub-resources and the `codeg-doc:` guest. Desktop-only: the only caller is
+/// `browser::doc_guest`, which is `tauri-runtime`.
+#[cfg(feature = "tauri-runtime")]
+pub(crate) fn is_within_workspace(canonical_root: &Path, canonical_target: &Path) -> bool {
+    canonical_target.starts_with(canonical_root)
+        || crate::folder_links::is_allowed(canonical_root, canonical_target)
+}
+
 fn ensure_path_in_workspace(root: &Path, target: &Path) -> Result<(), AppCommandError> {
     let canonical_root = std::fs::canonicalize(root).map_err(AppCommandError::io)?;
     let canonical_target = std::fs::canonicalize(target).map_err(AppCommandError::io)?;
@@ -5201,6 +5215,44 @@ pub async fn read_file_base64(
         Ok(base64::engine::general_purpose::STANDARD.encode(bytes))
     })
     .await
+}
+
+/// Open a file for reading, refusing a final-component symlink (unix) so a
+/// path validated by canonicalization cannot be redirected through a symlink
+/// swapped in afterward.
+///
+/// The only in-tree caller today is the non-unix `browser::doc_guest` arm.
+/// Keep the unix implementation anyway so the helper stays available for
+/// confined readers on every host.
+#[cfg(unix)]
+#[allow(dead_code)]
+pub(crate) fn open_no_follow(path: &Path) -> std::io::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
+}
+
+#[cfg(windows)]
+#[allow(dead_code)]
+pub(crate) fn open_no_follow(path: &Path) -> std::io::Result<std::fs::File> {
+    use std::os::windows::fs::OpenOptionsExt;
+    // FILE_FLAG_OPEN_REPARSE_POINT opens the reparse point itself instead of
+    // following it, so a symlink/junction swapped in after validation is opened
+    // (and then rejected by the is_file() check) rather than followed outside
+    // the workspace root.
+    const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+    std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)
+}
+
+#[cfg(not(any(unix, windows)))]
+#[allow(dead_code)]
+pub(crate) fn open_no_follow(path: &Path) -> std::io::Result<std::fs::File> {
+    std::fs::File::open(path)
 }
 
 /// Like `read_file_base64`, but confined to a workspace root: the path is

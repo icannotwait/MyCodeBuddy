@@ -71,7 +71,7 @@ export function useOpenFileTarget() {
       }
       await openFilePreview(path, {
         line: options?.line ?? undefined,
-        folderId: options?.folderId,
+        ...(options?.folderId != null ? { folderId: options.folderId } : {}),
       })
     },
     [fileColumnVisible, openFilePreview, openSessionFileDiff, viewerHost]

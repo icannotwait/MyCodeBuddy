@@ -1,6 +1,10 @@
 import { render, waitFor } from "@testing-library/react"
 import { describe, expect, it, vi } from "vitest"
 
+vi.mock("next-intl", () => ({
+  useTranslations: () => (key: string) => key,
+}))
+
 vi.mock("@/components/ai-elements/link-safety", async (importOriginal) => ({
   ...(await importOriginal<
     typeof import("@/components/ai-elements/link-safety")

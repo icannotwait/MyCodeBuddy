@@ -7,6 +7,7 @@ import {
 } from "@testing-library/react"
 import { NextIntlClientProvider } from "next-intl"
 import { beforeEach, describe, expect, it, vi } from "vitest"
+import enJson from "@/i18n/messages/en.json"
 
 vi.mock("@/lib/api", () => ({
   getSystemTerminalSettings: vi.fn(async () => ({
@@ -54,12 +55,21 @@ vi.mock("@/lib/api", () => ({
   getQuestionSettings: vi.fn(async () => ({ enabled: true })),
   setQuestionSettings: vi.fn(async (v: unknown) => v),
   getSessionInfoSettings: vi.fn(async () => ({ enabled: true })),
+  getBrowserToolsSettings: vi.fn(async () => ({ enabled: false })),
   setSessionInfoSettings: vi.fn(async (v: unknown) => v),
   getChatAuthoringSettings: vi.fn(async () => ({
     automations_enabled: false,
     work_tasks_enabled: false,
   })),
   setChatAuthoringSettings: vi.fn(async (v: unknown) => v),
+  getSystemCloseBehaviorSettings: vi.fn(async () => ({
+    behavior: "ask" as const,
+    tray_available: true,
+  })),
+  updateSystemCloseBehaviorSettings: vi.fn(async (behavior: string) => ({
+    behavior,
+    tray_available: true,
+  })),
 }))
 
 vi.mock("sonner", () => ({
@@ -334,6 +344,8 @@ const enMessages = {
       delete: "Delete",
     },
   },
+  BrowserSettings: enJson.BrowserSettings,
+  CloseBehaviorSettings: enJson.CloseBehaviorSettings,
 } as const
 
 type AvailableTerminalShells = {
@@ -438,7 +450,7 @@ describe("GeneralSettings terminal shell", () => {
       await screen.findByText(/C:\\Program Files\\PowerShell\\7\\pwsh.exe/)
     ).toBeInTheDocument()
 
-    fireEvent.click(screen.getByRole("combobox"))
+    fireEvent.click(screen.getByLabelText("Default Terminal"))
     fireEvent.click(
       await screen.findByRole("option", { name: /Command Prompt \(cmd\)/i })
     )
@@ -516,6 +528,7 @@ describe("GeneralSettings", () => {
       "Notification sounds",
       "Multi-Agent Collaboration",
       "In-conversation tools",
+      "Built-in browser",
     ]) {
       expect(screen.getByRole("heading", { name: heading })).toBeInTheDocument()
     }

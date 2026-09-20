@@ -12,10 +12,16 @@ import {
   type RefObject,
 } from "react"
 import { type Editor, type JSONContent } from "@tiptap/core"
+import { Selection } from "@tiptap/pm/state"
 import { EditorContent, useEditor } from "@tiptap/react"
 import { exitSuggestion } from "@tiptap/suggestion"
 
+import type { HistoryDirection } from "@/lib/composer-history"
 import { isImeCompositionKey } from "@/lib/ime-composition"
+import {
+  NO_KNOWN_INVOCATIONS,
+  type KnownInvocations,
+} from "@/lib/invocation-token"
 import { matchShortcutEvent } from "@/lib/keyboard-shortcuts"
 import { cn } from "@/lib/utils"
 
@@ -151,6 +157,20 @@ export interface RichComposerProps {
    */
   mentionAnchorRef?: RefObject<HTMLElement | null>
   /**
+   * The invocations the host's `/`·`$` menu can offer right now (see
+   * {@link "./invocation-reference".buildKnownInvocations}). Seeded and pasted
+   * text turns a bare `/cmd`·`$skill` token into a command badge only when it is
+   * one of these; anything else stays editable prose. Omit — or leave empty
+   * while the agent's list is still on its way — and no bare token is ever
+   * badged, which is the safe direction: text that stays text sends exactly as
+   * written.
+   *
+   * Read at event time, so a list that lands mid-compose applies to the next
+   * paste without recreating the editor. Badges already in the document are
+   * never revisited.
+   */
+  knownInvocations?: KnownInvocations
+  /**
    * Key binding (matchShortcutEvent form) that sends the message. Default
    * `"enter"`. When set to a non-Enter binding, a plain Enter inserts a newline.
    */
@@ -171,6 +191,21 @@ export interface RichComposerProps {
    * false (e.g. a letter that filters the list) to let normal editing proceed.
    */
   onExternalMenuKeyDown?: (event: KeyboardEvent) => boolean
+  /**
+   * Arrow-key prompt history (the chat composer's Up/Down recall). Called for a
+   * bare ArrowUp/ArrowDown BEFORE the caret moves, but ONLY when the collapsed
+   * selection already sits at the document's first (`"older"`) or last
+   * (`"newer"`) position — so the caret keeps moving line by line inside a
+   * multi-line entry, and only a press at an edge switches prompts. Return true
+   * to consume the key.
+   *
+   * Optional on purpose: the task and automation composers pass no handler and
+   * keep the editor's default Arrow behaviour.
+   */
+  onHistoryKeyDown?: (
+    direction: HistoryDirection,
+    event: KeyboardEvent
+  ) => boolean
   /**
    * Called on paste before the editor handles it. Return true when the paste was
    * consumed out-of-band (e.g. an image/file became an attachment) so the editor
@@ -221,10 +256,12 @@ export const RichComposer = forwardRef<RichComposerHandle, RichComposerProps>(
       mentionUiLabels,
       tabLabels,
       mentionAnchorRef,
+      knownInvocations,
       submitShortcut,
       newlineShortcut,
       isExternalMenuOpen,
       onExternalMenuKeyDown,
+      onHistoryKeyDown,
       onPasteFiles,
       onDropFiles,
       onPlainPaste,
@@ -245,10 +282,15 @@ export const RichComposer = forwardRef<RichComposerHandle, RichComposerProps>(
     // Controller that owns the currently open picker (may differ from the latest
     // prop during a replacement). onExit closes exactly this instance.
     const owningControllerRef = useRef<ReferenceSearchController | null>(null)
+    // Read at event time (paste, seed) rather than baked into the editor, so a
+    // command list that arrives after the connection comes up applies without
+    // rebuilding the editor — and without disturbing what is already typed.
+    const knownInvocationsRef = useRef(knownInvocations)
     const submitShortcutRef = useRef(submitShortcut)
     const newlineShortcutRef = useRef(newlineShortcut)
     const isExternalMenuOpenRef = useRef(isExternalMenuOpen)
     const onExternalMenuKeyDownRef = useRef(onExternalMenuKeyDown)
+    const onHistoryKeyDownRef = useRef(onHistoryKeyDown)
     const onPasteFilesRef = useRef(onPasteFiles)
     const onDropFilesRef = useRef(onDropFiles)
     const onPlainPasteRef = useRef(onPlainPaste)
@@ -264,10 +306,12 @@ export const RichComposer = forwardRef<RichComposerHandle, RichComposerProps>(
       onBlurRef.current = onBlur
       onReadyRef.current = onReady
       referenceControllerRef.current = referenceController
+      knownInvocationsRef.current = knownInvocations
       submitShortcutRef.current = submitShortcut
       newlineShortcutRef.current = newlineShortcut
       isExternalMenuOpenRef.current = isExternalMenuOpen
       onExternalMenuKeyDownRef.current = onExternalMenuKeyDown
+      onHistoryKeyDownRef.current = onHistoryKeyDown
       onPasteFilesRef.current = onPasteFiles
       onDropFilesRef.current = onDropFiles
       onPlainPasteRef.current = onPlainPaste
@@ -320,6 +364,12 @@ export const RichComposer = forwardRef<RichComposerHandle, RichComposerProps>(
     const placeholderRef = useRef(placeholder)
     const getPlaceholder = useCallback(() => placeholderRef.current ?? "", [])
 
+    /** The invocations badge-able right now (see the `knownInvocations` prop). */
+    const known = useCallback(
+      () => knownInvocationsRef.current ?? NO_KNOWN_INVOCATIONS,
+      []
+    )
+
     const editor = useEditor({
       // Static export / SSR safety: never render on the server.
       immediatelyRender: false,
@@ -365,6 +415,43 @@ export const RichComposer = forwardRef<RichComposerHandle, RichComposerProps>(
           // list) to let the inline token keep growing.
           if (isExternalMenuOpenRef.current) {
             return onExternalMenuKeyDownRef.current?.(event) ?? false
+          }
+          // Prompt history (chat composer only): a bare Up/Down at the
+          // document's first/last position steps through sent prompts; anywhere
+          // else the editor keeps the caret movement, which is what makes a
+          // multi-line recalled message navigable line by line. Placed after
+          // the menus so an open panel always wins, and after the IME guard
+          // above so a CJK candidate list keeps its own Arrow keys.
+          //
+          // A modifier keeps the native meaning: Shift+Arrow extends the
+          // selection (empty until it spans), and Ctrl/Alt+Arrow is a
+          // word/line jump — none of them is "recall a prompt".
+          if (
+            onHistoryKeyDownRef.current &&
+            (event.key === "ArrowUp" || event.key === "ArrowDown") &&
+            !event.shiftKey &&
+            !event.altKey &&
+            !event.ctrlKey &&
+            !event.metaKey
+          ) {
+            const { selection, doc } = view.state
+            const older = event.key === "ArrowUp"
+            // The edge that counts is the DOCUMENT's, not the current block's.
+            // The box is normally one paragraph of hard breaks, but a native
+            // paste can leave several paragraphs in it (see the quote
+            // decoration's scan) — and in one of those, the start of paragraph
+            // two is an ordinary "move up a line", not a recall.
+            const atBoundary =
+              selection.empty &&
+              (older
+                ? selection.from === Selection.atStart(doc).from
+                : selection.to === Selection.atEnd(doc).to)
+            if (atBoundary) {
+              return onHistoryKeyDownRef.current(
+                older ? "older" : "newer",
+                event
+              )
+            }
           }
           // Paste without formatting: Ctrl/⌘+Shift+V routes to the host, which
           // owns the clipboard read. Consume the key (suppressing the browser's
@@ -424,10 +511,13 @@ export const RichComposer = forwardRef<RichComposerHandle, RichComposerProps>(
           const editor = editorInstanceRef.current
           const clipboard = event.clipboardData
           if (!editor || !clipboard) return false
-          const inline = decidePastedContent({
-            html: clipboard.getData("text/html"),
-            text: clipboard.getData("text/plain"),
-          })
+          const inline = decidePastedContent(
+            {
+              html: clipboard.getData("text/html"),
+              text: clipboard.getData("text/plain"),
+            },
+            known()
+          )
           if (!inline) return false
           editor.chain().insertContent(inline).run()
           return true
@@ -437,7 +527,7 @@ export const RichComposer = forwardRef<RichComposerHandle, RichComposerProps>(
       onCreate: ({ editor }) => {
         editorInstanceRef.current = editor
         if (defaultText) {
-          editor.commands.setContent(textToSeededDoc(defaultText), {
+          editor.commands.setContent(textToSeededDoc(defaultText, known()), {
             emitUpdate: false,
           })
         }
@@ -476,7 +566,8 @@ export const RichComposer = forwardRef<RichComposerHandle, RichComposerProps>(
       ref,
       (): RichComposerHandle => ({
         getText: () => (editor ? serializeDocToText(editor.state.doc) : ""),
-        setText: (text) => editor?.commands.setContent(textToSeededDoc(text)),
+        setText: (text) =>
+          editor?.commands.setContent(textToSeededDoc(text, known())),
         setDoc: (doc) => editor?.commands.setContent(doc),
         clear: () => editor?.commands.clearContent(true),
         focus: () => editor?.commands.focus("end"),
@@ -522,7 +613,7 @@ export const RichComposer = forwardRef<RichComposerHandle, RichComposerProps>(
           editor
             ?.chain()
             .focus()
-            .insertContent(textToSeededInlineContent(text))
+            .insertContent(textToSeededInlineContent(text, known()))
             .run()
         },
         insertReference: (attrs) => {
@@ -530,7 +621,7 @@ export const RichComposer = forwardRef<RichComposerHandle, RichComposerProps>(
         },
         getEditor: () => editor ?? null,
       }),
-      [editor]
+      [editor, known]
     )
 
     const closeMention = useCallback(() => {

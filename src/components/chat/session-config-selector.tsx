@@ -31,6 +31,9 @@ interface SessionConfigSelectorProps {
   derivedGroups?: ModelOptionGroup[] | null
   /** When true, trigger stays visible with the current value but cannot open. */
   disabled?: boolean
+  /** Localized chip text for the agent's `recommended_value` row. Omit it and
+   *  the recommendation is simply not shown. */
+  recommendedLabel?: string
 }
 
 export function InlineSessionConfigSelector({
@@ -38,6 +41,7 @@ export function InlineSessionConfigSelector({
   onSelect,
   derivedGroups,
   disabled = false,
+  recommendedLabel,
 }: SessionConfigSelectorProps) {
   const [open, setOpen] = useState(false)
   // Close on relock without an effect (React render-time prop→state adjust).
@@ -75,6 +79,13 @@ export function InlineSessionConfigSelector({
   const currentLabel = selected
     ? configOptionDisplayLabel(selected)
     : option.kind.current_value
+  // The agent's recommended value, if it named one AND the caller supplied a
+  // chip label. Never falls back to `current_value`: "recommended" and
+  // "selected" are different claims, and badging the selected row when nothing
+  // was recommended would invent one.
+  const recommendedValue = recommendedLabel ? option.recommended_value : null
+  const badgeFor = (value: string) =>
+    value === recommendedValue ? recommendedLabel : null
 
   return (
     <DropdownMenu
@@ -137,6 +148,7 @@ export function InlineSessionConfigSelector({
                         <DropdownRadioItemContent
                           label={label}
                           description={item.description}
+                          recommendedLabel={badgeFor(item.value)}
                         />
                       </DropdownMenuRadioItem>
                     )
@@ -154,6 +166,7 @@ export function InlineSessionConfigSelector({
                     <DropdownRadioItemContent
                       label={label}
                       description={item.description}
+                      recommendedLabel={badgeFor(item.value)}
                     />
                   </DropdownMenuRadioItem>
                 )

@@ -8,6 +8,7 @@ import type {
   UnsubscribeFn,
 } from "./types"
 import { buildCodegWebSocketProtocols } from "./ws-auth"
+import { parseJsonOrThrow } from "../json-parse-error"
 import { getCodegToken } from "./web-auth"
 
 // 60s covers the worst-case ACP probe path: some agents (Gemini in
@@ -265,9 +266,16 @@ export class WebTransport implements Transport {
       }))
       throw error
     }
-    const body = (await res.json()) as T
-    this.captureCompletionContext(command, res, body)
-    return body
+    // Read the body as text and parse it here rather than calling
+    // `res.json()`. Identical on the happy path, but a truncated or malformed
+    // body otherwise throws a bare engine message — `Unterminated string in
+    // JSON at position 80865` — that names neither the endpoint nor anything
+    // else a user could report. Exactly that error was reported against the
+    // Agents settings page (#736) and could not be traced to a source.
+    const body = await res.text()
+    const parsed = parseJsonOrThrow<T>(body, `API ${command}`)
+    this.captureCompletionContext(command, res, parsed)
+    return parsed
   }
 
   /**

@@ -104,6 +104,15 @@ pub struct AppState {
     /// updated by the chat-authoring settings command on save. Populated at
     /// startup by `apply_persisted_chat_authoring_config`.
     pub chat_authoring_config: crate::acp::chat_authoring::ChatAuthoringRuntimeConfig,
+    /// Hot-swappable browser-tools (`browser_list_tabs` / `browser_snapshot`)
+    /// enable flag. Shared with the `DelegationInjection` so MCP injection
+    /// reads it, and re-read at call time by the access impl so switching it
+    /// off reaches sessions that are already running. Populated at startup by
+    /// `apply_persisted_browser_tools_config`. Carried in both runtimes even
+    /// though only the desktop one has a browser: the status popover lists
+    /// every group, and a flag that existed in one build only would be a
+    /// second shape of `AppState` to keep in step.
+    pub browser_tools_config: crate::acp::browser_tools::BrowserToolsRuntimeConfig,
     /// Serializes mutually-exclusive system operations — in-place
     /// self-update, restart, rollback — so a second click can't race a
     /// download/swap already in flight. Handlers `try_lock` and reject when
@@ -151,6 +160,7 @@ pub struct DelegationStack {
     pub metrics: Arc<DelegationMetrics>,
     pub continuation_store: Arc<dyn ContinuationStore>,
     pub continuation_coordinator: Arc<DelegationContinuationCoordinator>,
+    pub browser: crate::acp::browser_tools::BrowserToolsRuntimeConfig,
 }
 
 /// Build the delegation broker + token registry + per-process UDS socket
@@ -256,6 +266,7 @@ pub fn build_delegation_stack(
     let ask = crate::acp::question::QuestionRuntimeConfig::new();
     let sessions = crate::acp::session_info::SessionInfoRuntimeConfig::new();
     let authoring = crate::acp::chat_authoring::ChatAuthoringRuntimeConfig::new();
+    let browser = crate::acp::browser_tools::BrowserToolsRuntimeConfig::new();
 
     // Soft-supervisor wake channel: tx side is shared via SupervisorWake on
     // injection + broker; rx is taken once at desktop/server startup after
@@ -310,6 +321,7 @@ pub fn build_delegation_stack(
         metrics: delegation_metrics,
         continuation_store,
         continuation_coordinator,
+        browser,
     }
 }
 
@@ -558,6 +570,7 @@ impl AppState {
             question_config: stack.ask,
             session_info_config: stack.sessions,
             chat_authoring_config: stack.authoring,
+            browser_tools_config: stack.browser,
             system_op_lock: default_system_op_lock(),
             update_state: default_update_state(),
         }

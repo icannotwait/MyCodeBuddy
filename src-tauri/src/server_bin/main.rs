@@ -154,7 +154,9 @@ async fn async_main() -> ExitCode {
     // errors are silenced, no subprocesses spawned.
     std::thread::spawn(|| {
         let _ = std::panic::catch_unwind(|| {
+            codeg_lib::acp::binary_cache::migrate_legacy_root();
             codeg_lib::sweep_acp_binary_trash();
+            codeg_lib::sweep_acp_scratch_dirs();
         });
     });
 
@@ -394,6 +396,7 @@ async fn async_main() -> ExitCode {
         question_config: stack.ask.clone(),
         session_info_config: stack.sessions.clone(),
         chat_authoring_config: chat_authoring_config.clone(),
+        browser_tools_config: stack.browser.clone(),
         system_op_lock: codeg_lib::app_state::default_system_op_lock(),
         update_state: codeg_lib::app_state::default_update_state(),
     });
@@ -478,6 +481,14 @@ async fn async_main() -> ExitCode {
     codeg_lib::commands::chat_authoring::apply_persisted_chat_authoring_config(
         &state.db.conn,
         &chat_authoring_config,
+    )
+    .await;
+    // And the browser-tools switch, so the popover reports it truthfully.
+    // Server mode never advertises the group (there are no native tabs here),
+    // but the flag is one setting shared by both runtimes.
+    codeg_lib::commands::browser_tools::apply_persisted_browser_tools_config(
+        &state.db.conn,
+        &state.browser_tools_config,
     )
     .await;
     // Before accepting connections: keep ACP model terminal fallbacks aligned
@@ -621,6 +632,12 @@ async fn async_main() -> ExitCode {
         std::time::Duration::from_secs(codeg_lib::SWEEP_INTERVAL_SECS),
     ));
 
+    // Reclaim scratch directories lost track of mid-session. Deliberately NOT
+    // gated on `idle_timeout_from_env` like the sweep above: setting
+    // `CODEG_ACP_IDLE_TIMEOUT_SECS=0` disables idle disconnects, not disk
+    // reclamation.
+    tokio::spawn(codeg_lib::scratch_sweep_task());
+
     // Office watch preview servers: reap dead children + ref0 stragglers.
     if let Some(idle_timeout) = codeg_lib::office_watch::idle_timeout_from_env() {
         tokio::spawn(codeg_lib::office_watch::office_watch_idle_sweep_task(
@@ -657,6 +674,22 @@ async fn async_main() -> ExitCode {
         state.data_dir.clone(),
     ) {
         tokio::spawn(codeg_lib::work_task::run_task_engine(engine));
+    }
+
+    // Config-sync uploader (mirrors lib.rs setup): sleeps a minute, then
+    // compares the configuration's hash every interval and uploads only when
+    // it changed. Does nothing at all until a WebDAV endpoint is configured.
+    {
+        let db_for_sync = state.db.conn.clone();
+        let emitter = std::sync::Arc::new(state.emitter.clone());
+        tokio::spawn(async move {
+            codeg_lib::commands::config_sync::auto_sync::run_auto_sync_loop(
+                db_for_sync,
+                emitter,
+                codeg_lib::commands::config_sync::APP_VERSION.to_string(),
+            )
+            .await;
+        });
     }
 
     // Label worktree folders registered before aliases were seeded at creation
@@ -728,6 +761,20 @@ async fn async_main() -> ExitCode {
     // Token on stderr ONLY (bearer credential — keep it out of the log files
     // and the in-app viewer); the bind addresses are safe to log normally.
     eprintln!("[SERVER] Token: {}", token);
+    // Port bridge for dev servers on this host (web-mode built-in browser):
+    // bound where our own socket is, on the ports after ours unless
+    // CODEG_BRIDGE_PORTS says otherwise.
+    let bridge =
+        codeg_lib::web::browser_bridge::BridgeConfig::from_env(&advertised_host, actual_port);
+    match &bridge {
+        Some(config) => tracing::info!(
+            "[SERVER] Port bridge for dev servers: ports {} (CODEG_BRIDGE_PORTS)",
+            codeg_lib::web::describe_ports(&config.ports)
+        ),
+        None => tracing::info!("[SERVER] Port bridge for dev servers: off (CODEG_BRIDGE_PORTS)"),
+    }
+    codeg_lib::web::browser_bridge::configure(bridge);
+
     tracing::info!("[SERVER] Listening on:");
     for addr in &addresses {
         tracing::info!("  {}", addr);

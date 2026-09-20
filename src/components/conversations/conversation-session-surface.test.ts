@@ -880,6 +880,7 @@ vi.mock("@/contexts/acp-connections-context", async (importOriginal) => {
           connectionId: surfaceH.currentConnectionId,
         }
       },
+      getConnectPending: () => undefined,
       getActiveKey: () => null,
       subscribeKey: () => () => undefined,
       subscribeActiveKey: () => () => undefined,

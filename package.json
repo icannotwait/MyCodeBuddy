@@ -1,7 +1,7 @@
 {
   "name": "codeg",
   "private": true,
-  "version": "0.30.7-mycodebuddy.1",
+  "version": "0.31.0-mycodebuddy.1",
   "license": "Apache-2.0",
   "repository": {
     "type": "git",
@@ -28,6 +28,10 @@
     "licenses:generate": "node scripts/third-party-licenses.mjs",
     "server:build": "cd src-tauri && cargo build --release --bin codeg-server --no-default-features --features server",
     "server:dev": "cd src-tauri && cargo run --bin codeg-server --no-default-features --features server",
+    "browser:agent": "node scripts/build-browser-agent.mjs",
+    "browser:agent:check": "node scripts/build-browser-agent.mjs --check",
+    "browser:agent:types": "tsc -p browser-agent/tsconfig.json",
+    "browser:agent:probe": "node browser-agent/probe.mjs",
     "tauri:prepare-sidecars": "node src-tauri/scripts/prepare-sidecars.mjs",
     "tauri:before-dev": "pnpm tauri:prepare-sidecars && pnpm dev",
     "tauri:before-build": "pnpm licenses:generate && pnpm build && pnpm tauri:prepare-sidecars",
@@ -78,7 +82,7 @@
     "lucide-react": "^0.563.0",
     "mdast-util-from-markdown": "^2.0.2",
     "monaco-editor": "^0.55.1",
-    "motion": "^12.34.0",
+    "motion": "^13.4.0",
     "next": "^16",
     "next-intl": "^4.8.3",
     "next-themes": "^0.4.6",
@@ -118,6 +122,7 @@
     "@vitejs/plugin-react": "^4.3.4",
     "@vitest/coverage-v8": "^2.1.8",
     "@vitest/ui": "^2.1.8",
+    "esbuild": "^0.28.2",
     "eslint": "^9.39.2",
     "eslint-config-next": "^16.1.6",
     "eslint-config-prettier": "^10.1.8",
@@ -130,6 +135,7 @@
     "typescript": "~5.8.3",
     "unified": "^11.0.5",
     "unist-util-visit": "^5.0.0",
-    "vitest": "^2.1.8"
+    "vitest": "^2.1.8",
+    "yaml": "^2.9.0"
   }
 }

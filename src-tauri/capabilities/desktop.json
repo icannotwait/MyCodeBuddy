@@ -22,5 +22,5 @@
     "remote-push-*",
     "conversation-*"
   ],
-  "permissions": ["window-state:default"]
+  "permissions": ["window-state:default", "deep-link:default"]
 }

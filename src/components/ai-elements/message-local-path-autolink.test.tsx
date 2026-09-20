@@ -29,6 +29,7 @@ vi.mock("@/contexts/active-folder-context", () => ({
 }))
 
 vi.mock("@/contexts/workspace-context", () => ({
+  useOptionalWorkspaceActions: () => null,
   useWorkspaceActions: () => ({
     openFilePreview: mocks.openFilePreview,
   }),

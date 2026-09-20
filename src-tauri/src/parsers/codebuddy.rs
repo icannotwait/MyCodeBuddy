@@ -11,11 +11,16 @@ use crate::models::{
     AgentExecutionStats, AgentToolCall, AgentType, ContentBlock, ConversationDetail,
     ConversationSummary, MessageRole, MessageTurn, TurnRole, TurnUsage, UnifiedMessage,
 };
+use crate::parsers::claude::{
+    capture_tag, task_notification_status_regex, task_notification_summary_regex,
+    task_notification_task_id_regex, BACKGROUND_TASK_MARKER,
+};
 use crate::parsers::{
-    compute_session_stats, folder_name_from_path, infer_context_window_max_tokens,
-    is_safe_subagent_id, latest_turn_total_usage_tokens, merge_context_window_stats,
-    relocate_orphaned_tool_results, resolve_patch_line_numbers, structurize_read_tool_output,
-    title_from_user_text, truncate_str, visible_title, visible_user_text, AgentParser, ParseError,
+    backfill_turn_durations, compute_session_stats, folder_name_from_path,
+    infer_context_window_max_tokens, is_safe_subagent_id, latest_turn_total_usage_tokens,
+    merge_context_window_stats, relocate_orphaned_tool_results, resolve_patch_line_numbers,
+    structurize_read_tool_output, title_from_user_text, truncate_str, visible_title,
+    visible_user_text, AgentParser, ParseError,
 };
 
 /// Resolve CodeBuddy's config dir, honoring `CODEBUDDY_CONFIG_DIR`, else
@@ -65,7 +70,7 @@ impl CodeBuddyParser {
 
         let mut first_ts: Option<DateTime<Utc>> = None;
         let mut last_ts: Option<DateTime<Utc>> = None;
-        let mut ai_title: Option<String> = None;
+        let mut titles = CodeBuddyTitles::default();
         let mut first_user_text: Option<String> = None;
         let mut model: Option<String> = None;
         let mut cwd: Option<String> = None;
@@ -102,16 +107,15 @@ impl CodeBuddyParser {
             }
 
             match record_type {
-                "ai-title" => {
-                    if ai_title.is_none() {
-                        ai_title = value
-                            .get("aiTitle")
-                            .and_then(|t| t.as_str())
-                            .and_then(|t| visible_title(Some(t.to_string())));
-                    }
-                }
+                "custom-title" | "ai-title" | "topic" => titles.feed(record_type, &value),
                 "message" => match value.get("role").and_then(|r| r.as_str()).unwrap_or("") {
-                    "user" => {
+                    // A system-injected user record is not a prompt (see
+                    // `is_injected_user_record`): it must not be counted, nor
+                    // become the fallback title. The guard makes it fall to the
+                    // `_` arm — `parse_detail` applies the SAME exclusion, and
+                    // the two paths MUST agree or the auto-title backfill would
+                    // oscillate between them.
+                    "user" if !is_injected_user_record(&value) => {
                         let text = collect_text(&value, "input_text");
                         let Some(visible) = visible_user_text(&text) else {
                             continue;
@@ -142,7 +146,7 @@ impl CodeBuddyParser {
             agent_type: AgentType::CodeBuddy,
             folder_path: cwd,
             folder_name,
-            title: ai_title.or(first_user_text),
+            title: titles.resolve(first_user_text),
             started_at,
             ended_at: last_ts,
             message_count,
@@ -164,7 +168,7 @@ impl CodeBuddyParser {
         let mut messages: Vec<UnifiedMessage> = Vec::new();
         let mut first_ts: Option<DateTime<Utc>> = None;
         let mut last_ts: Option<DateTime<Utc>> = None;
-        let mut ai_title: Option<String> = None;
+        let mut titles = CodeBuddyTitles::default();
         let mut first_user_text: Option<String> = None;
         let mut model: Option<String> = None;
         let mut cwd: Option<String> = None;
@@ -177,6 +181,18 @@ impl CodeBuddyParser {
         // and the Claude-style "Task"+subagent_type form alike.
         let mut agent_call_ids: std::collections::HashSet<String> =
             std::collections::HashSet::new();
+        // Async `Agent` launch acks: tool `callId` → the detached worker's task
+        // id (`spawned_task_id`). Joined with `background_notifications` by
+        // `apply_background_lifecycle` once every record has been read.
+        let mut background_acks: std::collections::HashMap<String, String> =
+            std::collections::HashMap::new();
+        // task id → `(status, summary)` of its LATEST `<task-notification>`. The
+        // same id can notify more than once (a resumed worker re-notifies), so
+        // last wins — mirroring `claude.rs`.
+        let mut background_notifications: std::collections::HashMap<
+            String,
+            (String, Option<String>),
+        > = std::collections::HashMap::new();
 
         for (idx, line) in reader.lines().enumerate() {
             let Ok(line) = line else { continue };
@@ -205,32 +221,31 @@ impl CodeBuddyParser {
             }
 
             match record_type {
-                "ai-title" => {
-                    if ai_title.is_none() {
-                        ai_title = value
-                            .get("aiTitle")
-                            .and_then(|t| t.as_str())
-                            .and_then(|t| visible_title(Some(t.to_string())));
-                    }
-                }
+                "custom-title" | "ai-title" | "topic" => titles.feed(record_type, &value),
                 "message" => match value.get("role").and_then(|r| r.as_str()).unwrap_or("") {
                     "user" => {
                         let text = collect_text(&value, "input_text");
-                        let Some(visible) = visible_user_text(&text) else {
-                            continue;
-                        };
-                        message_count += 1;
-                        if first_user_text.is_none() {
-                            first_user_text = Some(title_from_user_text(&visible));
+                        if is_injected_user_record(&value) {
+                            // Never a prompt (see `is_injected_user_record`):
+                            // harvest the background-worker settlement it
+                            // carries for the lifecycle fold, then drop the
+                            // record entirely — no user turn, no message count,
+                            // no fallback title.
+                            capture_task_notification(&text, &mut background_notifications);
+                        } else if let Some(visible) = visible_user_text(&text) {
+                            message_count += 1;
+                            if first_user_text.is_none() {
+                                first_user_text = Some(title_from_user_text(&visible));
+                            }
+                            messages.push(text_message(
+                                format!("cb-user-{idx}"),
+                                MessageRole::User,
+                                visible,
+                                ts,
+                                None,
+                                None,
+                            ));
                         }
-                        messages.push(text_message(
-                            format!("cb-user-{idx}"),
-                            MessageRole::User,
-                            visible,
-                            ts,
-                            None,
-                            None,
-                        ));
                     }
                     "assistant" => {
                         message_count += 1;
@@ -280,9 +295,8 @@ impl CodeBuddyParser {
                             tool_use_id: tool_call_id,
                             tool_name,
                             input_preview: tool_input_preview(&value),
-                            meta: None,
-
                             status: None,
+                            meta: None,
                         }],
                         timestamp: ts,
                         usage: None,
@@ -295,14 +309,24 @@ impl CodeBuddyParser {
                 }
                 "function_call_result" => {
                     let tool_call_id = call_id(&value);
-                    // Load the sub-agent transcript only for a result paired (by
+                    // Both the sub-agent transcript load and the async-launch
+                    // accounting below are gated on the result being paired (by
                     // callId) to a `function_call` we classified as an `Agent`
                     // delegation — the historical mirror of the live path. Every
-                    // ordinary tool result stays `None`, even one that carries a
-                    // stray `subAgent` block, so non-Agent results are unchanged.
-                    let agent_stats = tool_call_id
+                    // ordinary tool result stays untouched, even one that carries
+                    // a stray `subAgent` / spawn renderer (corruption, schema
+                    // drift, a future tool).
+                    let is_agent_result = tool_call_id
                         .as_deref()
-                        .is_some_and(|id| agent_call_ids.contains(id))
+                        .is_some_and(|id| agent_call_ids.contains(id));
+                    if is_agent_result {
+                        if let (Some(id), Some(task_id)) =
+                            (tool_call_id.clone(), spawned_task_id(&value))
+                        {
+                            background_acks.insert(id, task_id);
+                        }
+                    }
+                    let agent_stats = is_agent_result
                         .then(|| agent_stats_from_subagent(&value, path))
                         .flatten();
                     messages.push(UnifiedMessage {
@@ -328,10 +352,13 @@ impl CodeBuddyParser {
             }
         }
 
+        apply_background_lifecycle(&mut messages, &background_acks, &background_notifications);
+
         let mut turns = group_into_turns(messages);
         relocate_orphaned_tool_results(&mut turns);
         structurize_read_tool_output(&mut turns);
         resolve_patch_line_numbers(&mut turns, cwd.as_deref());
+        backfill_turn_durations(&mut turns, &[]);
 
         let used_tokens = latest_turn_total_usage_tokens(&turns);
         let max_tokens = infer_context_window_max_tokens(model.as_deref());
@@ -344,7 +371,9 @@ impl CodeBuddyParser {
             agent_type: AgentType::CodeBuddy,
             folder_path: cwd,
             folder_name,
-            title: ai_title.or(first_user_text),
+            // Same precedence as `parse_summary` — the two paths MUST agree, or
+            // the auto-title backfill would oscillate between them.
+            title: titles.resolve(first_user_text),
             started_at: first_ts.unwrap_or_else(Utc::now),
             ended_at: last_ts,
             message_count,
@@ -467,6 +496,58 @@ fn record_cwd(value: &Value) -> Option<String> {
         .and_then(|c| c.as_str())
         .filter(|s| !s.is_empty())
         .map(String::from)
+}
+
+/// CodeBuddy's session title, resolved exactly like its own
+/// `getEffectiveSessionTitle`: the newest non-empty `custom-title` (what
+/// `/rename` writes), else the newest usable `ai-title`, else the newest usable
+/// `topic`, else the first real user message. All three records are appended
+/// (never rewritten) and repeat over a session's life — CodeBuddy scans them
+/// back-to-front — so the LAST value of each kind wins.
+#[derive(Default)]
+struct CodeBuddyTitles {
+    custom: Option<String>,
+    ai: Option<String>,
+    topic: Option<String>,
+}
+
+impl CodeBuddyTitles {
+    /// Feed one record. Non-title records are ignored, so callers can route the
+    /// three types through a single match arm.
+    fn feed(&mut self, record_type: &str, value: &Value) {
+        let (field, slot) = match record_type {
+            "custom-title" => ("customTitle", &mut self.custom),
+            "ai-title" => ("aiTitle", &mut self.ai),
+            "topic" => ("topic", &mut self.topic),
+            _ => return,
+        };
+        let Some(text) = value.get(field).and_then(|t| t.as_str()).map(str::trim) else {
+            return;
+        };
+        // A `custom-title` is user-typed and taken verbatim; only the generated
+        // kinds can carry CodeBuddy's placeholders, which it skips rather than
+        // showing.
+        if text.is_empty() || (record_type != "custom-title" && is_placeholder_title(text)) {
+            return;
+        }
+        let Some(visible) = visible_title(Some(text.to_string())) else {
+            return;
+        };
+        *slot = Some(truncate_str(&visible, 100));
+    }
+
+    fn resolve(self, first_user_text: Option<String>) -> Option<String> {
+        self.custom.or(self.ai).or(self.topic).or(first_user_text)
+    }
+}
+
+/// CodeBuddy's `isGeneratedPlaceholderTitle`: what its titler emits when there
+/// was nothing to summarize. Showing one of these as the session name is worse
+/// than falling through to the first user message.
+fn is_placeholder_title(text: &str) -> bool {
+    text == "(No content)"
+        || text == "/compact"
+        || (text.starts_with("<image_local_path>") && text.ends_with("</image_local_path>"))
 }
 
 /// Record types that carry actual conversation content, as opposed to the
@@ -748,20 +829,164 @@ fn tool_is_error(value: &Value) -> bool {
         .is_some_and(|prefix| prefix.eq_ignore_ascii_case("error:"))
 }
 
-/// The sub-agent transcript id CodeBuddy records on an `Agent` tool result
-/// (`providerData.toolResult.subAgent.sessionId`, e.g. `"agent-cdd7c1ea"`). The
-/// transcript lives at `<session_dir>/subagents/<id>.jsonl` — Claude Code's
-/// directory layout. Ordinary tool results carry no `subAgent` block, so this
-/// returns `None` for them.
-fn subagent_transcript_id(result: &Value) -> Option<&str> {
-    result
+/// True when a `message`/`role:"user"` record is one of CodeBuddy's
+/// SYSTEM-INJECTED messages rather than something the human typed. CodeBuddy
+/// marks every one of them `providerData.isMeta: true` — the
+/// `<task-notification>` a finished background worker enqueues
+/// (`BackgroundTaskNotifier::enqueueAndScheduleDrain` calls
+/// `kQ(xml, {isMeta: true})`), a `/goal` kick-off, and the like.
+///
+/// CodeBuddy's OWN renderer skips exactly these records when it replays a
+/// session (`"message" === type && "user" === role && (isMeta ||
+/// !InputItemUtils.isRealUserMessageItem(item))` → `continue`), so rendering
+/// them as user turns was a codeg-only artifact: it split one exchange into two
+/// prompts and dropped the raw notification XML — plus the model-facing guidance
+/// prose that follows the closing tag — into a chat bubble. The payload is not
+/// lost: `capture_task_notification` folds it onto the launching Agent card.
+///
+/// Read only on `role:"user"` records, so an assistant/tool record that happens
+/// to carry the flag is unaffected.
+fn is_injected_user_record(value: &Value) -> bool {
+    value
+        .get("providerData")
+        .and_then(|p| p.get("isMeta"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+}
+
+/// Record the `<task-notification>` an injected user message carries, keyed by
+/// `<task-id>`. Anything else (a `/goal` kick-off, a future injection kind) is
+/// ignored — it is simply dropped from the stream by the caller.
+///
+/// Status defaults to `"completed"` when the tag is absent, matching
+/// `claude.rs`. CodeBuddy writes NO `<result>` tag — neither
+/// `buildAgentTaskNotificationXml` (agent workers) nor
+/// `BackgroundTaskNotifier::buildNotificationXml` (background shells) emits one
+/// — so the fold carries the headline only; the full report stays on the
+/// `TaskOutput` card that read it.
+fn capture_task_notification(
+    text: &str,
+    out: &mut std::collections::HashMap<String, (String, Option<String>)>,
+) {
+    if !text.trim_start().starts_with("<task-notification>") {
+        return;
+    }
+    let Some(task_id) = capture_tag(task_notification_task_id_regex(), text) else {
+        return;
+    };
+    let status = capture_tag(task_notification_status_regex(), text)
+        .unwrap_or_else(|| "completed".to_string());
+    let summary = capture_tag(task_notification_summary_regex(), text);
+    out.insert(task_id, (status, summary));
+}
+
+/// Decode a `providerData.toolResult.renderer` payload of the given `type`.
+/// CodeBuddy serializes every renderer `value` to a JSON *string* (not an
+/// object), so it needs a second parse; an already-decoded object is accepted
+/// defensively.
+fn renderer_payload(result: &Value, expected_type: &str) -> Option<Value> {
+    let renderer = result
         .get("providerData")?
         .get("toolResult")?
-        .get("subAgent")?
-        .get("sessionId")?
+        .get("renderer")?;
+    if renderer.get("type").and_then(|t| t.as_str()) != Some(expected_type) {
+        return None;
+    }
+    match renderer.get("value")? {
+        Value::String(s) => serde_json::from_str(s).ok(),
+        obj @ Value::Object(_) => Some(obj.clone()),
+        _ => None,
+    }
+}
+
+/// The detached worker's task id on an ASYNC `Agent` launch
+/// (`run_in_background: true`). Such a call returns an ack immediately, so its
+/// result carries an `agent-spawned` renderer naming the worker
+/// (`{"taskId":"agent-…","description":…,"subagentType":…}`) INSTEAD of the
+/// `subAgent` block a BLOCKING delegation gets — that block only exists once the
+/// child has actually finished. `None` for a blocking delegation and for every
+/// ordinary tool.
+fn spawned_task_id(result: &Value) -> Option<String> {
+    renderer_payload(result, "agent-spawned")?
+        .get("taskId")?
         .as_str()
         .map(str::trim)
         .filter(|s| !s.is_empty())
+        .map(String::from)
+}
+
+/// The sub-agent transcript id CodeBuddy records on an `Agent` tool result. The
+/// transcript lives at `<session_dir>/subagents/<id>.jsonl` — Claude Code's
+/// directory layout.
+///
+/// A BLOCKING delegation names it directly
+/// (`providerData.toolResult.subAgent.sessionId`, e.g. `"agent-cdd7c1ea"`). An
+/// ASYNC launch has no `subAgent` block at all, but its detached worker writes
+/// the SAME transcript under its task id, so the spawn renderer's `taskId`
+/// reaches it too — without this fallback every backgrounded worker's nested
+/// tool calls were dropped. Ordinary tool results carry neither, so this returns
+/// `None` for them.
+fn subagent_transcript_id(result: &Value) -> Option<String> {
+    result
+        .get("providerData")
+        .and_then(|p| p.get("toolResult"))
+        .and_then(|tr| tr.get("subAgent"))
+        .and_then(|sa| sa.get("sessionId"))
+        .and_then(|s| s.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(String::from)
+        .or_else(|| spawned_task_id(result))
+}
+
+/// Rewrite each async `Agent` launch ack's `output_preview` into the structured
+/// [`BACKGROUND_TASK_MARKER`] payload the frontend's lifecycle card reads
+/// (`lib/background-agent.ts`), joined with the latest `<task-notification>`
+/// observed for that task.
+///
+/// The ack CodeBuddy returns is model-facing scheduling instruction ("The worker
+/// is running detached (no team). The returned agent_id is the task_id. End this
+/// turn unless the user asked for progress. …"), so rendering it verbatim leaked
+/// plumbing into the card where a settled/pending badge belongs.
+///
+/// `status: null` means no notification was observed — the frontend renders that
+/// as "launched, result pending", NEVER as "running": a transcript alone cannot
+/// distinguish a live worker from one whose CLI died. `result` is always null
+/// here (CodeBuddy emits no `<result>` tag; see `capture_task_notification`).
+/// Mirrors `claude.rs`'s `ClaudeRecordAccumulator::apply_background_lifecycle`,
+/// including its `is_error: false` gate — a failed ack has a real error to show.
+fn apply_background_lifecycle(
+    messages: &mut [UnifiedMessage],
+    acks: &std::collections::HashMap<String, String>,
+    notifications: &std::collections::HashMap<String, (String, Option<String>)>,
+) {
+    if acks.is_empty() {
+        return;
+    }
+    for msg in messages {
+        for block in &mut msg.content {
+            let ContentBlock::ToolResult {
+                tool_use_id: Some(id),
+                output_preview,
+                is_error: false,
+                ..
+            } = block
+            else {
+                continue;
+            };
+            let Some(task_id) = acks.get(id) else {
+                continue;
+            };
+            let notification = notifications.get(task_id);
+            let payload = serde_json::json!({
+                "task_id": task_id,
+                "status": notification.map(|(status, _)| status.clone()),
+                "summary": notification.and_then(|(_, summary)| summary.clone()),
+                "result": Value::Null,
+            });
+            *output_preview = Some(format!("{BACKGROUND_TASK_MARKER}{payload}"));
+        }
+    }
 }
 
 /// Parse a CodeBuddy sub-agent transcript and extract its tool calls.
@@ -828,10 +1053,12 @@ fn parse_codebuddy_subagent_tool_calls(path: &Path) -> Vec<AgentToolCall> {
 /// historical mirror of the live path, which synthesizes the same `agent_stats`
 /// from the streamed child tool calls (`conversation-runtime-context.tsx`).
 ///
-/// Returns `None` for ordinary results (no `subAgent` linkage), a
-/// missing/empty transcript, or a sub-agent that ran no tools, so the common
-/// case stays a plain tool result. `main_session_path` is the real `.jsonl`
-/// path the parser is reading; the transcript sits beside it under
+/// Returns `None` for ordinary results (no sub-agent linkage — see
+/// [`subagent_transcript_id`]), a missing/empty transcript, or a sub-agent that
+/// ran no tools, so the common case stays a plain tool result. A still-running
+/// async worker also lands here (its transcript has no completed calls yet) and
+/// recovers on the next refetch. `main_session_path` is the real `.jsonl` path
+/// the parser is reading; the transcript sits beside it under
 /// `<session_dir>/subagents/`.
 fn agent_stats_from_subagent(
     result: &Value,
@@ -841,7 +1068,7 @@ fn agent_stats_from_subagent(
     // Path-traversal guard: `id` becomes a filename under the session dir, so it
     // must be a single plain component (rejects separators, `..`, a Windows
     // drive colon, and NUL). See `is_safe_subagent_id`.
-    if !is_safe_subagent_id(id) {
+    if !is_safe_subagent_id(&id) {
         return None;
     }
     let transcript = main_session_path
@@ -870,7 +1097,8 @@ fn agent_stats_from_subagent(
         lines_removed: None,
         other_tool_count: None,
         tool_calls,
-
+        // CodeBuddy's sub-agent transcript is a file under the parent session,
+        // not a session of its own.
         child_session_id: None,
     })
 }
@@ -1111,6 +1339,93 @@ mod tests {
         assert_eq!(usage.input_tokens, 24049 - 12800);
 
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// Parse one session through BOTH title paths (list + detail) and assert
+    /// they agree on `expected` — a divergence makes the auto-title backfill
+    /// oscillate between them.
+    fn assert_title(tag: &str, records: &[Value], expected: Option<&str>) {
+        let root = std::env::temp_dir().join(format!("codeg-cb-{tag}-{}", uuid::Uuid::new_v4()));
+        let sid = "sess-title";
+        write_session(&root, "Users-demo-app", sid, records);
+
+        let parser = CodeBuddyParser::with_base_dir(root.clone());
+        let summaries = parser.list_conversations().expect("list");
+        assert_eq!(summaries.len(), 1, "{tag}: one session expected");
+        let listed = summaries[0].title.clone();
+        let detail = parser.get_conversation(sid).expect("detail");
+        std::fs::remove_dir_all(&root).ok();
+
+        assert_eq!(listed.as_deref(), expected, "{tag}: list title");
+        assert_eq!(
+            detail.summary.title.as_deref(),
+            expected,
+            "{tag}: detail title"
+        );
+    }
+
+    fn cb_user(text: &str) -> Value {
+        json!({"type":"message","role":"user","timestamp":1781821844178i64,"cwd":"/Users/demo/app",
+               "sessionId":"sess-title","content":[{"type":"input_text","text":text}]})
+    }
+
+    #[test]
+    fn title_prefers_rename_over_generated_titles() {
+        // CodeBuddy's `/rename` appends `{"type":"custom-title","customTitle":…}`
+        // and its own `getEffectiveSessionTitle` scans custom → ai → topic, so a
+        // generated title written afterwards never displaces the user's name.
+        assert_title(
+            "title-custom",
+            &[
+                cb_user("first prompt"),
+                json!({"type":"ai-title","timestamp":1781821846000i64,"aiTitle":"stale title","sessionId":"sess-title"}),
+                json!({"type":"custom-title","timestamp":1781821847000i64,"customTitle":"auth-refactor","sessionId":"sess-title"}),
+                json!({"type":"ai-title","timestamp":1781821848000i64,"aiTitle":"fresh title","sessionId":"sess-title"}),
+            ],
+            Some("auth-refactor"),
+        );
+    }
+
+    #[test]
+    fn title_takes_the_newest_generated_value() {
+        // CodeBuddy re-titles a session as it grows, appending a new record each
+        // time. The NEWEST value wins (it used to keep the first one, pinning a
+        // long session to the title of its opening exchange).
+        assert_title(
+            "title-newest",
+            &[
+                cb_user("first prompt"),
+                json!({"type":"ai-title","timestamp":1781821846000i64,"aiTitle":"stale title","sessionId":"sess-title"}),
+                json!({"type":"ai-title","timestamp":1781821848000i64,"aiTitle":"fresh title","sessionId":"sess-title"}),
+            ],
+            Some("fresh title"),
+        );
+    }
+
+    #[test]
+    fn title_skips_placeholders_and_falls_through_to_topic() {
+        assert_title(
+            "title-topic",
+            &[
+                cb_user("first prompt"),
+                json!({"type":"ai-title","timestamp":1781821846000i64,"aiTitle":"(No content)","sessionId":"sess-title"}),
+                json!({"type":"topic","timestamp":1781821847000i64,"topic":"重构鉴权","sessionId":"sess-title"}),
+            ],
+            Some("重构鉴权"),
+        );
+    }
+
+    #[test]
+    fn title_falls_back_to_first_prompt_when_every_generated_value_is_a_placeholder() {
+        assert_title(
+            "title-fallback",
+            &[
+                cb_user("first prompt"),
+                json!({"type":"ai-title","timestamp":1781821846000i64,"aiTitle":"/compact","sessionId":"sess-title"}),
+                json!({"type":"topic","timestamp":1781821847000i64,"topic":"   ","sessionId":"sess-title"}),
+            ],
+            Some("first prompt"),
+        );
     }
 
     #[test]
@@ -1598,6 +1913,319 @@ mod tests {
         std::fs::remove_dir_all(&root).ok();
     }
 
+    /// An async `Agent` launch's result renderer: CodeBuddy serializes the
+    /// payload to a JSON *string*, which is what the parser has to decode.
+    fn spawn_renderer(task_id: &str) -> Value {
+        json!({
+            "type": "agent-spawned",
+            "value": serde_json::to_string(&json!({
+                "taskId": task_id,
+                "description": "Run pnpm build",
+                "displayName": "pnpm-build",
+                "subagentType": "general-purpose",
+                "alreadyLive": false,
+            }))
+            .expect("serialize renderer value"),
+        })
+    }
+
+    /// The `providerData.isMeta` user record CodeBuddy injects when a detached
+    /// worker settles — the notification XML plus the model-facing guidance
+    /// prose that follows the closing tag (verbatim shape from a real session).
+    fn task_notification_record(ts: i64, task_id: &str, status: &str, summary: &str) -> Value {
+        json!({
+            "type": "message", "role": "user", "timestamp": ts,
+            "cwd": "/Users/demo/app", "sessionId": "sess-bg",
+            "content": [{"type": "input_text", "text": format!(
+                "<task-notification>\n<task-id>{task_id}</task-id>\n<kind>agent</kind>\n\
+                 <status>{status}</status>\n<summary>{summary}</summary>\n</task-notification>\n\n\
+                 A worker finished. Notification <summary> is a short headline, not the report \
+                 body. Call TaskOutput once (block is forced false) to read the full report."
+            )}],
+            "providerData": {"isMeta": true, "agent": "multitask"},
+        })
+    }
+
+    /// `[[codeg-background-task]]{…}` payload of the tool result with this id.
+    fn lifecycle_marker(detail: &ConversationDetail, tool_use_id: &str) -> Value {
+        let raw = detail
+            .turns
+            .iter()
+            .flat_map(|t| &t.blocks)
+            .find_map(|b| match b {
+                ContentBlock::ToolResult {
+                    tool_use_id: Some(id),
+                    output_preview,
+                    ..
+                } if id == tool_use_id => output_preview.clone(),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("tool result {tool_use_id}"));
+        let json = raw.strip_prefix(BACKGROUND_TASK_MARKER).unwrap_or_else(|| {
+            panic!("async launch ack must be rewritten to the lifecycle marker, got: {raw}")
+        });
+        serde_json::from_str(json).expect("marker payload is one-line JSON")
+    }
+
+    /// Records for a session that dispatches ONE async worker; the caller
+    /// appends the settlement (or not).
+    fn async_launch_records() -> Vec<Value> {
+        vec![
+            json!({"type":"message","role":"user","timestamp":1789450922480i64,"cwd":"/Users/demo/app","sessionId":"sess-bg",
+                   "content":[{"type":"input_text","text":"派发worker 执行 pnpm build"}]}),
+            json!({"type":"function_call","timestamp":1789450928193i64,"cwd":"/Users/demo/app","sessionId":"sess-bg",
+                   "name":"Agent","callId":"a1",
+                   "arguments":"{\"description\": \"Run pnpm build\", \"prompt\": \"run it\", \"name\": \"pnpm-build\", \"run_in_background\": true}"}),
+            json!({"type":"function_call_result","timestamp":1789450928182i64,"cwd":"/Users/demo/app","sessionId":"sess-bg",
+                   "name":"Agent","callId":"a1","status":"completed",
+                   "output":{"type":"text","text":"Started general-purpose agent: Run pnpm build\nagent_id: agent-x1\nThe worker is running detached (no team). The returned agent_id is the task_id. End this turn unless the user asked for progress.\n[Agent ID: agent-x1]"},
+                   "providerData":{"toolResult":{"content":"Started general-purpose agent: Run pnpm build","renderer": spawn_renderer("agent-x1")}}}),
+            json!({"type":"message","role":"assistant","timestamp":1789450930520i64,"cwd":"/Users/demo/app","sessionId":"sess-bg",
+                   "content":[{"type":"output_text","text":"Worker dispatched. I'll wait for it to finish."}],
+                   "providerData":{"requestModelName":"Hy3"}}),
+        ]
+    }
+
+    #[test]
+    fn injected_meta_user_record_is_not_a_prompt() {
+        // Regression: CodeBuddy enqueues a worker settlement as a
+        // `providerData.isMeta` user message. It used to render as a SECOND user
+        // bubble inside one exchange, dumping the raw notification XML and its
+        // model-facing guidance prose into the chat. CodeBuddy's own renderer
+        // skips these records; codeg folds the payload onto the launch card
+        // instead.
+        let root =
+            std::env::temp_dir().join(format!("codeg-cb-meta-user-{}", uuid::Uuid::new_v4()));
+        let sid = "sess-bg";
+        let mut records = async_launch_records();
+        records.push(task_notification_record(
+            1789450948007,
+            "agent-x1",
+            "completed",
+            "Build succeeded (exit code 0).",
+        ));
+        records.push(
+            json!({"type":"message","role":"assistant","timestamp":1789450954134i64,"cwd":"/Users/demo/app","sessionId":sid,
+                   "content":[{"type":"output_text","text":"构建成功。"}],
+                   "providerData":{"requestModelName":"Hy3"}}),
+        );
+        write_session(&root, "Users-demo-app", sid, &records);
+
+        let parser = CodeBuddyParser::with_base_dir(root.clone());
+        let detail = parser.get_conversation(sid).expect("detail");
+        let listed = parser.list_conversations().expect("list");
+
+        // (1) Exactly one User turn — the human's prompt.
+        let user_turns: Vec<&MessageTurn> = detail
+            .turns
+            .iter()
+            .filter(|t| matches!(t.role, TurnRole::User))
+            .collect();
+        assert_eq!(
+            user_turns.len(),
+            1,
+            "an injected settlement must not become a second user turn"
+        );
+        assert!(user_turns[0]
+            .blocks
+            .iter()
+            .any(|b| matches!(b, ContentBlock::Text { text } if text.contains("派发worker"))));
+
+        // (2) Neither the XML nor its guidance prose leaks into ANY block.
+        let rendered: String = detail
+            .turns
+            .iter()
+            .flat_map(|t| &t.blocks)
+            .filter_map(|b| match b {
+                ContentBlock::Text { text } | ContentBlock::Thinking { text } => Some(text.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            !rendered.contains("<task-notification>"),
+            "raw notification XML must never reach a rendered text block"
+        );
+        assert!(
+            !rendered.contains("Call TaskOutput once"),
+            "the notification's model-facing guidance prose must not reach the chat"
+        );
+
+        // (3) Both paths agree on the count, and neither counts the injection
+        // (user + 2 assistant = 3).
+        assert_eq!(detail.summary.message_count, 3);
+        assert_eq!(listed[0].message_count, 3);
+
+        // (4) The settlement is folded onto the launch card instead.
+        let marker = lifecycle_marker(&detail, "a1");
+        assert_eq!(marker["task_id"], "agent-x1");
+        assert_eq!(marker["status"], "completed");
+        assert_eq!(marker["summary"], "Build succeeded (exit code 0).");
+        assert!(
+            marker["result"].is_null(),
+            "CodeBuddy writes no <result> tag, so the marker must not invent one"
+        );
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn unsettled_async_launch_marker_reports_no_status() {
+        // No `<task-notification>` yet (the worker is still running, or the CLI
+        // died): `status: null` renders as "launched, result pending" — never as
+        // a zombie "running". Mirrors `claude.rs`.
+        let root =
+            std::env::temp_dir().join(format!("codeg-cb-unsettled-{}", uuid::Uuid::new_v4()));
+        let sid = "sess-bg";
+        write_session(&root, "Users-demo-app", sid, &async_launch_records());
+
+        let parser = CodeBuddyParser::with_base_dir(root.clone());
+        let detail = parser.get_conversation(sid).expect("detail");
+        let marker = lifecycle_marker(&detail, "a1");
+        assert_eq!(marker["task_id"], "agent-x1");
+        assert!(marker["status"].is_null());
+        assert!(marker["summary"].is_null());
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn a_failed_worker_notification_keeps_its_status() {
+        let root = std::env::temp_dir().join(format!("codeg-cb-bgfail-{}", uuid::Uuid::new_v4()));
+        let sid = "sess-bg";
+        let mut records = async_launch_records();
+        // A resumed worker re-notifies under the SAME id — last wins.
+        records.push(task_notification_record(
+            1789450948007,
+            "agent-x1",
+            "completed",
+            "first",
+        ));
+        records.push(task_notification_record(
+            1789450949007,
+            "agent-x1",
+            "failed",
+            "worker failed",
+        ));
+        write_session(&root, "Users-demo-app", sid, &records);
+
+        let parser = CodeBuddyParser::with_base_dir(root.clone());
+        let detail = parser.get_conversation(sid).expect("detail");
+        let marker = lifecycle_marker(&detail, "a1");
+        assert_eq!(marker["status"], "failed");
+        assert_eq!(marker["summary"], "worker failed");
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn async_launch_loads_the_detached_workers_transcript() {
+        // An async launch carries no `subAgent` block (that only appears once a
+        // BLOCKING delegation finishes), but the detached worker still writes
+        // `<session>/subagents/<taskId>.jsonl`. Without the spawn-renderer
+        // fallback every backgrounded worker's nested tool calls were dropped.
+        let root = std::env::temp_dir().join(format!("codeg-cb-asyncsub-{}", uuid::Uuid::new_v4()));
+        let sid = "sess-bg";
+        write_session(&root, "Users-demo-app", sid, &async_launch_records());
+        write_subagent(
+            &root,
+            "Users-demo-app",
+            sid,
+            "agent-x1",
+            &[
+                json!({"type":"function_call","timestamp":1789450930000i64,"sessionId":"agent-x1",
+                       "name":"Bash","callId":"s1","arguments":"{\"command\": \"pnpm build\"}"}),
+                json!({"type":"function_call_result","timestamp":1789450931000i64,"sessionId":"agent-x1",
+                       "name":"Bash","callId":"s1","status":"completed",
+                       "output":{"type":"text","text":"Compiled successfully"}}),
+            ],
+        );
+
+        let parser = CodeBuddyParser::with_base_dir(root.clone());
+        let detail = parser.get_conversation(sid).expect("detail");
+        let stats = detail
+            .turns
+            .iter()
+            .flat_map(|t| &t.blocks)
+            .find_map(|b| match b {
+                ContentBlock::ToolResult {
+                    tool_use_id,
+                    agent_stats,
+                    ..
+                } if tool_use_id.as_deref() == Some("a1") => agent_stats.clone(),
+                _ => None,
+            })
+            .expect("async launch must load the detached worker's transcript");
+        assert_eq!(stats.total_tool_use_count, Some(1));
+        assert_eq!(stats.tool_calls[0].tool_name, "Bash");
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn a_non_agent_result_is_never_touched_by_the_background_fold() {
+        // Isolation, mirroring `subagent_tool_calls_loaded_into_agent_stats`'s
+        // stray-`subAgent` guard: both the lifecycle rewrite and the transcript
+        // load are gated on the PAIRED CALL being an `Agent`, not on the
+        // renderer's presence — so a stray spawn renderer on a Bash result can
+        // neither rewrite its output nor pull in a transcript.
+        let root = std::env::temp_dir().join(format!("codeg-cb-bgiso-{}", uuid::Uuid::new_v4()));
+        let sid = "sess-bg";
+        let mut records = async_launch_records();
+        records.push(
+            json!({"type":"function_call","timestamp":1789450940000i64,"cwd":"/Users/demo/app","sessionId":sid,
+                   "name":"Bash","callId":"b1","arguments":"{\"command\": \"ls\"}"}),
+        );
+        records.push(
+            json!({"type":"function_call_result","timestamp":1789450940100i64,"cwd":"/Users/demo/app","sessionId":sid,
+                   "name":"Bash","callId":"b1","status":"completed",
+                   "output":{"type":"text","text":"a.ts"},
+                   "providerData":{"toolResult":{"content":"a.ts","renderer": spawn_renderer("agent-x1")}}}),
+        );
+        records.push(task_notification_record(
+            1789450948007,
+            "agent-x1",
+            "completed",
+            "done",
+        ));
+        write_session(&root, "Users-demo-app", sid, &records);
+        write_subagent(
+            &root,
+            "Users-demo-app",
+            sid,
+            "agent-x1",
+            &[
+                json!({"type":"function_call","timestamp":1789450930000i64,"sessionId":"agent-x1",
+                       "name":"Bash","callId":"s1","arguments":"{\"command\": \"pnpm build\"}"}),
+                json!({"type":"function_call_result","timestamp":1789450931000i64,"sessionId":"agent-x1",
+                       "name":"Bash","callId":"s1","status":"completed",
+                       "output":{"type":"text","text":"ok"}}),
+            ],
+        );
+
+        let parser = CodeBuddyParser::with_base_dir(root.clone());
+        let detail = parser.get_conversation(sid).expect("detail");
+        let (output, stats) = detail
+            .turns
+            .iter()
+            .flat_map(|t| &t.blocks)
+            .find_map(|b| match b {
+                ContentBlock::ToolResult {
+                    tool_use_id,
+                    output_preview,
+                    agent_stats,
+                    ..
+                } if tool_use_id.as_deref() == Some("b1") => {
+                    Some((output_preview.clone(), agent_stats.clone()))
+                }
+                _ => None,
+            })
+            .expect("bash result");
+        assert_eq!(output.as_deref(), Some("a.ts"));
+        assert!(stats.is_none());
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
     #[test]
     fn deferred_mcp_tool_is_unwrapped() {
         let root = std::env::temp_dir().join(format!("codeg-cb-defer-{}", uuid::Uuid::new_v4()));
@@ -1830,7 +2458,6 @@ mod tests {
 
         std::fs::remove_dir_all(&root).ok();
     }
-
     fn test_codeg_terminal_context() -> String {
         "<codeg_terminal_context version=\"1\">\n\
 Selected shell: PowerShell 7\n\

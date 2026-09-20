@@ -495,6 +495,7 @@ function seedDetail(turns: MessageTurn[], inFlightUserTurnId?: string) {
       batchBoundaryPrefixHash: null,
       loadingOlderTurns: false,
       olderTurnsPrependEpoch: 0,
+      pendingOutOfTurnContent: false,
       pendingCleanup: false,
       delegateSyncError: null,
       pendingCancel: null,

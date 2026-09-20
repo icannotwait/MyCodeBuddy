@@ -244,6 +244,7 @@ describe("ConversationPageInner route bootstrap", () => {
     render(<ConversationPage />)
 
     await waitFor(() => expect(h.emit).toHaveBeenCalledTimes(1))
+    await waitFor(() => expect(h.subscribe).toHaveBeenCalledTimes(1))
     expect(h.getFolderConversation).toHaveBeenCalledTimes(1)
     expect(h.getFolder).toHaveBeenCalledTimes(1)
     expect(h.seedFolder).toHaveBeenCalledTimes(1)

@@ -9,6 +9,9 @@ use portable_pty::{native_pty_system, CommandBuilder, MasterPty, PtySize};
 use super::error::TerminalError;
 use super::shell::{configure_interactive_command, ResolvedShellSpec};
 use super::types::{TerminalEvent, TerminalInfo, TerminalSnapshot};
+use crate::browser::service_url::ServiceScanner;
+use crate::browser::services::ServiceWatch;
+use crate::browser::types::ServiceSource;
 use crate::web::event_bridge::EventEmitter;
 
 /// How much recent PTY output a terminal keeps for re-attaching viewers. Sized
@@ -164,6 +167,7 @@ impl TerminalManager {
         let (write_tx, write_rx) = mpsc::channel::<Vec<u8>>();
         let scrollback = Arc::new(Mutex::new(Scrollback::default()));
 
+        let owner_window = opts.owner_window_label.clone();
         let instance = TerminalInstance {
             write_tx,
             master: pair.master,
@@ -191,10 +195,22 @@ impl TerminalManager {
         // Named reader thread — emits per-terminal events
         let id_for_reader = terminal_id.clone();
         let terminals_ref = self.terminals.clone();
+        // The watch that notices a dev server announcing itself in this
+        // terminal's output. Built here because this is where the owning
+        // window is known; it probes and emits on threads of its own, so the
+        // reader below never waits on a socket.
+        let watch = ServiceWatch::new(emitter.clone(), owner_window, ServiceSource::Terminal);
         std::thread::Builder::new()
             .name(format!("pty-reader-{short_id}"))
             .spawn(move || {
-                read_loop(reader, id_for_reader, &emitter, &terminals_ref, &scrollback);
+                read_loop(
+                    reader,
+                    id_for_reader,
+                    &emitter,
+                    &terminals_ref,
+                    &scrollback,
+                    &watch,
+                );
             })
             .map_err(|e| TerminalError::SpawnFailed(e.to_string()))?;
 
@@ -274,8 +290,19 @@ impl TerminalManager {
         Ok(())
     }
 
-    pub fn list_with_exit_check(&self, emitter: Option<&EventEmitter>) -> Vec<TerminalInfo> {
-        let mut terminals = self.terminals.lock().unwrap();
+    /// THE liveness gate. Drops terminals whose child has exited and returns
+    /// their ids so the caller can announce them.
+    ///
+    /// Every "is this terminal still running" question routes through here.
+    /// A second copy of the `try_wait` logic is how a close confirmation ends
+    /// up claiming three terminals will die while the kill that follows
+    /// reports two.
+    ///
+    /// Reaped instances get their temp files removed. Dropping a
+    /// `TerminalInstance` releases the PTY but not the credential store and
+    /// helper script on disk — only [`terminate_terminal`] did that, and it is
+    /// not on this path.
+    fn reap_exited(terminals: &mut HashMap<String, TerminalInstance>) -> Vec<String> {
         let mut exited_terminal_ids: Vec<String> = Vec::new();
 
         // Windows ConPTY may not always surface EOF promptly; reconcile exited
@@ -296,8 +323,17 @@ impl TerminalManager {
         }
 
         for terminal_id in &exited_terminal_ids {
-            terminals.remove(terminal_id);
+            if let Some(mut instance) = terminals.remove(terminal_id) {
+                cleanup_temp_files(&mut instance.temp_files);
+            }
         }
+
+        exited_terminal_ids
+    }
+
+    pub fn list_with_exit_check(&self, emitter: Option<&EventEmitter>) -> Vec<TerminalInfo> {
+        let mut terminals = self.terminals.lock().unwrap();
+        let exited_terminal_ids = Self::reap_exited(&mut terminals);
 
         let infos = terminals
             .iter()
@@ -316,6 +352,35 @@ impl TerminalManager {
         }
 
         infos
+    }
+
+    /// How many of `owner_window_label`'s terminals are still running.
+    ///
+    /// Shares [`Self::reap_exited`] with `list_with_exit_check` so a finished
+    /// build is never counted as work in progress — the close confirmation
+    /// this feeds is ignored the moment it cries wolf.
+    pub fn count_live_by_owner_window(
+        &self,
+        owner_window_label: &str,
+        emitter: Option<&EventEmitter>,
+    ) -> usize {
+        let mut terminals = self.terminals.lock().unwrap();
+        let exited_terminal_ids = Self::reap_exited(&mut terminals);
+
+        let live = terminals
+            .values()
+            .filter(|instance| instance.owner_window_label == owner_window_label)
+            .count();
+
+        drop(terminals);
+
+        if let Some(emitter) = emitter {
+            for terminal_id in exited_terminal_ids {
+                emit_terminal_exit_event(emitter, &terminal_id);
+            }
+        }
+
+        live
     }
 
     pub fn kill_by_owner_window(&self, owner_window_label: &str) -> usize {
@@ -541,9 +606,12 @@ fn read_loop(
     emitter: &EventEmitter,
     terminals: &Arc<Mutex<HashMap<String, TerminalInstance>>>,
     scrollback: &Arc<Mutex<Scrollback>>,
+    watch: &ServiceWatch,
 ) {
     let output_event = format!("terminal://output/{}", terminal_id);
     let mut buf = [0u8; 8192];
+    // Thread-confined, so the carry buffer and the rate limit need no lock.
+    let mut services = ServiceScanner::new();
 
     loop {
         match reader.read(&mut buf) {
@@ -562,6 +630,11 @@ fn read_loop(
                     .lock()
                     .map(|mut s| s.append(&data))
                     .unwrap_or_default();
+                // Before the emit, not after: this is the only place a
+                // terminal's output passes through in one piece, and a viewer
+                // that is not mounted (the mobile drawer, a canvas card on
+                // another route) never sees it at all.
+                watch.feed(&mut services, &data, &terminal_id);
                 let event = TerminalEvent {
                     terminal_id: terminal_id.clone(),
                     data,
@@ -611,6 +684,8 @@ fn thread_name_prefix(terminal_id: &str) -> String {
 mod tests {
     use super::thread_name_prefix;
     use super::TerminalManager;
+    #[cfg(not(target_os = "windows"))]
+    use super::{Arc, EventEmitter, SpawnOptions};
     use super::{Scrollback, SCROLLBACK_MAX_CHARS};
 
     #[test]
@@ -734,5 +809,77 @@ mod tests {
         assert!(tm.contains_for_test("t-other-op"));
         assert!(tm.contains_for_test("t-other-label"));
         assert!(tm.contains_for_test("t-no-op"));
+    }
+
+    /// The whole local-server path over a REAL pty: a real shell prints a real
+    /// banner, the watch reads it out of the output stream, connects to the
+    /// socket, and the frontend's event arrives naming the window that owns
+    /// the terminal.
+    ///
+    /// The pieces have unit tests of their own; what only an end-to-end run
+    /// can show is that the watch is wired into the reader at all, and that a
+    /// banner survives a real PTY (its line endings, its echo, its shell).
+    #[cfg(not(target_os = "windows"))]
+    #[tokio::test]
+    async fn a_server_announced_in_a_terminal_reaches_the_frontend() {
+        use crate::browser::types::SERVICE_DETECTED_EVENT;
+        use crate::web::event_bridge::WebEventBroadcaster;
+        use std::time::Duration;
+
+        // Something really listening, so the probe has something to find.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().unwrap().port();
+
+        let broadcaster = Arc::new(WebEventBroadcaster::new());
+        // Subscribed before the spawn: the broadcaster drops what it sends
+        // with no receivers, and a shell prints fast.
+        let mut events = broadcaster.subscribe();
+        let emitter = EventEmitter::test_web_only(broadcaster);
+
+        let manager = TerminalManager::new();
+        manager
+            .spawn_with_id(
+                SpawnOptions {
+                    terminal_id: "svc-e2e".to_string(),
+                    working_dir: std::env::temp_dir().to_string_lossy().to_string(),
+                    owner_window_label: "main".to_string(),
+                    owner_operation_id: None,
+                    shell: super::ResolvedShellSpec {
+                        executable: std::path::PathBuf::from("/bin/sh"),
+                        dialect: crate::terminal::shell::ShellDialect::Posix,
+                        display_name: "sh".into(),
+                        source: crate::terminal::shell::ShellSource::System,
+                        command_strategy: crate::terminal::shell::ShellCommandStrategy::Posix,
+                    },
+                    initial_command: Some(format!(
+                        "printf '  ➜  Local:   http://127.0.0.1:{port}/\\n'"
+                    )),
+                    extra_env: None,
+                    temp_files: vec![],
+                },
+                emitter,
+            )
+            .expect("spawn");
+
+        let detected = tokio::time::timeout(Duration::from_secs(20), async {
+            loop {
+                let event = events.recv().await.expect("event bus");
+                if event.channel == SERVICE_DETECTED_EVENT {
+                    return event;
+                }
+            }
+        })
+        .await
+        .expect("the service event");
+
+        let payload = detected.payload;
+        assert_eq!(payload["origin"], format!("http://127.0.0.1:{port}"));
+        assert_eq!(payload["url"], format!("http://127.0.0.1:{port}/"));
+        assert_eq!(payload["authority"], format!("127.0.0.1:{port}"));
+        assert_eq!(payload["ownerWindow"], "main");
+        assert_eq!(payload["source"], "terminal");
+        assert_eq!(payload["terminalId"], "svc-e2e");
+
+        let _ = manager.kill("svc-e2e");
     }
 }

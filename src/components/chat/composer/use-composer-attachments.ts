@@ -39,6 +39,7 @@ import {
   hasFileTreeDragType,
   readFileTreeDragPayload,
 } from "@/lib/file-tree-dnd"
+import type { KnownInvocations } from "@/lib/invocation-token"
 import { isDesktop, openFileDialog } from "@/lib/platform"
 import {
   buildFileUri,
@@ -168,8 +169,14 @@ export interface ComposerAttachments {
 
   /** Replay a stored `PromptInputBlock[]` into this composer: prose + file
    *  badges inline, images into the strip, bytes-bearing resources re-registered
-   *  behind fresh sentinel badges. Replaces whatever the editor held. */
-  hydrateFromBlocks: (editor: Editor, blocks: PromptInputBlock[]) => void
+   *  behind fresh sentinel badges. Replaces whatever the editor held. `known`
+   *  is the host's advertised invocations, gating bare `/cmd` tokens in the
+   *  prose (see {@link restoreBlocksIntoEditor}). */
+  hydrateFromBlocks: (
+    editor: Editor,
+    blocks: PromptInputBlock[],
+    known?: KnownInvocations
+  ) => void
   removeAttachment: (id: string) => void
   clearAttachments: () => void
   /** The image blocks for a send, in the encoding the agent accepts. Inline
@@ -1296,9 +1303,9 @@ export function useComposerAttachments({
   // re-registered in the payload map (their original sentinel uri was never
   // serialized, so each gets a fresh one).
   const hydrateFromBlocks = useCallback(
-    (editor: Editor, blocks: PromptInputBlock[]) => {
+    (editor: Editor, blocks: PromptInputBlock[], known?: KnownInvocations) => {
       embeddedPayloadsRef.current.clear()
-      const restored = restoreBlocksIntoEditor(editor, blocks)
+      const restored = restoreBlocksIntoEditor(editor, blocks, known)
       setAttachments(
         restored.filter((a): a is ImageInputAttachment => a.type === "image")
       )

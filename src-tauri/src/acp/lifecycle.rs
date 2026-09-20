@@ -665,6 +665,22 @@ async fn persist_live_external_id(
     Ok(())
 }
 
+/// Bind `session_id` onto a live conversation row without broadcasting.
+/// Used by `TurnComplete(end_turn)` so hydrate can find the agent store
+/// while the CAS path remains the sole `conversation://changed` writer.
+async fn bind_live_external_id(
+    db_conn: &DatabaseConnection,
+    conversation_id: i32,
+    agent_type: AgentType,
+    session_id: &str,
+) -> Result<(), DbError> {
+    let continues = crate::acp::continued_session_ids(agent_type, session_id);
+    let _preserved =
+        conversation_service::bind_external_id(db_conn, conversation_id, session_id, &continues)
+            .await?;
+    Ok(())
+}
+
 pub(crate) async fn handle_event(
     db_conn: &DatabaseConnection,
     manager: &ConnectionManager,
@@ -793,9 +809,13 @@ pub(crate) async fn handle_event(
                 if !sid.is_empty() {
                     match conversation_service::get_by_id(db_conn, cid).await {
                         Ok(row) if row.external_id.is_none() => {
+                            // Bind only. SessionStarted/ConversationLinked use
+                            // persist_live_external_id (upsert). end_turn must
+                            // emit exactly one conversation://changed State
+                            // after CAS — an extra upsert fails the fork
+                            // single-event invariant.
                             if let Err(e) =
-                                persist_live_external_id(db_conn, &emitter, cid, agent_type, &sid)
-                                    .await
+                                bind_live_external_id(db_conn, cid, agent_type, &sid).await
                             {
                                 tracing::warn!(
                                     conversation_id = cid,

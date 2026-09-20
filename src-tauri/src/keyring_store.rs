@@ -28,6 +28,13 @@ impl std::fmt::Debug for CredentialState {
     }
 }
 
+/// Namespace for secrets that are not tokens of an account or a channel. The
+/// prefix keeps them from ever colliding with a `github-token:<id>` whose id
+/// happens to look like a secret name.
+fn secret_key(name: &str) -> String {
+    format!("secret:{}", name)
+}
+
 // ── Tauri mode: OS keyring ──
 
 #[cfg(feature = "tauri-runtime")]
@@ -115,18 +122,39 @@ fn tokens_backup_path(path: &std::path::Path) -> std::path::PathBuf {
 /// empty map — they can result from a truncated legacy write.
 #[cfg(not(feature = "tauri-runtime"))]
 fn read_tokens_map() -> Result<std::collections::HashMap<String, String>, String> {
-    let path = tokens_file_path();
+    read_tokens_at_checked(&tokens_file_path())
+}
+
+#[cfg(not(feature = "tauri-runtime"))]
+#[allow(dead_code)]
+fn read_tokens_at(path: &std::path::Path) -> std::collections::HashMap<String, String> {
+    read_tokens_at_checked(path).unwrap_or_default()
+}
+
+/// The same read, but an unreadable or corrupt store is an error rather than an
+/// empty map. Callers that WRITE secrets back need the distinction: "there is no
+/// entry" and "the file would not open" lead to opposite decisions on the way
+/// out — write nothing, versus refuse to write at all — and collapsing them
+/// turns a transient read failure into a permanent deletion.
+///
+/// Empty / whitespace-only files are treated as corrupt (`Err`), not as an
+/// empty map — they can result from a truncated legacy write. A missing live
+/// file with a `.bak` sibling is recovered rather than treated as empty.
+#[cfg(not(feature = "tauri-runtime"))]
+fn read_tokens_at_checked(
+    path: &std::path::Path,
+) -> Result<std::collections::HashMap<String, String>, String> {
     #[cfg(unix)]
     if path.exists() {
         use std::os::unix::fs::PermissionsExt;
-        if let Err(err) = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)) {
+        if let Err(err) = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)) {
             tracing::warn!(
                 "[tokens] could not tighten {} to 0600: {err}",
                 path.display()
             );
         }
     }
-    match std::fs::read_to_string(&path) {
+    match std::fs::read_to_string(path) {
         Ok(s) => {
             let trimmed = s.trim();
             if trimmed.is_empty() {
@@ -139,11 +167,11 @@ fn read_tokens_map() -> Result<std::collections::HashMap<String, String>, String
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             // After a failed publish the live file may be gone while the
             // backup still holds credentials. That is Unavailable, not Absent.
-            let bak = tokens_backup_path(&path);
+            let bak = tokens_backup_path(path);
             if bak.exists() {
                 // Best-effort crash recovery: restore backup as the live store.
-                match std::fs::rename(&bak, &path) {
-                    Ok(()) => return read_tokens_map(),
+                match std::fs::rename(&bak, path) {
+                    Ok(()) => return read_tokens_at_checked(path),
                     Err(_) => {
                         return Err(
                             "token store missing after failed publish; backup present but unrecoverable"
@@ -581,6 +609,69 @@ pub fn delete_channel_token(channel_id: i32) -> Result<(), String> {
 pub fn codeg_data_dir_env_lock() -> &'static std::sync::Mutex<()> {
     static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
     &LOCK
+}
+
+// ── Named secrets ──
+// Same storage as the tokens above (OS keyring on desktop, the 0600
+// `tokens.json` on a server), for credentials that belong to a feature rather
+// than to an account: the config-sync WebDAV password and snapshot passphrase.
+
+#[cfg(feature = "tauri-runtime")]
+pub fn set_secret(name: &str, value: &str) -> Result<(), String> {
+    let entry = keyring::Entry::new(SERVICE_NAME, &secret_key(name))
+        .map_err(|e| format!("keyring init error: {e}"))?;
+    entry
+        .set_password(value)
+        .map_err(|e| format!("keyring set error: {e}"))
+}
+
+/// `Ok(None)` is "nothing stored under that name"; `Err` is "the store would not
+/// open". Unlike [`get_token`], which collapses both into `None`, a secret's
+/// reader has to keep them apart: an empty value means "delete this entry" when
+/// it travels back through [`set_secret`]/[`delete_secret`], so a denied
+/// keychain prompt read as "absent" would erase the secret at the next save.
+#[cfg(feature = "tauri-runtime")]
+pub fn get_secret(name: &str) -> Result<Option<String>, String> {
+    let entry = keyring::Entry::new(SERVICE_NAME, &secret_key(name))
+        .map_err(|e| format!("keyring init error: {e}"))?;
+    match entry.get_password() {
+        Ok(value) => Ok(Some(value)),
+        Err(keyring::Error::NoEntry) => Ok(None),
+        Err(e) => Err(format!("keyring get error: {e}")),
+    }
+}
+
+#[cfg(feature = "tauri-runtime")]
+pub fn delete_secret(name: &str) -> Result<(), String> {
+    let entry = keyring::Entry::new(SERVICE_NAME, &secret_key(name))
+        .map_err(|e| format!("keyring init error: {e}"))?;
+    match entry.delete_credential() {
+        Ok(()) => Ok(()),
+        Err(keyring::Error::NoEntry) => Ok(()),
+        Err(e) => Err(format!("keyring delete error: {e}")),
+    }
+}
+
+#[cfg(not(feature = "tauri-runtime"))]
+pub fn set_secret(name: &str, value: &str) -> Result<(), String> {
+    let _guard = tokens_mutex().lock().unwrap_or_else(|e| e.into_inner());
+    let mut tokens = read_tokens_map()?;
+    tokens.insert(secret_key(name), value.to_string());
+    write_tokens_map(&tokens)
+}
+
+#[cfg(not(feature = "tauri-runtime"))]
+pub fn get_secret(name: &str) -> Result<Option<String>, String> {
+    let _guard = tokens_mutex().lock().unwrap_or_else(|e| e.into_inner());
+    Ok(read_tokens_map()?.get(&secret_key(name)).cloned())
+}
+
+#[cfg(not(feature = "tauri-runtime"))]
+pub fn delete_secret(name: &str) -> Result<(), String> {
+    let _guard = tokens_mutex().lock().unwrap_or_else(|e| e.into_inner());
+    let mut tokens = read_tokens_map()?;
+    tokens.remove(&secret_key(name));
+    write_tokens_map(&tokens)
 }
 
 #[cfg(all(test, not(feature = "tauri-runtime")))]

@@ -47,6 +47,20 @@ jobs:
       - name: Lint
         run: pnpm eslint .
 
+      - name: Browser agent bundle matches its source
+        # `src-tauri/src/browser/js/agent.bundle.js` is committed so that a
+        # cargo build needs no node — `include_str!` reads it at compile time.
+        # A committed artifact is only worth anything if it is the one the
+        # source produces, and nothing else in the build would notice a stale
+        # one: the Rust side would happily embed last week's bundle.
+        run: pnpm browser:agent:check
+
+      - name: Browser agent typecheck
+        # `browser-agent/` is excluded from the app's tsconfig (its vendored
+        # half answers to Playwright's compiler settings, not ours), so the
+        # repo-wide typecheck in `pnpm build` never sees our entry point.
+        run: pnpm browser:agent:types
+
       - name: Unit tests (vitest)
         run: pnpm test
 
@@ -76,6 +90,10 @@ jobs:
   rust:
     name: Rust ${{ matrix.mode }} on ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
+    env:
+      # Ubuntu desktop links the full Tauri + integration-test graph. Parallel
+      # rustc on the 7 GiB runner SIGTERMs (exit 143) after the 0.31.0 merge.
+      CARGO_BUILD_JOBS: ${{ (matrix.os == 'ubuntu-22.04' && matrix.mode == 'desktop') && '1' || '4' }}
     strategy:
       fail-fast: false
       matrix:

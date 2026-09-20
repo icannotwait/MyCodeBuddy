@@ -277,7 +277,9 @@
           "type": "array",
           "items": {
             "type": "string"
-          }
+          },
+          "minItems": 1,
+          "description": "One or more task_ids returned by delegate_to_agent — pass a single id to poll one task, or several to poll them together in one call. The response is always a JSON object {\"tasks\":[...]} with one entry per id (in this order) — one entry for a single id — and each entry carries that task's task_id and status."
         },
         "wait_ms": {
           "minimum": 0,
