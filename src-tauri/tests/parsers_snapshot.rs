@@ -15,7 +15,8 @@ use std::path::Path;
 
 use codeg_lib::parsers::{
     claude::ClaudeParser, cline::ClineParser, codex::CodexParser, gemini::GeminiParser,
-    hermes::HermesParser, kimi_code::KimiCodeParser, opencode::OpenCodeParser, AgentParser,
+    hermes::HermesParser, kimi_code::KimiCodeParser, opencode::OpenCodeParser,
+    AgentParser,
 };
 use insta::assert_json_snapshot;
 use serde_json::json;
@@ -205,6 +206,7 @@ fn gemini_minimal_session_snapshot() {
     });
 }
 
+
 // ────────────────────────────────────────────────────────────────────────────
 // Cline
 // ────────────────────────────────────────────────────────────────────────────
@@ -317,8 +319,8 @@ fn opencode_minimal_session_snapshot() {
             .expect("open sqlite");
 
         for ddl in [
-            "CREATE TABLE session (id TEXT PRIMARY KEY, directory TEXT, title TEXT, \
-             time_created INTEGER, time_updated INTEGER)",
+            "CREATE TABLE session (id TEXT PRIMARY KEY, directory TEXT, parent_id TEXT, \
+             title TEXT, time_created INTEGER, time_updated INTEGER)",
             "CREATE TABLE message (id TEXT PRIMARY KEY, session_id TEXT, \
              time_created INTEGER, data TEXT)",
             "CREATE TABLE part (id TEXT PRIMARY KEY, message_id TEXT, \
@@ -421,6 +423,670 @@ fn opencode_minimal_session_snapshot() {
         ".**.timestamp" => "[ts]",
         ".**.completed_at" => "[ts]",
     });
+}
+
+/// Tool calls captured verbatim from a real opencode 1.18.14 run: OpenCode
+/// spells its arguments in camelCase (`filePath`, `oldString`), keeps a failed
+/// call's message in `state.error` rather than `state.output`, wraps `read`
+/// results in an XML envelope with `N: ` line prefixes, and returns the whole
+/// SKILL.md inside `<skill_content>`. This pins the rewrite onto codeg's shared
+/// tool vocabulary, plus the sub-agent session nesting via `session.parent_id`.
+#[test]
+fn opencode_tool_call_session_snapshot() {
+    use sea_orm::{ConnectionTrait, Database, DatabaseBackend, Statement};
+
+    let temp = tempfile::tempdir().expect("create tempdir");
+    let base = temp.path().to_path_buf();
+    let db_path = base.join("opencode.db");
+    let session_id = "oc-tools-001";
+    let child_session_id = "oc-tools-001-child";
+
+    // 2026-03-01T10:00:00Z in milliseconds.
+    let t0: i64 = 1_772_020_800_000;
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("build tokio runtime");
+    rt.block_on(async {
+        let conn = Database::connect(format!("sqlite:{}?mode=rwc", db_path.display()))
+            .await
+            .expect("open sqlite");
+
+        for ddl in [
+            "CREATE TABLE session (id TEXT PRIMARY KEY, directory TEXT, parent_id TEXT, \
+             title TEXT, time_created INTEGER, time_updated INTEGER)",
+            "CREATE TABLE message (id TEXT PRIMARY KEY, session_id TEXT, \
+             time_created INTEGER, data TEXT)",
+            "CREATE TABLE part (id TEXT PRIMARY KEY, message_id TEXT, \
+             time_created INTEGER, data TEXT)",
+        ] {
+            conn.execute(Statement::from_string(DatabaseBackend::Sqlite, ddl))
+                .await
+                .expect("create table");
+        }
+
+        for (id, parent, title) in [
+            (session_id, None, "OpenCode tool session"),
+            (
+                child_session_id,
+                Some(session_id),
+                "Inspect VERSION (@general subagent)",
+            ),
+        ] {
+            conn.execute(Statement::from_sql_and_values(
+                DatabaseBackend::Sqlite,
+                "INSERT INTO session (id, directory, parent_id, title, time_created, \
+                 time_updated) VALUES (?, ?, ?, ?, ?, ?)",
+                [
+                    id.into(),
+                    "/tmp/demo".into(),
+                    parent.into(),
+                    title.into(),
+                    t0.into(),
+                    (t0 + 9_000).into(),
+                ],
+            ))
+            .await
+            .expect("insert session");
+        }
+
+        for (mid, sid, offset, data) in [
+            (
+                "m-tools-user",
+                session_id,
+                500_i64,
+                json!({ "role": "user", "time": { "created": t0 + 500 } }),
+            ),
+            (
+                "m-tools-asst",
+                session_id,
+                1_000,
+                json!({
+                    "role": "assistant",
+                    "modelID": "claude-sonnet-4-6",
+                    "time": { "created": t0 + 1_000, "completed": t0 + 8_000 },
+                    "tokens": { "input": 400, "output": 340, "cache": { "read": 800, "write": 0 } },
+                }),
+            ),
+            (
+                "m-child-user",
+                child_session_id,
+                2_000,
+                json!({ "role": "user", "time": { "created": t0 + 2_000 } }),
+            ),
+        ] {
+            conn.execute(Statement::from_sql_and_values(
+                DatabaseBackend::Sqlite,
+                "INSERT INTO message (id, session_id, time_created, data) VALUES (?, ?, ?, ?)",
+                [
+                    mid.into(),
+                    sid.into(),
+                    (t0 + offset).into(),
+                    data.to_string().into(),
+                ],
+            ))
+            .await
+            .expect("insert message");
+        }
+
+        let parts = [
+            ("p-01", "m-tools-user", json!({ "type": "text", "text": "polish the greeting" })),
+            ("p-02", "m-tools-asst", json!({ "type": "text", "text": "Loading the skill." })),
+            ("p-03", "m-tools-asst", json!({
+                "type": "tool", "tool": "skill", "callID": "call_skill",
+                "state": {
+                    "status": "completed",
+                    "input": { "name": "demo-skill" },
+                    "output": "<skill_content name=\"demo-skill\">\n# Skill: demo-skill\n\n1. Read the target file.\n2. Apply the change.\n\nBase directory for this skill: /cfg/skills/demo-skill\nNote: file list is sampled.\n\n<skill_files>\n<file>/cfg/skills/demo-skill/run.sh</file>\n</skill_files>\n</skill_content>",
+                    "title": "Loaded skill: demo-skill",
+                    "metadata": { "name": "demo-skill", "dir": "/cfg/skills/demo-skill" },
+                    "time": { "start": t0 + 1_100, "end": t0 + 1_200 },
+                },
+            })),
+            ("p-04", "m-tools-asst", json!({
+                "type": "tool", "tool": "read", "callID": "call_read",
+                "state": {
+                    "status": "completed",
+                    "input": { "filePath": "src/app.ts" },
+                    "output": "<path>/tmp/demo/src/app.ts</path>\n<type>file</type>\n<content>\n1: export function greet(name: string) {\n2:   return `hello ${name}`\n3: }\n\n(End of file - total 3 lines)\n</content>",
+                    "metadata": {
+                        "preview": "export function greet(name: string) {",
+                        "display": {
+                            "type": "file",
+                            "path": "/tmp/demo/src/app.ts",
+                            "text": "export function greet(name: string) {\n  return `hello ${name}`\n}",
+                            "lineStart": 1,
+                            "lineEnd": 3,
+                            "totalLines": 3,
+                        },
+                    },
+                    "title": "src/app.ts",
+                    "time": { "start": t0 + 1_300, "end": t0 + 1_400 },
+                },
+            })),
+            ("p-05", "m-tools-asst", json!({
+                "type": "tool", "tool": "edit", "callID": "call_edit",
+                "state": {
+                    "status": "completed",
+                    "input": {
+                        "filePath": "src/app.ts",
+                        "oldString": "hello ${name}",
+                        "newString": "Hello, ${name}!",
+                    },
+                    "output": "Edit applied successfully.",
+                    "metadata": {
+                        "diagnostics": {},
+                        "diff": "Index: /tmp/demo/src/app.ts\n===================================================================\n--- /tmp/demo/src/app.ts\n+++ /tmp/demo/src/app.ts\n@@ -2,1 +2,1 @@\n-  return `hello ${name}`\n+  return `Hello, ${name}!`\n",
+                        "filediff": {
+                            "file": "/tmp/demo/src/app.ts",
+                            "patch": "…",
+                            "additions": 1,
+                            "deletions": 1,
+                        },
+                    },
+                    "title": "src/app.ts",
+                    "time": { "start": t0 + 1_500, "end": t0 + 1_600 },
+                },
+            })),
+            ("p-06", "m-tools-asst", json!({
+                "type": "tool", "tool": "write", "callID": "call_write",
+                "state": {
+                    "status": "completed",
+                    "input": { "filePath": "src/new.ts", "content": "export const A = 1\n" },
+                    "output": "Wrote file successfully.",
+                    "metadata": { "filepath": "/tmp/demo/src/new.ts", "exists": false },
+                    "title": "src/new.ts",
+                    "time": { "start": t0 + 1_700, "end": t0 + 1_800 },
+                },
+            })),
+            ("p-07", "m-tools-asst", json!({
+                "type": "tool", "tool": "grep", "callID": "call_grep",
+                "state": {
+                    "status": "completed",
+                    "input": { "pattern": "VERSION", "path": ".", "include": "*.ts" },
+                    "output": "Found 1 matches",
+                    "metadata": { "matches": 1 },
+                    "title": "VERSION",
+                    "time": { "start": t0 + 1_900, "end": t0 + 2_000 },
+                },
+            })),
+            ("p-08", "m-tools-asst", json!({
+                "type": "tool", "tool": "task", "callID": "call_task",
+                "state": {
+                    "status": "completed",
+                    "input": {
+                        "subagent_type": "general",
+                        "description": "Inspect VERSION",
+                        "prompt": "Find the VERSION constant and report it.",
+                    },
+                    "output": "<task id=\"oc-tools-001-child\" state=\"completed\">\n<task_result>\nVERSION is 1.0.0\n</task_result>\n</task>",
+                    "metadata": {
+                        "sessionId": child_session_id,
+                        "model": { "modelID": "claude-sonnet-4-6", "providerID": "anthropic" },
+                    },
+                    "title": "Inspect VERSION",
+                    "time": { "start": t0 + 2_100, "end": t0 + 2_600 },
+                },
+            })),
+            // Failure: the message lives in `state.error`, never `state.output`.
+            ("p-09", "m-tools-asst", json!({
+                "type": "tool", "tool": "edit", "callID": "call_edit_fail",
+                "state": {
+                    "status": "error",
+                    "input": { "filePath": "src/missing.ts", "oldString": "nope", "newString": "yep" },
+                    "error": "File /tmp/demo/src/missing.ts not found",
+                    "time": { "start": t0 + 2_700, "end": t0 + 2_800 },
+                },
+            })),
+            // OpenCode's own UI hides `patch` alongside step-start/step-finish.
+            ("p-10", "m-tools-asst", json!({
+                "type": "patch", "hash": "abc123", "files": ["/tmp/demo/src/app.ts"],
+            })),
+            ("p-11", "m-tools-asst", json!({
+                "type": "step-finish",
+                "reason": "stop",
+                "tokens": { "total": 1540, "input": 400, "output": 340, "reasoning": 0,
+                            "cache": { "read": 800, "write": 0 } },
+            })),
+            ("p-12", "m-child-user", json!({
+                "type": "text", "text": "Find the VERSION constant and report it.",
+            })),
+            // Child-session tool calls surface as `agent_stats.tool_calls`
+            // rows on the parent's Agent card (batch_load_subagent_tool_calls)
+            // and must go through the same normalization: canonical snake_case
+            // input, and `state.error` recovered for failures.
+            ("p-13", "m-child-user", json!({
+                "type": "tool", "tool": "edit", "callID": "call_child_edit",
+                "state": {
+                    "status": "completed",
+                    "input": {
+                        "filePath": "src/app.ts",
+                        "oldString": "  VERSION = \"1.0.0\"\n",
+                        "newString": "  VERSION = \"1.0.1\"\n",
+                    },
+                    "output": "Edit applied successfully.",
+                    "title": "src/app.ts",
+                    "time": { "start": t0 + 2_200, "end": t0 + 2_300 },
+                },
+            })),
+            ("p-14", "m-child-user", json!({
+                "type": "tool", "tool": "read", "callID": "call_child_read_fail",
+                "state": {
+                    "status": "error",
+                    "input": { "filePath": "src/gone.ts" },
+                    "error": "File not found: /tmp/demo/src/gone.ts",
+                    "time": { "start": t0 + 2_400, "end": t0 + 2_500 },
+                },
+            })),
+        ];
+
+        for (i, (pid, mid, data)) in parts.iter().enumerate() {
+            conn.execute(Statement::from_sql_and_values(
+                DatabaseBackend::Sqlite,
+                "INSERT INTO part (id, message_id, time_created, data) VALUES (?, ?, ?, ?)",
+                [
+                    (*pid).into(),
+                    (*mid).into(),
+                    (t0 + 1_000 + i as i64).into(),
+                    data.to_string().into(),
+                ],
+            ))
+            .await
+            .expect("insert part");
+        }
+    });
+
+    let parser = OpenCodeParser::with_base_dir(base);
+    let conversations = parser.list_conversations().expect("list conversations");
+    assert_json_snapshot!("opencode_tools_list", conversations, {
+        ".**.started_at" => "[ts]",
+        ".**.ended_at" => "[ts]",
+    });
+
+    let detail = parser
+        .get_conversation(session_id)
+        .expect("get conversation");
+    assert_json_snapshot!("opencode_tools_detail", detail, {
+        ".**.started_at" => "[ts]",
+        ".**.ended_at" => "[ts]",
+        ".**.timestamp" => "[ts]",
+        ".**.completed_at" => "[ts]",
+    });
+}
+
+/// The record shapes OpenCode writes AROUND the conversation, all verified
+/// against a real `~/.local/share/opencode/opencode.db` (430 sessions, 12 804
+/// parts):
+///
+///   - `synthetic` text — plan/build switch reminders and the post-compaction
+///     continuation OpenCode injects into the USER message for the model's
+///     benefit. Its own CLI filters them out of the transcript, and a message
+///     left with nothing else is not a turn the user took;
+///   - `compaction` parts, which are the sole part of their message, so the
+///     compaction previously showed as an empty user bubble;
+///   - an assistant `error`, whose message carries the only record of a turn
+///     the provider rejected or the user cancelled;
+///   - the `question` tool's positional `metadata.answers`.
+#[test]
+fn opencode_session_edges_snapshot() {
+    use sea_orm::{ConnectionTrait, Database, DatabaseBackend, Statement};
+
+    let temp = tempfile::tempdir().expect("create tempdir");
+    let base = temp.path().to_path_buf();
+    let db_path = base.join("opencode.db");
+    let session_id = "oc-edges-001";
+
+    // 2026-03-01T10:00:00Z in milliseconds.
+    let t0: i64 = 1_772_020_800_000;
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("build tokio runtime");
+    rt.block_on(async {
+        let conn = Database::connect(format!("sqlite:{}?mode=rwc", db_path.display()))
+            .await
+            .expect("open sqlite");
+
+        for ddl in [
+            "CREATE TABLE session (id TEXT PRIMARY KEY, directory TEXT, parent_id TEXT, \
+             title TEXT, time_created INTEGER, time_updated INTEGER)",
+            "CREATE TABLE message (id TEXT PRIMARY KEY, session_id TEXT, \
+             time_created INTEGER, data TEXT)",
+            "CREATE TABLE part (id TEXT PRIMARY KEY, message_id TEXT, \
+             time_created INTEGER, data TEXT)",
+        ] {
+            conn.execute(Statement::from_string(DatabaseBackend::Sqlite, ddl))
+                .await
+                .expect("create table");
+        }
+
+        conn.execute(Statement::from_sql_and_values(
+            DatabaseBackend::Sqlite,
+            "INSERT INTO session (id, directory, title, time_created, time_updated) \
+             VALUES (?, ?, ?, ?, ?)",
+            [
+                session_id.into(),
+                "/tmp/demo".into(),
+                "OpenCode session edges".into(),
+                t0.into(),
+                (t0 + 9_000).into(),
+            ],
+        ))
+        .await
+        .expect("insert session");
+
+        for (mid, offset, data) in [
+            // A real prompt with a reminder appended to the same message.
+            (
+                "m-user-mixed",
+                500_i64,
+                json!({ "role": "user", "time": { "created": t0 + 500 } }),
+            ),
+            // Nothing but the reminder: not a turn the user took.
+            (
+                "m-user-synthetic",
+                1_000,
+                json!({ "role": "user", "time": { "created": t0 + 1_000 } }),
+            ),
+            // The compaction boundary's own (synthetic) user message.
+            (
+                "m-user-compaction",
+                1_500,
+                json!({ "role": "user", "time": { "created": t0 + 1_500 } }),
+            ),
+            // A question answered in OpenCode's own TUI.
+            (
+                "m-asst-question",
+                2_000,
+                json!({
+                    "role": "assistant",
+                    "modelID": "claude-sonnet-4-6",
+                    "time": { "created": t0 + 2_000, "completed": t0 + 2_400 },
+                    "tokens": { "input": 10, "output": 4, "cache": { "read": 0, "write": 0 } },
+                }),
+            ),
+            // A turn the provider rejected: no parts at all, only the error.
+            (
+                "m-asst-error",
+                3_000,
+                json!({
+                    "role": "assistant",
+                    "modelID": "claude-sonnet-4-6",
+                    "time": { "created": t0 + 3_000, "completed": t0 + 3_100 },
+                    "tokens": { "input": 3, "output": 0, "cache": { "read": 0, "write": 0 } },
+                    "error": {
+                        "name": "APIError",
+                        "data": { "message": "Invalid Authentication" }
+                    },
+                }),
+            ),
+            // …and one the user stopped.
+            (
+                "m-asst-aborted",
+                4_000,
+                json!({
+                    "role": "assistant",
+                    "modelID": "claude-sonnet-4-6",
+                    "time": { "created": t0 + 4_000, "completed": t0 + 4_100 },
+                    "tokens": { "input": 2, "output": 0, "cache": { "read": 0, "write": 0 } },
+                    "error": {
+                        "name": "MessageAbortedError",
+                        "data": { "message": "The operation was aborted." }
+                    },
+                }),
+            ),
+        ] {
+            conn.execute(Statement::from_sql_and_values(
+                DatabaseBackend::Sqlite,
+                "INSERT INTO message (id, session_id, time_created, data) VALUES (?, ?, ?, ?)",
+                [
+                    mid.into(),
+                    session_id.into(),
+                    (t0 + offset).into(),
+                    data.to_string().into(),
+                ],
+            ))
+            .await
+            .expect("insert message");
+        }
+
+        for (i, (pid, mid, data)) in [
+            (
+                "p-user-real",
+                "m-user-mixed",
+                json!({ "type": "text", "text": "ship the release notes" }),
+            ),
+            (
+                "p-user-reminder",
+                "m-user-mixed",
+                json!({
+                    "type": "text",
+                    "synthetic": true,
+                    "text": "You are now in build mode. You can edit files."
+                }),
+            ),
+            (
+                "p-user-only-reminder",
+                "m-user-synthetic",
+                json!({
+                    "type": "text",
+                    "synthetic": true,
+                    "text": "Summarize the task tool output above and continue with your task."
+                }),
+            ),
+            (
+                "p-compaction",
+                "m-user-compaction",
+                json!({ "type": "compaction", "auto": true }),
+            ),
+            (
+                "p-question",
+                "m-asst-question",
+                json!({
+                    "type": "tool",
+                    "tool": "question",
+                    "callID": "question:2",
+                    "state": {
+                        "status": "completed",
+                        "input": {
+                            "questions": [{
+                                "question": "Ship it now?",
+                                "header": "Release",
+                                "multiple": false,
+                                "options": [
+                                    { "label": "Yes", "description": "Publish" },
+                                    { "label": "Not yet", "description": "Hold" }
+                                ]
+                            }]
+                        },
+                        "output": "User has answered your questions: \"Ship it now?\"=\"Not yet\". You can now continue with the user's answers in mind.",
+                        "title": "Asked 1 question",
+                        "metadata": { "answers": [["Not yet"]], "truncated": false },
+                        "time": { "start": t0 + 2_100, "end": t0 + 2_300 }
+                    }
+                }),
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            conn.execute(Statement::from_sql_and_values(
+                DatabaseBackend::Sqlite,
+                "INSERT INTO part (id, message_id, time_created, data) VALUES (?, ?, ?, ?)",
+                [
+                    pid.into(),
+                    mid.into(),
+                    (t0 + 1_000 + i as i64).into(),
+                    data.to_string().into(),
+                ],
+            ))
+            .await
+            .expect("insert part");
+        }
+    });
+
+    let parser = OpenCodeParser::with_base_dir(base);
+    let detail = parser
+        .get_conversation(session_id)
+        .expect("get conversation");
+    assert_json_snapshot!("opencode_edges_detail", detail, {
+        ".**.started_at" => "[ts]",
+        ".**.ended_at" => "[ts]",
+        ".**.timestamp" => "[ts]",
+        ".**.completed_at" => "[ts]",
+    });
+}
+
+/// OpenCode names a session `New session - <ISO>` at creation and is supposed to
+/// replace that on the first turn — but the rename is forked and its errors
+/// swallowed, so an unreachable small model leaves the placeholder as the
+/// session's name forever (243 of the 432 sessions in the author's store, every
+/// root session created since 2026-06-17). Both summary queries substitute the
+/// opening user message instead, the way OpenCode's own TUI does.
+///
+/// Exercises the correlated subquery rather than `resolve_title` alone: the
+/// `synthetic` filter and the ordering only exist in SQL, and a session whose
+/// first part is an injected reminder is exactly the case that would otherwise
+/// name the row after text nobody typed.
+#[test]
+fn opencode_placeholder_titles_fall_back_to_the_opening_message() {
+    use sea_orm::{ConnectionTrait, Database, DatabaseBackend, Statement};
+
+    let temp = tempfile::tempdir().expect("create tempdir");
+    let base = temp.path().to_path_buf();
+    let db_path = base.join("opencode.db");
+    let t0: i64 = 1_772_020_800_000;
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("build tokio runtime");
+    rt.block_on(async {
+        let conn = Database::connect(format!("sqlite:{}?mode=rwc", db_path.display()))
+            .await
+            .expect("open sqlite");
+
+        for ddl in [
+            "CREATE TABLE session (id TEXT PRIMARY KEY, directory TEXT, parent_id TEXT, \
+             title TEXT, time_created INTEGER, time_updated INTEGER)",
+            "CREATE TABLE message (id TEXT PRIMARY KEY, session_id TEXT, \
+             time_created INTEGER, data TEXT)",
+            "CREATE TABLE part (id TEXT PRIMARY KEY, message_id TEXT, \
+             time_created INTEGER, data TEXT)",
+        ] {
+            conn.execute(Statement::from_string(DatabaseBackend::Sqlite, ddl))
+                .await
+                .expect("create table");
+        }
+
+        // (session id, stored title, opening user text, whether that text is a
+        // synthetic injection the transcript also drops)
+        let sessions = [
+            (
+                "oc-placeholder",
+                "New session - 2026-03-01T10:00:00.000Z",
+                "执行一下 pnpm build",
+                false,
+            ),
+            (
+                "oc-fork",
+                "New session - 2026-03-01T10:00:00.000Z (fork #2)",
+                "look at [notes.md](file:///tmp/a/very/long/path/notes.md)",
+                false,
+            ),
+            ("oc-named", "Fix the login flow", "hi", false),
+            (
+                "oc-synthetic-only",
+                "New session - 2026-03-01T10:00:00.000Z",
+                "<system-reminder>switched to build mode</system-reminder>",
+                true,
+            ),
+        ];
+
+        for (i, (session_id, title, text, synthetic)) in sessions.iter().enumerate() {
+            let created = t0 + i as i64 * 1_000;
+            conn.execute(Statement::from_sql_and_values(
+                DatabaseBackend::Sqlite,
+                "INSERT INTO session (id, directory, title, time_created, time_updated) \
+                 VALUES (?, ?, ?, ?, ?)",
+                [
+                    (*session_id).into(),
+                    "/tmp/demo".into(),
+                    (*title).into(),
+                    created.into(),
+                    created.into(),
+                ],
+            ))
+            .await
+            .expect("insert session");
+
+            let message_id = format!("m-{session_id}");
+            conn.execute(Statement::from_sql_and_values(
+                DatabaseBackend::Sqlite,
+                "INSERT INTO message (id, session_id, time_created, data) VALUES (?, ?, ?, ?)",
+                [
+                    message_id.clone().into(),
+                    (*session_id).into(),
+                    created.into(),
+                    json!({ "role": "user", "time": { "created": created } })
+                        .to_string()
+                        .into(),
+                ],
+            ))
+            .await
+            .expect("insert message");
+
+            let mut part = json!({ "type": "text", "text": text });
+            if *synthetic {
+                part["synthetic"] = json!(true);
+            }
+            conn.execute(Statement::from_sql_and_values(
+                DatabaseBackend::Sqlite,
+                "INSERT INTO part (id, message_id, time_created, data) VALUES (?, ?, ?, ?)",
+                [
+                    format!("p-{session_id}").into(),
+                    message_id.into(),
+                    created.into(),
+                    part.to_string().into(),
+                ],
+            ))
+            .await
+            .expect("insert part");
+        }
+    });
+
+    let parser = OpenCodeParser::with_base_dir(base);
+    let titles: std::collections::HashMap<String, Option<String>> = parser
+        .list_conversations()
+        .expect("list conversations")
+        .into_iter()
+        .map(|c| (c.id, c.title))
+        .collect();
+
+    assert_eq!(
+        titles["oc-placeholder"].as_deref(),
+        Some("执行一下 pnpm build")
+    );
+    // The fork marker survives — it is the only thing telling the fork apart
+    // from the session it came from — while the placeholder under it does not.
+    // The message itself is folded the way every other derived title is.
+    assert_eq!(
+        titles["oc-fork"].as_deref(),
+        Some("look at notes.md (fork #2)")
+    );
+    assert_eq!(titles["oc-named"].as_deref(), Some("Fix the login flow"));
+    // Only synthetic text to go on: report untitled so the UI shows its own
+    // label rather than naming the row after a reminder nobody typed.
+    assert_eq!(titles["oc-synthetic-only"], None);
+
+    // The single-session query has to agree with the listing, or a row renames
+    // itself the moment it is opened.
+    let detail = parser
+        .get_conversation("oc-placeholder")
+        .expect("get conversation");
+    assert_eq!(detail.summary.title.as_deref(), Some("执行一下 pnpm build"));
 }
 
 // ────────────────────────────────────────────────────────────────────────────

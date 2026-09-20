@@ -189,6 +189,13 @@ Telegram forum supergroups can also use [Telegram topic mode](docs/chat-channels
 </details>
 
 <details>
+<summary><h2>URL scheme</h2></summary>
+
+`codeg://session/<id>` opens a conversation from another app on desktop. See [docs/url-scheme.md](docs/url-scheme.md).
+
+</details>
+
+<details>
 <summary><h2>Office Documents</h2></summary>
 
 Work with Word, Excel, and PowerPoint files as a first-class workflow. The bundled **officecli** toolset lets your agents create, analyze, proofread, and edit `.docx`, `.xlsx`, and `.pptx` documents — and you can preview the result right inside Codeg.

@@ -56,6 +56,7 @@ import {
 } from "@/lib/adapters/ai-elements-adapter"
 import { TurnStats } from "./turn-stats"
 import { LiveTurnStats } from "./live-turn-stats"
+import { ModelLabelProvider } from "./model-label-context"
 import { ReplyArtifacts } from "./reply-artifacts"
 import { UserResourceLinks } from "./user-resource-links"
 import { UserImageAttachments } from "./user-image-attachments"
@@ -127,6 +128,7 @@ import {
 import type { MessageScrollContextValue } from "@/components/message/message-scroll-context"
 import { InitialHistoryScrollController } from "./initial-history-scroll-controller"
 import { extractSessionFilesGrouped } from "@/lib/session-files"
+import { useModelLabels } from "@/hooks/use-model-labels"
 import { unescapeComposerText } from "@/lib/composer-copy-text"
 import { useStickToBottomContext } from "use-stick-to-bottom"
 import { useAppWorkspaceStore } from "@/stores/app-workspace-store"
@@ -1714,6 +1716,9 @@ export function MessageListView({
     Number.isFinite(waitingForSubagentsArmedAtMs)
   const t = useTranslations("Folder.chat.messageList")
   const sharedT = useTranslations("Folder.chat.shared")
+  // Resolved once for the whole thread rather than per reply: the labels are a
+  // property of the agent, not of any one turn.
+  const modelLabel = useModelLabels(agentType)
   const durableConversationId = useConversationRuntimeStore(
     useCallback(
       (s) =>
@@ -1774,12 +1779,27 @@ export function MessageListView({
     (s) =>
       s.allFolders.find((folder) => folder.id === imageFolderId)?.path ?? null
   )
-  const { loadOlderTurns } = useConversationRuntimeActions()
+  const { loadOlderTurns, refetchDetail } = useConversationRuntimeActions()
   // Narrow selectors: the whole session object changes on live tokens, and
   // subscribing to it would re-render the historical thread during streaming.
   const olderTurnsPrependEpoch = useConversationRuntimeStore(
     (s) => s.byConversationId.get(conversationId)?.olderTurnsPrependEpoch ?? 0
   )
+  // The agent ran a turn on its own and the wire content was dropped unrendered
+  // (see `pendingOutOfTurnContent`). Offer a re-read rather than doing one on a
+  // timer: the transcript's last write races the wire by single-digit
+  // milliseconds — the race that got the refetch-on-turn-complete patch
+  // reverted, see `completeTurn` in conversation-runtime-store — and a click
+  // lands far outside that window. `preserveLive` so a turn the user started in
+  // the meantime keeps streaming underneath. The flag clears on the response,
+  // so the pill doubles as its own progress indicator via `detailLoading`.
+  const pendingOutOfTurnContent = useConversationRuntimeStore(
+    (s) =>
+      s.byConversationId.get(conversationId)?.pendingOutOfTurnContent ?? false
+  )
+  const handleLoadOutOfTurnContent = useCallback(() => {
+    refetchDetail(conversationId, { preserveLive: true })
+  }, [refetchDetail, conversationId])
   const sessionLoadingOlderTurns = useConversationRuntimeStore((s) =>
     Boolean(s.byConversationId.get(conversationId)?.loadingOlderTurns)
   )
@@ -2643,11 +2663,29 @@ export function MessageListView({
               prependScopeKey={conversationId}
             />
             <MessageThreadScrollButton
+              className={pendingOutOfTurnContent ? "bottom-16" : undefined}
               onBeforeScrollToBottom={() => {
                 scrollApiRef.current?.footerScroll?.markAtBottom()
               }}
             />
           </MessageThread>
+          {pendingOutOfTurnContent && (
+            <Button
+              className="absolute bottom-4 left-[50%] translate-x-[-50%] gap-1.5 rounded-full bg-background/90 shadow-sm hover:bg-muted/90"
+              disabled={detailLoading}
+              onClick={handleLoadOutOfTurnContent}
+              size="sm"
+              type="button"
+              variant="outline"
+            >
+              {detailLoading ? (
+                <Loader2 className="size-3.5 animate-spin" />
+              ) : (
+                <RefreshCw className="size-3.5" />
+              )}
+              {t("loadBackgroundActivity")}
+            </Button>
+          )}
           <LiveTurnStatsBanner
             conversationId={conversationId}
             agentType={agentType}
@@ -2741,7 +2779,7 @@ export function MessageListView({
     <MarkdownImageProvider
       rootPath={imageRoot === undefined ? storedImageRoot : imageRoot}
     >
-      {thread}
+      <ModelLabelProvider value={modelLabel}>{thread}</ModelLabelProvider>
     </MarkdownImageProvider>
   )
 }

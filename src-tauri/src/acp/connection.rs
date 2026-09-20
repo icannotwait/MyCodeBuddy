@@ -199,11 +199,16 @@ fn apply_codex_cli_path_env(
     }
 }
 
+/// `scratch` is the per-launch temp directory from
+/// [`crate::acp::scratch_dir`], or `None` when isolation is off or the
+/// directory could not be created (then the child inherits the ambient temp
+/// dir, exactly as it did before).
 fn merge_agent_env(
     env: &[(&'static str, &'static str)],
     runtime_env: &BTreeMap<String, String>,
+    scratch: Option<&Path>,
 ) -> Vec<(String, String)> {
-    merge_agent_env_with_color(force_command_color_enabled(), env, runtime_env)
+    merge_agent_env_with_color(force_command_color_enabled(), env, runtime_env, scratch)
 }
 
 /// [`merge_agent_env`] with the color decision handed in.
@@ -215,6 +220,7 @@ fn merge_agent_env_with_color(
     force_color: bool,
     env: &[(&'static str, &'static str)],
     runtime_env: &BTreeMap<String, String>,
+    scratch: Option<&Path>,
 ) -> Vec<(String, String)> {
     // Env var order is not semantically meaningful; use map overwrite semantics
     // to keep precedence while avoiding repeated O(n) scans.
@@ -242,6 +248,18 @@ fn merge_agent_env_with_color(
     // even when codeg installed the binary outside the user's shell PATH — the
     // Windows self-managed dir, or `~/.local/bin` under a GUI launch.
     prepend_officecli_path(&mut merged);
+
+    // LAST, after `runtime_env`, and that ordering is the whole fix rather than
+    // a style choice. A self-extracting agent binary resolves its unpack
+    // location from `TMP` before `TEMP` (Windows `GetTempPathW`), so leaving a
+    // per-agent `env_json` `TMP` in place would send a 1.17 GB extraction
+    // wherever that points while codeg cheerfully deleted an empty scratch
+    // directory and reported the leak fixed. Users who want the churn on
+    // another volume set `CODEG_ACP_TMP_ROOT`; users who want the old
+    // pass-through wholesale set `CODEG_ACP_TMP_ISOLATION=0`.
+    if let Some(dir) = scratch {
+        crate::acp::scratch_dir::apply_to_env(&mut merged, dir);
+    }
 
     merged.into_iter().collect()
 }
@@ -800,7 +818,7 @@ pub fn antigravity_launch_env(runtime_env: &BTreeMap<String, String>) -> Vec<(St
             // `runtime_env` carries everything the panel owns.
             _ => &[],
         };
-    let mut merged = merge_agent_env(registry_env, runtime_env);
+    let mut merged = merge_agent_env(registry_env, runtime_env, None);
     apply_antigravity_env_policy(&mut merged, runtime_env);
     merged
 }
@@ -1106,6 +1124,41 @@ fn prepend_dir_to_path_env(
         .next_back()
         .unwrap_or_else(|| if windows { "Path" } else { "PATH" }.to_string());
     env.insert(key, new_path);
+}
+
+/// Prepend an agent's own installer directories (see
+/// [`registry::binary_system_dirs`]) to a merged env's PATH.
+///
+/// Operates on the merged `Vec` rather than inside [`merge_agent_env`] because
+/// it is the one PATH contributor that depends on WHICH agent is launching,
+/// and `merge_agent_env` is deliberately agent-agnostic (it is also called from
+/// the settings panel, with no agent process in hand).
+fn prepend_agent_install_dirs_path(env: &mut Vec<(String, String)>, agent_type: AgentType) {
+    let dirs = registry::binary_system_dirs(agent_type);
+    if dirs.is_empty() {
+        return;
+    }
+    let Some(home) = dirs::home_dir() else {
+        return;
+    };
+    let fallback = std::env::var("PATH").unwrap_or_default();
+    let mut map: BTreeMap<String, String> = std::mem::take(env).into_iter().collect();
+    // Reverse, because each pass prepends: walking `[a, b]` forwards would
+    // leave `b` ahead of `a` and quietly invert the registry's declared
+    // precedence the first time an agent lists two directories.
+    for dir in dirs.iter().rev() {
+        let joined = home.join(dir);
+        if !joined.is_dir() {
+            continue;
+        }
+        prepend_dir_to_path_env(
+            &mut map,
+            &joined.to_string_lossy(),
+            &fallback,
+            cfg!(windows),
+        );
+    }
+    *env = map.into_iter().collect();
 }
 
 /// Prepend codeg's known OfficeCLI install dir to `env`'s PATH when officecli is
@@ -2273,6 +2326,7 @@ async fn build_agent(
     runtime_env: &BTreeMap<String, String>,
     cwd: &Path,
     plan: &crate::acp::delegation::route::DelegationRoutePlan,
+    scratch: Option<&Path>,
 ) -> Result<AcpAgent, AcpError> {
     // A conversation can outlive the custom-agent definition it was started
     // with (the user deleted it in settings). `get_agent_meta` cannot report
@@ -2314,7 +2368,7 @@ async fn build_agent(
                     return Err(AcpError::PiProjectTrustRequired(message));
                 }
             }
-            let mut merged_env = merge_agent_env(env, runtime_env);
+            let mut merged_env = merge_agent_env(env, runtime_env, scratch);
             apply_npx_launch_env_policy(agent_type, &mut merged_env, runtime_env);
             apply_codex_env_policy(
                 agent_type,
@@ -2406,7 +2460,7 @@ async fn build_agent(
                         ))
                     })?;
             let merged_env =
-                apply_codex_cli_path_env(agent_type, merge_agent_env(env, runtime_env))?;
+                apply_codex_cli_path_env(agent_type, merge_agent_env(env, runtime_env, scratch))?;
             let mut env_map: BTreeMap<String, String> = merged_env.into_iter().collect();
             // Bundled: complete argv first, then one route application (env + argv).
             let mut argv: Vec<String> = Vec::new();
@@ -2537,7 +2591,13 @@ async fn build_agent(
             if !cmd_args.is_empty() {
                 server = server.args(cmd_args);
             }
-            let mut merged_env = merge_agent_env(env, runtime_env);
+            let mut merged_env = merge_agent_env(env, runtime_env, scratch);
+            // codeg launches the binary by absolute path, so this is not about
+            // finding it — it is about the agent finding ITSELF. An agent that
+            // re-execs its own CLI for a subtask looks it up on PATH, and a
+            // desktop launch never inherits the shell rc line the vendor's
+            // installer appended.
+            prepend_agent_install_dirs_path(&mut merged_env, agent_type);
             if agent_type == AgentType::Cursor {
                 apply_cursor_env_policy(&mut merged_env, runtime_env);
             } else if agent_type == AgentType::Grok {
@@ -2635,7 +2695,7 @@ async fn build_agent(
             system_cmd,
             ..
         } => {
-            let merged_env = merge_agent_env(env, runtime_env);
+            let merged_env = merge_agent_env(env, runtime_env, scratch);
             let mut parts: Vec<String> = Vec::new();
             for (k, v) in &merged_env {
                 parts.push(format!("{k}={v}"));
@@ -2806,6 +2866,8 @@ pub async fn spawn_agent_connection(
         None, // folder_id 由后续 prompt handler 在首次 send 时绑定 (Phase 2)
     );
     initial_state.connection_incarnation = connection_incarnation.clone();
+    initial_state.env_pinned_config_option_ids =
+        env_pinned_config_option_ids(agent_type, &runtime_env);
     initial_state.tool_lease_registry = tool_lease_registry.clone();
     initial_state.mcp_cancel_registry = mcp_cancel_registry;
     // Real plan-derived snapshot for every new SessionState (not the serde legacy default).
@@ -3010,9 +3072,20 @@ pub async fn spawn_agent_connection(
             let _cleanup = cleanup_guard;
             let driver = async move {
                 let delegation_for_cleanup = delegation_injection.clone();
+                // Per-launch temp directory, created BEFORE the spawn because it
+                // has to exist by the time the child looks. `None` (isolation
+                // off, or create failed) means the child inherits the ambient
+                // temp dir exactly as it did before.
+                let scratch = crate::acp::scratch_dir::create();
                 let agent =
-                    match build_agent(agent_type, &runtime_env, &launch_cwd, &driver_route_plan)
-                        .await
+                    match build_agent(
+                        agent_type,
+                        &runtime_env,
+                        &launch_cwd,
+                        &driver_route_plan,
+                        scratch.as_ref().map(|s| s.path()),
+                    )
+                    .await
                     {
                         Ok(agent) => agent
                             .on_spawn({
@@ -3021,9 +3094,20 @@ pub async fn spawn_agent_connection(
                             })
                             .on_exit({
                                 let child_pid = Arc::clone(&child_pid);
-                                move || child_pid.store(0, std::sync::atomic::Ordering::SeqCst)
+                                let scratch = std::sync::Mutex::new(scratch);
+                                move || {
+                                    child_pid.store(0, std::sync::atomic::Ordering::SeqCst);
+                                    if let Ok(mut held) = scratch.lock() {
+                                        if let Some(scratch) = held.take() {
+                                            scratch.release();
+                                        }
+                                    }
+                                }
                             }),
                         Err(error) => {
+                            if let Some(scratch) = scratch {
+                                scratch.release();
+                            }
                             let public_error = connection_driver_error_event(
                                 &error,
                                 agent_type,
@@ -3812,12 +3896,66 @@ fn ensure_codex_mode_option(options: &mut Vec<SessionConfigOptionInfo>) {
     );
 }
 
+/// Config-option ids a launch carrying `runtime_env` has pinned, so the agent
+/// will reject any attempt to change them (see
+/// [`SessionState::env_pinned_config_option_ids`]).
+///
+/// Only cline has one today: its `provider` selector is hard-refused whenever
+/// `CLINE_PROVIDER` is exported, which codeg does for every bring-your-own
+/// provider. The check is on the variable codeg actually ships, not on the
+/// configured provider id, because the pin is what the agent tests.
+fn env_pinned_config_option_ids(
+    agent_type: AgentType,
+    runtime_env: &BTreeMap<String, String>,
+) -> Vec<String> {
+    if agent_type != AgentType::Cline {
+        return Vec::new();
+    }
+    // Emptiness is judged the way the agent judges it. cline's guard is a bare
+    // `if (process.env.CLINE_PROVIDER)`, so only the empty string is falsy —
+    // whitespace is a pin, and `buildConfig`'s `?? ` would go on to use it
+    // verbatim as the provider id. Trimming first would leave the selector on
+    // screen for a session that refuses every choice in it.
+    let pinned = runtime_env
+        .get("CLINE_PROVIDER")
+        .is_some_and(|value| !value.is_empty());
+    if pinned {
+        vec![CLINE_PROVIDER_CONFIG_OPTION_ID.to_string()]
+    } else {
+        Vec::new()
+    }
+}
+
+/// Cline's provider selector id — the one `CLINE_PROVIDER` freezes.
+const CLINE_PROVIDER_CONFIG_OPTION_ID: &str = "provider";
+
+/// The advertised options minus the ones this launch pinned through the
+/// environment. Applied on the way out so all three producers of a
+/// `SessionConfigOptions` event share one rule.
+fn visible_config_options(
+    pinned: &[String],
+    config_options: Vec<SessionConfigOption>,
+) -> Vec<SessionConfigOption> {
+    if pinned.is_empty() {
+        return config_options;
+    }
+    config_options
+        .into_iter()
+        .filter(|option| !pinned.iter().any(|id| *id == option.id.to_string()))
+        .collect()
+}
+
 async fn emit_session_config_options_values(
     state: &Arc<RwLock<SessionState>>,
     emitter: &EventEmitter,
     agent_type: AgentType,
     config_options: Vec<SessionConfigOption>,
 ) {
+    // Drop what this launch froze BEFORE mapping, so every producer of this
+    // event — establishment, the answer to a set, and the agent's own
+    // `config_option_update` push — is filtered by one rule.
+    let pinned = state.read().await.env_pinned_config_option_ids.clone();
+    let config_options = visible_config_options(&pinned, config_options);
     let mut config_options = map_session_config_options(&config_options);
     if agent_type == AgentType::Codex {
         ensure_codex_mode_option(&mut config_options);
@@ -6747,13 +6885,24 @@ async fn run_connection(
     // Default terminals to the session working directory so an agent that calls
     // `terminal/create` without a `cwd` (e.g. CodeBuddy) runs in the folder the
     // conversation runs in rather than codeg's own process cwd.
+    // An agent that runs `pnpm dev` through `terminal/create` has started a
+    // local server the same way a person in the terminal panel has, and that
+    // output is the only place its address appears. A connection with no real
+    // window behind it (`work_task`, the delegation probe) still watches; the
+    // event it emits names that window and no workspace answers to it.
+    let owner_window_label = state.read().await.owner_window_label.clone();
     let terminal_runtime = Arc::new(
         TerminalRuntime::new(
             terminal_base_env,
             terminal_shell.spec.clone(),
             adapter_for(agent_type),
         )
-        .with_default_cwd(Some(cwd.clone())),
+        .with_default_cwd(Some(cwd.clone()))
+        .with_service_watch(Some(crate::browser::services::ServiceWatch::new(
+            emitter.clone(),
+            owner_window_label,
+            crate::browser::types::ServiceSource::Agent,
+        ))),
     );
     crate::acp::terminal_runtime::register_acp_terminal_runtime(&terminal_runtime);
     // Grok's ACP terminal adapter creates client terminals but omits
@@ -6864,6 +7013,15 @@ async fn run_connection(
                 async move |req: RequestPermissionRequest,
                             responder: Responder<RequestPermissionResponse>,
                             _cx: ConnectionTo<Agent>| {
+                    // An approval gating codeg's OWN ask tool is a dialog asking
+                    // permission to show a dialog; allow it so the user sees only
+                    // the interactive question card (see
+                    // `codeg_ask_auto_allow_option`).
+                    let responder =
+                        match try_auto_allow_codeg_ask(&perm_ask_access, &req, responder).await {
+                            Ok(()) => return Ok(()),
+                            Err(responder) => responder,
+                        };
                     // pi asks the user a question THROUGH this channel (see
                     // `try_bridge_pi_select_ask`); route it to the interactive
                     // question card instead of an approval card. Every reject
@@ -7222,6 +7380,11 @@ async fn run_connection(
                 init_resp.meta.as_ref(),
                 init_resp.agent_info.as_ref(),
             );
+            // Same `agent_info.version` proof, for a different shape decision:
+            // which generation of codex's `request_user_input` form this
+            // connection will receive.
+            let codex_user_input_shape =
+                codex_user_input_shape(agent_type, init_resp.agent_info.as_ref());
             tracing::info!(
                 "[ACP][{}] steering: advertised={}, agent_version={:?}, native={}",
                 agent_type,
@@ -7373,6 +7536,7 @@ async fn run_connection(
                 apply_initialized_connection_capabilities(
                     &mut s,
                     native_steering_available,
+                    codex_user_input_shape,
                     neutral_goal_channel,
                     goal_control,
                     companion,
@@ -8625,6 +8789,87 @@ async fn handle_grok_ask_user_question(
 /// A bridged select still parks an abort handle on `perms`, so every permission
 /// drain reclaims it exactly as it reclaimed the approval card this replaces —
 /// see [`PermissionQueue::detached`] for why that matters for pi specifically.
+/// The option id that silently allows a `session/request_permission` which is
+/// only gating codeg's OWN `ask_user_question` companion tool, or `None` to
+/// leave the request on the ordinary approval-card path.
+///
+/// An agent whose permission mode consults the user before every MCP tool call
+/// (claude-agent-acp's default) gates the ask tool too, so asking the user a
+/// question used to cost TWO dialogs: a raw "run mcp__codeg-mcp__ask_user_question?"
+/// approval dumping the questions as JSON, and only after "Yes" the real
+/// interactive card. The first one carries no decision the second doesn't — see
+/// [`crate::acp::question::is_codeg_ask_tool_name`] for why answering it is the
+/// user's consent either way.
+///
+/// The tool is identified by NAME, read from the two places a host puts it:
+/// `toolCall.title` (claude-agent-acp's `toolInfoFromToolUse` falls through to
+/// the raw tool name for MCP tools) and the request-level
+/// `_meta.permission.title` it pairs with (claude-agent-acp 0.73+ / codex-acp
+/// 1.7+, the same block [`hoist_request_permission_meta`] forwards to the card).
+/// The ACP `toolCall.name` field would be the exact answer but is UNSTABLE and
+/// dropped by the schema crate codeg pins, so it is not available here.
+///
+/// Only an `allow_once` option is ever selected. An `allow_always` writes a
+/// durable permission rule into the user's own agent settings — a decision that
+/// outlives this turn and this connection, so it stays theirs to make. With no
+/// such option (an agent that offers only "always"), `None` keeps today's card.
+fn codeg_ask_auto_allow_option(req: &RequestPermissionRequest) -> Option<String> {
+    let permission_title = req
+        .meta
+        .as_ref()
+        .and_then(|m| m.get("permission"))
+        .and_then(|p| p.get("title"))
+        .and_then(serde_json::Value::as_str);
+    let is_ask = [req.tool_call.fields.title.as_deref(), permission_title]
+        .into_iter()
+        .flatten()
+        .any(crate::acp::question::is_codeg_ask_tool_name);
+    if !is_ask {
+        return None;
+    }
+    req.options
+        .iter()
+        .find(|opt| opt.kind == PermissionOptionKind::AllowOnce)
+        .map(|opt| opt.option_id.to_string())
+}
+
+/// Answer a permission request that is merely gating codeg's own ask tool, so
+/// the interactive question card is the only thing the user ever sees.
+///
+/// `Err(responder)` hands the request back for the ordinary permission path —
+/// the outcome for every other tool, and the deliberate fallback whenever the
+/// auto-allow cannot be taken (the ask feature is off, or the agent offered no
+/// allow-once option).
+async fn try_auto_allow_codeg_ask(
+    access: &Option<(
+        Arc<dyn crate::acp::question::SessionQuestionAccess>,
+        crate::acp::question::QuestionRuntimeConfig,
+    )>,
+    req: &RequestPermissionRequest,
+    responder: Responder<RequestPermissionResponse>,
+) -> Result<(), Responder<RequestPermissionResponse>> {
+    let Some(option_id) = codeg_ask_auto_allow_option(req) else {
+        return Err(responder);
+    };
+    // Same kill switch as the ask tool itself (and as `try_bridge_pi_select_ask`):
+    // with the feature off codeg-mcp never exposed `ask_user_question`, so a
+    // request naming it is not the tool this shortcut is allowed to speak for.
+    let Some((_, ask_cfg)) = access else {
+        return Err(responder);
+    };
+    if !ask_cfg.is_enabled().await {
+        return Err(responder);
+    }
+    tracing::debug!(
+        "[ACP] auto-allowing the permission request for codeg's own ask_user_question tool \
+         (option {option_id}); the interactive question card is the actual prompt"
+    );
+    let _ = responder.respond(RequestPermissionResponse::new(
+        RequestPermissionOutcome::Selected(SelectedPermissionOutcome::new(option_id)),
+    ));
+    Ok(())
+}
+
 async fn try_bridge_pi_select_ask(
     access: &Option<(
         Arc<dyn crate::acp::question::SessionQuestionAccess>,
@@ -8893,7 +9138,15 @@ async fn handle_elicitation_request(
     // Everything codex-acp can send once `elicitation.form` is advertised
     // resolves to a plan here — an unhandled shape would silently reject the
     // agent's blocked request (an MCP tool-call approval, most damagingly).
-    let plan = match crate::acp::question::classify_elicitation(&raw) {
+    let peer = {
+        let s = state.read().await;
+        if s.agent_type == AgentType::Codex {
+            crate::acp::question::ElicitationPeer::Codex(s.codex_user_input_shape)
+        } else {
+            crate::acp::question::ElicitationPeer::Other
+        }
+    };
+    let plan = match crate::acp::question::classify_elicitation(&raw, peer) {
         Ok(plan) => plan,
         Err(e) => {
             tracing::warn!("[codex elicitation] declining unrenderable request: {e}");
@@ -16081,11 +16334,13 @@ fn resolve_goal_control(
 fn apply_initialized_connection_capabilities(
     state: &mut SessionState,
     native_steering_available: bool,
+    codex_user_input_shape: Option<crate::acp::question::CodexUserInputShape>,
     neutral_goal_channel: bool,
     goal_control: Option<(String, Vec<String>)>,
     companion: Option<(&str, bool, bool)>,
 ) {
     state.native_steering_available = native_steering_available;
+    state.codex_user_input_shape = codex_user_input_shape;
     state.neutral_goal_channel = neutral_goal_channel;
 
     // Resolve every adapter, advertising or not, from "unknown" to its final
@@ -16270,6 +16525,41 @@ fn synthesize_native_steering(
         && registry::steering_prompt_required_min_version(agent_type)
             .is_some_and(|min| steering_version_ok(agent_info, min))
 }
+
+/// codex-acp 1.12.0 swapped the question and the short tab header between a
+/// `request_user_input` property's `title` and `description`. Both generations
+/// emit both strings, so the FORM cannot be dated — but the adapter that built
+/// it can, from the `agentInfo.version` it reports at `initialize`.
+///
+/// Pinned once into `SessionState::codex_user_input_shape` because the running
+/// adapter is not necessarily the pinned one: launch prefers a PATH-resolved
+/// install, and a custom pinned version is a supported configuration
+/// (`registry::supports_custom_version`). `None` for every other agent, and for
+/// a codex adapter that reports no parseable version — the elicitation parser
+/// then falls back to the form's own markers (see
+/// [`crate::acp::question::CodexUserInputShape`]).
+fn codex_user_input_shape(
+    agent_type: AgentType,
+    agent_info: Option<&sacp::schema::Implementation>,
+) -> Option<crate::acp::question::CodexUserInputShape> {
+    use crate::acp::question::CodexUserInputShape;
+    if agent_type != AgentType::Codex {
+        return None;
+    }
+    let version = agent_info.map(|info| info.version.trim())?;
+    // Fail closed on an unparseable version rather than guessing a generation:
+    // `None` lets the parser use the form's markers, which is strictly better
+    // information than a coin flip.
+    if semver::Version::parse(version).is_err() {
+        return None;
+    }
+    Some(if version_at_least(version, "1.12.0") {
+        CodexUserInputShape::QuestionInTitle
+    } else {
+        CodexUserInputShape::QuestionInDescription
+    })
+}
+
 /// Extract a retryable-turn-error indicator from a Codex `session_info_update`'s
 /// `_meta` (codex-acp #289, v1.1.3+). codex ships a transient, auto-retried
 /// error as `_meta.codex.error = {message, codexErrorInfo, additionalDetails,
@@ -24518,6 +24808,7 @@ mod tests {
         apply_initialized_connection_capabilities(
             &mut state,
             true,
+            None,
             true,
             Some((
                 "_session/goal".to_string(),
@@ -25131,6 +25422,118 @@ mod tests {
             hoist_request_permission_meta(&mut tool_call, request_meta.as_ref());
             assert_eq!(tool_call, serde_json::json!({ "toolCallId": "t1" }));
         }
+    }
+
+    /// claude-agent-acp 0.78.0's permission request for an MCP tool, verified
+    /// against `buildClaudePermissionPresentation` + `toolInfoFromToolUse`: an
+    /// MCP tool falls through the tool switch, so BOTH the card title and the
+    /// request-level `_meta.permission.title` are the raw `mcp__<server>__<tool>`
+    /// name, and the options are allow-once / reject.
+    fn claude_mcp_permission_request(
+        tool_name: &str,
+        options: Vec<sacp::schema::PermissionOption>,
+    ) -> RequestPermissionRequest {
+        RequestPermissionRequest::new(
+            SessionId::new("sess-1"),
+            sacp::schema::ToolCallUpdate::new(
+                "toolu_01",
+                sacp::schema::ToolCallUpdateFields::new()
+                    .title(tool_name.to_string())
+                    .kind(sacp::schema::ToolKind::Other)
+                    .raw_input(serde_json::json!({ "questions": [] })),
+            ),
+            options,
+        )
+        .meta(meta_map(serde_json::json!({
+            "permission": { "version": 1, "title": tool_name }
+        })))
+    }
+
+    fn claude_permission_options() -> Vec<sacp::schema::PermissionOption> {
+        vec![
+            sacp::schema::PermissionOption::new(
+                "allow-once",
+                "Yes",
+                PermissionOptionKind::AllowOnce,
+            ),
+            sacp::schema::PermissionOption::new("reject", "No", PermissionOptionKind::RejectOnce),
+        ]
+    }
+
+    #[test]
+    fn codeg_ask_auto_allow_option_picks_allow_once_for_codegs_own_ask_tool() {
+        let req = claude_mcp_permission_request(
+            "mcp__codeg-mcp__ask_user_question",
+            claude_permission_options(),
+        );
+        assert_eq!(
+            codeg_ask_auto_allow_option(&req).as_deref(),
+            Some("allow-once")
+        );
+        let mut bare = claude_mcp_permission_request(
+            "mcp__codeg-mcp__ask_user_question",
+            claude_permission_options(),
+        );
+        bare.meta = None;
+        assert_eq!(
+            codeg_ask_auto_allow_option(&bare).as_deref(),
+            Some("allow-once")
+        );
+    }
+
+    #[test]
+    fn codeg_ask_auto_allow_option_leaves_every_other_approval_on_the_card() {
+        for foreign in [
+            "mcp__other-server__ask_user_question",
+            "mcp__codeg-mcp__delegate_to_agent",
+            "Bash",
+        ] {
+            let req = claude_mcp_permission_request(foreign, claude_permission_options());
+            assert!(
+                codeg_ask_auto_allow_option(&req).is_none(),
+                "{foreign} must keep its approval card"
+            );
+        }
+        let always_only = claude_mcp_permission_request(
+            "mcp__codeg-mcp__ask_user_question",
+            vec![
+                sacp::schema::PermissionOption::new(
+                    "allow-with-updates",
+                    "Yes, and don't ask again",
+                    PermissionOptionKind::AllowAlways,
+                ),
+                sacp::schema::PermissionOption::new(
+                    "reject",
+                    "No",
+                    PermissionOptionKind::RejectOnce,
+                ),
+            ],
+        );
+        assert!(codeg_ask_auto_allow_option(&always_only).is_none());
+    }
+
+    #[test]
+    fn codex_user_input_shape_reads_the_running_adapter_version() {
+        use sacp::schema::Implementation;
+        use crate::acp::question::CodexUserInputShape;
+        for (v, expected) in [
+            ("1.11.0", CodexUserInputShape::QuestionInDescription),
+            ("1.12.0", CodexUserInputShape::QuestionInTitle),
+            ("1.12.1", CodexUserInputShape::QuestionInTitle),
+        ] {
+            assert_eq!(
+                codex_user_input_shape(AgentType::Codex, Some(&Implementation::new("codex-acp", v))),
+                Some(expected)
+            );
+        }
+        assert_eq!(codex_user_input_shape(AgentType::Codex, None), None);
+        assert_eq!(
+            codex_user_input_shape(
+                AgentType::ClaudeCode,
+                Some(&Implementation::new("codex-acp", "1.12.0"))
+            ),
+            None
+        );
     }
 
     #[test]
@@ -26249,7 +26652,7 @@ mod tests {
     fn grok_npx_launch_env_policy_clears_inherited_key_for_subscription() {
         let runtime_env: BTreeMap<String, String> =
             [("GROK_AUTH_MODE".to_string(), "subscription".to_string())].into();
-        let mut merged_env = merge_agent_env(&[], &runtime_env);
+        let mut merged_env = merge_agent_env(&[], &runtime_env, None);
 
         apply_npx_launch_env_policy(AgentType::Grok, &mut merged_env, &runtime_env);
 
@@ -26265,7 +26668,7 @@ mod tests {
             ("XAI_API_KEY".to_string(), "xai-stale-key".to_string()),
         ]
         .into();
-        let mut merged_env = merge_agent_env(&[], &runtime_env);
+        let mut merged_env = merge_agent_env(&[], &runtime_env, None);
 
         apply_npx_launch_env_policy(AgentType::Grok, &mut merged_env, &runtime_env);
 
@@ -26286,7 +26689,7 @@ mod tests {
             ("xai_api_key".to_string(), "xai-stale-key".to_string()),
         ]
         .into();
-        let mut merged_env = merge_agent_env(&[], &runtime_env);
+        let mut merged_env = merge_agent_env(&[], &runtime_env, None);
 
         apply_grok_env_policy_with_platform(&mut merged_env, &runtime_env, true);
 
@@ -32856,7 +33259,7 @@ mod tests {
     /// launch reports about its terminal.
     #[test]
     fn merge_agent_env_omits_the_color_env_by_default() {
-        let merged = merge_agent_env_with_color(false, &[], &BTreeMap::new());
+        let merged = merge_agent_env_with_color(false, &[], &BTreeMap::new(), None);
         for key in ["CLICOLOR", "CLICOLOR_FORCE", "FORCE_COLOR", "TERM"] {
             assert_eq!(merged_value(&merged, key), None, "{key} must not be set");
         }
@@ -32873,7 +33276,7 @@ mod tests {
     /// this setting exists to fix.
     #[test]
     fn merge_agent_env_injects_the_whole_color_env_when_opted_in() {
-        let merged = merge_agent_env_with_color(true, &[], &BTreeMap::new());
+        let merged = merge_agent_env_with_color(true, &[], &BTreeMap::new(), None);
         assert_eq!(merged_value(&merged, "CLICOLOR"), Some("1"));
         assert_eq!(merged_value(&merged, "CLICOLOR_FORCE"), Some("1"));
         assert_eq!(merged_value(&merged, "FORCE_COLOR"), Some("1"));
@@ -32897,7 +33300,7 @@ mod tests {
             ("FORCE_COLOR".to_string(), "0".to_string()),
             ("TERM".to_string(), "dumb".to_string()),
         ]);
-        let merged = merge_agent_env_with_color(true, &[], &runtime_env);
+        let merged = merge_agent_env_with_color(true, &[], &runtime_env, None);
         assert_eq!(merged_value(&merged, "CLICOLOR"), Some(""));
         assert_eq!(merged_value(&merged, "CLICOLOR_FORCE"), Some(""));
         assert_eq!(merged_value(&merged, "FORCE_COLOR"), Some("0"));
@@ -32910,9 +33313,137 @@ mod tests {
     fn merge_agent_env_without_color_keeps_other_layers() {
         let runtime_env = BTreeMap::from([("FROM_ROW".to_string(), "row".to_string())]);
         let merged =
-            merge_agent_env_with_color(false, &[("FROM_REGISTRY", "registry")], &runtime_env);
+            merge_agent_env_with_color(false, &[("FROM_REGISTRY", "registry")], &runtime_env, None);
         assert_eq!(merged_value(&merged, "FROM_REGISTRY"), Some("registry"));
         assert_eq!(merged_value(&merged, "FROM_ROW"), Some("row"));
+    }
+
+    /// The precedence that IS the temp-leak fix.
+    ///
+    /// A self-extracting agent resolves its unpack root from `TMP` before
+    /// `TEMP` (Windows `GetTempPathW`). If a per-agent `env_json` `TMP` were
+    /// allowed to win — which it would under the ordinary `runtime_env`-last
+    /// rule every other variable follows — the extraction would land wherever
+    /// that points while codeg deleted an empty scratch directory and reported
+    /// the leak fixed. The whole fix is this one ordering, so it gets a test.
+    #[test]
+    fn scratch_dir_outranks_a_per_agent_temp_override() {
+        let mut runtime_env = BTreeMap::new();
+        for key in crate::acp::scratch_dir::TEMP_ENV_KEYS {
+            runtime_env.insert(key.to_string(), "/somewhere/the/user/picked".to_string());
+        }
+        let scratch = Path::new("/scratch/codeg-acp/123-deadbeef");
+
+        let merged = merge_agent_env_with_color(false, &[], &runtime_env, Some(scratch));
+
+        for key in crate::acp::scratch_dir::TEMP_ENV_KEYS {
+            assert_eq!(
+                merged_value(&merged, key),
+                Some("/scratch/codeg-acp/123-deadbeef"),
+                "{key} must point at the scratch dir, not the per-agent override"
+            );
+        }
+    }
+
+    /// All three names, every time. Setting only `TMPDIR` would leave `TMP`
+    /// inherited from codeg's own environment, and `GetTempPathW` reads `TMP`
+    /// first.
+    #[test]
+    fn scratch_dir_sets_every_temp_variable_the_child_might_read() {
+        let merged = merge_agent_env_with_color(
+            false,
+            &[],
+            &BTreeMap::new(),
+            Some(Path::new("/scratch/x")),
+        );
+        for key in crate::acp::scratch_dir::TEMP_ENV_KEYS {
+            assert_eq!(merged_value(&merged, key), Some("/scratch/x"), "{key}");
+        }
+    }
+
+    /// No scratch dir (isolation off, or the directory could not be created)
+    /// must leave the environment exactly as it was — the child then inherits
+    /// the ambient temp dir, which is the pre-fix behaviour and a working
+    /// launch.
+    #[test]
+    fn without_a_scratch_dir_the_temp_variables_are_untouched() {
+        let mut runtime_env = BTreeMap::new();
+        runtime_env.insert("TMP".to_string(), "/user/choice".to_string());
+
+        let merged = merge_agent_env_with_color(false, &[], &runtime_env, None);
+
+        assert_eq!(merged_value(&merged, "TMP"), Some("/user/choice"));
+        assert_eq!(merged_value(&merged, "TEMP"), None);
+        assert_eq!(merged_value(&merged, "TMPDIR"), None);
+    }
+
+    #[test]
+    fn a_pinned_cline_provider_is_read_off_the_variable_that_pins_it() {
+        let env = |pairs: &[(&str, &str)]| -> BTreeMap<String, String> {
+            pairs
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect()
+        };
+
+        assert_eq!(
+            env_pinned_config_option_ids(
+                AgentType::Cline,
+                &env(&[("CLINE_PROVIDER", "openai-compatible")])
+            ),
+            vec!["provider".to_string()]
+        );
+        assert!(
+            env_pinned_config_option_ids(AgentType::Cline, &env(&[("CLINE_MODEL", "gpt-4o")]))
+                .is_empty()
+        );
+        assert!(
+            env_pinned_config_option_ids(AgentType::Cline, &env(&[("CLINE_PROVIDER", "")]))
+                .is_empty()
+        );
+        assert_eq!(
+            env_pinned_config_option_ids(AgentType::Cline, &env(&[("CLINE_PROVIDER", "  ")])),
+            vec!["provider".to_string()]
+        );
+        assert!(env_pinned_config_option_ids(
+            AgentType::Codex,
+            &env(&[("CLINE_PROVIDER", "openai-compatible")])
+        )
+        .is_empty());
+    }
+
+    #[test]
+    fn a_pinned_option_is_withheld_from_the_composer() {
+        let options = || {
+            vec![
+                SessionConfigOption::boolean(
+                    sacp::schema::SessionConfigId::new("auto_approve"),
+                    "Auto-approve tools",
+                    false,
+                ),
+                SessionConfigOption::boolean(
+                    sacp::schema::SessionConfigId::new("provider"),
+                    "Provider",
+                    false,
+                ),
+            ]
+        };
+        let ids = |opts: Vec<SessionConfigOption>| -> Vec<String> {
+            opts.iter().map(|o| o.id.to_string()).collect()
+        };
+
+        assert_eq!(
+            ids(visible_config_options(
+                &["provider".to_string()],
+                options()
+            )),
+            vec!["auto_approve".to_string()],
+            "a dropdown whose every choice errors must not reach the composer"
+        );
+        assert_eq!(
+            ids(visible_config_options(&[], options())),
+            vec!["auto_approve".to_string(), "provider".to_string()]
+        );
     }
 
     // ─── trim_partial_ansi_tail ─────────────────────────────────────────

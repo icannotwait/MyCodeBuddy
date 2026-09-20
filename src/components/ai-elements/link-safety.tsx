@@ -11,200 +11,39 @@ import {
 } from "react"
 import { useTranslations } from "next-intl"
 import { resolveGrokSessionImage } from "@/lib/api"
-import { openUrl } from "@/lib/platform"
-import { getActiveRemoteConnectionId, isDesktop } from "@/lib/transport"
 import { extractAppCommandError, toErrorMessage } from "@/lib/app-error"
+import { openExternalTab, windowOpenReachesABrowser } from "@/lib/link-open"
+import {
+  isPrimaryModifier,
+  useOpenUrlTarget,
+} from "@/hooks/use-open-url-target"
 import type { LinkSafetyConfig, LinkSafetyModalProps } from "streamdown"
 import { toast } from "sonner"
 import { useActiveFolder } from "@/contexts/active-folder-context"
 import { useWorkspaceActions } from "@/contexts/workspace-context"
 import { useGrokSessionImageScope } from "@/components/ai-elements/grok-session-image-context"
+import { useOpenFileTarget } from "@/hooks/use-open-file-target"
 import { isHomeRelativePath } from "@/lib/file-open-target"
 import { isAbsoluteFilePath } from "@/lib/file-path-display"
-import { isLocalPathLike } from "@/lib/markdown/local-path-links"
 import {
   GROK_SESSION_IMAGE_MIME_BY_EXTENSION,
   parseGrokSessionImageRef,
 } from "@/lib/markdown/grok-session-image"
 import { cn } from "@/lib/utils"
 
-export interface LocalFileTarget {
-  path: string
-  line: number | null
-}
+import {
+  OS_HANDLER_PROTOCOLS,
+  getAllowedExternalProtocol,
+  normalizeSlashPath,
+  parseLocalFileTarget,
+  type LocalFileTarget,
+} from "@/lib/link-classify"
 
-const WINDOWS_ABSOLUTE_PATH = /^[a-zA-Z]:[\\/]/
-const URL_SCHEME = /^[a-zA-Z][a-zA-Z\d+\-.]*:/
-const ALLOWED_EXTERNAL_PROTOCOLS = new Set([
-  "http:",
-  "https:",
-  "mailto:",
-  "tel:",
-])
-// Protocols handled by the OS (mail client, dialer) rather than a browser
-// page load. They must NOT be opened via `window.open(_, "_blank")` — most
-// browsers leave behind an empty `about:blank` tab once the OS handler fires.
-const OS_HANDLER_PROTOCOLS = new Set(["mailto:", "tel:"])
-const useIsomorphicLayoutEffect =
-  typeof window !== "undefined" ? useLayoutEffect : useEffect
-
-function normalizeSlashPath(path: string): string {
-  return path.replace(/\\/g, "/")
-}
-
-/** Strip `/C:/` only when the pre-decode href had a literal drive prefix. */
-function stripLeadingSlashOnWindows(
-  decodedPath: string,
-  rawPath: string = decodedPath
-): string {
-  if (
-    decodedPath.startsWith("/") &&
-    rawPath.startsWith("/") &&
-    WINDOWS_ABSOLUTE_PATH.test(rawPath.slice(1))
-  ) {
-    return decodedPath.slice(1)
-  }
-  return decodedPath
-}
-
-function decodeUriSafely(value: string): string {
-  try {
-    return decodeURIComponent(value)
-  } catch {
-    return value
-  }
-}
-
-function parseLineValue(raw: string | undefined): number | null {
-  if (!raw) return null
-  const line = Number.parseInt(raw, 10)
-  if (!Number.isFinite(line) || line <= 0) return null
-  return line
-}
-
-function parseHashLine(hash: string): number | null {
-  const normalized = hash.startsWith("#") ? hash.slice(1) : hash
-  if (!normalized) return null
-  // `L<start>` / `L<start>-<end>` / `L<start>-L<end>` (GitHub-style) — a range
-  // (e.g. the editor's "add selection" badge `#L10-25`) jumps to its start line.
-  return (
-    parseLineValue(normalized.match(/^L(\d+)(?:-L?\d+)?$/i)?.[1]) ??
-    parseLineValue(normalized.match(/^line=(\d+)$/i)?.[1]) ??
-    parseLineValue(normalized.match(/^(\d+)$/)?.[1])
-  )
-}
-
-function splitPathAndLine(rawPath: string): LocalFileTarget {
-  const trimmed = rawPath.trim()
-  const match = trimmed.match(/^(.*?):(\d+)(?::\d+)?$/)
-  if (!match) {
-    return { path: trimmed, line: null }
-  }
-
-  const maybePath = match[1]
-  if (!maybePath || maybePath.endsWith("://")) {
-    return { path: trimmed, line: null }
-  }
-
-  const line = parseLineValue(match[2])
-  if (!line) {
-    return { path: trimmed, line: null }
-  }
-
-  return { path: maybePath, line }
-}
-
-/**
- * Parse a link target into a local file path + optional line, or null when it
- * isn't a local file (a web url, an unsupported scheme, a bare-relative path).
- * Exported so the transcript's file-badge action menu (message/
- * file-reference-actions.tsx) resolves a badge's path exactly the way a click
- * on that badge resolves it.
- */
-export function parseLocalFileTarget(rawUrl: string): LocalFileTarget | null {
-  const trimmed = rawUrl.trim()
-  if (!trimmed) return null
-
-  if (trimmed.toLowerCase().startsWith("file://")) {
-    try {
-      const parsed = new URL(trimmed)
-      const rawPathAndLine = splitPathAndLine(parsed.pathname)
-      const decodedPathname = decodeUriSafely(rawPathAndLine.path)
-      // A non-empty host is a UNC authority (file://server/share/x) -- preserve it
-      // as //server/share/x rather than dropping to /share/x.
-      const normalizedPathname = parsed.host
-        ? `//${parsed.host}${decodedPathname}`
-        : stripLeadingSlashOnWindows(decodedPathname, rawPathAndLine.path)
-      if (!normalizedPathname) return null
-      return {
-        path: normalizeSlashPath(normalizedPathname),
-        line: parseHashLine(parsed.hash) ?? rawPathAndLine.line,
-      }
-    } catch {
-      return null
-    }
-  }
-
-  if (URL_SCHEME.test(trimmed) && !WINDOWS_ABSOLUTE_PATH.test(trimmed)) {
-    return null
-  }
-
-  // Separate raw query, fragment, and colon-line syntax before decoding so
-  // encoded `%23`, `%3F`, and `%3A` remain filename data rather than being
-  // promoted to separators or line suffixes.
-  const hashIndex = trimmed.indexOf("#")
-  const rawHash = hashIndex >= 0 ? trimmed.slice(hashIndex) : ""
-  const beforeHash = hashIndex >= 0 ? trimmed.slice(0, hashIndex) : trimmed
-  const queryIndex = beforeHash.indexOf("?")
-  const rawPathPart =
-    queryIndex >= 0 ? beforeHash.slice(0, queryIndex) : beforeHash
-  const rawPathAndLine = splitPathAndLine(rawPathPart)
-  const decodedPath = decodeUriSafely(rawPathAndLine.path)
-  const normalizedPath = stripLeadingSlashOnWindows(
-    decodedPath,
-    rawPathAndLine.path
-  )
-  if (!isLocalPathLike(normalizedPath)) return null
-
-  return {
-    path: normalizeSlashPath(normalizedPath),
-    line: parseHashLine(rawHash) ?? rawPathAndLine.line,
-  }
-}
-
-function parseExternalUrl(rawUrl: string): URL | null {
-  const trimmed = rawUrl.trim()
-  if (!trimmed) return null
-
-  if (trimmed.startsWith("//")) {
-    // Protocol-relative: pin to https rather than the page protocol — a
-    // Tauri webview's own scheme (tauri://localhost) would otherwise
-    // classify these as an unsupported protocol, and the desktop opener
-    // capability only allows concrete http(s) URLs.
-    try {
-      return new URL(`https:${trimmed}`)
-    } catch {
-      return null
-    }
-  }
-
-  if (!URL_SCHEME.test(trimmed) || WINDOWS_ABSOLUTE_PATH.test(trimmed)) {
-    return null
-  }
-
-  try {
-    return new URL(trimmed)
-  } catch {
-    return null
-  }
-}
-
-function getAllowedExternalProtocol(rawUrl: string): string | null {
-  const parsed = parseExternalUrl(rawUrl)
-  if (!parsed) return null
-  const protocol = parsed.protocol.toLowerCase()
-  return ALLOWED_EXTERNAL_PROTOCOLS.has(protocol) ? protocol : null
-}
+// The parsing helpers live in `@/lib/link-classify` now (shared with the
+// built-in browser's link decision and the terminal); re-exported here so the
+// transcript-side importers keep their historical entry point.
+export { parseLocalFileTarget }
+export type { LocalFileTarget }
 
 /**
  * Whether {@link useOpenLinkOrFile} has anywhere to send `rawUrl`: a local
@@ -224,34 +63,6 @@ export function canOpenLinkOrFile(rawUrl: string): boolean {
   )
 }
 
-/**
- * True when `window.open` actually opens something — i.e. a real browser.
- *
- * NOT the same question as `isWebOpenerEnvironment` below. A Tauri window bound
- * to a remote codeg-server is still a TAURI WEBVIEW, and a webview that
- * registers no new-window handler opens nothing at all for `window.open` (wry
- * answers with nil on macOS, `SetHandled(true)` on Windows). Lumping remote
- * windows in with web mode here left every http(s) link in a remote workspace
- * silently dead; they must take the opener-plugin path instead, which
- * `capabilities/default.json` grants to the `remote-*` windows.
- */
-function windowOpenReachesABrowser(): boolean {
-  return !isDesktop()
-}
-
-/**
- * True when a `mailto:`/`tel:` URL should be handed to the OS through a
- * synthetic anchor rather than the Tauri opener plugin — pure web, or a Tauri
- * window bound to a remote codeg-server.
- *
- * The remote arm stays deliberately: unlike `window.open`, a synthetic anchor
- * DOES reach the OS handler from inside a webview, and it sidesteps the
- * question of whether the opener capability covers non-http(s) schemes.
- */
-function isWebOpenerEnvironment(): boolean {
-  return !isDesktop() || getActiveRemoteConnectionId() !== null
-}
-
 function shouldLetStreamdownOpenExternalUrl(rawUrl: string): boolean {
   if (parseLocalFileTarget(rawUrl)) return false
   const protocol = getAllowedExternalProtocol(rawUrl)
@@ -265,35 +76,30 @@ function shouldLetStreamdownOpenExternalUrl(rawUrl: string): boolean {
   return windowOpenReachesABrowser()
 }
 
-/**
- * Trigger an OS-registered protocol handler (mail client, dialer) from a
- * browser without leaving an empty tab. The synthetic anchor has no
- * `target`, so the browser hands the URL to the OS handler and stays on
- * the current page.
- */
-function dispatchOsHandlerUrl(url: string): void {
-  const anchor = document.createElement("a")
-  anchor.href = url
-  anchor.rel = "noreferrer noopener"
-  document.body.appendChild(anchor)
-  try {
-    anchor.click()
-  } finally {
-    anchor.remove()
-  }
+// `openExternalTab` moved to `@/lib/link-open`; re-exported for the transcript
+// components that import it from here.
+export { openExternalTab }
+
+// The modifier state of the most recent link gesture. Streamdown's link-safety
+// contract hands `useOpenLinkOrFile` only the URL (through its modal hook), so
+// the click handler parks the gesture here and the opener reads it back within
+// the same second. A stale record is ignored.
+let recentLinkGesture: { modifier: boolean; at: number } | null = null
+const LINK_GESTURE_WINDOW_MS = 1000
+
+export function rememberLinkGesture(event: {
+  metaKey?: boolean
+  ctrlKey?: boolean
+}): void {
+  recentLinkGesture = { modifier: isPrimaryModifier(event), at: Date.now() }
 }
 
-/**
- * Open an external URL in a new tab. Callers MUST invoke this inside the
- * click's own call stack — see `openLinkWithSafety`.
- */
-export function openExternalTab(url: string): void {
-  // `noreferrer` (which implies `noopener`) matters for AI-authored links: the
-  // opened page gets no `window.opener` handle back into the app and no
-  // Referer. It also makes `window.open` return null even on success (HTML
-  // window open steps 12 and 17), so the return value carries no signal —
-  // don't test it for a "popup blocked" check, it would fire on every success.
-  window.open(url, "_blank", "noreferrer")
+function consumeLinkGestureModifier(): boolean {
+  const gesture = recentLinkGesture
+  recentLinkGesture = null
+  return gesture !== null && Date.now() - gesture.at <= LINK_GESTURE_WINDOW_MS
+    ? gesture.modifier
+    : false
 }
 
 /**
@@ -311,8 +117,10 @@ export function openExternalTab(url: string): void {
 export function openLinkWithSafety(
   url: string,
   linkSafety: LinkSafetyConfig,
-  decline: () => void
+  decline: () => void,
+  gesture?: { metaKey?: boolean; ctrlKey?: boolean }
 ): void {
+  if (gesture) rememberLinkGesture(gesture)
   const verdict = linkSafety.onLinkCheck?.(url)
   if (verdict === true) {
     openExternalTab(url)
@@ -395,6 +203,9 @@ function DirectLinkOpen({
  * Used by the Streamdown link-safety modal and by standalone clickable file
  * affordances (e.g. user-message resource badges).
  */
+const useIsomorphicLayoutEffect =
+  typeof window !== "undefined" ? useLayoutEffect : useEffect
+
 export function useOpenLinkOrFile() {
   const t = useTranslations("Folder.chat.linkSafety")
   const workspaceT = useTranslations("Folder.workspaceContext")
@@ -402,12 +213,14 @@ export function useOpenLinkOrFile() {
   const folderPath = folder?.path
   const grokScope = useGrokSessionImageScope()
   const grokConversationId = grokScope?.conversationId ?? null
-  const { openFilePreview, openResolvedImagePreview } = useWorkspaceActions()
+  const { openResolvedImagePreview } = useWorkspaceActions()
   const resolveImage = resolveGrokSessionImage
   const grokInflightRef = useRef(new Map<string, Promise<void>>())
   const mountedRef = useRef(true)
   const currentConversationIdRef = useRef<number | null>(grokConversationId)
   const scopeEpochRef = useRef(0)
+  const openFileTarget = useOpenFileTarget()
+  const openUrlTarget = useOpenUrlTarget()
 
   useIsomorphicLayoutEffect(() => {
     if (currentConversationIdRef.current !== grokConversationId) {
@@ -513,8 +326,8 @@ export function useOpenLinkOrFile() {
         }
 
         try {
-          await openFilePreview(localTarget.path.replace(/^\.\/+/, ""), {
-            line: localTarget.line ?? undefined,
+          await openFileTarget(localTarget.path.replace(/^\.\/+/, ""), {
+            line: localTarget.line,
           })
         } catch (error) {
           toast.error(t("errorFailedOpen"), {
@@ -532,19 +345,19 @@ export function useOpenLinkOrFile() {
         return
       }
 
-      // Dispatch the CANONICAL form: a protocol-relative "//host/…" must
-      // reach the desktop opener as a concrete https URL — the opener
-      // capability only allows http(s), and raw "//…" would resolve
-      // against the webview's own scheme.
-      const openTarget = url.trim().startsWith("//")
-        ? `https:${url.trim()}`
-        : url
-
+      // http(s) and mailto/tel: the link decision (built-in browser, system
+      // browser, OS handler) runs and executes synchronously; the canonical
+      // form of a protocol-relative "//host/…" is produced in there.
       try {
-        if (OS_HANDLER_PROTOCOLS.has(protocol) && isWebOpenerEnvironment()) {
-          dispatchOsHandlerUrl(openTarget)
-        } else {
-          await openUrl(openTarget)
+        const action = openUrlTarget(url, {
+          source: "transcript",
+          modifier: consumeLinkGestureModifier(),
+        })
+        // A host blocked by a site rule is reported by the hook itself.
+        if (action.kind === "reject" && action.reason !== "blocked-host") {
+          toast.error(t("errorFailedLink"), {
+            description: t("errorUnsupportedLinkProtocol"),
+          })
         }
       } catch (error) {
         toast.error(t("errorFailedLink"), {
@@ -555,8 +368,9 @@ export function useOpenLinkOrFile() {
     [
       folderPath,
       grokConversationId,
-      openFilePreview,
+      openFileTarget,
       openResolvedImagePreview,
+      openUrlTarget,
       resolveImage,
       t,
       workspaceT,
@@ -622,7 +436,7 @@ export function FilePathLink({
   const t = useTranslations("Folder.chat.linkSafety")
   const { activeFolder: folder } = useActiveFolder()
   const folderPath = folder?.path ?? null
-  const { openFilePreview } = useWorkspaceActions()
+  const openFileTarget = useOpenFileTarget()
   // `opening` drives the visual busy state. `openingRef` is the synchronous
   // gate that survives rapid double-fires within a single event tick —
   // React batches the `setOpening(true)` commit, so relying purely on the
@@ -646,9 +460,7 @@ export function FilePathLink({
 
     openingRef.current = true
     setOpening(true)
-    void openFilePreview(target, {
-      line: line ?? undefined,
-    })
+    void openFileTarget(target, { line })
       .catch((error) => {
         toast.error(t("errorFailedOpen"), {
           description: toErrorMessage(error),
@@ -658,7 +470,7 @@ export function FilePathLink({
         openingRef.current = false
         setOpening(false)
       })
-  }, [filePath, folderPath, line, openFilePreview, t])
+  }, [filePath, folderPath, line, openFileTarget, t])
 
   return (
     <span className={cn("block min-w-0", className)}>

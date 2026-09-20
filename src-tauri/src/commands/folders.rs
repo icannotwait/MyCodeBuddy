@@ -5203,6 +5203,37 @@ pub async fn read_file_base64(
     .await
 }
 
+/// Open a file for reading, refusing a final-component symlink (unix) so a
+/// path validated by canonicalization cannot be redirected through a symlink
+/// swapped in afterward.
+#[cfg(unix)]
+pub(crate) fn open_no_follow(path: &Path) -> std::io::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
+}
+
+#[cfg(windows)]
+pub(crate) fn open_no_follow(path: &Path) -> std::io::Result<std::fs::File> {
+    use std::os::windows::fs::OpenOptionsExt;
+    // FILE_FLAG_OPEN_REPARSE_POINT opens the reparse point itself instead of
+    // following it, so a symlink/junction swapped in after validation is opened
+    // (and then rejected by the is_file() check) rather than followed outside
+    // the workspace root.
+    const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+    std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)
+}
+
+#[cfg(not(any(unix, windows)))]
+pub(crate) fn open_no_follow(path: &Path) -> std::io::Result<std::fs::File> {
+    std::fs::File::open(path)
+}
+
 /// Like `read_file_base64`, but confined to a workspace root: the path is
 /// relative to `root_path` and is canonicalized (resolving symlinks) so it can
 /// never read outside the workspace. Used by the HTML preview to inline local

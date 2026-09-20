@@ -18,6 +18,13 @@ import { configOptionDisplayLabel } from "@/lib/session-config-display"
 interface ModelOptionListProps {
   groups: ModelOptionGroup[]
   currentValue: string
+  /** The value the agent recommends, badged wherever it appears. Independent of
+   *  `currentValue` — the two may or may not be the same row. Needs
+   *  `recommendedLabel` to show anything. */
+  recommendedValue?: string | null
+  /** Localized chip text for that row (like the search/empty labels below, the
+   *  translation is the caller's). */
+  recommendedLabel?: string
   onSelect: (value: string) => void
   searchPlaceholder: string
   searchAriaLabel: string
@@ -49,6 +56,8 @@ const MAX_LIST_HEIGHT_REM = 20 // 320px @100%
 export function ModelOptionList({
   groups,
   currentValue,
+  recommendedValue = null,
+  recommendedLabel,
   onSelect,
   searchPlaceholder,
   searchAriaLabel,
@@ -281,6 +290,11 @@ export function ModelOptionList({
                         <DropdownRadioItemContent
                           label={label}
                           description={row.option.description}
+                          recommendedLabel={
+                            row.option.value === recommendedValue
+                              ? recommendedLabel
+                              : null
+                          }
                         />
                       </button>
                     )

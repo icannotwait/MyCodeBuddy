@@ -288,7 +288,12 @@ mod tests {
         ) -> Vec<crate::acp::feedback::PendingFeedback> {
             Vec::new()
         }
-        async fn commit_feedback_delivered(&self, _parent_connection_id: &str, _ids: Vec<String>) {}
+        async fn commit_feedback_delivered(
+            &self,
+            _parent_connection_id: &str,
+            _ids: Vec<String>,
+        ) {
+        }
     }
 
     #[async_trait]
@@ -315,6 +320,54 @@ mod tests {
         }
     }
 
+    /// A temp directory short enough to bind a socket inside, whatever the
+    /// ambient `$TMPDIR` happens to be.
+    ///
+    /// `tempfile::tempdir()` honours `$TMPDIR`, and these tests then add
+    /// `/.tmpXXXXXX/codeg-delegation-*.sock` on top — about 38 bytes. That is
+    /// fine against the ~20-byte default and fatal against codeg's own
+    /// per-session `TMPDIR`, which is 72 bytes (`/var/folders/…/T/codeg-acp/
+    /// <pid>-<hex>`): the composed path reaches 110 and `sun_path` caps at 104
+    /// on macOS. The whole suite went red inside a codeg session and green
+    /// outside it, for reasons having nothing to do with the code under test.
+    ///
+    /// Rooting in `/tmp` — the same move `scratch_dir`'s socket tests make —
+    /// keeps the result near 40 bytes no matter what the environment says.
+    fn socket_dir() -> tempfile::TempDir {
+        #[cfg(unix)]
+        {
+            tempfile::tempdir_in("/tmp").unwrap()
+        }
+        #[cfg(not(unix))]
+        {
+            // Windows addresses these tests to the named-pipe namespace, which
+            // ignores the directory entirely; there is no budget to protect.
+            tempfile::tempdir().unwrap()
+        }
+    }
+
+    /// A socket path exactly one byte past what `sun_path` can hold, inside
+    /// `holder`. Sized from the cap rather than hard-coded, so it keeps
+    /// straddling the boundary if either side of it moves.
+    ///
+    /// The parent directory is deliberately NOT created. `bind` is supposed to
+    /// refuse before it touches the filesystem, so its absence afterwards is
+    /// the observable that proves it — and a pre-created parent would destroy
+    /// that: `create_dir_all` on a directory that already exists creates
+    /// nothing, so the check could be moved below it and the test would still
+    /// pass.
+    #[cfg(unix)]
+    fn over_long_socket_path(holder: &Path) -> PathBuf {
+        const NAME: &str = "codeg-delegation-unreachable.sock";
+        let cap = crate::acp::scratch_dir::SUN_PATH_CAP;
+        // holder + '/' + pad + '/' + NAME == cap, i.e. one past the cap - 1
+        // bytes a path may actually occupy.
+        let pad = cap - holder.as_os_str().len() - 2 - NAME.len();
+        let path = holder.join("x".repeat(pad)).join(NAME);
+        assert_eq!(path.as_os_str().len(), cap);
+        path
+    }
+
     fn make_service(socket_path: PathBuf) -> Arc<DelegationService> {
         let broker = Arc::new(DelegationBroker::new(
             Arc::new(MockSpawner::new()) as Arc<dyn ConnectionSpawner>,
@@ -336,7 +389,7 @@ mod tests {
     /// by a detached task.
     #[tokio::test]
     async fn start_reports_bind_failure_and_records_it() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = socket_dir();
         // A directory is not a bindable socket address on either platform.
         let unbindable = dir.path().join("nested").join("dir");
         std::fs::create_dir_all(&unbindable).unwrap();
@@ -352,7 +405,7 @@ mod tests {
 
     #[tokio::test]
     async fn probe_answers_false_for_an_unbound_path() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = socket_dir();
         assert!(!probe_socket(&dir.path().join("nobody-here.sock")).await);
     }
 
@@ -362,7 +415,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn start_binds_probeable_socket_and_survives_a_restart() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = socket_dir();
         let socket = dir.path().join("codeg-delegation-test.sock");
         let service = make_service(socket.clone());
 
@@ -386,7 +439,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn ensure_running_is_a_noop_while_the_socket_answers() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = socket_dir();
         let service = make_service(dir.path().join("codeg-delegation-noop.sock"));
 
         service.start().await.unwrap();
@@ -407,7 +460,7 @@ mod tests {
     async fn a_failed_rebind_leaves_the_working_acceptor_alone() {
         use std::os::unix::fs::PermissionsExt;
 
-        let dir = tempfile::tempdir().unwrap();
+        let dir = socket_dir();
         let nest = dir.path().join("nest");
         std::fs::create_dir(&nest).unwrap();
         let socket = nest.join("codeg-delegation-keep.sock");
@@ -426,10 +479,7 @@ mod tests {
         assert!(!err.is_empty());
 
         let after = service.snapshot().await;
-        assert!(
-            after.task_alive,
-            "the acceptor must survive a failed rebind"
-        );
+        assert!(after.task_alive, "the acceptor must survive a failed rebind");
         assert_eq!(
             after.started_at, before.started_at,
             "a failed rebind must not look like a successful one"
@@ -464,7 +514,7 @@ mod tests {
     async fn rebinding_replaces_the_socket_without_ever_unlinking_the_path() {
         use std::os::unix::fs::MetadataExt;
 
-        let dir = tempfile::tempdir().unwrap();
+        let dir = socket_dir();
         let socket = dir.path().join("codeg-delegation-swap.sock");
         let service = make_service(socket.clone());
 
@@ -505,13 +555,15 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn concurrent_ensure_running_calls_settle_on_one_acceptor() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = socket_dir();
         let service = make_service(dir.path().join("codeg-delegation-race.sock"));
 
-        let results = futures::future::join_all((0..4).map(|_| {
-            let service = Arc::clone(&service);
-            async move { service.ensure_running().await }
-        }))
+        let results = futures::future::join_all(
+            (0..4).map(|_| {
+                let service = Arc::clone(&service);
+                async move { service.ensure_running().await }
+            }),
+        )
         .await;
         assert!(
             results.iter().all(Result::is_ok),
@@ -527,5 +579,56 @@ mod tests {
         let before = snap.started_at;
         service.ensure_running().await.unwrap();
         assert_eq!(service.snapshot().await.started_at, before);
+    }
+
+    /// A socket path too long to dial must be REFUSED, never published.
+    ///
+    /// `DelegationListener::bind` binds a short `.stg-*` sibling and renames it
+    /// onto the real path, and `rename(2)` answers to `PATH_MAX`, not to
+    /// `sun_path`. So an over-long path used to bind, publish and return `Ok`:
+    /// the socket file appeared, `start()` succeeded, and `snapshot()` reported
+    /// `task_alive` with no `last_error` — a service the status indicator
+    /// called healthy while every `connect(2)` to it failed with EINVAL and no
+    /// companion process could reach the broker at all.
+    ///
+    /// The silence is the bug this pins. A bind that simply failed was never
+    /// the dangerous case.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn start_never_reports_success_for_a_socket_nobody_can_reach() {
+        let holder = socket_dir();
+        let socket = over_long_socket_path(holder.path());
+        let service = make_service(socket.clone());
+
+        let err = service.start().await.unwrap_err();
+        assert!(
+            err.contains("AF_UNIX"),
+            "the error should name the limit that was hit: {err}"
+        );
+
+        assert!(
+            !socket.exists(),
+            "a socket nothing can dial must not be published at {}",
+            socket.display()
+        );
+        assert!(!service.is_listening().await);
+
+        let snap = service.snapshot().await;
+        assert!(!snap.task_alive);
+        assert!(snap.started_at.is_none());
+        assert_eq!(snap.last_error.as_deref(), Some(err.as_str()));
+
+        // Refused BEFORE the first filesystem call, which is what keeps the
+        // "a failed bind leaves an incumbent untouched" invariant free: there
+        // is no staged entry and no directory creation to undo. The parent was
+        // never created by this test (see `over_long_socket_path`), so its
+        // continued absence is exactly that claim — move the length check below
+        // `create_dir_all` and this fires.
+        let parent = socket.parent().unwrap();
+        assert!(
+            !parent.exists(),
+            "bind touched the filesystem: {} was created",
+            parent.display()
+        );
     }
 }

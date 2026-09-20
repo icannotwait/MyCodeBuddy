@@ -54,12 +54,21 @@ vi.mock("@/lib/api", () => ({
   getQuestionSettings: vi.fn(async () => ({ enabled: true })),
   setQuestionSettings: vi.fn(async (v: unknown) => v),
   getSessionInfoSettings: vi.fn(async () => ({ enabled: true })),
+  getBrowserToolsSettings: vi.fn(async () => ({ enabled: false })),
   setSessionInfoSettings: vi.fn(async (v: unknown) => v),
   getChatAuthoringSettings: vi.fn(async () => ({
     automations_enabled: false,
     work_tasks_enabled: false,
   })),
   setChatAuthoringSettings: vi.fn(async (v: unknown) => v),
+  getSystemCloseBehaviorSettings: vi.fn(async () => ({
+    behavior: "ask" as const,
+    tray_available: true,
+  })),
+  updateSystemCloseBehaviorSettings: vi.fn(async (behavior: string) => ({
+    behavior,
+    tray_available: true,
+  })),
 }))
 
 vi.mock("sonner", () => ({
@@ -516,6 +525,7 @@ describe("GeneralSettings", () => {
       "Notification sounds",
       "Multi-Agent Collaboration",
       "In-conversation tools",
+      "Built-in browser",
     ]) {
       expect(screen.getByRole("heading", { name: heading })).toBeInTheDocument()
     }
