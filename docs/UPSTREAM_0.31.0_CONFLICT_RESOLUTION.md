@@ -187,7 +187,7 @@ cargo test --no-default-features --features server --bin codeg-server --lib
 | `patchFileTabRef` 对 union `FileWorkspaceTab` 做 `{...tab,...patch}` | `applyFileTabPatch` 保 discriminant；patch 只叠共享字段。 |
 | `antigravity_launch_env` 丢了上游 `scratch` 第二参 | 签名接 `Option<&Path>`，login spawn 传 `scratch.path()`；settings 测试传 `None`。 |
 | fixture 缺 `show_thinking` / `recommended_value` | 测试构造补字段；`OpenCodeParser` 从 `super` 再 import。 |
-| `folders::open_no_follow` 仅非 unix `doc_guest` 调用 | unix 实现 `#[allow(dead_code)]`，避免 server clippy `-D warnings`。 |
+| `folders::open_no_follow` 仅非 unix `doc_guest` 调用 | unix / windows / other 都 `#[allow(dead_code)]`；server clippy 没有 `doc_guest`。 |
 | `folders::is_within_workspace` 被 TAKE_OURS 丢掉 | 从上游回植：canonical starts_with **或** `folder_links::is_allowed`。`#[cfg(feature = "tauri-runtime")]`，server clippy 不要 `dead_code`。 |
 | `strip_environment_details` 被上游 `trim()` 吃掉行首空格 | fork 用 `trim_end()` + `trim_start_matches(['\\r','\\n'])`，保留 indented mandatory-route。 |
 | Cline `legacy_conversation` title 没走 `visible_title` | 先 `visible_title`；task 只剩 terminal context 时回落到第一条可见 user-turn。 |

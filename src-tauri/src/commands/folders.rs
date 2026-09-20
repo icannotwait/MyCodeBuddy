@@ -5235,6 +5235,7 @@ pub(crate) fn open_no_follow(path: &Path) -> std::io::Result<std::fs::File> {
 }
 
 #[cfg(windows)]
+#[allow(dead_code)]
 pub(crate) fn open_no_follow(path: &Path) -> std::io::Result<std::fs::File> {
     use std::os::windows::fs::OpenOptionsExt;
     // FILE_FLAG_OPEN_REPARSE_POINT opens the reparse point itself instead of
@@ -5249,6 +5250,7 @@ pub(crate) fn open_no_follow(path: &Path) -> std::io::Result<std::fs::File> {
 }
 
 #[cfg(not(any(unix, windows)))]
+#[allow(dead_code)]
 pub(crate) fn open_no_follow(path: &Path) -> std::io::Result<std::fs::File> {
     std::fs::File::open(path)
 }
