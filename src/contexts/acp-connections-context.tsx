@@ -14,10 +14,7 @@ import { toast } from "sonner"
 import { getEventStream } from "@/lib/platform"
 import { getTransport, isRemoteDesktopMode } from "@/lib/transport"
 import { subscribeDesktopAcpEvents } from "@/lib/transport/desktop-acp-events"
-import {
-  EventIngestor,
-  prepareEventEnvelope,
-} from "@/lib/acp/event-ingestor"
+import { EventIngestor, prepareEventEnvelope } from "@/lib/acp/event-ingestor"
 import { recordFrontendTurnTrace } from "@/lib/acp/frontend-turn-trace"
 import {
   getStreamingPerformanceConfig,
