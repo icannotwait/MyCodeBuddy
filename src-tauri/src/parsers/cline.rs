@@ -699,10 +699,11 @@ impl ClineParser {
             .as_ref()
             .and_then(|e| e.cwd_on_task_initialization.clone());
         let folder_name = folder_path.as_deref().map(folder_name_from_path);
-        let title = history_entry
+        let mut title = history_entry
             .as_ref()
             .and_then(|e| e.task.as_deref())
-            .map(|t| title_from_user_text(t.trim()));
+            .and_then(|t| visible_title(Some(t.trim().to_string())))
+            .map(|t| title_from_user_text(&t));
 
         let mut turns: Vec<MessageTurn> = Vec::new();
         let mut turn_counter = 0u32;
@@ -808,6 +809,22 @@ impl ClineParser {
 
         let started_at = turns.first().map(|t| t.timestamp).unwrap_or_else(Utc::now);
         let ended_at = turns.last().map(|t| t.timestamp);
+
+        // When the task field was only terminal context (or missing), fall back
+        // to the first visible user-turn text so list title stays useful.
+        if title.is_none() {
+            title = turns.iter().find_map(|turn| {
+                if !matches!(turn.role, TurnRole::User) {
+                    return None;
+                }
+                turn.blocks.iter().find_map(|b| match b {
+                    ContentBlock::Text { text } if !text.is_empty() => {
+                        Some(title_from_user_text(text))
+                    }
+                    _ => None,
+                })
+            });
+        }
 
         backfill_turn_durations(&mut turns, &[]);
         let session_stats = compute_session_stats(&turns);
@@ -1329,7 +1346,17 @@ fn strip_environment_details(text: &str) -> String {
         return String::new();
     }
 
-    result.trim().to_string()
+    // Keep leading spaces (indented mandatory-route quotes) and only drop
+    // surrounding blank lines. A full trim() would hide exact-prefix matches
+    // that visible_user_text still needs to see.
+    if result.trim().is_empty() {
+        String::new()
+    } else {
+        result
+            .trim_end()
+            .trim_start_matches(['\r', '\n'])
+            .to_string()
+    }
 }
 
 #[cfg(test)]
