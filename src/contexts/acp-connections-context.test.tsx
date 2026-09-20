@@ -7601,14 +7601,14 @@ describe("streaming flush window widens with the run it re-renders", () => {
     vi.useFakeTimers()
     try {
       emitAcpEvent(handlers, {
-        seq: 4,
+        seq: 2,
         connection_id: "spawned-conn",
         type: "content_delta",
         text: "hello ",
       })
       expect(liveText()).toBe("")
 
-      // eventSeq 2 is behind the cursor the delta above advanced to 4, so
+      // eventSeq 1 is behind the cursor the delta above advanced to 2, so
       // this hydrate takes the stale branch. Note it carries no live message
       // of its own — the stale branch would ignore one anyway.
       h.denormalizeSnapshot.mockReturnValue({
@@ -7629,11 +7629,11 @@ describe("streaming flush window widens with the run it re-renders", () => {
         configStale: false,
         configStaleKind: null,
         lastError: null,
-        eventSeq: 2,
+        eventSeq: 1,
         activeDelegations: [],
       })
       hydrateSnapshot(handlers, {
-        event_seq: 2,
+        event_seq: 1,
       } as unknown as LiveSessionSnapshot)
 
       // The stale branch merged its latched field and left the turn alone…
@@ -7926,8 +7926,10 @@ describe("AcpConnectionsProvider Grok cross-agent-type model switch", () => {
     })
 
     expect(h.toastWarning).toHaveBeenCalledTimes(1)
-    // The useTranslations mock echoes the key, so the message itself is the key.
-    expect(h.toastWarning).toHaveBeenCalledWith("configOptionAdjusted")
+    // The mock echoes the key; interpolated params may ride along.
+    expect(h.toastWarning).toHaveBeenCalledWith(
+      expect.stringMatching(/^configOptionAdjusted/)
+    )
   })
 
   it("stays silent for option snapshots nobody asked for", async () => {
@@ -8173,7 +8175,7 @@ describe("empty-turn error diagnostics", () => {
         agent_type: "claude_code",
         code,
       })
-      expect(h.store!.getConnection(TAB)!.error).toBe(key)
+      expect(h.store!.getConnection(TAB)!.error).toMatch(new RegExp(`^${key}`))
     })
   })
 
@@ -8193,8 +8195,8 @@ describe("empty-turn error diagnostics", () => {
       code: "turn_failed_auth_required",
     })
 
-    expect(h.store!.getConnection(TAB)!.error).toBe(
-      "backendErrors.turnFailedAuthRequired"
+    expect(h.store!.getConnection(TAB)!.error).toMatch(
+      /^backendErrors\.turnFailedAuthRequired/
     )
   })
 
@@ -8220,14 +8222,17 @@ describe("empty-turn error diagnostics", () => {
     const alertCalls = h.pushAlert.mock.calls
     const [, , alertDetail, , alertEvidence] =
       alertCalls[alertCalls.length - 1]!
-    expect(alertDetail).toBe("backendErrors.turnFailedEmptyProtocol")
+    expect(alertDetail).toMatch(/^backendErrors\.turnFailedEmptyProtocol/)
     expect(alertEvidence).toBe(details)
 
     // `conn.error` feeds the composer tooltip — the localized line plus a
     // pointer at the only surface that can expand the evidence, never the
     // evidence itself.
-    expect(h.store!.getConnection(TAB)!.error).toBe(
-      "backendErrors.turnFailedEmptyProtocol backendErrors.detailsInAlerts"
+    expect(h.store!.getConnection(TAB)!.error).toMatch(
+      /^backendErrors\.turnFailedEmptyProtocol/
+    )
+    expect(h.store!.getConnection(TAB)!.error).toContain(
+      "backendErrors.detailsInAlerts"
     )
 
     // Notification centers persist their payload outside the app.
@@ -8253,12 +8258,15 @@ describe("empty-turn error diagnostics", () => {
     const alertCalls = h.pushAlert.mock.calls
     const [, , alertDetail, , alertEvidence] =
       alertCalls[alertCalls.length - 1]!
-    expect(alertDetail).toBe("backendErrors.turnFailedEmpty")
+    expect(alertDetail).toMatch(/^backendErrors\.turnFailedEmpty/)
     expect(alertEvidence).toBeUndefined()
     // Nothing to expand, so the tooltip must not send the user looking for an
     // expander.
-    expect(h.store!.getConnection(TAB)!.error).toBe(
-      "backendErrors.turnFailedEmpty"
+    expect(h.store!.getConnection(TAB)!.error).toMatch(
+      /^backendErrors\.turnFailedEmpty/
+    )
+    expect(h.store!.getConnection(TAB)!.error).not.toContain(
+      "backendErrors.detailsInAlerts"
     )
   })
 })
@@ -8298,8 +8306,8 @@ describe("session_load_failed archived-session recovery", () => {
       code: "session_archived",
     })
 
-    expect(h.store!.getConnection(TAB)!.loadError).toBe(
-      "backendErrors.sessionArchived"
+    expect(h.store!.getConnection(TAB)!.loadError).toMatch(
+      /^backendErrors\.sessionArchived/
     )
     // The point of the banner: the exact command, built from the session the
     // load failed for — no scraping of the (reword-able) error body.
@@ -8328,8 +8336,8 @@ describe("session_load_failed archived-session recovery", () => {
       code: "session_archived",
     })
 
-    expect(h.store!.getConnection(TAB)!.loadError).toBe(
-      "backendErrors.sessionArchived"
+    expect(h.store!.getConnection(TAB)!.loadError).toMatch(
+      /^backendErrors\.sessionArchived/
     )
     expect(lastArchivedCall()?.[1]?.command).toBe(
       `codex unarchive ${ARCHIVED_SID}`
@@ -15591,9 +15599,10 @@ describe("AcpConnectionsProvider canonical observer aliases", () => {
     })
 
     expect(notify).toHaveBeenCalled()
-    // prompting resets liveMessage, then content_delta appends text — both
-    // must reach the alias sink registered under the tab key.
-    expect(sink.mock.calls.length).toBeGreaterThanOrEqual(2)
+    // prompting resets liveMessage, then the flush window commits the delta.
+    await waitFor(() => {
+      expect(sink.mock.calls.length).toBeGreaterThanOrEqual(2)
+    })
     const lastLive = sink.mock.calls[sink.mock.calls.length - 1]![0]
     expect(lastLive.content).toContainEqual({
       type: "text",
@@ -16662,9 +16671,11 @@ describe("AcpConnectionsProvider canonical observer aliases", () => {
       text: "hydrated",
     })
     expect(h.store!.getConnection(TAB)?.sessionId).toBe("sess-shared")
-    expect(h.store!.getConnection(TAB)?.liveMessage?.content).toContainEqual({
-      type: "text",
-      text: "hydrated",
+    await waitFor(() => {
+      expect(h.store!.getConnection(TAB)?.liveMessage?.content).toContainEqual({
+        type: "text",
+        text: "hydrated",
+      })
     })
 
     // Same sessionId still aliases (must not rekey the connectionId entry).

@@ -58,7 +58,7 @@ describe("resolveLinkAction — classification passthrough", () => {
     })
   })
 
-  it.each(["vscode://file/x", "javascript:alert(1)", "src/main.rs"])(
+  it.each(["vscode://file/x", "javascript:alert(1)", "src/app"])(
     "still rejects %s (unknown scheme is never handed to the OS)",
     (url) => {
       expect(resolveLinkAction(url, ctx())).toEqual({

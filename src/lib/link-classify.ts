@@ -1,3 +1,5 @@
+import { isLocalPathLike } from "@/lib/markdown/local-path-links"
+
 // Pure link-target classification shared by every place a clicked address
 // has to be routed: the transcript link-safety flow, the built-in browser's
 // link decision function (`resolve-link-action.ts`) and the terminal's link
@@ -5,9 +7,14 @@
 // React, the transport layer or the DOM, so it is unit-testable in isolation
 // and the classification cannot drift between entrances.
 //
-// The parsing helpers below were lifted verbatim from
+// The parsing helpers below were lifted from
 // `components/ai-elements/link-safety.tsx`; `resource-kind.ts` mirrors the
 // same regexes for the presentational type icon. Keep the three in step.
+//
+// Fork MERGE_BOTH vs upstream extract: split `:line` / `#` / `?` on the
+// *raw* href so `%3A` / `%23` stay filename data, and only strip `/C:/`
+// when the pre-decode href had a literal drive prefix. Bare relatives use
+// the shared `isLocalPathLike` gate (`docs/a.md` is a file; `src/app` is not).
 
 export interface LocalFileTarget {
   path: string
@@ -31,12 +38,19 @@ export function normalizeSlashPath(path: string): string {
   return path.replace(/\\/g, "/")
 }
 
-/** Strip leading slash before Windows drive letter: /C:/foo → C:/foo */
-function stripLeadingSlashOnWindows(p: string): string {
-  if (p.startsWith("/") && WINDOWS_ABSOLUTE_PATH.test(p.slice(1))) {
-    return p.slice(1)
+/** Strip `/C:/` only when the pre-decode href had a literal drive prefix. */
+function stripLeadingSlashOnWindows(
+  decodedPath: string,
+  rawPath: string = decodedPath
+): string {
+  if (
+    decodedPath.startsWith("/") &&
+    rawPath.startsWith("/") &&
+    WINDOWS_ABSOLUTE_PATH.test(rawPath.slice(1))
+  ) {
+    return decodedPath.slice(1)
   }
-  return p
+  return decodedPath
 }
 
 function decodeUriSafely(value: string): string {
@@ -68,7 +82,9 @@ function parseHashLine(hash: string): number | null {
 
 function splitPathAndLine(rawPath: string): LocalFileTarget {
   const trimmed = rawPath.trim()
-  const match = trimmed.match(/^(.*):(\d+)(?::\d+)?$/)
+  // Non-greedy so `/C:/file.ts:12:8` takes `:12` as the line (and `:8` as a
+  // column), not the last `:digits` leaving `:12` glued to the path.
+  const match = trimmed.match(/^(.*?):(\d+)(?::\d+)?$/)
   if (!match) {
     return { path: trimmed, line: null }
   }
@@ -86,22 +102,6 @@ function splitPathAndLine(rawPath: string): LocalFileTarget {
   return { path: maybePath, line }
 }
 
-function isLocalPathLike(path: string): boolean {
-  // "//host/…" (forward slashes) is protocol-relative — a WEB url, not a
-  // local path. It must fall through to the external-URL route, never into
-  // local file IO. A "\\server\share" (backslashes) IS a local UNC path
-  // (a web url never uses backslashes) — the form remark-file-uri-links
-  // emits for file://server/share URIs.
-  return (
-    (path.startsWith("/") && !path.startsWith("//")) ||
-    path.startsWith("\\\\") ||
-    path.startsWith("./") ||
-    path.startsWith("../") ||
-    path.startsWith("~/") ||
-    WINDOWS_ABSOLUTE_PATH.test(path)
-  )
-}
-
 /**
  * Parse a link target into a local file path + optional line, or null when it
  * isn't a local file (a web url, an unsupported scheme, a bare-relative path).
@@ -116,17 +116,17 @@ export function parseLocalFileTarget(rawUrl: string): LocalFileTarget | null {
   if (trimmed.toLowerCase().startsWith("file://")) {
     try {
       const parsed = new URL(trimmed)
-      const rawPathname = decodeUriSafely(parsed.pathname)
+      const rawPathAndLine = splitPathAndLine(parsed.pathname)
+      const decodedPathname = decodeUriSafely(rawPathAndLine.path)
       // A non-empty host is a UNC authority (file://server/share/x) —
       // preserve it as //server/share/x rather than dropping to /share/x.
       const normalizedPathname = parsed.host
-        ? `//${parsed.host}${rawPathname}`
-        : stripLeadingSlashOnWindows(rawPathname)
-      const pathAndLine = splitPathAndLine(normalizedPathname)
-      if (!pathAndLine.path) return null
+        ? `//${parsed.host}${decodedPathname}`
+        : stripLeadingSlashOnWindows(decodedPathname, rawPathAndLine.path)
+      if (!normalizedPathname) return null
       return {
-        path: normalizeSlashPath(pathAndLine.path),
-        line: parseHashLine(parsed.hash) ?? pathAndLine.line,
+        path: normalizeSlashPath(normalizedPathname),
+        line: parseHashLine(parsed.hash) ?? rawPathAndLine.line,
       }
     } catch {
       return null
@@ -137,23 +137,26 @@ export function parseLocalFileTarget(rawUrl: string): LocalFileTarget | null {
     return null
   }
 
-  // Split on raw # / ? before decoding so encoded `%23` / `%3F` inside the
-  // path don't get promoted to fragment/query separators (which would point
-  // the file opener at the wrong file).
+  // Separate raw query, fragment, and colon-line syntax before decoding so
+  // encoded `%23`, `%3F`, and `%3A` remain filename data rather than being
+  // promoted to separators or line suffixes.
   const hashIndex = trimmed.indexOf("#")
   const rawHash = hashIndex >= 0 ? trimmed.slice(hashIndex) : ""
   const beforeHash = hashIndex >= 0 ? trimmed.slice(0, hashIndex) : trimmed
   const queryIndex = beforeHash.indexOf("?")
   const rawPathPart =
     queryIndex >= 0 ? beforeHash.slice(0, queryIndex) : beforeHash
-  const decodedPath = decodeUriSafely(rawPathPart)
-  const pathAndLine = splitPathAndLine(decodedPath)
-  const normalizedPath = stripLeadingSlashOnWindows(pathAndLine.path)
+  const rawPathAndLine = splitPathAndLine(rawPathPart)
+  const decodedPath = decodeUriSafely(rawPathAndLine.path)
+  const normalizedPath = stripLeadingSlashOnWindows(
+    decodedPath,
+    rawPathAndLine.path
+  )
   if (!isLocalPathLike(normalizedPath)) return null
 
   return {
     path: normalizeSlashPath(normalizedPath),
-    line: parseHashLine(rawHash) ?? pathAndLine.line,
+    line: parseHashLine(rawHash) ?? rawPathAndLine.line,
   }
 }
 

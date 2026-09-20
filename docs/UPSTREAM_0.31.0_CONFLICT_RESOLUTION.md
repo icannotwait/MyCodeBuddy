@@ -180,3 +180,4 @@ cargo test --no-default-features --features server --bin codeg-server --lib
 | `WebTransport.call` 改 `res.text()` | 测试 mock 补 `text()`；fork completion-context 捕获留下。 |
 | `useOpenFileTarget` 多了 `folderId` | 未设时不要把 `folderId: undefined` 传给 `openFilePreview`。 |
 | General / tab-bar / MarkdownLink 测试 | fixture 并上 `BrowserSettings`；`Browser.tab.untitled`；`useOptionalWorkspaceActions` mock。 |
+| `link-classify.ts` 抽走了 fork 的 Windows/`%3A`/bare-relative 解析 | 先对 raw href 切 `:line`；`stripLeadingSlashOnWindows` 看解码前是否真是盘符；bare relative 走共享 `isLocalPathLike`。 |

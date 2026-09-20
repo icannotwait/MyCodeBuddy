@@ -12,6 +12,10 @@ describe("classifyLinkTarget", () => {
     ["C:\\repo\\a.png", "C:/repo/a.png", null],
     ["file:///repo/src/app.ts#L10", "/repo/src/app.ts", 10],
     ["\\\\server\\share\\x.txt", "//server/share/x.txt", null],
+    ["docs/a.md", "docs/a.md", null],
+    ["/C:/repo/src/app.ts:12:8", "C:/repo/src/app.ts", 12],
+    ["/C%3A/repo/src/app.ts", "/C:/repo/src/app.ts", null],
+    ["/tmp/report%3A12", "/tmp/report:12", null],
   ])("classifies %s as a local file", (input, path, line) => {
     expect(classifyLinkTarget(input)).toEqual({
       kind: "file",
@@ -54,7 +58,7 @@ describe("classifyLinkTarget", () => {
     "ftp://example.com/file",
     "tauri://localhost/",
     "#section",
-    "src/main.rs",
+    "src/app",
     "www.example.com",
   ])("refuses %s as unsupported (never handed to the OS)", (input) => {
     expect(classifyLinkTarget(input)).toEqual({ kind: "unsupported" })

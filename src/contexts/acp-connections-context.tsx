@@ -14,7 +14,10 @@ import { toast } from "sonner"
 import { getEventStream } from "@/lib/platform"
 import { getTransport, isRemoteDesktopMode } from "@/lib/transport"
 import { subscribeDesktopAcpEvents } from "@/lib/transport/desktop-acp-events"
-import { EventIngestor } from "@/lib/acp/event-ingestor"
+import {
+  EventIngestor,
+  prepareEventEnvelope,
+} from "@/lib/acp/event-ingestor"
 import { recordFrontendTurnTrace } from "@/lib/acp/frontend-turn-trace"
 import {
   getStreamingPerformanceConfig,
@@ -8785,30 +8788,42 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
         return
       }
 
-      const pendingNonStreaming: EventEnvelope[] = []
-      const flushPendingNonStreaming = () => {
-        if (pendingNonStreaming.length === 0) return
+      const isStreamingEnvelope = (event: EventEnvelope) =>
+        event.type === "content_delta" || event.type === "thinking"
+      const streamingOnly = events.every(isStreamingEnvelope)
+
+      // A mixed replay (`user_message` + `content_delta` + `turn_complete`)
+      // must stay one EventIngestor frame so completion pairing survives.
+      // Desktop-sourced deltas (unmapped-buffer drain) also stay on the
+      // ingestor so transcript frames keep `deliverySource: "desktop"`.
+      // The flush window only holds live attach ticks (`emitAcpEvent`).
+      if (!streamingOnly || source === "desktop") {
         flushStreamingQueue(contextKey)
-        ingestor.pushMapped(contextKey, pendingNonStreaming, source)
-        pendingNonStreaming.length = 0
+        ingestor.pushMapped(contextKey, events, source)
+        if (flush) ingestor.flushNow()
+        return
       }
 
       for (const event of events) {
-        if (event.type !== "content_delta" && event.type !== "thinking") {
-          pendingNonStreaming.push(event)
+        const stamped = prepareEventEnvelope(event)
+        const conn = storeRef.current.connections.get(contextKey)
+        if (conn && stamped.seq > conn.lastAppliedSeq + 1) {
+          handleSequenceGap({
+            contextKey,
+            connectionId: stamped.connection_id,
+            expectedSeq: conn.lastAppliedSeq + 1,
+            receivedSeq: stamped.seq,
+          })
           continue
         }
-
-        flushPendingNonStreaming()
-        const conn = storeRef.current.connections.get(contextKey)
         if (
-          !event.parent_tool_use_id &&
+          !stamped.parent_tool_use_id &&
           conn?.generationClockStartedAt == null
         ) {
           dispatch({
             type: "GENERATION_CLOCK_START",
             contextKey,
-            at: requiredReceivedAt(event),
+            at: requiredReceivedAt(stamped),
           })
         }
         if (conn && hasSettleableRetryIncident(conn.sessionFailures)) {
@@ -8819,24 +8834,22 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
           })
         }
         enqueueStreamingAction({
-          type: event.type === "thinking" ? "THINKING" : "CONTENT_DELTA",
+          type: stamped.type === "thinking" ? "THINKING" : "CONTENT_DELTA",
           contextKey,
-          text: event.text,
-          parentToolUseId: event.parent_tool_use_id ?? undefined,
-          receivedAt: requiredReceivedAt(event),
+          text: stamped.text,
+          parentToolUseId: stamped.parent_tool_use_id ?? undefined,
+          receivedAt: requiredReceivedAt(stamped),
         })
-        dispatch({ type: "EVENT_APPLIED", contextKey, seq: event.seq })
-        playEventSound(event)
-        notifyRawSubscribers(event)
+        dispatch({ type: "EVENT_APPLIED", contextKey, seq: stamped.seq })
+        playEventSound(stamped)
+        notifyRawSubscribers(stamped)
       }
-
-      flushPendingNonStreaming()
-      if (flush) ingestor.flushNow()
     },
     [
       dispatch,
       enqueueStreamingAction,
       flushStreamingQueue,
+      handleSequenceGap,
       notifyRawSubscribers,
     ]
   )
@@ -9852,6 +9865,7 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
           for (const env of consumeBufferedEvents(connectionId)) {
             applyMappedEnvelope(contextKey, env)
           }
+          flushStreamingQueue(contextKey)
         }
       },
       claimConnectionOwnership: async (args) => {
@@ -9959,6 +9973,7 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
         for (const env of consumeBufferedEvents(connectionId)) {
           applyMappedEnvelope(contextKey, env)
         }
+        flushStreamingQueue(contextKey)
         return {
           connectionId,
           ownershipGeneration: ownershipGeneration ?? undefined,
@@ -10356,6 +10371,7 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
       for (const env of consumeBufferedEvents(connectionId)) {
         applyMappedEnvelope(connectionId, env)
       }
+      flushStreamingQueue(connectionId)
       return true
     },
     [
@@ -11295,6 +11311,7 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
             for (const event of buffered) {
               applyMappedEnvelope(contextKey, event)
             }
+            flushStreamingQueue(contextKey)
           }
         }
       } catch (err) {
@@ -12286,6 +12303,7 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
         for (const env of consumeBufferedEvents(connectionId)) {
           applyMappedEnvelope(connectionId, env)
         }
+        flushStreamingQueue(connectionId)
       }
       if (!hydrate) {
         route()

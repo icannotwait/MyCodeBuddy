@@ -450,7 +450,7 @@ describe("GeneralSettings terminal shell", () => {
       await screen.findByText(/C:\\Program Files\\PowerShell\\7\\pwsh.exe/)
     ).toBeInTheDocument()
 
-    fireEvent.click(screen.getByRole("combobox"))
+    fireEvent.click(screen.getByLabelText("Default Terminal"))
     fireEvent.click(
       await screen.findByRole("option", { name: /Command Prompt \(cmd\)/i })
     )
