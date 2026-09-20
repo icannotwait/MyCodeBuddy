@@ -8785,8 +8785,11 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
         return
       }
 
-      const isStreamingEnvelope = (event: EventEnvelope) =>
-        event.type === "content_delta" || event.type === "thinking"
+      const isStreamingEnvelope = (
+        event: EventEnvelope
+      ): event is EventEnvelope & {
+        type: "content_delta" | "thinking"
+      } => event.type === "content_delta" || event.type === "thinking"
       const streamingOnly = events.every(isStreamingEnvelope)
 
       // A mixed replay (`user_message` + `content_delta` + `turn_complete`)
@@ -8802,6 +8805,7 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
       }
 
       for (const event of events) {
+        if (!isStreamingEnvelope(event)) continue
         const stamped = prepareEventEnvelope(event)
         const conn = storeRef.current.connections.get(contextKey)
         if (conn && stamped.seq > conn.lastAppliedSeq + 1) {

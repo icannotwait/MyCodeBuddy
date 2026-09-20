@@ -182,3 +182,6 @@ cargo test --no-default-features --features server --bin codeg-server --lib
 | General / tab-bar / MarkdownLink 测试 | fixture 并上 `BrowserSettings`；`Browser.tab.untitled`；`useOptionalWorkspaceActions` mock。 |
 | `link-classify.ts` 抽走了 fork 的 Windows/`%3A`/bare-relative 解析 | 先对 raw href 切 `:line`；`stripLeadingSlashOnWindows` 看解码前是否真是盘符；bare relative 走共享 `isLocalPathLike`。 |
 | `conversation-session-surface.tsx` 没迁上游 `queueSteerInFlight` | 薄包装仍 TAKE_OURS。把 click-to-insert hold + `handleQueueSteer` 接到真正的 flush 臂（fork 的 `waitingForSubagents` / lock / pause / `sharedSession` 闸门都留下）。依赖数组保持多行；layout 测试认 trailing-comma 最后一项。 |
+| `prepareEventEnvelope` 把 streaming 变体拓宽成整份 `EventEnvelope` | 改成 generic `<T extends EventEnvelope>`；flush 窗口里用 `content_delta \| thinking` type guard，再读 `parent_tool_use_id`。 |
+| `browserTabRecord` 缺 fork 的 `hasLoadedSuccessfully` | 冷开 browser tab 写 `false`（与 file-tab 工厂一致）。`BrowserWorkspaceTab` 继承 `FileWorkspaceTabBase`。 |
+| `patchFileTabRef` 对 union `FileWorkspaceTab` 做 `{...tab,...patch}` | `applyFileTabPatch` 保 discriminant；patch 只叠共享字段。 |

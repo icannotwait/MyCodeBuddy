@@ -44,7 +44,7 @@ interface ConnectionDrainState {
   deliveryIdSet: Set<number>
 }
 
-export function prepareEventEnvelope(event: EventEnvelope): EventEnvelope {
+export function prepareEventEnvelope<T extends EventEnvelope>(event: T): T {
   if (event.received_at != null) return event
   return { ...event, received_at: performance.now() }
 }

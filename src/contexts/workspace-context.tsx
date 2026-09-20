@@ -243,6 +243,15 @@ export interface BrowserWorkspaceTab extends FileWorkspaceTabBase {
 // and the compiler should say so at every switch on `kind`.
 export type FileWorkspaceTab = FileLikeWorkspaceTab | BrowserWorkspaceTab
 
+function applyFileTabPatch(
+  tab: FileWorkspaceTab,
+  patch: object
+): FileWorkspaceTab {
+  // Spreading a Partial<union> widens `kind` and fails assignability.
+  // Patches only overlay shared fields; they never change the discriminant.
+  return { ...tab, ...patch } as FileWorkspaceTab
+}
+
 // The provider value is split across three contexts so high-frequency
 // fileTabs churn (per-keystroke content updates, watcher-driven reloads)
 // only re-renders components that actually read tab data. Action-only
@@ -1000,6 +1009,7 @@ export function WorkspaceProvider({ children }: WorkspaceProviderProps) {
       content: "",
       loading: true,
       readonly: true,
+      hasLoadedSuccessfully: false,
       browser: { initialUrl: url, openerTabId, profile },
     }),
     []
@@ -1417,14 +1427,11 @@ export function WorkspaceProvider({ children }: WorkspaceProviderProps) {
 
   // Eager same-turn ref patch so warm/cold classification after await does
   // not depend on React committing the matching setFileTabs.
-  const patchFileTabRef = useCallback(
-    (tabId: string, patch: Partial<FileWorkspaceTab>) => {
-      fileTabsRef.current = fileTabsRef.current.map((tab) =>
-        tab.id === tabId ? { ...tab, ...patch } : tab
-      )
-    },
-    []
-  )
+  const patchFileTabRef = useCallback((tabId: string, patch: object) => {
+    fileTabsRef.current = fileTabsRef.current.map((tab) =>
+      tab.id === tabId ? applyFileTabPatch(tab, patch) : tab
+    )
+  }, [])
 
   // Commit a disk-backed ready shape as one logical transition. In
   // particular, converting a trusted image snapshot must not merely overlay
@@ -1443,7 +1450,7 @@ export function WorkspaceProvider({ children }: WorkspaceProviderProps) {
           tab.id === tabId &&
           tab.kind === "file" &&
           isTabIncarnationCurrent(tabId, incarnation)
-            ? { ...tab, ...patch }
+            ? applyFileTabPatch(tab, patch)
             : tab
         )
       fileTabsRef.current = apply(fileTabsRef.current)
@@ -1610,7 +1617,9 @@ export function WorkspaceProvider({ children }: WorkspaceProviderProps) {
             saveState: "idle" as const,
           }
       setFileTabs((prev) =>
-        prev.map((tab) => (tab.id === tabId ? { ...tab, ...patch } : tab))
+        prev.map((tab) =>
+          tab.id === tabId ? applyFileTabPatch(tab, patch) : tab
+        )
       )
       if (!loading) {
         patchFileTabRef(tabId, patch)
@@ -1742,7 +1751,9 @@ export function WorkspaceProvider({ children }: WorkspaceProviderProps) {
             hasLoadedSuccessfully: true as const,
           }
       setFileTabs((prev) =>
-        prev.map((tab) => (tab.id === tabId ? { ...tab, ...patch } : tab))
+        prev.map((tab) =>
+          tab.id === tabId ? applyFileTabPatch(tab, patch) : tab
+        )
       )
       if (!loading) {
         patchFileTabRef(tabId, patch)
@@ -1835,7 +1846,7 @@ export function WorkspaceProvider({ children }: WorkspaceProviderProps) {
               tab.id === tabId &&
               !tab.snapshotSource &&
               isSnapshotIncarnationCurrent(tabId, snapshotIncarnation)
-                ? { ...tab, ...imagePatch }
+                ? applyFileTabPatch(tab, imagePatch)
                 : tab
             )
           )
@@ -1882,7 +1893,7 @@ export function WorkspaceProvider({ children }: WorkspaceProviderProps) {
             tab.id === tabId &&
             !tab.snapshotSource &&
             isSnapshotIncarnationCurrent(tabId, snapshotIncarnation)
-              ? { ...tab, ...textPatch }
+              ? applyFileTabPatch(tab, textPatch)
               : tab
           )
         )
