@@ -165,3 +165,18 @@ cargo test --no-default-features --features server --bin codeg-server --lib
 - `tools/list` 正好 6 个父工具名。
 - `DelegationListener::new` 仍是 7 参；`lib.rs` 没有生产路径内联 `tauri::generate_handler![`。
 - 详情面板仍是 thin wrapper。
+
+---
+
+## 7. 合入后验证收口（不是冲突块，是错位功能）
+
+这些是 `<<<<<<<` 清零之后、`pnpm test` 才暴露的 MERGE_BOTH 缺口。不要把它们写进第 3 节的「当时怎么收冲突」表。
+
+| 缺口 | 决议 |
+|---|---|
+| `acp-connections-context.tsx` 迁了 `flushStreamingQueue` / `STREAM_FLUSH_*`，但没迁 `enqueueStreamingAction` | 在 `pushMappedEvents` 里对 `content_delta` / `thinking` 入队 + `EVENT_APPLIED`；其它事件先 `flushStreamingQueue` 再走 `EventIngestor`。不要复活上游 `handleMappedEvent` 当唯一分发器。 |
+| `session-config-selector.tsx` 被上游 `selected?.name` 盖掉 | 回植 `configOptionDisplayLabel`，保留上游 `recommendedLabel` chip。 |
+| `useConnectionLifecycle` 的 `preparing` | 在 session surface 上传 `preparing: isActive && awaitingHistoricalSessionId`。 |
+| `WebTransport.call` 改 `res.text()` | 测试 mock 补 `text()`；fork completion-context 捕获留下。 |
+| `useOpenFileTarget` 多了 `folderId` | 未设时不要把 `folderId: undefined` 传给 `openFilePreview`。 |
+| General / tab-bar / MarkdownLink 测试 | fixture 并上 `BrowserSettings`；`Browser.tab.untitled`；`useOptionalWorkspaceActions` mock。 |

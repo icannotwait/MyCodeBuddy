@@ -16,6 +16,7 @@ import {
 import { DropdownRadioItemContent } from "@/components/chat/dropdown-radio-item-content"
 import { SelectorTooltip } from "@/components/chat/selector-tooltip"
 import type { ModelOptionGroup } from "@/lib/model-config-groups"
+import { configOptionDisplayLabel } from "@/lib/session-config-display"
 import type { SessionConfigOptionInfo } from "@/lib/types"
 
 interface SessionConfigSelectorProps {
@@ -74,7 +75,10 @@ export function InlineSessionConfigSelector({
   const selected = renderedOptions.find(
     (item) => item.value === option.kind.current_value
   )
-  const currentLabel = selected?.name ?? option.kind.current_value
+  // Prefer wire value when it extends a short name (Cursor compound model ids).
+  const currentLabel = selected
+    ? configOptionDisplayLabel(selected)
+    : option.kind.current_value
   // The agent's recommended value, if it named one AND the caller supplied a
   // chip label. Never falls back to `current_value`: "recommended" and
   // "selected" are different claims, and badging the selected row when nothing
@@ -133,34 +137,40 @@ export function InlineSessionConfigSelector({
                   {group.name !== null && (
                     <DropdownMenuLabel>{group.name}</DropdownMenuLabel>
                   )}
-                  {group.options.map((item) => (
-                    <DropdownMenuRadioItem
-                      key={`${group.key}-${item.value}`}
-                      value={item.value}
-                      title={item.name}
-                    >
-                      <DropdownRadioItemContent
-                        label={item.name}
-                        description={item.description}
-                        recommendedLabel={badgeFor(item.value)}
-                      />
-                    </DropdownMenuRadioItem>
-                  ))}
+                  {group.options.map((item) => {
+                    const label = configOptionDisplayLabel(item)
+                    return (
+                      <DropdownMenuRadioItem
+                        key={`${group.key}-${item.value}`}
+                        value={item.value}
+                        title={item.name !== label ? item.name : undefined}
+                      >
+                        <DropdownRadioItemContent
+                          label={label}
+                          description={item.description}
+                          recommendedLabel={badgeFor(item.value)}
+                        />
+                      </DropdownMenuRadioItem>
+                    )
+                  })}
                 </Fragment>
               ))
-            : option.kind.options.map((item) => (
-                <DropdownMenuRadioItem
-                  key={item.value}
-                  value={item.value}
-                  title={item.name}
-                >
-                  <DropdownRadioItemContent
-                    label={item.name}
-                    description={item.description}
-                    recommendedLabel={badgeFor(item.value)}
-                  />
-                </DropdownMenuRadioItem>
-              ))}
+            : option.kind.options.map((item) => {
+                const label = configOptionDisplayLabel(item)
+                return (
+                  <DropdownMenuRadioItem
+                    key={item.value}
+                    value={item.value}
+                    title={item.name !== label ? item.name : undefined}
+                  >
+                    <DropdownRadioItemContent
+                      label={label}
+                      description={item.description}
+                      recommendedLabel={badgeFor(item.value)}
+                    />
+                  </DropdownMenuRadioItem>
+                )
+              })}
         </DropdownMenuRadioGroup>
       </DropdownMenuContent>
     </DropdownMenu>

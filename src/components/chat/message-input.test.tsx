@@ -134,6 +134,7 @@ vi.mock("@/hooks/use-open-file-target", () => ({
   useOpenFileTarget: () => async () => {},
 }))
 vi.mock("@/contexts/workspace-context", () => ({
+  useOptionalWorkspaceActions: () => null,
   useWorkspaceActions: () => ({
     openFilePreview: async () => ({ ok: true }),
     openResolvedImagePreview: () => ({ ok: true }),

@@ -73,11 +73,18 @@ const toastMock = vi.hoisted(() => ({
 vi.mock("next-intl", async () => {
   const { default: messages } = await import("@/i18n/messages/en.json")
   const fileWorkspace = messages.Folder.fileWorkspace as Record<string, string>
+  const browserTab = messages.Browser.tab as Record<string, string>
   return {
     useTranslations: (namespace?: string) => {
       return (key: string, values?: Record<string, string | number>) => {
-        if (namespace === "Folder.fileWorkspace") {
-          const template = fileWorkspace[key]
+        const table =
+          namespace === "Folder.fileWorkspace"
+            ? fileWorkspace
+            : namespace === "Browser.tab"
+              ? browserTab
+              : null
+        if (table) {
+          const template = table[key]
           if (typeof template === "string") {
             return template.replace(/\{(\w+)\}/g, (_, name: string) =>
               values?.[name] != null ? String(values[name]) : `{${name}}`

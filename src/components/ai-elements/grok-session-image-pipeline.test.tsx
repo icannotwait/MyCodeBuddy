@@ -2,6 +2,10 @@ import { render, screen, waitFor } from "@testing-library/react"
 import type { ComponentProps } from "react"
 import { beforeEach, describe, expect, it, vi } from "vitest"
 
+vi.mock("next-intl", () => ({
+  useTranslations: () => (key: string) => key,
+}))
+
 const mocks = vi.hoisted(() => ({
   imageProps: [] as Record<string, unknown>[],
 }))

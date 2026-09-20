@@ -1321,6 +1321,13 @@ const STREAM_FLUSH_CHARS_PER_FRAME = 8 * 1024
  * closed content unmounted.
  */
 const STREAM_FLUSH_BLOCK_CHARS = 128
+/**
+ * Deltas one connection may coalesce before the window is cut short. A safety
+ * valve for a burst the timer can't keep up with, not a cadence knob — it
+ * bounds one connection's unrendered backlog, so it is per connection like the
+ * window it pre-empts.
+ */
+const STREAM_QUEUE_CAP = 256
 
 /**
  * What the next batch will re-render, in prose-equivalent characters, read off
@@ -8457,6 +8464,39 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
     [dispatch]
   )
 
+  const enqueueStreamingAction = useCallback(
+    (action: StreamingAction) => {
+      const { contextKey } = action
+      let queue = streamingQueuesRef.current.get(contextKey)
+      if (queue === undefined) {
+        queue = []
+        streamingQueuesRef.current.set(contextKey, queue)
+      }
+      queue.push(action)
+      if (queue.length >= STREAM_QUEUE_CAP) {
+        // Cap reached — `flushStreamingQueue` clears the pending window itself.
+        flushStreamingQueue(contextKey)
+        return
+      }
+      if (!flushTimersRef.current.has(contextKey)) {
+        // Size the window from what this batch will re-render, read as of the
+        // last batch — so it costs one map lookup plus a walk over the live
+        // turn's blocks, and a fresh turn (empty live message) is back to a
+        // single frame. See `liveRerenderChars` and `streamFlushDelayMs`.
+        const delay = streamFlushDelayMs(
+          liveRerenderChars(
+            storeRef.current.connections.get(contextKey)?.liveMessage?.content
+          )
+        )
+        flushTimersRef.current.set(
+          contextKey,
+          setTimeout(() => flushStreamingQueue(contextKey), delay)
+        )
+      }
+    },
+    [flushStreamingQueue]
+  )
+
   const waitForListenerReady = useCallback(async () => {
     const phase = listenerPhaseRef.current
     if (phase === "ready") return
@@ -8720,6 +8760,13 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
 
   // Push envelopes into the frame ingestor. Optional flush for connect-time
   // buffered drains that must apply before the next tick.
+  //
+  // Streaming deltas (`content_delta` / `thinking`) do NOT go through the
+  // ingestor: attach `onEvent` calls this with `flush=true`, and an immediate
+  // `commitEventFrame` would apply the text in the same `act()` — defeating
+  // the per-connection flush window. Queue them here (upstream capability)
+  // while still advancing `lastAppliedSeq`, the generation clock, and the
+  // fork estimator / leftover-live side effects.
   const pushMappedEvents = useCallback(
     (
       contextKey: string,
@@ -8737,10 +8784,61 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
         )
         return
       }
-      ingestor.pushMapped(contextKey, events, source)
+
+      const pendingNonStreaming: EventEnvelope[] = []
+      const flushPendingNonStreaming = () => {
+        if (pendingNonStreaming.length === 0) return
+        flushStreamingQueue(contextKey)
+        ingestor.pushMapped(contextKey, pendingNonStreaming, source)
+        pendingNonStreaming.length = 0
+      }
+
+      for (const event of events) {
+        if (event.type !== "content_delta" && event.type !== "thinking") {
+          pendingNonStreaming.push(event)
+          continue
+        }
+
+        flushPendingNonStreaming()
+        const conn = storeRef.current.connections.get(contextKey)
+        if (
+          !event.parent_tool_use_id &&
+          conn?.generationClockStartedAt == null
+        ) {
+          dispatch({
+            type: "GENERATION_CLOCK_START",
+            contextKey,
+            at: requiredReceivedAt(event),
+          })
+        }
+        if (conn && hasSettleableRetryIncident(conn.sessionFailures)) {
+          dispatch({
+            type: "SETTLE_SESSION_FAILURES",
+            contextKey,
+            scope: "retry_incidents",
+          })
+        }
+        enqueueStreamingAction({
+          type: event.type === "thinking" ? "THINKING" : "CONTENT_DELTA",
+          contextKey,
+          text: event.text,
+          parentToolUseId: event.parent_tool_use_id ?? undefined,
+          receivedAt: requiredReceivedAt(event),
+        })
+        dispatch({ type: "EVENT_APPLIED", contextKey, seq: event.seq })
+        playEventSound(event)
+        notifyRawSubscribers(event)
+      }
+
+      flushPendingNonStreaming()
       if (flush) ingestor.flushNow()
     },
-    []
+    [
+      dispatch,
+      enqueueStreamingAction,
+      flushStreamingQueue,
+      notifyRawSubscribers,
+    ]
   )
 
   // Apply a single envelope through the ingestor (attach / buffered drain).

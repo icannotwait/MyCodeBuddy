@@ -7,6 +7,7 @@ import {
 } from "@testing-library/react"
 import { NextIntlClientProvider } from "next-intl"
 import { beforeEach, describe, expect, it, vi } from "vitest"
+import enJson from "@/i18n/messages/en.json"
 
 vi.mock("@/lib/api", () => ({
   getSystemTerminalSettings: vi.fn(async () => ({
@@ -343,6 +344,8 @@ const enMessages = {
       delete: "Delete",
     },
   },
+  BrowserSettings: enJson.BrowserSettings,
+  CloseBehaviorSettings: enJson.CloseBehaviorSettings,
 } as const
 
 type AvailableTerminalShells = {

@@ -435,6 +435,7 @@ describe("WebTransport call abort + timeout", () => {
     fetchMock.mockResolvedValue({
       status: 200,
       ok: true,
+      text: async () => JSON.stringify({ ok: true }),
       json: async () => ({ ok: true }),
     })
     await t.call("noop", {}, { signal: controller.signal })
@@ -454,12 +455,14 @@ describe("WebTransport completion context capture/replay", () => {
     const headerMap = new Map(
       Object.entries(headers ?? {}).map(([k, v]) => [k.toLowerCase(), v])
     )
+    const raw = JSON.stringify(body)
     return {
       status: 200,
       ok: true,
       headers: {
         get: (name: string) => headerMap.get(name.toLowerCase()) ?? null,
       },
+      text: async () => raw,
       json: async () => body,
     }
   }

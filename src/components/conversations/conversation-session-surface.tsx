@@ -812,6 +812,7 @@ export const ConversationSessionSurface = memo(
       connectionIntent: delegatePolicy.intent,
       retryObserverDiscovery: delegatePolicy.retryObserverDiscovery,
       isTransientUnmount,
+      preparing: isActive && awaitingHistoricalSessionId,
       onDelegateViewerOnly: () =>
         handleDelegateViewerOnlyRejectionRef.current(),
     })
