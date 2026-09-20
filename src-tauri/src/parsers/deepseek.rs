@@ -2009,7 +2009,13 @@ mod tests {
     /// `<dir>/<bucket>/<id>/`. One call must never leave a second generation
     /// behind: a test that means to stage a lone v3 would otherwise be passing
     /// on a v0 companion nobody asked for.
-    fn write_log_bytes(dir: &Path, bucket: &str, id: &str, filename: &str, bytes: &[u8]) -> PathBuf {
+    fn write_log_bytes(
+        dir: &Path,
+        bucket: &str,
+        id: &str,
+        filename: &str,
+        bytes: &[u8],
+    ) -> PathBuf {
         let session_dir = dir.join(bucket).join(id);
         fs::create_dir_all(&session_dir).expect("mkdir");
         let path = session_dir.join(filename);
@@ -2051,7 +2057,12 @@ mod tests {
         for (index, text) in texts.iter().enumerate() {
             let turn = index as u64 + 1;
             let base = turn * 10;
-            lines.push(event("turn/start", base, 1_000 + base as i64, json!({"turn": turn})));
+            lines.push(event(
+                "turn/start",
+                base,
+                1_000 + base as i64,
+                json!({"turn": turn}),
+            ));
             lines.push(event(
                 "user/message",
                 base + 1,
@@ -2333,11 +2344,7 @@ mod tests {
         );
         let mut bytes = zstd_frames(&tagged_log(&["new"]));
         let tail = zstd::stream::encode_all(
-            format!(
-                "\n{}",
-                event("turn/start", 50, 2_000, json!({"turn": 2}))
-            )
-            .as_bytes(),
+            format!("\n{}", event("turn/start", 50, 2_000, json!({"turn": 2}))).as_bytes(),
             0,
         )
         .expect("tail frame");
@@ -2446,7 +2453,13 @@ mod tests {
     #[test]
     fn a_mixed_encoding_root_reads_the_compressed_set() {
         let dir = scratch_dir("gen-mixed");
-        write_log(&dir, "--w--", GEN_ID, "session.v3.jsonl", &tagged_log(&["raw"]));
+        write_log(
+            &dir,
+            "--w--",
+            GEN_ID,
+            "session.v3.jsonl",
+            &tagged_log(&["raw"]),
+        );
         write_log(
             &dir,
             "--w--",
@@ -2497,10 +2510,7 @@ mod tests {
         assert_eq!(
             select_generation_log(
                 &session_dir,
-                vec![
-                    Ok((name(&old), old.clone())),
-                    Ok((name(&new), new.clone())),
-                ],
+                vec![Ok((name(&old), old.clone())), Ok((name(&new), new.clone())),],
             ),
             Some((new.clone(), LogEncoding::Zstd))
         );

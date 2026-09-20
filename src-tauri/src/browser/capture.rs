@@ -160,7 +160,14 @@ pub fn fit(
     max_width: u32,
     format: CaptureFormat,
 ) -> Result<Fitted, String> {
-    fit_within(encoded, css_width, clip, max_width, format, CAPTURE_MAX_ENCODED_BYTES)
+    fit_within(
+        encoded,
+        css_width,
+        clip,
+        max_width,
+        format,
+        CAPTURE_MAX_ENCODED_BYTES,
+    )
 }
 
 /// [`fit`] with the encoded-size budget as a parameter, for the tests that
@@ -205,7 +212,9 @@ pub fn fit_within(
     let image = match clip {
         Some(region) => {
             let x0 = (region.x * scale).floor().clamp(0.0, f64::from(full_width)) as u32;
-            let y0 = (region.y * scale).floor().clamp(0.0, f64::from(full_height)) as u32;
+            let y0 = (region.y * scale)
+                .floor()
+                .clamp(0.0, f64::from(full_height)) as u32;
             let x1 = ((region.x + region.width) * scale)
                 .ceil()
                 .clamp(0.0, f64::from(full_width)) as u32;
@@ -233,8 +242,10 @@ pub fn fit_within(
         // width comes down by the square root of the overshoot, and a
         // little more so that one more pass is the rare case.
         let ratio = (budget as f64 / bytes.len() as f64).sqrt() * 0.9;
-        let narrower = ((f64::from(image.width()) * ratio).floor() as u32)
-            .clamp(CAPTURE_MIN_WIDTH, image.width().saturating_sub(1).max(CAPTURE_MIN_WIDTH));
+        let narrower = ((f64::from(image.width()) * ratio).floor() as u32).clamp(
+            CAPTURE_MIN_WIDTH,
+            image.width().saturating_sub(1).max(CAPTURE_MIN_WIDTH),
+        );
         image = narrow_to(image, narrower);
     }
 }
@@ -345,9 +356,11 @@ mod tests {
             width: 10.0,
             height: 10.0,
         };
-        assert!(fit(&two_tone(), 100.0, Some(gone), 4096, CaptureFormat::Png)
-            .unwrap_err()
-            .contains("no visible area"));
+        assert!(
+            fit(&two_tone(), 100.0, Some(gone), 4096, CaptureFormat::Png)
+                .unwrap_err()
+                .contains("no visible area")
+        );
         let flat = CaptureRegion {
             x: 10.0,
             y: 10.0,
@@ -384,9 +397,16 @@ mod tests {
         let png = noise(256, 128);
         let budget = 40_000;
         let fitted = fit_within(&png, 256.0, None, 4096, CaptureFormat::Png, budget).unwrap();
-        assert!(fitted.bytes.len() <= budget, "{} bytes over {budget}", fitted.bytes.len());
+        assert!(
+            fitted.bytes.len() <= budget,
+            "{} bytes over {budget}",
+            fitted.bytes.len()
+        );
         assert!(fitted.width < 256 && fitted.width >= CAPTURE_MIN_WIDTH);
-        assert_eq!(fitted.height, (f64::from(fitted.width) / 2.0).round() as u32);
+        assert_eq!(
+            fitted.height,
+            (f64::from(fitted.width) / 2.0).round() as u32
+        );
 
         let roomy = fit_within(&png, 256.0, None, 4096, CaptureFormat::Png, usize::MAX).unwrap();
         assert_eq!((roomy.width, roomy.height), (256, 128));
@@ -437,7 +457,10 @@ mod tests {
         let jpeg = fit(&two_tone(), 100.0, None, 4096, CaptureFormat::Jpeg).unwrap();
         assert!(jpeg.bytes.starts_with(&[0xFF, 0xD8]));
         assert_eq!((jpeg.width, jpeg.height), (200, 100));
-        assert!(jpeg.bytes.len() < png.bytes.len() * 4, "not absurdly larger");
+        assert!(
+            jpeg.bytes.len() < png.bytes.len() * 4,
+            "not absurdly larger"
+        );
         assert_eq!(CaptureFormat::parse("JPEG"), Some(CaptureFormat::Jpeg));
         // Exactly what the tool's schema advertises, nothing beside it.
         assert_eq!(CaptureFormat::parse("jpg"), None);

@@ -141,7 +141,12 @@ pub fn default_ports(codeg_port: u16) -> Vec<u16> {
 /// a typo must not silently bind ten ports the operator did not choose.
 pub fn parse_ports(raw: &str, codeg_port: u16) -> Option<Vec<u16>> {
     let raw = raw.trim();
-    if raw.is_empty() || matches!(raw.to_ascii_lowercase().as_str(), "off" | "none" | "disabled") {
+    if raw.is_empty()
+        || matches!(
+            raw.to_ascii_lowercase().as_str(),
+            "off" | "none" | "disabled"
+        )
+    {
         return None;
     }
     if raw.eq_ignore_ascii_case("auto") {
@@ -154,7 +159,10 @@ pub fn parse_ports(raw: &str, codeg_port: u16) -> Option<Vec<u16>> {
             continue;
         }
         let range = match item.split_once('-') {
-            Some((lo, hi)) => (lo.trim().parse::<u16>().ok()?, hi.trim().parse::<u16>().ok()?),
+            Some((lo, hi)) => (
+                lo.trim().parse::<u16>().ok()?,
+                hi.trim().parse::<u16>().ok()?,
+            ),
             None => {
                 let port = item.parse::<u16>().ok()?;
                 (port, port)
@@ -226,7 +234,8 @@ struct Listener {
 impl Listener {
     fn has_cap(&self, cap: &str) -> bool {
         let caps = lock(&self.caps);
-        caps.iter().any(|known| constant_time_eq(known.as_bytes(), cap.as_bytes()))
+        caps.iter()
+            .any(|known| constant_time_eq(known.as_bytes(), cap.as_bytes()))
     }
 
     fn touch(&self) {
@@ -271,7 +280,9 @@ impl Listener {
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
-    mutex.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    mutex
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
@@ -352,7 +363,10 @@ pub async fn open(target_port: u16, tab_id: &str) -> Result<BridgeGrant, BridgeE
         return Ok(existing.grant(tab_id, config.public_host.clone()));
     }
 
-    let used: HashSet<u16> = lock(&BRIDGE.listeners).values().map(|l| l.bridge_port).collect();
+    let used: HashSet<u16> = lock(&BRIDGE.listeners)
+        .values()
+        .map(|l| l.bridge_port)
+        .collect();
     let mut last_error = String::from("no ports configured");
     for &port in &config.ports {
         if port != 0 && used.contains(&port) {
@@ -402,9 +416,7 @@ pub async fn open(target_port: u16, tab_id: &str) -> Result<BridgeGrant, BridgeE
             SWEEPER.get_or_init(|| {
                 tokio::spawn(sweep_task());
             });
-            tracing::info!(
-                "[bridge] port {bridge_port} now forwards to 127.0.0.1:{target_port}"
-            );
+            tracing::info!("[bridge] port {bridge_port} now forwards to 127.0.0.1:{target_port}");
         } else {
             listener.close();
         }
@@ -433,7 +445,10 @@ pub fn sweep(now: Instant) -> usize {
             })
             .map(|l| l.target_port)
             .collect();
-        stale.iter().filter_map(|port| listeners.remove(port)).collect()
+        stale
+            .iter()
+            .filter_map(|port| listeners.remove(port))
+            .collect()
     };
     for listener in &stale {
         tracing::info!(
@@ -521,7 +536,11 @@ async fn enter(
         .and_then(|q| query_param(q, "to"))
         .filter(|to| is_local_path(to))
         .unwrap_or_else(|| "/".to_string());
-    let secure = if forwarded_https(&headers) { "; Secure" } else { "" };
+    let secure = if forwarded_https(&headers) {
+        "; Secure"
+    } else {
+        ""
+    };
     let cookie = format!(
         "{}={cap}; Path=/; HttpOnly; SameSite=Lax{secure}",
         listener.cookie_name()
@@ -624,7 +643,12 @@ fn drop_request_header(name: &str) -> bool {
 fn drop_response_header(name: &str) -> bool {
     matches!(
         name,
-        "connection" | "keep-alive" | "transfer-encoding" | "trailer" | "upgrade" | "x-frame-options"
+        "connection"
+            | "keep-alive"
+            | "transfer-encoding"
+            | "trailer"
+            | "upgrade"
+            | "x-frame-options"
     )
 }
 
@@ -747,7 +771,10 @@ fn is_websocket_upgrade(headers: &HeaderMap) -> bool {
     let connection = headers
         .get(header::CONNECTION)
         .and_then(|v| v.to_str().ok())
-        .is_some_and(|v| v.split(',').any(|part| part.trim().eq_ignore_ascii_case("upgrade")));
+        .is_some_and(|v| {
+            v.split(',')
+                .any(|part| part.trim().eq_ignore_ascii_case("upgrade"))
+        });
     upgrade && connection
 }
 
@@ -767,7 +794,11 @@ async fn proxy_websocket(listener: &Listener, parts: &mut Parts) -> Response {
         Ok(request) => request,
         Err(err) => return bad_gateway_page(target, &err),
     };
-    for name in [header::SEC_WEBSOCKET_PROTOCOL, header::USER_AGENT, header::ACCEPT_LANGUAGE] {
+    for name in [
+        header::SEC_WEBSOCKET_PROTOCOL,
+        header::USER_AGENT,
+        header::ACCEPT_LANGUAGE,
+    ] {
         if let Some(value) = parts.headers.get(&name) {
             request.headers_mut().insert(name, value.clone());
         }
@@ -923,7 +954,11 @@ fn request_authority(headers: &HeaderMap, trust_forwarded: bool) -> Option<Strin
         Some(host) => host.to_string(),
         None => headers.get(header::HOST)?.to_str().ok()?.trim().to_string(),
     };
-    let scheme = if trust_forwarded && forwarded_https(headers) { "https" } else { "http" };
+    let scheme = if trust_forwarded && forwarded_https(headers) {
+        "https"
+    } else {
+        "http"
+    };
     url_authority(&format!("{scheme}://{host}"))
 }
 
@@ -976,7 +1011,11 @@ fn forwarded_https(headers: &HeaderMap) -> bool {
     headers
         .get("x-forwarded-proto")
         .and_then(|v| v.to_str().ok())
-        .is_some_and(|v| v.split(',').next().is_some_and(|p| p.trim().eq_ignore_ascii_case("https")))
+        .is_some_and(|v| {
+            v.split(',')
+                .next()
+                .is_some_and(|p| p.trim().eq_ignore_ascii_case("https"))
+        })
 }
 
 fn cookie_pairs(headers: &HeaderMap) -> Vec<(String, String)> {
@@ -1015,7 +1054,11 @@ fn foreign_cookies(headers: &HeaderMap) -> String {
 /// `localhost`, `*.localhost`, `127/8`, `::1` and the unspecified addresses,
 /// which a browser connects to as local.
 pub fn is_loopback_host(host: &str) -> bool {
-    let host = host.trim().trim_start_matches('[').trim_end_matches(']').to_ascii_lowercase();
+    let host = host
+        .trim()
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .to_ascii_lowercase();
     if host == "localhost" || host.ends_with(".localhost") {
         return true;
     }
@@ -1139,8 +1182,14 @@ mod tests {
             header::COOKIE,
             HeaderValue::from_static("codeg-bridge-3082=cap-two; codeg.locale=zh-CN"),
         );
-        assert_eq!(cookie_value(&headers, "codeg-bridge-3081").as_deref(), Some("cap-one"));
-        assert_eq!(cookie_value(&headers, "codeg-bridge-3082").as_deref(), Some("cap-two"));
+        assert_eq!(
+            cookie_value(&headers, "codeg-bridge-3081").as_deref(),
+            Some("cap-one")
+        );
+        assert_eq!(
+            cookie_value(&headers, "codeg-bridge-3082").as_deref(),
+            Some("cap-two")
+        );
         assert_eq!(cookie_value(&headers, "codeg-bridge-3083"), None);
         assert_eq!(foreign_cookies(&headers), "a=1; b=2");
         assert_eq!(foreign_cookies(&HeaderMap::new()), "");
@@ -1149,12 +1198,18 @@ mod tests {
     #[test]
     fn origin_and_referer_point_at_the_target() {
         let mut headers = HeaderMap::new();
-        headers.insert(header::ORIGIN, HeaderValue::from_static("http://codeg.example:3081"));
+        headers.insert(
+            header::ORIGIN,
+            HeaderValue::from_static("http://codeg.example:3081"),
+        );
         headers.insert(
             header::REFERER,
             HeaderValue::from_static("http://codeg.example:3081/app/page?tab=2"),
         );
-        headers.insert(header::COOKIE, HeaderValue::from_static("codeg-bridge-3081=c; sid=9"));
+        headers.insert(
+            header::COOKIE,
+            HeaderValue::from_static("codeg-bridge-3081=c; sid=9"),
+        );
         let rewritten = rewritten_request_headers(&headers, 3000);
         let get = |name: HeaderName| {
             rewritten
@@ -1162,7 +1217,10 @@ mod tests {
                 .find(|(n, _)| *n == name)
                 .map(|(_, v)| v.to_str().unwrap().to_string())
         };
-        assert_eq!(get(header::ORIGIN).as_deref(), Some("http://127.0.0.1:3000"));
+        assert_eq!(
+            get(header::ORIGIN).as_deref(),
+            Some("http://127.0.0.1:3000")
+        );
         assert_eq!(
             get(header::REFERER).as_deref(),
             Some("http://127.0.0.1:3000/app/page?tab=2")
@@ -1184,8 +1242,14 @@ mod tests {
             rewrite_location(&HeaderValue::from_str(raw).unwrap(), 3000)
                 .map(|v| v.to_str().unwrap().to_string())
         };
-        assert_eq!(rewrite("http://127.0.0.1:3000/login?next=%2F").as_deref(), Some("/login?next=%2F"));
-        assert_eq!(rewrite("http://localhost:3000/a#b").as_deref(), Some("/a#b"));
+        assert_eq!(
+            rewrite("http://127.0.0.1:3000/login?next=%2F").as_deref(),
+            Some("/login?next=%2F")
+        );
+        assert_eq!(
+            rewrite("http://localhost:3000/a#b").as_deref(),
+            Some("/a#b")
+        );
         assert_eq!(rewrite("http://[::1]:3000/").as_deref(), Some("/"));
         assert_eq!(rewrite("http://0.0.0.0:3000/x").as_deref(), Some("/x"));
         // Another port, another host, a relative path: untouched.
@@ -1197,26 +1261,69 @@ mod tests {
 
     #[test]
     fn loopback_hosts() {
-        for host in ["localhost", "LOCALHOST", "app.localhost", "127.0.0.1", "127.1.2.3", "::1", "[::1]", "0.0.0.0", "::", "::ffff:127.0.0.1"] {
+        for host in [
+            "localhost",
+            "LOCALHOST",
+            "app.localhost",
+            "127.0.0.1",
+            "127.1.2.3",
+            "::1",
+            "[::1]",
+            "0.0.0.0",
+            "::",
+            "::ffff:127.0.0.1",
+        ] {
             assert!(is_loopback_host(host), "{host}");
         }
-        for host in ["example.com", "10.0.0.1", "192.168.1.5", "128.0.0.1", "localhost.evil", "fe80::1", ""] {
+        for host in [
+            "example.com",
+            "10.0.0.1",
+            "192.168.1.5",
+            "128.0.0.1",
+            "localhost.evil",
+            "fe80::1",
+            "",
+        ] {
             assert!(!is_loopback_host(host), "{host}");
         }
     }
 
     #[test]
     fn header_filters() {
-        for name in ["host", "connection", "cookie", "origin", "referer", "content-length", "upgrade", "expect"] {
+        for name in [
+            "host",
+            "connection",
+            "cookie",
+            "origin",
+            "referer",
+            "content-length",
+            "upgrade",
+            "expect",
+        ] {
             assert!(drop_request_header(name), "{name}");
         }
-        for name in ["accept", "authorization", "content-type", "accept-encoding", "sec-fetch-site", "x-requested-with"] {
+        for name in [
+            "accept",
+            "authorization",
+            "content-type",
+            "accept-encoding",
+            "sec-fetch-site",
+            "x-requested-with",
+        ] {
             assert!(!drop_request_header(name), "{name}");
         }
         for name in ["x-frame-options", "connection", "transfer-encoding"] {
             assert!(drop_response_header(name), "{name}");
         }
-        for name in ["content-type", "content-length", "content-encoding", "set-cookie", "location", "content-security-policy", "cache-control"] {
+        for name in [
+            "content-type",
+            "content-length",
+            "content-encoding",
+            "set-cookie",
+            "location",
+            "content-security-policy",
+            "cache-control",
+        ] {
             assert!(!drop_response_header(name), "{name}");
         }
     }
@@ -1227,7 +1334,10 @@ mod tests {
         assert!(!is_websocket_upgrade(&headers));
         headers.insert(header::UPGRADE, HeaderValue::from_static("WebSocket"));
         assert!(!is_websocket_upgrade(&headers));
-        headers.insert(header::CONNECTION, HeaderValue::from_static("keep-alive, Upgrade"));
+        headers.insert(
+            header::CONNECTION,
+            HeaderValue::from_static("keep-alive, Upgrade"),
+        );
         assert!(is_websocket_upgrade(&headers));
     }
 
@@ -1250,7 +1360,10 @@ mod tests {
         let headers = |pairs: &[(&str, &'static str)]| {
             let mut headers = HeaderMap::new();
             for (name, value) in pairs {
-                headers.append(HeaderName::from_bytes(name.as_bytes()).unwrap(), HeaderValue::from_static(value));
+                headers.append(
+                    HeaderName::from_bytes(name.as_bytes()).unwrap(),
+                    HeaderValue::from_static(value),
+                );
             }
             headers
         };
@@ -1271,11 +1384,20 @@ mod tests {
         assert!(direct(&[("host", "h:3081"), ("origin", "http://h:3081")]));
         assert!(direct(&[("host", "H:3081"), ("origin", "http://h:3081")]));
         assert!(!direct(&[("host", "h:3081"), ("origin", "http://h:3082")]));
-        assert!(!direct(&[("host", "h:3081"), ("origin", "http://other:3081")]));
+        assert!(!direct(&[
+            ("host", "h:3081"),
+            ("origin", "http://other:3081")
+        ]));
         assert!(!direct(&[("host", "h:3081"), ("origin", "null")]));
         assert!(direct(&[("host", "h:3081"), ("referer", "http://h:3081/")]));
-        assert!(direct(&[("host", "h:3081"), ("referer", "http://h:3081/a/b?c")]));
-        assert!(!direct(&[("host", "h:3081"), ("referer", "http://h:3082/")]));
+        assert!(direct(&[
+            ("host", "h:3081"),
+            ("referer", "http://h:3081/a/b?c")
+        ]));
+        assert!(!direct(&[
+            ("host", "h:3081"),
+            ("referer", "http://h:3082/")
+        ]));
         // Origin wins over Referer when both are there.
         assert!(!direct(&[
             ("host", "h:3081"),
@@ -1311,7 +1433,10 @@ mod tests {
         ]));
         assert_eq!(url_authority("https://h").as_deref(), Some("h:443"));
         assert_eq!(url_authority("http://h").as_deref(), Some("h:80"));
-        assert_eq!(url_authority("http://[::1]:3081/x").as_deref(), Some("[::1]:3081"));
+        assert_eq!(
+            url_authority("http://[::1]:3081/x").as_deref(),
+            Some("[::1]:3081")
+        );
         assert_eq!(url_authority("null"), None);
         assert_eq!(url_authority("/relative"), None);
         assert_eq!(url_authority("ftp://h:21"), None);
@@ -1327,21 +1452,27 @@ mod tests {
         // the block: exactly one `</script>` remains, the page's own.
         assert!(!hostile.contains("<script>alert"));
         assert!(hostile.contains("url=/a&quot;&gt;&lt;script&gt;alert(1)&lt;/script&gt;\""));
-        assert!(hostile.contains("location.replace(\"/a\\\"\\u003e\\u003cscript\\u003ealert(1)\\u003c/script\\u003e\")"));
+        assert!(hostile.contains(
+            "location.replace(\"/a\\\"\\u003e\\u003cscript\\u003ealert(1)\\u003c/script\\u003e\")"
+        ));
         assert_eq!(hostile.matches("</script>").count(), 1);
     }
 
     #[test]
     fn frame_ancestors_is_dropped_from_a_csp() {
         let strip = |raw: &'static str| {
-            without_frame_ancestors(&HeaderValue::from_static(raw)).map(|v| v.to_str().unwrap().to_string())
+            without_frame_ancestors(&HeaderValue::from_static(raw))
+                .map(|v| v.to_str().unwrap().to_string())
         };
         assert_eq!(
             strip("default-src 'self'; frame-ancestors 'none'; img-src *").as_deref(),
             Some("default-src 'self'; img-src *")
         );
         assert_eq!(strip("FRAME-ANCESTORS 'self'"), None);
-        assert_eq!(strip("default-src 'self'").as_deref(), Some("default-src 'self'"));
+        assert_eq!(
+            strip("default-src 'self'").as_deref(),
+            Some("default-src 'self'")
+        );
         // A source expression that merely contains the word stays.
         assert_eq!(
             strip("img-src https://frame-ancestors.example").as_deref(),
@@ -1350,10 +1481,14 @@ mod tests {
         // Several policies in one header: each loses the directive; a
         // policy left empty disappears.
         assert_eq!(
-            strip("default-src 'self', frame-ancestors 'none', img-src *; frame-ancestors 'self'").as_deref(),
+            strip("default-src 'self', frame-ancestors 'none', img-src *; frame-ancestors 'self'")
+                .as_deref(),
             Some("default-src 'self', img-src *")
         );
-        assert_eq!(strip("frame-ancestors 'none', frame-ancestors 'self'"), None);
+        assert_eq!(
+            strip("frame-ancestors 'none', frame-ancestors 'self'"),
+            None
+        );
     }
 
     #[test]

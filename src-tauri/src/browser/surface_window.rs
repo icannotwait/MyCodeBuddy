@@ -10,7 +10,9 @@
 //! `platform` answers the same calls by saying so.
 
 use tauri::webview::{DownloadEvent, PageLoadEvent};
-use tauri::{AppHandle, Manager, Url, WebviewUrl, WebviewWindow, WebviewWindowBuilder, WindowEvent};
+use tauri::{
+    AppHandle, Manager, Url, WebviewUrl, WebviewWindow, WebviewWindowBuilder, WindowEvent,
+};
 
 use super::downloads;
 use super::events;
@@ -33,7 +35,9 @@ pub fn create(
     devtools: bool,
     profile: &str,
 ) -> tauri::Result<WebviewWindow> {
-    build(app, owner, tab_id, label, title, background, devtools, profile, None)
+    build(
+        app, owner, tab_id, label, title, background, devtools, profile, None,
+    )
 }
 
 /// The window a page asked for, built from the one that asked: same profile,
@@ -74,7 +78,12 @@ fn build(
                     // one, because a page must not be able to put `data:` in
                     // the address bar by asking for it as a navigation.
                     if !(cfg!(target_os = "linux") && policy::subframe_navigation_allowed(url)) {
-                        hooks::navigation_blocked(&app, &tab_id, url.as_str(), NavigationBlockReason::Scheme);
+                        hooks::navigation_blocked(
+                            &app,
+                            &tab_id,
+                            url.as_str(),
+                            NavigationBlockReason::Scheme,
+                        );
                     }
                     return false;
                 }
@@ -82,7 +91,12 @@ fn build(
                     .try_state::<BrowserPolicy>()
                     .is_some_and(|policy| policy.blocked(url))
                 {
-                    hooks::navigation_blocked(&app, &tab_id, url.as_str(), NavigationBlockReason::HostRule);
+                    hooks::navigation_blocked(
+                        &app,
+                        &tab_id,
+                        url.as_str(),
+                        NavigationBlockReason::HostRule,
+                    );
                     return false;
                 }
                 // Allowed, and this is the last moment before the request is
@@ -231,10 +245,10 @@ mod platform {
     use super::super::registry::{BrowserRegistry, BrowserTab};
     use super::super::shim::linux as shim;
     use super::super::surface::{BrowserSurface, SurfaceError};
+    use super::super::tab_label;
     use super::super::types::{
         BrowserPopupPayload, BrowserTabState, ChannelKind, PopupPresentation, SurfaceKind, TabKind,
     };
-    use super::super::tab_label;
 
     /// The opener a new window must be built from: WebKitGTK refuses to open
     /// one for a page unless the webview it is given is RELATED to the webview
@@ -320,8 +334,13 @@ mod platform {
             // the allocator can hand out again, so it is let go of here rather
             // than left to be inherited by whoever lands on that address.
             let replaced = WEBVIEWS.with(|live| {
-                live.borrow_mut()
-                    .insert(held, Live { webview, tab_id: tab })
+                live.borrow_mut().insert(
+                    held,
+                    Live {
+                        webview,
+                        tab_id: tab,
+                    },
+                )
             });
             if let Some(replaced) = replaced {
                 shim::forget(&replaced.webview);

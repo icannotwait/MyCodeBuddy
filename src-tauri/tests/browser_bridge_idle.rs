@@ -70,7 +70,10 @@ async fn listeners_close_when_released_and_idle() {
         .header(header::COOKIE, cookie_for(&grant))
         .send()
         .await;
-    assert!(result.is_err(), "closed listener still answered: {result:?}");
+    assert!(
+        result.is_err(),
+        "closed listener still answered: {result:?}"
+    );
 
     // A held listener still closes after two hours without a request. The
     // clock starts again here: the request above waits on a port that was

@@ -1017,7 +1017,11 @@ fn parse_detail(path: &Path, conversation_id: &str) -> Result<ConversationDetail
     // (`qfmodel`) that the table cannot match at all.
     let max_tokens = transcript
         .reported_context_window
-        .or_else(|| transcript.reported_context.and_then(ReportedContext::window))
+        .or_else(|| {
+            transcript
+                .reported_context
+                .and_then(ReportedContext::window)
+        })
         .or_else(|| infer_context_window_max_tokens(transcript.model.as_deref()));
     // The stated occupancy goes on LAST, over whatever the used/max division
     // produced: for a session recorded before `QODER_EXPOSE_TOKEN_USAGE` there
@@ -1782,7 +1786,10 @@ mod tests {
         assert_eq!(s.context_window_used_tokens, Some(2803));
         assert_eq!(s.context_window_max_tokens, Some(180_000));
         let percent = s.context_window_usage_percent.expect("percent");
-        assert!((percent - 1.557_222_222_222_222_2).abs() < 1e-9, "{percent}");
+        assert!(
+            (percent - 1.557_222_222_222_222_2).abs() < 1e-9,
+            "{percent}"
+        );
     }
 
     // Occupancy is a level, not a sum: the newest response describes the
@@ -1803,7 +1810,10 @@ mod tests {
         let detail = parser_in(tmp.path()).get_conversation("s1").unwrap();
         let s = detail.session_stats.expect("session stats");
         let percent = s.context_window_usage_percent.expect("percent");
-        assert!((percent - 1.557_222_222_222_222_2).abs() < 1e-9, "{percent}");
+        assert!(
+            (percent - 1.557_222_222_222_222_2).abs() < 1e-9,
+            "{percent}"
+        );
     }
 
     // A rewound branch describes a context that no longer exists. `a8` stays in
@@ -1826,7 +1836,10 @@ mod tests {
         let detail = parser_in(tmp.path()).get_conversation("s1").unwrap();
         let s = detail.session_stats.expect("session stats");
         let percent = s.context_window_usage_percent.expect("percent");
-        assert!((percent - 1.557_222_222_222_222_2).abs() < 1e-9, "{percent}");
+        assert!(
+            (percent - 1.557_222_222_222_222_2).abs() < 1e-9,
+            "{percent}"
+        );
         assert_eq!(s.context_window_max_tokens, Some(180_000));
     }
 
@@ -1850,7 +1863,10 @@ mod tests {
         assert_eq!(s.context_window_max_tokens, Some(262_144));
         // ...but the percentage is still Qoder's own, not 2803/262144.
         let percent = s.context_window_usage_percent.expect("percent");
-        assert!((percent - 1.557_222_222_222_222_2).abs() < 1e-9, "{percent}");
+        assert!(
+            (percent - 1.557_222_222_222_222_2).abs() < 1e-9,
+            "{percent}"
+        );
     }
 
     // A ratio Qoder clamped to 1.0 means "full or overflowing"; inverting it
@@ -1895,10 +1911,16 @@ mod tests {
         // the very numerator Qoder divided to get its ratio.
         assert_eq!(s.context_window_used_tokens, Some(2803));
         let percent = s.context_window_usage_percent.expect("percent");
-        assert!((percent - 1.557_222_222_222_222_2).abs() < 1e-9, "{percent}");
+        assert!(
+            (percent - 1.557_222_222_222_222_2).abs() < 1e-9,
+            "{percent}"
+        );
         // The stated percentage and the used/max pair now tell the same story.
         let recomputed = 2803.0 / 180_000.0 * 100.0;
-        assert!((percent - recomputed).abs() < 1e-6, "{percent} vs {recomputed}");
+        assert!(
+            (percent - recomputed).abs() < 1e-6,
+            "{percent} vs {recomputed}"
+        );
 
         // The split is a re-labelling, not a deduction: the turn's own counters
         // still add back up to the prompt Qoder charged for.
@@ -1907,9 +1929,7 @@ mod tests {
         assert_eq!(usage.cache_read_input_tokens, 900);
         assert_eq!(usage.cache_creation_input_tokens, 100);
         assert_eq!(
-            usage.input_tokens
-                + usage.cache_read_input_tokens
-                + usage.cache_creation_input_tokens,
+            usage.input_tokens + usage.cache_read_input_tokens + usage.cache_creation_input_tokens,
             2803
         );
     }
@@ -1948,6 +1968,9 @@ mod tests {
         assert_eq!(s.context_window_used_tokens, Some(10));
         assert_eq!(s.context_window_max_tokens, Some(262_144));
         let percent = s.context_window_usage_percent.expect("percent");
-        assert!((percent - (10.0 / 262_144.0) * 100.0).abs() < 1e-9, "{percent}");
+        assert!(
+            (percent - (10.0 / 262_144.0) * 100.0).abs() < 1e-9,
+            "{percent}"
+        );
     }
 }

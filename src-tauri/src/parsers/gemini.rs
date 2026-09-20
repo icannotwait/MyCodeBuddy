@@ -12,7 +12,6 @@ use crate::parsers::{
     visible_user_text, AgentParser, ParseError, RecoveryCandidateTracker, RecoveryQuery,
 };
 
-
 #[cfg(any(test, feature = "test-utils"))]
 std::thread_local! {
     static CHAT_FILE_WALKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
@@ -113,8 +112,7 @@ impl GeminiParser {
         if parent_name == "chats" {
             return None;
         }
-        (parent.parent()?.file_name()?.to_str()? == "chats")
-            .then(|| parent_name.to_string())
+        (parent.parent()?.file_name()?.to_str()? == "chats").then(|| parent_name.to_string())
     }
 
     fn parse_chat_value(path: &Path, raw: &str) -> Option<Value> {
@@ -230,7 +228,11 @@ impl GeminiParser {
 
             // Own the id before handing `value` over: `object` borrows `value`,
             // so a `&str` into it cannot survive the move.
-            if let Some(id) = object.get("id").and_then(|v| v.as_str()).map(str::to_string) {
+            if let Some(id) = object
+                .get("id")
+                .and_then(|v| v.as_str())
+                .map(str::to_string)
+            {
                 Self::upsert_message(&mut messages, &mut index_by_id, &id, value);
                 continue;
             }
@@ -247,10 +249,7 @@ impl GeminiParser {
                 continue;
             }
 
-            let is_partial_metadata = object
-                .get("sessionId")
-                .and_then(|v| v.as_str())
-                .is_some()
+            let is_partial_metadata = object.get("sessionId").and_then(|v| v.as_str()).is_some()
                 && object.get("projectHash").and_then(|v| v.as_str()).is_some();
             if is_partial_metadata {
                 for (key, value) in object {
@@ -862,8 +861,9 @@ impl GeminiParser {
                         usage: None,
                         duration_ms: None,
                         model: None,
+                        reasoning_effort: None,
                         completed_at: Some(timestamp),
-                    agent_message_id: None,
+                        agent_message_id: None,
                     });
                 }
                 "gemini" | "assistant" | "model" => {
@@ -882,8 +882,9 @@ impl GeminiParser {
                             .get("model")
                             .and_then(|v| v.as_str())
                             .map(|s| s.to_string()),
+                        reasoning_effort: None,
                         completed_at: Some(timestamp),
-                    agent_message_id: None,
+                        agent_message_id: None,
                     });
                 }
                 "system" => {
@@ -898,8 +899,9 @@ impl GeminiParser {
                         usage: None,
                         duration_ms: None,
                         model: None,
+                        reasoning_effort: None,
                         completed_at: Some(timestamp),
-                    agent_message_id: None,
+                        agent_message_id: None,
                     });
                 }
                 _ => {}
@@ -983,7 +985,6 @@ impl AgentParser for GeminiParser {
         Ok(conversations)
     }
 
-
     fn recover_conversation(
         &self,
         query: &RecoveryQuery<'_>,
@@ -1057,8 +1058,13 @@ fn group_into_turns(messages: Vec<UnifiedMessage>) -> Vec<MessageTurn> {
                 usage: None,
                 duration_ms: None,
                 model: None,
+                reasoning_effort: None,
                 completed_at: msg.completed_at,
-            agent_message_id: None,
+                outcome: None,
+                autonomous_origin: None,
+                generation_ms: None,
+                generation_tokens: None,
+                agent_message_id: None,
             });
             i += 1;
             continue;
@@ -1073,8 +1079,13 @@ fn group_into_turns(messages: Vec<UnifiedMessage>) -> Vec<MessageTurn> {
                 usage: None,
                 duration_ms: None,
                 model: None,
+                reasoning_effort: None,
                 completed_at: msg.completed_at,
-            agent_message_id: None,
+                outcome: None,
+                autonomous_origin: None,
+                generation_ms: None,
+                generation_tokens: None,
+                agent_message_id: None,
             });
             i += 1;
             continue;
@@ -1117,8 +1128,13 @@ fn group_into_turns(messages: Vec<UnifiedMessage>) -> Vec<MessageTurn> {
             usage,
             duration_ms,
             model,
+            reasoning_effort: None,
             completed_at,
-        agent_message_id: None,
+            outcome: None,
+            autonomous_origin: None,
+            generation_ms: None,
+            generation_tokens: None,
+            agent_message_id: None,
         });
     }
 
@@ -2052,5 +2068,4 @@ earlier terminal context records.\n\
 
         let _ = fs::remove_dir_all(base);
     }
-
 }

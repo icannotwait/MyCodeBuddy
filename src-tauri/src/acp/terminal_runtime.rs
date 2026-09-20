@@ -683,10 +683,7 @@ impl TerminalRuntime {
     /// Use a shared General Settings shell value for ACP terminal fallbacks.
     /// The config is read at command creation time so existing connections pick
     /// up setting changes without being restarted.
-    pub fn with_default_shell_config(
-        mut self,
-        default_shell: TerminalShellRuntimeConfig,
-    ) -> Self {
+    pub fn with_default_shell_config(mut self, default_shell: TerminalShellRuntimeConfig) -> Self {
         self.default_shell = default_shell;
         self
     }

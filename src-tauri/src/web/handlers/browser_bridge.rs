@@ -98,10 +98,22 @@ mod tests {
             bridgeable_target("http://localhost:3000/docs?x=1#frag").unwrap(),
             (3000, "/docs?x=1".to_string())
         );
-        assert_eq!(bridgeable_target("http://127.0.0.1:5173").unwrap(), (5173, "/".to_string()));
-        assert_eq!(bridgeable_target("http://[::1]:8080/a/b").unwrap(), (8080, "/a/b".to_string()));
-        assert_eq!(bridgeable_target("http://0.0.0.0:3000/").unwrap(), (3000, "/".to_string()));
-        assert_eq!(bridgeable_target("http://localhost/").unwrap(), (80, "/".to_string()));
+        assert_eq!(
+            bridgeable_target("http://127.0.0.1:5173").unwrap(),
+            (5173, "/".to_string())
+        );
+        assert_eq!(
+            bridgeable_target("http://[::1]:8080/a/b").unwrap(),
+            (8080, "/a/b".to_string())
+        );
+        assert_eq!(
+            bridgeable_target("http://0.0.0.0:3000/").unwrap(),
+            (3000, "/".to_string())
+        );
+        assert_eq!(
+            bridgeable_target("http://localhost/").unwrap(),
+            (80, "/".to_string())
+        );
     }
 
     #[test]

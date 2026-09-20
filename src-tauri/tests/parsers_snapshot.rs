@@ -15,8 +15,7 @@ use std::path::Path;
 
 use codeg_lib::parsers::{
     claude::ClaudeParser, cline::ClineParser, codex::CodexParser, gemini::GeminiParser,
-    hermes::HermesParser, kimi_code::KimiCodeParser, opencode::OpenCodeParser,
-    AgentParser,
+    hermes::HermesParser, kimi_code::KimiCodeParser, opencode::OpenCodeParser, AgentParser,
 };
 use insta::assert_json_snapshot;
 use serde_json::json;
@@ -205,7 +204,6 @@ fn gemini_minimal_session_snapshot() {
         ".**.completed_at" => "[ts]",
     });
 }
-
 
 // ────────────────────────────────────────────────────────────────────────────
 // Cline

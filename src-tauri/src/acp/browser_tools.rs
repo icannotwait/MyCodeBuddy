@@ -491,14 +491,22 @@ impl BrowserTabOutcome {
     /// refusal does not disclose which gate it fell at.
     pub fn grant_required(tab_id: &str) -> Self {
         let read = BrowserSnapshotOutcome::grant_required(tab_id);
-        Self::refused(Some(tab_id), ERROR_GRANT_REQUIRED, read.note.unwrap_or_default())
+        Self::refused(
+            Some(tab_id),
+            ERROR_GRANT_REQUIRED,
+            read.note.unwrap_or_default(),
+        )
     }
 
     /// Shared for reading. Pointing a tab somewhere else, or closing it, is at
     /// least as much as clicking a link on it.
     pub fn control_required(tab_id: &str) -> Self {
         let act = BrowserActOutcome::control_required(tab_id);
-        Self::refused(Some(tab_id), ERROR_CONTROL_REQUIRED, act.note.unwrap_or_default())
+        Self::refused(
+            Some(tab_id),
+            ERROR_CONTROL_REQUIRED,
+            act.note.unwrap_or_default(),
+        )
     }
 }
 
@@ -679,8 +687,8 @@ mod tests {
     /// key is there.
     #[test]
     fn the_wire_carries_exactly_one_of_the_page_and_the_refusal() {
-        let refused = serde_json::to_value(BrowserSnapshotOutcome::grant_required("t1"))
-            .expect("serialises");
+        let refused =
+            serde_json::to_value(BrowserSnapshotOutcome::grant_required("t1")).expect("serialises");
         assert_eq!(refused["error"], ERROR_GRANT_REQUIRED);
         // camelCase, the same spelling the listing uses.
         assert_eq!(refused["tabId"], "t1");
@@ -755,17 +763,19 @@ mod tests {
         ] {
             let note = BrowserActOutcome::stale_ref("t3", detail).note.unwrap();
             assert!(!note.contains(".."), "{note}");
-            assert!(note.contains(". Call browser_snapshot on tab t3 again"), "{note}");
+            assert!(
+                note.contains(". Call browser_snapshot on tab t3 again"),
+                "{note}"
+            );
             // And it takes a stop off, never a word.
             assert!(note.starts_with(detail.trim_end_matches('.')), "{note}");
         }
         // Exactly one stop, though. A detail that ends by quoting a name off
         // the page keeps the name: `Load more...` must not come back as
         // `Load more`, which is a different button.
-        let quoted =
-            BrowserActOutcome::stale_ref("t3", "e4 does not name the button Load more...")
-                .note
-                .unwrap();
+        let quoted = BrowserActOutcome::stale_ref("t3", "e4 does not name the button Load more...")
+            .note
+            .unwrap();
         assert!(
             quoted.starts_with("e4 does not name the button Load more... Call browser_snapshot"),
             "{quoted}"
@@ -796,23 +806,36 @@ mod tests {
     async fn console_and_capture_refusals_read_like_a_refused_read() {
         let console = BrowserConsoleOutcome::grant_required("t4");
         assert_eq!(console.error.as_deref(), Some(ERROR_GRANT_REQUIRED));
-        assert_eq!(console.note, BrowserSnapshotOutcome::grant_required("t4").note);
+        assert_eq!(
+            console.note,
+            BrowserSnapshotOutcome::grant_required("t4").note
+        );
         assert!(console.console.is_none());
 
         let capture = BrowserCaptureOutcome::stale_ref("t4", "e2 is gone");
         assert_eq!(capture.error.as_deref(), Some(ERROR_STALE_REF));
-        assert!(capture.note.as_deref().unwrap().contains("browser_snapshot"));
+        assert!(capture
+            .note
+            .as_deref()
+            .unwrap()
+            .contains("browser_snapshot"));
         let wire = serde_json::to_value(&capture).unwrap();
         assert_eq!(wire["tabId"], "t4");
         assert!(wire.get("capture").is_none());
 
         let none = NoBrowserTabs;
         assert_eq!(
-            none.console("t1", ConsoleQuery::default()).await.error.as_deref(),
+            none.console("t1", ConsoleQuery::default())
+                .await
+                .error
+                .as_deref(),
             Some(ERROR_UNAVAILABLE)
         );
         assert_eq!(
-            none.capture("t1", CaptureRequest::default()).await.error.as_deref(),
+            none.capture("t1", CaptureRequest::default())
+                .await
+                .error
+                .as_deref(),
             Some(ERROR_UNAVAILABLE)
         );
     }
@@ -881,7 +904,9 @@ mod tests {
         assert_eq!(no_tab["error"], ERROR_BLOCKED);
 
         let unavailable = NoBrowserTabs
-            .tab_op(BrowserTabOp::Close { tab_id: "t7".into() })
+            .tab_op(BrowserTabOp::Close {
+                tab_id: "t7".into(),
+            })
             .await;
         assert_eq!(unavailable.error.as_deref(), Some(ERROR_UNAVAILABLE));
         assert_eq!(unavailable.tab_id.as_deref(), Some("t7"));

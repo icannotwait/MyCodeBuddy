@@ -646,9 +646,7 @@ async fn start_claimed(
         StartSignal::Url(url) => url,
         StartSignal::Authenticated => {
             reap_and_release(child, stdin, scratch).await;
-            tracing::info!(
-                "[ACP][Antigravity] {method_id} was already signed in; no link needed"
-            );
+            tracing::info!("[ACP][Antigravity] {method_id} was already signed in; no link needed");
             return Ok(AntigravityLoginStart {
                 already_signed_in: true,
                 handle: None,
@@ -764,10 +762,7 @@ async fn spawn_agent(
     // because neither emits the `[ACP] spawning connection` line the user
     // counted — the directories were there all the same.
     let scratch = crate::acp::scratch_dir::create();
-    let mut env = crate::acp::connection::antigravity_launch_env(
-        runtime_env,
-        scratch.as_ref().map(|s| s.path()),
-    );
+    let mut env = crate::acp::connection::antigravity_launch_env(runtime_env);
     env.extend(extra_env);
 
     let mut command = crate::process::tokio_command(&binary);

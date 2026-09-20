@@ -218,8 +218,12 @@ pub fn handle_message(app: &AppHandle, tab_id: &str, raw: String, main_frame: bo
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_millis() as i64)
                 .unwrap_or_default();
-            match console::parse_reported(&envelope.payload, main_frame && envelope.top, at, origin.clone())
-            {
+            match console::parse_reported(
+                &envelope.payload,
+                main_frame && envelope.top,
+                at,
+                origin.clone(),
+            ) {
                 Some(line) => {
                     if registry.push_console(tab_id, line) {
                         // The first error of this document. Said once, so the
@@ -274,7 +278,10 @@ mod tests {
         assert!(minimal.payload.is_null());
         assert!(parse_envelope("not json").is_none());
         assert!(parse_envelope(r#"{"payload":{}}"#).is_none());
-        let huge = format!(r#"{{"kind":"x","payload":"{}"}}"#, "a".repeat(MAX_MESSAGE_BYTES));
+        let huge = format!(
+            r#"{{"kind":"x","payload":"{}"}}"#,
+            "a".repeat(MAX_MESSAGE_BYTES)
+        );
         assert!(parse_envelope(&huge).is_none());
     }
 

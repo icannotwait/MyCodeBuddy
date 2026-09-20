@@ -682,10 +682,10 @@ fn thread_name_prefix(terminal_id: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    #[cfg(not(target_os = "windows"))]
-    use super::{Arc, EventEmitter, SpawnOptions};
     use super::thread_name_prefix;
     use super::TerminalManager;
+    #[cfg(not(target_os = "windows"))]
+    use super::{Arc, EventEmitter, SpawnOptions};
     use super::{Scrollback, SCROLLBACK_MAX_CHARS};
 
     #[test]

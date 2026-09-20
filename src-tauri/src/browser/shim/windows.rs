@@ -33,27 +33,27 @@ use tauri::Url;
 use tauri_runtime_wry::wry::{self, WebViewExtWindows};
 use webview2_com::Microsoft::Web::WebView2::Win32::{
     ICoreWebView2, ICoreWebView2DevToolsProtocolEventReceivedEventArgs2,
-    ICoreWebView2DevToolsProtocolEventReceiver, ICoreWebView2Environment15,
-    ICoreWebView2Find, ICoreWebView2Frame, ICoreWebView2Frame2, ICoreWebView2Frame7,
-    ICoreWebView2PermissionRequestedEventArgs3,
-    ICoreWebView2Settings2, ICoreWebView2_28, ICoreWebView2_4,
-    COREWEBVIEW2_CAPTURE_PREVIEW_IMAGE_FORMAT, COREWEBVIEW2_CAPTURE_PREVIEW_IMAGE_FORMAT_JPEG,
+    ICoreWebView2DevToolsProtocolEventReceiver, ICoreWebView2Environment15, ICoreWebView2Find,
+    ICoreWebView2Frame, ICoreWebView2Frame2, ICoreWebView2Frame7,
+    ICoreWebView2PermissionRequestedEventArgs3, ICoreWebView2Settings2, ICoreWebView2_28,
+    ICoreWebView2_4, COREWEBVIEW2_CAPTURE_PREVIEW_IMAGE_FORMAT,
+    COREWEBVIEW2_CAPTURE_PREVIEW_IMAGE_FORMAT_JPEG, COREWEBVIEW2_CAPTURE_PREVIEW_IMAGE_FORMAT_PNG,
     COREWEBVIEW2_PERMISSION_KIND, COREWEBVIEW2_PERMISSION_KIND_MULTIPLE_AUTOMATIC_DOWNLOADS,
     COREWEBVIEW2_PERMISSION_STATE_ALLOW, COREWEBVIEW2_PERMISSION_STATE_DENY,
-    COREWEBVIEW2_CAPTURE_PREVIEW_IMAGE_FORMAT_PNG, COREWEBVIEW2_WEB_ERROR_STATUS,
+    COREWEBVIEW2_WEB_ERROR_STATUS,
     COREWEBVIEW2_WEB_ERROR_STATUS_CERTIFICATE_COMMON_NAME_IS_INCORRECT,
     COREWEBVIEW2_WEB_ERROR_STATUS_CERTIFICATE_EXPIRED,
     COREWEBVIEW2_WEB_ERROR_STATUS_CERTIFICATE_IS_INVALID,
     COREWEBVIEW2_WEB_ERROR_STATUS_CERTIFICATE_REVOKED,
     COREWEBVIEW2_WEB_ERROR_STATUS_CLIENT_CERTIFICATE_CONTAINS_ERRORS,
     COREWEBVIEW2_WEB_ERROR_STATUS_HOST_NAME_NOT_RESOLVED,
-    COREWEBVIEW2_WEB_ERROR_STATUS_OPERATION_CANCELED,
-    COREWEBVIEW2_WEB_RESOURCE_CONTEXT_DOCUMENT,
+    COREWEBVIEW2_WEB_ERROR_STATUS_OPERATION_CANCELED, COREWEBVIEW2_WEB_RESOURCE_CONTEXT_DOCUMENT,
 };
 use webview2_com::{
     take_pwstr, CallDevToolsProtocolMethodCompletedHandler, CapturePreviewCompletedHandler,
-    DevToolsProtocolEventReceivedEventHandler, FindStartCompletedHandler, FrameChildFrameCreatedEventHandler,
-    FrameCreatedEventHandler, FrameNavigationStartingEventHandler, NavigationCompletedEventHandler,
+    DevToolsProtocolEventReceivedEventHandler, FindStartCompletedHandler,
+    FrameChildFrameCreatedEventHandler, FrameCreatedEventHandler,
+    FrameNavigationStartingEventHandler, NavigationCompletedEventHandler,
     NavigationStartingEventHandler, PermissionRequestedEventHandler,
     WebResourceRequestedEventHandler,
 };
@@ -88,8 +88,7 @@ pub type FrameNavigationSink = std::sync::Arc<dyn Fn(&str) -> bool + Send + Sync
 /// `false` refuses. Answered by the host so the engine keeps its own prompt
 /// — drawn inside the page's rectangle, in nobody's design language, and
 /// invisible to codeg — out of an embedded tab.
-pub type DownloadPermissionSink =
-    std::sync::Arc<dyn Fn(&str, bool) -> bool + Send + Sync>;
+pub type DownloadPermissionSink = std::sync::Arc<dyn Fn(&str, bool) -> bool + Send + Sync>;
 
 /// A page-world execution context: the frame it belongs to and the origin
 /// the engine reported for it (`None` when opaque).
@@ -417,15 +416,14 @@ fn call_async(
     let name = HSTRING::from(method);
     let params = HSTRING::from(params);
     let method = method.to_string();
-    let handler = CallDevToolsProtocolMethodCompletedHandler::create(Box::new(
-        move |result, json| {
+    let handler =
+        CallDevToolsProtocolMethodCompletedHandler::create(Box::new(move |result, json| {
             match result {
                 Ok(()) => done(Ok(json)),
                 Err(err) => done(Err(format!("{method} failed: {err}"))),
             }
             Ok(())
-        },
-    ));
+        }));
     // SAFETY: main thread, live webview; WebView2 owns the handler until it
     // has called it.
     unsafe { webview.CallDevToolsProtocolMethod(&name, &params, &handler) }
@@ -491,8 +489,10 @@ fn on_event(key: usize, event: &str, session: &str, raw: &str) {
     // A console line the size of a novel is cut to a few kilobytes further
     // on; the one cost it could still impose is parsing it here, on the
     // main thread, so it is not parsed.
-    if matches!(event, "Runtime.consoleAPICalled" | "Runtime.exceptionThrown")
-        && raw.len() > console::CDP_MAX_EVENT_BYTES
+    if matches!(
+        event,
+        "Runtime.consoleAPICalled" | "Runtime.exceptionThrown"
+    ) && raw.len() > console::CDP_MAX_EVENT_BYTES
     {
         tracing::debug!("[browser] dropped a {} byte console event", raw.len());
         return;
@@ -587,8 +587,8 @@ fn on_event(key: usize, event: &str, session: &str, raw: &str) {
             let Some(PageContext { frame, origin }) = located else {
                 return;
             };
-            let main_frame = session.is_empty()
-                && state.main_frame.borrow().as_deref() == Some(frame.as_str());
+            let main_frame =
+                session.is_empty() && state.main_frame.borrow().as_deref() == Some(frame.as_str());
             let at = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_millis() as i64)
@@ -705,9 +705,7 @@ fn recover_world(webview: &ICoreWebView2, key: usize) {
                 None => false,
             };
             let context = answer.ok().and_then(|json| {
-                serde_json::from_str::<Value>(&json)
-                    .ok()?["executionContextId"]
-                    .as_i64()
+                serde_json::from_str::<Value>(&json).ok()?["executionContextId"].as_i64()
             });
             if let Some(context) = context {
                 tracing::debug!("[browser] page channel recovered in context {context}");
@@ -795,9 +793,7 @@ fn main_world_context(state: &SurfaceState) -> Option<i64> {
         .contexts
         .borrow()
         .iter()
-        .find_map(|((session, id), frame)| {
-            (session.is_empty() && *frame == main).then_some(*id)
-        })
+        .find_map(|((session, id), frame)| (session.is_empty() && *frame == main).then_some(*id))
 }
 
 /// Evaluate `expression` in the `codeg` world of the main frame. The result
@@ -870,7 +866,12 @@ pub fn dispatch_pointer(
     let webview2 = core(webview);
     let steps = match gesture {
         PointerGesture::Move { x, y } => vec![mouse_event("mouseMoved", x, y, "none", 0)],
-        PointerGesture::Click { x, y, button, count } => {
+        PointerGesture::Click {
+            x,
+            y,
+            button,
+            count,
+        } => {
             let name = match button {
                 PointerButton::Left => "left",
                 PointerButton::Right => "right",
@@ -908,17 +909,22 @@ fn run_input_steps(
         return;
     };
     let next = webview.clone();
-    let issued = call_async(&webview, "Input.dispatchMouseEvent", &params, move |answer| {
-        match answer {
-            Ok(_) => run_input_steps(next, steps, done),
-            Err(error) => done(Err(PointerFailure {
-                // Step 0 is the move; a button event has reached the page
-                // only once a later step has run.
-                delivered: index > 0,
-                error,
-            })),
-        }
-    });
+    let issued = call_async(
+        &webview,
+        "Input.dispatchMouseEvent",
+        &params,
+        move |answer| {
+            match answer {
+                Ok(_) => run_input_steps(next, steps, done),
+                Err(error) => done(Err(PointerFailure {
+                    // Step 0 is the move; a button event has reached the page
+                    // only once a later step has run.
+                    delivered: index > 0,
+                    error,
+                })),
+            }
+        },
+    );
     if let Err(err) = issued {
         tracing::warn!("[browser] Input.dispatchMouseEvent could not be issued: {err}");
     }
@@ -1181,7 +1187,8 @@ fn default_user_agent(state: &SurfaceState, settings: &ICoreWebView2Settings2) -
 /// changed.
 fn apply_user_agent(webview: &ICoreWebView2, key: usize, url: &Url) {
     // SAFETY: main thread, live webview.
-    let Ok(settings) = (unsafe { webview.Settings() }).and_then(|s| s.cast::<ICoreWebView2Settings2>())
+    let Ok(settings) =
+        (unsafe { webview.Settings() }).and_then(|s| s.cast::<ICoreWebView2Settings2>())
     else {
         return;
     };
@@ -1293,7 +1300,9 @@ pub fn install_navigation_hooks(
     *state.navigation.borrow_mut() = Some(navigation);
     // Read the engine's own identity before anything can override it.
     // SAFETY: main thread, live webview.
-    if let Ok(settings) = (unsafe { webview2.Settings() }).and_then(|s| s.cast::<ICoreWebView2Settings2>()) {
+    if let Ok(settings) =
+        (unsafe { webview2.Settings() }).and_then(|s| s.cast::<ICoreWebView2Settings2>())
+    {
         default_user_agent(&state, &settings);
     }
 
@@ -1545,7 +1554,11 @@ fn on_navigation_completed(
     // The navigation that replaced it owns the flag, the address, and the
     // identity set for where IT is going; the one on its way out may not take
     // any of them back.
-    if state.navigation_id.get().is_some_and(|id| id != navigation_id) {
+    if state
+        .navigation_id
+        .get()
+        .is_some_and(|id| id != navigation_id)
+    {
         tracing::debug!("[browser] navigation {navigation_id} was superseded ({status:?})");
         return;
     }
@@ -1741,11 +1754,7 @@ mod tests {
         assert!(!surface.spoke_as_main_frame_in(3, "S-2"));
         assert_eq!(main_world_context(&state_of(surface.key)), Some(3));
         // Its renderer goes; the page's context 3 is not the one destroyed.
-        surface.session_event(
-            "Runtime.executionContextsCleared",
-            "S-2",
-            json!({}),
-        );
+        surface.session_event("Runtime.executionContextsCleared", "S-2", json!({}));
         assert!(surface.spoke_as_main_frame(3));
         // And when the page's own goes, the id is nobody's.
         surface.event(
@@ -1812,7 +1821,11 @@ mod tests {
         assert!(needs_world(&state, Some("https://example.com/popup"), true));
         // That look is still not a way around the binding.
         state.binding_ready.set(false);
-        assert!(!needs_world(&state, Some("https://example.com/popup"), true));
+        assert!(!needs_world(
+            &state,
+            Some("https://example.com/popup"),
+            true
+        ));
     }
 
     /// The engine's statuses, by kind — and the one that is NOT a page failure.

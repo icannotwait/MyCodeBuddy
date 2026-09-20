@@ -274,8 +274,9 @@ impl CodeBuddyParser {
                             usage: None,
                             duration_ms: None,
                             model: record_model(&value),
+                            reasoning_effort: None,
                             completed_at: Some(ts),
-                        agent_message_id: None,
+                            agent_message_id: None,
                         });
                     }
                 }
@@ -301,8 +302,9 @@ impl CodeBuddyParser {
                         usage: None,
                         duration_ms: None,
                         model: None,
+                        reasoning_effort: None,
                         completed_at: Some(ts),
-                    agent_message_id: None,
+                        agent_message_id: None,
                     });
                 }
                 "function_call_result" => {
@@ -341,8 +343,9 @@ impl CodeBuddyParser {
                         usage: None,
                         duration_ms: None,
                         model: None,
+                        reasoning_effort: None,
                         completed_at: Some(ts),
-                    agent_message_id: None,
+                        agent_message_id: None,
                     });
                 }
                 _ => {}
@@ -440,11 +443,11 @@ impl AgentParser for CodeBuddyParser {
             if is_subagent_transcript(&self.base_dir, path) {
                 continue;
             }
-            if let Ok(Some(summary)) = super::summary_cache::get_or_parse(
-                AgentType::CodeBuddy,
-                path,
-                || Ok(self.parse_summary(path)),
-            ) {
+            if let Ok(Some(summary)) =
+                super::summary_cache::get_or_parse(AgentType::CodeBuddy, path, || {
+                    Ok(self.parse_summary(path))
+                })
+            {
                 conversations.push(summary);
             }
         }
@@ -624,7 +627,10 @@ fn reasoning_text(value: &Value) -> String {
 /// `cached_tokens` to get the non-cached input.
 fn usage_from_raw(value: &Value) -> Option<TurnUsage> {
     let raw = value.get("providerData")?.get("rawUsage")?;
-    let prompt = raw.get("prompt_tokens").and_then(Value::as_u64).unwrap_or(0);
+    let prompt = raw
+        .get("prompt_tokens")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
     let completion = raw
         .get("completion_tokens")
         .and_then(Value::as_u64)
@@ -740,7 +746,11 @@ fn deferred_result_envelope(value: &Value) -> Option<String> {
     }
     let text = value
         .get("output")
-        .and_then(|o| o.get("text").and_then(|t| t.as_str()).or_else(|| o.as_str()))
+        .and_then(|o| {
+            o.get("text")
+                .and_then(|t| t.as_str())
+                .or_else(|| o.as_str())
+        })
         .or_else(|| tool_result.get("content").and_then(|c| c.as_str()))
         .unwrap_or("");
     let is_error = mcp_meta
@@ -771,7 +781,10 @@ fn tool_output_preview(value: &Value) -> Option<String> {
             return Some(text.to_string());
         }
     }
-    let content = value.get("providerData")?.get("toolResult")?.get("content")?;
+    let content = value
+        .get("providerData")?
+        .get("toolResult")?
+        .get("content")?;
     if let Some(text) = content.as_str() {
         Some(text.to_string())
     } else {
@@ -1106,8 +1119,9 @@ fn text_message(
         usage,
         duration_ms: None,
         model,
+        reasoning_effort: None,
         completed_at: Some(ts),
-    agent_message_id: None,
+        agent_message_id: None,
     }
 }
 
@@ -1132,8 +1146,13 @@ fn group_into_turns(messages: Vec<UnifiedMessage>) -> Vec<MessageTurn> {
                 usage: None,
                 duration_ms: None,
                 model: None,
+                reasoning_effort: None,
                 completed_at: msg.completed_at,
-            agent_message_id: None,
+                outcome: None,
+                autonomous_origin: None,
+                generation_ms: None,
+                generation_tokens: None,
+                agent_message_id: None,
             });
             i += 1;
         } else if matches!(msg.role, MessageRole::System) {
@@ -1145,8 +1164,13 @@ fn group_into_turns(messages: Vec<UnifiedMessage>) -> Vec<MessageTurn> {
                 usage: None,
                 duration_ms: None,
                 model: None,
+                reasoning_effort: None,
                 completed_at: msg.completed_at,
-            agent_message_id: None,
+                outcome: None,
+                autonomous_origin: None,
+                generation_ms: None,
+                generation_tokens: None,
+                agent_message_id: None,
             });
             i += 1;
         } else {
@@ -1184,8 +1208,13 @@ fn group_into_turns(messages: Vec<UnifiedMessage>) -> Vec<MessageTurn> {
                 usage,
                 duration_ms,
                 model: turn_model,
+                reasoning_effort: None,
                 completed_at,
-            agent_message_id: None,
+                outcome: None,
+                autonomous_origin: None,
+                generation_ms: None,
+                generation_tokens: None,
+                agent_message_id: None,
             });
         }
     }
@@ -1218,8 +1247,10 @@ mod tests {
 
     #[test]
     fn empty_env_falls_back_to_home() {
-        let resolved =
-            resolve_codebuddy_config_dir_from(Some(OsString::new()), Some(PathBuf::from("/home/u")));
+        let resolved = resolve_codebuddy_config_dir_from(
+            Some(OsString::new()),
+            Some(PathBuf::from("/home/u")),
+        );
         assert_eq!(resolved, PathBuf::from("/home/u/.codebuddy"));
     }
 
@@ -1229,8 +1260,12 @@ mod tests {
         let mut file =
             std::fs::File::create(dir.join(format!("{session_id}.jsonl"))).expect("create jsonl");
         for record in records {
-            writeln!(file, "{}", serde_json::to_string(record).expect("serialize"))
-                .expect("write line");
+            writeln!(
+                file,
+                "{}",
+                serde_json::to_string(record).expect("serialize")
+            )
+            .expect("write line");
         }
     }
 
@@ -1273,9 +1308,9 @@ mod tests {
 
         let has_user_text = detail.turns.iter().any(|t| {
             matches!(t.role, TurnRole::User)
-                && t.blocks
-                    .iter()
-                    .any(|b| matches!(b, ContentBlock::Text { text } if text.contains("你会做什么")))
+                && t.blocks.iter().any(
+                    |b| matches!(b, ContentBlock::Text { text } if text.contains("你会做什么")),
+                )
         });
         assert!(has_user_text, "user input_text must become a User turn");
 
@@ -1288,9 +1323,9 @@ mod tests {
 
         let has_assistant_text = detail.turns.iter().any(|t| {
             matches!(t.role, TurnRole::Assistant)
-                && t.blocks.iter().any(
-                    |b| matches!(b, ContentBlock::Text { text } if text.contains("CodeBuddy")),
-                )
+                && t.blocks
+                    .iter()
+                    .any(|b| matches!(b, ContentBlock::Text { text } if text.contains("CodeBuddy")))
         });
         assert!(has_assistant_text, "assistant output_text must render");
 
@@ -1456,7 +1491,10 @@ mod tests {
             .iter()
             .find(|(id, _, _)| id.as_deref() == Some("call_1"))
             .expect("bash result");
-        assert!(bash.1, "toolResult.error must set is_error even when status=completed");
+        assert!(
+            bash.1,
+            "toolResult.error must set is_error even when status=completed"
+        );
 
         let glob = results
             .iter()
@@ -1716,8 +1754,12 @@ mod tests {
         let mut file =
             std::fs::File::create(dir.join(format!("{agent_id}.jsonl"))).expect("create subagent");
         for record in records {
-            writeln!(file, "{}", serde_json::to_string(record).expect("serialize"))
-                .expect("write line");
+            writeln!(
+                file,
+                "{}",
+                serde_json::to_string(record).expect("serialize")
+            )
+            .expect("write line");
         }
     }
 
@@ -1952,7 +1994,8 @@ mod tests {
         // model-facing guidance prose into the chat. CodeBuddy's own renderer
         // skips these records; codeg folds the payload onto the launch card
         // instead.
-        let root = std::env::temp_dir().join(format!("codeg-cb-meta-user-{}", uuid::Uuid::new_v4()));
+        let root =
+            std::env::temp_dir().join(format!("codeg-cb-meta-user-{}", uuid::Uuid::new_v4()));
         let sid = "sess-bg";
         let mut records = async_launch_records();
         records.push(task_notification_record(
@@ -2030,7 +2073,8 @@ mod tests {
         // No `<task-notification>` yet (the worker is still running, or the CLI
         // died): `status: null` renders as "launched, result pending" — never as
         // a zombie "running". Mirrors `claude.rs`.
-        let root = std::env::temp_dir().join(format!("codeg-cb-unsettled-{}", uuid::Uuid::new_v4()));
+        let root =
+            std::env::temp_dir().join(format!("codeg-cb-unsettled-{}", uuid::Uuid::new_v4()));
         let sid = "sess-bg";
         write_session(&root, "Users-demo-app", sid, &async_launch_records());
 
@@ -2475,5 +2519,4 @@ earlier terminal context records.\n\
 
         std::fs::remove_dir_all(&root).ok();
     }
-
 }

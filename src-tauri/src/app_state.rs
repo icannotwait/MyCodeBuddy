@@ -291,7 +291,6 @@ pub fn build_delegation_stack(
         ask: ask.clone(),
         sessions: sessions.clone(),
         authoring: authoring.clone(),
-        browser: browser.clone(),
         // Same backing manager as the listener's question lookup; used only by
         // the run_connection teardown guard to reclaim a parked ask.
         questions: Arc::new(crate::acp::manager::ConnectionManagerQuestionLookup {

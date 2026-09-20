@@ -263,7 +263,6 @@ describe("FileWorkspaceHeader — a hoisted HTML preview", () => {
   })
 })
 
-
 function snapshotHtmlTab(snapshot: boolean): FileWorkspaceTab {
   return {
     id: "file:%2Frepo%2Fimages%2Falias.html",

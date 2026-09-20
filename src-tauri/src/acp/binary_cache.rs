@@ -651,7 +651,13 @@ fn installed_version_labels(agent_id: &str, cmd_name: &str) -> Result<Vec<String
     // already de-duplicates a version present in both.
     let roots = [Some(cache_dir()?), legacy_cache_dir()];
     for base in roots.into_iter().flatten() {
-        collect_version_labels(&base.join(agent_id), agent_id, cmd_name, &mut versions, &mut seen)?;
+        collect_version_labels(
+            &base.join(agent_id),
+            agent_id,
+            cmd_name,
+            &mut versions,
+            &mut seen,
+        )?;
     }
     Ok(versions)
 }
@@ -1280,7 +1286,10 @@ mod tests {
 
         let meta = std::fs::symlink_metadata(to.join("link")).expect("link must exist");
         assert!(meta.file_type().is_symlink(), "and must still be a symlink");
-        assert_eq!(std::fs::read_link(to.join("link")).expect("read_link"), Path::new("real"));
+        assert_eq!(
+            std::fs::read_link(to.join("link")).expect("read_link"),
+            Path::new("real")
+        );
         assert_eq!(std::fs::read(to.join("real")).expect("read"), b"payload");
     }
 

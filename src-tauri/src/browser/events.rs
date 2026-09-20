@@ -13,11 +13,11 @@ use super::confirm::{EvalRequestPayload, EVAL_REQUEST_EVENT};
 use super::doc_guest::DocGuestState;
 use super::downloads::{BrowserDownload, DOWNLOAD_EVENT};
 use super::types::{
-    BrowserClosedPayload, BrowserConsoleErrorsPayload, BrowserNavigationBlockedPayload,
-    BrowserOpenRequestPayload, BrowserPopupPayload, BrowserShortcutPayload, BrowserTabState,
-    BrowserDevtoolsClosedPayload, NavigationBlockReason, CLOSED_EVENT, CONSOLE_ERRORS_EVENT,
-    DEVTOOLS_CLOSED_EVENT, DOC_STATE_EVENT,
-    NAVIGATION_BLOCKED_EVENT, OPEN_REQUEST_EVENT, POPUP_EVENT, SHORTCUT_EVENT, STATE_EVENT,
+    BrowserClosedPayload, BrowserConsoleErrorsPayload, BrowserDevtoolsClosedPayload,
+    BrowserNavigationBlockedPayload, BrowserOpenRequestPayload, BrowserPopupPayload,
+    BrowserShortcutPayload, BrowserTabState, NavigationBlockReason, CLOSED_EVENT,
+    CONSOLE_ERRORS_EVENT, DEVTOOLS_CLOSED_EVENT, DOC_STATE_EVENT, NAVIGATION_BLOCKED_EVENT,
+    OPEN_REQUEST_EVENT, POPUP_EVENT, SHORTCUT_EVENT, STATE_EVENT,
 };
 
 pub fn emit_state(app: &AppHandle, state: &BrowserTabState) {
@@ -38,12 +38,7 @@ pub fn emit_devtools_closed(app: &AppHandle, tab_id: &str) {
 
 /// `request_id` names the `browser_close` call this is the answer to, and is
 /// `None` for a close nobody asked for — see [`BrowserClosedPayload`].
-pub fn emit_closed(
-    app: &AppHandle,
-    tab_id: &str,
-    owner_window: &str,
-    request_id: Option<&str>,
-) {
+pub fn emit_closed(app: &AppHandle, tab_id: &str, owner_window: &str, request_id: Option<&str>) {
     emit_event(
         &EventEmitter::Tauri(app.clone()),
         CLOSED_EVENT,
@@ -60,7 +55,11 @@ pub fn emit_popup(app: &AppHandle, payload: &BrowserPopupPayload) {
 }
 
 pub fn emit_open_request(app: &AppHandle, payload: &BrowserOpenRequestPayload) {
-    emit_event(&EventEmitter::Tauri(app.clone()), OPEN_REQUEST_EVENT, payload);
+    emit_event(
+        &EventEmitter::Tauri(app.clone()),
+        OPEN_REQUEST_EVENT,
+        payload,
+    );
 }
 
 pub fn emit_shortcut(app: &AppHandle, tab_id: &str, shortcut: &str) {
@@ -134,7 +133,11 @@ pub fn emit_agent_activity(
 /// showing the same question would be two chances to answer it, and the second
 /// answer would arrive after the first had already decided.
 pub fn emit_eval_request(app: &AppHandle, payload: &EvalRequestPayload) {
-    emit_event(&EventEmitter::Tauri(app.clone()), EVAL_REQUEST_EVENT, payload);
+    emit_event(
+        &EventEmitter::Tauri(app.clone()),
+        EVAL_REQUEST_EVENT,
+        payload,
+    );
 }
 
 /// Whether the document in a tab has printed an error — see
@@ -152,7 +155,12 @@ pub fn emit_console_errors(app: &AppHandle, tab_id: &str, errors: bool) {
     );
 }
 
-pub fn emit_navigation_blocked(app: &AppHandle, tab_id: &str, url: &str, reason: NavigationBlockReason) {
+pub fn emit_navigation_blocked(
+    app: &AppHandle,
+    tab_id: &str,
+    url: &str,
+    reason: NavigationBlockReason,
+) {
     emit_event(
         &EventEmitter::Tauri(app.clone()),
         NAVIGATION_BLOCKED_EVENT,

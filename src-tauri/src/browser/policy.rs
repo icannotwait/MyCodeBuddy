@@ -118,7 +118,9 @@ fn parse_pattern(pattern: &str) -> Option<ParsedPattern> {
         (host.to_string(), port.map(str::to_string), true)
     } else {
         match trimmed.rsplit_once(':') {
-            Some((host, digits)) if !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()) => {
+            Some((host, digits))
+                if !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()) =>
+            {
                 (host.to_string(), Some(digits.to_string()), false)
             }
             Some(_) => return None,
@@ -192,7 +194,9 @@ impl ParsedPattern {
     fn matches(&self, hostname: &str, port: Option<u16>) -> bool {
         let host_ok = match &self.host {
             HostMatcher::Any => true,
-            HostMatcher::Suffix(suffix) => hostname.ends_with(suffix.as_str()) && hostname.len() > suffix.len(),
+            HostMatcher::Suffix(suffix) => {
+                hostname.ends_with(suffix.as_str()) && hostname.len() > suffix.len()
+            }
             HostMatcher::Exact(exact) => hostname == exact,
         };
         host_ok && self.port.is_none_or(|wanted| port == Some(wanted))
@@ -331,7 +335,10 @@ pub fn parse_managed_policy(raw: &str) -> Result<ManagedPolicy, String> {
     for value in file.browser.host_rules {
         match serde_json::from_value::<HostRule>(value.clone()) {
             Ok(rule) if valid_pattern(&rule.pattern) => host_rules.push(rule),
-            Ok(rule) => tracing::warn!("[browser] policy: ignoring rule with invalid pattern {:?}", rule.pattern),
+            Ok(rule) => tracing::warn!(
+                "[browser] policy: ignoring rule with invalid pattern {:?}",
+                rule.pattern
+            ),
             Err(err) => tracing::warn!("[browser] policy: ignoring malformed rule {value}: {err}"),
         }
     }
@@ -351,7 +358,10 @@ pub fn read_managed_policy(path: &Path) -> Option<ManagedPolicy> {
         Ok(raw) => raw,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return None,
         Err(err) => {
-            tracing::error!("[browser] policy file {} is unreadable: {err}", path.display());
+            tracing::error!(
+                "[browser] policy file {} is unreadable: {err}",
+                path.display()
+            );
             return None;
         }
     };
@@ -367,7 +377,10 @@ pub fn read_managed_policy(path: &Path) -> Option<ManagedPolicy> {
             Some(policy)
         }
         Err(err) => {
-            tracing::error!("[browser] policy file {} is malformed: {err}", path.display());
+            tracing::error!(
+                "[browser] policy file {} is malformed: {err}",
+                path.display()
+            );
             None
         }
     }
@@ -427,7 +440,10 @@ impl BrowserPolicy {
     }
 
     pub fn user_rules(&self) -> Vec<HostRule> {
-        self.user_rules.read().unwrap_or_else(|p| p.into_inner()).clone()
+        self.user_rules
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
     }
 
     /// The rule for `url`: the administrator's table first (it wins whatever
@@ -516,7 +532,12 @@ mod tests {
         ] {
             assert!(subframe_navigation_allowed(&u(ok)), "{ok}");
         }
-        for bad in ["file:///etc/passwd", "tauri://localhost/", "codeg-doc://g/x", "about:config"] {
+        for bad in [
+            "file:///etc/passwd",
+            "tauri://localhost/",
+            "codeg-doc://g/x",
+            "about:config",
+        ] {
             assert!(!subframe_navigation_allowed(&u(bad)), "{bad}");
         }
     }
@@ -635,12 +656,30 @@ mod tests {
             rule("*.sso.corp.example", HostRuleAction::Builtin),
         ];
         let action = |url: &str| match_host_rule(&rules, &u(url)).map(|r| r.action);
-        assert_eq!(action("https://sso.corp.example/"), Some(HostRuleAction::Block));
-        assert_eq!(action("https://sso.corp.example:8443/"), Some(HostRuleAction::Block));
-        assert_eq!(action("https://wiki.corp.example:8443/"), Some(HostRuleAction::System));
-        assert_eq!(action("https://wiki.corp.example/"), Some(HostRuleAction::Builtin));
-        assert_eq!(action("https://a.sso.corp.example/"), Some(HostRuleAction::Builtin));
-        assert_eq!(action("https://elsewhere.example/"), Some(HostRuleAction::System));
+        assert_eq!(
+            action("https://sso.corp.example/"),
+            Some(HostRuleAction::Block)
+        );
+        assert_eq!(
+            action("https://sso.corp.example:8443/"),
+            Some(HostRuleAction::Block)
+        );
+        assert_eq!(
+            action("https://wiki.corp.example:8443/"),
+            Some(HostRuleAction::System)
+        );
+        assert_eq!(
+            action("https://wiki.corp.example/"),
+            Some(HostRuleAction::Builtin)
+        );
+        assert_eq!(
+            action("https://a.sso.corp.example/"),
+            Some(HostRuleAction::Builtin)
+        );
+        assert_eq!(
+            action("https://elsewhere.example/"),
+            Some(HostRuleAction::System)
+        );
         // Equal specificity: the more restrictive action, whatever the order
         // — including two spellings of one host.
         let tie = [
@@ -710,7 +749,10 @@ mod tests {
         )
         .unwrap();
         assert!(!parsed.browser_enabled);
-        assert_eq!(parsed.host_rules, vec![rule("*.corp.example", HostRuleAction::Block)]);
+        assert_eq!(
+            parsed.host_rules,
+            vec![rule("*.corp.example", HostRuleAction::Block)]
+        );
 
         // Missing keys mean "no restriction", not "off".
         let empty = parse_managed_policy("{}").unwrap();
@@ -725,7 +767,11 @@ mod tests {
         assert!(read_managed_policy(&path).is_none());
         std::fs::write(&path, "{ nope").unwrap();
         assert!(read_managed_policy(&path).is_none());
-        std::fs::write(&path, r#"{"browser":{"hostRules":[{"pattern":"a.example","action":"system"}]}}"#).unwrap();
+        std::fs::write(
+            &path,
+            r#"{"browser":{"hostRules":[{"pattern":"a.example","action":"system"}]}}"#,
+        )
+        .unwrap();
         let loaded = read_managed_policy(&path).unwrap();
         assert_eq!(loaded.source.as_deref(), Some(path.as_path()));
         assert_eq!(loaded.host_rules.len(), 1);

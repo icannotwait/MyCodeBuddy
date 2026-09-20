@@ -12,8 +12,8 @@ pub mod browser_tools;
 pub mod canvas;
 pub mod chat_authoring;
 pub mod chat_channel;
-pub(crate) mod confined_file;
 pub mod config_sync;
+pub(crate) mod confined_file;
 pub mod conversation_experience;
 #[cfg(feature = "tauri-runtime")]
 pub mod conversation_popout;

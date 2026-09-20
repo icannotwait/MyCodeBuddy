@@ -30,6 +30,16 @@ pub enum AgentDistribution {
         /// per-version cache dir and the entry path inside it is launched.
         dir_entry: Option<BinaryDirEntry>,
     },
+    /// Fork-only: a platform-filtered executable shipped with the desktop
+    /// app (or pointed at by `override_env`), not fetched via npx/uvx/URL.
+    Bundled {
+        version: &'static str,
+        cmd: &'static str,
+        args: &'static [&'static str],
+        env: &'static [(&'static str, &'static str)],
+        override_env: &'static str,
+        platforms: &'static [&'static str],
+    },
     /// Python agents launched through `uvx` (the `uv` tool runner), which
     /// fetches + caches the pinned package on first use — analogous to npx.
     /// Used for custom ACP agents distributed as PyPI packages (Hermes shipped
@@ -114,6 +124,17 @@ pub struct BinaryDirEntry {
     pub required_siblings: PlatformFiles,
 }
 
+impl AgentDistribution {
+    pub fn env(&self) -> &'static [(&'static str, &'static str)] {
+        match self {
+            Self::Npx { env, .. }
+            | Self::Binary { env, .. }
+            | Self::Bundled { env, .. }
+            | Self::Uvx { env, .. } => env,
+        }
+    }
+}
+
 impl BinaryDirEntry {
     /// Entry path for the current platform.
     pub fn for_current_platform(&self) -> &'static str {
@@ -143,6 +164,7 @@ impl AcpAgentMeta {
         match &self.distribution {
             AgentDistribution::Npx { version, .. }
             | AgentDistribution::Binary { version, .. }
+            | AgentDistribution::Bundled { version, .. }
             | AgentDistribution::Uvx { version, .. } => Some(*version),
         }
     }
@@ -174,6 +196,7 @@ impl AcpAgentMeta {
         match &self.distribution {
             AgentDistribution::Npx { .. } => true,
             AgentDistribution::Uvx { .. } => false,
+            AgentDistribution::Bundled { .. } => false,
             AgentDistribution::Binary {
                 version, platforms, ..
             } => platforms
@@ -407,7 +430,6 @@ fn codex_distribution() -> AgentDistribution {
     }
 }
 
-
 /// Minimum adapter version whose `_session/steering` honors the
 /// `_meta.steering.idleBehavior = "promptRequired"` opt-in — one of the three
 /// gates for codeg's NATIVE live-feedback push channel (synthesized into
@@ -498,6 +520,7 @@ fn distribution_uses_cursor_acp(distribution: &AgentDistribution) -> bool {
             launch_spec_uses_cursor_acp(cmd, args)
                 || system_cmd.is_some_and(|(c, a)| launch_spec_uses_cursor_acp(c, a))
         }
+        AgentDistribution::Bundled { .. } => false,
     }
 }
 
@@ -2814,12 +2837,7 @@ mod tests {
             "@google/gemini-cli@0.60.0",
             Some("20.0.0"),
         );
-        assert_npx_version(
-            AgentType::Cline,
-            "3.0.62",
-            "cline@3.0.62",
-            Some("22.0.0"),
-        );
+        assert_npx_version(AgentType::Cline, "3.0.62", "cline@3.0.62", Some("22.0.0"));
         assert_npx_version(
             AgentType::CodeBuddy,
             "2.155.0",
@@ -2859,7 +2877,11 @@ mod tests {
             "@qoder-ai/qodercli@1.1.57",
             Some("20.0.0"),
         );
-        assert_binary_version(AgentType::OpenCode, "1.18.31", "/releases/download/v1.18.31/");
+        assert_binary_version(
+            AgentType::OpenCode,
+            "1.18.31",
+            "/releases/download/v1.18.31/",
+        );
         // Hermes rides the community npm bridge (upstream retired its PyPI
         // channel at 0.19.0; see the registry entry). The npm package version
         // tracks the upstream version 1:1, and the pin must stay EXACT — the

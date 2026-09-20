@@ -3077,66 +3077,65 @@ pub async fn spawn_agent_connection(
                 // off, or create failed) means the child inherits the ambient
                 // temp dir exactly as it did before.
                 let scratch = crate::acp::scratch_dir::create();
-                let agent =
-                    match build_agent(
-                        agent_type,
-                        &runtime_env,
-                        &launch_cwd,
-                        &driver_route_plan,
-                        scratch.as_ref().map(|s| s.path()),
-                    )
-                    .await
-                    {
-                        Ok(agent) => agent
-                            .on_spawn({
-                                let child_pid = Arc::clone(&child_pid);
-                                move |pid| child_pid.store(pid, std::sync::atomic::Ordering::SeqCst)
-                            })
-                            .on_exit({
-                                let child_pid = Arc::clone(&child_pid);
-                                let scratch = std::sync::Mutex::new(scratch);
-                                move || {
-                                    child_pid.store(0, std::sync::atomic::Ordering::SeqCst);
-                                    if let Ok(mut held) = scratch.lock() {
-                                        if let Some(scratch) = held.take() {
-                                            scratch.release();
-                                        }
+                let agent = match build_agent(
+                    agent_type,
+                    &runtime_env,
+                    &launch_cwd,
+                    &driver_route_plan,
+                    scratch.as_ref().map(|s| s.path()),
+                )
+                .await
+                {
+                    Ok(agent) => agent
+                        .on_spawn({
+                            let child_pid = Arc::clone(&child_pid);
+                            move |pid| child_pid.store(pid, std::sync::atomic::Ordering::SeqCst)
+                        })
+                        .on_exit({
+                            let child_pid = Arc::clone(&child_pid);
+                            let scratch = std::sync::Mutex::new(scratch);
+                            move || {
+                                child_pid.store(0, std::sync::atomic::Ordering::SeqCst);
+                                if let Ok(mut held) = scratch.lock() {
+                                    if let Some(scratch) = held.take() {
+                                        scratch.release();
                                     }
                                 }
-                            }),
-                        Err(error) => {
-                            if let Some(scratch) = scratch {
-                                scratch.release();
                             }
-                            let public_error = connection_driver_error_event(
-                                &error,
-                                agent_type,
-                                redact_shared_diagnostics,
-                            );
-                            let _ = route_bootstrap_tx.send(RouteBootstrapOutcome::Fatal(error));
-                            if let Some(injection) = delegation_for_cleanup {
-                                cleanup_delegation_parent(&injection, &conn_id, &state_clone).await;
-                            }
-                            emit_with_state(&state_clone, &emitter_clone, public_error).await;
-                            emit_with_state(
-                                &state_clone,
-                                &emitter_clone,
-                                AcpEvent::StatusChanged {
-                                    status: ConnectionStatus::Error,
-                                },
-                            )
-                            .await;
-                            emit_with_state(
-                                &state_clone,
-                                &emitter_clone,
-                                AcpEvent::StatusChanged {
-                                    status: ConnectionStatus::Disconnected,
-                                },
-                            )
-                            .await;
-                            return;
+                        }),
+                    Err(error) => {
+                        if let Some(scratch) = scratch {
+                            scratch.release();
                         }
-                    };
+                        let public_error = connection_driver_error_event(
+                            &error,
+                            agent_type,
+                            redact_shared_diagnostics,
+                        );
+                        let _ = route_bootstrap_tx.send(RouteBootstrapOutcome::Fatal(error));
+                        if let Some(injection) = delegation_for_cleanup {
+                            cleanup_delegation_parent(&injection, &conn_id, &state_clone).await;
+                        }
+                        emit_with_state(&state_clone, &emitter_clone, public_error).await;
+                        emit_with_state(
+                            &state_clone,
+                            &emitter_clone,
+                            AcpEvent::StatusChanged {
+                                status: ConnectionStatus::Error,
+                            },
+                        )
+                        .await;
+                        emit_with_state(
+                            &state_clone,
+                            &emitter_clone,
+                            AcpEvent::StatusChanged {
+                                status: ConnectionStatus::Disconnected,
+                            },
+                        )
+                        .await;
+                        return;
+                    }
+                };
                 // run_connection reports bootstrap via oneshot; map AcpError paths to
                 // typed outcomes for the manager's single-attempt fallback policy.
                 let result = run_connection(
@@ -3758,7 +3757,25 @@ fn map_session_config_select_group(
     }
 }
 
+/// JetBrains AIR `recommendedValue` (codex-acp 1.11.0+). A hint only: the
+/// selector still follows `current_value`.
+fn air_recommended_value(
+    meta: Option<&serde_json::Map<String, serde_json::Value>>,
+) -> Option<String> {
+    let air = meta?.get("jetbrains")?.get("air")?;
+    let version = air.get("version").and_then(serde_json::Value::as_i64)?;
+    if version < 1 {
+        return None;
+    }
+    let value = air
+        .get("recommendedValue")
+        .and_then(serde_json::Value::as_str)?
+        .trim();
+    (!value.is_empty()).then(|| value.to_string())
+}
+
 fn map_session_config_option(option: &SessionConfigOption) -> Option<SessionConfigOptionInfo> {
+    let recommended_value = air_recommended_value(option.meta.as_ref());
     match &option.kind {
         SessionConfigKind::Select(select) => {
             let (flat_options, groups) = match &select.options {
@@ -3794,6 +3811,7 @@ fn map_session_config_option(option: &SessionConfigOption) -> Option<SessionConf
                     options: flat_options,
                     groups,
                 }),
+                recommended_value,
             })
         }
         SessionConfigKind::Boolean(toggle) => Some(SessionConfigOptionInfo {
@@ -3804,6 +3822,7 @@ fn map_session_config_option(option: &SessionConfigOption) -> Option<SessionConf
             kind: SessionConfigKindInfo::Boolean(SessionConfigBooleanInfo {
                 current_value: toggle.current_value,
             }),
+            recommended_value: None,
         }),
         _ => None,
     }
@@ -3892,6 +3911,7 @@ fn ensure_codex_mode_option(options: &mut Vec<SessionConfigOptionInfo>) {
                 ],
                 groups: vec![],
             }),
+            recommended_value: None,
         },
     );
 }
@@ -4159,6 +4179,7 @@ fn build_grok_effort_option(
             options,
             groups: Vec::new(),
         }),
+        recommended_value: None,
     })
 }
 
@@ -4255,6 +4276,7 @@ fn synthesize_grok_config_options(
                 options: model_opts,
                 groups: Vec::new(),
             }),
+            recommended_value: None,
         });
     }
     // Effort selector. With per-model `specs` (parsed from the response's
@@ -4282,6 +4304,7 @@ fn synthesize_grok_config_options(
                 options: effort_opts,
                 groups: Vec::new(),
             }),
+            recommended_value: None,
         });
     }
     if result.is_empty() {
@@ -9580,6 +9603,8 @@ fn config_option_rejection(
         option_name: option.name.clone(),
         requested: label(requested),
         actual: label(&select.current_value),
+        requested_value: requested.to_string(),
+        actual_value: select.current_value.clone(),
     })
 }
 
@@ -25514,15 +25539,18 @@ mod tests {
 
     #[test]
     fn codex_user_input_shape_reads_the_running_adapter_version() {
-        use sacp::schema::Implementation;
         use crate::acp::question::CodexUserInputShape;
+        use sacp::schema::Implementation;
         for (v, expected) in [
             ("1.11.0", CodexUserInputShape::QuestionInDescription),
             ("1.12.0", CodexUserInputShape::QuestionInTitle),
             ("1.12.1", CodexUserInputShape::QuestionInTitle),
         ] {
             assert_eq!(
-                codex_user_input_shape(AgentType::Codex, Some(&Implementation::new("codex-acp", v))),
+                codex_user_input_shape(
+                    AgentType::Codex,
+                    Some(&Implementation::new("codex-acp", v))
+                ),
                 Some(expected)
             );
         }
@@ -33350,12 +33378,8 @@ mod tests {
     /// first.
     #[test]
     fn scratch_dir_sets_every_temp_variable_the_child_might_read() {
-        let merged = merge_agent_env_with_color(
-            false,
-            &[],
-            &BTreeMap::new(),
-            Some(Path::new("/scratch/x")),
-        );
+        let merged =
+            merge_agent_env_with_color(false, &[], &BTreeMap::new(), Some(Path::new("/scratch/x")));
         for key in crate::acp::scratch_dir::TEMP_ENV_KEYS {
             assert_eq!(merged_value(&merged, key), Some("/scratch/x"), "{key}");
         }
@@ -33433,10 +33457,7 @@ mod tests {
         };
 
         assert_eq!(
-            ids(visible_config_options(
-                &["provider".to_string()],
-                options()
-            )),
+            ids(visible_config_options(&["provider".to_string()], options())),
             vec!["auto_approve".to_string()],
             "a dropdown whose every choice errors must not reach the composer"
         );

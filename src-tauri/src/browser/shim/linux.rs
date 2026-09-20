@@ -60,8 +60,8 @@ use javascriptcore::ValueExt;
 use serde_json::{json, Value};
 use webkit2gtk::{
     FindController, FindControllerExt, FindOptions, LoadEvent, SnapshotOptions, SnapshotRegion,
-    UserContentInjectedFrames, UserContentManagerExt, UserScript, UserScriptInjectionTime,
-    WebView, WebViewExt,
+    UserContentInjectedFrames, UserContentManagerExt, UserScript, UserScriptInjectionTime, WebView,
+    WebViewExt,
 };
 
 use super::super::hooks::LoadFailure;
@@ -293,9 +293,11 @@ pub fn snapshot_png(
     webview: &WebView,
     callback: impl Fn(Result<Vec<u8>, String>) + Send + 'static,
 ) -> Result<(), String> {
-    capture(webview, move |pixbuf| {
-        encode(&pixbuf, "png", &[]).map(|bytes| bytes.0)
-    }, callback)
+    capture(
+        webview,
+        move |pixbuf| encode(&pixbuf, "png", &[]).map(|bytes| bytes.0),
+        callback,
+    )
 }
 
 /// The frame as displayed now, JPEG-encoded, for the freeze frame.
@@ -474,10 +476,7 @@ pub fn install_navigation_hooks(
                         // afterwards — a dropped connection mid-body — which
                         // must stop the spinner, not replace the page the user
                         // is reading with an error.
-                        provisional: matches!(
-                            event,
-                            LoadEvent::Started | LoadEvent::Redirected
-                        ),
+                        provisional: matches!(event, LoadEvent::Started | LoadEvent::Redirected),
                     }),
                 );
             }

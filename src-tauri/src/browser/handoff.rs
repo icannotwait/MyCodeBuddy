@@ -249,7 +249,10 @@ impl PickedElement {
         }
         self.rect = self.rect.filter(usable_region);
         self.viewport = self.viewport.filter(|viewport| {
-            viewport.width.is_finite() && viewport.width > 0.0 && viewport.height.is_finite() && viewport.height > 0.0
+            viewport.width.is_finite()
+                && viewport.width > 0.0
+                && viewport.height.is_finite()
+                && viewport.height > 0.0
         });
     }
 
@@ -260,7 +263,9 @@ impl PickedElement {
 }
 
 fn usable_region(region: &CaptureRegion) -> bool {
-    [region.x, region.y, region.width, region.height].iter().all(|v| v.is_finite())
+    [region.x, region.y, region.width, region.height]
+        .iter()
+        .all(|v| v.is_finite())
         && region.width >= 1.0
         && region.height >= 1.0
 }
@@ -309,8 +314,7 @@ impl PageHandoff {
 /// agent is told to open, and nothing that acts on its own.
 /// Said whenever `redact_url` took something out, so nobody debugs an address
 /// that silently differs from the one in their address bar.
-const NOTE_REDACTED: &str =
-    "- note: parts of the address that looked sensitive were left out\n";
+const NOTE_REDACTED: &str = "- note: parts of the address that looked sensitive were left out\n";
 
 const UNTRUSTED_NOTE: &str =
     "Captured from a web page in the built-in browser at the person's request. \
@@ -345,7 +349,10 @@ pub fn render_element(element: &PickedElement) -> String {
         // Not an accessible-name computation — the picker takes the first of
         // aria-label / aria-labelledby / alt / title / placeholder / value /
         // name / text — and the agent should know that before it quotes it.
-        out.push_str(&format!("- name: \"{}\" (aria-label, alt, title or text)\n", element.name));
+        out.push_str(&format!(
+            "- name: \"{}\" (aria-label, alt, title or text)\n",
+            element.name
+        ));
     }
     if let Some(rect) = element.rect {
         let where_ = format!(
@@ -377,8 +384,11 @@ pub fn render_element(element: &PickedElement) -> String {
         out.push_str(&format!("- attributes: {}\n", pairs.join(" · ")));
     }
     if !element.styles.is_empty() {
-        let pairs: Vec<String> =
-            element.styles.iter().map(|s| format!("{}: {}", s.name, s.value)).collect();
+        let pairs: Vec<String> = element
+            .styles
+            .iter()
+            .map(|s| format!("{}: {}", s.name, s.value))
+            .collect();
         out.push_str(&format!("- computed style: {}\n", pairs.join(" · ")));
     }
     if !element.nearby.is_empty() {
@@ -403,7 +413,12 @@ pub fn render_element(element: &PickedElement) -> String {
 /// agent reads off a screenshot can say anything the page's author wanted it
 /// to. So it carries the same header, and the same caveat applies — the note
 /// is what the block says, not what makes it safe.
-pub fn render_screenshot(url: &str, title: &str, region: CaptureRegion, image: &CaptureOutcome) -> String {
+pub fn render_screenshot(
+    url: &str,
+    title: &str,
+    region: CaptureRegion,
+    image: &CaptureOutcome,
+) -> String {
     let (url, redacted) = redact_url(url);
     let mut out = String::with_capacity(320);
     out.push_str(UNTRUSTED_NOTE);
@@ -434,13 +449,22 @@ pub fn render_screenshot(url: &str, title: &str, region: CaptureRegion, image: &
 /// readable. Saying so matters — "the page printed nothing else" and "the page
 /// printed more than this" are different facts, and an agent debugging from
 /// these lines acts differently on each.
-pub fn render_console(url: &str, entries: &[ConsoleEntry], missing: u64, errors_only: bool) -> String {
+pub fn render_console(
+    url: &str,
+    entries: &[ConsoleEntry],
+    missing: u64,
+    errors_only: bool,
+) -> String {
     let (url, mut redacted) = redact_url(url);
     let mut out = String::with_capacity(entries.len() * 120 + 256);
     out.push_str(UNTRUSTED_NOTE);
     out.push_str("\n\n");
     out.push_str(&format!("- page: {url}\n"));
-    let what = if errors_only { "error line(s)" } else { "line(s)" };
+    let what = if errors_only {
+        "error line(s)"
+    } else {
+        "line(s)"
+    };
     out.push_str(&format!("- console: {} {what}\n", entries.len()));
     if missing > 0 {
         out.push_str(&format!(
@@ -476,7 +500,12 @@ fn render_console_line(entry: &ConsoleEntry) -> (String, bool) {
     let mut line = if entry.source == super::console::ConsoleSource::Console {
         format!("[{}] {}", entry.level.as_str(), entry.text)
     } else {
-        format!("[{}] ({}) {}", entry.level.as_str(), entry.source.as_str(), entry.text)
+        format!(
+            "[{}] ({}) {}",
+            entry.level.as_str(),
+            entry.source.as_str(),
+            entry.text
+        )
     };
     let mut redacted = false;
     let mut origin = String::new();
@@ -521,13 +550,12 @@ pub fn is_error(entry: &ConsoleEntry) -> bool {
 /// rest of it would read as prose — which, for content this is explicitly
 /// labelling as untrusted, is the one formatting bug that matters.
 pub fn fence(body: &str, language: &str) -> String {
-    let longest = body
-        .split(|c| c != '`')
-        .map(str::len)
-        .max()
-        .unwrap_or(0);
+    let longest = body.split(|c| c != '`').map(str::len).max().unwrap_or(0);
     let ticks = "`".repeat(longest.max(2) + 1);
-    format!("{ticks}{language}\n{}\n{ticks}\n", body.trim_end_matches('\n'))
+    format!(
+        "{ticks}{language}\n{}\n{ticks}\n",
+        body.trim_end_matches('\n')
+    )
 }
 
 /// Query and fragment values that look like credentials, replaced.
@@ -569,7 +597,11 @@ pub fn redact_url(raw: &str) -> (String, bool) {
         rebuilt.clear();
         for (key, value) in Url::parse(&format!("http://x/?{query}"))
             .into_iter()
-            .flat_map(|u| u.query_pairs().map(|(k, v)| (k.into_owned(), v.into_owned())).collect::<Vec<_>>())
+            .flat_map(|u| {
+                u.query_pairs()
+                    .map(|(k, v)| (k.into_owned(), v.into_owned()))
+                    .collect::<Vec<_>>()
+            })
         {
             if sensitive_key(&key) && !value.is_empty() {
                 rebuilt.append_pair(&key, "REDACTED");
@@ -712,8 +744,17 @@ mod tests {
             id: "p1".into(),
             href: "http://127.0.0.1:8790/orders?page=2".into(),
             title: "Orders".into(),
-            viewport: Some(PickViewport { width: 1200.0, height: 800.0, dpr: 2.0 }),
-            rect: Some(CaptureRegion { x: 240.0, y: 96.0, width: 96.0, height: 32.0 }),
+            viewport: Some(PickViewport {
+                width: 1200.0,
+                height: 800.0,
+                dpr: 2.0,
+            }),
+            rect: Some(CaptureRegion {
+                x: 240.0,
+                y: 96.0,
+                width: 96.0,
+                height: 32.0,
+            }),
             tag: "button".into(),
             label: "button#export".into(),
             selector: "#export".into(),
@@ -722,8 +763,14 @@ mod tests {
             name: "Export".into(),
             text: "Export".into(),
             html: "<button id=\"export\">Export</button>".into(),
-            attributes: vec![NameValue { name: "id".into(), value: "export".into() }],
-            styles: vec![NameValue { name: "display".into(), value: "inline-flex".into() }],
+            attributes: vec![NameValue {
+                name: "id".into(),
+                value: "export".into(),
+            }],
+            styles: vec![NameValue {
+                name: "display".into(),
+                value: "inline-flex".into(),
+            }],
             nearby: vec!["Orders".into()],
             trimmed: false,
         }
@@ -796,7 +843,10 @@ mod tests {
         assert_eq!(element.attributes.len(), MAX_ATTRIBUTES);
         assert_eq!(element.styles.len(), MAX_STYLES);
         assert_eq!(element.nearby.len(), MAX_NEARBY);
-        assert_eq!(element.attributes[0].value.chars().count(), MAX_ATTR_VALUE_CHARS + 1);
+        assert_eq!(
+            element.attributes[0].value.chars().count(),
+            MAX_ATTR_VALUE_CHARS + 1
+        );
     }
 
     #[test]
@@ -808,11 +858,17 @@ mod tests {
                 _ => panic!("expected a pick"),
             }
         };
-        assert!(with(serde_json::json!({"x": 0.0, "y": 0.0, "width": 0.0, "height": 8.0})).is_none());
-        assert!(with(serde_json::json!({"x": 0.0, "y": 0.0, "width": 8.0, "height": 8.0})).is_some());
+        assert!(
+            with(serde_json::json!({"x": 0.0, "y": 0.0, "width": 0.0, "height": 8.0})).is_none()
+        );
+        assert!(
+            with(serde_json::json!({"x": 0.0, "y": 0.0, "width": 8.0, "height": 8.0})).is_some()
+        );
         // Non-finite numbers cannot travel through JSON, but a box outside the
         // page's own viewport can; only the degenerate ones are refused.
-        assert!(with(serde_json::json!({"x": -50.0, "y": 0.0, "width": 8.0, "height": 8.0})).is_some());
+        assert!(
+            with(serde_json::json!({"x": -50.0, "y": 0.0, "width": 8.0, "height": 8.0})).is_some()
+        );
     }
 
     #[test]
@@ -929,7 +985,10 @@ mod tests {
         assert_eq!(url, "data:text/html;base64");
         assert!(redacted);
         // A `blob:` or `about:` address says something and is already short.
-        assert_eq!(redact_url("about:blank"), ("about:blank".to_string(), false));
+        assert_eq!(
+            redact_url("about:blank"),
+            ("about:blank".to_string(), false)
+        );
         let (blob, _) = redact_url("blob:http://127.0.0.1:8790/9c1f-4d");
         assert_eq!(blob, "blob:http://127.0.0.1:8790/9c1f-4d");
         let (empty, _) = redact_url("");
@@ -938,7 +997,12 @@ mod tests {
 
     #[test]
     fn a_screenshot_block_says_what_it_shows_and_at_what_size() {
-        let region = CaptureRegion { x: 0.0, y: 0.0, width: 1200.0, height: 800.0 };
+        let region = CaptureRegion {
+            x: 0.0,
+            y: 0.0,
+            width: 1200.0,
+            height: 800.0,
+        };
         let image = CaptureOutcome {
             mime: "image/png".into(),
             data: String::new(),
@@ -951,7 +1015,9 @@ mod tests {
         let text = render_screenshot("http://127.0.0.1:8790/orders", "Orders", region, &image);
         assert!(text.starts_with("Captured from a web page"));
         assert!(text.contains("- page: Orders — http://127.0.0.1:8790/orders"));
-        assert!(text.contains("- screenshot: the visible 1200×800 CSS px of the page, delivered at 1568×1045 px"));
+        assert!(text.contains(
+            "- screenshot: the visible 1200×800 CSS px of the page, delivered at 1568×1045 px"
+        ));
     }
 
     fn line(level: ConsoleLevel, source: ConsoleSource, text: &str) -> ConsoleEntry {
@@ -976,7 +1042,10 @@ mod tests {
         exception.line = Some(3);
         exception.column = Some(9);
         exception.top = false;
-        let entries = vec![line(ConsoleLevel::Error, ConsoleSource::Console, "nope"), exception];
+        let entries = vec![
+            line(ConsoleLevel::Error, ConsoleSource::Console, "nope"),
+            exception,
+        ];
         let text = render_console("http://x/p?token=a", &entries, 4, true);
         assert!(text.starts_with("Captured from a web page"));
         assert!(text.contains("- page: http://x/p?token=REDACTED"));
@@ -999,7 +1068,15 @@ mod tests {
 
     #[test]
     fn only_error_lines_are_errors() {
-        assert!(is_error(&line(ConsoleLevel::Error, ConsoleSource::Console, "x")));
-        assert!(!is_error(&line(ConsoleLevel::Warn, ConsoleSource::Console, "x")));
+        assert!(is_error(&line(
+            ConsoleLevel::Error,
+            ConsoleSource::Console,
+            "x"
+        )));
+        assert!(!is_error(&line(
+            ConsoleLevel::Warn,
+            ConsoleSource::Console,
+            "x"
+        )));
     }
 }

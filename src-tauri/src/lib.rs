@@ -9,10 +9,10 @@
 
 pub mod acp;
 pub mod acp_transcript;
+pub use acp::scratch_dir::scratch_sweep_task;
 pub use acp::{
     idle_sweep_task, idle_timeout_from_env, lifecycle_subscriber_task, SWEEP_INTERVAL_SECS,
 };
-pub use acp::scratch_dir::scratch_sweep_task;
 pub use network::proxy::init_proxy_from_db;
 mod app_error;
 pub mod app_state;
@@ -91,11 +91,11 @@ mod tauri_app {
         background as background_commands, backup, browser as browser_commands,
         canvas as canvas_commands, chat_authoring as chat_authoring_commands,
         chat_channel as chat_channel_commands, config_sync, conversation_popout, conversations,
-        custom_skills as custom_skills_commands,
-        deepseek_settings as deepseek_settings_commands, delegation as delegation_commands,
-        experts as experts_commands, feedback as feedback_commands, file_io, folder_commands,
-        folder_links, folders, forge as forge_commands, logging as logging_commands,
-        mcp as mcp_commands, model_provider as model_provider_commands, notification,
+        custom_skills as custom_skills_commands, deepseek_settings as deepseek_settings_commands,
+        delegation as delegation_commands, experts as experts_commands,
+        feedback as feedback_commands, file_io, folder_commands, folder_links, folders,
+        forge as forge_commands, logging as logging_commands, mcp as mcp_commands,
+        model_provider as model_provider_commands, notification,
         office_tools as office_tools_commands, open_in, pet as pet_commands, project_boot,
         question as question_commands, quick_messages as quick_messages_commands,
         remote_proxy as remote_proxy_commands, remote_workspace as remote_workspace_commands,

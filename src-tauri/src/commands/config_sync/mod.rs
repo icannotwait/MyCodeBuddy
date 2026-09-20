@@ -202,8 +202,8 @@ mod tauri_commands {
     // were a safety net that existed on disk and nowhere in the product.
 
     #[tauri::command]
-    pub async fn config_sync_list_rollbacks(
-    ) -> Result<Vec<RollbackSnapshotInfo>, AppCommandError> {
+    pub async fn config_sync_list_rollbacks() -> Result<Vec<RollbackSnapshotInfo>, AppCommandError>
+    {
         Ok(list_rollbacks_core(&rollback_dir()))
     }
 

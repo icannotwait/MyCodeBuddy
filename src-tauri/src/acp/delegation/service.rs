@@ -288,12 +288,7 @@ mod tests {
         ) -> Vec<crate::acp::feedback::PendingFeedback> {
             Vec::new()
         }
-        async fn commit_feedback_delivered(
-            &self,
-            _parent_connection_id: &str,
-            _ids: Vec<String>,
-        ) {
-        }
+        async fn commit_feedback_delivered(&self, _parent_connection_id: &str, _ids: Vec<String>) {}
     }
 
     #[async_trait]
@@ -479,7 +474,10 @@ mod tests {
         assert!(!err.is_empty());
 
         let after = service.snapshot().await;
-        assert!(after.task_alive, "the acceptor must survive a failed rebind");
+        assert!(
+            after.task_alive,
+            "the acceptor must survive a failed rebind"
+        );
         assert_eq!(
             after.started_at, before.started_at,
             "a failed rebind must not look like a successful one"
@@ -558,12 +556,10 @@ mod tests {
         let dir = socket_dir();
         let service = make_service(dir.path().join("codeg-delegation-race.sock"));
 
-        let results = futures::future::join_all(
-            (0..4).map(|_| {
-                let service = Arc::clone(&service);
-                async move { service.ensure_running().await }
-            }),
-        )
+        let results = futures::future::join_all((0..4).map(|_| {
+            let service = Arc::clone(&service);
+            async move { service.ensure_running().await }
+        }))
         .await;
         assert!(
             results.iter().all(Result::is_ok),

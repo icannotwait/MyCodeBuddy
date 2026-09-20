@@ -359,9 +359,10 @@ impl ConsoleRing {
             Some(n) => n,
         };
         let min_level = query.min_level.unwrap_or(ConsoleLevel::Debug);
-        let mut matching = self.entries.iter().filter(|e| {
-            e.seq > query.since && e.level >= min_level && covers(e.origin.as_deref())
-        });
+        let mut matching = self
+            .entries
+            .iter()
+            .filter(|e| e.seq > query.since && e.level >= min_level && covers(e.origin.as_deref()));
         let entries: Vec<ConsoleEntry> = matching.by_ref().take(limit).cloned().collect();
         let more = matching.next().is_some();
         let next_since = entries.last().map_or(query.since, |e| e.seq);
@@ -430,7 +431,12 @@ fn u32_field(payload: &Value, key: &str) -> Option<u32> {
 /// for a payload that is not a line: no level, or one this module does not
 /// know. Everything else has a default, because a line with a missing detail
 /// is still a line.
-pub fn parse_reported(payload: &Value, top: bool, at: i64, origin: Option<String>) -> Option<ReportedLine> {
+pub fn parse_reported(
+    payload: &Value,
+    top: bool,
+    at: i64,
+    origin: Option<String>,
+) -> Option<ReportedLine> {
     let level = ConsoleLevel::parse(payload.get("level")?.as_str()?)?;
     let source = payload
         .get("source")
@@ -521,7 +527,9 @@ pub fn cdp_remote_object_text(object: &Value) -> String {
         "symbol" => description.unwrap_or("Symbol()").to_string(),
         "function" => {
             // The description is the source; its first line names it.
-            let first = description.and_then(|d| d.lines().next()).unwrap_or("function");
+            let first = description
+                .and_then(|d| d.lines().next())
+                .unwrap_or("function");
             format!("[Function: {}]", first.trim_end_matches('{').trim())
         }
         _ => {
@@ -533,7 +541,10 @@ pub fn cdp_remote_object_text(object: &Value) -> String {
                     Some(preview) if preview.is_object() => cdp_preview_text(preview),
                     _ => description.map(str::to_string).unwrap_or_else(|| {
                         piece(
-                            object.get("className").and_then(Value::as_str).unwrap_or("Object"),
+                            object
+                                .get("className")
+                                .and_then(Value::as_str)
+                                .unwrap_or("Object"),
                             CDP_MAX_PIECE_CHARS,
                         )
                     }),
@@ -558,9 +569,15 @@ fn cdp_preview_text(preview: &Value) -> String {
     let mut cut = false;
     if let Some(properties) = preview.get("properties").and_then(Value::as_array) {
         for property in properties.iter().take(CDP_MAX_PREVIEW_ITEMS) {
-            let name = piece(property.get("name").and_then(Value::as_str).unwrap_or(""), 256);
+            let name = piece(
+                property.get("name").and_then(Value::as_str).unwrap_or(""),
+                256,
+            );
             let kind = property.get("type").and_then(Value::as_str).unwrap_or("");
-            let value = piece(property.get("value").and_then(Value::as_str).unwrap_or(""), 256);
+            let value = piece(
+                property.get("value").and_then(Value::as_str).unwrap_or(""),
+                256,
+            );
             let rendered = match kind {
                 "string" => format!("{value:?}"),
                 "object" if value.is_empty() => "{…}".to_string(),
@@ -584,7 +601,11 @@ fn cdp_preview_text(preview: &Value) -> String {
                     .unwrap_or("?"),
                 256,
             );
-            match entry.get("key").and_then(|k| k.get("description")).and_then(Value::as_str) {
+            match entry
+                .get("key")
+                .and_then(|k| k.get("description"))
+                .and_then(Value::as_str)
+            {
                 Some(key) => parts.push(format!("{} => {value}", piece(key, 256))),
                 None => parts.push(value),
             }
@@ -662,12 +683,22 @@ fn substitute(args: &[String]) -> String {
 /// A `Runtime.consoleAPICalled` event as a line, or `None` for a call that
 /// prints nothing. `top` and `origin` come from the execution context the
 /// event names, resolved by the caller.
-pub fn cdp_console_line(params: &Value, at: i64, top: bool, origin: Option<String>) -> Option<ReportedLine> {
+pub fn cdp_console_line(
+    params: &Value,
+    at: i64,
+    top: bool,
+    origin: Option<String>,
+) -> Option<ReportedLine> {
     let kind = params.get("type").and_then(Value::as_str).unwrap_or("log");
     let level = cdp_console_level(kind)?;
     let all_args = params.get("args").and_then(Value::as_array);
     let mut args: Vec<String> = all_args
-        .map(|args| args.iter().take(CDP_MAX_ARGS).map(cdp_remote_object_text).collect())
+        .map(|args| {
+            args.iter()
+                .take(CDP_MAX_ARGS)
+                .map(cdp_remote_object_text)
+                .collect()
+        })
         .unwrap_or_default();
     if let Some(extra) = all_args.map(Vec::len).filter(|n| *n > CDP_MAX_ARGS) {
         args.push(format!("…(+{} more)", extra - CDP_MAX_ARGS));
@@ -712,11 +743,13 @@ pub fn cdp_console_line(params: &Value, at: i64, top: bool, origin: Option<Strin
         line: frame
             .and_then(|f| f.get("lineNumber"))
             .and_then(Value::as_u64)
-            .and_then(|n| n.checked_add(1)).and_then(|n| u32::try_from(n).ok()),
+            .and_then(|n| n.checked_add(1))
+            .and_then(|n| u32::try_from(n).ok()),
         column: frame
             .and_then(|f| f.get("columnNumber"))
             .and_then(Value::as_u64)
-            .and_then(|n| n.checked_add(1)).and_then(|n| u32::try_from(n).ok()),
+            .and_then(|n| n.checked_add(1))
+            .and_then(|n| u32::try_from(n).ok()),
         top,
         origin,
         dropped: 0,
@@ -724,7 +757,12 @@ pub fn cdp_console_line(params: &Value, at: i64, top: bool, origin: Option<Strin
 }
 
 /// A `Runtime.exceptionThrown` event as a line.
-pub fn cdp_exception_line(params: &Value, at: i64, top: bool, origin: Option<String>) -> Option<ReportedLine> {
+pub fn cdp_exception_line(
+    params: &Value,
+    at: i64,
+    top: bool,
+    origin: Option<String>,
+) -> Option<ReportedLine> {
     let details = params.get("exceptionDetails")?;
     let description = details
         .get("exception")
@@ -735,7 +773,10 @@ pub fn cdp_exception_line(params: &Value, at: i64, top: bool, origin: Option<Str
         Some(d) if !d.is_empty() => d,
         _ => {
             let text = piece(
-                details.get("text").and_then(Value::as_str).unwrap_or("Uncaught exception"),
+                details
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .unwrap_or("Uncaught exception"),
                 CDP_MAX_PIECE_CHARS,
             );
             match details.get("exception").map(cdp_remote_object_text) {
@@ -760,11 +801,13 @@ pub fn cdp_exception_line(params: &Value, at: i64, top: bool, origin: Option<Str
         line: details
             .get("lineNumber")
             .and_then(Value::as_u64)
-            .and_then(|n| n.checked_add(1)).and_then(|n| u32::try_from(n).ok()),
+            .and_then(|n| n.checked_add(1))
+            .and_then(|n| u32::try_from(n).ok()),
         column: details
             .get("columnNumber")
             .and_then(Value::as_u64)
-            .and_then(|n| n.checked_add(1)).and_then(|n| u32::try_from(n).ok()),
+            .and_then(|n| n.checked_add(1))
+            .and_then(|n| u32::try_from(n).ok()),
         top,
         origin,
         dropped: 0,
@@ -821,10 +864,17 @@ mod tests {
         for i in 0..CONSOLE_RING_CAPACITY {
             ring.push(line(&format!("l{i}"), ConsoleLevel::Log, SITE), true);
         }
-        assert!(ring.read(&ConsoleQuery::default(), SITE, |_| true).entries.iter().all(|e| e.text != "boom"));
+        assert!(ring
+            .read(&ConsoleQuery::default(), SITE, |_| true)
+            .entries
+            .iter()
+            .all(|e| e.text != "boom"));
         assert_eq!(ring.errors(), 1);
         // A line from another origin is not this page's error.
-        ring.push(line("elsewhere", ConsoleLevel::Error, "http://other"), false);
+        ring.push(
+            line("elsewhere", ConsoleLevel::Error, "http://other"),
+            false,
+        );
         assert_eq!(ring.errors(), 1);
         // A new document starts clean.
         ring.clear();
@@ -844,9 +894,15 @@ mod tests {
         }
         assert_eq!(ring.errors(), 0);
         // Now the page's first error, which is over budget and not kept.
-        assert!(ring.push(line("boom", ConsoleLevel::Error, SITE), true).is_none());
+        assert!(ring
+            .push(line("boom", ConsoleLevel::Error, SITE), true)
+            .is_none());
         assert_eq!(ring.errors(), 1);
-        assert!(ring.read(&ConsoleQuery::default(), SITE, |_| true).entries.iter().all(|e| e.text != "boom"));
+        assert!(ring
+            .read(&ConsoleQuery::default(), SITE, |_| true)
+            .entries
+            .iter()
+            .all(|e| e.text != "boom"));
     }
 
     /// Reads answer with the seq to continue from, and `since` excludes what
@@ -867,7 +923,11 @@ mod tests {
             |_| true,
         );
         assert_eq!(
-            first.entries.iter().map(|e| e.text.as_str()).collect::<Vec<_>>(),
+            first
+                .entries
+                .iter()
+                .map(|e| e.text.as_str())
+                .collect::<Vec<_>>(),
             ["l0", "l1"]
         );
         assert!(first.more);
@@ -882,7 +942,10 @@ mod tests {
             |_| true,
         );
         assert_eq!(
-            rest.entries.iter().map(|e| e.text.as_str()).collect::<Vec<_>>(),
+            rest.entries
+                .iter()
+                .map(|e| e.text.as_str())
+                .collect::<Vec<_>>(),
             ["l2", "l3", "l4"]
         );
         assert!(!rest.more);
@@ -907,7 +970,10 @@ mod tests {
     fn a_read_gives_only_the_lines_of_the_granted_origin() {
         let mut ring = ConsoleRing::new();
         ring.push(line("mine", ConsoleLevel::Log, SITE), true);
-        ring.push(line("theirs", ConsoleLevel::Error, "https://ads.example"), true);
+        ring.push(
+            line("theirs", ConsoleLevel::Error, "https://ads.example"),
+            true,
+        );
         let mut opaque = line("blank", ConsoleLevel::Error, SITE);
         opaque.origin = None;
         ring.push(opaque, true);
@@ -934,7 +1000,10 @@ mod tests {
             |_| true,
         );
         assert_eq!(
-            out.entries.iter().map(|e| e.text.as_str()).collect::<Vec<_>>(),
+            out.entries
+                .iter()
+                .map(|e| e.text.as_str())
+                .collect::<Vec<_>>(),
             ["w", "e"]
         );
     }
@@ -967,9 +1036,15 @@ mod tests {
         let last_seq = ring.next_seq - 1;
         ring.clear();
         assert!(ring.is_empty());
-        assert_eq!(ring.read(&ConsoleQuery::default(), "u", |_| true).dropped, 0);
+        assert_eq!(
+            ring.read(&ConsoleQuery::default(), "u", |_| true).dropped,
+            0
+        );
         // Seqs continue past the clear, so an old cursor does not replay.
-        assert_eq!(ring.push(line("new", ConsoleLevel::Log, SITE), true), Some(last_seq + 1));
+        assert_eq!(
+            ring.push(line("new", ConsoleLevel::Log, SITE), true),
+            Some(last_seq + 1)
+        );
     }
 
     /// The host admits a bounded number of lines per second per tab however
@@ -980,7 +1055,11 @@ mod tests {
         let mut ring = ConsoleRing::default();
         let mut l = line("x", ConsoleLevel::Log, SITE);
         l.at = 10_000;
-        assert_eq!(ring.push(l.clone(), true), Some(1), "a default ring numbers from 1");
+        assert_eq!(
+            ring.push(l.clone(), true),
+            Some(1),
+            "a default ring numbers from 1"
+        );
         let mut admitted = 1;
         for _ in 1..(CONSOLE_HOST_BUDGET_PER_SECOND + 50) {
             if ring.push(l.clone(), true).is_some() {
@@ -1001,7 +1080,10 @@ mod tests {
             50 + u64::from(CONSOLE_HOST_BUDGET_PER_SECOND) - CONSOLE_RING_CAPACITY as u64
         );
         l.at = 11_000;
-        assert!(ring.push(l.clone(), true).is_some(), "a new second, a new budget");
+        assert!(
+            ring.push(l.clone(), true).is_some(),
+            "a new second, a new budget"
+        );
         ring.note_dropped(7);
         assert_eq!(
             ring.read(&ConsoleQuery::default(), "u", |_| true).dropped,
@@ -1022,13 +1104,19 @@ mod tests {
             assert_eq!(ring.push(l.clone(), false), None);
         }
         assert!(ring.is_empty());
-        assert_eq!(ring.read(&ConsoleQuery::default(), "u", |_| true).dropped, 0);
+        assert_eq!(
+            ring.read(&ConsoleQuery::default(), "u", |_| true).dropped,
+            0
+        );
         // The budget is spent: the page's own line is now turned away, and
         // that one is counted.
         let mut mine = line("mine", ConsoleLevel::Log, SITE);
         mine.at = 5_100;
         assert_eq!(ring.push(mine.clone(), true), None);
-        assert_eq!(ring.read(&ConsoleQuery::default(), "u", |_| true).dropped, 1);
+        assert_eq!(
+            ring.read(&ConsoleQuery::default(), "u", |_| true).dropped,
+            1
+        );
         mine.at = 6_100;
         mine.url = Some("u".repeat(5000));
         assert!(ring.push(mine, true).is_some());
@@ -1063,7 +1151,11 @@ mod tests {
         let params = json!({ "type": "log", "args": args });
         let line = cdp_console_line(&params, 0, true, None).unwrap();
         assert!(line.text.chars().count() <= CONSOLE_MAX_TEXT_CHARS + 1);
-        assert!(line.text.contains("…(+70 more)"), "{}", &line.text[line.text.len() - 40..]);
+        assert!(
+            line.text.contains("…(+70 more)"),
+            "{}",
+            &line.text[line.text.len() - 40..]
+        );
         assert!(line.text.contains("k19: 19, …}"));
         assert!(!line.text.contains("k20"));
         // A position at the top of the range does not wrap.
@@ -1112,15 +1204,28 @@ mod tests {
         assert!(!ok.top, "the payload's `top` is not consulted");
         assert_eq!(ok.origin.as_deref(), Some(SITE));
 
-        assert!(parse_reported(&json!({ "level": "verbose", "text": "x" }), true, 0, None).is_none());
+        assert!(
+            parse_reported(&json!({ "level": "verbose", "text": "x" }), true, 0, None).is_none()
+        );
         assert!(parse_reported(&json!({ "text": "no level" }), true, 0, None).is_none());
-        let sparse = parse_reported(&json!({ "level": "log", "source": "made-up", "line": -4 }), true, 0, None)
-            .unwrap();
+        let sparse = parse_reported(
+            &json!({ "level": "log", "source": "made-up", "line": -4 }),
+            true,
+            0,
+            None,
+        )
+        .unwrap();
         assert_eq!(sparse.source, ConsoleSource::Console);
         assert_eq!(sparse.text, "");
         assert_eq!(sparse.line, None);
         // A claimed drop count is bounded, on a line and on its own.
-        let boastful = parse_reported(&json!({ "level": "log", "dropped": u64::MAX }), true, 0, None).unwrap();
+        let boastful = parse_reported(
+            &json!({ "level": "log", "dropped": u64::MAX }),
+            true,
+            0,
+            None,
+        )
+        .unwrap();
         assert_eq!(boastful.dropped, CONSOLE_MAX_REPORTED_DROP);
         assert_eq!(reported_drop(&json!({ "dropped": 3 })), 3);
         assert_eq!(reported_drop(&json!({ "dropped": -3 })), 0);
@@ -1169,7 +1274,9 @@ mod tests {
         assert_eq!((line.line, line.column), (Some(42), Some(9)));
 
         assert!(cdp_console_line(&json!({ "type": "clear", "args": [] }), 0, true, None).is_none());
-        assert!(cdp_console_line(&json!({ "type": "startGroup", "args": [] }), 0, true, None).is_none());
+        assert!(
+            cdp_console_line(&json!({ "type": "startGroup", "args": [] }), 0, true, None).is_none()
+        );
         let assert_line = cdp_console_line(
             &json!({ "type": "assert", "args": [ { "type": "string", "value": "must hold" } ] }),
             0,
@@ -1179,7 +1286,8 @@ mod tests {
         .unwrap();
         assert_eq!(assert_line.level, ConsoleLevel::Error);
         assert_eq!(assert_line.text, "Assertion failed: must hold");
-        let warn = cdp_console_line(&json!({ "type": "warning", "args": [] }), 0, false, None).unwrap();
+        let warn =
+            cdp_console_line(&json!({ "type": "warning", "args": [] }), 0, false, None).unwrap();
         assert_eq!(warn.level, ConsoleLevel::Warn);
         assert!(!warn.top);
     }
@@ -1212,7 +1320,10 @@ mod tests {
         // A thrown primitive has no description; the engine's text plus the
         // value is what there is.
         let thrown = json!({ "exceptionDetails": { "text": "Uncaught", "exception": { "type": "string", "value": "plain" } } });
-        assert_eq!(cdp_exception_line(&thrown, 0, true, None).unwrap().text, "Uncaught plain");
+        assert_eq!(
+            cdp_exception_line(&thrown, 0, true, None).unwrap().text,
+            "Uncaught plain"
+        );
         // A thrown object with a wide preview is cut at the line cap at
         // assembly, not only in the ring.
         let properties: Vec<Value> = (0..CDP_MAX_PREVIEW_ITEMS)
@@ -1222,7 +1333,11 @@ mod tests {
             "preview": { "type": "object", "description": "Object", "properties": properties,
                          "entries": (0..CDP_MAX_PREVIEW_ITEMS).map(|i| json!({ "key": { "description": format!("e{i}") }, "value": { "description": "w".repeat(300) } })).collect::<Vec<_>>() } } } });
         let line = cdp_exception_line(&wide, 0, true, None).unwrap();
-        assert!(line.text.chars().count() <= CONSOLE_MAX_TEXT_CHARS + 1, "{}", line.text.chars().count());
+        assert!(
+            line.text.chars().count() <= CONSOLE_MAX_TEXT_CHARS + 1,
+            "{}",
+            line.text.chars().count()
+        );
     }
 
     /// Thirty-two capped pieces would still add up to more than the channel
@@ -1232,7 +1347,8 @@ mod tests {
         let args: Vec<Value> = (0..CDP_MAX_ARGS)
             .map(|_| json!({ "type": "string", "value": "y".repeat(CDP_MAX_PIECE_CHARS) }))
             .collect();
-        let line = cdp_console_line(&json!({ "type": "log", "args": args }), 0, true, None).unwrap();
+        let line =
+            cdp_console_line(&json!({ "type": "log", "args": args }), 0, true, None).unwrap();
         assert_eq!(line.text.chars().count(), CONSOLE_MAX_TEXT_CHARS + 1);
         assert!(line.text.ends_with('…'));
     }
@@ -1259,13 +1375,15 @@ mod tests {
     fn the_wire_shape_is_camel_case_and_hides_the_origin() {
         let mut ring = ConsoleRing::new();
         ring.push(line("x", ConsoleLevel::Info, SITE), true);
-        let out = serde_json::to_value(ring.read(&ConsoleQuery::default(), "http://x/", |_| true)).unwrap();
+        let out = serde_json::to_value(ring.read(&ConsoleQuery::default(), "http://x/", |_| true))
+            .unwrap();
         assert_eq!(out["nextSince"], 1);
         assert_eq!(out["entries"][0]["level"], "info");
         assert_eq!(out["entries"][0]["source"], "console");
         assert!(out["entries"][0].get("origin").is_none());
         assert!(out["entries"][0].get("url").is_none());
-        let q: ConsoleQuery = serde_json::from_value(json!({ "since": 3, "minLevel": "warn", "limit": 5 })).unwrap();
+        let q: ConsoleQuery =
+            serde_json::from_value(json!({ "since": 3, "minLevel": "warn", "limit": 5 })).unwrap();
         assert_eq!(q.since, 3);
         assert_eq!(q.min_level, Some(ConsoleLevel::Warn));
         assert_eq!(q.limit, Some(5));

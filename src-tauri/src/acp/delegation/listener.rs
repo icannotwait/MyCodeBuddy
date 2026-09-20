@@ -998,6 +998,21 @@ impl DelegationListener {
                     outcome: Value::Null,
                 }
             }
+            // Browser tools are a 0.31.0 wire capability. This listener does
+            // not inject them onto the default six-tool `tools/list`; the
+            // variants exist so a companion that sends them gets a stable
+            // JSON error instead of a decode/exhaustiveness failure.
+            BrokerMessage::BrowserTabs(_)
+            | BrokerMessage::BrowserSnapshot(_)
+            | BrokerMessage::BrowserAct(_)
+            | BrokerMessage::BrowserConsole(_)
+            | BrokerMessage::BrowserCapture(_)
+            | BrokerMessage::BrowserEval(_)
+            | BrokerMessage::BrowserTabOp(_) => BrokerResponse {
+                outcome: serde_json::json!({
+                    "error": "browser tools are not available"
+                }),
+            },
         };
         write_frame(conn, &resp).await?;
         if let Some(owner) = foreground_release_owner.take() {

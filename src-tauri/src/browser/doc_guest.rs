@@ -48,9 +48,9 @@ use std::fs::{File, Metadata};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
-use std::time::{SystemTime, UNIX_EPOCH};
 #[cfg(any(unix, test))]
 use std::time::Duration;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use http::{header, Request, Response, StatusCode, Uri};
 use serde::{Deserialize, Serialize};
@@ -605,7 +605,10 @@ fn open_beneath(canonical: &Path) -> std::io::Result<File> {
     // SAFETY: plain libc calls with checked arguments; every descriptor is
     // owned by a `File` as soon as it is valid, so none leaks on an error.
     let mut dir = unsafe {
-        let fd = libc::open(c"/".as_ptr(), libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC);
+        let fd = libc::open(
+            c"/".as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+        );
         if fd < 0 {
             return Err(std::io::Error::last_os_error());
         }
@@ -767,7 +770,12 @@ impl Served {
 /// The answer to a request from a webview that is not the grant's own. The
 /// handler is per webview already; this is the belt to that suspender.
 pub fn forbidden() -> Response<Vec<u8>> {
-    Served::error(StatusCode::FORBIDDEN, "not this document's webview", DocMode::Safe).response
+    Served::error(
+        StatusCode::FORBIDDEN,
+        "not this document's webview",
+        DocMode::Safe,
+    )
+    .response
 }
 
 // ---------------------------------------------------------------------------
@@ -996,7 +1004,11 @@ mod tests {
     }
 
     fn grant_in(dir: &Path) -> DocGrant {
-        let entry = write(dir, "site/index.html", b"<!doctype html><script src=app.js></script>");
+        let entry = write(
+            dir,
+            "site/index.html",
+            b"<!doctype html><script src=app.js></script>",
+        );
         write(dir, "site/app.js", b"console.log(1)");
         write(dir, "site/img/a.png", &[0x89, b'P', b'N', b'G']);
         write(dir, "secret.txt", b"outside");
@@ -1018,23 +1030,59 @@ mod tests {
         let grant = grant_in(dir.path());
         let page = get(&grant, "/index.html");
         assert_eq!(page.response.status(), StatusCode::OK);
-        assert_eq!(page.response.headers()[header::CONTENT_TYPE], "text/html; charset=utf-8");
+        assert_eq!(
+            page.response.headers()[header::CONTENT_TYPE],
+            "text/html; charset=utf-8"
+        );
         assert!(csp(&page).contains("script-src 'none'"));
-        assert_eq!(page.response.headers()[header::X_CONTENT_TYPE_OPTIONS], "nosniff");
-        assert_eq!(page.response.headers()[header::REFERRER_POLICY], "no-referrer");
+        assert_eq!(
+            page.response.headers()[header::X_CONTENT_TYPE_OPTIONS],
+            "nosniff"
+        );
+        assert_eq!(
+            page.response.headers()[header::REFERRER_POLICY],
+            "no-referrer"
+        );
         assert_eq!(page.response.headers()[header::CACHE_CONTROL], "no-store");
-        assert_eq!(page.response.body(), b"<!doctype html><script src=app.js></script>");
+        assert_eq!(
+            page.response.body(),
+            b"<!doctype html><script src=app.js></script>"
+        );
         // A directory answers with its index; the root itself too.
         assert_eq!(get(&grant, "/").response.status(), StatusCode::OK);
-        assert_eq!(get(&grant, "/img/a.png").response.headers()[header::CONTENT_TYPE], "image/png");
-        assert_eq!(get(&grant, "/img/").response.status(), StatusCode::NOT_FOUND);
-        assert_eq!(get(&grant, "/missing.css").response.status(), StatusCode::NOT_FOUND);
+        assert_eq!(
+            get(&grant, "/img/a.png").response.headers()[header::CONTENT_TYPE],
+            "image/png"
+        );
+        assert_eq!(
+            get(&grant, "/img/").response.status(),
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            get(&grant, "/missing.css").response.status(),
+            StatusCode::NOT_FOUND
+        );
         // Percent-encoded segments decode; traversal and separators do not.
-        assert_eq!(get(&grant, "/img/%61.png").response.status(), StatusCode::OK);
-        assert_eq!(get(&grant, "/../secret.txt").response.status(), StatusCode::BAD_REQUEST);
-        assert_eq!(get(&grant, "/%2e%2e/secret.txt").response.status(), StatusCode::BAD_REQUEST);
-        assert_eq!(get(&grant, "/img%2F..%2F..%2Fsecret.txt").response.status(), StatusCode::BAD_REQUEST);
-        assert_eq!(get(&grant, "/a%00.html").response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            get(&grant, "/img/%61.png").response.status(),
+            StatusCode::OK
+        );
+        assert_eq!(
+            get(&grant, "/../secret.txt").response.status(),
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            get(&grant, "/%2e%2e/secret.txt").response.status(),
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            get(&grant, "/img%2F..%2F..%2Fsecret.txt").response.status(),
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            get(&grant, "/a%00.html").response.status(),
+            StatusCode::BAD_REQUEST
+        );
     }
 
     #[cfg(unix)]
@@ -1042,12 +1090,21 @@ mod tests {
     fn a_symlink_out_of_the_root_is_refused() {
         let dir = tempfile::tempdir().unwrap();
         let grant = grant_in(dir.path());
-        std::os::unix::fs::symlink(dir.path().join("secret.txt"), dir.path().join("site/leak.txt"))
-            .unwrap();
-        assert_eq!(get(&grant, "/leak.txt").response.status(), StatusCode::FORBIDDEN);
+        std::os::unix::fs::symlink(
+            dir.path().join("secret.txt"),
+            dir.path().join("site/leak.txt"),
+        )
+        .unwrap();
+        assert_eq!(
+            get(&grant, "/leak.txt").response.status(),
+            StatusCode::FORBIDDEN
+        );
         // A symlink to a sibling inside the root is fine.
-        std::os::unix::fs::symlink(dir.path().join("site/app.js"), dir.path().join("site/alias.js"))
-            .unwrap();
+        std::os::unix::fs::symlink(
+            dir.path().join("site/app.js"),
+            dir.path().join("site/alias.js"),
+        )
+        .unwrap();
         assert_eq!(get(&grant, "/alias.js").response.status(), StatusCode::OK);
     }
 
@@ -1080,7 +1137,10 @@ mod tests {
             })
         );
         assert_eq!(grant.mode(), DocMode::Safe);
-        assert_eq!(grant.state("t").reset.as_ref().map(|r| r.path.as_str()), Some("app.js"));
+        assert_eq!(
+            grant.state("t").reset.as_ref().map(|r| r.path.as_str()),
+            Some("app.js")
+        );
         // Safe mode serves it (no script runs under the safe CSP anyway).
         let again = get(&grant, "/app.js");
         assert_eq!(again.response.status(), StatusCode::OK);
@@ -1125,7 +1185,8 @@ mod tests {
         // Both targets predate the approval by a wide margin.
         for name in ["old.js", "new.js"] {
             let file = File::options().write(true).open(site.join(name)).unwrap();
-            file.set_modified(SystemTime::now() - Duration::from_secs(3600)).unwrap();
+            file.set_modified(SystemTime::now() - Duration::from_secs(3600))
+                .unwrap();
         }
         std::os::unix::fs::symlink(site.join("old.js"), site.join("alias.js")).unwrap();
         std::thread::sleep(Duration::from_millis(20));
@@ -1155,7 +1216,8 @@ mod tests {
         write(&site, "v2/lazy.js", b"v2()");
         for name in ["v1/lazy.js", "v2/lazy.js"] {
             let file = File::options().write(true).open(site.join(name)).unwrap();
-            file.set_modified(SystemTime::now() - Duration::from_secs(3600)).unwrap();
+            file.set_modified(SystemTime::now() - Duration::from_secs(3600))
+                .unwrap();
         }
         std::os::unix::fs::symlink(site.join("v1"), site.join("vendor")).unwrap();
         std::thread::sleep(Duration::from_millis(20));
@@ -1166,7 +1228,10 @@ mod tests {
         std::os::unix::fs::symlink(site.join("v2"), site.join("vendor")).unwrap();
         let served = get(&grant, "/vendor/lazy.js");
         assert_eq!(served.response.status(), StatusCode::FORBIDDEN);
-        assert_eq!(served.reset.as_ref().map(|r| r.reason), Some(DocResetReason::Newer));
+        assert_eq!(
+            served.reset.as_ref().map(|r| r.reason),
+            Some(DocResetReason::Newer)
+        );
         assert_eq!(grant.mode(), DocMode::Safe);
     }
 
@@ -1182,7 +1247,8 @@ mod tests {
         write(&site, "v2/lazy.js", b"v2()");
         for name in ["v1/lazy.js", "v2/lazy.js"] {
             let file = File::options().write(true).open(site.join(name)).unwrap();
-            file.set_modified(SystemTime::now() - Duration::from_secs(3600)).unwrap();
+            file.set_modified(SystemTime::now() - Duration::from_secs(3600))
+                .unwrap();
         }
         // `assets -> linked` (relative), `linked -> v1` (absolute).
         std::os::unix::fs::symlink("linked", site.join("assets")).unwrap();
@@ -1190,7 +1256,10 @@ mod tests {
         std::thread::sleep(Duration::from_millis(20));
         grant.set_mode(DocMode::Dynamic);
         std::thread::sleep(Duration::from_millis(20));
-        assert_eq!(get(&grant, "/assets/lazy.js").response.status(), StatusCode::OK);
+        assert_eq!(
+            get(&grant, "/assets/lazy.js").response.status(),
+            StatusCode::OK
+        );
         assert_eq!(get(&grant, "/assets/lazy.js").response.body(), b"v1()");
         std::fs::remove_file(site.join("linked")).unwrap();
         std::os::unix::fs::symlink(site.join("v2"), site.join("linked")).unwrap();
@@ -1238,7 +1307,9 @@ mod tests {
         std::os::unix::fs::symlink(&real, dir.path().join("link")).unwrap();
         let canonical = std::fs::canonicalize(real.join("a.txt")).unwrap();
         assert!(open_beneath(&canonical).is_ok());
-        let through_link = std::fs::canonicalize(dir.path()).unwrap().join("link/a.txt");
+        let through_link = std::fs::canonicalize(dir.path())
+            .unwrap()
+            .join("link/a.txt");
         assert!(open_beneath(&through_link).is_err());
         assert!(open_beneath(Path::new("relative/a.txt")).is_err());
     }
@@ -1270,7 +1341,10 @@ mod tests {
             .unwrap();
         let served = grant.serve(&request);
         assert_eq!(served.response.status(), StatusCode::PARTIAL_CONTENT);
-        assert_eq!(served.response.headers()[header::CONTENT_RANGE], "bytes 10-19/100");
+        assert_eq!(
+            served.response.headers()[header::CONTENT_RANGE],
+            "bytes 10-19/100"
+        );
         assert_eq!(served.response.body().len(), 10);
         assert_eq!(parse_range("bytes=90-", 100), Some((90, 99)));
         assert_eq!(parse_range("bytes=-10", 100), Some((90, 99)));
@@ -1329,7 +1403,10 @@ mod tests {
         // before the handler sees it, and a guest handed the mapped one is
         // still asking for itself.
         let mapped = Request::builder()
-            .uri(format!("{DOC_SCHEME}://{}/index.html", mapped_host(mine.host())))
+            .uri(format!(
+                "{DOC_SCHEME}://{}/index.html",
+                mapped_host(mine.host())
+            ))
             .body(Vec::new())
             .unwrap();
         assert_eq!(mine.serve(&mapped).response.status(), StatusCode::OK);
@@ -1348,8 +1425,14 @@ mod tests {
         );
         let doc = Url::parse("codeg-doc://doc-1111/other.html").unwrap();
         assert!(is_document_url(&doc, own));
-        assert!(is_document_url(&Url::parse("https://codeg-doc.doc-1111/x").unwrap(), own));
-        assert!(!is_document_url(&Url::parse("https://example.com/").unwrap(), own));
+        assert!(is_document_url(
+            &Url::parse("https://codeg-doc.doc-1111/x").unwrap(),
+            own
+        ));
+        assert!(!is_document_url(
+            &Url::parse("https://example.com/").unwrap(),
+            own
+        ));
         // Not every host that merely begins with the mapped prefix: that one
         // is registrable by anyone, and a guest may navigate to its own.
         assert!(!is_document_url(
@@ -1532,8 +1615,14 @@ mod tests {
 
     #[test]
     fn content_types_by_extension() {
-        assert_eq!(content_type(Path::new("A.HTML")), "text/html; charset=utf-8");
-        assert_eq!(content_type(Path::new("x.mjs")), "text/javascript; charset=utf-8");
+        assert_eq!(
+            content_type(Path::new("A.HTML")),
+            "text/html; charset=utf-8"
+        );
+        assert_eq!(
+            content_type(Path::new("x.mjs")),
+            "text/javascript; charset=utf-8"
+        );
         assert_eq!(content_type(Path::new("x.woff2")), "font/woff2");
         assert_eq!(content_type(Path::new("x.bin")), "application/octet-stream");
         assert_eq!(content_type(Path::new("noext")), "application/octet-stream");

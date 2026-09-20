@@ -2302,10 +2302,7 @@ pub(crate) fn with_macos_fullscreen_drained(
 /// Exit native fullscreen and wait until the Space is gone, then run `then`
 /// on the main thread.
 #[cfg(target_os = "macos")]
-fn drain_macos_fullscreen_then(
-    window: tauri::WebviewWindow,
-    then: impl FnOnce() + Send + 'static,
-) {
+fn drain_macos_fullscreen_then(window: tauri::WebviewWindow, then: impl FnOnce() + Send + 'static) {
     let Some(generation) = claim_macos_fullscreen_drain() else {
         return;
     };
@@ -2630,7 +2627,10 @@ mod owner_window_tests {
         state.set_owner("import-sessions".to_string(), "main".to_string());
 
         assert_eq!(state.take_owner("stash-7").as_deref(), Some("main"));
-        assert_eq!(state.take_owner("push-7").as_deref(), Some("remote-workspace-3"));
+        assert_eq!(
+            state.take_owner("push-7").as_deref(),
+            Some("remote-workspace-3")
+        );
         assert_eq!(state.take_owner("project-boot").as_deref(), Some("main"));
         assert_eq!(state.take_owner("import-sessions").as_deref(), Some("main"));
     }
@@ -2658,7 +2658,10 @@ mod owner_window_tests {
         state.set_owner("stash-7".to_string(), "main".to_string());
         state.set_owner("stash-7".to_string(), "remote-workspace-3".to_string());
 
-        assert_eq!(state.take_owner("stash-7").as_deref(), Some("remote-workspace-3"));
+        assert_eq!(
+            state.take_owner("stash-7").as_deref(),
+            Some("remote-workspace-3")
+        );
     }
 }
 

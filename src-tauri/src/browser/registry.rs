@@ -177,7 +177,9 @@ pub struct BrowserRegistry {
 
 impl BrowserRegistry {
     fn lock(&self) -> MutexGuard<'_, HashMap<String, BrowserTab>> {
-        self.tabs.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+        self.tabs
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     /// The visibility lock of a tab (created on first use, dropped with the
@@ -320,7 +322,11 @@ impl BrowserRegistry {
     /// that is there NOW — a tab id is reused across incarnations, and a
     /// caller that decided on an earlier snapshot must not remove a tab it
     /// never looked at.
-    pub fn remove_if(&self, tab_id: &str, matches: impl FnOnce(&BrowserTab) -> bool) -> Option<BrowserTab> {
+    pub fn remove_if(
+        &self,
+        tab_id: &str,
+        matches: impl FnOnce(&BrowserTab) -> bool,
+    ) -> Option<BrowserTab> {
         // Lock order everywhere: tabs, then visibility (never the reverse),
         // and the lock entry goes while the tabs lock is still held — a tab
         // inserted under the same id in between would otherwise lose its
@@ -427,7 +433,8 @@ impl BrowserRegistry {
     /// loop cannot turn the strip into a stream.
     pub fn push_console(&self, tab_id: &str, line: ReportedLine) -> bool {
         self.update(tab_id, |tab| {
-            let admissible = console::admissible(tab.state.origin.as_deref(), line.origin.as_deref());
+            let admissible =
+                console::admissible(tab.state.origin.as_deref(), line.origin.as_deref());
             let before = tab.console.errors();
             tab.console.push(line, admissible);
             before == 0 && tab.console.errors() > 0
@@ -477,7 +484,11 @@ impl BrowserRegistry {
     /// pick already abandoned, and is dropped.
     pub fn resolve_pick(&self, tab_id: &str, report: PickReport) {
         let pending = self.update(tab_id, |tab| {
-            match tab.pending_pick.as_ref().is_some_and(|p| p.token == report.id()) {
+            match tab
+                .pending_pick
+                .as_ref()
+                .is_some_and(|p| p.token == report.id())
+            {
                 true => tab.pending_pick.take(),
                 false => None,
             }
@@ -558,14 +569,22 @@ fn gesture_is_modifier_click(payload: &Value, wanted: &str) -> bool {
             .and_then(Value::as_bool)
             .unwrap_or(false)
     };
-    let primary = if cfg!(target_os = "macos") { flag("meta") } else { flag("ctrl") };
+    let primary = if cfg!(target_os = "macos") {
+        flag("meta")
+    } else {
+        flag("ctrl")
+    };
     if !primary {
         return false;
     }
     let Some(anchor) = payload.get("anchor").filter(|a| !a.is_null()) else {
         return false;
     };
-    if anchor.get("download").and_then(Value::as_bool).unwrap_or(false) {
+    if anchor
+        .get("download")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
         return false;
     }
     let target = anchor.get("target").and_then(Value::as_str).unwrap_or("");
@@ -612,7 +631,10 @@ mod tests {
     fn open_reservations_are_exclusive_and_released_on_drop() {
         let registry = BrowserRegistry::default();
         let first = registry.reserve("t1").expect("first reservation");
-        assert!(registry.reserve("t1").is_err(), "second open of the same id must fail");
+        assert!(
+            registry.reserve("t1").is_err(),
+            "second open of the same id must fail"
+        );
         assert!(registry.reserve("t2").is_ok(), "another id is unaffected");
         drop(first);
         assert!(registry.reserve("t1").is_ok(), "released on drop");
@@ -632,7 +654,10 @@ mod tests {
         assert_eq!(slot_for(Some("7.2"), Some("7.1")), PickSlot::Elsewhere);
         // Its own is its own, and the answer names it so the page can be told
         // WHICH picker to put away.
-        assert_eq!(slot_for(Some("7.1"), Some("7.1")), PickSlot::Cleared("7.1".into()));
+        assert_eq!(
+            slot_for(Some("7.1"), Some("7.1")),
+            PickSlot::Cleared("7.1".into())
+        );
         // The person pressing the button again ends whatever is armed…
         assert_eq!(slot_for(Some("7.2"), None), PickSlot::Cleared("7.2".into()));
         // …and an empty slot is an orphan the page may still be showing.
@@ -653,14 +678,53 @@ mod tests {
         let primary = cfg!(target_os = "macos");
         let (meta, ctrl) = (primary, !primary);
         let wanted = normalize_for_match("https://example.com/a?b=1#frag");
-        assert!(gesture_is_modifier_click(&click("https://example.com/a?b=1", meta, ctrl, json!({})), &wanted));
+        assert!(gesture_is_modifier_click(
+            &click("https://example.com/a?b=1", meta, ctrl, json!({})),
+            &wanted
+        ));
         // Wrong modifier, plain click, middle click, _blank, download, other href: no match.
-        assert!(!gesture_is_modifier_click(&click("https://example.com/a?b=1", !meta, !ctrl, json!({})), &wanted));
-        assert!(!gesture_is_modifier_click(&click("https://example.com/a?b=1", false, false, json!({})), &wanted));
-        assert!(!gesture_is_modifier_click(&click("https://example.com/a?b=1", meta, ctrl, json!({"button": 1})), &wanted));
-        assert!(!gesture_is_modifier_click(&click("https://example.com/a?b=1", meta, ctrl, json!({"anchor": {"target": "_blank"}})), &wanted));
-        assert!(!gesture_is_modifier_click(&click("https://example.com/a?b=1", meta, ctrl, json!({"anchor": {"download": true}})), &wanted));
-        assert!(!gesture_is_modifier_click(&click("https://example.com/other", meta, ctrl, json!({})), &wanted));
-        assert!(!gesture_is_modifier_click(&json!({"type": "keydown"}), &wanted));
+        assert!(!gesture_is_modifier_click(
+            &click("https://example.com/a?b=1", !meta, !ctrl, json!({})),
+            &wanted
+        ));
+        assert!(!gesture_is_modifier_click(
+            &click("https://example.com/a?b=1", false, false, json!({})),
+            &wanted
+        ));
+        assert!(!gesture_is_modifier_click(
+            &click(
+                "https://example.com/a?b=1",
+                meta,
+                ctrl,
+                json!({"button": 1})
+            ),
+            &wanted
+        ));
+        assert!(!gesture_is_modifier_click(
+            &click(
+                "https://example.com/a?b=1",
+                meta,
+                ctrl,
+                json!({"anchor": {"target": "_blank"}})
+            ),
+            &wanted
+        ));
+        assert!(!gesture_is_modifier_click(
+            &click(
+                "https://example.com/a?b=1",
+                meta,
+                ctrl,
+                json!({"anchor": {"download": true}})
+            ),
+            &wanted
+        ));
+        assert!(!gesture_is_modifier_click(
+            &click("https://example.com/other", meta, ctrl, json!({})),
+            &wanted
+        ));
+        assert!(!gesture_is_modifier_click(
+            &json!({"type": "keydown"}),
+            &wanted
+        ));
     }
 }

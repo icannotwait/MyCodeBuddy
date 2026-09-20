@@ -5056,6 +5056,8 @@ function prepareMappedEnvelope(
         }
         entry.configOptions = configOptions
         selectorsCache.set(agentType, entry)
+        // Only place a model's display name and id are seen together.
+        rememberModelLabels(agentType, configOptions)
       })
       break
     }
@@ -5152,6 +5154,8 @@ function prepareMappedEnvelope(
         if (!selectorsCache.has(agentType)) {
           selectorsCache.set(agentType, { modes, configOptions })
         }
+        // Replay path: options restored without a fresh session_config_options.
+        rememberModelLabels(agentType, configOptions)
       })
       break
     }
@@ -9422,7 +9426,6 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
       eventIngestorRef.current = null
     }
   }, [bufferUnmappedEvent, settleListenerWaiters])
-
 
   // Drop every armed window on unmount. Its own effect, because the listener
   // effect above returns early on web / remote-desktop transports — before it

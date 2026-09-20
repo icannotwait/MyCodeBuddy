@@ -222,7 +222,6 @@ fn ts_to_datetime(ts: i64) -> DateTime<Utc> {
     Utc.timestamp_millis_opt(ts).single().unwrap_or_default()
 }
 
-
 #[cfg(any(test, feature = "test-utils"))]
 std::thread_local! {
     static HISTORY_BODY_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
@@ -410,7 +409,12 @@ impl ClineParser {
                         usage: msg.metrics.as_ref().map(session_usage),
                         duration_ms: None,
                         model,
+                        reasoning_effort: None,
                         completed_at: Some(timestamp),
+                        outcome: None,
+                        autonomous_origin: None,
+                        generation_ms: None,
+                        generation_tokens: None,
                         agent_message_id: None,
                     });
                 }
@@ -425,7 +429,12 @@ impl ClineParser {
                             usage: None,
                             duration_ms: None,
                             model: None,
+                            reasoning_effort: None,
                             completed_at: Some(timestamp),
+                            outcome: None,
+                            autonomous_origin: None,
+                            generation_ms: None,
+                            generation_tokens: None,
                             agent_message_id: None,
                         });
                     }
@@ -438,7 +447,12 @@ impl ClineParser {
                             usage: None,
                             duration_ms: None,
                             model: None,
+                            reasoning_effort: None,
                             completed_at: Some(timestamp),
+                            outcome: None,
+                            autonomous_origin: None,
+                            generation_ms: None,
+                            generation_tokens: None,
                             agent_message_id: None,
                         });
                     }
@@ -449,11 +463,7 @@ impl ClineParser {
 
         backfill_turn_durations(&mut turns, &[]);
         let session_stats = compute_session_stats(&turns);
-        let summary = session_summary(
-            manifest,
-            messages.updated_at.as_deref(),
-            turns.len() as u32,
-        );
+        let summary = session_summary(manifest, messages.updated_at.as_deref(), turns.len() as u32);
 
         ConversationDetail {
             summary,
@@ -488,8 +498,8 @@ fn session_summary(
     transcript_updated_at: Option<&str>,
     message_count: u32,
 ) -> ConversationSummary {
-    let folder_path = non_empty(manifest.cwd.clone())
-        .or_else(|| non_empty(manifest.workspace_root.clone()));
+    let folder_path =
+        non_empty(manifest.cwd.clone()).or_else(|| non_empty(manifest.workspace_root.clone()));
     let folder_name = folder_path.as_deref().map(folder_name_from_path);
 
     // `metadata.title` is cline's own summary of the session; the opening
@@ -649,10 +659,7 @@ impl ClineParser {
         Ok(summaries)
     }
 
-    fn legacy_conversation(
-        &self,
-        conversation_id: &str,
-    ) -> Result<ConversationDetail, ParseError> {
+    fn legacy_conversation(&self, conversation_id: &str) -> Result<ConversationDetail, ParseError> {
         let tasks_dir = self.base_dir.join("tasks").join(conversation_id);
         if !tasks_dir.exists() {
             return Err(ParseError::ConversationNotFound(
@@ -738,8 +745,13 @@ impl ClineParser {
                         usage,
                         duration_ms: None,
                         model,
+                        reasoning_effort: None,
                         completed_at: Some(timestamp),
-                    agent_message_id: None,
+                        outcome: None,
+                        autonomous_origin: None,
+                        generation_ms: None,
+                        generation_tokens: None,
+                        agent_message_id: None,
                     });
                 }
                 "user" => {
@@ -759,8 +771,13 @@ impl ClineParser {
                             usage: None,
                             duration_ms: None,
                             model: None,
+                            reasoning_effort: None,
                             completed_at: Some(timestamp),
-                        agent_message_id: None,
+                            outcome: None,
+                            autonomous_origin: None,
+                            generation_ms: None,
+                            generation_tokens: None,
+                            agent_message_id: None,
                         });
                     }
 
@@ -775,8 +792,13 @@ impl ClineParser {
                             usage: None,
                             duration_ms: None,
                             model: None,
+                            reasoning_effort: None,
                             completed_at: Some(timestamp),
-                        agent_message_id: None,
+                            outcome: None,
+                            autonomous_origin: None,
+                            generation_ms: None,
+                            generation_tokens: None,
+                            agent_message_id: None,
                         });
                     }
                 }
@@ -1051,8 +1073,8 @@ fn parse_content_blocks(
                             .get("is_error")
                             .and_then(|v| v.as_bool())
                             .unwrap_or(false);
-                        let output_preview = tool_result_output(item.get("content"))
-                            .map(|s| truncate_str(&s, 500));
+                        let output_preview =
+                            tool_result_output(item.get("content")).map(|s| truncate_str(&s, 500));
                         blocks.push(ContentBlock::ToolResult {
                             tool_use_id,
                             output_preview,
@@ -1437,7 +1459,10 @@ mod tests {
         assert!(reply.completed_at.is_some());
 
         assert_eq!(detail.summary.title.as_deref(), Some("Fix the parser"));
-        assert_eq!(detail.summary.folder_path.as_deref(), Some("/Users/dev/my-app"));
+        assert_eq!(
+            detail.summary.folder_path.as_deref(),
+            Some("/Users/dev/my-app")
+        );
         assert_eq!(detail.summary.git_branch.as_deref(), Some("master"));
         assert_eq!(detail.summary.model.as_deref(), Some("deepseek-v4-flash"));
     }
@@ -1466,7 +1491,10 @@ mod tests {
         assert_eq!(summaries.len(), 1);
         assert_eq!(summaries[0].id, "s1");
         assert_eq!(summaries[0].message_count, 2);
-        assert_eq!(summaries[0].folder_path.as_deref(), Some("/Users/dev/my-app"));
+        assert_eq!(
+            summaries[0].folder_path.as_deref(),
+            Some("/Users/dev/my-app")
+        );
     }
 
     /// `messages_path` in the manifest is the absolute path the WRITING
@@ -2004,5 +2032,4 @@ earlier terminal context records.\n\
             "recovery must open only the winning api_conversation_history.json"
         );
     }
-
 }

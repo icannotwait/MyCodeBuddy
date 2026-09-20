@@ -314,8 +314,7 @@ static CLOSE_BEHAVIOR_CACHE: std::sync::atomic::AtomicU8 =
 /// while the dialog is up, and every click re-enters `CloseRequested` — without
 /// this the user stacks a dialog per click and has to dismiss all of them.
 #[cfg(feature = "tauri-runtime")]
-static CLOSE_PROMPT_OPEN: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
+static CLOSE_PROMPT_OPEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// When the outstanding claim was taken, so an unanswered one can expire.
 #[cfg(feature = "tauri-runtime")]
@@ -389,7 +388,8 @@ pub(crate) fn store_close_behavior_cache(behavior: CloseWindowBehavior) {
 pub(crate) async fn load_system_close_behavior_settings(
     conn: &DatabaseConnection,
 ) -> SystemCloseBehaviorSettings {
-    let raw = match app_metadata_service::get_value(conn, SYSTEM_CLOSE_BEHAVIOR_SETTINGS_KEY).await {
+    let raw = match app_metadata_service::get_value(conn, SYSTEM_CLOSE_BEHAVIOR_SETTINGS_KEY).await
+    {
         Ok(Some(raw)) => raw,
         Ok(None) => return SystemCloseBehaviorSettings::default(),
         Err(err) => {

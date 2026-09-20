@@ -41,7 +41,10 @@ async fn spawn_upstream() -> u16 {
         Response::builder()
             .status(StatusCode::OK)
             .header("x-frame-options", "DENY")
-            .header("content-security-policy", "default-src 'self'; frame-ancestors 'none'")
+            .header(
+                "content-security-policy",
+                "default-src 'self'; frame-ancestors 'none'",
+            )
             .header("set-cookie", "sid=1; Path=/")
             .header("x-echo-cookie", echo("cookie"))
             .header("x-echo-origin", echo("origin"))
@@ -82,26 +85,27 @@ async fn spawn_upstream() -> u16 {
             .and_then(|v| v.to_str().ok())
             .unwrap_or("")
             .to_string();
-        ws.protocols(["vite-hmr"]).on_upgrade(move |mut socket| async move {
-            let _ = socket
-                .send(Message::Text(format!("origin:{origin}").into()))
-                .await;
-            while let Some(Ok(message)) = socket.recv().await {
-                match message {
-                    Message::Text(text) => {
-                        if socket
-                            .send(Message::Text(format!("echo:{text}").into()))
-                            .await
-                            .is_err()
-                        {
-                            break;
+        ws.protocols(["vite-hmr"])
+            .on_upgrade(move |mut socket| async move {
+                let _ = socket
+                    .send(Message::Text(format!("origin:{origin}").into()))
+                    .await;
+                while let Some(Ok(message)) = socket.recv().await {
+                    match message {
+                        Message::Text(text) => {
+                            if socket
+                                .send(Message::Text(format!("echo:{text}").into()))
+                                .await
+                                .is_err()
+                            {
+                                break;
+                            }
                         }
+                        Message::Close(_) => break,
+                        _ => {}
                     }
-                    Message::Close(_) => break,
-                    _ => {}
                 }
-            }
-        })
+            })
     }
     let app = Router::new()
         .route("/hello", get(hello))
@@ -248,7 +252,10 @@ async fn requests_need_this_listeners_cookie() {
     assert_eq!(response.status(), StatusCode::FORBIDDEN);
     let response = client()
         .get(&url)
-        .header(header::COOKIE, format!("codeg-bridge-{}=wrong", grant.bridge_port))
+        .header(
+            header::COOKIE,
+            format!("codeg-bridge-{}=wrong", grant.bridge_port),
+        )
         .send()
         .await
         .unwrap();
@@ -271,7 +278,10 @@ async fn requests_need_this_listeners_cookie() {
     // like a direct one.
     let response = client()
         .get(&url)
-        .header(header::COOKIE, format!("{}; codeg.locale=zh-CN; sid=abc", cookie_for(&grant)))
+        .header(
+            header::COOKIE,
+            format!("{}; codeg.locale=zh-CN; sid=abc", cookie_for(&grant)),
+        )
         .header("sec-fetch-site", "same-origin")
         // The page's own request: an Origin on this listener's port (the
         // public hostname may differ from the bind address).
@@ -313,10 +323,14 @@ async fn requests_need_this_listeners_cookie() {
 async fn only_the_pages_own_requests_pass() {
     configure_once();
     let upstream = spawn_upstream().await;
-    let grant = browser_bridge::open(upstream, "tab-initiator").await.unwrap();
+    let grant = browser_bridge::open(upstream, "tab-initiator")
+        .await
+        .unwrap();
     let url = format!("{}/hello", base(&grant));
     let send = |site: Option<&'static str>, origin: Option<String>| {
-        let mut request = client().get(&url).header(header::COOKIE, cookie_for(&grant));
+        let mut request = client()
+            .get(&url)
+            .header(header::COOKIE, cookie_for(&grant));
         if let Some(site) = site {
             request = request.header("sec-fetch-site", site);
         }
@@ -326,29 +340,60 @@ async fn only_the_pages_own_requests_pass() {
         request.send()
     };
     // The page itself, and a navigation the user typed.
-    assert_eq!(send(Some("same-origin"), None).await.unwrap().status(), StatusCode::OK);
-    assert_eq!(send(Some("none"), None).await.unwrap().status(), StatusCode::OK);
+    assert_eq!(
+        send(Some("same-origin"), None).await.unwrap().status(),
+        StatusCode::OK
+    );
+    assert_eq!(
+        send(Some("none"), None).await.unwrap().status(),
+        StatusCode::OK
+    );
     // Another proxied page (another port on this host) or the workbench,
     // whose browser attaches this listener's cookie all the same.
     let refused = send(Some("same-site"), None).await.unwrap();
     assert_eq!(refused.status(), StatusCode::FORBIDDEN);
-    assert!(refused.text().await.unwrap().contains("did not come from the page itself"));
+    assert!(refused
+        .text()
+        .await
+        .unwrap()
+        .contains("did not come from the page itself"));
     assert_eq!(
-        send(Some("cross-site"), Some(base(&grant))).await.unwrap().status(),
+        send(Some("cross-site"), Some(base(&grant)))
+            .await
+            .unwrap()
+            .status(),
         StatusCode::FORBIDDEN
     );
     // Without Fetch Metadata (plain http) the Origin must name the
     // authority the request went to — this listener's.
     assert_eq!(
-        send(None, Some(format!("http://127.0.0.1:{}", grant.bridge_port))).await.unwrap().status(),
+        send(
+            None,
+            Some(format!("http://127.0.0.1:{}", grant.bridge_port))
+        )
+        .await
+        .unwrap()
+        .status(),
         StatusCode::OK
     );
     assert_eq!(
-        send(None, Some(format!("http://127.0.0.1:{}", grant.bridge_port + 1))).await.unwrap().status(),
+        send(
+            None,
+            Some(format!("http://127.0.0.1:{}", grant.bridge_port + 1))
+        )
+        .await
+        .unwrap()
+        .status(),
         StatusCode::FORBIDDEN
     );
     assert_eq!(
-        send(None, Some(format!("http://codeg.example:{}", grant.bridge_port))).await.unwrap().status(),
+        send(
+            None,
+            Some(format!("http://codeg.example:{}", grant.bridge_port))
+        )
+        .await
+        .unwrap()
+        .status(),
         StatusCode::FORBIDDEN
     );
     // Else the Referer; nothing at all is refused (a page cannot forge a
@@ -361,21 +406,32 @@ async fn only_the_pages_own_requests_pass() {
             .send()
     };
     assert_eq!(
-        with_referer(format!("{}/some/page?x=1", base(&grant))).await.unwrap().status(),
+        with_referer(format!("{}/some/page?x=1", base(&grant)))
+            .await
+            .unwrap()
+            .status(),
         StatusCode::OK
     );
     assert_eq!(
-        with_referer(format!("http://127.0.0.1:{}/", grant.bridge_port + 1)).await.unwrap().status(),
+        with_referer(format!("http://127.0.0.1:{}/", grant.bridge_port + 1))
+            .await
+            .unwrap()
+            .status(),
         StatusCode::FORBIDDEN
     );
-    assert_eq!(send(None, None).await.unwrap().status(), StatusCode::FORBIDDEN);
+    assert_eq!(
+        send(None, None).await.unwrap().status(),
+        StatusCode::FORBIDDEN
+    );
 }
 
 #[tokio::test]
 async fn redirects_and_bodies_pass_through() {
     configure_once();
     let upstream = spawn_upstream().await;
-    let grant = browser_bridge::open(upstream, "tab-redirect").await.unwrap();
+    let grant = browser_bridge::open(upstream, "tab-redirect")
+        .await
+        .unwrap();
 
     let response = client()
         .get(format!("{}/redirect", base(&grant)))
@@ -387,7 +443,10 @@ async fn redirects_and_bodies_pass_through() {
     assert_eq!(response.status(), StatusCode::FOUND);
     // The upstream answered with its own absolute address; the browser must
     // stay on the bridge origin.
-    assert_eq!(response.headers().get(header::LOCATION).unwrap(), "/after?x=1");
+    assert_eq!(
+        response.headers().get(header::LOCATION).unwrap(),
+        "/after?x=1"
+    );
 
     let response = client()
         .post(format!("{}/echo", base(&grant)))
@@ -451,7 +510,10 @@ async fn websockets_are_bridged_with_their_subprotocol() {
         .insert(header::ORIGIN, base(&grant).parse().unwrap());
     let (mut socket, response) = tokio_tungstenite::connect_async(request).await.unwrap();
     assert_eq!(
-        response.headers().get(header::SEC_WEBSOCKET_PROTOCOL).unwrap(),
+        response
+            .headers()
+            .get(header::SEC_WEBSOCKET_PROTOCOL)
+            .unwrap(),
         "vite-hmr"
     );
     // The upstream saw an Origin naming itself, as a page served directly
@@ -471,28 +533,31 @@ async fn websockets_are_bridged_with_their_subprotocol() {
 
     // Without the cookie the upgrade is refused; so is one from another
     // proxied page (an Origin on another port, or same-site Fetch Metadata).
-    let refused = |mutate: Box<dyn Fn(&mut tokio_tungstenite::tungstenite::handshake::client::Request)>| {
-        let mut request = format!("ws://127.0.0.1:{}/ws", grant.bridge_port)
-            .into_client_request()
-            .unwrap();
-        mutate(&mut request);
-        async move {
-            let err = tokio_tungstenite::connect_async(request).await.unwrap_err();
-            assert!(
-                matches!(
-                    err,
-                    tokio_tungstenite::tungstenite::Error::Http(ref response)
-                        if response.status() == StatusCode::FORBIDDEN
-                ),
-                "{err:?}"
-            );
-        }
-    };
+    let refused =
+        |mutate: Box<dyn Fn(&mut tokio_tungstenite::tungstenite::handshake::client::Request)>| {
+            let mut request = format!("ws://127.0.0.1:{}/ws", grant.bridge_port)
+                .into_client_request()
+                .unwrap();
+            mutate(&mut request);
+            async move {
+                let err = tokio_tungstenite::connect_async(request).await.unwrap_err();
+                assert!(
+                    matches!(
+                        err,
+                        tokio_tungstenite::tungstenite::Error::Http(ref response)
+                            if response.status() == StatusCode::FORBIDDEN
+                    ),
+                    "{err:?}"
+                );
+            }
+        };
     refused(Box::new(|_| {})).await;
     let cookie = cookie_for(&grant);
     let other_port = grant.bridge_port + 1;
     refused(Box::new(move |request| {
-        request.headers_mut().insert(header::COOKIE, cookie.parse().unwrap());
+        request
+            .headers_mut()
+            .insert(header::COOKIE, cookie.parse().unwrap());
         request.headers_mut().insert(
             header::ORIGIN,
             format!("http://127.0.0.1:{other_port}").parse().unwrap(),
@@ -501,8 +566,12 @@ async fn websockets_are_bridged_with_their_subprotocol() {
     .await;
     let cookie = cookie_for(&grant);
     refused(Box::new(move |request| {
-        request.headers_mut().insert(header::COOKIE, cookie.parse().unwrap());
-        request.headers_mut().insert("sec-fetch-site", "same-site".parse().unwrap());
+        request
+            .headers_mut()
+            .insert(header::COOKIE, cookie.parse().unwrap());
+        request
+            .headers_mut()
+            .insert("sec-fetch-site", "same-site".parse().unwrap());
     }))
     .await;
 }

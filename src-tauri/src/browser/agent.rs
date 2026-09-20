@@ -104,9 +104,7 @@ impl ListenerIdentity {
     /// typed, rather than the path they never look at.
     pub fn display_name(&self) -> Option<&str> {
         let program = self.program.as_deref()?;
-        program
-            .rsplit(['/', '\\'])
-            .find(|part| !part.is_empty())
+        program.rsplit(['/', '\\']).find(|part| !part.is_empty())
     }
 }
 
@@ -196,9 +194,7 @@ pub fn summarize_tab(state: &BrowserTabState) -> Option<AgentTabSummary> {
         tab_id: state.tab_id.clone(),
         origin: state.origin.clone(),
         level,
-        title: level
-            .allows(GrantLevel::Read)
-            .then(|| state.title.clone()),
+        title: level.allows(GrantLevel::Read).then(|| state.title.clone()),
     })
 }
 
@@ -484,7 +480,11 @@ pub fn revoke_if_replaced(
 /// grant, never widen one.
 pub fn revoke_if_departed(state: &mut BrowserTabState) -> Option<AgentGrant> {
     let origin = state.origin.as_deref();
-    if state.agent_grant.as_ref().is_some_and(|g| !g.covers(origin)) {
+    if state
+        .agent_grant
+        .as_ref()
+        .is_some_and(|g| !g.covers(origin))
+    {
         state.agent_grant.take()
     } else {
         None
@@ -672,9 +672,13 @@ pub enum ActionKind {
     },
     /// Press a key — `"Enter"`, `"a"`, `"Control+Shift+k"` — on the element,
     /// or on whatever has focus when the request names none.
-    Press { key: String },
+    Press {
+        key: String,
+    },
     /// Choose options of a `<select>`, by value or by label.
-    Select { values: Vec<String> },
+    Select {
+        values: Vec<String>,
+    },
 }
 
 impl ActionKind {
@@ -1062,7 +1066,10 @@ mod tests {
 
         // Same level, same origin: nothing happened, and in particular the
         // clock the audit surface shows did not restart.
-        assert_eq!(apply_grant(&mut state, GrantLevel::Read, 200, None), Ok(None));
+        assert_eq!(
+            apply_grant(&mut state, GrantLevel::Read, 200, None),
+            Ok(None)
+        );
         assert_eq!(state.agent_grant.as_ref().unwrap().granted_at, 100);
 
         // A different level is a decision, and dates from when it was made.
@@ -1217,7 +1224,11 @@ mod tests {
     fn a_probe_of_one_address_does_not_judge_a_grant_on_another() {
         let mut state = shared_localhost(Some(serving("/usr/local/bin/node", "/p")));
         assert_eq!(
-            revoke_if_replaced(&mut state, "http://localhost:4000", &serving("/other", "/q")),
+            revoke_if_replaced(
+                &mut state,
+                "http://localhost:4000",
+                &serving("/other", "/q")
+            ),
             None
         );
         assert!(state.agent_grant.is_some());
@@ -1264,7 +1275,10 @@ mod tests {
         assert_eq!(refreshed, None, "a button already on announces nothing");
         let grant = state.agent_grant.as_ref().expect("a grant");
         assert_eq!(grant.granted_at, 100);
-        assert_eq!(grant.listener, Some(serving("/usr/bin/python3", "/home/dev")));
+        assert_eq!(
+            grant.listener,
+            Some(serving("/usr/bin/python3", "/home/dev"))
+        );
     }
 
     #[test]
@@ -1334,7 +1348,12 @@ mod tests {
 
     #[test]
     fn the_expression_probes_before_it_calls() {
-        let js = probe_and_snapshot(&SnapshotRequest { max_chars: Some(2000) }, "7.2");
+        let js = probe_and_snapshot(
+            &SnapshotRequest {
+                max_chars: Some(2000),
+            },
+            "7.2",
+        );
         assert!(js.starts_with("typeof globalThis.__codegAgent === 'undefined'"));
         assert!(js.contains(r#""absent""#));
         assert!(js.contains(r#""epoch":"7.2""#));
@@ -1360,7 +1379,10 @@ mod tests {
     fn the_installing_form_is_one_expression_ending_in_the_call() {
         let js = install_and_snapshot(&SnapshotRequest::default(), "1.0");
         assert!(js.starts_with("(function(){\n"));
-        assert!(js.ends_with(";})()"), "must be an immediately invoked expression");
+        assert!(
+            js.ends_with(";})()"),
+            "must be an immediately invoked expression"
+        );
         assert!(js.contains(";return JSON.stringify(globalThis.__codegAgent.snapshot("));
         // The bundle goes in whole, and it is a program: statements at the
         // top, no trailing expression of its own to be confused with ours.
@@ -1423,9 +1445,12 @@ mod tests {
         let keyless = ActionRequest {
             generation: "g".into(),
             target: None,
-            action: ActionKind::Press { key: "Enter".into() },
+            action: ActionKind::Press {
+                key: "Enter".into(),
+            },
         };
-        assert!(act_call(&keyless).contains(".act(\"g\", null, {\"key\":\"Enter\",\"kind\":\"press\"}))"));
+        assert!(act_call(&keyless)
+            .contains(".act(\"g\", null, {\"key\":\"Enter\",\"kind\":\"press\"}))"));
 
         let locate = locate_call("g", "e1");
         assert!(locate.contains(".locate(\"g\", \"e1\"))"));
@@ -1454,12 +1479,14 @@ mod tests {
             values: vec!["l".into()],
         })
         .unwrap();
-        assert_eq!(select, serde_json::json!({ "kind": "select", "values": ["l"] }));
+        assert_eq!(
+            select,
+            serde_json::json!({ "kind": "select", "values": ["l"] })
+        );
 
-        let request: ActionRequest = serde_json::from_str(
-            r#"{"generation":"g.1.0","ref":"e3","action":{"kind":"hover"}}"#,
-        )
-        .unwrap();
+        let request: ActionRequest =
+            serde_json::from_str(r#"{"generation":"g.1.0","ref":"e3","action":{"kind":"hover"}}"#)
+                .unwrap();
         assert_eq!(request.target.as_deref(), Some("e3"));
         assert_eq!(request.action, ActionKind::Hover);
         let request: ActionRequest =
@@ -1474,7 +1501,15 @@ mod tests {
         assert_eq!(refused.error, Some(ActionError::Obscured));
         // Every error the world can name has to deserialize, or a refusal
         // reads as an unreadable answer.
-        for slug in ["stale", "not-visible", "obscured", "not-editable", "no-option", "disabled", "unsupported"] {
+        for slug in [
+            "stale",
+            "not-visible",
+            "obscured",
+            "not-editable",
+            "no-option",
+            "disabled",
+            "unsupported",
+        ] {
             let answer: WorldAnswer = serde_json::from_str(&format!(
                 r#"{{"ok":false,"url":"http://x/","error":"{slug}","detail":"d"}}"#
             ))
@@ -1493,7 +1528,10 @@ mod tests {
         .unwrap();
         // No `scrolled` key at all for an action that did not scroll, rather
         // than a null one: every action but a key press is in this shape.
-        assert_eq!(outcome, serde_json::json!({ "fidelity": "trusted", "url": "http://x/" }));
+        assert_eq!(
+            outcome,
+            serde_json::json!({ "fidelity": "trusted", "url": "http://x/" })
+        );
         let scrolled: WorldAnswer = serde_json::from_str(
             r#"{"ok":true,"url":"http://x/","scrolled":{"by":700,"top":700,"max":2900}}"#,
         )

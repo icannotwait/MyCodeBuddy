@@ -503,9 +503,15 @@ mod tests {
     fn the_same_origin_is_rate_limited_not_silenced_forever() {
         let mut scanner = ServiceScanner::new();
         let start = Instant::now();
-        assert_eq!(scanner.feed("Local: http://localhost:5173/\n", start).len(), 1);
+        assert_eq!(
+            scanner.feed("Local: http://localhost:5173/\n", start).len(),
+            1
+        );
         assert!(scanner
-            .feed("Local: http://localhost:5173/\n", start + Duration::from_secs(3))
+            .feed(
+                "Local: http://localhost:5173/\n",
+                start + Duration::from_secs(3)
+            )
             .is_empty());
         assert_eq!(
             scanner

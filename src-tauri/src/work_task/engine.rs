@@ -6864,13 +6864,14 @@ async fn instruction_scan(conn: &sea_orm::DatabaseConnection, task_id: i32) -> I
                         )
                         .unwrap_or_default();
                         let returned =
-                            payload.get("feedback").and_then(|v| v.as_str()).map(|text| {
-                                Outstanding {
+                            payload
+                                .get("feedback")
+                                .and_then(|v| v.as_str())
+                                .map(|text| Outstanding {
                                     kind: OutstandingKind::Review(intent),
                                     text: text.to_string(),
                                     attachments: payload_blocks(&payload),
-                                }
-                            });
+                                });
                         if scan.outstanding.is_none() {
                             let Some(returned) = returned else {
                                 break;
@@ -8515,9 +8516,14 @@ mod tests {
         );
         assert!(joined.contains("check the logs first"));
         // Oldest first: the turn, then the note that refines it.
-        let question = joined.find("why did you pick a map here?").expect("question");
+        let question = joined
+            .find("why did you pick a map here?")
+            .expect("question");
         let note = joined.find("check the logs first").expect("note");
-        assert!(question < note, "the note refines the turn, so it follows it");
+        assert!(
+            question < note,
+            "the note refines the turn, so it follows it"
+        );
         // And it is still a question, so the licence stays read-only.
         let guard = texts(&blocks)
             .into_iter()
@@ -11843,7 +11849,9 @@ mod tests {
         let (engine, task_id, home, feature_tip, _main_tip) =
             branch_choice_fixture(serde_json::json!({ "base_branch": "feature" })).await;
         let task = row(&engine, task_id).await;
-        let root = get_folder_core(&engine.db, task.folder_id).await.expect("root");
+        let root = get_folder_core(&engine.db, task.folder_id)
+            .await
+            .expect("root");
 
         let wt = engine
             .ensure_worktree(&task, &root, &WorkTaskFolderSettings::default())
@@ -11873,7 +11881,9 @@ mod tests {
         let (engine, task_id, home, _feature_tip, main_tip) =
             branch_choice_fixture(serde_json::json!({})).await;
         let task = row(&engine, task_id).await;
-        let root = get_folder_core(&engine.db, task.folder_id).await.expect("root");
+        let root = get_folder_core(&engine.db, task.folder_id)
+            .await
+            .expect("root");
 
         engine
             .ensure_worktree(&task, &root, &WorkTaskFolderSettings::default())
@@ -11895,7 +11905,9 @@ mod tests {
         let (engine, task_id, home, _feature_tip, _main_tip) =
             branch_choice_fixture(serde_json::json!({ "base_branch": "gone" })).await;
         let task = row(&engine, task_id).await;
-        let root = get_folder_core(&engine.db, task.folder_id).await.expect("root");
+        let root = get_folder_core(&engine.db, task.folder_id)
+            .await
+            .expect("root");
 
         let err = engine
             .ensure_worktree(&task, &root, &WorkTaskFolderSettings::default())

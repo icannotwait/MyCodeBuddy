@@ -39,7 +39,10 @@ pub fn loopback_port(origin: &str) -> Option<u16> {
     let url = Url::parse(origin).ok()?;
     let host = url.host_str()?;
     // An IPv6 host keeps its brackets in the URL serialization.
-    let literal = host.strip_prefix('[').and_then(|h| h.strip_suffix(']')).unwrap_or(host);
+    let literal = host
+        .strip_prefix('[')
+        .and_then(|h| h.strip_suffix(']'))
+        .unwrap_or(host);
     let is_loopback = match literal.parse::<IpAddr>() {
         // 127/8 and ::1. Not the unspecified address: `http://0.0.0.0:3000`
         // does reach a wildcard listener on most stacks, but it is not the
@@ -212,7 +215,10 @@ fn lsof_address_serves(name: &str, port: u16) -> bool {
     if addr == "*" {
         return true;
     }
-    let addr = addr.strip_prefix('[').and_then(|a| a.strip_suffix(']')).unwrap_or(addr);
+    let addr = addr
+        .strip_prefix('[')
+        .and_then(|a| a.strip_suffix(']'))
+        .unwrap_or(addr);
     addr.parse::<IpAddr>().is_ok_and(serves_loopback)
 }
 
@@ -288,7 +294,11 @@ mod imp {
             return found;
         };
         for entry in procs.flatten() {
-            let Some(pid) = entry.file_name().to_str().and_then(|n| n.parse::<u32>().ok()) else {
+            let Some(pid) = entry
+                .file_name()
+                .to_str()
+                .and_then(|n| n.parse::<u32>().ok())
+            else {
                 continue;
             };
             let Ok(fds) = std::fs::read_dir(entry.path().join("fd")) else {
@@ -298,7 +308,10 @@ mod imp {
                 let Ok(link) = std::fs::read_link(fd.path()) else {
                     continue;
                 };
-                if needles.iter().any(|needle| link.as_os_str() == needle.as_str()) {
+                if needles
+                    .iter()
+                    .any(|needle| link.as_os_str() == needle.as_str())
+                {
                     found.push(pid);
                     break;
                 }
@@ -368,7 +381,11 @@ mod imp {
         // process this user does not own.
         let mut buf = vec![0u8; 4096];
         let written = unsafe {
-            libc::proc_pidpath(pid as libc::c_int, buf.as_mut_ptr().cast(), buf.len() as u32)
+            libc::proc_pidpath(
+                pid as libc::c_int,
+                buf.as_mut_ptr().cast(),
+                buf.len() as u32,
+            )
         };
         if written <= 0 {
             return None;
@@ -464,7 +481,10 @@ mod imp {
     /// answer is the same today, and a wrong guess would not fail — it would
     /// read neighbouring fields as pids.
     fn rows<T: Copy>(buf: &[u8], start: usize) -> Vec<T> {
-        let Some(count) = buf.get(..4).map(|n| u32::from_ne_bytes(n.try_into().unwrap())) else {
+        let Some(count) = buf
+            .get(..4)
+            .map(|n| u32::from_ne_bytes(n.try_into().unwrap()))
+        else {
             return Vec::new();
         };
         let stride = std::mem::size_of::<T>();
@@ -527,7 +547,11 @@ mod imp {
             return None;
         }
         buf.truncate(len as usize);
-        Some(std::ffi::OsString::from_wide(&buf).to_string_lossy().into_owned())
+        Some(
+            std::ffi::OsString::from_wide(&buf)
+                .to_string_lossy()
+                .into_owned(),
+        )
     }
 
     pub fn workdir_of(_pid: u32) -> Option<String> {

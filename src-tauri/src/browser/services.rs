@@ -224,7 +224,10 @@ impl ServiceRegistry {
             .partition(|(_, alive)| *alive);
         self.forget(
             owner_window,
-            &dead.into_iter().map(|(service, _)| service).collect::<Vec<_>>(),
+            &dead
+                .into_iter()
+                .map(|(service, _)| service)
+                .collect::<Vec<_>>(),
         );
         live.into_iter().map(|(service, _)| service).collect()
     }
@@ -402,8 +405,16 @@ mod tests {
         drop(dead);
 
         let registry = ServiceRegistry::new();
-        registry.record(service(&format!("http://127.0.0.1:{live_port}"), "t1", "main"));
-        registry.record(service(&format!("http://127.0.0.1:{dead_port}"), "t2", "main"));
+        registry.record(service(
+            &format!("http://127.0.0.1:{live_port}"),
+            "t1",
+            "main",
+        ));
+        registry.record(service(
+            &format!("http://127.0.0.1:{dead_port}"),
+            "t2",
+            "main",
+        ));
 
         let live = registry.list_live("main");
         assert_eq!(live.len(), 1);

@@ -616,7 +616,9 @@ describe("FileWorkspaceTabBar — the add-tab '+'", () => {
     await act(async () => {
       screen.getByRole("menuitem", { name: "Open file…" }).click()
     })
-    expect(browserMocks.openFileDialog).toHaveBeenCalledWith({ title: "Open file" })
+    expect(browserMocks.openFileDialog).toHaveBeenCalledWith({
+      title: "Open file",
+    })
     expect(openFilePreview).toHaveBeenCalledWith("/repo/src/notes.md")
   })
 

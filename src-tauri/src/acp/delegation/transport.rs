@@ -587,6 +587,16 @@ pub enum BrokerMessage {
     /// by a dead one, which a bare `connect()` cannot. The listener answers
     /// without touching the broker, DB, or token registry.
     Ping,
+    /// Built-in browser tools (0.31.0). Authenticated by the per-launch token.
+    /// Listed here so companions can round-trip; they are NOT on the default
+    /// six-tool `tools/list`.
+    BrowserTabs(BrokerBrowserTabsRequest),
+    BrowserSnapshot(BrokerBrowserSnapshotRequest),
+    BrowserAct(BrokerBrowserActRequest),
+    BrowserConsole(BrokerBrowserConsoleRequest),
+    BrowserCapture(BrokerBrowserCaptureRequest),
+    BrowserEval(BrokerBrowserEvalRequest),
+    BrowserTabOp(BrokerBrowserTabOpRequest),
 }
 
 /// The wrapped outcome the main process returns over the same socket.

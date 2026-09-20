@@ -297,7 +297,7 @@ mod tests {
             value: None,
             truncated: false,
             error: Some("TypeError: x is not a function\n    at <anonymous>:1:1".into()),
-            };
+        };
         let outcome = EvalOutcome::from_answer(&answer, "https://a.example/".into());
         assert_eq!(outcome.kind, EVAL_KIND_EXCEPTION);
         assert!(outcome.value.starts_with("TypeError:"));
@@ -309,9 +309,11 @@ mod tests {
             ok: false,
             ..Default::default()
         };
-        assert!(!EvalOutcome::from_answer(&mute, "https://a.example/".into())
-            .value
-            .is_empty());
+        assert!(
+            !EvalOutcome::from_answer(&mute, "https://a.example/".into())
+                .value
+                .is_empty()
+        );
     }
 
     /// A value clipped at the cap must not be cut inside a character.

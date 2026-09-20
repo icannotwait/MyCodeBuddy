@@ -58,7 +58,10 @@ pub fn blank_substituted_for(provisional: Option<&str>, committed: &Url) -> bool
 }
 
 pub fn page_load(app: &AppHandle, tab_id: &str, url: &Url, started: bool) {
-    tracing::debug!("[browser] tab {tab_id} page load {}: {url}", if started { "started" } else { "finished" });
+    tracing::debug!(
+        "[browser] tab {tab_id} page load {}: {url}",
+        if started { "started" } else { "finished" }
+    );
     let Some(registry) = app.try_state::<BrowserRegistry>() else {
         return;
     };
@@ -68,19 +71,18 @@ pub fn page_load(app: &AppHandle, tab_id: &str, url: &Url, started: bool) {
     let history = if started {
         None
     } else {
-        registry
-            .surface(tab_id)
-            .map(|surface| {
-                (
-                    surface.can_go_back().unwrap_or(false),
-                    surface.can_go_forward().unwrap_or(false),
-                )
-            })
+        registry.surface(tab_id).map(|surface| {
+            (
+                surface.can_go_back().unwrap_or(false),
+                surface.can_go_forward().unwrap_or(false),
+            )
+        })
     };
     let state = registry.update(tab_id, |tab| {
-        let failed_address = (started && blank_substituted_for(tab.provisional_url.as_deref(), url))
-            .then(|| tab.provisional_url.clone())
-            .flatten();
+        let failed_address = (started
+            && blank_substituted_for(tab.provisional_url.as_deref(), url))
+        .then(|| tab.provisional_url.clone())
+        .flatten();
         let substituted = failed_address.is_some();
         if started {
             tab.provisional_url = None;

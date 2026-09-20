@@ -299,10 +299,12 @@ pub(crate) fn resolve_system_agent_binary_for(agent_type: AgentType, cmd: &str) 
         cmd.to_string()
     };
     let home = home_dir_or_default();
-    registry::binary_system_dirs(agent_type).iter().find_map(|dir| {
-        let cand = home.join(dir).join(&exe);
-        cand.is_file().then_some(cand)
-    })
+    registry::binary_system_dirs(agent_type)
+        .iter()
+        .find_map(|dir| {
+            let cand = home.join(dir).join(&exe);
+            cand.is_file().then_some(cand)
+        })
 }
 
 /// Resolve the VENDOR CLI wrapped by an ACP adapter agent (`claude`, `codex`
@@ -2897,7 +2899,9 @@ fn cline_model_id_keys_for_provider(provider: &str) -> (&'static str, &'static s
 /// written by `cline auth` reads back correctly. With several entries and no
 /// usable `lastUsedProvider` there is no defensible "current" provider, so this
 /// reports none rather than guessing one and overwriting it on the next save.
-fn load_cline_provider_settings_at(path: &Path) -> Option<serde_json::Map<String, serde_json::Value>> {
+fn load_cline_provider_settings_at(
+    path: &Path,
+) -> Option<serde_json::Map<String, serde_json::Value>> {
     let root = fs::read_to_string(path)
         .ok()
         .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())?;
@@ -2920,14 +2924,21 @@ fn load_cline_provider_settings_at(path: &Path) -> Option<serde_json::Map<String
         "apiProvider".to_string(),
         serde_json::Value::String(normalize_cline_provider_id(&selected)),
     );
-    for (source, target) in [("apiKey", "apiKey"), ("model", "model"), ("baseUrl", "apiBaseUrl")] {
+    for (source, target) in [
+        ("apiKey", "apiKey"),
+        ("model", "model"),
+        ("baseUrl", "apiBaseUrl"),
+    ] {
         if let Some(value) = settings
             .get(source)
             .and_then(|v| v.as_str())
             .map(str::trim)
             .filter(|v| !v.is_empty())
         {
-            merged.insert(target.to_string(), serde_json::Value::String(value.to_string()));
+            merged.insert(
+                target.to_string(),
+                serde_json::Value::String(value.to_string()),
+            );
         }
     }
     Some(merged)
@@ -3095,7 +3106,10 @@ fn persist_cline_provider_settings_at(
         .ok_or_else(|| AcpError::protocol("cline providers.json root must be an object"))?;
     // `version` is a zod literal — anything else and cline reads the file as empty.
     root_obj.insert("version".to_string(), serde_json::json!(1));
-    if !root_obj.get("modes").is_some_and(serde_json::Value::is_object) {
+    if !root_obj
+        .get("modes")
+        .is_some_and(serde_json::Value::is_object)
+    {
         root_obj.insert("modes".to_string(), serde_json::json!({}));
     }
     root_obj.insert(
@@ -3140,18 +3154,17 @@ fn persist_cline_provider_settings_at(
     // not otherwise recognize, and is honoured for the same reason.
     let agent_managed_credential =
         cline_provider_is_agent_managed(provider) || token_source == "oauth";
-    for (key, value) in [
-        ("apiKey", api_key),
-        ("model", model),
-        ("baseUrl", base_url),
-    ] {
+    for (key, value) in [("apiKey", api_key), ("model", model), ("baseUrl", base_url)] {
         let credential = key != "model";
         match value {
             Some(value) => {
                 if credential && agent_managed_credential {
                     continue;
                 }
-                settings.insert(key.to_string(), serde_json::Value::String(value.to_string()));
+                settings.insert(
+                    key.to_string(),
+                    serde_json::Value::String(value.to_string()),
+                );
             }
             None => {
                 if credential && agent_managed_credential {
@@ -9374,11 +9387,7 @@ fn agent_env_keys(agent_type: AgentType) -> (&'static str, &'static str, &'stati
         // the base-url slot stays an inert `AGY_BASE_URL` placeholder for the
         // same reason `CURSOR_MODEL`/`QODER_BASE_URL` above are: it keeps the
         // generic cascade off the `OPENAI_*` keys.
-        AgentType::Antigravity => (
-            "AGY_BASE_URL",
-            "GEMINI_API_KEY",
-            "AGY_ACP_DEFAULT_MODEL",
-        ),
+        AgentType::Antigravity => ("AGY_BASE_URL", "GEMINI_API_KEY", "AGY_ACP_DEFAULT_MODEL"),
         // `CLINE_API_KEY` is not just a convenience: it is one of only two ways
         // past cline's ACP auth gate (`isSessionReady`), and the only one a BYO
         // provider can take — see [`apply_cline_launch_env`]. `CLINE_MODEL`
@@ -9426,7 +9435,8 @@ fn agent_env_keys(agent_type: AgentType) -> (&'static str, &'static str, &'stati
 /// [`build_runtime_env_from_setting`] (see [`agent_env_keys`]); this only fills
 /// what is still missing, so an explicit `env_json` row keeps winning.
 fn apply_cline_launch_env(config_json: Option<&str>, merged: &mut BTreeMap<String, String>) {
-    let Some(config) = config_json.and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
+    let Some(config) =
+        config_json.and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
     else {
         return;
     };
@@ -11318,8 +11328,7 @@ pub async fn acp_clear_binary_cache(agent_type: AgentType) -> Result<(), AcpErro
 /// Scan the system temp directory for artifacts leaked by agent launches from
 /// BEFORE per-launch temp isolation shipped. Read-only.
 #[cfg_attr(feature = "tauri-runtime", tauri::command)]
-pub async fn acp_scan_leaked_temp(
-) -> Result<crate::acp::temp_reclaim::LeakedTempScan, AcpError> {
+pub async fn acp_scan_leaked_temp() -> Result<crate::acp::temp_reclaim::LeakedTempScan, AcpError> {
     tokio::task::spawn_blocking(crate::acp::temp_reclaim::scan)
         .await
         .map_err(|e| AcpError::protocol(e.to_string()))
@@ -18429,7 +18438,11 @@ model = "gpt"
     /// each of these assertions is the difference between a working agent and a
     /// user whose every provider silently vanished.
     fn assert_valid_cline_provider_store(root: &serde_json::Value) {
-        assert_eq!(root["version"], serde_json::json!(1), "version is a zod literal");
+        assert_eq!(
+            root["version"],
+            serde_json::json!(1),
+            "version is a zod literal"
+        );
         assert!(root["modes"].is_object(), "`modes` must be an object");
         for (id, entry) in root["providers"].as_object().expect("providers object") {
             let token_source = entry["tokenSource"].as_str().unwrap_or_default();
@@ -18566,7 +18579,10 @@ model = "gpt"
             root["providers"]["deepseek"]["settings"]["reasoning"]["effort"],
             "high"
         );
-        assert_eq!(root["providers"]["deepseek"]["settings"]["apiKey"], "sk-rotated");
+        assert_eq!(
+            root["providers"]["deepseek"]["settings"]["apiKey"],
+            "sk-rotated"
+        );
         assert_eq!(root["lastUsedProvider"], "deepseek");
     }
 
@@ -18574,13 +18590,27 @@ model = "gpt"
     fn cline_save_clears_a_field_the_panel_emptied() {
         let store = ClineStore::new();
         store
-            .save("openai-native", Some("sk-a"), Some("gpt-5.4"), Some("https://a.example/v1"))
+            .save(
+                "openai-native",
+                Some("sk-a"),
+                Some("gpt-5.4"),
+                Some("https://a.example/v1"),
+            )
             .expect("save");
-        store.save("openai-native", Some("sk-a"), None, None).expect("save 2");
+        store
+            .save("openai-native", Some("sk-a"), None, None)
+            .expect("save 2");
 
-        let settings = read_cline_json(&store.providers)["providers"]["openai-native"]["settings"].clone();
-        assert!(settings.get("model").is_none(), "cleared model must be removed");
-        assert!(settings.get("baseUrl").is_none(), "cleared base URL must be removed");
+        let settings =
+            read_cline_json(&store.providers)["providers"]["openai-native"]["settings"].clone();
+        assert!(
+            settings.get("model").is_none(),
+            "cleared model must be removed"
+        );
+        assert!(
+            settings.get("baseUrl").is_none(),
+            "cleared base URL must be removed"
+        );
     }
 
     #[test]
@@ -18604,7 +18634,9 @@ model = "gpt"
         )
         .expect("seed");
 
-        store.save("openai-codex", Some("sk-x"), None, None).expect("save");
+        store
+            .save("openai-codex", Some("sk-x"), None, None)
+            .expect("save");
         assert_eq!(
             read_cline_json(&store.providers)["providers"]["openai-codex"]["tokenSource"],
             "oauth",
@@ -18633,7 +18665,9 @@ model = "gpt"
         )
         .expect("seed");
 
-        store.save("deepseek", Some("sk-x"), None, None).expect("save");
+        store
+            .save("deepseek", Some("sk-x"), None, None)
+            .expect("save");
         // Round-tripping the out-of-enum value would hand cline a file it reads
         // as empty — every provider gone, endpoint and key with it.
         assert_valid_cline_provider_store(&read_cline_json(&store.providers));
@@ -18675,16 +18709,29 @@ model = "gpt"
     fn cline_models_catalog_keeps_models_registered_elsewhere() {
         let store = ClineStore::new();
         store
-            .save("openai-compatible", Some("sk"), Some("first"), Some("https://a.example/v1"))
+            .save(
+                "openai-compatible",
+                Some("sk"),
+                Some("first"),
+                Some("https://a.example/v1"),
+            )
             .expect("save");
         store
-            .save("openai-compatible", Some("sk"), Some("second"), Some("https://b.example/v1"))
+            .save(
+                "openai-compatible",
+                Some("sk"),
+                Some("second"),
+                Some("https://b.example/v1"),
+            )
             .expect("save 2");
 
         let entry = read_cline_json(&store.models)["providers"]["openai-compatible"].clone();
         assert_eq!(entry["provider"]["defaultModelId"], "second");
         assert_eq!(entry["provider"]["baseUrl"], "https://b.example/v1");
-        assert!(entry["models"]["first"].is_object(), "earlier model stays selectable");
+        assert!(
+            entry["models"]["first"].is_object(),
+            "earlier model stays selectable"
+        );
         assert!(entry["models"]["second"].is_object());
     }
 
@@ -18706,16 +18753,28 @@ model = "gpt"
         );
 
         store
-            .save("openai-compatible", Some("sk"), Some("m"), Some("http://127.0.0.1:11434/v1"))
+            .save(
+                "openai-compatible",
+                Some("sk"),
+                Some("m"),
+                Some("http://127.0.0.1:11434/v1"),
+            )
             .expect("a plain-http loopback endpoint is legitimate");
     }
 
     #[test]
     fn cline_reader_picks_the_last_used_provider() {
         let store = ClineStore::new();
-        store.save("deepseek", Some("sk-deep"), Some("deepseek-chat"), None).expect("save");
         store
-            .save("openai-compatible", Some("sk-compat"), Some("m"), Some("https://a.example/v1"))
+            .save("deepseek", Some("sk-deep"), Some("deepseek-chat"), None)
+            .expect("save");
+        store
+            .save(
+                "openai-compatible",
+                Some("sk-compat"),
+                Some("m"),
+                Some("https://a.example/v1"),
+            )
             .expect("save 2");
 
         let loaded = load_cline_provider_settings_at(&store.providers).expect("load");
@@ -18788,7 +18847,10 @@ model = "gpt"
             "model": "my-model",
             "apiBaseUrl": "https://proxy.example/v1",
         }));
-        assert_eq!(env.get("CLINE_API_KEY").map(String::as_str), Some("sk-test"));
+        assert_eq!(
+            env.get("CLINE_API_KEY").map(String::as_str),
+            Some("sk-test")
+        );
         assert_eq!(
             env.get("CLINE_PROVIDER").map(String::as_str),
             Some("openai-compatible"),
@@ -18798,7 +18860,10 @@ model = "gpt"
         // The endpoint travels in providers.json — `CLINE_API_BASE_URL` is
         // cline's ACCOUNT service and must never receive an LLM endpoint.
         assert!(!env.contains_key("CLINE_API_BASE_URL"));
-        assert!(!env.contains_key("OPENAI_API_KEY"), "the cline key must not leak into OPENAI_*");
+        assert!(
+            !env.contains_key("OPENAI_API_KEY"),
+            "the cline key must not leak into OPENAI_*"
+        );
     }
 
     #[test]
@@ -18991,7 +19056,10 @@ model = "gpt"
         }));
         // Ollama has no API key, but the gate only tests the var for emptiness.
         assert_eq!(env.get("CLINE_API_KEY").map(String::as_str), Some("local"));
-        assert_eq!(env.get("CLINE_PROVIDER").map(String::as_str), Some("ollama"));
+        assert_eq!(
+            env.get("CLINE_PROVIDER").map(String::as_str),
+            Some("ollama")
+        );
     }
 
     #[test]
@@ -19014,6 +19082,9 @@ model = "gpt"
             Some(&setting),
             Some(&serde_json::json!({ "apiProvider": "deepseek", "apiKey": "sk" }).to_string()),
         );
-        assert_eq!(env.get("CLINE_PROVIDER").map(String::as_str), Some("cline-pass"));
+        assert_eq!(
+            env.get("CLINE_PROVIDER").map(String::as_str),
+            Some("cline-pass")
+        );
     }
 }

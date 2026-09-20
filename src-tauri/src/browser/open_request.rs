@@ -75,7 +75,10 @@ impl OpenRequests {
         Self::default()
     }
 
-    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<String, tokio::sync::oneshot::Sender<Option<String>>>> {
+    fn lock(
+        &self,
+    ) -> std::sync::MutexGuard<'_, HashMap<String, tokio::sync::oneshot::Sender<Option<String>>>>
+    {
         self.pending
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())

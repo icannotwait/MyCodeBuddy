@@ -13,11 +13,13 @@ use std::ptr::NonNull;
 use block2::RcBlock;
 use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, NSObject, NSObjectProtocol, ProtocolObject, Sel};
-use objc2::{define_class, msg_send, sel, DeclaredClass, MainThreadMarker, MainThreadOnly, Message};
+use objc2::{
+    define_class, msg_send, sel, DeclaredClass, MainThreadMarker, MainThreadOnly, Message,
+};
 use objc2_app_kit::{NSBitmapImageFileType, NSBitmapImageRep, NSImage, NSImageCompressionFactor};
 use objc2_foundation::{
-    ns_string, NSArray, NSDate, NSDictionary, NSError, NSNumber, NSProcessInfo, NSString, NSURL,
-    NSURLErrorFailingURLErrorKey, NSUUID,
+    ns_string, NSArray, NSDate, NSDictionary, NSError, NSNumber, NSProcessInfo, NSString,
+    NSURLErrorFailingURLErrorKey, NSURL, NSUUID,
 };
 use objc2_web_kit::{
     WKContentWorld, WKFindConfiguration, WKFindResult, WKNavigation, WKNavigationAction,
@@ -127,13 +129,14 @@ pub fn install_world(
                 ns_string!("codegBrowser"),
             );
             for source in scripts {
-                let script = WKUserScript::initWithSource_injectionTime_forMainFrameOnly_inContentWorld(
-                    mtm.alloc(),
-                    &NSString::from_str(source),
-                    WKUserScriptInjectionTime::AtDocumentStart,
-                    false,
-                    &world,
-                );
+                let script =
+                    WKUserScript::initWithSource_injectionTime_forMainFrameOnly_inContentWorld(
+                        mtm.alloc(),
+                        &NSString::from_str(source),
+                        WKUserScriptInjectionTime::AtDocumentStart,
+                        false,
+                        &world,
+                    );
                 controller.addUserScript(&script);
             }
             add_page_scripts(&controller, page_scripts, mtm);
@@ -273,7 +276,11 @@ pub fn snapshot_jpeg(
 
 /// # Safety
 /// Main thread, live image.
-unsafe fn encode_jpeg(image: &NSImage, quality: f64, mtm: MainThreadMarker) -> Result<(Vec<u8>, u32, u32), String> {
+unsafe fn encode_jpeg(
+    image: &NSImage,
+    quality: f64,
+    mtm: MainThreadMarker,
+) -> Result<(Vec<u8>, u32, u32), String> {
     let cg = image
         .CGImageForProposedRect_context_hints(std::ptr::null_mut(), None, None)
         .ok_or_else(|| "snapshot has no bitmap".to_string())?;
@@ -343,10 +350,11 @@ pub fn find_string(
 ) -> Result<(), String> {
     let mtm = mtm()?;
     let wk = webview.webview();
-    let block = RcBlock::<dyn Fn(NonNull<WKFindResult>)>::new(move |result: NonNull<WKFindResult>| {
-        // SAFETY: WebKit hands us a live result for the duration of the call.
-        callback(unsafe { result.as_ref().matchFound() });
-    });
+    let block =
+        RcBlock::<dyn Fn(NonNull<WKFindResult>)>::new(move |result: NonNull<WKFindResult>| {
+            // SAFETY: WebKit hands us a live result for the duration of the call.
+            callback(unsafe { result.as_ref().matchFound() });
+        });
     // SAFETY: main thread, live webview.
     unsafe {
         let configuration = WKFindConfiguration::new(mtm);
@@ -408,7 +416,11 @@ pub fn stop_loading(webview: &wry::WebView) {
 pub fn current_url(webview: &wry::WebView) -> Option<String> {
     let wk = WebViewExtMacOS::webview(webview);
     // SAFETY: main thread; WebKit hands back an owned NSURL / NSString.
-    unsafe { wk.URL().and_then(|u| u.absoluteString()).map(|s| s.to_string()) }
+    unsafe {
+        wk.URL()
+            .and_then(|u| u.absoluteString())
+            .map(|s| s.to_string())
+    }
 }
 
 /// `WKWebView.isLoading`. wry has no navigation-failure callback, so this is
@@ -495,8 +507,7 @@ pub fn open_devtools(webview: &wry::WebView) -> bool {
 /// open, because WebKit reports its closing no other way.
 pub fn devtools_visible(webview: &wry::WebView) -> bool {
     with_inspector(webview, |inspector| unsafe {
-        let can_ask: bool =
-            objc2::msg_send![inspector, respondsToSelector: objc2::sel!(isVisible)];
+        let can_ask: bool = objc2::msg_send![inspector, respondsToSelector: objc2::sel!(isVisible)];
         can_ask && objc2::msg_send![inspector, isVisible]
     })
     .unwrap_or(false)
@@ -542,7 +553,12 @@ pub fn debug_view(webview: &wry::WebView) -> serde_json::Value {
             wk.isHiddenOrHasHiddenAncestor(),
             wk.window().is_some(),
             wk.superview().is_some(),
-            [frame.origin.x, frame.origin.y, frame.size.width, frame.size.height],
+            [
+                frame.origin.x,
+                frame.origin.y,
+                frame.size.width,
+                frame.size.height,
+            ],
             wk.isLoading(),
             wk.URL().is_some(),
         )
@@ -840,7 +856,10 @@ fn apply_user_agent(webview: &WKWebView, url: &tauri::Url) {
 }
 
 /// Wrap the webview's navigation delegate. Idempotent per webview.
-pub fn install_navigation_delegate(webview: &wry::WebView, sink: NavigationSink) -> Result<(), String> {
+pub fn install_navigation_delegate(
+    webview: &wry::WebView,
+    sink: NavigationSink,
+) -> Result<(), String> {
     let mtm = mtm()?;
     let wk = webview.webview();
     let key = Retained::as_ptr(&wk) as usize;
@@ -944,7 +963,10 @@ fn profile_is_isolated(profile_id: &str) -> bool {
 /// A `WKWebViewConfiguration` whose data store is the profile's. Every regular
 /// tab is built from one; popups inherit their opener's instead (and with it
 /// the opener's profile).
-pub fn profile_configuration(mtm: MainThreadMarker, profile_id: &str) -> Retained<WKWebViewConfiguration> {
+pub fn profile_configuration(
+    mtm: MainThreadMarker,
+    profile_id: &str,
+) -> Retained<WKWebViewConfiguration> {
     let store = profile_store(mtm, profile_id);
     // SAFETY: main thread; both objects are live.
     unsafe {
@@ -1071,7 +1093,13 @@ pub fn remove_profile_store(
         done(result);
     });
     // SAFETY: main thread; a valid identifier and a live block.
-    unsafe { WKWebsiteDataStore::removeDataStoreForIdentifier_completionHandler(&identifier, &handler, mtm) };
+    unsafe {
+        WKWebsiteDataStore::removeDataStoreForIdentifier_completionHandler(
+            &identifier,
+            &handler,
+            mtm,
+        )
+    };
     Ok(())
 }
 
@@ -1087,29 +1115,31 @@ pub fn clear_shared_store_except_app(done: impl Fn() + 'static) -> Result<(), St
     let done = std::rc::Rc::new(done);
     let removing_store = store.clone();
     let removing_types = types.clone();
-    let fetched = RcBlock::new(move |records: std::ptr::NonNull<NSArray<WKWebsiteDataRecord>>| {
-        // SAFETY: WebKit passes a live array on the main thread.
-        let records = unsafe { records.as_ref() };
-        let victims: Vec<Retained<WKWebsiteDataRecord>> = records
-            .iter()
-            .filter(|record| {
-                // SAFETY: live record.
-                let name = unsafe { record.displayName() };
-                !is_app_origin(&name.to_string())
-            })
-            .collect();
-        let victims = NSArray::from_retained_slice(&victims);
-        let done = done.clone();
-        let finished = RcBlock::new(move || done());
-        // SAFETY: main thread; all three arguments are live.
-        unsafe {
-            removing_store.removeDataOfTypes_forDataRecords_completionHandler(
-                &removing_types,
-                &victims,
-                &finished,
-            );
-        }
-    });
+    let fetched = RcBlock::new(
+        move |records: std::ptr::NonNull<NSArray<WKWebsiteDataRecord>>| {
+            // SAFETY: WebKit passes a live array on the main thread.
+            let records = unsafe { records.as_ref() };
+            let victims: Vec<Retained<WKWebsiteDataRecord>> = records
+                .iter()
+                .filter(|record| {
+                    // SAFETY: live record.
+                    let name = unsafe { record.displayName() };
+                    !is_app_origin(&name.to_string())
+                })
+                .collect();
+            let victims = NSArray::from_retained_slice(&victims);
+            let done = done.clone();
+            let finished = RcBlock::new(move || done());
+            // SAFETY: main thread; all three arguments are live.
+            unsafe {
+                removing_store.removeDataOfTypes_forDataRecords_completionHandler(
+                    &removing_types,
+                    &victims,
+                    &finished,
+                );
+            }
+        },
+    );
     // SAFETY: main thread.
     unsafe { store.fetchDataRecordsOfTypes_completionHandler(&types, &fetched) };
     Ok(())
@@ -1122,16 +1152,18 @@ pub fn default_store_record_names(done: impl Fn(Vec<String>) + 'static) -> Resul
     // SAFETY: main thread; WebKit owns the store.
     let store = unsafe { WKWebsiteDataStore::defaultDataStore(mtm) };
     let types = unsafe { WKWebsiteDataStore::allWebsiteDataTypes(mtm) };
-    let fetched = RcBlock::new(move |records: std::ptr::NonNull<NSArray<WKWebsiteDataRecord>>| {
-        // SAFETY: WebKit passes a live array on the main thread.
-        let records = unsafe { records.as_ref() };
-        let names = records
-            .iter()
-            // SAFETY: live record.
-            .map(|record| unsafe { record.displayName() }.to_string())
-            .collect();
-        done(names);
-    });
+    let fetched = RcBlock::new(
+        move |records: std::ptr::NonNull<NSArray<WKWebsiteDataRecord>>| {
+            // SAFETY: WebKit passes a live array on the main thread.
+            let records = unsafe { records.as_ref() };
+            let names = records
+                .iter()
+                // SAFETY: live record.
+                .map(|record| unsafe { record.displayName() }.to_string())
+                .collect();
+            done(names);
+        },
+    );
     // SAFETY: main thread.
     unsafe { store.fetchDataRecordsOfTypes_completionHandler(&types, &fetched) };
     Ok(())
@@ -1187,9 +1219,15 @@ mod network {
         let (create_host, create_socks5, create_http_connect, add_excluded_domain) = unsafe {
             (
                 std::mem::transmute::<*mut c_void, CreateHost>(symbol("nw_endpoint_create_host")?),
-                std::mem::transmute::<*mut c_void, CreateSocks5>(symbol("nw_proxy_config_create_socksv5")?),
-                std::mem::transmute::<*mut c_void, CreateHttpConnect>(symbol("nw_proxy_config_create_http_connect")?),
-                std::mem::transmute::<*mut c_void, AddExcludedDomain>(symbol("nw_proxy_config_add_excluded_domain")?),
+                std::mem::transmute::<*mut c_void, CreateSocks5>(symbol(
+                    "nw_proxy_config_create_socksv5",
+                )?),
+                std::mem::transmute::<*mut c_void, CreateHttpConnect>(symbol(
+                    "nw_proxy_config_create_http_connect",
+                )?),
+                std::mem::transmute::<*mut c_void, AddExcludedDomain>(symbol(
+                    "nw_proxy_config_add_excluded_domain",
+                )?),
             )
         };
         let host = CString::new(proxy.host.as_str()).map_err(|e| format!("proxy host: {e}"))?;
@@ -1198,7 +1236,12 @@ mod network {
         // (+1), which `Retained::from_raw` takes over.
         unsafe {
             let endpoint = Retained::from_raw(create_host(host.as_ptr(), port.as_ptr()))
-                .ok_or_else(|| format!("cannot describe proxy endpoint {}:{}", proxy.host, proxy.port))?;
+                .ok_or_else(|| {
+                    format!(
+                        "cannot describe proxy endpoint {}:{}",
+                        proxy.host, proxy.port
+                    )
+                })?;
             let endpoint_ptr = Retained::as_ptr(&endpoint) as *mut NSObject;
             let config = match proxy.scheme {
                 ProxyScheme::Http => create_http_connect(endpoint_ptr, std::ptr::null_mut()),

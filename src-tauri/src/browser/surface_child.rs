@@ -41,15 +41,15 @@ use super::hooks;
 use super::policy::{self, BrowserPolicy};
 use super::profile;
 use super::registry::{BrowserRegistry, BrowserTab};
+#[cfg(target_os = "macos")]
+use super::shim::macos as shim;
+#[cfg(target_os = "windows")]
+use super::shim::windows as shim;
 use super::surface::BrowserSurface;
 use super::types::{
     Bounds, BrowserOpenRequestPayload, BrowserPopupPayload, BrowserTabState, ChannelKind,
     NavigationBlockReason, PopupPresentation, SurfaceKind, TabKind,
 };
-#[cfg(target_os = "macos")]
-use super::shim::macos as shim;
-#[cfg(target_os = "windows")]
-use super::shim::windows as shim;
 
 thread_local! {
     static SURFACES: RefCell<HashMap<String, wry::WebView>> = RefCell::new(HashMap::new());
@@ -116,10 +116,12 @@ fn tab_id_for_webview(pointer: usize) -> Option<String> {
 /// an adopted popup shares its opener's user-content controller (macOS).
 fn message_sink(app: &AppHandle) -> MessageSink {
     let app = app.clone();
-    Arc::new(move |raw, main_frame, source| match tab_id_for_webview(source) {
-        Some(tab_id) => channel::handle_message(&app, &tab_id, raw, main_frame),
-        None => tracing::debug!("[browser] channel message from an unknown webview dropped"),
-    })
+    Arc::new(
+        move |raw, main_frame, source| match tab_id_for_webview(source) {
+            Some(tab_id) => channel::handle_message(&app, &tab_id, raw, main_frame),
+            None => tracing::debug!("[browser] channel message from an unknown webview dropped"),
+        },
+    )
 }
 
 /// Main thread only. Hook the engine's navigation reporting so failures and
@@ -230,14 +232,12 @@ fn download_permission_sink(
         // The engine's own reading of "the user asked for this" counts too:
         // it is all a tab with no page channel has, since a gesture reaches
         // the ring through the channel.
-        let gesture = app
-            .try_state::<BrowserRegistry>()
-            .is_some_and(|registry| {
-                registry
-                    .recent_gestures(&id)
-                    .iter()
-                    .any(|g| g.received.elapsed() <= DOWNLOAD_GESTURE_WINDOW)
-            });
+        let gesture = app.try_state::<BrowserRegistry>().is_some_and(|registry| {
+            registry
+                .recent_gestures(&id)
+                .iter()
+                .any(|g| g.received.elapsed() <= DOWNLOAD_GESTURE_WINDOW)
+        });
         if gesture || user_initiated {
             tracing::info!(
                 "[browser] tab {id}: several downloads from {url} allowed (gesture {gesture}, engine {user_initiated})"
@@ -668,7 +668,8 @@ fn document_protocol(
     tab_id: &str,
     label: &str,
     grant: Arc<DocGrant>,
-) -> impl Fn(wry::WebViewId<'_>, wry::http::Request<Vec<u8>>, wry::RequestAsyncResponder) + 'static {
+) -> impl Fn(wry::WebViewId<'_>, wry::http::Request<Vec<u8>>, wry::RequestAsyncResponder) + 'static
+{
     let app = app.clone();
     let tab_id = tab_id.to_string();
     let label = label.to_string();
@@ -709,7 +710,9 @@ fn document_protocol(
                             continue;
                         };
                         if let Err(err) = surface.reload() {
-                            tracing::warn!("[browser] document {id}: reload after reset failed: {err}");
+                            tracing::warn!(
+                                "[browser] document {id}: reload after reset failed: {err}"
+                            );
                         } else {
                             hooks::begin_load(&app, &id);
                         }
@@ -773,13 +776,23 @@ fn configure_child<'a>(
                     GuestNavigation::Allow => true,
                     GuestNavigation::External => {
                         if main_frame {
-                            hooks::navigation_blocked(&nav_app, &nav_id, &url, NavigationBlockReason::External);
+                            hooks::navigation_blocked(
+                                &nav_app,
+                                &nav_id,
+                                &url,
+                                NavigationBlockReason::External,
+                            );
                         }
                         false
                     }
                     GuestNavigation::Scheme => {
                         if main_frame {
-                            hooks::navigation_blocked(&nav_app, &nav_id, &url, NavigationBlockReason::Scheme);
+                            hooks::navigation_blocked(
+                                &nav_app,
+                                &nav_id,
+                                &url,
+                                NavigationBlockReason::Scheme,
+                            );
                         }
                         false
                     }
@@ -792,7 +805,12 @@ fn configure_child<'a>(
             };
             if !scheme_ok {
                 if main_frame {
-                    hooks::navigation_blocked(&nav_app, &nav_id, &url, NavigationBlockReason::Scheme);
+                    hooks::navigation_blocked(
+                        &nav_app,
+                        &nav_id,
+                        &url,
+                        NavigationBlockReason::Scheme,
+                    );
                 } else {
                     tracing::debug!("[browser] tab {nav_id} blocked frame navigation to {url}");
                 }
@@ -805,7 +823,12 @@ fn configure_child<'a>(
                 .is_some_and(|policy| policy.blocked(&parsed))
             {
                 if main_frame {
-                    hooks::navigation_blocked(&nav_app, &nav_id, &url, NavigationBlockReason::HostRule);
+                    hooks::navigation_blocked(
+                        &nav_app,
+                        &nav_id,
+                        &url,
+                        NavigationBlockReason::HostRule,
+                    );
                 }
                 return false;
             }
@@ -864,7 +887,12 @@ fn configure_child<'a>(
                     super::downloads::finished(&app, &url, path, success)
                 }
             })
-            .with_new_window_req_handler(new_window_handler(app.clone(), owner.clone(), tab_id.to_string(), profile.to_string())),
+            .with_new_window_req_handler(new_window_handler(
+                app.clone(),
+                owner.clone(),
+                tab_id.to_string(),
+                profile.to_string(),
+            )),
         ChildKind::Document(grant) => builder
             // A document does not download and does not open windows: both
             // are refused and reported, and a web address a `window.open`
@@ -967,7 +995,18 @@ pub fn create(
     let profile = profile.to_string();
     run_on_main(&app.clone(), move || -> Result<(), String> {
         let kind = ChildKind::Page;
-        let webview = build_child(&app, &owner, &id, &label, bounds, !background, devtools, None, &kind, &profile)?;
+        let webview = build_child(
+            &app,
+            &owner,
+            &id,
+            &label,
+            bounds,
+            !background,
+            devtools,
+            None,
+            &kind,
+            &profile,
+        )?;
         attach_navigation_delegate(&app, &id, &kind, &webview);
         SURFACES.with(|s| s.borrow_mut().insert(id, webview));
         Ok(())
@@ -1003,7 +1042,18 @@ pub fn create_document(
         let kind = ChildKind::Document(grant);
         // A guest's store is its own (non-persistent); the profile only names
         // the WebView2 environment it would share on Windows.
-        let webview = build_child(&app, &owner, &id, &label, bounds, !background, devtools, None, &kind, profile::DEFAULT_PROFILE_ID)?;
+        let webview = build_child(
+            &app,
+            &owner,
+            &id,
+            &label,
+            bounds,
+            !background,
+            devtools,
+            None,
+            &kind,
+            profile::DEFAULT_PROFILE_ID,
+        )?;
         attach_navigation_delegate(&app, &id, &kind, &webview);
         SURFACES.with(|s| s.borrow_mut().insert(id, webview));
         Ok(())
@@ -1012,7 +1062,13 @@ pub fn create_document(
     Ok(handle)
 }
 
-fn deny(app: &AppHandle, opener_tab_id: &str, url: &str, features: &NewWindowFeatures, reason: &str) -> NewWindowResponse {
+fn deny(
+    app: &AppHandle,
+    opener_tab_id: &str,
+    url: &str,
+    features: &NewWindowFeatures,
+    reason: &str,
+) -> NewWindowResponse {
     tracing::info!("[browser] tab {opener_tab_id}: new-window request for {url} denied ({reason})");
     events::emit_popup(
         app,
@@ -1071,7 +1127,9 @@ fn new_window_handler(
             let tab_id = loop {
                 let seq = POPUP_SEQ.fetch_add(1, Ordering::SeqCst) + 1;
                 let candidate = format!("{opener_tab_id}-p{seq}");
-                if !registry.contains(&candidate) && !SURFACES.with(|s| s.borrow().contains_key(&candidate)) {
+                if !registry.contains(&candidate)
+                    && !SURFACES.with(|s| s.borrow().contains_key(&candidate))
+                {
                     break candidate;
                 }
             };
@@ -1096,7 +1154,18 @@ fn new_window_handler(
                 return deny(&app, &opener_tab_id, &url, &features, "profile-deleting");
             };
             let kind = ChildKind::Page;
-            let webview = match build_child(&app, &owner, &tab_id, &label, bounds, true, devtools, Some(configuration), &kind, &profile) {
+            let webview = match build_child(
+                &app,
+                &owner,
+                &tab_id,
+                &label,
+                bounds,
+                true,
+                devtools,
+                Some(configuration),
+                &kind,
+                &profile,
+            ) {
                 Ok(webview) => webview,
                 Err(err) => {
                     tracing::warn!("[browser] popup webview creation failed: {err}");

@@ -256,11 +256,11 @@ impl BrowserSurface {
         done: impl FnOnce(Result<(), PointerFailure>) + Send + 'static,
     ) -> Result<(), SurfaceError> {
         per_surface!(self,
-            child: |c| Ok(c.dispatch_pointer(gesture, done)?),
-            window: |_w| {
-                let _ = (gesture, done);
-                Err(SurfaceError("this surface delivers no trusted input".into()))
-            })
+        child: |c| Ok(c.dispatch_pointer(gesture, done)?),
+        window: |_w| {
+            let _ = (gesture, done);
+            Err(SurfaceError("this surface delivers no trusted input".into()))
+        })
     }
 
     pub fn snapshot_png(
