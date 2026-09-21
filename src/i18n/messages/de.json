@@ -6650,8 +6650,8 @@
     },
     "browserEval": {
       "label": "Code im integrierten Browser ausführen",
-      "short": "Führt eigenen Code auf einer freigegebenen Seite aus — Sie genehmigen jeden Schnipsel.",
-      "hint": "Erlaubt Agenten, eigenes JavaScript auf einer von dir geteilten Seite auszuführen. Standardmäßig aus und nur zusammen mit dem Schalter darüber. Jeder Codeausschnitt wird dir gezeigt und einzeln bestätigt – automatisch geht das nicht."
+      "short": "Führt eigenen Code auf einer freigegebenen Seite aus — ohne Nachfrage.",
+      "hint": "Erlaubt Agenten, eigenes JavaScript auf einer von dir geteilten Seite auszuführen. Standardmäßig aus und nur zusammen mit dem Schalter darüber. Einschalten heißt, dass Codeausschnitte ohne Nachfrage laufen – die Entscheidung fällt also an diesem Schalter; unter Einstellungen → Integrierter Browser kannst du dir stattdessen jeden Ausschnitt zeigen lassen."
     },
     "automations": {
       "label": "Automatisierungen erstellen",
@@ -6750,7 +6750,11 @@
     "profileDeleteFailed": "Das Profil konnte nicht gelöscht werden: {message}",
     "clearConfirmDescriptionProfile": "Cookies, Caches und Website-Daten des Profils {name} werden entfernt. Offene Tabs bleiben offen, aber du wirst bei Websites abgemeldet.",
     "signInUaTitle": "Kompatibilität mit der Google-Anmeldung",
-    "signInUaHint": "Google verweigert die Anmeldung aus eingebetteten Browsern. Wenn eingeschaltet, geben sich Tabs nur gegenüber Googles Anmeldeseiten (accounts.google.com) als Firefox aus; überall sonst geben sie sich als die Engine aus, in der sie laufen, nie als Firefox. Nur in eingebetteten Tabs, nicht im separaten Fenster; leitet eine Anmeldeseite auf eine andere Website weiter, trägt die erste Anfrage dort noch die Anmeldekennung."
+    "signInUaHint": "Google verweigert die Anmeldung aus eingebetteten Browsern. Wenn eingeschaltet, geben sich Tabs nur gegenüber Googles Anmeldeseiten (accounts.google.com) als Firefox aus; überall sonst geben sie sich als die Engine aus, in der sie laufen, nie als Firefox. Nur in eingebetteten Tabs, nicht im separaten Fenster; leitet eine Anmeldeseite auf eine andere Website weiter, trägt die erste Anfrage dort noch die Anmeldekennung.",
+    "evalApprovalTitle": "Code auf einer Seite ausführen",
+    "evalApprovalHint": "Was passiert, wenn ein Agent eigenes JavaScript auf einer mit „Lesen und bedienen“ geteilten Seite ausführen will. Es läuft, ohne Nachfrage – entschieden wird das am Schalter „Code im integrierten Browser ausführen“, der aus ist, bis du ihn einschaltest, und an der Freigabestufe der Seite; jede Ausführung steht in der Agent-Aktivität dieses Tabs. „Jedes Mal fragen“ zeigt dir jeden Ausschnitt vollständig und wartet auf eine Antwort.",
+    "evalApprovalAsk": "Jedes Mal fragen",
+    "evalApprovalSilent": "Ohne Nachfrage ausführen"
   },
   "Browser": {
     "toolbar": {
@@ -6959,7 +6963,7 @@
         "description": "Ein Agent möchte JavaScript auf dieser Seite ausführen. Er kann alles lesen und ändern, was du auf {site} kannst.",
         "descriptionWithTitle": "Ein Agent möchte JavaScript auf „{title}“ ausführen. Er kann alles lesen und ändern, was du auf {site} kannst.",
         "codeLabel": "Der Code, der ausgeführt wird",
-        "everyTime": "Du wirst bei jedem Ausschnitt erneut gefragt – diese Freigabe gilt nicht für den nächsten.",
+        "everyTime": "Du wirst bei jedem Ausschnitt erneut gefragt – diese Freigabe gilt nicht für den nächsten. Ob überhaupt gefragt wird, legst du unter Einstellungen → Integrierter Browser fest.",
         "allow": "Einmal ausführen",
         "deny": "Nicht ausführen"
       }
