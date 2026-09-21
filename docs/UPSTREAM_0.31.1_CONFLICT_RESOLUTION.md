@@ -134,3 +134,16 @@ cargo clippy --no-default-features --features server --bin codeg-server --lib --
 - `tools/list` 正好 6 个父工具名。
 - `lib.rs` 没有生产路径内联 `tauri::generate_handler![`（宏内部那一次除外）。
 - 无 `<<<<<<<` / `=======` / `>>>>>>>`。
+
+---
+
+## 8. 合入后验证收口（不是冲突块）
+
+`<<<<<<<` 清零之后、`pnpm test:release` / `cargo fmt --check` 才暴露：
+
+| 缺口 | 决议 |
+|---|---|
+| `scripts/release-policy.test.mjs` 仍钉 `0.31.0-mycodebuddy.1` / `sync/codeg-0.31.0` | 改成 `0.31.1-mycodebuddy.1` / `sync/codeg-0.31.1` |
+| `install.ps1` 与各 README 的 `.\install.ps1 -Version` 示例 | 跟身份一起升到 `v0.31.1-mycodebuddy.1` |
+| `blank_page.rs` `is_hex_colour` 折行 | `cargo fmt`（上游文件在我们的 rustc/rustfmt 下不过 `--check`） |
+| `windows.rs` MERGE_BOTH import | `cargo fmt` 收成 rustfmt 折行 |

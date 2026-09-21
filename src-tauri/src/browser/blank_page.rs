@@ -47,9 +47,7 @@ static THEME: RwLock<Option<BlankPageTheme>> = RwLock::new(None);
 /// hand-written custom one — can put anything at all in, so it is checked
 /// here rather than trusted.
 fn is_hex_colour(value: &str) -> bool {
-    value.len() == 7
-        && value.starts_with('#')
-        && value[1..].bytes().all(|b| b.is_ascii_hexdigit())
+    value.len() == 7 && value.starts_with('#') && value[1..].bytes().all(|b| b.is_ascii_hexdigit())
 }
 
 /// Record what the blank page should look like. Refuses a colour that is not
