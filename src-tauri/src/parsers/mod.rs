@@ -805,12 +805,15 @@ pub fn fold_reference_links(text: &str) -> String {
     out
 }
 
-/// Derive a conversation title from a user's first message: fold inline
-/// reference links to their labels, then cap the length. Folding first ensures a
-/// `[name](file://<long path>)` mention becomes `name` instead of a raw — and,
-/// once truncated, unterminable — Markdown link.
+/// Derive a conversation title from a user's first message: strip complete
+/// Codeg wire envelopes, fold inline reference links to their labels, then cap
+/// the length. Strip and fold first so a `[name](file://<long path>)` mention
+/// becomes `name` instead of a raw — and, once truncated, unterminable —
+/// Markdown link, and so a 100-char cap cannot leave a half
+/// `<codeg_terminal_context` tag in the sidebar.
 pub fn title_from_user_text(text: &str) -> String {
-    truncate_str(&fold_reference_links(text), 100)
+    let visible = visible_user_text(text).unwrap_or_default();
+    truncate_str(&fold_reference_links(&visible), 100)
 }
 
 /// Exact Codeg version-1 wire envelope for terminal shell context (see
@@ -2451,6 +2454,42 @@ earlier terminal context records.\n\
         let title = title_from_user_text(&long);
         assert_eq!(title.chars().count(), 103); // 100 + "..."
         assert!(title.ends_with("..."));
+    }
+
+    #[test]
+    fn title_from_user_text_strips_terminal_context_before_truncating() {
+        // Titles used to truncate the raw wire prompt, leaving a half-open
+        // `<codeg_terminal_context version="1">` in the sidebar. Strip the
+        // complete envelope first so the cap can only land in user prose.
+        let ctx = concat!(
+            "<codeg_terminal_context version=\"1\">\n",
+            "Selected shell: bash\n",
+            "Dialect: posix\n",
+            "Generate shell command lines using POSIX syntax.\n",
+            "ACP command+args requests may still execute directly.\n",
+            "This context is authoritative for the current connection and supersedes\n",
+            "earlier terminal context records.\n",
+            "</codeg_terminal_context>"
+        );
+        let prose = "请解释这段代码";
+        let persisted = format!("{prose} {ctx}");
+        assert!(
+            persisted.chars().count() > 100,
+            "fixture must exceed the title cap"
+        );
+        let title = title_from_user_text(&persisted);
+        assert_eq!(title, prose);
+        assert!(
+            !title.contains("codeg_terminal_context") && !title.contains("<codeg"),
+            "truncated titles must not keep a half-tag: {title:?}"
+        );
+
+        let partial = format!("{prose} <codeg_terminal_context version=\"1\">\nSelected shell:");
+        let partial_title = title_from_user_text(&partial);
+        assert!(
+            partial_title.contains("<codeg_terminal_context"),
+            "user-authored / truncated-on-disk fragments stay visible: {partial_title:?}"
+        );
     }
 
     #[test]

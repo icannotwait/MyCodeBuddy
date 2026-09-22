@@ -55,7 +55,8 @@ use crate::parsers::expand_home_prefix;
 use crate::parsers::{
     backfill_turn_durations, compute_session_stats, folder_name_from_path,
     infer_context_window_max_tokens, merge_context_window_stats, relocate_orphaned_tool_results,
-    structurize_read_tool_output, title_from_user_text, truncate_str, AgentParser, ParseError,
+    select_unique_recovery_match, structurize_read_tool_output, title_from_user_text, truncate_str,
+    visible_user_text, AgentParser, ParseError, RecoveryQuery,
 };
 
 /// Bound a single tool output / input preview so one enormous step cannot blow
@@ -573,6 +574,18 @@ impl AgentParser for AntigravityParser {
         Ok(conversations)
     }
 
+    fn recover_conversation(
+        &self,
+        query: &RecoveryQuery<'_>,
+        accept: &dyn Fn(&ConversationSummary) -> bool,
+    ) -> Result<Option<ConversationDetail>, ParseError> {
+        let summaries = self.list_conversations()?;
+        let Some(winner) = select_unique_recovery_match(&summaries, query, accept) else {
+            return Ok(None);
+        };
+        self.get_conversation(&winner.id).map(Some)
+    }
+
     fn get_conversation(&self, conversation_id: &str) -> Result<ConversationDetail, ParseError> {
         if !self.db_path(conversation_id).is_file() {
             return Err(ParseError::ConversationNotFound(
@@ -835,7 +848,7 @@ fn project_steps(steps: &[Step]) -> SessionParse {
                 turn_index += 1;
             }
             pending = PendingAssistant::default();
-            let Some(text) = user_input_text(user_input) else {
+            let Some(text) = user_input_text(user_input).and_then(|t| visible_user_text(&t)) else {
                 continue;
             };
             parsed
@@ -2076,5 +2089,135 @@ mod tests {
             &blocks[1],
             ContentBlock::ToolResult { output_preview: Some(out), .. } if out.contains("a.txt")
         ));
+    }
+
+    fn test_codeg_terminal_context() -> String {
+        "<codeg_terminal_context version=\"1\">\n\
+Selected shell: bash\n\
+Dialect: posix\n\
+Generate shell command lines using POSIX syntax.\n\
+ACP command+args requests may still execute directly.\n\
+This context is authoritative for the current connection and supersedes\n\
+earlier terminal context records.\n\
+</codeg_terminal_context>"
+            .to_string()
+    }
+
+    fn user_turn_texts(detail: &crate::models::ConversationDetail) -> Vec<String> {
+        detail
+            .turns
+            .iter()
+            .filter(|t| matches!(t.role, TurnRole::User))
+            .flat_map(|t| t.blocks.iter())
+            .filter_map(|b| match b {
+                ContentBlock::Text { text } => Some(text.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn user_step(seconds: i64, query: &str) -> Step {
+        Step {
+            metadata: Some(StepMetadata {
+                created_at: ts(seconds),
+                ..Default::default()
+            }),
+            user_input: Some(UserInput {
+                query: query.to_string(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn hides_codeg_terminal_context_from_history_and_title() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = test_codeg_terminal_context();
+        let real_plus = format!("real prompt\n\n{ctx}");
+        write_steps(
+            dir.path(),
+            "agy-term",
+            &[
+                user_step(1_700_000_000, &ctx),
+                user_step(1_700_000_001, &real_plus),
+                user_step(
+                    1_700_000_002,
+                    "<codeg_terminal_context version=\"1\">partial",
+                ),
+                Step {
+                    metadata: Some(StepMetadata {
+                        created_at: ts(1_700_000_010),
+                        ..Default::default()
+                    }),
+                    planner_response: Some(PlannerResponse {
+                        response: "ok".into(),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+            ],
+        );
+        std::fs::write(
+            dir.path().join("agy-term.meta"),
+            br#"{"cwd": "/work/proj"}"#,
+        )
+        .unwrap();
+
+        let parser = AntigravityParser::with_base_dir(dir.path().to_path_buf());
+        let detail = parser.get_conversation("agy-term").expect("detail");
+
+        assert_eq!(detail.summary.title.as_deref(), Some("real prompt"));
+        let visible_user_texts = user_turn_texts(&detail);
+        assert!(!visible_user_texts
+            .iter()
+            .any(|text| text.contains("Selected shell:")));
+        assert!(visible_user_texts.iter().any(|text| text == "real prompt"));
+        assert!(visible_user_texts
+            .iter()
+            .any(|text| text.contains("partial")));
+    }
+
+    #[test]
+    fn recover_conversation_picks_cwd_time_winner_for_unbound_row() {
+        // Codeg can leave conversation.external_id NULL after an Antigravity
+        // turn. Reopen must recover the unique cwd+time winner so history
+        // hydrates without a manual DB patch.
+        let dir = tempfile::tempdir().unwrap();
+        write_steps(
+            dir.path(),
+            "agy-real",
+            &[user_step(1_784_000_000, "winner prompt")],
+        );
+        std::fs::write(
+            dir.path().join("agy-real.meta"),
+            br#"{"cwd": "/work/proj"}"#,
+        )
+        .unwrap();
+        write_steps(
+            dir.path(),
+            "agy-far",
+            &[user_step(1_784_000_000 + 20 * 60, "decoy prompt")],
+        );
+        std::fs::write(dir.path().join("agy-far.meta"), br#"{"cwd": "/work/proj"}"#).unwrap();
+
+        let parser = AntigravityParser::with_base_dir(dir.path().to_path_buf());
+        let approx = Utc.timestamp_opt(1_784_000_000, 0).single().unwrap();
+        let query = RecoveryQuery {
+            cwd: "/work/proj",
+            approx,
+            max_skew: chrono::Duration::minutes(5),
+            ambiguity: chrono::Duration::seconds(60),
+        };
+        let recovered = parser
+            .recover_conversation(&query, &|_| true)
+            .expect("recover")
+            .expect("unbound Antigravity row must recover the cwd+time winner");
+        assert_eq!(recovered.summary.id, "agy-real");
+        assert_eq!(recovered.summary.title.as_deref(), Some("winner prompt"));
+        assert!(
+            !recovered.turns.is_empty(),
+            "recovered session must still show the agent-side turns"
+        );
     }
 }

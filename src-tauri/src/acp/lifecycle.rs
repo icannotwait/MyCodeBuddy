@@ -795,10 +795,17 @@ pub(crate) async fn handle_event(
             // ConversationLinked can fire before external_id is on state. Both
             // skip the DB write, leaving `external_id=None` / `message_count=0`
             // so get_folder_conversation cannot find the agent transcript
-            // (Grok ~/.grok/sessions/…, Cursor store, …). By end_turn the
+            // (Grok ~/.grok/sessions/…, Cursor store, Antigravity
+            // ~/.gemini/antigravity-acp/conversations/…). By TurnComplete the
             // live session id is known — persist it now so a post-turn hydrate
-            // can read the final assistant message off disk.
-            if stop_reason.as_str() == "end_turn" {
+            // can read history off disk.
+            //
+            // Bind on every stop reason, not only `end_turn`. Antigravity (and
+            // others) can finish as `empty` / `refusal` / `cancelled` after
+            // `rewrite_end_turn_if_empty`; those turns still have a live ACP
+            // session on disk. Restricting the settle to `end_turn` left
+            // Antigravity rows unbound after an otherwise successful turn.
+            {
                 let (agent_type, live_sid) = {
                     let snap = state_arc.read().await;
                     (snap.agent_type, snap.external_id.clone())
@@ -810,9 +817,9 @@ pub(crate) async fn handle_event(
                     match conversation_service::get_by_id(db_conn, cid).await {
                         Ok(row) if row.external_id.is_none() => {
                             // Bind only. SessionStarted/ConversationLinked use
-                            // persist_live_external_id (upsert). end_turn must
-                            // emit exactly one conversation://changed State
-                            // after CAS — an extra upsert fails the fork
+                            // persist_live_external_id (upsert). TurnComplete
+                            // must emit exactly one conversation://changed
+                            // State after CAS — an extra upsert fails the fork
                             // single-event invariant.
                             if let Err(e) =
                                 bind_live_external_id(db_conn, cid, agent_type, &sid).await
@@ -820,8 +827,9 @@ pub(crate) async fn handle_event(
                                 tracing::warn!(
                                     conversation_id = cid,
                                     session_id = %sid,
+                                    stop_reason = %stop_reason,
                                     error = %e,
-                                    "[lifecycle] end_turn could not bind unbound external_id"
+                                    "[lifecycle] TurnComplete could not bind unbound external_id"
                                 );
                             }
                         }
@@ -830,7 +838,7 @@ pub(crate) async fn handle_event(
                             tracing::warn!(
                                 conversation_id = cid,
                                 error = %e,
-                                "[lifecycle] end_turn skipped unbound-row bind; get_by_id failed"
+                                "[lifecycle] TurnComplete skipped unbound-row bind; get_by_id failed"
                             );
                         }
                     }
@@ -3983,6 +3991,130 @@ mod tests {
             read_row_status(&db, conv.id).await,
             ConversationStatus::PendingReview
         );
+    }
+
+    #[tokio::test]
+    async fn handle_event_end_turn_binds_unbound_antigravity_session() {
+        // Same class as the Grok empty-reopen bug: conversation.external_id
+        // stayed NULL after an Antigravity turn even though
+        // ~/.gemini/antigravity-acp/conversations/<session>.db still had
+        // history. Bind the live ACP session id on end_turn so reopen can
+        // attach without a manual DB patch.
+        let db = test_helpers::fresh_in_memory_db().await;
+        let folder_id = test_helpers::seed_folder(&db, "/tmp/turn-complete-agy-bind").await;
+        let conv =
+            conversation_service::create(&db.conn, folder_id, AgentType::Antigravity, None, None)
+                .await
+                .unwrap();
+        assert!(conv.external_id.is_none());
+
+        let mgr = ConnectionManager::new();
+        {
+            let mut map = mgr.connections.lock().await;
+            let conn = fake_connection_with_state("c-agy", Some(conv.id));
+            conn.state.write().await.agent_type = AgentType::Antigravity;
+            conn.state.write().await.external_id =
+                Some("agy-01a0902e-5e58-7330-baf5-74d8f5b9ea68".into());
+            map.insert("c-agy".to_string(), conn);
+        }
+        let env = EventEnvelope {
+            seq: 1,
+            connection_id: "c-agy".to_string(),
+            payload: AcpEvent::TurnComplete {
+                session_id: "agy-01a0902e-5e58-7330-baf5-74d8f5b9ea68".into(),
+                stop_reason: "end_turn".into(),
+                agent_type: "antigravity".into(),
+                mark_awaiting_reply: true,
+                termination_source: None,
+                provider_turn_id: None,
+            },
+        };
+        handle_event(&db.conn, &mgr, &env, None).await.unwrap();
+        let reloaded = conversation_service::get_by_id(&db.conn, conv.id)
+            .await
+            .unwrap();
+        assert_eq!(
+            reloaded.external_id.as_deref(),
+            Some("agy-01a0902e-5e58-7330-baf5-74d8f5b9ea68")
+        );
+        assert_eq!(
+            read_row_status(&db, conv.id).await,
+            ConversationStatus::PendingReview
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_event_empty_turn_binds_unbound_antigravity_session() {
+        // Antigravity output can miss Codeg's turn-output probe, so
+        // rewrite_end_turn_if_empty rewrites the stop reason to `empty`.
+        // Restricting the settle to `end_turn` left those rows unbound.
+        let db = test_helpers::fresh_in_memory_db().await;
+        let folder_id = test_helpers::seed_folder(&db, "/tmp/turn-empty-agy-bind").await;
+        let conv =
+            conversation_service::create(&db.conn, folder_id, AgentType::Antigravity, None, None)
+                .await
+                .unwrap();
+        assert!(conv.external_id.is_none());
+
+        let mgr = ConnectionManager::new();
+        {
+            let mut map = mgr.connections.lock().await;
+            let conn = fake_connection_with_state("c-agy-empty", Some(conv.id));
+            conn.state.write().await.agent_type = AgentType::Antigravity;
+            conn.state.write().await.external_id = Some("agy-empty-session".into());
+            map.insert("c-agy-empty".to_string(), conn);
+        }
+        let env = EventEnvelope {
+            seq: 1,
+            connection_id: "c-agy-empty".to_string(),
+            payload: AcpEvent::TurnComplete {
+                session_id: "agy-empty-session".into(),
+                stop_reason: "empty".into(),
+                agent_type: "antigravity".into(),
+                mark_awaiting_reply: true,
+                termination_source: None,
+                provider_turn_id: None,
+            },
+        };
+        handle_event(&db.conn, &mgr, &env, None).await.unwrap();
+        let reloaded = conversation_service::get_by_id(&db.conn, conv.id)
+            .await
+            .unwrap();
+        assert_eq!(reloaded.external_id.as_deref(), Some("agy-empty-session"));
+    }
+
+    #[tokio::test]
+    async fn handle_event_conversation_linked_binds_antigravity_session() {
+        let db = test_helpers::fresh_in_memory_db().await;
+        let folder_id = test_helpers::seed_folder(&db, "/tmp/test-agy-link-bind").await;
+        let conv =
+            conversation_service::create(&db.conn, folder_id, AgentType::Antigravity, None, None)
+                .await
+                .unwrap();
+        assert!(conv.external_id.is_none(), "create leaves the row unbound");
+        let mgr = ConnectionManager::new();
+        {
+            let mut map = mgr.connections.lock().await;
+            let conn = fake_connection_with_state("c-agy-link", Some(conv.id));
+            conn.state.write().await.external_id = Some("agy-sess-live".into());
+            conn.state.write().await.agent_type = AgentType::Antigravity;
+            map.insert("c-agy-link".to_string(), conn);
+        }
+        let env = EventEnvelope {
+            seq: 1,
+            connection_id: "c-agy-link".to_string(),
+            payload: AcpEvent::ConversationLinked {
+                conversation_id: conv.id,
+                folder_id,
+                parent_conversation_id: None,
+                parent_tool_use_id: None,
+            },
+        };
+        handle_event(&db.conn, &mgr, &env, None).await.unwrap();
+        let reloaded = conversation_service::get_by_id(&db.conn, conv.id)
+            .await
+            .unwrap();
+        assert_eq!(reloaded.external_id.as_deref(), Some("agy-sess-live"));
     }
 
     async fn read_row_awaiting_reply_token(
