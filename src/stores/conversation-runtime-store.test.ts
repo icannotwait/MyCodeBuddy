@@ -177,6 +177,7 @@ function seedRuntimeSession(input: SeedInput = {}) {
           loadingOlderTurns: input.loadingOlderTurns ?? false,
           olderTurnsPrependEpoch: 0,
           pendingCleanup: false,
+          pendingOutOfTurnContent: false,
           delegateSyncError: null,
           pendingCancel: null,
           softFence: false,
@@ -1025,6 +1026,7 @@ describe("selectHistoricalTimelineTurns edge-case semantics", () => {
         loadingOlderTurns: false,
         olderTurnsPrependEpoch: 0,
         pendingCleanup: false,
+        pendingOutOfTurnContent: false,
         delegateSyncError: null,
         pendingCancel: null,
         softFence: false,
@@ -3111,6 +3113,167 @@ describe("owner overlay retirement without live-* persist ids", () => {
               block.type === "text" && block.text.includes("22 个任务都做完了")
           )
       ).toBe(true)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it.each([true, false])(
+    "hydrates an assistant-only Codex continuation only with matching tool ids (%s)",
+    async (matchingTools) => {
+      vi.useFakeTimers()
+      const startedAt = Date.parse("2026-09-22T15:00:37.000Z")
+      const timestamp = new Date(startedAt).toISOString()
+      const history = [
+        userTurn(
+          "original-prompt",
+          "Finish the fixes",
+          "2026-09-22T13:30:00.000Z"
+        ),
+        assistantTurn(
+          "earlier-reply",
+          "Earlier work is done.",
+          "2026-09-22T14:00:00.000Z"
+        ),
+      ]
+      const live: LiveMessage = {
+        id: "continuation",
+        role: "assistant",
+        startedAt,
+        content: [
+          {
+            type: "text",
+            text: "Checking the final build and review results.",
+          },
+          {
+            type: "tool_call",
+            info: {
+              tool_call_id: "final-check",
+              title: "exec_command",
+              kind: "execute",
+              status: "completed",
+              content: null,
+              raw_input: "{}",
+              raw_output_chunks: ["ok"],
+              raw_output_total_bytes: 2,
+              locations: null,
+              meta: null,
+              images: [],
+            },
+          },
+          { type: "thinking", text: "Targeted checks await permission" },
+        ],
+      }
+      const persisted = [
+        ...history,
+        assistantTurn(
+          "commentary",
+          "Checking the final build and review results.",
+          timestamp
+        ),
+        assistantTurnWithBlocks(
+          "tool",
+          [
+            {
+              type: "tool_use",
+              tool_use_id: matchingTools ? "final-check" : "unrelated-check",
+              tool_name: "exec_command",
+              input_preview: "{}",
+            },
+            {
+              type: "tool_result",
+              tool_use_id: matchingTools ? "final-check" : "unrelated-check",
+              output_preview: "ok",
+              is_error: false,
+            },
+          ],
+          "2026-09-22T15:20:00.000Z"
+        ),
+        assistantTurnWithBlocks(
+          "reasoning",
+          [{ type: "thinking", text: "Targeted checks await permission" }],
+          "2026-09-22T15:21:00.000Z"
+        ),
+        assistantTurn(
+          "final",
+          "9 fixes are ready.",
+          "2026-09-22T15:21:18.000Z"
+        ),
+      ]
+      seedRuntimeSession({
+        detail: detailWithTurns(history),
+        syncState: "awaiting_persist",
+      })
+      mockGetFolderConversation
+        .mockResolvedValueOnce(detailWithTurns(persisted.slice(0, -1)))
+        .mockResolvedValueOnce(detailWithTurns(persisted))
+
+      try {
+        const { actions } = useConversationRuntimeStore.getState()
+        actions.completeTurn(CID, live)
+        await vi.advanceTimersByTimeAsync(80)
+        expect(
+          useConversationRuntimeStore.getState().byConversationId.get(CID)
+            ?.localTurns
+        ).toHaveLength(2)
+        await vi.advanceTimersByTimeAsync(300)
+
+        const state = useConversationRuntimeStore.getState()
+        if (!matchingTools) {
+          expect(state.byConversationId.get(CID)?.localTurns).toHaveLength(2)
+          expect(state.byConversationId.get(CID)?.detail?.turns).toEqual(
+            history
+          )
+          return
+        }
+        expect(state.byConversationId.get(CID)?.localTurns).toEqual([])
+        expect(
+          selectTimelineTurns(state, CID).map((entry) => entry.turn)
+        ).toEqual(persisted)
+      } finally {
+        vi.useRealTimers()
+      }
+    }
+  )
+
+  it("hydrates a Codex answer after a reasoning-only stream and waits for a settled snapshot", async () => {
+    vi.useFakeTimers()
+    const timestamp = "2026-09-22T15:21:00.000Z"
+    const prompt = userTurn("prompt", "What is the result?", timestamp)
+    const thought = { type: "thinking" as const, text: "Checking the result" }
+    const persisted = [
+      prompt,
+      assistantTurnWithBlocks("reasoning", [thought], timestamp),
+      assistantTurn("final", "All checks passed.", timestamp),
+    ]
+    seedRuntimeSession({ detail: detailWithTurns([]) })
+    mockGetFolderConversation
+      .mockResolvedValueOnce(
+        detailWithTurns(persisted, { in_flight_user_turn_id: prompt.id })
+      )
+      .mockResolvedValueOnce(detailWithTurns(persisted))
+
+    try {
+      const { actions } = useConversationRuntimeStore.getState()
+      actions.appendOptimisticTurn(CID, prompt, prompt.id)
+      actions.completeTurn(CID, {
+        id: "reasoning-only",
+        role: "assistant",
+        startedAt: Date.parse(timestamp),
+        content: [thought],
+      })
+      await vi.advanceTimersByTimeAsync(80)
+      expect(
+        useConversationRuntimeStore.getState().byConversationId.get(CID)
+          ?.localTurns
+      ).toHaveLength(2)
+      await vi.advanceTimersByTimeAsync(300)
+
+      const state = useConversationRuntimeStore.getState()
+      expect(state.byConversationId.get(CID)?.localTurns).toEqual([])
+      expect(
+        selectTimelineTurns(state, CID).map((entry) => entry.turn)
+      ).toEqual(persisted)
     } finally {
       vi.useRealTimers()
     }

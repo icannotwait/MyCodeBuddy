@@ -952,6 +952,21 @@ function splitTurnGroups(turns: readonly MessageTurn[]): TurnGroup[] {
   return groups
 }
 
+/** A continuation may have several assistant fragments and no visible prompt. */
+function lastReplyGroup(turns: readonly MessageTurn[]): TurnGroup | undefined {
+  let start = turns.length
+  while (
+    start > 0 &&
+    turns[start - 1]!.role === "assistant" &&
+    turns[start - 1]!.autonomous_origin == null
+  ) {
+    start -= 1
+  }
+  if (start === turns.length) return undefined
+  if (start > 0 && turns[start - 1]!.role === "user") start -= 1
+  return { start, end: turns.length }
+}
+
 function contentValueEquivalent(left: unknown, right: unknown): boolean {
   if (left === right) return true
   if (left == null || right == null) return left == null && right == null
@@ -1156,12 +1171,35 @@ function turnGroupPersistedCoversLocal(
   if (localText.length > 0 && persistedText.startsWith(localText)) return true
   const localToolIds = assistantToolUseIds(localAssistants)
   if (localText.length === 0) {
-    if (localToolIds.size === 0) return false
+    if (localToolIds.size === 0) {
+      const thoughts = localAssistants.flatMap((turn) =>
+        turn.blocks.filter((block) => block.type === "thinking" && block.text)
+      )
+      return (
+        usersMatch &&
+        thoughts.length > 0 &&
+        thoughts.every((thought) =>
+          persistedAssistants.some((turn) =>
+            turn.blocks.some((block) => contentBlockEquivalent(thought, block))
+          )
+        )
+      )
+    }
     const persistedToolIds = assistantToolUseIds(persistedAssistants)
     for (const id of localToolIds) {
       if (!persistedToolIds.has(id)) return false
     }
     return true
+  }
+  // Hidden continuation prompts leave the older reply in this same persisted
+  // group. Match the continuation by its tool ids and text, and require NEW
+  // trailing text rather than counting that older reply as growth.
+  if (!localUser && localToolIds.size > 0) {
+    const offset = persistedText.lastIndexOf(localText)
+    if (offset >= 0 && offset + localText.length < persistedText.length) {
+      const persistedToolIds = assistantToolUseIds(persistedAssistants)
+      return [...localToolIds].every((id) => persistedToolIds.has(id))
+    }
   }
   // Distinct trailing summary on the same user turn (Grok chat_history after
   // extension turn_completed). Without a matching user, a longer unrelated
@@ -1469,8 +1507,8 @@ function retireCoveredLocalTurns(
       break
     }
   }
-  const lastLocal = alignment.localGroups.at(-1)
-  const lastPersisted = splitTurnGroups(persisted).at(-1)
+  const lastLocal = lastReplyGroup(localTurns)
+  const lastPersisted = lastReplyGroup(persisted)
   // Richer-cover is only valid after persist itself grew (hydrate). Applying
   // it on COMPLETE_TURN against the previous turn drops a repeated prompt.
   const dropLastCovered =
@@ -4455,9 +4493,8 @@ export interface RuntimeActions {
    */
   syncViewerDetail: (conversationId: number) => void
   /**
-   * After a tool-using ACP `end_turn`, poll the agent transcript until the
-   * persisted last assistant is strictly richer than the promoted live stub
-   * (Grok writes the final summary to disk after extension `turn_completed`).
+   * After ACP `end_turn`, recover missing final text from a settled transcript
+   * whose last reply is strictly richer than the promoted live fragments.
    * Empty / still-stub reads are not committed over `localTurns`.
    */
   hydrateSettledTurnFromTranscript: (conversationId: number) => void
@@ -5505,7 +5542,7 @@ function isExactIdViewerUserEcho(
 // trailing USER turn (Claude/Codex append the assistant reply to the JSONL only
 // on completion, so a trailing user turn means the reply is still mid-flush).
 const VIEWER_DETAIL_SYNC_DELAYS_MS = [0, 300, 700, 1500, 2500] as const
-// Owner hydrate after a tool-using end_turn. First tick is delayed so
+// Owner hydrate after end_turn when the adapter may omit final text. Delayed so
 // completeTurn's in-memory promote is the first paint (no empty-history
 // wipe), and so SessionStarted/ConversationLinked bind can land.
 const SETTLED_TURN_HYDRATE_DELAYS_MS = [80, 300, 700, 1500, 2500] as const
@@ -7083,8 +7120,8 @@ export const useConversationRuntimeStore = create<ConversationRuntimeStore>()((
           const lastLocalAssistant = [...cur2.localTurns]
             .reverse()
             .find((turn) => turn.role === "assistant")
-          const lastLocalGroup = splitTurnGroups(cur2.localTurns).at(-1)
-          const lastPersistedGroup = splitTurnGroups(detail.turns).at(-1)
+          const lastLocalGroup = lastReplyGroup(cur2.localTurns)
+          const lastPersistedGroup = lastReplyGroup(detail.turns)
           const richer =
             persistTailGrew(cur2.detail?.turns ?? [], detail.turns) &&
             lastLocalGroup != null &&
@@ -7095,7 +7132,11 @@ export const useConversationRuntimeStore = create<ConversationRuntimeStore>()((
               detail.turns,
               lastPersistedGroup
             )
-          if (hasTurns && (richer || lastLocalAssistant == null)) {
+          if (
+            detail.in_flight_user_turn_id == null &&
+            hasTurns &&
+            (richer || lastLocalAssistant == null)
+          ) {
             if (
               sessionHasPendingCancel(
                 get().byConversationId.get(conversationId)
@@ -7526,9 +7567,8 @@ export const useConversationRuntimeStore = create<ConversationRuntimeStore>()((
       // Immediate refetchDetail is still forbidden (tried and reverted — see
       // git history). A same-tick read races the transcript flush and, with
       // `preserveLive: false`, used to discard the already-correct promote.
-      // Tool-using ACP turns are the exception that still needs a *later*
-      // hydrate: Grok's extension `turn_completed` settles the live buffer on
-      // the mid-turn stub, while the final assistant lands only on disk.
+      // Grok tool turns and Codex turns need a later hydrate: final text can
+      // land only on disk when the adapter misses its streaming deltas.
       // `hydrateSettledTurnFromTranscript` polls after a delay and commits
       // only a strictly richer persist (never an empty/stub overwrite).
       const sessionBefore = get().byConversationId.get(conversationId)
@@ -7540,7 +7580,13 @@ export const useConversationRuntimeStore = create<ConversationRuntimeStore>()((
         ) ?? false
       dispatch({ type: "COMPLETE_TURN", conversationId, liveMessage })
       persistTurnGenerationFromSession(conversationId, sessionBefore)
-      if (hadToolActivity) {
+      if (
+        hadToolActivity ||
+        (sessionBefore?.detail?.summary.agent_type === "codex" &&
+          sourceLiveMessage?.content.some(
+            (block) => block.type === "text" || block.type === "thinking"
+          ))
+      ) {
         hydrateSettledTurnFromTranscript(conversationId)
       }
     },
