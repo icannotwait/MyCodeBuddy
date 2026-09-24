@@ -42,17 +42,12 @@ Declared license: Apache-2.0
 Homepage: https://github.com/agentclientprotocol/agent-client-protocol
 License text SHA-256: 69be80ff413ac16949b13ac65fdefd849fbc12c31453e09b5d052721f3c84338
 
-cargo:ahash@0.7.8
-Declared license: MIT OR Apache-2.0
-Homepage: https://github.com/tkaitchuck/ahash
-License text SHA-256: none
-
 cargo:ahash@0.8.12
 Declared license: MIT OR Apache-2.0
 Homepage: https://github.com/tkaitchuck/ahash
 License text SHA-256: none
 
-cargo:aho-corasick@1.1.4
+cargo:aho-corasick@1.1.5
 Declared license: Unlicense OR MIT
 Homepage: https://github.com/BurntSushi/aho-corasick
 License text SHA-256: 65314a6c96683f76f7495709bb0ddecb4eaa6fa244b28f23c4812ef8e5524066
@@ -117,7 +112,7 @@ Declared license: MIT OR Apache-2.0
 Homepage: https://github.com/bluss/arrayvec
 License text SHA-256: none
 
-cargo:async-compression@0.4.43
+cargo:async-compression@0.4.48
 Declared license: MIT OR Apache-2.0
 Homepage: https://github.com/Nullus157/async-compression
 License text SHA-256: none
@@ -132,7 +127,7 @@ Declared license: MIT
 Homepage: https://github.com/tokio-rs/async-stream
 License text SHA-256: 557930f3a6b348321984ce42bd53128746d410ceecde616e955b484c8a79f42e
 
-cargo:async-trait@0.1.91
+cargo:async-trait@0.1.92
 Declared license: MIT OR Apache-2.0
 Homepage: https://github.com/dtolnay/async-trait
 License text SHA-256: none
@@ -182,6 +177,11 @@ Declared license: MIT OR Apache-2.0
 Homepage: https://github.com/marshallpierce/rust-base64
 License text SHA-256: none
 
+cargo:base64@0.23.1
+Declared license: MIT OR Apache-2.0
+Homepage: https://github.com/marshallpierce/rust-base64
+License text SHA-256: none
+
 cargo:base64ct@1.8.3
 Declared license: Apache-2.0 OR MIT
 Homepage: https://github.com/RustCrypto/formats/tree/master/base64ct
@@ -212,15 +212,10 @@ Declared license: MIT/Apache-2.0
 Homepage: https://github.com/bitflags/bitflags
 License text SHA-256: none
 
-cargo:bitflags@2.13.1
+cargo:bitflags@2.13.2
 Declared license: MIT OR Apache-2.0
 Homepage: https://github.com/bitflags/bitflags
 License text SHA-256: none
-
-cargo:bitvec@1.1.1
-Declared license: MIT
-Homepage: https://bitvecto-rs.github.io/bitvec
-License text SHA-256: 667fdb63d9abc6e572b47947a9b2ed3d73f317b1a7ee36def6c52b4b83b6b166
 
 cargo:blake2@0.10.6
 Declared license: MIT OR Apache-2.0
@@ -237,12 +232,12 @@ Declared license: MIT
 Homepage: https://github.com/madsmtm/objc2
 License text SHA-256: none
 
-cargo:borsh@1.8.0
+cargo:borsh@1.8.1
 Declared license: MIT OR Apache-2.0
 Homepage: https://borsh.io
 License text SHA-256: none
 
-cargo:borsh-derive@1.8.0
+cargo:borsh-derive@1.8.1
 Declared license: Apache-2.0
 Homepage: https://borsh.io
 License text SHA-256: none
@@ -267,7 +262,7 @@ Declared license: MIT/Apache-2.0
 Homepage: https://github.com/Nullus157/bs58-rs
 License text SHA-256: none
 
-cargo:bstr@1.13.0
+cargo:bstr@1.13.1
 Declared license: MIT OR Apache-2.0
 Homepage: https://github.com/BurntSushi/bstr
 License text SHA-256: 8649bf6c5eca0205e3a95d64eba9ead0be2804c25c3fa335e04ce5e76c04b714
@@ -276,16 +271,6 @@ cargo:bumpalo@3.20.3
 Declared license: MIT OR Apache-2.0
 Homepage: https://github.com/fitzgen/bumpalo
 License text SHA-256: none
-
-cargo:bytecheck@0.6.12
-Declared license: MIT
-Homepage: https://github.com/djkoloski/bytecheck
-License text SHA-256: 6cb29bf78c6e512c65df670da014b3e1ee04a1db1f0adffd8147c21e25696241
-
-cargo:bytecheck_derive@0.6.12
-Declared license: MIT
-Homepage: https://github.com/djkoloski/bytecheck
-License text SHA-256: 6cb29bf78c6e512c65df670da014b3e1ee04a1db1f0adffd8147c21e25696241
 
 cargo:bytemuck@1.25.2
 Declared license: Zlib OR Apache-2.0 OR MIT
@@ -317,7 +302,7 @@ Declared license: MIT/Apache-2.0
 Homepage: https://github.com/alexcrichton/bzip2-rs
 License text SHA-256: none
 
-cargo:camino@1.2.5
+cargo:camino@1.2.6
 Declared license: MIT OR Apache-2.0
 Homepage: https://github.com/camino-rs/camino
 License text SHA-256: none
@@ -337,7 +322,7 @@ Declared license: Apache-2.0 OR MIT
 Homepage: https://lib.rs/cargo_toml
 License text SHA-256: fa4363848a0f6846633204f15e6570ad77dd22202129567d4db120d53d681417
 
-cargo:cc@1.4.0
+cargo:cc@1.4.7
 Declared license: MIT OR Apache-2.0
 Homepage: https://github.com/rust-lang/cc-rs
 License text SHA-256: none
@@ -352,7 +337,7 @@ Declared license: MIT
 Homepage: https://github.com/mdsteele/rust-cfb
 License text SHA-256: 3ce3e2561c6a4cd41b435e1358d71aab5dbfe6b91a7e9b8b57df9a605c0ab87a
 
-cargo:cfg-if@1.0.4
+cargo:cfg-if@1.0.5
 Declared license: MIT OR Apache-2.0
 Homepage: https://github.com/rust-lang/cfg-if
 License text SHA-256: none
@@ -382,22 +367,22 @@ Declared license: Apache-2.0
 Homepage: https://github.com/KyleMayes/clang-sys
 License text SHA-256: 58d1e17ffe5109a7ae296caafcadfdbe6a7d176f0bc4ab01e12a689b0499d8bd
 
-cargo:clap@4.6.4
+cargo:clap@4.6.7
 Declared license: MIT OR Apache-2.0
 Homepage: https://github.com/clap-rs/clap
 License text SHA-256: none
 
-cargo:clap_builder@4.6.2
+cargo:clap_builder@4.6.7
 Declared license: MIT OR Apache-2.0
 Homepage: https://github.com/clap-rs/clap
 License text SHA-256: none
 
-cargo:clap_derive@4.6.4
+cargo:clap_derive@4.6.7
 Declared license: MIT OR Apache-2.0
 Homepage: https://github.com/clap-rs/clap
 License text SHA-256: none
 
-cargo:clap_lex@1.1.0
+cargo:clap_lex@1.1.1
 Declared license: MIT OR Apache-2.0
 Homepage: https://github.com/clap-rs/clap
 License text SHA-256: none
@@ -412,12 +397,12 @@ Declared license: MIT OR Apache-2.0
 Homepage: https://github.com/rust-cli/anstyle.git
 License text SHA-256: none
 
-cargo:compression-codecs@0.4.38
+cargo:compression-codecs@0.4.43
 Declared license: MIT OR Apache-2.0
 Homepage: https://github.com/Nullus157/async-compression
 License text SHA-256: none
 
-cargo:compression-core@0.4.32
+cargo:compression-core@0.4.33
 Declared license: MIT OR Apache-2.0
 Homepage: https://github.com/Nullus157/async-compression
 License text SHA-256: none
@@ -437,7 +422,7 @@ Declared license: MIT
 Homepage: https://github.com/rutrum/convert-case
 License text SHA-256: aed7b1758e35afa0cd0fde059d61950747ca11cd0e5e169cb21c11608daed772
 
-cargo:cookie@0.18.1
+cargo:cookie@0.18.2
 Declared license: MIT OR Apache-2.0
 Homepage: https://github.com/SergioBenitez/cookie-rs
 License text SHA-256: none
@@ -467,6 +452,11 @@ Declared license: MIT OR Apache-2.0
 Homepage: https://github.com/servo/core-foundation-rs
 License text SHA-256: none
 
+cargo:core_detect@1.0.0
+Declared license: MIT/Apache-2.0
+Homepage: https://github.com/thomcc/core_detect
+License text SHA-256: none
+
 cargo:cpufeatures@0.2.17
 Declared license: MIT OR Apache-2.0
 Homepage: https://github.com/RustCrypto/utils
@@ -482,7 +472,7 @@ Declared license: MIT OR Apache-2.0
 Homepage: https://github.com/akhilles/crc-catalog.git
 License text SHA-256: none
 
-cargo:crc32fast@1.5.0
+cargo:crc32fast@1.5.2
 Declared license: MIT OR Apache-2.0
 Homepage: https://github.com/srijs/rust-crc32fast
 License text SHA-256: none
@@ -492,27 +482,27 @@ Declared license: MIT OR Apache-2.0
 Homepage: https://github.com/zslayton/cron
 License text SHA-256: none
 
-cargo:crossbeam-channel@0.5.16
+cargo:crossbeam-channel@0.5.17
 Declared license: MIT OR Apache-2.0
 Homepage: https://github.com/crossbeam-rs/crossbeam/tree/master/crossbeam-channel
 License text SHA-256: none
 
-cargo:crossbeam-deque@0.8.7
+cargo:crossbeam-deque@0.8.8
 Declared license: MIT OR Apache-2.0
 Homepage: https://github.com/crossbeam-rs/crossbeam/tree/master/crossbeam-deque
 License text SHA-256: none
 
-cargo:crossbeam-epoch@0.9.20
+cargo:crossbeam-epoch@0.9.21
 Declared license: MIT OR Apache-2.0
 Homepage: https://github.com/crossbeam-rs/crossbeam/tree/master/crossbeam-epoch
 License text SHA-256: none
 
-cargo:crossbeam-queue@0.3.13
+cargo:crossbeam-queue@0.3.14
 Declared license: MIT OR Apache-2.0
 Homepage: https://github.com/crossbeam-rs/crossbeam/tree/master/crossbeam-queue
 License text SHA-256: none
 
-cargo:crossbeam-utils@0.8.22
+cargo:crossbeam-utils@0.8.23
 Declared license: MIT OR Apache-2.0
 Homepage: https://github.com/crossbeam-rs/crossbeam/tree/master/crossbeam-utils
 License text SHA-256: none
@@ -557,12 +547,22 @@ Declared license: MIT
 Homepage: https://github.com/TedDriggs/darling
 License text SHA-256: cc8f3c8ab396de7fa549e3907319281cf13d0a4a456a2b0695c5b61d877dba68
 
+cargo:darling@0.24.1
+Declared license: MIT
+Homepage: https://github.com/TedDriggs/darling
+License text SHA-256: cc8f3c8ab396de7fa549e3907319281cf13d0a4a456a2b0695c5b61d877dba68
+
 cargo:darling_core@0.20.11
 Declared license: MIT
 Homepage: https://github.com/TedDriggs/darling
 License text SHA-256: cc8f3c8ab396de7fa549e3907319281cf13d0a4a456a2b0695c5b61d877dba68
 
 cargo:darling_core@0.23.0
+Declared license: MIT
+Homepage: https://github.com/TedDriggs/darling
+License text SHA-256: cc8f3c8ab396de7fa549e3907319281cf13d0a4a456a2b0695c5b61d877dba68
+
+cargo:darling_core@0.24.1
 Declared license: MIT
 Homepage: https://github.com/TedDriggs/darling
 License text SHA-256: cc8f3c8ab396de7fa549e3907319281cf13d0a4a456a2b0695c5b61d877dba68
@@ -577,7 +577,12 @@ Declared license: MIT
 Homepage: https://github.com/TedDriggs/darling
 License text SHA-256: cc8f3c8ab396de7fa549e3907319281cf13d0a4a456a2b0695c5b61d877dba68
 
-cargo:data-encoding@2.11.0
+cargo:darling_macro@0.24.1
+Declared license: MIT
+Homepage: https://github.com/TedDriggs/darling
+License text SHA-256: cc8f3c8ab396de7fa549e3907319281cf13d0a4a456a2b0695c5b61d877dba68
+
+cargo:data-encoding@2.11.1
 Declared license: MIT
 Homepage: https://github.com/ia0/data-encoding
 License text SHA-256: 9db9de9edfd0ae7c1a5ac724191c0899dc218273f62c717e004ef037501646c2
@@ -586,6 +591,21 @@ cargo:deflate64@0.1.12
 Declared license: MIT
 Homepage: https://github.com/anatawa12/deflate64-rs#readme
 License text SHA-256: e2509010ead2bd972e8113b1c4054287f01a6b5363555344af047376e808ef7f
+
+cargo:defmt@1.1.1
+Declared license: MIT OR Apache-2.0
+Homepage: https://knurling.ferrous-systems.com/
+License text SHA-256: none
+
+cargo:defmt-macros@1.1.1
+Declared license: MIT OR Apache-2.0
+Homepage: https://github.com/knurling-rs/defmt
+License text SHA-256: none
+
+cargo:defmt-parser@1.0.0
+Declared license: MIT OR Apache-2.0
+Homepage: https://github.com/knurling-rs/defmt
+License text SHA-256: none
 
 cargo:der@0.7.10
 Declared license: Apache-2.0 OR MIT
@@ -692,7 +712,7 @@ Declared license: MIT OR Apache-2.0
 Homepage: https://github.com/dtolnay/dyn-clone
 License text SHA-256: none
 
-cargo:either@1.17.0
+cargo:either@1.18.0
 Declared license: MIT OR Apache-2.0
 Homepage: https://github.com/rayon-rs/either
 License text SHA-256: none
@@ -707,7 +727,7 @@ Declared license: MIT OR Apache-2.0
 Homepage: https://github.com/nvzqz/embed-plist-rs
 License text SHA-256: none
 
-cargo:encoding_rs@0.8.35
+cargo:encoding_rs@0.8.41
 Declared license: (Apache-2.0 OR MIT) AND BSD-3-Clause
 Homepage: https://docs.rs/encoding_rs/
 License text SHA-256: none
@@ -772,7 +792,7 @@ Declared license: MIT/Apache-2.0
 Homepage: https://github.com/alexcrichton/filetime
 License text SHA-256: none
 
-cargo:find-msvc-tools@0.1.9
+cargo:find-msvc-tools@0.1.13
 Declared license: MIT OR Apache-2.0
 Homepage: https://github.com/rust-lang/cc-rs
 License text SHA-256: none
@@ -786,7 +806,7 @@ Declared license: MIT OR Apache-2.0
 Homepage: https://github.com/petgraph/fixedbitset
 License text SHA-256: none
 
-cargo:flate2@1.1.9
+cargo:flate2@1.1.10
 Declared license: MIT OR Apache-2.0
 Homepage: https://github.com/rust-lang/flate2-rs
 License text SHA-256: none
@@ -836,17 +856,12 @@ Declared license: MIT
 Homepage: https://github.com/octplane/fsevent-rust/tree/master/fsevent-sys
 License text SHA-256: 983a293c55cd84a374b96ca1aacc798b6d0c6cfb307326d360a8d8e7e131b3c4
 
-cargo:funty@2.0.0
-Declared license: MIT
-Homepage: https://github.com/myrrlyn/funty
-License text SHA-256: 72641d65642c759f84f06cfbb6028c4f97a5d19387792d0a7c26fae27b5752fb
-
-cargo:futures@0.3.33
+cargo:futures@0.3.34
 Declared license: MIT OR Apache-2.0
 Homepage: https://rust-lang.github.io/futures-rs
 License text SHA-256: none
 
-cargo:futures-channel@0.3.33
+cargo:futures-channel@0.3.34
 Declared license: MIT OR Apache-2.0
 Homepage: https://rust-lang.github.io/futures-rs
 License text SHA-256: none
@@ -856,12 +871,12 @@ Declared license: MIT OR Apache-2.0
 Homepage: https://github.com/yoshuawuyts/futures-concurrency
 License text SHA-256: none
 
-cargo:futures-core@0.3.33
+cargo:futures-core@0.3.34
 Declared license: MIT OR Apache-2.0
 Homepage: https://rust-lang.github.io/futures-rs
 License text SHA-256: none
 
-cargo:futures-executor@0.3.33
+cargo:futures-executor@0.3.34
 Declared license: MIT OR Apache-2.0
 Homepage: https://rust-lang.github.io/futures-rs
 License text SHA-256: none
@@ -871,7 +886,7 @@ Declared license: MIT OR Apache-2.0
 Homepage: https://github.com/Matthias247/futures-intrusive
 License text SHA-256: none
 
-cargo:futures-io@0.3.33
+cargo:futures-io@0.3.34
 Declared license: MIT OR Apache-2.0
 Homepage: https://rust-lang.github.io/futures-rs
 License text SHA-256: none
@@ -881,22 +896,22 @@ Declared license: Apache-2.0 OR MIT
 Homepage: https://github.com/smol-rs/futures-lite
 License text SHA-256: none
 
-cargo:futures-macro@0.3.33
+cargo:futures-macro@0.3.34
 Declared license: MIT OR Apache-2.0
 Homepage: https://rust-lang.github.io/futures-rs
 License text SHA-256: none
 
-cargo:futures-sink@0.3.33
+cargo:futures-sink@0.3.34
 Declared license: MIT OR Apache-2.0
 Homepage: https://rust-lang.github.io/futures-rs
 License text SHA-256: none
 
-cargo:futures-task@0.3.33
+cargo:futures-task@0.3.34
 Declared license: MIT OR Apache-2.0
 Homepage: https://rust-lang.github.io/futures-rs
 License text SHA-256: none
 
-cargo:futures-util@0.3.33
+cargo:futures-util@0.3.34
 Declared license: MIT OR Apache-2.0
 Homepage: https://rust-lang.github.io/futures-rs
 License text SHA-256: none
@@ -941,12 +956,12 @@ Declared license: MIT OR Apache-2.0
 Homepage: https://github.com/rust-lang/glob
 License text SHA-256: none
 
-cargo:globset@0.4.19
+cargo:globset@0.4.20
 Declared license: Unlicense OR MIT
 Homepage: https://github.com/BurntSushi/ripgrep/tree/master/crates/globset
 License text SHA-256: 65314a6c96683f76f7495709bb0ddecb4eaa6fa244b28f23c4812ef8e5524066
 
-cargo:h2@0.4.15
+cargo:h2@0.4.19
 Declared license: MIT
 Homepage: https://github.com/hyperium/h2
 License text SHA-256: f5352eaa5597c02c95e541596fe44c4cd73ca822230bd7283287ebb8b5d56cda
@@ -1026,7 +1041,7 @@ Declared license: MIT
 Homepage: https://github.com/hyperium/http-body
 License text SHA-256: 57f841bc9767b5b843e0c0c471bd50a95ddb00f13b1f4a2c6d6f57a7dbfdc1f3
 
-cargo:http-body-util@0.1.4
+cargo:http-body-util@0.1.5
 Declared license: MIT
 Homepage: https://github.com/hyperium/http-body
 License text SHA-256: 57f841bc9767b5b843e0c0c471bd50a95ddb00f13b1f4a2c6d6f57a7dbfdc1f3
@@ -1046,7 +1061,7 @@ Declared license: MIT OR Apache-2.0
 Homepage: https://github.com/pyfisch/httpdate
 License text SHA-256: none
 
-cargo:hyper@1.11.0
+cargo:hyper@1.11.1
 Declared license: MIT
 Homepage: https://hyper.rs
 License text SHA-256: 05f344491a7d18e1a3188acbddf6f921284cb192e49d16391128d453000468ff
@@ -1076,37 +1091,37 @@ Declared license: MIT
 Homepage: https://github.com/mdsteele/rust-ico
 License text SHA-256: 95573f040b56af53b368e25454c8cd660dfa72ab6999327e6120095846650ebd
 
-cargo:icu_collections@2.2.0
+cargo:icu_collections@2.3.0
 Declared license: Unicode-3.0
 Homepage: https://icu4x.unicode.org
 License text SHA-256: cde87abe221f413fede55ded0f17985f37b8fdc23e5f6cba9a3955437facb3ae
 
-cargo:icu_locale_core@2.2.0
+cargo:icu_locale_core@2.3.0
 Declared license: Unicode-3.0
 Homepage: https://icu4x.unicode.org
 License text SHA-256: cde87abe221f413fede55ded0f17985f37b8fdc23e5f6cba9a3955437facb3ae
 
-cargo:icu_normalizer@2.2.0
+cargo:icu_normalizer@2.3.0
 Declared license: Unicode-3.0
 Homepage: https://icu4x.unicode.org
 License text SHA-256: cde87abe221f413fede55ded0f17985f37b8fdc23e5f6cba9a3955437facb3ae
 
-cargo:icu_normalizer_data@2.2.0
+cargo:icu_normalizer_data@2.3.0
 Declared license: Unicode-3.0
 Homepage: https://icu4x.unicode.org
 License text SHA-256: cde87abe221f413fede55ded0f17985f37b8fdc23e5f6cba9a3955437facb3ae
 
-cargo:icu_properties@2.2.0
+cargo:icu_properties@2.3.0
 Declared license: Unicode-3.0
 Homepage: https://icu4x.unicode.org
 License text SHA-256: cde87abe221f413fede55ded0f17985f37b8fdc23e5f6cba9a3955437facb3ae
 
-cargo:icu_properties_data@2.2.0
+cargo:icu_properties_data@2.3.0
 Declared license: Unicode-3.0
 Homepage: https://icu4x.unicode.org
 License text SHA-256: cde87abe221f413fede55ded0f17985f37b8fdc23e5f6cba9a3955437facb3ae
 
-cargo:icu_provider@2.2.0
+cargo:icu_provider@2.3.1
 Declared license: Unicode-3.0
 Homepage: https://icu4x.unicode.org
 License text SHA-256: cde87abe221f413fede55ded0f17985f37b8fdc23e5f6cba9a3955437facb3ae
@@ -1131,7 +1146,7 @@ Declared license: MIT OR BSD-3-Clause
 Homepage: https://github.com/messense/if-addrs
 License text SHA-256: none
 
-cargo:ignore@0.4.31
+cargo:ignore@0.4.33
 Declared license: Unlicense OR MIT
 Homepage: https://github.com/BurntSushi/ripgrep/tree/master/crates/ignore
 License text SHA-256: 65314a6c96683f76f7495709bb0ddecb4eaa6fa244b28f23c4812ef8e5524066
@@ -1161,7 +1176,7 @@ Declared license: Apache-2.0 OR MIT
 Homepage: https://github.com/bluss/indexmap
 License text SHA-256: none
 
-cargo:indexmap@2.14.0
+cargo:indexmap@2.14.2
 Declared license: Apache-2.0 OR MIT
 Homepage: https://github.com/indexmap-rs/indexmap
 License text SHA-256: none
@@ -1186,7 +1201,7 @@ Declared license: MIT
 Homepage: https://github.com/dcuddeback/ioctl-rs
 License text SHA-256: 34d584cb59706931ab8c06c343a38be22caf1714db1edcede689f785c5d27d54
 
-cargo:ipnet@2.12.0
+cargo:ipnet@2.12.2
 Declared license: MIT OR Apache-2.0
 Homepage: https://github.com/krisprice/ipnet
 License text SHA-256: none
@@ -1210,6 +1225,26 @@ cargo:itoa@1.0.18
 Declared license: MIT OR Apache-2.0
 Homepage: https://github.com/dtolnay/itoa
 License text SHA-256: none
+
+cargo:jiff@0.2.37
+Declared license: Unlicense OR MIT
+Homepage: https://github.com/BurntSushi/jiff
+License text SHA-256: 65314a6c96683f76f7495709bb0ddecb4eaa6fa244b28f23c4812ef8e5524066
+
+cargo:jiff-core@0.1.1
+Declared license: Unlicense OR MIT
+Homepage: https://github.com/BurntSushi/jiff/tree/master/crates/jiff-core
+License text SHA-256: 65314a6c96683f76f7495709bb0ddecb4eaa6fa244b28f23c4812ef8e5524066
+
+cargo:jiff-tzdb@0.1.8
+Declared license: Unlicense OR MIT
+Homepage: https://github.com/BurntSushi/jiff/tree/master/crates/jiff-tzdb
+License text SHA-256: 65314a6c96683f76f7495709bb0ddecb4eaa6fa244b28f23c4812ef8e5524066
+
+cargo:jiff-tzdb-platform@0.1.3
+Declared license: Unlicense OR MIT
+Homepage: https://github.com/BurntSushi/jiff/tree/master/crates/jiff-tzdb-platform
+License text SHA-256: 65314a6c96683f76f7495709bb0ddecb4eaa6fa244b28f23c4812ef8e5524066
 
 cargo:jobserver@0.1.35
 Declared license: MIT OR Apache-2.0
@@ -1281,7 +1316,7 @@ Declared license: MIT
 Homepage: https://github.com/rusqlite/rusqlite
 License text SHA-256: 1b22c746764567f538d003a5ed8abf27e3957939727be7e896f928a37724c40f
 
-cargo:litemap@0.8.2
+cargo:litemap@0.8.3
 Declared license: Unicode-3.0
 Homepage: https://github.com/unicode-org/icu4x
 License text SHA-256: cde87abe221f413fede55ded0f17985f37b8fdc23e5f6cba9a3955437facb3ae
@@ -1291,7 +1326,7 @@ Declared license: MIT OR Apache-2.0
 Homepage: https://github.com/Amanieu/parking_lot
 License text SHA-256: none
 
-cargo:log@0.4.33
+cargo:log@0.4.34
 Declared license: MIT OR Apache-2.0
 Homepage: https://github.com/rust-lang/log
 License text SHA-256: none
@@ -1376,7 +1411,12 @@ Declared license: MIT OR Zlib OR Apache-2.0
 Homepage: https://github.com/Frommi/miniz_oxide/tree/master/miniz_oxide
 License text SHA-256: 7427abc630365f6335b3ced8b620b6c8a87b3793edea701d15cdde01ec7a6cde
 
-cargo:mio@1.2.2
+cargo:miniz_oxide@0.9.1
+Declared license: MIT OR Zlib OR Apache-2.0
+Homepage: https://github.com/Frommi/miniz_oxide/tree/master/miniz_oxide
+License text SHA-256: 7427abc630365f6335b3ced8b620b6c8a87b3793edea701d15cdde01ec7a6cde
+
+cargo:mio@1.2.3
 Declared license: MIT
 Homepage: https://github.com/tokio-rs/mio
 License text SHA-256: c804065b0956d00a65ce119456ec48ee456f5446b904b07ee85225ba5a88ce41
@@ -1395,6 +1435,21 @@ cargo:multer@3.1.0
 Declared license: MIT
 Homepage: https://github.com/rwf2/multer
 License text SHA-256: e6a7acaed4385702fbc99c5854d387a309dea4598003e2bc12fa2c3d41bbda7e
+
+cargo:multiversion@0.9.0
+Declared license: MIT OR Apache-2.0
+Homepage: https://github.com/calebzulawski/multiversion
+License text SHA-256: none
+
+cargo:multiversion-macros@0.9.0
+Declared license: MIT OR Apache-2.0
+Homepage: https://github.com/calebzulawski/multiversion
+License text SHA-256: none
+
+cargo:multiversion_no_op@1.0.0
+Declared license: Apache-2.0 OR MIT
+Homepage: https://docs.rs/multiversion_no_op/
+License text SHA-256: none
 
 cargo:native-tls@0.2.18
 Declared license: MIT OR Apache-2.0
@@ -1456,7 +1511,7 @@ Declared license: MIT OR Apache-2.0
 Homepage: https://github.com/jhpratt/num-conv
 License text SHA-256: none
 
-cargo:num-integer@0.1.46
+cargo:num-integer@0.1.47
 Declared license: MIT OR Apache-2.0
 Homepage: https://github.com/rust-num/num-integer
 License text SHA-256: none
@@ -1536,7 +1591,7 @@ Declared license: MIT OR Apache-2.0
 Homepage: https://github.com/RustCrypto/utils
 License text SHA-256: none
 
-cargo:open@5.4.0
+cargo:open@5.4.4
 Declared license: MIT
 Homepage: https://github.com/Byron/open-rs
 License text SHA-256: c3ca23514163a6fe592466d3a6c4dd28ba8998dc1f012916ebf64bdb7764c1d4
@@ -1676,12 +1731,12 @@ Declared license: Apache-2.0 OR MIT
 Homepage: https://github.com/RustCrypto/formats/tree/master/pkcs8
 License text SHA-256: none
 
-cargo:pkg-config@0.3.33
+cargo:pkg-config@0.3.34
 Declared license: MIT OR Apache-2.0
 Homepage: https://github.com/rust-lang/pkg-config-rs
 License text SHA-256: none
 
-cargo:plist@1.10.0
+cargo:plist@1.10.1
 Declared license: MIT
 Homepage: https://github.com/ebarnard/rust-plist/
 License text SHA-256: 5b0ae40d1a35f7ae6591a28e44771240e6a88cb03a66c9189a45b9681639b466
@@ -1706,7 +1761,7 @@ Declared license: MIT
 Homepage: https://github.com/wez/wezterm
 License text SHA-256: 0f5e2ba844a4557af19c2277bf6c7d4a088606d1dde4abab72f29b65dbbbc8cb
 
-cargo:potential_utf@0.1.5
+cargo:potential_utf@0.1.6
 Declared license: Unicode-3.0
 Homepage: https://icu4x.unicode.org
 License text SHA-256: cde87abe221f413fede55ded0f17985f37b8fdc23e5f6cba9a3955437facb3ae
@@ -1756,16 +1811,6 @@ Declared license: Apache-2.0
 Homepage: https://github.com/tokio-rs/prost
 License text SHA-256: 769f80b5bcb42ed0af4e4d2fd74e1ac9bf843cb80c5a29219d1ef3544428a6bb
 
-cargo:ptr_meta@0.1.4
-Declared license: MIT
-Homepage: https://github.com/djkoloski/ptr_meta
-License text SHA-256: a427dbea98ffc849b4d8368d97211afdfef816e5c34090e7024a4787299f0e2e
-
-cargo:ptr_meta_derive@0.1.4
-Declared license: MIT
-Homepage: https://github.com/djkoloski/ptr_meta
-License text SHA-256: a427dbea98ffc849b4d8368d97211afdfef816e5c34090e7024a4787299f0e2e
-
 cargo:pulldown-cmark@0.13.4
 Declared license: MIT
 Homepage: https://github.com/raphlinus/pulldown-cmark
@@ -1791,7 +1836,7 @@ Declared license: MIT/Apache-2.0
 Homepage: http://github.com/tailhook/quick-error
 License text SHA-256: none
 
-cargo:quick-xml@0.41.0
+cargo:quick-xml@0.42.0
 Declared license: MIT
 Homepage: https://github.com/tafia/quick-xml
 License text SHA-256: none
@@ -1801,12 +1846,7 @@ Declared license: MIT OR Apache-2.0
 Homepage: https://github.com/dtolnay/quote
 License text SHA-256: none
 
-cargo:radium@0.7.0
-Declared license: MIT
-Homepage: https://github.com/bitvecto-rs/radium
-License text SHA-256: fa811b6d5b5d154bff9018882a06d1b0bcbe9c214c64b78aaaeaa59d98a3f3c3
-
-cargo:rand@0.8.7
+cargo:rand@0.8.8
 Declared license: MIT OR Apache-2.0
 Homepage: https://rust-random.github.io/book
 License text SHA-256: none
@@ -1841,12 +1881,12 @@ Declared license: MIT OR Apache-2.0 OR Zlib
 Homepage: https://github.com/rust-windowing/raw-window-handle
 License text SHA-256: none
 
-cargo:ref-cast@1.0.26
+cargo:ref-cast@1.0.27
 Declared license: MIT OR Apache-2.0
 Homepage: https://github.com/dtolnay/ref-cast
 License text SHA-256: none
 
-cargo:ref-cast-impl@1.0.26
+cargo:ref-cast-impl@1.0.27
 Declared license: MIT OR Apache-2.0
 Homepage: https://github.com/dtolnay/ref-cast
 License text SHA-256: none
@@ -1856,7 +1896,7 @@ Declared license: MIT OR Apache-2.0
 Homepage: https://github.com/rust-lang/regex
 License text SHA-256: none
 
-cargo:regex-automata@0.4.16
+cargo:regex-automata@0.4.18
 Declared license: MIT OR Apache-2.0
 Homepage: https://github.com/rust-lang/regex/tree/master/regex-automata
 License text SHA-256: none
@@ -1866,17 +1906,12 @@ Declared license: MIT OR Apache-2.0
 Homepage: https://github.com/rust-lang/regex/tree/master/regex-syntax
 License text SHA-256: none
 
-cargo:rend@0.4.2
-Declared license: MIT
-Homepage: https://github.com/djkoloski/rend
-License text SHA-256: a427dbea98ffc849b4d8368d97211afdfef816e5c34090e7024a4787299f0e2e
-
 cargo:reqwest@0.12.28
 Declared license: MIT OR Apache-2.0
 Homepage: https://github.com/seanmonstar/reqwest
 License text SHA-256: none
 
-cargo:reqwest@0.13.4
+cargo:reqwest@0.13.5
 Declared license: MIT OR Apache-2.0
 Homepage: https://github.com/seanmonstar/reqwest
 License text SHA-256: none
@@ -1890,16 +1925,6 @@ cargo:ring@0.17.14
 Declared license: Apache-2.0 AND ISC
 Homepage: https://github.com/briansmith/ring
 License text SHA-256: edb9c6dbff4676b90e729ffdb6c9239076a2e01b3bb8aadf080bdc7a682296da
-
-cargo:rkyv@0.7.46
-Declared license: MIT
-Homepage: https://github.com/rkyv/rkyv
-License text SHA-256: a427dbea98ffc849b4d8368d97211afdfef816e5c34090e7024a4787299f0e2e
-
-cargo:rkyv_derive@0.7.46
-Declared license: MIT
-Homepage: https://github.com/rkyv/rkyv
-License text SHA-256: a427dbea98ffc849b4d8368d97211afdfef816e5c34090e7024a4787299f0e2e
 
 cargo:rmcp@1.8.0
 Declared license: Apache-2.0
@@ -1921,7 +1946,7 @@ Declared license: MIT
 Homepage: https://github.com/rusqlite/rusqlite
 License text SHA-256: 1b22c746764567f538d003a5ed8abf27e3957939727be7e896f928a37724c40f
 
-cargo:rust_decimal@1.42.1
+cargo:rust_decimal@1.43.0
 Declared license: MIT
 Homepage: https://github.com/paupino/rust-decimal
 License text SHA-256: 6e5c30d0e9f43884aed9f8960eec61fd4a0e37e3785abbe05d2e887df4e0f20f
@@ -1946,12 +1971,12 @@ Declared license: Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT
 Homepage: https://github.com/bytecodealliance/rustix
 License text SHA-256: none
 
-cargo:rustix@1.1.4
+cargo:rustix@1.1.5
 Declared license: Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT
 Homepage: https://github.com/bytecodealliance/rustix
 License text SHA-256: none
 
-cargo:rustls@0.23.43
+cargo:rustls@0.23.45
 Declared license: Apache-2.0 OR ISC OR MIT
 Homepage: https://github.com/rustls/rustls
 License text SHA-256: none
@@ -1966,10 +1991,15 @@ Declared license: MIT OR Apache-2.0
 Homepage: https://github.com/rustls/rustls-platform-verifier
 License text SHA-256: none
 
-cargo:rustls-webpki@0.103.13
+cargo:rustls-webpki@0.103.15
 Declared license: ISC
 Homepage: https://github.com/rustls/webpki
 License text SHA-256: 3ac27594ed56fd079c95a71f8beabc498c5b997ec31e91f4a18e59a5974adb2a
+
+cargo:rustversion@1.0.23
+Declared license: MIT OR Apache-2.0
+Homepage: https://github.com/dtolnay/rustversion
+License text SHA-256: none
 
 cargo:ryu@1.0.23
 Declared license: Apache-2.0 OR BSL-1.0
@@ -2081,11 +2111,6 @@ Declared license: MIT OR Apache-2.0
 Homepage: https://github.com/SeaQL/sea-schema
 License text SHA-256: none
 
-cargo:seahash@4.1.0
-Declared license: MIT
-Homepage: https://gitlab.redox-os.org/redox-os/seahash
-License text SHA-256: none
-
 cargo:security-framework@3.7.0
 Declared license: MIT OR Apache-2.0
 Homepage: https://lib.rs/crates/security_framework
@@ -2166,12 +2191,12 @@ Declared license: MIT/Apache-2.0
 Homepage: https://github.com/nox/serde_urlencoded
 License text SHA-256: none
 
-cargo:serde_with@3.21.0
+cargo:serde_with@3.23.0
 Declared license: MIT OR Apache-2.0
 Homepage: https://github.com/jonasbb/serde_with/
 License text SHA-256: none
 
-cargo:serde_with_macros@3.21.0
+cargo:serde_with_macros@3.23.0
 Declared license: MIT OR Apache-2.0
 Homepage: https://github.com/jonasbb/serde_with/
 License text SHA-256: none
@@ -2286,7 +2311,7 @@ Declared license: MIT
 Homepage: https://github.com/tokio-rs/slab
 License text SHA-256: 12c7116c4425c559c9d7aed5cafbc1d4039286f17619ee2e6dd25f59728e679e
 
-cargo:smallvec@1.15.2
+cargo:smallvec@1.16.1
 Declared license: MIT OR Apache-2.0
 Homepage: https://github.com/servo/rust-smallvec
 License text SHA-256: none
@@ -2401,7 +2426,7 @@ Declared license: BSD-3-Clause
 Homepage: https://dalek.rs/
 License text SHA-256: 24fa06d8eae3c3ba93e1f863f0640ef57c8996f4bece3e14c3d29c5efb7c0089
 
-cargo:swift-rs@1.0.7
+cargo:swift-rs@1.0.8
 Declared license: MIT OR Apache-2.0
 Homepage: https://github.com/Brendonovich/swift-rs
 License text SHA-256: none
@@ -2411,17 +2436,12 @@ Declared license: MIT/Apache-2.0
 Homepage: https://gitlab.com/chris-morgan/symlink
 License text SHA-256: none
 
-cargo:syn@1.0.109
-Declared license: MIT OR Apache-2.0
-Homepage: https://github.com/dtolnay/syn
-License text SHA-256: none
-
 cargo:syn@2.0.119
 Declared license: MIT OR Apache-2.0
 Homepage: https://github.com/dtolnay/syn
 License text SHA-256: none
 
-cargo:syn@3.0.3
+cargo:syn@3.0.6
 Declared license: MIT OR Apache-2.0
 Homepage: https://github.com/dtolnay/syn
 License text SHA-256: none
@@ -2431,7 +2451,7 @@ Declared license: Apache-2.0
 Homepage: https://docs.rs/sync_wrapper
 License text SHA-256: 0cec06e0e55fbc3dc5cee4fca9b607f66cb8f4e4dbcf3b3c013594dd156732e9
 
-cargo:synstructure@0.13.2
+cargo:synstructure@0.14.0
 Declared license: MIT
 Homepage: https://github.com/mystor/synstructure
 License text SHA-256: 3a036676ec8c0dba1c24b96f83595456280b7a754ddee64585dd8048ed2b087f
@@ -2451,17 +2471,12 @@ Declared license: Apache-2.0
 Homepage: https://github.com/tauri-apps/tao
 License text SHA-256: 28694f36acab4f505232fc18954400c323a43402098abd2ce0f8510d510ed04d, 6dc0e068dcf3a5bc8e054205b85b7720e1d49265bbc64bf515d2cf79197df69a
 
-cargo:tap@1.0.1
-Declared license: MIT
-Homepage: https://github.com/myrrlyn/tap
-License text SHA-256: 386091cda07036e7f6d8e2d30137b358b355484c29a305ececb63d0386025daa
-
 cargo:tar@0.4.46
 Declared license: MIT OR Apache-2.0
 Homepage: https://github.com/composefs/tar-rs
 License text SHA-256: none
 
-cargo:tauri@2.11.5
+cargo:tauri@2.11.6
 Declared license: Apache-2.0 OR MIT
 Homepage: https://tauri.app/
 License text SHA-256: none
@@ -2491,22 +2506,27 @@ Declared license: Apache-2.0 OR MIT
 Homepage: https://github.com/tauri-apps/plugins-workspace
 License text SHA-256: eb8a6c84630461b352badcab1dbe5d0168c56d377358b2b8c86b51003272d5ef
 
-cargo:tauri-plugin-dialog@2.7.2
+cargo:tauri-plugin-deep-link@2.4.10
 Declared license: Apache-2.0 OR MIT
 Homepage: https://github.com/tauri-apps/plugins-workspace
 License text SHA-256: eb8a6c84630461b352badcab1dbe5d0168c56d377358b2b8c86b51003272d5ef
 
-cargo:tauri-plugin-fs@2.5.1
+cargo:tauri-plugin-dialog@2.7.3
 Declared license: Apache-2.0 OR MIT
 Homepage: https://github.com/tauri-apps/plugins-workspace
 License text SHA-256: eb8a6c84630461b352badcab1dbe5d0168c56d377358b2b8c86b51003272d5ef
 
-cargo:tauri-plugin-notification@2.3.3
+cargo:tauri-plugin-fs@2.5.2
 Declared license: Apache-2.0 OR MIT
 Homepage: https://github.com/tauri-apps/plugins-workspace
 License text SHA-256: eb8a6c84630461b352badcab1dbe5d0168c56d377358b2b8c86b51003272d5ef
 
-cargo:tauri-plugin-opener@2.5.4
+cargo:tauri-plugin-notification@2.4.0
+Declared license: Apache-2.0 OR MIT
+Homepage: https://github.com/tauri-apps/plugins-workspace
+License text SHA-256: eb8a6c84630461b352badcab1dbe5d0168c56d377358b2b8c86b51003272d5ef
+
+cargo:tauri-plugin-opener@2.5.5
 Declared license: Apache-2.0 OR MIT
 Homepage: https://github.com/tauri-apps/plugins-workspace
 License text SHA-256: eb8a6c84630461b352badcab1dbe5d0168c56d377358b2b8c86b51003272d5ef
@@ -2516,12 +2536,12 @@ Declared license: Apache-2.0 OR MIT
 Homepage: https://github.com/tauri-apps/plugins-workspace
 License text SHA-256: eb8a6c84630461b352badcab1dbe5d0168c56d377358b2b8c86b51003272d5ef
 
-cargo:tauri-plugin-single-instance@2.4.3
+cargo:tauri-plugin-single-instance@2.4.5
 Declared license: Apache-2.0 OR MIT
 Homepage: https://github.com/tauri-apps/plugins-workspace
 License text SHA-256: eb8a6c84630461b352badcab1dbe5d0168c56d377358b2b8c86b51003272d5ef
 
-cargo:tauri-plugin-updater@2.10.1
+cargo:tauri-plugin-updater@2.12.0
 Declared license: Apache-2.0 OR MIT
 Homepage: https://github.com/tauri-apps/plugins-workspace
 License text SHA-256: eb8a6c84630461b352badcab1dbe5d0168c56d377358b2b8c86b51003272d5ef
@@ -2576,7 +2596,7 @@ Declared license: MIT OR Apache-2.0
 Homepage: https://github.com/dtolnay/thiserror
 License text SHA-256: none
 
-cargo:thiserror@2.0.19
+cargo:thiserror@2.0.20
 Declared license: MIT OR Apache-2.0
 Homepage: https://github.com/dtolnay/thiserror
 License text SHA-256: none
@@ -2586,7 +2606,7 @@ Declared license: MIT OR Apache-2.0
 Homepage: https://github.com/dtolnay/thiserror
 License text SHA-256: none
 
-cargo:thiserror-impl@2.0.19
+cargo:thiserror-impl@2.0.20
 Declared license: MIT OR Apache-2.0
 Homepage: https://github.com/dtolnay/thiserror
 License text SHA-256: none
@@ -2596,7 +2616,7 @@ Declared license: MIT OR Apache-2.0
 Homepage: https://github.com/Amanieu/thread_local-rs
 License text SHA-256: none
 
-cargo:time@0.3.54
+cargo:time@0.3.55
 Declared license: MIT OR Apache-2.0
 Homepage: https://time-rs.github.io
 License text SHA-256: none
@@ -2611,19 +2631,14 @@ Declared license: MIT OR Apache-2.0
 Homepage: https://github.com/time-rs/time
 License text SHA-256: none
 
-cargo:tinystr@0.8.3
+cargo:tinystr@0.8.4
 Declared license: Unicode-3.0
 Homepage: https://github.com/unicode-org/icu4x
 License text SHA-256: cde87abe221f413fede55ded0f17985f37b8fdc23e5f6cba9a3955437facb3ae
 
-cargo:tinyvec@1.12.0
+cargo:tinyvec@1.13.3
 Declared license: Zlib OR Apache-2.0 OR MIT
 Homepage: https://github.com/Lokathor/tinyvec
-License text SHA-256: none
-
-cargo:tinyvec_macros@0.1.1
-Declared license: MIT OR Apache-2.0 OR Zlib
-Homepage: https://github.com/Soveu/tinyvec_macros
 License text SHA-256: none
 
 cargo:tokio@1.53.1
@@ -2641,7 +2656,7 @@ Declared license: MIT
 Homepage: https://tokio.rs
 License text SHA-256: c1e08ee9a7288bf649d6a78f6079006333df4212f5fcda85be1a0a451f71852d
 
-cargo:tokio-rustls@0.26.4
+cargo:tokio-rustls@0.26.5
 Declared license: MIT OR Apache-2.0
 Homepage: https://github.com/rustls/tokio-rustls
 License text SHA-256: none
@@ -2666,7 +2681,7 @@ Declared license: MIT
 Homepage: https://tokio.rs
 License text SHA-256: 3e1bef82aa0dfee4504ad211f7e4895153e3191db6ab179f94a7e20f990a0b67
 
-cargo:toml@0.8.23
+cargo:toml@0.8.2
 Declared license: MIT OR Apache-2.0
 Homepage: https://github.com/toml-rs/toml
 License text SHA-256: none
@@ -2676,12 +2691,12 @@ Declared license: MIT OR Apache-2.0
 Homepage: https://github.com/toml-rs/toml
 License text SHA-256: none
 
-cargo:toml@1.1.4+spec-1.1.0
+cargo:toml@1.1.6+spec-1.1.0
 Declared license: MIT OR Apache-2.0
 Homepage: https://github.com/toml-rs/toml
 License text SHA-256: none
 
-cargo:toml_datetime@0.6.11
+cargo:toml_datetime@0.6.3
 Declared license: MIT OR Apache-2.0
 Homepage: https://github.com/toml-rs/toml
 License text SHA-256: none
@@ -2701,22 +2716,17 @@ Declared license: MIT OR Apache-2.0
 Homepage: https://github.com/toml-rs/toml
 License text SHA-256: none
 
-cargo:toml_edit@0.22.27
+cargo:toml_edit@0.20.2
 Declared license: MIT OR Apache-2.0
 Homepage: https://github.com/toml-rs/toml
 License text SHA-256: none
 
-cargo:toml_edit@0.25.13+spec-1.1.0
+cargo:toml_edit@0.25.15+spec-1.1.0
 Declared license: MIT OR Apache-2.0
 Homepage: https://github.com/toml-rs/toml
 License text SHA-256: none
 
 cargo:toml_parser@1.1.3+spec-1.1.0
-Declared license: MIT OR Apache-2.0
-Homepage: https://github.com/toml-rs/toml
-License text SHA-256: none
-
-cargo:toml_write@0.1.2
 Declared license: MIT OR Apache-2.0
 Homepage: https://github.com/toml-rs/toml
 License text SHA-256: none
@@ -2846,7 +2856,7 @@ Declared license: MIT OR Apache-2.0
 Homepage: https://github.com/servo/unicode-bidi
 License text SHA-256: none
 
-cargo:unicode-ident@1.0.24
+cargo:unicode-ident@1.0.26
 Declared license: (MIT OR Apache-2.0) AND Unicode-3.0
 Homepage: https://github.com/dtolnay/unicode-ident
 License text SHA-256: none
@@ -2921,7 +2931,7 @@ Declared license: Apache-2.0 OR MIT
 Homepage: https://github.com/alacritty/vte
 License text SHA-256: none
 
-cargo:uuid@1.24.0
+cargo:uuid@1.26.1
 Declared license: Apache-2.0 OR MIT
 Homepage: https://github.com/uuid-rs/uuid
 License text SHA-256: none
@@ -2961,7 +2971,7 @@ Declared license: MIT
 Homepage: https://github.com/seanmonstar/want
 License text SHA-256: f7dfffe03f9faba8e83911d59bbf459371a0fe8d18f6c84f71d5386030fba26c
 
-cargo:web_atoms@0.2.5
+cargo:web_atoms@0.2.6
 Declared license: MIT OR Apache-2.0
 Homepage: https://github.com/servo/html5ever
 License text SHA-256: none
@@ -3082,6 +3092,11 @@ Homepage: https://github.com/microsoft/windows-rs
 License text SHA-256: none
 
 cargo:windows-numerics@0.2.0
+Declared license: MIT OR Apache-2.0
+Homepage: https://github.com/microsoft/windows-rs
+License text SHA-256: none
+
+cargo:windows-registry@0.5.3
 Declared license: MIT OR Apache-2.0
 Homepage: https://github.com/microsoft/windows-rs
 License text SHA-256: none
@@ -3221,7 +3236,7 @@ Declared license: MIT
 Homepage: https://github.com/rodrigocfd/winsafe
 License text SHA-256: 811b4109408f979d6e5ccde421fca051488ae3c18be5e05ce82d6c6e620df26c
 
-cargo:writeable@0.6.3
+cargo:writeable@0.6.4
 Declared license: Unicode-3.0
 Homepage: https://github.com/unicode-org/icu4x
 License text SHA-256: cde87abe221f413fede55ded0f17985f37b8fdc23e5f6cba9a3955437facb3ae
@@ -3230,11 +3245,6 @@ cargo:wry@0.55.1
 Declared license: Apache-2.0 OR MIT
 Homepage: https://github.com/tauri-apps/wry
 License text SHA-256: 26235c41e314fb0da35b33b2bb5bcbc4dd523839f8eeca52efcd43586f441fb5
-
-cargo:wyz@0.5.1
-Declared license: MIT
-Homepage: https://myrrlyn.net/crates/wyz
-License text SHA-256: 667fdb63d9abc6e572b47947a9b2ed3d73f317b1a7ee36def6c52b4b83b6b166
 
 cargo:xattr@1.6.1
 Declared license: MIT OR Apache-2.0
@@ -3256,12 +3266,12 @@ Declared license: Unicode-3.0
 Homepage: https://github.com/unicode-org/icu4x
 License text SHA-256: cde87abe221f413fede55ded0f17985f37b8fdc23e5f6cba9a3955437facb3ae
 
-cargo:yoke-derive@0.8.2
+cargo:yoke-derive@0.8.3
 Declared license: Unicode-3.0
 Homepage: https://github.com/unicode-org/icu4x
 License text SHA-256: cde87abe221f413fede55ded0f17985f37b8fdc23e5f6cba9a3955437facb3ae
 
-cargo:zerocopy@0.8.55
+cargo:zerocopy@0.8.57
 Declared license: BSD-2-Clause OR Apache-2.0 OR MIT
 Homepage: https://github.com/google/zerocopy
 License text SHA-256: none
@@ -3271,7 +3281,7 @@ Declared license: Unicode-3.0
 Homepage: https://github.com/unicode-org/icu4x
 License text SHA-256: cde87abe221f413fede55ded0f17985f37b8fdc23e5f6cba9a3955437facb3ae
 
-cargo:zerofrom-derive@0.1.7
+cargo:zerofrom-derive@0.1.8
 Declared license: Unicode-3.0
 Homepage: https://github.com/unicode-org/icu4x
 License text SHA-256: cde87abe221f413fede55ded0f17985f37b8fdc23e5f6cba9a3955437facb3ae
@@ -3286,17 +3296,17 @@ Declared license: Apache-2.0 OR MIT
 Homepage: https://github.com/RustCrypto/utils
 License text SHA-256: none
 
-cargo:zerotrie@0.2.4
+cargo:zerotrie@0.2.5
 Declared license: Unicode-3.0
 Homepage: https://icu4x.unicode.org
 License text SHA-256: cde87abe221f413fede55ded0f17985f37b8fdc23e5f6cba9a3955437facb3ae
 
-cargo:zerovec@0.11.6
+cargo:zerovec@0.11.8
 Declared license: Unicode-3.0
 Homepage: https://github.com/unicode-org/icu4x
 License text SHA-256: cde87abe221f413fede55ded0f17985f37b8fdc23e5f6cba9a3955437facb3ae
 
-cargo:zerovec-derive@0.11.3
+cargo:zerovec-derive@0.11.6
 Declared license: Unicode-3.0
 Homepage: https://github.com/unicode-org/icu4x
 License text SHA-256: cde87abe221f413fede55ded0f17985f37b8fdc23e5f6cba9a3955437facb3ae
@@ -3310,6 +3320,11 @@ cargo:zip@4.6.1
 Declared license: MIT
 Homepage: https://github.com/zip-rs/zip2.git
 License text SHA-256: 04dc52136d82400b11df5f474949863a70a5d05d2278dec45b99c479494450a6
+
+cargo:zlib-rs@0.6.8
+Declared license: Zlib
+Homepage: https://github.com/trifectatechfoundation/zlib-rs
+License text SHA-256: 6ddf0fba55d4ce67cbbef082d1169e84680c7a34be31a00edef4c89e0c3cf580
 
 cargo:zmij@1.0.23
 Declared license: MIT
@@ -3326,17 +3341,17 @@ Declared license: MIT
 Homepage: https://github.com/gyscos/zstd-rs
 License text SHA-256: 84b7e1b767becaf1620b800ed3f5c323d90c18c9a8c3c5714c7f4410e6416b86
 
-cargo:zstd-safe@7.2.4
-Declared license: MIT OR Apache-2.0
+cargo:zstd-safe@7.3.0
+Declared license: BSD-3-Clause
 Homepage: https://github.com/gyscos/zstd-rs
-License text SHA-256: 0cec06e0e55fbc3dc5cee4fca9b607f66cb8f4e4dbcf3b3c013594dd156732e9, 10b6a2ae8a02143a3ef9e954be98fa86edcef27b12a6082b665da63ce1510d1e, 84b7e1b767becaf1620b800ed3f5c323d90c18c9a8c3c5714c7f4410e6416b86
+License text SHA-256: 769153f04f135a5bc87cd68f6dcf5168ad3c136749616e8dbd9b78b0199e0b18
 
-cargo:zstd-sys@2.0.16+zstd.1.5.7
-Declared license: MIT/Apache-2.0
+cargo:zstd-sys@2.1.0+zstd.1.5.7
+Declared license: BSD-3-Clause
 Homepage: https://github.com/gyscos/zstd-rs
-License text SHA-256: 0cec06e0e55fbc3dc5cee4fca9b607f66cb8f4e4dbcf3b3c013594dd156732e9, 10b6a2ae8a02143a3ef9e954be98fa86edcef27b12a6082b665da63ce1510d1e, 30367d9a4eadd6c9dcd719ea082ac9f6c499cdbd9976b246bdf2153ebe8e53f6, 84b7e1b767becaf1620b800ed3f5c323d90c18c9a8c3c5714c7f4410e6416b86
+License text SHA-256: 08728d1c12d66320bd53177c8c026f2191e0a2e14fe0f3c143dcf49d3cd476d1, 769153f04f135a5bc87cd68f6dcf5168ad3c136749616e8dbd9b78b0199e0b18
 
-cargo:zune-core@0.5.1
+cargo:zune-core@0.5.3
 Declared license: MIT OR Apache-2.0 OR Zlib
 Homepage: https://github.com/etemesi254/zune-image
 License text SHA-256: none
@@ -3624,16 +3639,6 @@ npm:@ecies/ciphers@0.2.5
 Declared license: MIT
 Homepage: https://github.com/ecies/js-ciphers#readme
 License text SHA-256: 7ca3dae437b1f14351e5a5e04714180e3ff168ffc8621784fdd9cc84acfccb3a
-
-npm:@emotion/is-prop-valid@1.4.0
-Declared license: MIT
-Homepage: https://github.com/emotion-js/emotion/tree/main#readme
-License text SHA-256: 719058ae8dbdba06fafd4b21795bf624026bd34f61baf2b122fb35630d990280
-
-npm:@emotion/memoize@0.9.0
-Declared license: MIT
-Homepage: https://github.com/emotion-js/emotion/tree/main#readme
-License text SHA-256: 719058ae8dbdba06fafd4b21795bf624026bd34f61baf2b122fb35630d990280
 
 npm:@floating-ui/core@1.8.0
 Declared license: MIT
@@ -5950,7 +5955,7 @@ Declared license: MIT
 Homepage: https://github.com/jshttp/forwarded#readme
 License text SHA-256: 0696190d4967590d31936e7278676d601ee1acf3a0bc53859751bcb2b093c088
 
-npm:framer-motion@12.34.0
+npm:framer-motion@13.4.0
 Declared license: MIT
 Homepage: https://github.com/motiondivision/motion#readme
 License text SHA-256: aac842346e3368e0459dd620003c2c90e5caf48c8aeac28da6504f66b26b13be
@@ -6866,17 +6871,17 @@ Declared license: MIT
 Homepage: https://github.com/microsoft/monaco-editor
 License text SHA-256: 806766baa9009e389d0163173365c947273b560e1fedfacfc60e8d7bab6057da
 
-npm:motion@12.34.0
+npm:motion@13.4.0
 Declared license: MIT
 Homepage: https://github.com/motiondivision/motion#readme
 License text SHA-256: bb59eb35f694a158d8f9892e7ce188428bc5d1e719910c7a29444d7c0787e57d
 
-npm:motion-dom@12.34.0
+npm:motion-dom@13.3.0
 Declared license: MIT
 Homepage: https://github.com/motiondivision/motion#readme
 License text SHA-256: bb59eb35f694a158d8f9892e7ce188428bc5d1e719910c7a29444d7c0787e57d
 
-npm:motion-utils@12.29.2
+npm:motion-utils@13.3.0
 Declared license: MIT
 Homepage: https://github.com/motiondivision/motion#readme
 License text SHA-256: bb59eb35f694a158d8f9892e7ce188428bc5d1e719910c7a29444d7c0787e57d
@@ -8352,7 +8357,7 @@ SOFTWARE.
 
 SHA-256: 05f344491a7d18e1a3188acbddf6f921284cb192e49d16391128d453000468ff
 Packages:
-- cargo:hyper@1.11.0
+- cargo:hyper@1.11.1
 
 Copyright (c) 2014-2026 Sean McArthur
 
@@ -8543,6 +8548,43 @@ LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 
+SHA-256: 08728d1c12d66320bd53177c8c026f2191e0a2e14fe0f3c143dcf49d3cd476d1
+Packages:
+- cargo:zstd-sys@2.1.0+zstd.1.5.7
+
+The auto-generated bindings are under the 3-clause BSD license:
+
+BSD License
+
+For Zstandard software
+
+Copyright (c) Meta Platforms, Inc. and affiliates. All rights reserved.
+
+Redistribution and use in source and binary forms, with or without modification,
+are permitted provided that the following conditions are met:
+
+ * Redistributions of source code must retain the above copyright notice, this
+   list of conditions and the following disclaimer.
+
+ * Redistributions in binary form must reproduce the above copyright notice,
+   this list of conditions and the following disclaimer in the documentation
+   and/or other materials provided with the distribution.
+
+ * Neither the name Facebook, nor Meta, nor the names of its contributors may
+   be used to endorse or promote products derived from this software without
+   specific prior written permission.
+
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND
+ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
+WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE FOR
+ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
+(INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
+LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON
+ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+(INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
+SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
 SHA-256: 0a76605191713ca2bbad604774cabf83c2d93eeccf3d785745e0c40a4b5a2d2a
 Packages:
 - npm:graphql@16.14.2
@@ -8646,8 +8688,6 @@ SOFTWARE.
 SHA-256: 0cec06e0e55fbc3dc5cee4fca9b607f66cb8f4e4dbcf3b3c013594dd156732e9
 Packages:
 - cargo:sync_wrapper@1.0.2
-- cargo:zstd-safe@7.2.4
-- cargo:zstd-sys@2.0.16+zstd.1.5.7
 
 
                                  Apache License
@@ -9166,13 +9206,6 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
-
-SHA-256: 10b6a2ae8a02143a3ef9e954be98fa86edcef27b12a6082b665da63ce1510d1e
-Packages:
-- cargo:zstd-safe@7.2.4
-- cargo:zstd-sys@2.0.16+zstd.1.5.7
-
-MIT or Apache-2.0
 
 SHA-256: 10d0bd153dbc02fefa5d28ffa21071f9539d0fbe0ba23ce1b44370b310bfe322
 Packages:
@@ -11008,43 +11041,6 @@ CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
 OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
-SHA-256: 30367d9a4eadd6c9dcd719ea082ac9f6c499cdbd9976b246bdf2153ebe8e53f6
-Packages:
-- cargo:zstd-sys@2.0.16+zstd.1.5.7
-
-The auto-generated bindings are under the 3-clause BSD license:
-
-BSD License
-
-For Zstandard software
-
-Copyright (c) 2016-present, Facebook, Inc. All rights reserved.
-
-Redistribution and use in source and binary forms, with or without modification,
-are permitted provided that the following conditions are met:
-
- * Redistributions of source code must retain the above copyright notice, this
-   list of conditions and the following disclaimer.
-
- * Redistributions in binary form must reproduce the above copyright notice,
-   this list of conditions and the following disclaimer in the documentation
-   and/or other materials provided with the distribution.
-
- * Neither the name Facebook nor the names of its contributors may be used to
-   endorse or promote products derived from this software without specific
-   prior written permission.
-
-THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND
-ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
-WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
-DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE FOR
-ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
-(INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
-LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON
-ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
-(INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
-SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
-
 SHA-256: 3234ac55816264ee7b6c7ee27efd61cf0a1fe775806870e3d9b4c41ea73c5cb1
 Packages:
 - cargo:memoffset@0.6.5
@@ -11323,32 +11319,6 @@ LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 
-SHA-256: 386091cda07036e7f6d8e2d30137b358b355484c29a305ececb63d0386025daa
-Packages:
-- cargo:tap@1.0.1
-
-MIT License
-
-Copyright (c) 2017 Elliot Linder <darfink@gmail.com>
-
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
-
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-SOFTWARE.
-
 SHA-256: 38fdb5e42d4842bde17baea7f4bf690c25706ce06c6a90c981c57379f01751b1
 Packages:
 - npm:d3-sankey@0.12.3
@@ -11409,7 +11379,7 @@ SOFTWARE.
 
 SHA-256: 3a036676ec8c0dba1c24b96f83595456280b7a754ddee64585dd8048ed2b087f
 Packages:
-- cargo:synstructure@0.13.2
+- cargo:synstructure@0.14.0
 
 Copyright 2016 Nika Layzell
 
@@ -11466,7 +11436,7 @@ PERFORMANCE OF THIS SOFTWARE.
 
 SHA-256: 3ac27594ed56fd079c95a71f8beabc498c5b997ec31e91f4a18e59a5974adb2a
 Packages:
-- cargo:rustls-webpki@0.103.13
+- cargo:rustls-webpki@0.103.15
 
 Except as otherwise noted, this project is licensed under the following
 (ISC-style) terms:
@@ -13435,7 +13405,7 @@ CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
 SHA-256: 57f841bc9767b5b843e0c0c471bd50a95ddb00f13b1f4a2c6d6f57a7dbfdc1f3
 Packages:
-- cargo:http-body-util@0.1.4
+- cargo:http-body-util@0.1.5
 - cargo:http-body@1.1.0
 
 Copyright (c) 2019-2026 Sean McArthur & Hyper Contributors
@@ -13892,7 +13862,7 @@ ARISING OUT OF OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
 
 SHA-256: 5b0ae40d1a35f7ae6591a28e44771240e6a88cb03a66c9189a45b9681639b466
 Packages:
-- cargo:plist@1.10.0
+- cargo:plist@1.10.1
 
 Copyright (c) 2015 Edward Barnard
 
@@ -14904,10 +14874,14 @@ SOFTWARE.
 
 SHA-256: 65314a6c96683f76f7495709bb0ddecb4eaa6fa244b28f23c4812ef8e5524066
 Packages:
-- cargo:aho-corasick@1.1.4
+- cargo:aho-corasick@1.1.5
 - cargo:byteorder@1.5.0
-- cargo:globset@0.4.19
-- cargo:ignore@0.4.31
+- cargo:globset@0.4.20
+- cargo:ignore@0.4.33
+- cargo:jiff-core@0.1.1
+- cargo:jiff-tzdb-platform@0.1.3
+- cargo:jiff-tzdb@0.1.8
+- cargo:jiff@0.2.37
 - cargo:memchr@2.8.3
 - cargo:same-file@1.0.6
 - cargo:walkdir@2.5.0
@@ -15008,33 +14982,6 @@ Packages:
 MIT License
 
 Copyright (c) 2021 Anthony Fu <https://github.com/antfu>
-
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
-
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-SOFTWARE.
-
-SHA-256: 667fdb63d9abc6e572b47947a9b2ed3d73f317b1a7ee36def6c52b4b83b6b166
-Packages:
-- cargo:bitvec@1.1.1
-- cargo:wyz@0.5.1
-
-MIT License
-
-Copyright (c) 2018 myrrlyn (Alexander Payne)
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
@@ -15587,19 +15534,6 @@ Redistribution and use in source and binary forms, with or without modification,
 
 THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
-SHA-256: 6cb29bf78c6e512c65df670da014b3e1ee04a1db1f0adffd8147c21e25696241
-Packages:
-- cargo:bytecheck@0.6.12
-- cargo:bytecheck_derive@0.6.12
-
-Copyright 2020 David Koloski
-
-Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated documentation files (the "Software"), to deal in the Software without restriction, including without limitation the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of the Software, and to permit persons to whom the Software is furnished to do so, subject to the following conditions:
-
-The above copyright notice and this permission notice shall be included in all copies or substantial portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
-
 SHA-256: 6d489af6292662d9e36d34ce49423784984a5f6e41d7b58f49b01264df59fa03
 Packages:
 - cargo:dunce@1.0.5
@@ -15933,6 +15867,30 @@ Apache License
    See the License for the specific language governing permissions and
    limitations under the License.
 
+SHA-256: 6ddf0fba55d4ce67cbbef082d1169e84680c7a34be31a00edef4c89e0c3cf580
+Packages:
+- cargo:zlib-rs@0.6.8
+
+(C) 2024 Trifecta Tech Foundation
+
+This software is provided 'as-is', without any express or implied
+warranty. In no event will the authors be held liable for any damages
+arising from the use of this software.
+
+Permission is granted to anyone to use this software for any purpose,
+including commercial applications, and to alter it and redistribute it
+freely, subject to the following restrictions:
+
+1. The origin of this software must not be misrepresented; you must not
+   claim that you wrote the original software. If you use this software
+   in a product, an acknowledgment in the product documentation would be
+   appreciated but is not required.
+
+2. Altered source versions must be plainly marked as such, and must not be
+   misrepresented as being the original software.
+
+3. This notice may not be removed or altered from any source distribution.
+
 SHA-256: 6dfc8a41d27c6bfd01a963b61461f22060aa32909f1c0eda6863755cc3aea9a0
 Packages:
 - npm:layout-base@1.0.2
@@ -15962,7 +15920,7 @@ SOFTWARE.
 
 SHA-256: 6e5c30d0e9f43884aed9f8960eec61fd4a0e37e3785abbe05d2e887df4e0f20f
 Packages:
-- cargo:rust_decimal@1.42.1
+- cargo:rust_decimal@1.43.0
 
 MIT License
 
@@ -16012,59 +15970,6 @@ IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
 CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT,
 TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
 SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
-
-SHA-256: 719058ae8dbdba06fafd4b21795bf624026bd34f61baf2b122fb35630d990280
-Packages:
-- npm:@emotion/is-prop-valid@1.4.0
-- npm:@emotion/memoize@0.9.0
-
-MIT License
-
-Copyright (c) Emotion team and other contributors
-
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
-
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-SOFTWARE.
-
-SHA-256: 72641d65642c759f84f06cfbb6028c4f97a5d19387792d0a7c26fae27b5752fb
-Packages:
-- cargo:funty@2.0.0
-
-MIT License
-
-Copyright (c) 2020 myrrlyn (Alexander Payne)
-
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
-
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-SOFTWARE.
 
 SHA-256: 72bb6356e9efb4942c80e26ff54be9191267f62a8c2651d0b5fcd5f872737da0
 Packages:
@@ -16278,6 +16183,7 @@ THE SOFTWARE.
 SHA-256: 7427abc630365f6335b3ced8b620b6c8a87b3793edea701d15cdde01ec7a6cde
 Packages:
 - cargo:miniz_oxide@0.8.9
+- cargo:miniz_oxide@0.9.1
 
 MIT License
 
@@ -16367,6 +16273,40 @@ LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
 DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
 THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
 (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+SHA-256: 769153f04f135a5bc87cd68f6dcf5168ad3c136749616e8dbd9b78b0199e0b18
+Packages:
+- cargo:zstd-safe@7.3.0
+- cargo:zstd-sys@2.1.0+zstd.1.5.7
+
+BSD 3-Clause License
+
+Copyright (c) 2026, Alexandre Bury
+
+Redistribution and use in source and binary forms, with or without
+modification, are permitted provided that the following conditions are met:
+
+1. Redistributions of source code must retain the above copyright notice, this
+   list of conditions and the following disclaimer.
+
+2. Redistributions in binary form must reproduce the above copyright notice,
+   this list of conditions and the following disclaimer in the documentation
+   and/or other materials provided with the distribution.
+
+3. Neither the name of the copyright holder nor the names of its
+   contributors may be used to endorse or promote products derived from
+   this software without specific prior written permission.
+
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
+FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
+SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
+CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
+OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 SHA-256: 769f80b5bcb42ed0af4e4d2fd74e1ac9bf843cb80c5a29219d1ef3544428a6bb
@@ -17255,8 +17195,6 @@ THE SOFTWARE.
 
 SHA-256: 84b7e1b767becaf1620b800ed3f5c323d90c18c9a8c3c5714c7f4410e6416b86
 Packages:
-- cargo:zstd-safe@7.2.4
-- cargo:zstd-sys@2.0.16+zstd.1.5.7
 - cargo:zstd@0.13.3
 
 The MIT License (MIT)
@@ -17270,7 +17208,7 @@ THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLI
 
 SHA-256: 8649bf6c5eca0205e3a95d64eba9ead0be2804c25c3fa335e04ce5e76c04b714
 Packages:
-- cargo:bstr@1.13.0
+- cargo:bstr@1.13.1
 
 This project is licensed under either of
 
@@ -19531,7 +19469,7 @@ ARISING OUT OF OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
 
 SHA-256: 9db9de9edfd0ae7c1a5ac724191c0899dc218273f62c717e004ef037501646c2
 Packages:
-- cargo:data-encoding@2.11.0
+- cargo:data-encoding@2.11.1
 
 The MIT License (MIT)
 
@@ -20155,22 +20093,6 @@ CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT,
 TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
 SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
-SHA-256: a427dbea98ffc849b4d8368d97211afdfef816e5c34090e7024a4787299f0e2e
-Packages:
-- cargo:ptr_meta@0.1.4
-- cargo:ptr_meta_derive@0.1.4
-- cargo:rend@0.4.2
-- cargo:rkyv@0.7.46
-- cargo:rkyv_derive@0.7.46
-
-Copyright 2021 David Koloski
-
-Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated documentation files (the "Software"), to deal in the Software without restriction, including without limitation the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of the Software, and to permit persons to whom the Software is furnished to do so, subject to the following conditions:
-
-The above copyright notice and this permission notice shall be included in all copies or substantial portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
-
 SHA-256: a61302db4ae78c16c1c8a3bc532eae0a1c2b2b8a28601da88eeb299aafbcff08
 Packages:
 - npm:remark-cjk-friendly-gfm-strikethrough@1.2.3
@@ -20444,7 +20366,7 @@ SOFTWARE.
 
 SHA-256: aac842346e3368e0459dd620003c2c90e5caf48c8aeac28da6504f66b26b13be
 Packages:
-- npm:framer-motion@12.34.0
+- npm:framer-motion@13.4.0
 
 The MIT License (MIT)
 
@@ -21357,9 +21279,9 @@ SOFTWARE.
 
 SHA-256: bb59eb35f694a158d8f9892e7ce188428bc5d1e719910c7a29444d7c0787e57d
 Packages:
-- npm:motion-dom@12.34.0
-- npm:motion-utils@12.29.2
-- npm:motion@12.34.0
+- npm:motion-dom@13.3.0
+- npm:motion-utils@13.3.0
+- npm:motion@13.4.0
 
 The MIT License (MIT)
 
@@ -21878,7 +21800,7 @@ SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
 SHA-256: c3ca23514163a6fe592466d3a6c4dd28ba8998dc1f012916ebf64bdb7764c1d4
 Packages:
-- cargo:open@5.4.0
+- cargo:open@5.4.4
 
 The MIT License (MIT)
 =====================
@@ -22491,7 +22413,7 @@ Creator: Person: Daniel Thompson-Yvetot
 
 SHA-256: c804065b0956d00a65ce119456ec48ee456f5446b904b07ee85225ba5a88ce41
 Packages:
-- cargo:mio@1.2.2
+- cargo:mio@1.2.3
 
 Copyright (c) 2014 Carl Lerche and other MIO contributors
 
@@ -22632,10 +22554,13 @@ SHA-256: cc8f3c8ab396de7fa549e3907319281cf13d0a4a456a2b0695c5b61d877dba68
 Packages:
 - cargo:darling@0.20.11
 - cargo:darling@0.23.0
+- cargo:darling@0.24.1
 - cargo:darling_core@0.20.11
 - cargo:darling_core@0.23.0
+- cargo:darling_core@0.24.1
 - cargo:darling_macro@0.20.11
 - cargo:darling_macro@0.23.0
+- cargo:darling_macro@0.24.1
 
 MIT License
 
@@ -22779,24 +22704,24 @@ THIS SOFTWARE.
 
 SHA-256: cde87abe221f413fede55ded0f17985f37b8fdc23e5f6cba9a3955437facb3ae
 Packages:
-- cargo:icu_collections@2.2.0
-- cargo:icu_locale_core@2.2.0
-- cargo:icu_normalizer@2.2.0
-- cargo:icu_normalizer_data@2.2.0
-- cargo:icu_properties@2.2.0
-- cargo:icu_properties_data@2.2.0
-- cargo:icu_provider@2.2.0
-- cargo:litemap@0.8.2
-- cargo:potential_utf@0.1.5
-- cargo:tinystr@0.8.3
-- cargo:writeable@0.6.3
-- cargo:yoke-derive@0.8.2
+- cargo:icu_collections@2.3.0
+- cargo:icu_locale_core@2.3.0
+- cargo:icu_normalizer@2.3.0
+- cargo:icu_normalizer_data@2.3.0
+- cargo:icu_properties@2.3.0
+- cargo:icu_properties_data@2.3.0
+- cargo:icu_provider@2.3.1
+- cargo:litemap@0.8.3
+- cargo:potential_utf@0.1.6
+- cargo:tinystr@0.8.4
+- cargo:writeable@0.6.4
+- cargo:yoke-derive@0.8.3
 - cargo:yoke@0.8.3
-- cargo:zerofrom-derive@0.1.7
+- cargo:zerofrom-derive@0.1.8
 - cargo:zerofrom@0.1.8
-- cargo:zerotrie@0.2.4
-- cargo:zerovec-derive@0.11.3
-- cargo:zerovec@0.11.6
+- cargo:zerotrie@0.2.5
+- cargo:zerovec-derive@0.11.6
+- cargo:zerovec@0.11.8
 
 UNICODE LICENSE V3
 
@@ -25260,13 +25185,14 @@ CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 SHA-256: eb8a6c84630461b352badcab1dbe5d0168c56d377358b2b8c86b51003272d5ef
 Packages:
 - cargo:tauri-plugin-autostart@2.5.1
-- cargo:tauri-plugin-dialog@2.7.2
-- cargo:tauri-plugin-fs@2.5.1
-- cargo:tauri-plugin-notification@2.3.3
-- cargo:tauri-plugin-opener@2.5.4
+- cargo:tauri-plugin-deep-link@2.4.10
+- cargo:tauri-plugin-dialog@2.7.3
+- cargo:tauri-plugin-fs@2.5.2
+- cargo:tauri-plugin-notification@2.4.0
+- cargo:tauri-plugin-opener@2.5.5
 - cargo:tauri-plugin-process@2.3.1
-- cargo:tauri-plugin-single-instance@2.4.3
-- cargo:tauri-plugin-updater@2.10.1
+- cargo:tauri-plugin-single-instance@2.4.5
+- cargo:tauri-plugin-updater@2.12.0
 - cargo:tauri-plugin-window-state@2.4.1
 - npm:@tauri-apps/plugin-dialog@2.7.2
 - npm:@tauri-apps/plugin-opener@2.5.4
@@ -25736,7 +25662,7 @@ SOFTWARE.
 
 SHA-256: f5352eaa5597c02c95e541596fe44c4cd73ca822230bd7283287ebb8b5d56cda
 Packages:
-- cargo:h2@0.4.15
+- cargo:h2@0.4.19
 
 Copyright (c) 2017 h2 authors
 
@@ -26358,32 +26284,6 @@ IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
 CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT,
 TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
 SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
-
-SHA-256: fa811b6d5b5d154bff9018882a06d1b0bcbe9c214c64b78aaaeaa59d98a3f3c3
-Packages:
-- cargo:radium@0.7.0
-
-MIT License
-
-Copyright (c) 2019 kneecaw (Nika Layzell)
-
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
-
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-SOFTWARE.
 
 SHA-256: fb06d5b872e5eac1ab3d21198d91270a3073ff08ba87fab2a9f4e32ccf573884
 Packages:
