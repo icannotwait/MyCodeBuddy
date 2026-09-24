@@ -4960,6 +4960,7 @@ const GROK_HIDDEN_GENERATION_DISALLOWED_TOOLS: &[&str] = &[
     // Subagents
     "Agent",
     "spawn_subagent",
+    "workflow",
     // MCP meta-tools (restrictive allowlists intentionally keep these)
     "search_tool",
     "use_tool",
@@ -5018,6 +5019,9 @@ const GROK_CODEG_ROUTE_DISALLOWED_TOOLS: &[&str] = &[
     "spawn_subagent",
     "get_command_or_subagent_output",
     "kill_command_or_subagent",
+    // workflow agent()/parallel() spawn native children independently of
+    // GROK_SUBAGENTS; leaving the tool exposed starts runs that then pause.
+    "workflow",
     // Legacy / alternate names observed in Grok tool catalogs
     "Agent",
     "task",
@@ -30590,6 +30594,10 @@ mod tests {
                 "{purpose:?}: must deny MCP meta tools"
             );
             assert!(
+                as_str.contains(&"workflow"),
+                "{purpose:?}: must deny workflow's native agent entry point"
+            );
+            assert!(
                 !meta.contains_key("askUserQuestion"),
                 "{purpose:?}: native ask bridge remains available"
             );
@@ -30682,6 +30690,7 @@ mod tests {
                 "spawn_subagent",
                 "get_command_or_subagent_output",
                 "kill_command_or_subagent",
+                "workflow",
             ] {
                 assert!(
                     as_str.contains(&tool),
@@ -30693,6 +30702,16 @@ mod tests {
                 !as_str.contains(&"read_file") && !as_str.contains(&"run_terminal_command"),
                 "{label}: must not strip shell/read, got {as_str:?}"
             );
+            for tool in [
+                "search_tool",
+                "use_tool",
+                "mcp__codeg-mcp__delegate_to_agent",
+            ] {
+                assert!(
+                    !as_str.contains(&tool),
+                    "{label}: must keep MCP delegation available, got {as_str:?}"
+                );
+            }
             assert!(
                 profile.get("maxTurns").is_none(),
                 "{label}: must not set maxTurns"
