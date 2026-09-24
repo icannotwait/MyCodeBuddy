@@ -1858,8 +1858,8 @@ pub(crate) fn suppression_application_for_plan(
 ///
 /// - Codex: merge `features.multi_agent=false` and `agents.enabled=false`
 ///   into the official `CODEX_CONFIG` JSON contract (v1/v2 native tools)
-/// - Grok: set/override `GROK_SUBAGENTS=0` (documented host kill-switch; pairs
-///   with argv `--no-subagents` and session `_meta.agentProfile` denylist)
+/// - Grok: disable native subagents, workflows, and goal orchestration via
+///   their separate env switches, alongside the session tool denylist.
 ///
 /// Native, unmanaged, and non-matching agent plans leave keys byte-for-byte
 /// untouched (including user values `0`/`1` and absence).
@@ -1954,7 +1954,14 @@ where
             merge_codex_official_native_suppression(env, windows, inherited_config)?;
         }
         (NativeSuppressionPlan::GrokNoSubagents, AgentType::Grok) => {
-            env.insert("GROK_SUBAGENTS".into(), "0".into());
+            for key in ["GROK_SUBAGENTS", "GROK_WORKFLOWS", "GROK_GOAL"] {
+                // Command applies Windows env keys case-insensitively; remove
+                // aliases so a later user entry cannot re-enable an engine.
+                if windows {
+                    env.retain(|existing, _| !existing.eq_ignore_ascii_case(key));
+                }
+                env.insert(key.into(), "0".into());
+            }
         }
         _ => {}
     }
@@ -4941,6 +4948,7 @@ const GROK_HIDDEN_GENERATION_DISALLOWED_TOOLS: &[&str] = &[
     "list_dir",
     // Web / media
     "web_search",
+    "x_search",
     "web_fetch",
     "image_gen",
     "image_edit",
@@ -4960,7 +4968,11 @@ const GROK_HIDDEN_GENERATION_DISALLOWED_TOOLS: &[&str] = &[
     // Subagents
     "Agent",
     "spawn_subagent",
+    "send_subagent_message",
     "workflow",
+    // Optional memory tools are injected independently of skill discovery.
+    "memory_search",
+    "memory_get",
     // MCP meta-tools (restrictive allowlists intentionally keep these)
     "search_tool",
     "use_tool",
@@ -5007,7 +5019,7 @@ fn merge_grok_hidden_generation_agent_profile(
     meta
 }
 
-/// Built-in Grok tool names that constitute the **native subagent creation
+/// Built-in Grok tool names that constitute the **native orchestration
 /// surface**. Stripped on Codeg-route user sessions via session
 /// `_meta.agentProfile.disallowedTools` — the ACP-effective denylist path
 /// (CLI `--no-subagents` alone does not remove these from the model toolset
@@ -5017,18 +5029,21 @@ fn merge_grok_hidden_generation_agent_profile(
 /// parent can still work and use `codeg-mcp` delegation.
 const GROK_CODEG_ROUTE_DISALLOWED_TOOLS: &[&str] = &[
     "spawn_subagent",
+    "send_subagent_message",
     "get_command_or_subagent_output",
     "kill_command_or_subagent",
     // workflow agent()/parallel() spawn native children independently of
     // GROK_SUBAGENTS; leaving the tool exposed starts runs that then pause.
     "workflow",
+    // Disabling workflows exposes the legacy goal tool again.
+    "update_goal",
     // Legacy / alternate names observed in Grok tool catalogs
     "Agent",
     "task",
 ];
 
 /// Grok Codeg-route gate for ordinary (non-hidden) sessions: stamp a minimal
-/// `agentProfile` that denylists only native subagent tools so creation routes
+/// `agentProfile` that denylists native orchestration tools so creation routes
 /// through `codeg-mcp` instead of `spawn_subagent`.
 ///
 /// Skipped when:
@@ -23222,11 +23237,44 @@ mod tests {
     }
 
     #[test]
+    fn grok_codeg_env_respects_platform_key_rules() {
+        for windows in [false, true] {
+            let mut env = BTreeMap::from([
+                ("grok_subagents".into(), "1".into()),
+                ("grok_workflows".into(), "1".into()),
+                ("grok_goal".into(), "1".into()),
+                ("KEEP_ME".into(), "yes".into()),
+            ]);
+            for _ in 0..2 {
+                apply_route_environment_with_inherited(
+                    AgentType::Grok,
+                    &codeg_plan(AgentType::Grok),
+                    &mut env,
+                    windows,
+                    || panic!("Grok must not read CODEX_CONFIG"),
+                )
+                .unwrap();
+                for key in ["GROK_SUBAGENTS", "GROK_WORKFLOWS", "GROK_GOAL"] {
+                    assert_eq!(env.get(key).map(String::as_str), Some("0"), "{key}");
+                    assert_eq!(
+                        env.get(&key.to_ascii_lowercase()).map(String::as_str),
+                        if windows { None } else { Some("1") },
+                        "{key}, windows={windows}"
+                    );
+                }
+                assert_eq!(env.get("KEEP_ME").map(String::as_str), Some("yes"));
+            }
+        }
+    }
+
+    #[test]
     fn grok_env_and_claude_meta_are_additive_and_route_scoped() {
-        // Grok Codeg sets GROK_SUBAGENTS=0 and never touches CODEX_ACP_MULTI_AGENT.
+        // Grok Codeg disables native engines without changing other agents' settings.
         let mut grok_env = BTreeMap::from([
             ("CODEX_ACP_MULTI_AGENT".into(), "1".into()),
             ("GROK_SUBAGENTS".into(), "1".into()),
+            ("GROK_WORKFLOWS".into(), "1".into()),
+            ("GROK_GOAL".into(), "1".into()),
         ]);
         apply_route_environment(AgentType::Grok, &codeg_plan(AgentType::Grok), &mut grok_env)
             .unwrap();
@@ -23234,22 +23282,22 @@ mod tests {
             grok_env.get("CODEX_ACP_MULTI_AGENT").map(String::as_str),
             Some("1")
         );
-        assert_eq!(
-            grok_env.get("GROK_SUBAGENTS").map(String::as_str),
-            Some("0")
-        );
-        // Native Grok leaves GROK_SUBAGENTS untouched.
-        let mut grok_native_env = BTreeMap::from([("GROK_SUBAGENTS".into(), "1".into())]);
+        for key in ["GROK_SUBAGENTS", "GROK_WORKFLOWS", "GROK_GOAL"] {
+            assert_eq!(grok_env.get(key).map(String::as_str), Some("0"), "{key}");
+        }
+        // Native Grok preserves explicit settings and absent keys.
+        let original = BTreeMap::from([
+            ("GROK_SUBAGENTS".into(), "1".into()),
+            ("GROK_WORKFLOWS".into(), "1".into()),
+        ]);
+        let mut grok_native_env = original.clone();
         apply_route_environment(
             AgentType::Grok,
             &native_plan(AgentType::Grok),
             &mut grok_native_env,
         )
         .unwrap();
-        assert_eq!(
-            grok_native_env.get("GROK_SUBAGENTS").map(String::as_str),
-            Some("1")
-        );
+        assert_eq!(grok_native_env, original);
 
         let existing = serde_json::json!({
             "claudeCode": {
@@ -30597,6 +30645,17 @@ mod tests {
                 as_str.contains(&"workflow"),
                 "{purpose:?}: must deny workflow's native agent entry point"
             );
+            for tool in [
+                "send_subagent_message",
+                "memory_search",
+                "memory_get",
+                "x_search",
+            ] {
+                assert!(
+                    as_str.contains(&tool),
+                    "{purpose:?}: must deny {tool}, got {as_str:?}"
+                );
+            }
             assert!(
                 !meta.contains_key("askUserQuestion"),
                 "{purpose:?}: native ask bridge remains available"
@@ -30691,6 +30750,8 @@ mod tests {
                 "get_command_or_subagent_output",
                 "kill_command_or_subagent",
                 "workflow",
+                "send_subagent_message",
+                "update_goal",
             ] {
                 assert!(
                     as_str.contains(&tool),
@@ -30706,10 +30767,14 @@ mod tests {
                 "search_tool",
                 "use_tool",
                 "mcp__codeg-mcp__delegate_to_agent",
+                "monitor",
+                "memory_search",
+                "memory_get",
+                "x_search",
             ] {
                 assert!(
                     !as_str.contains(&tool),
-                    "{label}: must keep MCP delegation available, got {as_str:?}"
+                    "{label}: must keep {tool} available, got {as_str:?}"
                 );
             }
             assert!(
