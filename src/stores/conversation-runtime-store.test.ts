@@ -3202,7 +3202,11 @@ describe("owner overlay retirement without live-* persist ids", () => {
       ]
       seedRuntimeSession({
         detail: detailWithTurns(history),
-        syncState: "awaiting_persist",
+        // Internal continuations do not append an optimistic user prompt.
+        // They stream over the previous owner's idle runtime session.
+        syncState: "idle",
+        lastTurnOwned: true,
+        liveMessage: live,
       })
       mockGetFolderConversation
         .mockResolvedValueOnce(detailWithTurns(persisted.slice(0, -1)))

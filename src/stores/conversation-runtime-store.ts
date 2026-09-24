@@ -7069,7 +7069,15 @@ export const useConversationRuntimeStore = create<ConversationRuntimeStore>()((
     const session = get().byConversationId.get(conversationId)
     if (!session) return
     if (sessionHasPendingCancel(session)) return
-    if (isPureViewerSession(session)) return
+    // Codex continuations have no optimistic user turn, so completion clears
+    // lastTurnOwned. Their promoted fragments still need the same coverage-
+    // checked hydration; ownership is only a guard for the viewer sync path.
+    if (
+      isPureViewerSession(session) &&
+      (session.detail?.summary.agent_type !== "codex" ||
+        session.localTurns.length === 0)
+    )
+      return
 
     cancelSettledTurnHydrate(conversationId)
 
@@ -7091,7 +7099,12 @@ export const useConversationRuntimeStore = create<ConversationRuntimeStore>()((
         cancel()
         return
       }
-      if (isPureViewerSession(cur) || sessionHasPendingCancel(cur)) {
+      if (
+        (isPureViewerSession(cur) &&
+          (cur.detail?.summary.agent_type !== "codex" ||
+            cur.localTurns.length === 0)) ||
+        sessionHasPendingCancel(cur)
+      ) {
         cancel()
         return
       }
