@@ -10701,6 +10701,96 @@ describe("AcpConnectionsProvider frame transactions (raw order)", () => {
     }
   })
 
+  it.each([
+    ["turn_complete", "empty"],
+    ["turn_complete", "prefix"],
+    ["checkpoint", "empty"],
+    ["checkpoint", "prefix"],
+  ] as const)(
+    "isolates another session's %s from a runtime with %s content",
+    async (boundary, contentKind) => {
+      const { useConversationRuntimeStore, resetConversationRuntimeStore } =
+        await import("@/stores/conversation-runtime-store")
+      resetConversationRuntimeStore()
+      const runtimeActions = useConversationRuntimeStore.getState().actions
+      runtimeActions.setExternalId(42, "sess-1")
+      runtimeActions.setExternalId(5087, "unrelated-session")
+      const unrelatedMessage: LiveMessage = {
+        id: "acp:unrelated-conn:2",
+        role: "assistant",
+        startedAt: Date.now(),
+        content:
+          contentKind === "empty" ? [] : [{ type: "text", text: "Review" }],
+      }
+      runtimeActions.setLiveMessage(5087, unrelatedMessage, true)
+      const unrelatedBefore = useConversationRuntimeStore
+        .getState()
+        .byConversationId.get(5087)
+
+      try {
+        await mountDesktopOwner("owner-conn", TAB, "sess-1", 42)
+        h.actions!.registerLiveSinks(TAB, {
+          runtimeConversationId: 42,
+          canonical: (message, isLive) => {
+            runtimeActions.setLiveMessage(42, message, isLive)
+            return true
+          },
+        })
+        act(() => {
+          h.emitDesktopBatch(
+            batch(1, [
+              {
+                connection_id: "owner-conn",
+                seq: 1,
+                type: "session_started",
+                session_id: "sess-1",
+              },
+              status("owner-conn", 2, "prompting"),
+              content("owner-conn", 3, "Review from another session"),
+            ])
+          )
+          h.runAnimationFrame()
+        })
+        act(() => {
+          h.emitDesktopBatch(
+            batch(2, [
+              boundary === "checkpoint"
+                ? status("owner-conn", 4, "connected")
+                : {
+                    connection_id: "owner-conn",
+                    seq: 4,
+                    type: "turn_complete",
+                    session_id: "sess-1",
+                    stop_reason: "end_turn",
+                    mark_awaiting_reply: false,
+                  },
+            ])
+          )
+          h.runAnimationFrame()
+        })
+
+        expect(
+          useConversationRuntimeStore.getState().byConversationId.get(5087)
+        ).toBe(unrelatedBefore)
+        const owner = useConversationRuntimeStore
+          .getState()
+          .byConversationId.get(42)
+        expect(owner?.liveMessage).toBeNull()
+        expect(owner?.localTurns.map((turn) => turn.blocks)).toEqual([
+          [{ type: "text", text: "Review from another session" }],
+        ])
+        if (boundary === "turn_complete") {
+          expect(
+            h.store!.getConnection(TAB)
+              ?.acceptedCompletionRuntimeConversationIds
+          ).toEqual([42])
+        }
+      } finally {
+        resetConversationRuntimeStore()
+      }
+    }
+  )
+
   it("does not complete a runtime from another session", async () => {
     const { useConversationRuntimeStore, resetConversationRuntimeStore } =
       await import("@/stores/conversation-runtime-store")

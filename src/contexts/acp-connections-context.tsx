@@ -5808,15 +5808,23 @@ function admitTurnComplete(
     runtimeConversationId,
     runtime,
   ] of useConversationRuntimeStore.getState().byConversationId) {
+    const mappedToConnection = mappedRuntimeOwnsConnection(
+      runtime,
+      snapshot,
+      event.session_id
+    )
+    // Content compatibility (including an empty prefix) can only rebase a
+    // known owner. Otherwise a sibling's completion can overwrite this turn.
+    if (
+      !mappedToConnection &&
+      runtime.liveMessage?.id !== snapshot.liveMessage.id
+    ) {
+      continue
+    }
     const runtimeLiveMatches = liveMessageOwnsSameTurn(
       runtime.liveMessage,
       snapshot.liveMessage
     )
-    const mappedToConnection =
-      runtime.externalId === event.session_id ||
-      (snapshot.conversationId != null &&
-        (runtime.conversationId === snapshot.conversationId ||
-          runtime.dbConversationId === snapshot.conversationId))
     if (!mappedToConnection && !runtimeLiveMatches) {
       continue
     }
@@ -5886,15 +5894,21 @@ function admitSuspensionCheckpoint(snapshot: ConnectionState): number[] {
     runtimeConversationId,
     runtime,
   ] of useConversationRuntimeStore.getState().byConversationId) {
+    const mappedToConnection = mappedRuntimeOwnsConnection(
+      runtime,
+      snapshot,
+      knownSessionId
+    )
+    if (
+      !mappedToConnection &&
+      runtime.liveMessage?.id !== snapshot.liveMessage.id
+    ) {
+      continue
+    }
     const runtimeLiveMatches = liveMessageOwnsSameTurn(
       runtime.liveMessage,
       snapshot.liveMessage
     )
-    const mappedToConnection =
-      (knownSessionId != null && runtime.externalId === knownSessionId) ||
-      (snapshot.conversationId != null &&
-        (runtime.conversationId === snapshot.conversationId ||
-          runtime.dbConversationId === snapshot.conversationId))
     if (!mappedToConnection && !runtimeLiveMatches) continue
     // Same stale-externalId exception as admitTurnComplete: a draft/virtual
     // runtime can keep a persisted id after conversation://changed while
