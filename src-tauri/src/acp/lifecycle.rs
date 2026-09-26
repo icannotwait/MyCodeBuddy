@@ -710,7 +710,27 @@ async fn bind_unbound_completion_external_id(
     if session_id.is_empty() {
         return;
     }
-    if let Err(error) = bind_live_external_id(db_conn, conversation_id, session_id).await {
+    for attempt in 0..=HANDLE_EVENT_RETRY_BACKOFFS.len() {
+        let Err(error) = bind_live_external_id(db_conn, conversation_id, session_id).await else {
+            return;
+        };
+        // Retry only SQLite BUSY/LOCKED (including their extended codes).
+        // A uniqueness conflict cannot heal by retrying and must not hold up
+        // the status transition. Keep this separate from whole-event retries.
+        let retryable = matches!(
+            &error,
+            DbError::Database(sea_orm::DbErr::Exec(sea_orm::RuntimeErr::SqlxError(error)))
+                if error.as_database_error()
+                    .and_then(|error| error.code())
+                    .and_then(|code| code.parse::<i32>().ok())
+                    .is_some_and(|code| matches!(code & 0xff, 5 | 6))
+        );
+        if retryable {
+            if let Some(backoff) = HANDLE_EVENT_RETRY_BACKOFFS.get(attempt) {
+                tokio::time::sleep(*backoff).await;
+                continue;
+            }
+        }
         tracing::warn!(
             conversation_id,
             session_id = %session_id,
@@ -718,6 +738,7 @@ async fn bind_unbound_completion_external_id(
             error = %error,
             "[lifecycle] TurnComplete could not bind unbound external_id"
         );
+        return;
     }
 }
 
@@ -3928,6 +3949,87 @@ mod tests {
                 })
             }),
         }
+    }
+
+    #[tokio::test]
+    async fn completion_binding_retries_sqlite_writer_contention() {
+        use sea_orm::{ConnectOptions, ConnectionTrait, Database, DbBackend, Statement};
+
+        let dir = tempfile::tempdir().unwrap();
+        let db = test_helpers::fresh_disk_db(dir.path()).await;
+        let folder_id = test_helpers::seed_folder(&db, "/tmp/bind-retry").await;
+        let conv = conversation_service::create(&db.conn, folder_id, AgentType::Pi, None, None)
+            .await
+            .unwrap();
+        let mut options = ConnectOptions::new(format!(
+            "sqlite:{}?mode=rw",
+            dir.path().join("source.db").to_string_lossy()
+        ));
+        options
+            .max_connections(1)
+            .map_sqlx_sqlite_opts(|opts| opts.busy_timeout(Duration::ZERO));
+        let writer = Database::connect(options).await.unwrap();
+        let lock = db.conn.begin().await.unwrap();
+        lock.execute(Statement::from_string(
+            DbBackend::Sqlite,
+            "UPDATE conversation SET external_id = external_id".to_owned(),
+        ))
+        .await
+        .unwrap();
+        assert!(bind_live_external_id(&writer, conv.id, "pi-session")
+            .await
+            .is_err());
+
+        {
+            let binding =
+                bind_unbound_completion_external_id(&writer, conv.id, "pi-session", "end_turn");
+            tokio::pin!(binding);
+            tokio::select! {
+                _ = &mut binding => panic!("binding must retry while the writer lock is held"),
+                _ = tokio::time::sleep(Duration::from_millis(50)) => {}
+            }
+            lock.rollback().await.unwrap();
+            binding.await;
+        }
+        let row = conversation_service::get_by_id(&db.conn, conv.id)
+            .await
+            .unwrap();
+        assert_eq!(row.external_id.as_deref(), Some("pi-session"));
+        writer.close().await.unwrap();
+        db.conn.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn internal_completion_binding_conflict_still_finishes_without_retry() {
+        let db = test_helpers::fresh_in_memory_db().await;
+        let folder_id = test_helpers::seed_folder(&db, "/tmp/bind-conflict").await;
+        let owner = conversation_service::create(&db.conn, folder_id, AgentType::Pi, None, None)
+            .await
+            .unwrap();
+        conversation_service::bind_external_id(&db.conn, owner.id, "occupied-session", &[])
+            .await
+            .unwrap();
+        let row = conversation_service::create(&db.conn, folder_id, AgentType::Pi, None, None)
+            .await
+            .unwrap();
+        let mgr = ConnectionManager::new();
+        let event = internal_completion(Some(row.id), "occupied-session", "end_turn");
+        tokio::time::timeout(
+            Duration::from_millis(400),
+            handle_internal_event(&db.conn, &mgr, &event, None),
+        )
+        .await
+        .expect("unique conflicts must not use the 100ms + 500ms retry backoff")
+        .unwrap();
+        assert!(conversation_service::get_by_id(&db.conn, row.id)
+            .await
+            .unwrap()
+            .external_id
+            .is_none());
+        assert_eq!(
+            read_row_status(&db, row.id).await,
+            ConversationStatus::PendingReview
+        );
     }
 
     #[tokio::test]

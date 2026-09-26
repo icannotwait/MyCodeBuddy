@@ -1860,7 +1860,7 @@ pub async fn get_folder_conversation_core(
     registry: &InternalAgentSessionRegistry,
     conversation_id: i32,
 ) -> Result<(DbConversationDetail, Option<String>), AppCommandError> {
-    let summary = conversation_service::get_by_id(conn, conversation_id)
+    let mut summary = conversation_service::get_by_id(conn, conversation_id)
         .await
         .map_err(AppCommandError::from)?;
 
@@ -1982,13 +1982,24 @@ pub async fn get_folder_conversation_core(
     // `SessionStarted` that rebound the row while we were parsing leaves this
     // write matching nothing instead of clobbering the newer binding.
     if let Some(new_ext_id) = resolved_ext_id {
-        let _ = conversation_service::renormalize_external_id_alias(
+        conversation_service::renormalize_external_id_alias(
             conn,
             conversation_id,
             summary.external_id.as_deref(),
-            new_ext_id,
+            new_ext_id.clone(),
         )
-        .await;
+        .await
+        .map_err(AppCommandError::from)?;
+        // A competing rebind makes the CAS a no-op. Never return history for
+        // an identity this row failed to claim, including unique-key conflicts.
+        summary = conversation_service::get_by_id(conn, conversation_id)
+            .await
+            .map_err(AppCommandError::from)?;
+        if summary.external_id.as_deref() != Some(new_ext_id.as_str()) {
+            return Err(AppCommandError::database_error(
+                "Conversation changed during history recovery; retry loading it",
+            ));
+        }
     }
 
     let continuation_store = DbContinuationStore::new(conn.clone());
@@ -2012,7 +2023,6 @@ pub async fn get_folder_conversation_core(
             })
         });
 
-    let mut summary = summary;
     summary.message_count = turns.len() as u32;
     // The transcript is the richer source for the session's model. Codex is
     // the concrete case: an ACP-driven row is created before any
@@ -6094,6 +6104,117 @@ Call get_delegation_status with the returned task_id to collect the result.";
                 .expect("legal second candidate must win after excluding the internal nearest");
         assert_eq!(recovered.summary.id, legal_id);
         assert_eq!(recovered.summary.title.as_deref(), Some("legal second"));
+    }
+
+    #[tokio::test]
+    async fn pi_history_recovery_persists_identity_and_rejects_occupied_sessions() {
+        // No other test mutates this Pi-specific setting. Use a unique cwd so
+        // concurrent history reads cannot select this fixture's sessions.
+        struct RestorePiSessionsDir(Option<std::ffi::OsString>);
+        impl Drop for RestorePiSessionsDir {
+            fn drop(&mut self) {
+                match self.0.take() {
+                    Some(value) => std::env::set_var("PI_CODING_AGENT_SESSION_DIR", value),
+                    None => std::env::remove_var("PI_CODING_AGENT_SESSION_DIR"),
+                }
+            }
+        }
+        let dir = TempDir::new().unwrap();
+        let _restore = RestorePiSessionsDir(std::env::var_os("PI_CODING_AGENT_SESSION_DIR"));
+        std::env::set_var("PI_CODING_AGENT_SESSION_DIR", dir.path());
+        for old_id in [None, Some("stale-acp-id")] {
+            let db = fresh_in_memory_db().await;
+            let cwd = dir.path().join(uuid::Uuid::new_v4().to_string());
+            let folder_id = seed_folder(&db, &cwd.to_string_lossy()).await;
+            let row = conversation_service::create(&db.conn, folder_id, AgentType::Pi, None, None)
+                .await
+                .unwrap();
+            if let Some(old_id) = old_id {
+                conversation_service::bind_external_id(&db.conn, row.id, old_id, &[])
+                    .await
+                    .unwrap();
+            }
+            let session_id = uuid::Uuid::new_v4().to_string();
+            let records = [
+                serde_json::json!({"type":"session","version":3,"id":session_id,
+                    "timestamp":row.created_at,"cwd":cwd}),
+                serde_json::json!({"type":"message","id":"m1","parentId":null,
+                    "timestamp":row.created_at,"message":{"role":"user","content":"Recover my history"}}),
+            ];
+            std::fs::write(
+                dir.path().join(format!("{session_id}.jsonl")),
+                records
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            )
+            .unwrap();
+            let registry = inert_internal_session_registry(&db, dir.path()).await;
+            let (detail, _) = get_folder_conversation_core(&db.conn, &registry, row.id)
+                .await
+                .unwrap();
+            assert_eq!(
+                detail.summary.external_id.as_deref(),
+                Some(session_id.as_str())
+            );
+            assert!(!detail.turns.is_empty());
+            assert_eq!(
+                conversation_service::get_by_id(&db.conn, row.id)
+                    .await
+                    .unwrap()
+                    .external_id,
+                Some(session_id)
+            );
+
+            let other =
+                conversation_service::create(&db.conn, folder_id, AgentType::Pi, None, None)
+                    .await
+                    .unwrap();
+            assert!(
+                get_folder_conversation_core(&db.conn, &registry, other.id)
+                    .await
+                    .is_err(),
+                "must not display another row's transcript when recovery cannot claim its identity"
+            );
+            assert!(conversation_service::get_by_id(&db.conn, other.id)
+                .await
+                .unwrap()
+                .external_id
+                .is_none());
+
+            // Deterministically model a rebind between the recovery UPDATE
+            // and its verification read, without scheduler timing assumptions.
+            use sea_orm::{ConnectionTrait, DbBackend, Statement};
+            conversation_service::renormalize_external_id_alias(
+                &db.conn,
+                row.id,
+                detail.summary.external_id.as_deref(),
+                "stale-again".into(),
+            )
+            .await
+            .unwrap();
+            db.conn.execute(Statement::from_string(DbBackend::Sqlite, format!(
+                "CREATE TRIGGER competing_rebind AFTER UPDATE OF external_id ON conversation \
+                 WHEN NEW.id = {} AND NEW.external_id <> 'competing-session' \
+                 BEGIN UPDATE conversation SET external_id = 'competing-session' WHERE id = NEW.id; END",
+                row.id
+            ))).await.unwrap();
+            assert!(
+                get_folder_conversation_core(&db.conn, &registry, row.id)
+                    .await
+                    .is_err(),
+                "must reject the parsed history if the stored identity changed during recovery"
+            );
+            assert_eq!(
+                conversation_service::get_by_id(&db.conn, row.id)
+                    .await
+                    .unwrap()
+                    .external_id
+                    .as_deref(),
+                Some("competing-session")
+            );
+        }
     }
 
     #[tokio::test]

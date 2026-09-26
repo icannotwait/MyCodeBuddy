@@ -15,8 +15,9 @@ use crate::models::{
 use crate::parsers::{
     backfill_turn_durations, compute_session_stats, folder_name_from_path,
     infer_context_window_max_tokens, latest_turn_total_usage_tokens, merge_context_window_stats,
-    relocate_orphaned_tool_results, resolve_patch_line_numbers, structurize_read_tool_output,
-    title_from_user_text, truncate_str, visible_title, visible_user_text, AgentParser, ParseError,
+    relocate_orphaned_tool_results, resolve_patch_line_numbers, select_unique_recovery_match,
+    structurize_read_tool_output, title_from_user_text, truncate_str, visible_title,
+    visible_user_text, AgentParser, ParseError, RecoveryQuery,
 };
 
 /// Resolve the `pi` coding agent's sessions directory, honoring (highest
@@ -459,6 +460,18 @@ impl AgentParser for PiParser {
 
         conversations.sort_by_key(|c| std::cmp::Reverse(c.started_at));
         Ok(conversations)
+    }
+
+    fn recover_conversation(
+        &self,
+        query: &RecoveryQuery<'_>,
+        accept: &dyn Fn(&ConversationSummary) -> bool,
+    ) -> Result<Option<ConversationDetail>, ParseError> {
+        let summaries = self.list_conversations()?;
+        let Some(winner) = select_unique_recovery_match(&summaries, query, accept) else {
+            return Ok(None);
+        };
+        self.get_conversation(&winner.id).map(Some)
     }
 
     fn get_conversation(&self, conversation_id: &str) -> Result<ConversationDetail, ParseError> {
@@ -1809,6 +1822,77 @@ mod tests {
                    "message":{"role":"assistant","provider":"anthropic","model":"claude-sonnet-4-6","stopReason":"end_turn",
                      "content":[{"type":"text","text":"Build succeeded."}]}}),
         ]
+    }
+
+    #[test]
+    fn recovery_matches_unique_visible_session_in_both_directory_layouts() {
+        use crate::parsers::RecoveryQuery;
+
+        for bucket in ["", "--Users-demo-my-app--"] {
+            let dir = tempdir().unwrap();
+            write_session(
+                dir.path(),
+                bucket,
+                "visible.jsonl",
+                &sample_records("visible"),
+            );
+            write_session(
+                dir.path(),
+                bucket,
+                "hidden.jsonl",
+                &sample_records("hidden"),
+            );
+            let parser = PiParser::with_base_dir(dir.path().to_path_buf());
+            let mut query = RecoveryQuery {
+                cwd: "/Users/demo/my-app",
+                approx: "2026-06-27T10:00:00Z".parse().unwrap(),
+                max_skew: chrono::Duration::minutes(5),
+                ambiguity: chrono::Duration::seconds(60),
+            };
+            let detail = parser
+                .recover_conversation(&query, &|s| s.id != "hidden")
+                .unwrap()
+                .expect("recover the unique visible session");
+            assert_eq!(detail.summary.id, "visible");
+            assert!(!detail.turns.is_empty());
+
+            query.cwd = "/another/project";
+            assert!(parser
+                .recover_conversation(&query, &|_| true)
+                .unwrap()
+                .is_none());
+            query.cwd = "/Users/demo/my-app";
+            query.approx = "2026-06-28T10:00:00Z".parse().unwrap();
+            assert!(parser
+                .recover_conversation(&query, &|_| true)
+                .unwrap()
+                .is_none());
+        }
+    }
+
+    #[test]
+    fn recovery_rejects_ambiguous_or_missing_sessions() {
+        use crate::parsers::RecoveryQuery;
+
+        let dir = tempdir().unwrap();
+        let parser = PiParser::with_base_dir(dir.path().to_path_buf());
+        let query = RecoveryQuery {
+            cwd: "/Users/demo/my-app",
+            approx: "2026-06-27T10:00:00Z".parse().unwrap(),
+            max_skew: chrono::Duration::minutes(5),
+            ambiguity: chrono::Duration::seconds(60),
+        };
+        assert!(parser
+            .recover_conversation(&query, &|_| true)
+            .unwrap()
+            .is_none());
+        for id in ["first", "second"] {
+            write_session(dir.path(), "", &format!("{id}.jsonl"), &sample_records(id));
+        }
+        assert!(parser
+            .recover_conversation(&query, &|_| true)
+            .unwrap()
+            .is_none());
     }
 
     #[test]
