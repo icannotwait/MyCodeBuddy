@@ -46,8 +46,21 @@ WebSocket，再携带原连接 ID、租约和消息游标接入；服务进程�
 这些日志只说明 30 秒 `{action:"ping"}` 有没有发出，以及服务端有没有续约。
 租约时长、续约结果和回收策略不变。
 
-浏览器 DevTools Console 过滤 `[lease-heartbeat]`，并把级别调到 Verbose。
-`console.debug` 在默认的 Info 视图里不显示。
+它们只走 debug，默认 info 看不到。浏览器用 `console.debug`，服务端用
+`tracing::debug!`。成功续约和每一次 ping 都不会打 info。
+
+要看到这些行，两处都要打开 debug：
+
+1. 浏览器 DevTools Console 过滤 `[lease-heartbeat]`，并把级别调到 Verbose。
+   默认 Info 视图不显示 `console.debug`。
+2. 服务端把该模块调到 debug。未设置时 `RUST_LOG` 保持默认 info，这条路径保持安静。
+   `CODEG_LOG` 优先于 `RUST_LOG`；只设置其中一个：
+
+```bash
+RUST_LOG=codeg_lib::web::ws=debug
+```
+
+打开后，行在 stderr 和 `codeg-server.<date>.log` 里。
 
 - `[WebEventStream][lease-heartbeat] start` / `stop` / `not started`：
   共享与非共享订阅数量、缩短后的 connection / subscription id，以及是否带有
@@ -57,13 +70,6 @@ WebSocket，再携带原连接 ID、租约和消息游标接入；服务进程�
 - `[WebTransport][lease-heartbeat] wake probe sent` / `wake probe skipped`：
   页面回到前台或 `online` 时的探测。跳过原因是 `hidden`、`not connected`、
   `ws closed`、`destroyed` 或 `send failed`。
-
-服务端默认级别是 info，不会写出续约摘要。行在 stderr 和
-`codeg-server.<date>.log` 里。`CODEG_LOG` 优先于 `RUST_LOG`；只设置其中一个：
-
-```bash
-RUST_LOG=codeg_lib::web::ws=debug
-```
 
 示例（不含 lease id）：
 
