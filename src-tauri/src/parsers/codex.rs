@@ -9092,7 +9092,7 @@ earlier terminal context records.\n\
         detail
     }
 
-    fn write_rollout(content: &str) -> PathBuf {
+    fn write_goal_rollout(content: &str) -> PathBuf {
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("system time ok")
@@ -9144,7 +9144,7 @@ earlier terminal context records.\n\
             r#"{"timestamp":"2026-08-18T00:00:00Z","type":"session_meta","payload":{"id":"sess-1","cwd":"/tmp"}}"#,
             "\n",
         );
-        let path = write_rollout(&format!("{complete}{{\"type\":\""));
+        let path = write_goal_rollout(&format!("{complete}{{\"type\":\""));
         let detail = parse_path(&path);
         assert_eq!(detail.transcript_watermark, Some(complete.len() as u64));
     }
@@ -9152,7 +9152,7 @@ earlier terminal context records.\n\
     #[test]
     fn goal_context_turn_uses_native_id_and_agent_autonomous_origin() {
         let jsonl = GOAL_CYCLE_JSONL;
-        let detail = parse_path(&write_rollout(jsonl));
+        let detail = parse_path(&write_goal_rollout(jsonl));
         assert!(detail.turns.iter().all(|t| {
             !matches!(t.role, TurnRole::User)
                 || !t.blocks.iter().any(|b| {
@@ -9184,7 +9184,7 @@ earlier terminal context records.\n\
             r#"{"timestamp":"2026-08-18T00:00:03Z","type":"event_msg","payload":{"type":"agent_message","message":"hi"}}"#,
             "\n",
         );
-        let detail = parse_path(&write_rollout(content));
+        let detail = parse_path(&write_goal_rollout(content));
         let assistant = detail
             .turns
             .iter()
@@ -9215,7 +9215,7 @@ earlier terminal context records.\n\
             r#"{"timestamp":"2026-08-18T00:00:06Z","type":"event_msg","payload":{"type":"agent_message","message":"later"}}"#,
             "\n",
         );
-        let detail = parse_path(&write_rollout(jsonl));
+        let detail = parse_path(&write_goal_rollout(jsonl));
         let working: Vec<&str> = detail
             .turns
             .iter()
@@ -9254,7 +9254,7 @@ earlier terminal context records.\n\
 
     #[test]
     fn goal_internal_context_never_becomes_title() {
-        let path = write_rollout(GOAL_CYCLE_JSONL);
+        let path = write_goal_rollout(GOAL_CYCLE_JSONL);
         let parser = CodexParser::new();
         let summary = parser
             .parse_jsonl_summary(&path)
@@ -9281,7 +9281,7 @@ earlier terminal context records.\n\
     #[test]
     fn incomplete_goal_turn_still_returns_partial_assistant() {
         // GOAL_CYCLE_JSONL has task_started + assistant and no task_complete.
-        let detail = parse_path(&write_rollout(GOAL_CYCLE_JSONL));
+        let detail = parse_path(&write_goal_rollout(GOAL_CYCLE_JSONL));
         let auto = detail
             .turns
             .iter()
@@ -9293,7 +9293,7 @@ earlier terminal context records.\n\
 
     #[test]
     fn later_user_turn_is_not_swallowed_by_an_incomplete_goal_span() {
-        let detail = parse_path(&write_rollout(
+        let detail = parse_path(&write_goal_rollout(
             INCOMPLETE_GOAL_WITH_CANONICAL_FOLLOW_UP_JSONL,
         ));
         assert_eq!(
@@ -9334,7 +9334,7 @@ earlier terminal context records.\n\
 
     #[test]
     fn goal_turn_identity_is_stable_across_repeated_parses() {
-        let path = write_rollout(GOAL_CYCLE_JSONL);
+        let path = write_goal_rollout(GOAL_CYCLE_JSONL);
         let parser = CodexParser::new();
         let first = parser
             .parse_conversation_detail(&path, "01abc")
@@ -9373,7 +9373,7 @@ earlier terminal context records.\n\
             r#"{"timestamp":"2026-08-18T00:00:03Z","type":"response_item","payload":{"type":"message","role":"assistant","id":"msg_live","content":[{"type":"output_text","text":"working"}]}}"#,
             "\n",
         );
-        let detail = parse_path(&write_rollout(jsonl));
+        let detail = parse_path(&write_goal_rollout(jsonl));
         let auto = detail
             .turns
             .iter()
@@ -9402,7 +9402,7 @@ earlier terminal context records.\n\
             r#"{"timestamp":"2026-08-18T00:00:03Z","type":"event_msg","payload":{"type":"agent_message","message":"ok"}}"#,
             "\n",
         );
-        let detail = parse_path(&write_rollout(content));
+        let detail = parse_path(&write_goal_rollout(content));
         let assistant = detail
             .turns
             .iter()
@@ -9424,7 +9424,7 @@ earlier terminal context records.\n\
             r#"{"timestamp":"2026-08-18T00:00:03Z","type":"response_item","payload":{"type":"message","role":"assistant","id":"msg_live","content":[{"type":"output_text","text":"working"}]}}"#,
             "\n",
         );
-        let detail = parse_path(&write_rollout(jsonl));
+        let detail = parse_path(&write_goal_rollout(jsonl));
         assert!(detail.turns.iter().all(|t| {
             !matches!(t.role, TurnRole::User)
                 || !t.blocks.iter().any(|b| {
@@ -9452,7 +9452,7 @@ earlier terminal context records.\n\
             r#"{"timestamp":"2026-08-18T00:00:03Z","type":"response_item","payload":{"type":"message","role":"assistant","id":"item-2","content":[{"type":"output_text","text":"working"}]}}"#,
             "\n",
         );
-        let detail = parse_path(&write_rollout(jsonl));
+        let detail = parse_path(&write_goal_rollout(jsonl));
         let auto = detail
             .turns
             .iter()
@@ -9484,7 +9484,7 @@ earlier terminal context records.\n\
 
     #[test]
     fn rollout_session_id_reads_session_meta_payload_id() {
-        let path = write_rollout(GOAL_CYCLE_JSONL);
+        let path = write_goal_rollout(GOAL_CYCLE_JSONL);
         assert_eq!(super::rollout_session_id(&path).as_deref(), Some("01abc"));
         let _ = fs::remove_file(&path);
 

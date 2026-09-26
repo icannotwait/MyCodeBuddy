@@ -3563,7 +3563,8 @@
         "waitingForSubagents": "하위 작업 대기 중…",
         "backgroundContinuation": "백그라운드 이어쓰기",
         "loadOlderHistory": "이전 메시지 불러오기",
-        "loadBackgroundActivity": "백그라운드 활동 불러오기"
+        "loadBackgroundActivity": "백그라운드 활동 불러오기",
+        "snapshotOmittedToolCalls": "이 라이브 보기에서 도구 호출 {count}개가 생략되었습니다. 저장된 메시지로 빈칸을 채웁니다."
       },
       "liveTurnStats": {
         "thinking": "생각 중...",

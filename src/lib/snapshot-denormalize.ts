@@ -192,6 +192,17 @@ export interface SnapshotPatch {
   sharedSession: SharedSessionProjectionView | null
   /** Omission counts from the bounded snapshot. `null` when the server omitted the field. */
   snapshotTruncation: SnapshotTruncation | null
+  /**
+   * `truncation.omitted_tool_calls` from the snapshot. `0` when the server
+   * omitted the truncation object. The thread must not treat a live message
+   * as the full turn while this is positive.
+   */
+  snapshotOmittedToolCalls?: number
+  /**
+   * Live-message refs whose tool state was not in `active_tool_calls`.
+   * Also counts dangling refs on older snapshots that lack the wire field.
+   */
+  snapshotOmittedLiveToolRefs?: number
 }
 
 const DEFAULT_PROMPT_CAPS: PromptCapabilitiesInfo = {
@@ -200,6 +211,9 @@ const DEFAULT_PROMPT_CAPS: PromptCapabilitiesInfo = {
   embedded_context: false,
 }
 
+/** Marker on a hydrate placeholder for a tool call the snapshot did not include. */
+export const SNAPSHOT_OMITTED_TOOL_META = "codeg.snapshot_omitted"
+
 export function denormalizeSnapshot(wire: LiveSessionSnapshot): SnapshotPatch {
   const toolMap = new Map<string, ToolCallState>()
   for (const tc of wire.active_tool_calls) {
@@ -207,6 +221,12 @@ export function denormalizeSnapshot(wire: LiveSessionSnapshot): SnapshotPatch {
   }
   const lastError = normalizeSnapshotLastError(wire.last_error)
   const lastErrorCode = wire.last_error?.code?.trim() || null
+  const danglingLiveRefs = countDanglingLiveToolRefs(wire.live_message, toolMap)
+  const snapshotOmittedToolCalls = wire.truncation?.omitted_tool_calls ?? 0
+  const snapshotOmittedLiveToolRefs = Math.max(
+    wire.truncation?.omitted_live_tool_refs ?? 0,
+    danglingLiveRefs
+  )
 
   return {
     connectionId: wire.connection_id,
@@ -218,7 +238,10 @@ export function denormalizeSnapshot(wire: LiveSessionSnapshot): SnapshotPatch {
     availableCommands: wire.available_commands ?? null,
     usage: wire.usage,
     liveMessage: wire.live_message
-      ? denormalizeLiveMessage(wire.live_message, toolMap)
+      ? denormalizeLiveMessage(wire.live_message, toolMap, {
+          omittedToolCalls: snapshotOmittedToolCalls,
+          omittedLiveToolRefs: snapshotOmittedLiveToolRefs,
+        })
       : null,
     pendingPermission: wire.pending_permission
       ? {
@@ -269,6 +292,8 @@ export function denormalizeSnapshot(wire: LiveSessionSnapshot): SnapshotPatch {
       ? denormalizeSharedSession(wire.shared_session)
       : null,
     snapshotTruncation: wire.truncation ?? null,
+    snapshotOmittedToolCalls,
+    snapshotOmittedLiveToolRefs,
   }
 }
 
@@ -344,9 +369,27 @@ function normalizeSnapshotLastError(
   return message || null
 }
 
+function countDanglingLiveToolRefs(
+  wire: WireLiveMessage | null,
+  toolMap: Map<string, ToolCallState>
+): number {
+  if (!wire) return 0
+  const seen = new Set<string>()
+  let dangling = 0
+  for (const block of wire.content) {
+    if (block.kind !== "tool_call_ref" || seen.has(block.tool_call_id)) {
+      continue
+    }
+    seen.add(block.tool_call_id)
+    if (!toolMap.has(block.tool_call_id)) dangling += 1
+  }
+  return dangling
+}
+
 function denormalizeLiveMessage(
   wire: WireLiveMessage,
-  toolMap: Map<string, ToolCallState>
+  toolMap: Map<string, ToolCallState>,
+  gap: { omittedToolCalls: number; omittedLiveToolRefs: number }
 ): LocalLiveMessage {
   const startedAtMs = Date.parse(wire.started_at)
   return {
@@ -356,6 +399,8 @@ function denormalizeLiveMessage(
       .map((block) => denormalizeBlock(block, toolMap))
       .filter((b): b is LocalLiveContentBlock => b !== null),
     startedAt: Number.isNaN(startedAtMs) ? Date.now() : startedAtMs,
+    snapshotOmittedToolCalls: gap.omittedToolCalls,
+    snapshotOmittedLiveToolRefs: gap.omittedLiveToolRefs,
   }
 }
 
@@ -388,9 +433,14 @@ function denormalizeBlock(
     case "tool_call_ref": {
       const tc = toolMap.get(wire.tool_call_id)
       if (!tc) {
-        // Snapshot referenced a tool_call that wasn't in active_tool_calls.
-        // Skip the block — the next tool_call event will recreate it.
-        return null
+        // Hydrate does not replay tool_call events the snapshot already
+        // folded in. Dropping the ref here deletes the card for the rest of
+        // the turn. Keep a placeholder so the id stays in the thread until a
+        // later event or the saved transcript fills it.
+        return {
+          type: "tool_call",
+          info: omittedSnapshotToolCall(wire.tool_call_id),
+        }
       }
       return { type: "tool_call", info: toolStateToInfo(tc) }
     }
@@ -440,6 +490,22 @@ function toolOutputRawText(output: ToolCallState["output"]): string | null {
   // A variant this build doesn't know yet: still better as its own JSON than
   // dropped on the floor.
   return JSON.stringify(output)
+}
+
+function omittedSnapshotToolCall(toolCallId: string): ToolCallInfo {
+  return {
+    tool_call_id: toolCallId,
+    title: toolCallId,
+    kind: "other",
+    status: "pending",
+    content: null,
+    raw_input: null,
+    raw_output_chunks: [],
+    raw_output_total_bytes: 0,
+    locations: null,
+    meta: { [SNAPSHOT_OMITTED_TOOL_META]: true },
+    images: [],
+  }
 }
 
 function toolStateToInfo(tc: ToolCallState): ToolCallInfo {

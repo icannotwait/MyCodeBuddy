@@ -3563,7 +3563,8 @@
         "waitingForSubagents": "بانتظار الوكلاء الفرعيين…",
         "backgroundContinuation": "متابعة في الخلفية",
         "loadOlderHistory": "تحميل الرسائل الأقدم",
-        "loadBackgroundActivity": "تحميل نشاط الخلفية"
+        "loadBackgroundActivity": "تحميل نشاط الخلفية",
+        "snapshotOmittedToolCalls": "أسقط هذا العرض المباشر {count} من استدعاءات الأدوات. الرسائل المحفوظة تسد هذه الفجوات."
       },
       "liveTurnStats": {
         "thinking": "جارٍ التفكير...",

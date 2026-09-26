@@ -3563,7 +3563,8 @@
         "waitingForSubagents": "Aguardando subagentes…",
         "backgroundContinuation": "Continuação em segundo plano",
         "loadOlderHistory": "Carregar mensagens anteriores",
-        "loadBackgroundActivity": "Carregar atividade em segundo plano"
+        "loadBackgroundActivity": "Carregar atividade em segundo plano",
+        "snapshotOmittedToolCalls": "Esta vista ao vivo omitiu {count} chamadas de ferramenta. As mensagens salvas preenchem essas lacunas."
       },
       "liveTurnStats": {
         "thinking": "Pensando...",

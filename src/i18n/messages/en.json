@@ -3563,7 +3563,8 @@
         "waitingForSubagents": "Waiting for subagents...",
         "backgroundContinuation": "Background continuation",
         "loadOlderHistory": "Load earlier messages",
-        "loadBackgroundActivity": "Load background activity"
+        "loadBackgroundActivity": "Load background activity",
+        "snapshotOmittedToolCalls": "This live view omitted {count} tool calls. Saved messages are loaded to fill the gaps."
       },
       "liveTurnStats": {
         "thinking": "Thinking...",

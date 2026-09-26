@@ -544,3 +544,129 @@ describe("denormalizeSnapshot — truncation", () => {
     expect(denormalizeSnapshot(baseSnapshot()).snapshotTruncation).toBeNull()
   })
 })
+
+function toolState(
+  id: string,
+  label: string,
+  meta: Record<string, unknown> | null = null
+): ToolCallState {
+  return {
+    id,
+    kind: "other",
+    label,
+    status: "completed",
+    input: null,
+    output: null,
+    content: null,
+    locations: null,
+    meta,
+  }
+}
+
+describe("denormalizeSnapshot — truncated tool projections", () => {
+  it("keeps a dangling tool_call_ref instead of dropping the card", () => {
+    const patch = denormalizeSnapshot(
+      baseSnapshot({
+        truncation: { omitted_tool_calls: 1, omitted_live_tool_refs: 1 },
+        live_message: {
+          id: "lm-gap",
+          role: "assistant",
+          started_at: "2026-09-26T09:41:09.851Z",
+          content: [
+            { kind: "tool_call_ref", tool_call_id: "call-kept" },
+            { kind: "tool_call_ref", tool_call_id: "call-missing" },
+          ],
+        },
+        active_tool_calls: [toolState("call-kept", "read_file")],
+      })
+    )
+    const ids = patch.liveMessage?.content.flatMap((block) =>
+      block.type === "tool_call" ? [block.info.tool_call_id] : []
+    )
+    expect(ids).toEqual(["call-kept", "call-missing"])
+    const missing = patch.liveMessage?.content[1]
+    expect(missing?.type).toBe("tool_call")
+    if (missing?.type === "tool_call") {
+      expect(missing.info.meta).toEqual({ "codeg.snapshot_omitted": true })
+    }
+    expect(patch.snapshotOmittedToolCalls).toBe(1)
+    expect(patch.snapshotOmittedLiveToolRefs).toBe(1)
+    expect(patch.liveMessage?.snapshotOmittedToolCalls).toBe(1)
+    expect(patch.liveMessage?.snapshotOmittedLiveToolRefs).toBe(1)
+  })
+
+  it("counts a dangling ref when an older snapshot has no omitted_live_tool_refs", () => {
+    const patch = denormalizeSnapshot(
+      baseSnapshot({
+        truncation: { omitted_tool_calls: 2 },
+        live_message: {
+          id: "lm-old",
+          role: "assistant",
+          started_at: "2026-09-26T09:41:09.851Z",
+          content: [{ kind: "tool_call_ref", tool_call_id: "call-missing" }],
+        },
+        active_tool_calls: [],
+      })
+    )
+    expect(patch.snapshotOmittedLiveToolRefs).toBe(1)
+    expect(patch.liveMessage?.content).toHaveLength(1)
+  })
+
+  it("resolves delegation cards past the 128-call prefix, including lex-late ids", () => {
+    const calls: ToolCallState[] = []
+    const refs: LiveSessionSnapshot["live_message"] = {
+      id: "lm-many",
+      role: "assistant",
+      started_at: "2026-09-26T09:41:09.851Z",
+      content: [],
+    }
+    for (let index = 0; index < 160; index += 1) {
+      const id = `call-${index.toString(16).padStart(4, "0")}`
+      const delegation = index === 140 || index === 159
+      const continued = index === 147
+      const label = delegation
+        ? "delegate_to_agent"
+        : continued
+          ? "continue_delegation"
+          : "read_file"
+      calls.push(
+        toolState(
+          id,
+          label,
+          delegation || continued
+            ? {
+                "codeg.delegation": {
+                  child_conversation_id: 70 + index,
+                  status: index === 159 ? "running" : "completed",
+                },
+              }
+            : null
+        )
+      )
+      refs!.content.push({ kind: "tool_call_ref", tool_call_id: id })
+    }
+    const patch = denormalizeSnapshot(
+      baseSnapshot({
+        live_message: refs,
+        active_tool_calls: calls,
+        truncation: { omitted_tool_calls: 0, omitted_live_tool_refs: 0 },
+      })
+    )
+    expect(patch.liveMessage?.content).toHaveLength(160)
+    const byId = new Map(
+      patch.liveMessage?.content.flatMap((block) =>
+        block.type === "tool_call"
+          ? [[block.info.tool_call_id, block.info]]
+          : []
+      )
+    )
+    for (const index of [140, 147, 159]) {
+      const id = `call-${index.toString(16).padStart(4, "0")}`
+      const info = byId.get(id)
+      expect(info?.meta).toMatchObject({
+        "codeg.delegation": { child_conversation_id: 70 + index },
+      })
+    }
+    expect(patch.snapshotOmittedLiveToolRefs).toBe(0)
+  })
+})
