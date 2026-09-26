@@ -9087,6 +9087,20 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
       const stream = getEventStream()
       if (!stream) return null
 
+      // Reattaching an already-owned connection must retain its heartbeat
+      // binding even when the caller only knows the connection id.
+      const existing = storeRef.current.connections.get(contextKey)
+      if (
+        !shared &&
+        existing?.connectionId === connectionId &&
+        existing.sharedSession
+      ) {
+        shared = {
+          generation: existing.sharedSession.generation,
+          leaseId: existing.sharedSession.leaseId,
+        }
+      }
+
       let activeSub: EventStreamSubscription | null = null
       let lastBackgroundDetailRevision = 0
       let lastBackgroundTranscriptGeneration = 0
@@ -10631,9 +10645,11 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
             dispatch({ type: "CONNECTION_REMOVED", contextKey })
           }
           const prefs = getSavedPrefsForConnect(agentType)
-          const identity = getSharedClientIdentity()
-          const attachWith = (connectRequest: ConnectRequest) =>
-            acpConnectOrAttach({
+          const attachWith = (connectRequest: ConnectRequest) => {
+            const identity = getSharedClientIdentity(
+              connectRequest.sharedRequestId
+            )
+            return acpConnectOrAttach({
               conversationId: conversationId ?? null,
               agentType,
               workingDir: nextWorkingDir,
@@ -10647,6 +10663,7 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
               retryFailedGeneration:
                 connectRequest.retryFailedGeneration ?? null,
             })
+          }
           let activeRequest = request
           let response
           try {
@@ -11969,7 +11986,9 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
       const activity = beginRootConversationActivity(conn, opts?.conversationId)
       try {
         const shared = conn.sharedSession
-        const identity = shared ? getSharedClientIdentity() : null
+        const identity = shared
+          ? getSharedClientIdentity(shared.connectRequestId)
+          : null
         const result = shared
           ? await acpPrompt(
               conn.connectionId,

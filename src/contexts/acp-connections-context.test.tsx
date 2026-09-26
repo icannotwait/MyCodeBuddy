@@ -2304,6 +2304,76 @@ describe("AcpConnectionsProvider shared server roots", () => {
     }
   )
 
+  it("keeps independent views of one shared session on distinct lease identities", async () => {
+    h.isDesktop = false
+    h.acpConnectOrAttach
+      .mockResolvedValueOnce(sharedResponse())
+      .mockResolvedValueOnce(sharedResponse({ leaseId: "lease-2" }))
+    await mountProvider()
+    await act(async () => {
+      await h.actions!.connect(TAB, "claude_code", "/work", "sess", 42)
+      await h.actions!.connect(
+        "second-view",
+        "claude_code",
+        "/work",
+        "sess",
+        42
+      )
+      await h.actions!.sendPrompt(TAB, [{ type: "text", text: "first" }])
+      await h.actions!.sendPrompt("second-view", [
+        { type: "text", text: "second" },
+      ])
+    })
+
+    const first = h.acpConnectOrAttach.mock.calls[0]![0]
+    const second = h.acpConnectOrAttach.mock.calls[1]![0]
+    expect(first.clientInstanceId).not.toBe(second.clientInstanceId)
+    expect(first.deviceId).toBe(second.deviceId)
+    expect(acpPromptMock.mock.calls[0]?.[6]).toMatchObject({
+      leaseId: "lease-1",
+      clientInstanceId: first.clientInstanceId,
+    })
+    expect(acpPromptMock.mock.calls[1]?.[6]).toMatchObject({
+      leaseId: "lease-2",
+      clientInstanceId: second.clientInstanceId,
+    })
+    await act(async () => {
+      await h.actions!.disconnect(TAB, "idle_timeout")
+      await h.actions!.sendPrompt("second-view", [
+        { type: "text", text: "still here" },
+      ])
+    })
+    expect(h.acpReleaseLease).toHaveBeenCalledTimes(1)
+    expect(h.acpReleaseLease).toHaveBeenCalledWith("conn", 1, "lease-1")
+    expect(h.acpTerminateSharedSession).not.toHaveBeenCalled()
+    expect(acpPromptMock.mock.calls.at(-1)?.[6]).toMatchObject({
+      leaseId: "lease-2",
+      clientInstanceId: second.clientInstanceId,
+    })
+  })
+
+  it("retains a known shared lease when a child view restores its failed attach", async () => {
+    h.isDesktop = false
+    await mountProvider()
+    await act(async () => {
+      await h.actions!.connect("conn", "claude_code", "/work", "sess", 42)
+    })
+    act(() =>
+      latestAttachHandlers().onAttachError("snapshot_budget_exceeded", true)
+    )
+    act(() => {
+      h.actions!.attachDelegationChild({
+        connectionId: "conn",
+        parentConnectionId: "parent",
+        parentToolUseId: "tool",
+        agentType: "claude_code",
+      })
+    })
+    expect(h.attach.mock.calls.at(-1)?.[1]).toMatchObject({
+      shared: { generation: 1, leaseId: "lease-1" },
+    })
+  })
+
   it("releases a shared lease on provider teardown without disconnecting", async () => {
     h.isDesktop = false
     h.acpConnectOrAttach.mockResolvedValue(sharedResponse())
@@ -2424,6 +2494,9 @@ describe("AcpConnectionsProvider shared server roots", () => {
     )
     expect(h.acpConnectOrAttach.mock.calls[1]?.[0].requestId).toBe(
       h.acpConnectOrAttach.mock.calls[0]?.[0].requestId
+    )
+    expect(h.acpConnectOrAttach.mock.calls[1]?.[0].clientInstanceId).toBe(
+      h.acpConnectOrAttach.mock.calls[0]?.[0].clientInstanceId
     )
   })
 
@@ -2720,6 +2793,14 @@ describe("AcpConnectionsProvider shared server roots", () => {
     expect(h.store!.getConnection("new-tab")?.sharedSession).toMatchObject({
       leaseId: "lease-2",
       connectRequestId: h.acpConnectOrAttach.mock.calls[1]?.[0].requestId,
+    })
+    await act(async () => {
+      await h.actions!.sendPrompt("new-tab", [{ type: "text", text: "hello" }])
+    })
+    expect(acpPromptMock.mock.calls.at(-1)?.[6]).toMatchObject({
+      leaseId: "lease-2",
+      clientInstanceId:
+        h.acpConnectOrAttach.mock.calls[1]?.[0].clientInstanceId,
     })
     expect(h.pushAlert).not.toHaveBeenCalled()
   })

@@ -10,15 +10,24 @@ let deviceId: string | null = null
 export interface SharedClientIdentity {
   /** Diagnostic label only; authentication remains the server bearer token. */
   deviceId: string
-  /** Document-lifetime diagnostic label, never an authorization or path input. */
+  /** Document/attachment identity, never an authorization or path input. */
   clientInstanceId: string
 }
 
-export function getSharedClientIdentity(): SharedClientIdentity {
+export function getSharedClientIdentity(
+  attachmentId?: string
+): SharedClientIdentity {
   if (deviceId === null) {
     deviceId = readOrCreateDeviceId()
   }
-  return { deviceId, clientInstanceId }
+  // The broker keeps one active lease per client per session. Independent
+  // views must not rotate each other's leases; retries keep the attachment id.
+  return {
+    deviceId,
+    clientInstanceId: attachmentId
+      ? `${clientInstanceId}:${attachmentId}`
+      : clientInstanceId,
+  }
 }
 
 export function newSharedRequestId(): string {
