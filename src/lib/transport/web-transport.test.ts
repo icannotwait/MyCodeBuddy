@@ -87,6 +87,13 @@ function lastWs(): MockWebSocket {
 }
 
 let fetchMock: ReturnType<typeof vi.fn>
+const transports: WebTransport[] = []
+
+function createTransport() {
+  const transport = new WebTransport("http://localhost")
+  transports.push(transport)
+  return transport
+}
 
 beforeEach(() => {
   vi.useFakeTimers()
@@ -98,6 +105,8 @@ beforeEach(() => {
 })
 
 afterEach(() => {
+  for (const transport of transports.splice(0)) transport.destroy()
+  vi.restoreAllMocks()
   vi.unstubAllGlobals()
   vi.useRealTimers()
   localStorage.clear()
@@ -107,7 +116,7 @@ afterEach(() => {
 // `eventStream()` synchronously triggers the WS connect (no await, unlike
 // `subscribe()`), which keeps the timer/promise interleaving simple.
 function connectReady() {
-  const t = new WebTransport("http://localhost")
+  const t = createTransport()
   t.eventStream()
   const ws = lastWs()
   ws.open()
@@ -118,9 +127,168 @@ function connectReady() {
 const ok200 = () => ({ status: 200, ok: true, json: async () => ({}) })
 const resp401 = () => ({ status: 401, ok: false, json: async () => ({}) })
 
+describe("WebTransport silent disconnect recovery", () => {
+  function attachShared(t: WebTransport) {
+    return t.eventStream().attach(
+      "running-agent",
+      { shared: { generation: 2, leaseId: "lease" }, sinceSeq: 17 },
+      {
+        onSnapshot: vi.fn(),
+        onReplay: vi.fn(),
+        onEvent: vi.fn(),
+        onDetached: vi.fn(),
+        onAttachError: vi.fn(),
+      }
+    )
+  }
+
+  it("recovers a socket that stops answering heartbeats without closing", async () => {
+    const { t, ws } = connectReady()
+    const sub = attachShared(t)
+    fetchMock.mockResolvedValue(ok200())
+    await vi.advanceTimersByTimeAsync(30_000)
+    expect(ws.sent).toContain(JSON.stringify({ action: "ping" }))
+
+    await vi.advanceTimersByTimeAsync(15_000)
+    expect(t.getConnectionSnapshot()).toBe("reconnecting")
+    expect(ws.readyState).toBe(MockWebSocket.CLOSED)
+    await vi.advanceTimersByTimeAsync(1000)
+    const replacement = lastWs()
+    replacement.open()
+    replacement.ready()
+    expect(replacement.sent.map((frame) => JSON.parse(frame))).toContainEqual({
+      action: "attach",
+      subscription_id: sub.subscriptionId,
+      connection_id: "running-agent",
+      generation: 2,
+      lease_id: "lease",
+      since_seq: 17,
+    })
+    expect(localStorage.getItem("codeg_token")).toBe("tok")
+  })
+
+  it("keeps an idle healthy agent attached when the server answers ping", async () => {
+    const { t, ws } = connectReady()
+    attachShared(t)
+    for (let i = 0; i < 4; i++) {
+      await vi.advanceTimersByTimeAsync(30_000)
+      ws.onmessage?.({ data: JSON.stringify({ type: "pong" }) })
+    }
+    expect(t.getConnectionSnapshot()).toBe("connected")
+    expect(MockWebSocket.instances).toHaveLength(1)
+    expect(fetchMock).not.toHaveBeenCalled()
+  })
+
+  it("probes the existing socket immediately when the page wakes", async () => {
+    const { t, ws } = connectReady()
+    attachShared(t)
+    vi.spyOn(document, "visibilityState", "get").mockReturnValue("visible")
+    document.dispatchEvent(new Event("visibilitychange"))
+    expect(ws.sent.at(-1)).toBe(JSON.stringify({ action: "ping" }))
+    ws.onmessage?.({ data: JSON.stringify({ type: "pong" }) })
+    await vi.advanceTimersByTimeAsync(15_000)
+    expect(t.getConnectionSnapshot()).toBe("connected")
+    expect(fetchMock).not.toHaveBeenCalled()
+  })
+
+  it("gives a hidden page a fresh heartbeat deadline on wake", async () => {
+    const { t, ws } = connectReady()
+    attachShared(t)
+    const visibility = vi
+      .spyOn(document, "visibilityState", "get")
+      .mockReturnValue("hidden")
+    await vi.advanceTimersByTimeAsync(45_000)
+    expect(t.getConnectionSnapshot()).toBe("connected")
+    visibility.mockReturnValue("visible")
+    document.dispatchEvent(new Event("visibilitychange"))
+    expect(ws.sent.at(-1)).toBe(JSON.stringify({ action: "ping" }))
+    ws.onmessage?.({ data: JSON.stringify({ type: "pong" }) })
+    await vi.advanceTimersByTimeAsync(14_000)
+    expect(t.getConnectionSnapshot()).toBe("connected")
+  })
+
+  it.each([false, true])(
+    "retries a stalled handshake (socket opened: %s)",
+    async (opened) => {
+      const t = createTransport()
+      t.eventStream()
+      const ws = lastWs()
+      if (opened) ws.open()
+      fetchMock.mockResolvedValue(ok200())
+      await vi.advanceTimersByTimeAsync(15_000)
+      expect(t.getConnectionSnapshot()).toBe("reconnecting")
+      expect(ws.readyState).toBe(MockWebSocket.CLOSED)
+      await vi.advanceTimersByTimeAsync(1000)
+      expect(lastWs()).not.toBe(ws)
+    }
+  )
+
+  it("removes heartbeat timers and wake listeners on destroy", async () => {
+    const { t, ws } = connectReady()
+    attachShared(t)
+    await vi.advanceTimersByTimeAsync(30_000)
+    t.destroy()
+    const sentCount = ws.sent.length
+    window.dispatchEvent(new Event("online"))
+    document.dispatchEvent(new Event("visibilitychange"))
+    await vi.advanceTimersByTimeAsync(60_000)
+    expect(ws.sent).toHaveLength(sentCount)
+    expect(fetchMock).not.toHaveBeenCalled()
+  })
+
+  it("ignores old socket callbacks after recovering a failed send", async () => {
+    const { t, ws } = connectReady()
+    attachShared(t)
+    const lateMessage = ws.onmessage
+    const lateClose = ws.onclose
+    vi.spyOn(ws, "send").mockImplementation(() => {
+      throw new Error("socket closed while sending")
+    })
+    fetchMock.mockResolvedValue(ok200())
+    await vi.advanceTimersByTimeAsync(30_000)
+    expect(t.getConnectionSnapshot()).toBe("reconnecting")
+    await vi.advanceTimersByTimeAsync(1000)
+    const replacement = lastWs()
+    replacement.open()
+    lateMessage?.({ data: JSON.stringify({ channel: "__ready__" }) })
+    lateClose?.()
+    expect(t.getConnectionSnapshot()).toBe("reconnecting")
+    replacement.ready()
+    expect(t.getConnectionSnapshot()).toBe("connected")
+  })
+
+  it("waits for the replacement ready frame after explicit reconnect", async () => {
+    const { t } = connectReady()
+    fetchMock.mockResolvedValue(ok200())
+    t.reconnectNow()
+    const ready = vi.fn()
+    void t.waitForReady().then(ready)
+    await vi.advanceTimersByTimeAsync(0)
+    expect(ready).not.toHaveBeenCalled()
+    lastWs().open()
+    lastWs().ready()
+    await vi.advanceTimersByTimeAsync(0)
+    expect(ready).toHaveBeenCalledOnce()
+  })
+
+  it("keeps pending ready waiters across handshake retries and settles on destroy", async () => {
+    const t = createTransport()
+    t.eventStream()
+    const ready = vi.fn()
+    void t.waitForReady().then(ready)
+    fetchMock.mockResolvedValue(ok200())
+    lastWs().drop()
+    await vi.advanceTimersByTimeAsync(1000)
+    expect(ready).not.toHaveBeenCalled()
+    t.destroy()
+    await vi.advanceTimersByTimeAsync(0)
+    expect(ready).toHaveBeenCalledOnce()
+  })
+})
+
 describe("WebTransport connection state machine", () => {
   it("starts connected and the first __ready__ does not fire reconnect callbacks", () => {
-    const t = new WebTransport("http://localhost")
+    const t = createTransport()
     const onReconnect = vi.fn()
     t.onReconnect(onReconnect)
     expect(t.getConnectionSnapshot()).toBe("connected")
@@ -317,7 +485,7 @@ describe("WebTransport connection state machine", () => {
   })
 
   it("enters reconnecting when the very first connect fails (server unreachable at load)", () => {
-    const t = new WebTransport("http://localhost")
+    const t = createTransport()
     t.eventStream() // opens the socket
     const ws = lastWs()
 
@@ -382,7 +550,7 @@ describe("WebTransport oversized attach recovery", () => {
 
 describe("WebTransport call abort + timeout", () => {
   it("throws AbortError for a pre-aborted caller signal without calling fetch", async () => {
-    const t = new WebTransport("http://localhost")
+    const t = createTransport()
     const controller = new AbortController()
     controller.abort()
     await expect(
@@ -392,7 +560,7 @@ describe("WebTransport call abort + timeout", () => {
   })
 
   it("throws AbortError when the caller aborts mid-fetch (not timeout)", async () => {
-    const t = new WebTransport("http://localhost")
+    const t = createTransport()
     const controller = new AbortController()
     fetchMock.mockImplementation(
       (_url: string, opts: { signal: AbortSignal }) =>
@@ -410,7 +578,7 @@ describe("WebTransport call abort + timeout", () => {
   })
 
   it("throws Error('Request timed out') when the internal timer fires", async () => {
-    const t = new WebTransport("http://localhost")
+    const t = createTransport()
     fetchMock.mockImplementation(
       (_url: string, opts: { signal: AbortSignal }) =>
         new Promise((_resolve, reject) => {
@@ -428,7 +596,7 @@ describe("WebTransport call abort + timeout", () => {
   })
 
   it("removes the caller abort listener after the call settles", async () => {
-    const t = new WebTransport("http://localhost")
+    const t = createTransport()
     const controller = new AbortController()
     const addSpy = vi.spyOn(controller.signal, "addEventListener")
     const removeSpy = vi.spyOn(controller.signal, "removeEventListener")
@@ -484,7 +652,7 @@ describe("WebTransport completion context capture/replay", () => {
   })
 
   it("captures snapshot capability and replays it on completion mutations", async () => {
-    const t = new WebTransport("http://localhost")
+    const t = createTransport()
     const attentionId = "attention-root-42"
     const token = "completion-token-root-42"
 
@@ -552,7 +720,7 @@ describe("WebTransport completion context capture/replay", () => {
   ])(
     "treats removed %s as an unknown command without replaying a capability",
     async (command, args) => {
-      const t = new WebTransport("http://localhost")
+      const t = createTransport()
       fetchMock
         .mockResolvedValueOnce(
           mockJsonResponse(
@@ -574,7 +742,7 @@ describe("WebTransport completion context capture/replay", () => {
   )
 
   it("scopes replayed capabilities to the snapshot root", async () => {
-    const t = new WebTransport("http://localhost")
+    const t = createTransport()
 
     fetchMock
       .mockResolvedValueOnce(
@@ -686,7 +854,7 @@ describe("WebTransport completion context capture/replay", () => {
   })
 
   it("does not send bearer-only completion mutations without a captured capability", async () => {
-    const t = new WebTransport("http://localhost")
+    const t = createTransport()
     fetchMock.mockResolvedValueOnce(mockJsonResponse({ ok: true }))
 
     await t.call("resolve_completion_decision", {
