@@ -226,10 +226,29 @@ async fn handle_internal_event(
 ) -> Result<(), DbError> {
     match &internal.payload {
         AcpEvent::TurnComplete {
+            session_id,
             stop_reason,
             mark_awaiting_reply,
             ..
         } => {
+            let conversation_id = if let Some(snapshot) = internal.completion.as_ref() {
+                Some(snapshot.conversation_id)
+            } else if let Some((state, _)) =
+                manager.get_state_and_emitter(&internal.connection_id).await
+            {
+                let state = state.read().await;
+                state.conversation_id.filter(|_| {
+                    state
+                        .external_id
+                        .as_deref()
+                        .is_none_or(|live_id| live_id.is_empty() || live_id == session_id)
+                })
+            } else {
+                None
+            };
+            if let Some(cid) = conversation_id {
+                bind_unbound_completion_external_id(db_conn, cid, session_id, stop_reason).await;
+            }
             handle_turn_complete_internal(
                 db_conn,
                 manager,
@@ -665,20 +684,41 @@ async fn persist_live_external_id(
     Ok(())
 }
 
-/// Bind `session_id` onto a live conversation row without broadcasting.
-/// Used by `TurnComplete(end_turn)` so hydrate can find the agent store
+/// Bind `session_id` only onto a still-unbound live row without broadcasting.
+/// Used by `TurnComplete` so hydrate can find the agent store
 /// while the CAS path remains the sole `conversation://changed` writer.
 async fn bind_live_external_id(
     db_conn: &DatabaseConnection,
     conversation_id: i32,
-    agent_type: AgentType,
     session_id: &str,
 ) -> Result<(), DbError> {
-    let continues = crate::acp::continued_session_ids(agent_type, session_id);
-    let _preserved =
-        conversation_service::bind_external_id(db_conn, conversation_id, session_id, &continues)
-            .await?;
-    Ok(())
+    conversation_service::renormalize_external_id_alias(
+        db_conn,
+        conversation_id,
+        None,
+        session_id.to_string(),
+    )
+    .await
+}
+
+async fn bind_unbound_completion_external_id(
+    db_conn: &DatabaseConnection,
+    conversation_id: i32,
+    session_id: &str,
+    stop_reason: &str,
+) {
+    if session_id.is_empty() {
+        return;
+    }
+    if let Err(error) = bind_live_external_id(db_conn, conversation_id, session_id).await {
+        tracing::warn!(
+            conversation_id,
+            session_id = %session_id,
+            stop_reason = %stop_reason,
+            error = %error,
+            "[lifecycle] TurnComplete could not bind unbound external_id"
+        );
+    }
 }
 
 pub(crate) async fn handle_event(
@@ -806,43 +846,11 @@ pub(crate) async fn handle_event(
             // session on disk. Restricting the settle to `end_turn` left
             // Antigravity rows unbound after an otherwise successful turn.
             {
-                let (agent_type, live_sid) = {
-                    let snap = state_arc.read().await;
-                    (snap.agent_type, snap.external_id.clone())
-                };
+                let live_sid = state_arc.read().await.external_id.clone();
                 let sid = live_sid
                     .filter(|s| !s.is_empty())
                     .unwrap_or_else(|| session_id.clone());
-                if !sid.is_empty() {
-                    match conversation_service::get_by_id(db_conn, cid).await {
-                        Ok(row) if row.external_id.is_none() => {
-                            // Bind only. SessionStarted/ConversationLinked use
-                            // persist_live_external_id (upsert). TurnComplete
-                            // must emit exactly one conversation://changed
-                            // State after CAS — an extra upsert fails the fork
-                            // single-event invariant.
-                            if let Err(e) =
-                                bind_live_external_id(db_conn, cid, agent_type, &sid).await
-                            {
-                                tracing::warn!(
-                                    conversation_id = cid,
-                                    session_id = %sid,
-                                    stop_reason = %stop_reason,
-                                    error = %e,
-                                    "[lifecycle] TurnComplete could not bind unbound external_id"
-                                );
-                            }
-                        }
-                        Ok(_) => {}
-                        Err(e) => {
-                            tracing::warn!(
-                                conversation_id = cid,
-                                error = %e,
-                                "[lifecycle] TurnComplete skipped unbound-row bind; get_by_id failed"
-                            );
-                        }
-                    }
-                }
+                bind_unbound_completion_external_id(db_conn, cid, &sid, stop_reason).await;
             }
             // Delegate rows: durable task status + sidebar ConversationStatus are
             // owned by the broker store CAS (`settle_task`). A generic
@@ -3891,6 +3899,289 @@ mod tests {
             .unwrap()
             .expect("conversation row exists")
             .status
+    }
+
+    fn internal_completion(
+        conversation_id: Option<i32>,
+        session_id: &str,
+        stop_reason: &str,
+    ) -> InternalEventEnvelope {
+        InternalEventEnvelope {
+            event: Arc::new(EventEnvelope {
+                seq: 1,
+                connection_id: "completion-conn".into(),
+                payload: AcpEvent::TurnComplete {
+                    session_id: session_id.into(),
+                    stop_reason: stop_reason.into(),
+                    agent_type: "antigravity".into(),
+                    mark_awaiting_reply: true,
+                    termination_source: None,
+                    provider_turn_id: None,
+                },
+            }),
+            completion: conversation_id.map(|conversation_id| {
+                Arc::new(TurnCompletionSnapshot {
+                    conversation_id,
+                    turn_token: "captured-turn".into(),
+                    locale: crate::models::system::AppLocale::En,
+                    final_text: Arc::from("Captured reply"),
+                })
+            }),
+        }
+    }
+
+    #[tokio::test]
+    async fn internal_completion_binds_missing_external_id_for_representative_stop_reasons() {
+        for stop_reason in ["end_turn", "empty", "refusal", "cancelled"] {
+            for with_sidecar in [false, true] {
+                let db = test_helpers::fresh_in_memory_db().await;
+                let folder_id =
+                    test_helpers::seed_folder(&db, "/tmp/internal-completion-bind").await;
+                let conv = conversation_service::create(
+                    &db.conn,
+                    folder_id,
+                    AgentType::Antigravity,
+                    None,
+                    None,
+                )
+                .await
+                .unwrap();
+                let mgr = ConnectionManager::new();
+                let conn = fake_connection_with_state("completion-conn", Some(conv.id));
+                {
+                    let mut state = conn.state.write().await;
+                    state.agent_type = AgentType::Antigravity;
+                    state.external_id = Some("captured-session".into());
+                }
+                mgr.connections.lock().await.insert(conn.id.clone(), conn);
+                let internal = internal_completion(
+                    with_sidecar.then_some(conv.id),
+                    "captured-session",
+                    stop_reason,
+                );
+
+                handle_internal_event(&db.conn, &mgr, &internal, None)
+                    .await
+                    .unwrap();
+
+                let row = conversation_service::get_by_id(&db.conn, conv.id)
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    row.external_id.as_deref(),
+                    Some("captured-session"),
+                    "{stop_reason}, sidecar={with_sidecar}"
+                );
+                let expected_status = match stop_reason {
+                    "end_turn" => ConversationStatus::PendingReview,
+                    "cancelled" => ConversationStatus::InProgress,
+                    _ => ConversationStatus::Cancelled,
+                };
+                assert_eq!(read_row_status(&db, conv.id).await, expected_status);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn internal_completion_binds_captured_session_after_live_identity_changes() {
+        for live_identity in ["same-row", "new-row", "removed"] {
+            let db = test_helpers::fresh_in_memory_db().await;
+            let folder_id = test_helpers::seed_folder(&db, "/tmp/internal-completion-stale").await;
+            let old = conversation_service::create(
+                &db.conn,
+                folder_id,
+                AgentType::Antigravity,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+            let newer = conversation_service::create(
+                &db.conn,
+                folder_id,
+                AgentType::Antigravity,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+            let mgr = ConnectionManager::new();
+            let internal = internal_completion(Some(old.id), "captured-session", "end_turn");
+            if live_identity != "removed" {
+                let live_cid = if live_identity == "same-row" {
+                    old.id
+                } else {
+                    newer.id
+                };
+                let conn = fake_connection_with_state("completion-conn", Some(live_cid));
+                {
+                    let mut state = conn.state.write().await;
+                    state.agent_type = AgentType::Antigravity;
+                    state.external_id = Some("newer-session".into());
+                    state.turn_in_flight = true;
+                }
+                mgr.connections.lock().await.insert(conn.id.clone(), conn);
+            }
+
+            handle_internal_event(&db.conn, &mgr, &internal, None)
+                .await
+                .unwrap();
+
+            let old_row = conversation_service::get_by_id(&db.conn, old.id)
+                .await
+                .unwrap();
+            let newer_row = conversation_service::get_by_id(&db.conn, newer.id)
+                .await
+                .unwrap();
+            assert_eq!(
+                old_row.external_id.as_deref(),
+                Some("captured-session"),
+                "{live_identity}"
+            );
+            assert!(newer_row.external_id.is_none(), "{live_identity}");
+            assert_eq!(
+                read_row_status(&db, newer.id).await,
+                ConversationStatus::InProgress
+            );
+            if let Some((state, _)) = mgr.get_state_and_emitter("completion-conn").await {
+                let state = state.read().await;
+                assert_eq!(state.external_id.as_deref(), Some("newer-session"));
+                assert!(state.turn_in_flight);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn internal_completion_preserves_existing_external_id() {
+        for bound_session in ["captured-session", "already-bound-session"] {
+            let db = test_helpers::fresh_in_memory_db().await;
+            let folder_id = test_helpers::seed_folder(&db, "/tmp/internal-completion-bound").await;
+            let conv = conversation_service::create(
+                &db.conn,
+                folder_id,
+                AgentType::Antigravity,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+            conversation_service::bind_external_id(&db.conn, conv.id, bound_session, &[])
+                .await
+                .unwrap();
+            let mgr = ConnectionManager::new();
+            let internal = internal_completion(Some(conv.id), "captured-session", "end_turn");
+
+            handle_internal_event(&db.conn, &mgr, &internal, None)
+                .await
+                .unwrap();
+
+            let row = conversation_service::get_by_id(&db.conn, conv.id)
+                .await
+                .unwrap();
+            assert_eq!(row.external_id.as_deref(), Some(bound_session));
+            assert_eq!(
+                read_row_status(&db, conv.id).await,
+                ConversationStatus::PendingReview
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn internal_completion_competing_binding_does_not_split_history() {
+        use crate::db::entities::conversation;
+        use crate::web::event_bridge::{WebEventBroadcaster, CONVERSATION_CHANGED_EVENT};
+
+        let db = test_helpers::fresh_in_memory_db().await;
+        let folder_id = test_helpers::seed_folder(&db, "/tmp/completion-binding-cas").await;
+        let conv =
+            conversation_service::create(&db.conn, folder_id, AgentType::Antigravity, None, None)
+                .await
+                .unwrap();
+        let broadcaster = Arc::new(WebEventBroadcaster::new());
+        let mut events = broadcaster.subscribe();
+        let mgr = ConnectionManager::new();
+        let mut old = fake_connection_with_state("completion-conn", Some(conv.id));
+        old.emitter = EventEmitter::test_web_only(broadcaster);
+        old.state.write().await.external_id = Some("captured-session".into());
+        mgr.connections.lock().await.insert(old.id.clone(), old);
+        let internal = internal_completion(Some(conv.id), "captured-session", "end_turn");
+        let observed = conversation_service::get_by_id(&db.conn, conv.id)
+            .await
+            .unwrap();
+        assert!(observed.external_id.is_none());
+
+        conversation_service::bind_external_id(&db.conn, conv.id, "newer-session", &[])
+            .await
+            .unwrap();
+        let newer = fake_connection_with_state("newer-conn", Some(conv.id));
+        newer.state.write().await.external_id = Some("newer-session".into());
+        mgr.connections.lock().await.insert(newer.id.clone(), newer);
+
+        bind_live_external_id(&db.conn, conv.id, "captured-session")
+            .await
+            .unwrap();
+        handle_internal_event(&db.conn, &mgr, &internal, None)
+            .await
+            .unwrap();
+
+        let rows = conversation::Entity::find().all(&db.conn).await.unwrap();
+        let row = rows.iter().find(|row| row.id == conv.id).unwrap();
+        assert_eq!(
+            (rows.len(), row.external_id.as_deref()),
+            (1, Some("newer-session")),
+            "a stale completion write must neither rebind nor create a preserved sibling"
+        );
+        let (newer_state, _) = mgr.get_state_and_emitter("newer-conn").await.unwrap();
+        let newer_state = newer_state.read().await;
+        assert_eq!(newer_state.conversation_id, Some(row.id));
+        assert_eq!(newer_state.external_id, row.external_id);
+        assert_eq!(row.status, ConversationStatus::PendingReview);
+        let token = row.awaiting_reply_token.as_deref().unwrap();
+        let mut changed = Vec::new();
+        while let Ok(event) = events.try_recv() {
+            if event.channel == CONVERSATION_CHANGED_EVENT {
+                changed.push(event);
+            }
+        }
+        assert_eq!(changed.len(), 1);
+        let payload = &*changed[0].payload;
+        assert_eq!(payload["kind"], "state");
+        assert_eq!(payload["patch"]["id"], conv.id);
+        assert_eq!(payload["patch"]["status"], "pending_review");
+        assert_eq!(payload["patch"]["awaiting_reply_token"], token);
+    }
+
+    #[tokio::test]
+    async fn internal_completion_without_owned_identity_does_not_bind_newer_session() {
+        for (with_sidecar, session_id) in [(false, ""), (true, ""), (false, "captured-session")] {
+            let db = test_helpers::fresh_in_memory_db().await;
+            let folder_id =
+                test_helpers::seed_folder(&db, "/tmp/internal-completion-no-identity").await;
+            let conv = conversation_service::create(
+                &db.conn,
+                folder_id,
+                AgentType::Antigravity,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+            let mgr = ConnectionManager::new();
+            let conn = fake_connection_with_state("completion-conn", Some(conv.id));
+            conn.state.write().await.external_id = Some("newer-session".into());
+            mgr.connections.lock().await.insert(conn.id.clone(), conn);
+            let internal =
+                internal_completion(with_sidecar.then_some(conv.id), session_id, "end_turn");
+
+            handle_internal_event(&db.conn, &mgr, &internal, None)
+                .await
+                .unwrap();
+
+            let row = conversation_service::get_by_id(&db.conn, conv.id)
+                .await
+                .unwrap();
+            assert!(row.external_id.is_none());
+        }
     }
 
     #[tokio::test]

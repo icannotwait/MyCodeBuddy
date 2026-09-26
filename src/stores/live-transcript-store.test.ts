@@ -21,6 +21,7 @@ import {
 } from "@/lib/markdown/incremental-stream-blocks"
 import { resetJsonParseCacheForTests } from "@/lib/try-parse-json"
 import {
+  createLiveTranscriptFrameSink,
   createLiveTranscriptStore,
   getToolJoinedOutput,
   selectRunningOutputTail,
@@ -88,6 +89,89 @@ describe("live-transcript-store", () => {
     expect(textListener).toHaveBeenCalledTimes(1)
     expect(unrelatedToolListener).not.toHaveBeenCalled()
     expect(store.getConversation(42)!.segmentIds).toBe(snapshot.segmentIds)
+  })
+
+  it("applies duplicate and older publications once per connection and message", () => {
+    const store = createLiveTranscriptStore()
+    const first = createLiveTranscriptFrameSink(42, "c1", store)
+    const second = createLiveTranscriptFrameSink(42, "c1", store)
+    first.rebuild(liveMessageWithText("a"), 1)
+    const listener = vi.fn()
+    store.subscribeConversation(42, listener)
+    const delta = frame([content("c1", 2, "b")])
+    first.publish(delta, liveMessageWithText("ab"))
+    const applied = store.getConversation(42)
+    second.publish(delta, liveMessageWithText("ab"))
+    second.publish(frame([content("c1", 1, "a")]), liveMessageWithText("a"))
+    expect(store.getConversation(42)).toBe(applied)
+    expect(listener).toHaveBeenCalledTimes(1)
+    expect([...applied!.segments.values()][0]).toMatchObject({ text: "ab" })
+    const terminal = frame([
+      {
+        connection_id: "c1",
+        seq: 3,
+        type: "turn_complete",
+        session_id: "sess",
+        stop_reason: "end_turn",
+        mark_awaiting_reply: false,
+      },
+    ])
+    first.publish(terminal, liveMessageWithText("ab"))
+    second.publish(terminal, liveMessageWithText("ab"))
+    expect(store.getConversation(42)?.status).toBe("completing")
+  })
+
+  it("rebuilds overlapping compacted replay from canonical without duplicating its prefix", () => {
+    const store = createLiveTranscriptStore()
+    store.rebuild(42, "c1", liveMessageWithText("ab"), 2)
+    const replay = {
+      ...frame([content("c1", 3, "bc")]),
+      rawEvents: [content("c1", 2, "b"), content("c1", 3, "c")],
+    }
+    store.publish(42, replay, liveMessageWithText("abc"))
+    store.publish(42, replay, liveMessageWithText("abc"))
+    expect([...store.getConversation(42)!.segments.values()][0]).toMatchObject({
+      text: "abc",
+    })
+    expect(store.getConversation(42)?.lastAppliedSeq).toBe(3)
+  })
+
+  it("resumes the same message on a new connection with a lower cursor", () => {
+    const store = createLiveTranscriptStore()
+    store.rebuild(42, "c1", liveMessageWithText("old"), 20)
+    const resumed = frame([content("c2", 1, " new")], "c2")
+    store.publish(42, resumed, liveMessageWithText("recovered new"))
+    store.publish(42, resumed, liveMessageWithText("recovered new"))
+    expect([...store.getConversation(42)!.segments.values()][0]).toMatchObject({
+      text: "recovered new",
+    })
+    expect(store.getConversation(42)).toMatchObject({
+      connectionId: "c2",
+      lastAppliedSeq: 1,
+    })
+  })
+
+  it("allows explicit snapshot rebuild and new-message publication at the same cursor", () => {
+    const store = createLiveTranscriptStore()
+    store.rebuild(42, "c1", liveMessageWithText("a"), 2)
+    store.rebuild(42, "c1", liveMessageWithText("recovered"), 2)
+    store.publish(
+      42,
+      frame([content("c1", 3, "!")]),
+      liveMessageWithText("recovered!")
+    )
+    expect([...store.getConversation(42)!.segments.values()][0]).toMatchObject({
+      text: "recovered!",
+    })
+    store.publish(
+      42,
+      frame([content("c1", 3, "next")]),
+      liveMessageWithText("next", "msg-2")
+    )
+    expect(store.getConversation(42)?.messageId).toBe("msg-2")
+    expect([...store.getConversation(42)!.segments.values()][0]).toMatchObject({
+      text: "next",
+    })
   })
 
   it("rebuilds from canonical state without advancing a false cursor", () => {

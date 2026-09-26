@@ -435,7 +435,10 @@ export const ConversationSessionSurface = memo(
     // For new conversations this is a virtual (negative) ID; for existing
     // conversations opened from the sidebar it equals the real DB ID.
     const [effectiveConversationId] = useState(
-      () => conversationId ?? buildVirtualConversationId(`draft-${tabId}`)
+      () =>
+        ownTab?.runtimeConversationId ??
+        conversationId ??
+        buildVirtualConversationId(`draft-${tabId}`)
     )
     const [createdConversationId, setCreatedConversationId] = useState<
       number | null

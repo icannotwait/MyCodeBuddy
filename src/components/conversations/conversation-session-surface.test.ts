@@ -15,6 +15,7 @@ import type {
   CreateChatConversationResult,
   EventEnvelope,
   SessionFailureRecord,
+  SessionStats,
 } from "@/lib/types"
 import type { SessionFailureAction } from "@/lib/session-failures"
 import {
@@ -539,6 +540,7 @@ type CapturedShellProps = {
 }
 
 type CapturedMessageListProps = {
+  conversationId: number
   onResumeRoot?: () => void
   onOpenRootConversation?: (conversationId: number) => Promise<void>
   onForkFromTurn?: (turnId: string) => void | Promise<void>
@@ -561,6 +563,7 @@ type HarnessTab = {
   isPinned: boolean
   isChat?: boolean
   workingDir?: string
+  runtimeConversationId?: number
 }
 
 const lifecycleCapture = vi.hoisted(() => ({
@@ -672,6 +675,9 @@ const surfaceH = vi.hoisted(() => ({
   runtimeQueuedOptimisticTurnIds: [] as string[],
   runtimeUserTurns: [] as Array<{ id: string; role: "user" }>,
   runtimeLocalTurns: [] as Array<{ id: string }>,
+  realRuntime: null as
+    | typeof import("@/stores/conversation-runtime-store")
+    | null,
   asyncTasks: [] as AsyncTaskRecord[],
   setExternalId: vi.fn(),
   pendingUserMessage: null as PendingUserMessage | null,
@@ -1035,44 +1041,51 @@ vi.mock("@/stores/conversation-runtime-store", () => ({
   getRuntimeSession: () => ({
     optimisticTurns: surfaceH.runtimeOptimisticTurns,
   }),
-  useConversationRuntimeActions: () => ({
-    appendOptimisticTurn: (
-      _conversationId: number,
-      turn: { id: string; role: "user" },
-      _turnToken: string,
-      options?: { queuePending?: boolean }
-    ) => {
-      if (
-        !surfaceH.runtimeOptimisticTurns.some((item) => item.id === turn.id)
-      ) {
-        surfaceH.runtimeOptimisticTurns.push(turn)
-      }
-      surfaceH.runtimeQueuedOptimisticTurnIds = options?.queuePending
-        ? [...new Set([...surfaceH.runtimeQueuedOptimisticTurnIds, turn.id])]
-        : surfaceH.runtimeQueuedOptimisticTurnIds.filter((id) => id !== turn.id)
-    },
-    removeOptimisticTurn: surfaceH.removeOptimisticTurn,
-    appendViewerUserTurn: (
-      _conversationId: number,
-      turn: { id: string; role: "user" }
-    ) => {
-      if (!surfaceH.runtimeUserTurns.some((item) => item.id === turn.id)) {
-        surfaceH.runtimeUserTurns.push(turn)
-      }
-    },
-    refetchDetail: surfaceH.refetchDetail,
-    reloadDetail: surfaceH.reloadDetail,
-    syncTurnMetadata: vi.fn(() => () => undefined),
-    syncDelegateTerminalDetail: surfaceH.syncDelegateTerminalDetail,
-    removeConversation: surfaceH.removeConversation,
-    setAcpLoadError: vi.fn(),
-    setDbConversationId: vi.fn(),
-    setExternalId: surfaceH.setExternalId,
-    setLiveMessage: vi.fn(),
-    setLiveOwnsActiveTurn: vi.fn(),
-    setPendingCleanup: surfaceH.setPendingCleanup,
-    setSyncState: surfaceH.setSyncState,
-  }),
+  useConversationRuntimeActions: () => {
+    if (surfaceH.realRuntime) {
+      return surfaceH.realRuntime.useConversationRuntimeActions()
+    }
+    return {
+      appendOptimisticTurn: (
+        _conversationId: number,
+        turn: { id: string; role: "user" },
+        _turnToken: string,
+        options?: { queuePending?: boolean }
+      ) => {
+        if (
+          !surfaceH.runtimeOptimisticTurns.some((item) => item.id === turn.id)
+        ) {
+          surfaceH.runtimeOptimisticTurns.push(turn)
+        }
+        surfaceH.runtimeQueuedOptimisticTurnIds = options?.queuePending
+          ? [...new Set([...surfaceH.runtimeQueuedOptimisticTurnIds, turn.id])]
+          : surfaceH.runtimeQueuedOptimisticTurnIds.filter(
+              (id) => id !== turn.id
+            )
+      },
+      removeOptimisticTurn: surfaceH.removeOptimisticTurn,
+      appendViewerUserTurn: (
+        _conversationId: number,
+        turn: { id: string; role: "user" }
+      ) => {
+        if (!surfaceH.runtimeUserTurns.some((item) => item.id === turn.id)) {
+          surfaceH.runtimeUserTurns.push(turn)
+        }
+      },
+      refetchDetail: surfaceH.refetchDetail,
+      reloadDetail: surfaceH.reloadDetail,
+      syncTurnMetadata: vi.fn(() => () => undefined),
+      syncDelegateTerminalDetail: surfaceH.syncDelegateTerminalDetail,
+      removeConversation: surfaceH.removeConversation,
+      setAcpLoadError: vi.fn(),
+      setDbConversationId: vi.fn(),
+      setExternalId: surfaceH.setExternalId,
+      setLiveMessage: vi.fn(),
+      setLiveOwnsActiveTurn: vi.fn(),
+      setPendingCleanup: surfaceH.setPendingCleanup,
+      setSyncState: surfaceH.setSyncState,
+    }
+  },
   useConversationRuntimeStore: Object.assign(
     (
       sel: (s: {
@@ -1080,15 +1093,22 @@ vi.mock("@/stores/conversation-runtime-store", () => ({
           number,
           {
             externalId: string | null
-            sessionStats: null
+            sessionStats: SessionStats | null
             syncState: string
             delegateSyncError: string | null
             localTurns: Array<{ id: string }>
           }
         >
       }) => unknown
-    ) => sel(runtimeStoreState()),
-    { getState: () => runtimeStoreState() }
+    ) =>
+      surfaceH.realRuntime
+        ? surfaceH.realRuntime.useConversationRuntimeStore(sel)
+        : sel(runtimeStoreState()),
+    {
+      getState: () =>
+        surfaceH.realRuntime?.useConversationRuntimeStore.getState() ??
+        runtimeStoreState(),
+    }
   ),
 }))
 
@@ -1113,20 +1133,37 @@ function runtimeStoreState() {
   return { byConversationId }
 }
 
-vi.mock("@/stores/live-transcript-store", () => ({
+vi.mock("@/stores/live-transcript-store", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("@/stores/live-transcript-store")>()),
   createLiveTranscriptFrameSink: () => vi.fn(),
-}))
-
-vi.mock("zustand/react/shallow", () => ({
-  useShallow: (fn: unknown) => fn,
 }))
 
 vi.mock("@/components/message/message-list-view", () => ({
   MessageListView: (props: CapturedMessageListProps) => {
     surfaceH.messageListProps = props
+    if (surfaceH.realRuntime) {
+      return createElement(RuntimeReply, {
+        conversationId: props.conversationId,
+      })
+    }
     return null
   },
 }))
+
+function RuntimeReply({ conversationId }: { conversationId: number }) {
+  const runtime = surfaceH.realRuntime!
+  const state = runtime.useConversationRuntimeStore()
+  const turns = runtime.selectTimelineTurns(state, conversationId)
+  return createElement(
+    "div",
+    null,
+    turns
+      .flatMap(({ turn }) =>
+        turn.blocks.map((block) => (block.type === "text" ? block.text : ""))
+      )
+      .join("")
+  )
+}
 
 vi.mock("@/components/message/initial-history-scroll-controller", () => ({
   useInitialHistoryScrollEligibility: () => false,
@@ -1511,6 +1548,8 @@ function armTerminalDisconnect() {
 }
 
 function resetSurfaceHarness() {
+  surfaceH.realRuntime?.resetConversationRuntimeStore()
+  surfaceH.realRuntime = null
   vi.mocked(completeLiveTranscriptTurn).mockClear()
   lifecycleCapture.lastOptions = null
   lifecycleCapture.handleReconnect.mockClear()
@@ -2016,6 +2055,70 @@ describe("ConversationSessionSurface useConnectionLifecycle options harness", ()
 
     expect(surfaceH.removeConversation).toHaveBeenCalledOnce()
     expect(surfaceH.removeConversation).toHaveBeenCalledWith(42)
+  })
+
+  it("renders the retained reply after a bound draft remounts in another group", async () => {
+    const runtime = await vi.importActual<
+      typeof import("@/stores/conversation-runtime-store")
+    >("@/stores/conversation-runtime-store")
+    runtime.resetConversationRuntimeStore()
+    surfaceH.realRuntime = runtime
+    surfaceH.conversations = [fullSummary(42, "completed")]
+    surfaceH.connStatus = "connected"
+    let outgoing!: ReturnType<typeof render>
+    await act(async () => {
+      outgoing = render(
+        createElement(ConversationSessionSurface, {
+          ...surfaceProps(null),
+          groupId: "g-main",
+        })
+      )
+    })
+    const runtimeId = [
+      ...runtime.useConversationRuntimeStore.getState().byConversationId.keys(),
+    ][0]
+    expect(runtimeId).toBeLessThan(0)
+    const message = {
+      id: "bound-draft-reply",
+      role: "assistant" as const,
+      content: [{ type: "text" as const, text: "Retained draft reply" }],
+      startedAt: 1_700_000_000_000,
+    }
+    act(() => {
+      const actions = runtime.useConversationRuntimeStore.getState().actions
+      actions.setDbConversationId(runtimeId, 42)
+      actions.setLiveMessage(runtimeId, message, true)
+      actions.completeTurn(runtimeId, message)
+    })
+    outgoing.rerender(
+      createElement(ConversationSessionSurface, {
+        ...surfaceProps(42),
+        groupId: "g-main",
+      })
+    )
+    expect(outgoing.getByText("Retained draft reply")).toBeInTheDocument()
+    surfaceH.tabStoreState.tabs[0].runtimeConversationId = runtimeId
+    surfaceH.tabStoreState.groupOf = { "tab-1": "g-next" }
+    surfaceH.tabStoreState.groupLayout = { type: "group", id: "g-next" }
+    outgoing.unmount()
+
+    let incoming!: ReturnType<typeof render>
+    await act(async () => {
+      incoming = render(
+        createElement(ConversationSessionSurface, {
+          ...surfaceProps(42),
+          groupId: "g-next",
+        })
+      )
+    })
+
+    expect(incoming.getByText("Retained draft reply")).toBeInTheDocument()
+    expect(surfaceH.messageListProps!.conversationId).toBe(runtimeId)
+    expect(
+      runtime.useConversationRuntimeStore
+        .getState()
+        .byConversationId.get(runtimeId)?.dbConversationId
+    ).toBe(42)
   })
 
   it("finishes first-send creation across a split-group reparent", async () => {

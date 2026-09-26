@@ -501,7 +501,7 @@ describe("SubAgentSessionDialog", () => {
     expect(list).toHaveAttribute("data-conversation-id", "99")
   })
 
-  it("bridges conn.liveMessage to setLiveMessage while open and clears the runtime session on close", () => {
+  it("bridges conn.liveMessage while open and releases subscriptions on close without deleting shared runtime", () => {
     const liveMessage = {
       id: "live-1",
       role: "assistant" as const,
@@ -530,11 +530,10 @@ describe("SubAgentSessionDialog", () => {
       undefined
     )
 
-    // Closing the dialog (body unmount) must wipe the entire runtime session
-    // so a later reopen starts from a fresh fetchDetail — otherwise a
-    // close-mid-stream / reopen-after-complete leaks stale state.
     unmount()
-    expect(mockRemoveConversation).toHaveBeenCalledWith(99)
+    expect(mockRemoveConversation).not.toHaveBeenCalled()
+    expect(liveSinks).toBeNull()
+    expect(storeCallbacks).toEqual([])
   })
 
   it("marks the session as liveOwnsActiveTurn on open so getTimelineTurns filters persisted reply turns while a live reply is present", () => {
@@ -868,17 +867,9 @@ describe("SubAgentSessionDialog", () => {
     expect(mockRefetchDetail).toHaveBeenCalledWith(99, { preserveLive: true })
     const firstCallCount = mockRefetchDetail.mock.calls.length
 
-    // Close the dialog BEFORE any fetchDetail / refetchDetail response has
-    // resolved. The cleanup wipes the runtime session via
-    // removeConversation, but the in-flight fetch is not cancelled — its
-    // later success would resurrect the session with stale detail.
     unmount()
-    expect(mockRemoveConversation).toHaveBeenCalledWith(99)
+    expect(mockRemoveConversation).not.toHaveBeenCalled()
 
-    // Second open: body re-mounts. refetchDetail MUST fire again so the
-    // resurrected stale session (if any) is overwritten with the latest DB
-    // state. The dialog disables useConversationDetail's auto-fetch, so this
-    // gated refetch is the sole fetch path.
     renderWithIntl(<SubAgentSessionDialog {...props} />)
     expect(mockRefetchDetail.mock.calls.length).toBeGreaterThan(firstCallCount)
     expect(mockRefetchDetail).toHaveBeenLastCalledWith(99, {

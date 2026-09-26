@@ -407,6 +407,7 @@ interface HistoricalTimelineCacheKey {
   localTurns: MessageTurn[]
   backgroundTurns: BackgroundOverlayEntry[]
   optimisticTurns: MessageTurn[]
+  queuedOptimisticTurnIds?: string[]
   batchBoundaryIndex: number | null
   batchBoundaryPrefixHash: string | null
   lastTurnOwned: boolean
@@ -433,6 +434,7 @@ function sameHistoricalKey(
     left.localTurns === right.localTurns &&
     left.backgroundTurns === right.backgroundTurns &&
     left.optimisticTurns === right.optimisticTurns &&
+    left.queuedOptimisticTurnIds === right.queuedOptimisticTurnIds &&
     left.batchBoundaryIndex === right.batchBoundaryIndex &&
     left.batchBoundaryPrefixHash === right.batchBoundaryPrefixHash &&
     left.lastTurnOwned === right.lastTurnOwned &&
@@ -451,6 +453,7 @@ function buildHistoricalKey(
     localTurns: session.localTurns,
     backgroundTurns: session.backgroundTurns,
     optimisticTurns: session.optimisticTurns,
+    queuedOptimisticTurnIds: session.queuedOptimisticTurnIds,
     batchBoundaryIndex: session.batchBoundaryIndex,
     batchBoundaryPrefixHash: session.batchBoundaryPrefixHash,
     lastTurnOwned: session.lastTurnOwned,
@@ -471,6 +474,8 @@ type Action =
       type: "FETCH_DETAIL_SUCCESS"
       conversationId: number
       detail: DbConversationDetail
+      /** Content present when this read started, before any newer wire events. */
+      readSnapshot?: ConversationRuntimeSession | null
       /**
        * Keep `liveMessage` / `optimisticTurns` / `localTurns` across this
        * detail load even though `syncState` isn't "awaiting_persist". The
@@ -1091,31 +1096,6 @@ function turnVisibleText(turn: MessageTurn): string {
     .join("")
 }
 
-function lastAssistantVisibleText(turns: readonly MessageTurn[]): string {
-  for (let i = turns.length - 1; i >= 0; i -= 1) {
-    const turn = turns[i]
-    if (turn?.role === "assistant") return turnVisibleText(turn)
-  }
-  return ""
-}
-
-/**
- * Persist only "covers" a live stub after the transcript itself grew.
- * An unchanged previous turn with the same user prompt (repeated-prompt
- * resume replay) must not retire the new overlay.
- */
-function persistTailGrew(
-  previous: readonly MessageTurn[],
-  next: readonly MessageTurn[]
-): boolean {
-  if (next.length === 0) return false
-  if (next.length > previous.length) return true
-  return (
-    lastAssistantVisibleText(next).length >
-    lastAssistantVisibleText(previous).length
-  )
-}
-
 function assistantToolUseIds(turns: readonly MessageTurn[]): Set<string> {
   const ids = new Set<string>()
   for (const turn of turns) {
@@ -1130,66 +1110,147 @@ function assistantToolUseIds(turns: readonly MessageTurn[]): Set<string> {
 }
 
 /**
- * True when the persisted group is a strictly richer copy of the same live
- * stub — same user prompt, assistant text is a prefix / trailing summary
- * after tools. Used so a post-`end_turn` hydrate can drop the mid-turn
- * "正在核对…" overlay once disk has the final assistant message.
+ * Merge a richer same-round reply while retaining blocks the parser omitted.
+ * Only a merge with no uncovered blocks permits retirement of the local copy.
  */
-function turnGroupPersistedCoversLocal(
+function mergeRicherPersistedReply(
   localTurns: readonly MessageTurn[],
   localGroup: TurnGroup,
   persisted: readonly MessageTurn[],
-  persistedGroup: TurnGroup
-): boolean {
+  persistedGroup: TurnGroup,
+  detail: DbConversationDetail,
+  alignment: TurnGroupAlignment
+): { turns: MessageTurn[]; coversLocal: boolean } | null {
+  if (
+    alignment.verifiedBoundaryIndex != null &&
+    turnsOffsetOf(detail) + persistedGroup.end <=
+      alignment.verifiedBoundaryIndex
+  )
+    return null
   const localSlice = localTurns.slice(localGroup.start, localGroup.end)
   const persistedSlice = persisted.slice(
     persistedGroup.start,
     persistedGroup.end
   )
-  if (localSlice.length === 0 || persistedSlice.length === 0) return false
+  if (localSlice.length === 0 || persistedSlice.length === 0) return null
   const localAssistants = localSlice.filter((turn) => turn.role === "assistant")
   const persistedAssistants = persistedSlice.filter(
     (turn) => turn.role === "assistant"
   )
   if (localAssistants.length === 0 || persistedAssistants.length === 0) {
-    return false
+    return null
   }
   const localUser = localSlice.find((turn) => turn.role === "user")
   const persistedUser = persistedSlice.find((turn) => turn.role === "user")
+  const localGroupIndex = alignment.localGroups.findIndex(
+    (group) => group.start === localGroup.start
+  )
+  for (const [ownerIndex, range] of alignment.persistedRangeByLocalGroup) {
+    const owner = alignment.localGroups[ownerIndex]!
+    if (
+      (owner.start < localGroup.start || owner.end > localGroup.end) &&
+      range.start < persistedGroup.end &&
+      persistedGroup.start < range.end
+    )
+      return null
+  }
+  const alignedRange = alignment.persistedRangeByLocalGroup.get(localGroupIndex)
+  const boundaryAligned =
+    alignment.verifiedBoundaryIndex != null &&
+    alignedRange?.start === persistedGroup.start &&
+    alignedRange.end === persistedGroup.end
   const usersMatch =
     localUser != null &&
     persistedUser != null &&
-    contentBlocksEquivalent(localUser.blocks, persistedUser.blocks)
+    contentBlocksEquivalent(localUser.blocks, persistedUser.blocks) &&
+    (boundaryAligned ||
+      localUser.id === persistedUser.id ||
+      (persistIdentityKey(localUser) != null &&
+        persistIdentityKey(localUser) === persistIdentityKey(persistedUser)))
   if (localUser && persistedUser && !usersMatch) {
-    return false
+    return null
+  }
+  const localToolIds = assistantToolUseIds(localAssistants)
+  const persistedToolIds = assistantToolUseIds(persistedAssistants)
+  const toolsMatch =
+    localToolIds.size > 0 &&
+    [...localToolIds].every((id) => persistedToolIds.has(id))
+  const matchedAssistants = localAssistants.flatMap((local) => {
+    const matches = persistedAssistants.filter(
+      (turn) =>
+        local.id === turn.id ||
+        (persistIdentityKey(local) != null &&
+          persistIdentityKey(local) === persistIdentityKey(turn))
+    )
+    return matches.length === 1 ? matches : []
+  })
+  // A shared text prefix is content, not turn identity. In particular an
+  // assistant-only continuation must not match a later unrelated answer.
+  if (!usersMatch && !toolsMatch) {
+    if (matchedAssistants.length === 0 || localToolIds.size > 0) return null
+    if (
+      !localUser &&
+      persistedUser &&
+      Date.parse(persistedUser.timestamp) >=
+        Date.parse(localAssistants[0]!.timestamp)
+    )
+      return null
   }
   const localText = localAssistants.map(turnVisibleText).join("")
   const persistedText = persistedAssistants.map(turnVisibleText).join("")
-  if (persistedText.length <= localText.length) return false
+  if (persistedText.length <= localText.length) return null
   // Empty local text is a prefix of every persist string; that would retire
   // a fresh tool-only replay against a previous turn with the same prompt.
-  if (localText.length > 0 && persistedText.startsWith(localText)) return true
-  const localToolIds = assistantToolUseIds(localAssistants)
+  let textCovered = localText.length > 0 && persistedText.startsWith(localText)
   if (localText.length === 0) {
+    const thoughts = localAssistants.flatMap((turn) =>
+      turn.blocks.filter((block) => block.type === "thinking" && block.text)
+    )
     if (localToolIds.size === 0) {
-      const thoughts = localAssistants.flatMap((turn) =>
-        turn.blocks.filter((block) => block.type === "thinking" && block.text)
-      )
-      return (
-        usersMatch &&
-        thoughts.length > 0 &&
-        thoughts.every((thought) =>
-          persistedAssistants.some((turn) =>
-            turn.blocks.some((block) => contentBlockEquivalent(thought, block))
+      if (
+        !(
+          thoughts.length > 0 &&
+          thoughts.every((thought) =>
+            (usersMatch ? persistedAssistants : matchedAssistants).some(
+              (turn) =>
+                turn.blocks.some((block) =>
+                  contentBlockEquivalent(thought, block)
+                )
+            )
           )
         )
       )
+        return null
     }
-    const persistedToolIds = assistantToolUseIds(persistedAssistants)
     for (const id of localToolIds) {
-      if (!persistedToolIds.has(id)) return false
+      if (!persistedToolIds.has(id)) return null
     }
-    return true
+    // Older replies can share the persisted user group with a continuation.
+    // Their text is not its final: wait for text after this reply's reasoning
+    // or tool evidence instead of stopping on the first partial disk write.
+    const blocksWithTurn = persistedAssistants.flatMap((turn) =>
+      turn.blocks.map((block) => ({ turn, block }))
+    )
+    const lastEvidence = blocksWithTurn.reduce(
+      (last, { turn, block }, index) =>
+        (block.type === "tool_use" &&
+          block.tool_use_id != null &&
+          localToolIds.has(block.tool_use_id)) ||
+        (block.type === "thinking" &&
+          (usersMatch || matchedAssistants.includes(turn)) &&
+          thoughts.some((thought) => contentBlockEquivalent(thought, block)))
+          ? index
+          : last,
+      -1
+    )
+    if (
+      lastEvidence < 0 ||
+      !blocksWithTurn
+        .slice(lastEvidence + 1)
+        .some(({ block }) => block.type === "text" && block.text.length > 0)
+    )
+      return null
+    textCovered = true
   }
   // Hidden continuation prompts leave the older reply in this same persisted
   // group. Match the continuation by its tool ids and text, and require NEW
@@ -1197,14 +1258,41 @@ function turnGroupPersistedCoversLocal(
   if (!localUser && localToolIds.size > 0) {
     const offset = persistedText.lastIndexOf(localText)
     if (offset >= 0 && offset + localText.length < persistedText.length) {
-      const persistedToolIds = assistantToolUseIds(persistedAssistants)
-      return [...localToolIds].every((id) => persistedToolIds.has(id))
+      textCovered = toolsMatch
     }
   }
   // Distinct trailing summary on the same user turn (Grok chat_history after
   // extension turn_completed). Without a matching user, a longer unrelated
   // last assistant must not retire an overlay.
-  return usersMatch && !localText.includes(persistedText)
+  if (!textCovered && !usersMatch) return null
+  const persistedBlocks = persistedAssistants.flatMap((turn) => turn.blocks)
+  let coveredTextEnd = 0
+  const uncovered = localAssistants
+    .flatMap((turn) => turn.blocks)
+    .filter((block) => {
+      if (block.type === "text") {
+        const offset = persistedText.indexOf(block.text, coveredTextEnd)
+        if (offset < 0) return true
+        coveredTextEnd = offset + block.text.length
+        return false
+      }
+      return !persistedBlocks.some((other) =>
+        contentBlockEquivalent(block, other)
+      )
+    })
+  if (uncovered.length === 0)
+    return { turns: persistedSlice, coversLocal: true }
+  const firstAssistant = persistedSlice.findIndex(
+    (turn) => turn.role === "assistant"
+  )
+  return {
+    turns: persistedSlice.map((turn, index) =>
+      index === firstAssistant
+        ? { ...turn, blocks: [...uncovered, ...turn.blocks] }
+        : turn
+    ),
+    coversLocal: false,
+  }
 }
 
 function uniqueTurnIndexes(
@@ -1309,6 +1397,11 @@ function alignTurnGroups(
       if (persistedIndex === undefined) continue
       const localGroup = localGroupByTurn[localIndex]!
       const range = persistedRangeForMatch(localGroup, persistedIndex)
+      if (
+        verifiedBoundaryIndex != null &&
+        turnsOffsetOf(detail) + range.end <= verifiedBoundaryIndex
+      )
+        continue
       const groupCandidates =
         candidates.get(localGroup) ?? new Map<string, TurnGroup>()
       groupCandidates.set(`${range.start}:${range.end}`, range)
@@ -1509,18 +1602,20 @@ function retireCoveredLocalTurns(
   }
   const lastLocal = lastReplyGroup(localTurns)
   const lastPersisted = lastReplyGroup(persisted)
-  // Richer-cover is only valid after persist itself grew (hydrate). Applying
-  // it on COMPLETE_TURN against the previous turn drops a repeated prompt.
+  // Richer coverage requires same-turn evidence, not growth since the last
+  // read: the complete transcript may already have arrived before promotion.
   const dropLastCovered =
     options?.allowRicherCover === true &&
     lastLocal != null &&
     lastPersisted != null &&
-    turnGroupPersistedCoversLocal(
+    mergeRicherPersistedReply(
       localTurns,
       lastLocal,
       persisted,
-      lastPersisted
-    )
+      lastPersisted,
+      detail,
+      alignment
+    )?.coversLocal === true
   const firstRetained =
     retiredGroupCount === 0
       ? 0
@@ -3054,7 +3149,24 @@ function reducer(
       const current =
         state.byConversationId.get(action.conversationId) ??
         createEmptySession(action.conversationId)
-      const authoritative = action.authoritative === true
+      const readSnapshot = action.readSnapshot
+      // Read generations order reads, not wire activity. Even Manual Reload
+      // only owns buffers present when it started, never a newer completed turn.
+      const contentAdvanced =
+        readSnapshot !== undefined &&
+        (readSnapshot === null
+          ? current.liveMessage != null ||
+            current.localTurns.length > 0 ||
+            current.optimisticTurns.length > 0 ||
+            current.backgroundTurns.length > 0
+          : current.liveMessage !== readSnapshot.liveMessage ||
+            current.localTurns !== readSnapshot.localTurns ||
+            current.optimisticTurns !== readSnapshot.optimisticTurns ||
+            current.queuedOptimisticTurnIds !==
+              readSnapshot.queuedOptimisticTurnIds ||
+            current.activeTurnToken !== readSnapshot.activeTurnToken ||
+            current.backgroundTurns !== readSnapshot.backgroundTurns)
+      const authoritative = action.authoritative === true && !contentAdvanced
       const detail = authoritative
         ? action.detail
         : preserveLoadedHistoryOnRefetch(current.detail, action.detail)
@@ -3082,10 +3194,12 @@ function reducer(
       const isActivelyInteracting =
         !authoritative &&
         (current.syncState === "awaiting_persist" ||
+          contentAdvanced ||
           action.preserveLive === true ||
           detailIsInFlight)
       const keepAllLiveBuffers =
-        !authoritative && (action.preserveLive === true || detailIsInFlight)
+        !authoritative &&
+        (contentAdvanced || action.preserveLive === true || detailIsInFlight)
       const dropIds =
         !authoritative && action.dropLiveTurnIds?.length
           ? new Set(action.dropLiveTurnIds)
@@ -3111,7 +3225,7 @@ function reducer(
       // still drop overlays whose aligned persisted content is complete.
       const nextLocalTurns = authoritative
         ? []
-        : detailIsInFlight
+        : detailIsInFlight || contentAdvanced
           ? current.localTurns
           : retireCoveredLocalTurns(
               current.localTurns,
@@ -3121,10 +3235,7 @@ function reducer(
                 ? undefined
                 : current.batchBoundaryPrefixHash,
               {
-                allowRicherCover: persistTailGrew(
-                  current.detail?.turns ?? [],
-                  detail.turns
-                ),
+                allowRicherCover: true,
               }
             )
       const retiredLocalPrefix =
@@ -6010,7 +6121,7 @@ function computeHistoricalTimeline(
       )
   const localGroupByPersistedStart = new Map<
     number,
-    { localGroup: number; persistedEnd: number }
+    { localGroup: number; persistedEnd: number; replacement?: MessageTurn[] }
   >()
   const consumedLocalGroups = new Set<number>()
   alignment?.persistedRangeByLocalGroup.forEach(
@@ -6023,9 +6134,25 @@ function computeHistoricalTimeline(
         consumedLocalGroups.add(localGroup)
         return
       }
+      const merged =
+        session.detail == null
+          ? null
+          : mergeRicherPersistedReply(
+              session.localTurns,
+              group,
+              rawPersistedTurns,
+              persistedRange,
+              session.detail,
+              alignment
+            )
+      if (merged?.coversLocal) {
+        consumedLocalGroups.add(localGroup)
+        return
+      }
       localGroupByPersistedStart.set(persistedRange.start, {
         localGroup,
         persistedEnd: persistedRange.end,
+        replacement: merged?.turns,
       })
     }
   )
@@ -6043,10 +6170,9 @@ function computeHistoricalTimeline(
       for (; nextLocalGroup <= matched.localGroup; nextLocalGroup += 1) {
         if (consumedLocalGroups.has(nextLocalGroup)) continue
         const localGroup = alignment.localGroups[nextLocalGroup]!
-        const replacement = session.localTurns.slice(
-          localGroup.start,
-          localGroup.end
-        )
+        const replacement =
+          (nextLocalGroup === matched.localGroup && matched.replacement) ||
+          session.localTurns.slice(localGroup.start, localGroup.end)
         persistedWithLocalReplacement.push(...replacement)
         replacement.forEach((turn) =>
           replacementLocalKeys.add(`${turn.role}\0${turn.id}`)
@@ -6121,7 +6247,21 @@ function computeHistoricalTimeline(
   // client clock on the streaming path — neither can locate the prompt across
   // machines. When the new prompt isn't persisted yet the backend reports no
   // id, so an earlier completed round's reply is never mistaken for a partial.
-  const inFlightPromptId = session.detail?.in_flight_user_turn_id ?? null
+  const stampedPromptId = session.detail?.in_flight_user_turn_id ?? null
+  // Detail can retain the previous round's marker across completion and the
+  // next send. A promoted prompt or a different active prompt proves it stale;
+  // queued prompts do not supersede the reply that is still streaming.
+  const staleInFlightPrompt =
+    stampedPromptId !== null &&
+    (session.localTurns.some(
+      (turn) => turn.role === "user" && turn.id === stampedPromptId
+    ) ||
+      session.optimisticTurns.some(
+        (turn) =>
+          turn.id !== stampedPromptId &&
+          !(session.queuedOptimisticTurnIds ?? []).includes(turn.id)
+      ))
+  const inFlightPromptId = staleInFlightPrompt ? null : stampedPromptId
   const inFlightPromptIdx =
     !hasLiveOrLocalReply && liveMessageId !== null && inFlightPromptId !== null
       ? persistedTurns.findIndex(
@@ -6483,6 +6623,7 @@ export const useConversationRuntimeStore = create<ConversationRuntimeStore>()((
           conversationId,
           detail,
           preserveLive,
+          readSnapshot: session ?? null,
         })
         afterDetailFetchSuccess(conversationId, detail)
       })
@@ -6575,6 +6716,7 @@ export const useConversationRuntimeStore = create<ConversationRuntimeStore>()((
           detail,
           preserveLive,
           dropLiveTurnIds: options?.dropLiveTurnIds,
+          readSnapshot: session ?? null,
         })
         afterDetailFetchSuccess(conversationId, detail)
       })
@@ -6797,6 +6939,7 @@ export const useConversationRuntimeStore = create<ConversationRuntimeStore>()((
           detail,
           preserveLive: false,
           authoritative: true,
+          readSnapshot: session,
         })
         if (authoritativeFetchGeneration.get(conversationId) === generation) {
           authoritativeFetchGeneration.delete(conversationId)
@@ -7033,6 +7176,7 @@ export const useConversationRuntimeStore = create<ConversationRuntimeStore>()((
               conversationId,
               detail,
               preserveLive: false,
+              readSnapshot: cur,
             })
             installWorkflowGraphFromDetail(conversationId, detail)
           }
@@ -7135,15 +7279,22 @@ export const useConversationRuntimeStore = create<ConversationRuntimeStore>()((
             .find((turn) => turn.role === "assistant")
           const lastLocalGroup = lastReplyGroup(cur2.localTurns)
           const lastPersistedGroup = lastReplyGroup(detail.turns)
+          const alignment = alignTurnGroups(
+            cur2.localTurns,
+            detail,
+            cur2.batchBoundaryIndex,
+            cur2.batchBoundaryPrefixHash
+          )
           const richer =
-            persistTailGrew(cur2.detail?.turns ?? [], detail.turns) &&
             lastLocalGroup != null &&
             lastPersistedGroup != null &&
-            turnGroupPersistedCoversLocal(
+            mergeRicherPersistedReply(
               cur2.localTurns,
               lastLocalGroup,
               detail.turns,
-              lastPersistedGroup
+              lastPersistedGroup,
+              detail,
+              alignment
             )
           if (
             detail.in_flight_user_turn_id == null &&
@@ -7163,6 +7314,7 @@ export const useConversationRuntimeStore = create<ConversationRuntimeStore>()((
               conversationId,
               detail,
               preserveLive: true,
+              readSnapshot: cur,
             })
             installWorkflowGraphFromDetail(conversationId, detail)
             if (richer || lastLocalAssistant == null) {
@@ -7252,6 +7404,7 @@ export const useConversationRuntimeStore = create<ConversationRuntimeStore>()((
               conversationId,
               detail,
               preserveLive: true,
+              readSnapshot: initial,
             })
             installWorkflowGraphFromDetail(conversationId, detail)
           }
@@ -7360,6 +7513,7 @@ export const useConversationRuntimeStore = create<ConversationRuntimeStore>()((
               detail,
               preserveLive: !converged,
               localAlignmentBoundaryIndex,
+              readSnapshot: current,
             })
             installWorkflowGraphFromDetail(conversationId, detail)
           }

@@ -550,8 +550,21 @@ export function createLiveTranscriptStore(
       const prev = conversations.get(conversationId) ?? null
       const connectionId = frame.connectionId
 
+      if (
+        prev?.connectionId === connectionId &&
+        prev.messageId === canonical.id &&
+        frame.highestSeq <= prev.lastAppliedSeq
+      ) {
+        return
+      }
+
       // New turn / first publish / message identity change → full rebuild.
-      if (!prev || prev.messageId !== canonical.id) {
+      if (
+        !prev ||
+        prev.messageId !== canonical.id ||
+        prev.connectionId !== connectionId ||
+        frame.rawEvents.some((event) => event.seq <= prev.lastAppliedSeq)
+      ) {
         const next = projector.projectLiveSnapshot(
           conversationId,
           connectionId,

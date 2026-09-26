@@ -5792,7 +5792,8 @@ function admitTurnComplete(
   snapshot: ConnectionState,
   event: TurnCompleteEnvelope,
   frameInitialLiveMessage: LiveMessage | null,
-  terminalDeliveryIsAuthoritative: boolean
+  terminalDeliveryIsAuthoritative: boolean,
+  completedRuntimeSessions: ReadonlyMap<number, string>
 ): TurnCompleteAdmission {
   if (snapshot.status !== "prompting" || snapshot.liveMessage == null) {
     return { accepted: false, runtimeConversationIds: [] }
@@ -5821,8 +5822,13 @@ function admitTurnComplete(
     ) {
       continue
     }
+    const runtimeLiveMessage = completedRuntimeSessions.has(
+      runtimeConversationId
+    )
+      ? null
+      : runtime.liveMessage
     const runtimeLiveMatches = liveMessageOwnsSameTurn(
-      runtime.liveMessage,
+      runtimeLiveMessage,
       snapshot.liveMessage
     )
     if (!mappedToConnection && !runtimeLiveMatches) {
@@ -5842,7 +5848,12 @@ function admitTurnComplete(
     // When connection.sessionId is still unset, do not let a live match
     // override a concrete runtime.externalId mismatch — that is the
     // wrong-session turn_complete case.
-    if (runtimeLiveMatches) {
+    if (
+      runtimeLiveMatches ||
+      (completedRuntimeSessions.get(runtimeConversationId) ===
+        event.session_id &&
+        snapshot.sessionId === event.session_id)
+    ) {
       if (
         snapshot.sessionId == null &&
         runtime.externalId != null &&
@@ -5853,7 +5864,7 @@ function admitTurnComplete(
     } else if (!sessionMatches) {
       continue
     }
-    if (runtime.liveMessage != null && !runtimeLiveMatches) {
+    if (runtimeLiveMessage != null && !runtimeLiveMatches) {
       continue
     }
     if (
@@ -5991,6 +6002,7 @@ function prepareEventFrame(
     let stepLiveMessageIsLive: boolean | undefined
     let stepCheckpointRuntimeConversationIds: readonly number[] | undefined
     let stepCompletionRuntimeConversationIds: readonly number[] | undefined
+    const completedRuntimeSessions = new Map<number, string>()
     const pushConnectionStep = (
       highestSeq: number,
       nextSnapshot: ConnectionState
@@ -6050,10 +6062,14 @@ function prepareEventFrame(
           snapshot,
           event,
           before.liveMessage,
-          hasAuthoritativeTerminalDelivery(connFrame, event.seq)
+          hasAuthoritativeTerminalDelivery(connFrame, event.seq),
+          completedRuntimeSessions
         )
         if (!admission.accepted) continue
         stepCompletionRuntimeConversationIds = admission.runtimeConversationIds
+        for (const runtimeId of admission.runtimeConversationIds) {
+          completedRuntimeSessions.set(runtimeId, event.session_id)
+        }
       }
       stepEvents.push(event)
       const previousLiveMessage = snapshot.liveMessage
@@ -7193,7 +7209,7 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
   // Per-contextKey live sinks (canonical runtime mirror + optional transcript).
   // Fired synchronously from frame commit / dispatch when liveMessage changes.
   // A ref → no re-renders.
-  const liveSinksRef = useRef(new Map<string, ConnectionLiveSinks>())
+  const liveSinksRef = useRef(new Map<string, Set<ConnectionLiveSinks>>())
 
   // Activity tracking (no re-renders)
   const lastActivityRef = useRef(new Map<string, number>())
@@ -7220,6 +7236,9 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
     Array<{ resolve: () => void; reject: (err: Error) => void }>
   >([])
   const eventIngestorRef = useRef<EventIngestor | null>(null)
+  const gapRecoveryTimersRef = useRef(
+    new Map<string, ReturnType<typeof setTimeout> | null>()
+  )
   // Process + session durable: survives Provider remount / WebView soft reload
   // until the app process is fully restarted (batcher is not rebuilt).
   const desktopDeliveryFailedRef = useRef(readDesktopDeliveryFailed())
@@ -7328,6 +7347,7 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
   const mirrorLiveMessageOnce = useCallback(
     (
       key: string,
+      sinks: ConnectionLiveSinks,
       previousConnection: ConnectionState | undefined,
       nextConnection: ConnectionState | undefined,
       deliveryIds: readonly number[],
@@ -7336,8 +7356,6 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
       boundaryRuntimeConversationIds?: ReadonlySet<number>,
       rejectedBoundaryRuntimeConversationIds?: Set<number>
     ) => {
-      const sinks = liveSinksRef.current.get(key)
-      if (!sinks) return
       if (
         boundaryRuntimeConversationIds &&
         sinks.runtimeConversationId != null &&
@@ -7474,108 +7492,114 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
       boundaryRuntimeConversationIds?: ReadonlySet<number>,
       rejectedBoundaryRuntimeConversationIds?: Set<number>
     ) => {
-      // At most one sink invocation per registered key: canonical first,
-      // then each open tab alias (two open aliases mirror into two sessions).
-      mirrorLiveMessageOnce(
-        canonical,
-        previousConnection,
-        nextConnection,
-        deliveryIds,
-        connectionFrame,
-        liveMessageIsLive,
-        boundaryRuntimeConversationIds,
-        rejectedBoundaryRuntimeConversationIds
-      )
-      for (const alias of aliasKeysFor(canonical)) {
-        mirrorLiveMessageOnce(
-          alias,
-          previousConnection,
-          nextConnection,
-          deliveryIds,
-          connectionFrame,
-          liveMessageIsLive,
-          boundaryRuntimeConversationIds,
-          rejectedBoundaryRuntimeConversationIds
-        )
+      for (const key of [canonical, ...aliasKeysFor(canonical)]) {
+        for (const sinks of liveSinksRef.current.get(key) ?? []) {
+          mirrorLiveMessageOnce(
+            key,
+            sinks,
+            previousConnection,
+            nextConnection,
+            deliveryIds,
+            connectionFrame,
+            liveMessageIsLive,
+            boundaryRuntimeConversationIds,
+            rejectedBoundaryRuntimeConversationIds
+          )
+        }
       }
     },
     [aliasKeysFor, mirrorLiveMessageOnce]
   )
 
-  const replayCurrentLiveMessageToSink = useCallback((key: string) => {
-    const sinks = liveSinksRef.current.get(key)
-    if (!sinks) return
-    const stateKey = observerAliasesRef.current.get(key) ?? key
-    const runtimeConversationId = sinks.runtimeConversationId
-    let conn = storeRef.current.connections.get(stateKey)
-    if (conn == null && runtimeConversationId != null) {
-      let retainedMatch: ConnectionState | null = null
-      for (const candidate of storeRef.current.connections.values()) {
-        if (
-          candidate.liveMessage == null ||
-          candidate.acceptedCompletionMessageId !== candidate.liveMessage.id ||
-          !(candidate.acceptedCompletionRuntimeConversationIds ?? []).includes(
-            runtimeConversationId
-          )
-        ) {
-          continue
+  const replayLiveMessageToSink = useCallback(
+    (key: string, sinks: ConnectionLiveSinks) => {
+      const stateKey = observerAliasesRef.current.get(key) ?? key
+      const runtimeConversationId = sinks.runtimeConversationId
+      let conn = storeRef.current.connections.get(stateKey)
+      if (conn == null && runtimeConversationId != null) {
+        let retainedMatch: ConnectionState | null = null
+        for (const candidate of storeRef.current.connections.values()) {
+          if (
+            candidate.liveMessage == null ||
+            candidate.acceptedCompletionMessageId !==
+              candidate.liveMessage.id ||
+            !(
+              candidate.acceptedCompletionRuntimeConversationIds ?? []
+            ).includes(runtimeConversationId)
+          ) {
+            continue
+          }
+          if (retainedMatch != null) {
+            retainedMatch = null
+            break
+          }
+          retainedMatch = candidate
         }
-        if (retainedMatch != null) {
-          retainedMatch = null
-          break
-        }
-        retainedMatch = candidate
+        conn = retainedMatch ?? undefined
       }
-      conn = retainedMatch ?? undefined
-    }
-    if (conn?.liveMessage == null) {
-      if (conn) settleIdleLiveRuntimes(conn)
-      return
-    }
+      if (conn?.liveMessage == null) {
+        if (conn) settleIdleLiveRuntimes(conn)
+        return
+      }
 
-    const isLive = conn.status === "prompting"
-    const runtime =
-      runtimeConversationId == null
-        ? null
-        : useConversationRuntimeStore
-            .getState()
-            .byConversationId.get(runtimeConversationId)
-    const runtimeOwnsAnotherMessage =
-      runtime?.liveMessage != null &&
-      !liveMessageOwnsSameTurn(runtime.liveMessage, conn.liveMessage)
-    const settledReplayAccepted =
-      conn.acceptedCompletionMessageId === conn.liveMessage.id &&
-      runtimeConversationId != null &&
-      (conn.acceptedCompletionRuntimeConversationIds ?? []).includes(
-        runtimeConversationId
+      const isLive = conn.status === "prompting"
+      const runtime =
+        runtimeConversationId == null
+          ? null
+          : useConversationRuntimeStore
+              .getState()
+              .byConversationId.get(runtimeConversationId)
+      const runtimeOwnsAnotherMessage =
+        runtime?.liveMessage != null &&
+        !liveMessageOwnsSameTurn(runtime.liveMessage, conn.liveMessage)
+      const settledReplayAccepted =
+        conn.acceptedCompletionMessageId === conn.liveMessage.id &&
+        runtimeConversationId != null &&
+        (conn.acceptedCompletionRuntimeConversationIds ?? []).includes(
+          runtimeConversationId
+        )
+      const queuedOptimisticIds = new Set(
+        runtime?.queuedOptimisticTurnIds ?? []
       )
-    const queuedOptimisticIds = new Set(runtime?.queuedOptimisticTurnIds ?? [])
-    const hasInFlightOptimistic =
-      runtime?.optimisticTurns.some(
-        (turn) => !queuedOptimisticIds.has(turn.id)
-      ) ?? false
-    const shouldAdoptSettledReplay =
-      settledReplayAccepted &&
-      runtime != null &&
-      runtime.detail == null &&
-      runtime.syncState !== "awaiting_persist" &&
-      !hasInFlightOptimistic
-    if (
-      runtimeOwnsAnotherMessage ||
-      (!isLive && runtimeConversationId != null && !shouldAdoptSettledReplay)
-    ) {
-      return
-    }
+      const hasInFlightOptimistic =
+        runtime?.optimisticTurns.some(
+          (turn) => !queuedOptimisticIds.has(turn.id)
+        ) ?? false
+      const shouldAdoptSettledReplay =
+        settledReplayAccepted &&
+        runtime != null &&
+        runtime.detail == null &&
+        runtime.syncState !== "awaiting_persist" &&
+        !hasInFlightOptimistic
+      if (
+        runtimeOwnsAnotherMessage ||
+        (!isLive && runtimeConversationId != null && !shouldAdoptSettledReplay)
+      ) {
+        return
+      }
 
-    const accepted =
-      sinks.canonical(conn.liveMessage, isLive || shouldAdoptSettledReplay) !==
-      false
-    if (!accepted) return
-    sinks.transcript?.rebuild(conn.liveMessage, conn.lastAppliedSeq)
-    if (shouldAdoptSettledReplay) {
-      completeLiveTranscriptTurn(runtimeConversationId, conn.liveMessage)
-    }
-  }, [])
+      const accepted =
+        sinks.canonical(
+          conn.liveMessage,
+          isLive || shouldAdoptSettledReplay
+        ) !== false
+      if (!accepted) return
+      sinks.transcript?.rebuild(conn.liveMessage, conn.lastAppliedSeq)
+      if (shouldAdoptSettledReplay) {
+        completeLiveTranscriptTurn(runtimeConversationId, conn.liveMessage)
+      }
+    },
+    []
+  )
+
+  const replayCurrentLiveMessageToSink = useCallback(
+    (key: string) => {
+      for (const sinks of liveSinksRef.current.get(key) ?? []) {
+        replayLiveMessageToSink(key, sinks)
+      }
+    },
+    [replayLiveMessageToSink]
+  )
 
   const commitEventFrame = useCallback(
     (frame: AcceptedEventFrame): void => {
@@ -7656,7 +7680,7 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
         const finalLiveMessage = nextConnection.liveMessage
         const traceSinkKeys = [contextKey, ...aliasKeysFor(contextKey)]
         const traceSink = traceSinkKeys
-          .map((key) => liveSinksRef.current.get(key))
+          .flatMap((key) => [...(liveSinksRef.current.get(key) ?? [])])
           .find((sinks) => sinks != null)
         const traceCommittedAt = performance.now()
         for (const milestone of turnTraceFrameMilestones(
@@ -7892,9 +7916,10 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
               )
             ) {
               for (const key of sinkKeys) {
-                const sinks = liveSinksRef.current.get(key)
-                if (sinks?.runtimeConversationId === runtimeConversationId) {
-                  sinks.transcript?.clear(checkpointSource.id)
+                for (const sinks of liveSinksRef.current.get(key) ?? []) {
+                  if (sinks.runtimeConversationId === runtimeConversationId) {
+                    sinks.transcript?.clear(checkpointSource.id)
+                  }
                 }
               }
               useConversationRuntimeStore
@@ -7937,11 +7962,10 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
 
         for (const runtimeConversationId of runtimeConversationIds) {
           const hasSinkForRuntime = sinkKeys.some((key) => {
-            const sinks = liveSinksRef.current.get(key)
-            return (
-              sinks != null &&
-              (sinks.runtimeConversationId == null ||
-                sinks.runtimeConversationId === runtimeConversationId)
+            return [...(liveSinksRef.current.get(key) ?? [])].some(
+              (sinks) =>
+                sinks.runtimeConversationId == null ||
+                sinks.runtimeConversationId === runtimeConversationId
             )
           })
           if (
@@ -8263,7 +8287,11 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
         const sinks = liveSinksRef.current.get(action.fromKey)
         if (sinks) {
           liveSinksRef.current.delete(action.fromKey)
-          liveSinksRef.current.set(action.toKey, sinks)
+          const destination = liveSinksRef.current.get(action.toKey)
+          liveSinksRef.current.set(
+            action.toKey,
+            new Set([...(destination ?? []), ...sinks])
+          )
         }
         replayCurrentLiveMessageToSink(action.toKey)
         for (const alias of aliasKeysFor(action.toKey)) {
@@ -8349,15 +8377,23 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
 
   const registerLiveSinks = useCallback(
     (contextKey: string, sinks: ConnectionLiveSinks) => {
-      liveSinksRef.current.set(contextKey, sinks)
-      replayCurrentLiveMessageToSink(contextKey)
+      const registration = { ...sinks }
+      let registrations = liveSinksRef.current.get(contextKey)
+      if (!registrations) {
+        registrations = new Set()
+        liveSinksRef.current.set(contextKey, registrations)
+      }
+      registrations.add(registration)
+      replayLiveMessageToSink(contextKey, registration)
       return () => {
-        if (liveSinksRef.current.get(contextKey) === sinks) {
-          liveSinksRef.current.delete(contextKey)
+        for (const [key, current] of liveSinksRef.current) {
+          if (current.delete(registration) && current.size === 0) {
+            liveSinksRef.current.delete(key)
+          }
         }
       }
     },
-    [replayCurrentLiveMessageToSink]
+    [replayLiveMessageToSink]
   )
 
   const registerLiveSurfaceKeys = useCallback(
@@ -8571,6 +8607,7 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
 
   const handleSequenceGap = useCallback(
     (gap: SequenceGap) => {
+      if (gapRecoveryTimersRef.current.has(gap.connectionId)) return
       if (
         streamingPerfRecorder.isActive() &&
         streamingPerfRecorder.matchesTargetConnection(gap.connectionId)
@@ -8578,8 +8615,11 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
         streamingPerfRecorder.markFrontendSequenceGap()
       }
       const ingestor = eventIngestorRef.current
+      if (!ingestor) return
+      gapRecoveryTimersRef.current.set(gap.connectionId, null)
       ingestor?.pauseConnection(gap.connectionId)
-      void (async () => {
+      const recover = async () => {
+        if (eventIngestorRef.current !== ingestor) return
         // After any await, orphan rescue may have rekeyed the store entry.
         // Always re-resolve the live context key before hydrate/remove so we
         // never clear the stale pre-await key while leaving the new canonical
@@ -8598,6 +8638,7 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
           return entry?.connectionId === gap.connectionId
         }
         const dropOriginalBookkeepingOnly = () => {
+          gapRecoveryTimersRef.current.delete(gap.connectionId)
           reverseMapRef.current.delete(gap.connectionId)
           pendingUnmappedEventsRef.current.delete(gap.connectionId)
           clearAliasesPointingTo(gap.connectionId)
@@ -8605,12 +8646,14 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
         }
         try {
           const snapshot = await acpGetSessionSnapshot(gap.connectionId)
+          if (eventIngestorRef.current !== ingestor) return
           const contextKey = resolveGapContextKey()
           if (!entryStillOriginal(contextKey)) {
             dropOriginalBookkeepingOnly()
             return
           }
           if (!snapshot) {
+            gapRecoveryTimersRef.current.delete(gap.connectionId)
             reverseMapRef.current.delete(gap.connectionId)
             // Drop tab aliases that still target this dead canonical so a
             // later owner/viewer reconnect under the tab id can resolve.
@@ -8625,6 +8668,7 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
             )
             return
           }
+          flushStreamingQueue(contextKey)
           const patch = denormalizeSnapshot(snapshot)
           dispatch({ type: "HYDRATE_FROM_SNAPSHOT", contextKey, patch })
           seedDelegationsFromSnapshotRef.current(
@@ -8637,8 +8681,10 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
             applied?.connectionId === gap.connectionId
               ? applied.lastAppliedSeq
               : patch.eventSeq
+          gapRecoveryTimersRef.current.delete(gap.connectionId)
           ingestor?.resumeConnection(gap.connectionId, resumeSeq)
         } catch (err) {
+          if (eventIngestorRef.current !== ingestor) return
           console.warn(
             "[acp-context] sequence gap recovery failed",
             gap.connectionId,
@@ -8649,19 +8695,17 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
             dropOriginalBookkeepingOnly()
             return
           }
-          reverseMapRef.current.delete(gap.connectionId)
-          clearAliasesPointingTo(contextKey)
-          if (gap.connectionId !== contextKey) {
-            clearAliasesPointingTo(gap.connectionId)
-          }
-          // Throw ≠ confirmed dead: clean up local entry only. Do not fire
-          // handoff re-entry (would acpConnect-spawn while broker may live).
-          removeDeadCanonicalOnly(contextKey)
-          ingestor?.resumeConnection(gap.connectionId, Number.MAX_SAFE_INTEGER)
+          gapRecoveryTimersRef.current.set(
+            gap.connectionId,
+            setTimeout(() => {
+              void recover()
+            }, 1000)
+          )
         }
-      })()
+      }
+      void recover()
     },
-    [clearAliasesPointingTo, dispatch]
+    [clearAliasesPointingTo, dispatch, flushStreamingQueue]
   )
 
   const handleDesktopDeliveryFailure = useCallback(
@@ -8822,13 +8866,12 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
         if (!isStreamingEnvelope(event)) continue
         const stamped = prepareEventEnvelope(event)
         const conn = storeRef.current.connections.get(contextKey)
-        if (conn && stamped.seq > conn.lastAppliedSeq + 1) {
-          handleSequenceGap({
-            contextKey,
-            connectionId: stamped.connection_id,
-            expectedSeq: conn.lastAppliedSeq + 1,
-            receivedSeq: stamped.seq,
-          })
+        if (
+          gapRecoveryTimersRef.current.has(stamped.connection_id) ||
+          (conn && stamped.seq > conn.lastAppliedSeq + 1)
+        ) {
+          ingestor.pushMapped(contextKey, [stamped], source)
+          if (flush) ingestor.flushNow()
           continue
         }
         if (
@@ -8864,7 +8907,6 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
       dispatch,
       enqueueStreamingAction,
       flushStreamingQueue,
-      handleSequenceGap,
       notifyRawSubscribers,
     ]
   )
@@ -9560,6 +9602,16 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
   // the provider fires into a `dispatch` whose store nothing is reading, and
   // under a test runner it outlives the test that armed it.
   useEffect(() => discardStreamingQueues, [discardStreamingQueues])
+
+  useEffect(() => {
+    const timers = gapRecoveryTimersRef.current
+    return () => {
+      for (const timer of timers.values()) {
+        if (timer != null) clearTimeout(timer)
+      }
+      timers.clear()
+    }
+  }, [])
 
   const isConnectionLiveOnBackend = useCallback(
     async (connectionId: string): Promise<boolean> => {

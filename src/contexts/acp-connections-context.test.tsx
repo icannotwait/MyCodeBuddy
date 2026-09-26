@@ -7536,6 +7536,303 @@ describe("streaming flush window widens with the run it re-renders", () => {
   // the reply shows the same prose twice. The attach stream re-emits a
   // snapshot on RECONNECT, mid-turn, so this is what a dropped WebSocket does
   // to a streaming reply, not a corner case.
+  it("flushes queued text before a prompting gap snapshot", async () => {
+    const handlers = await mountStreamingOwner()
+    vi.useFakeTimers()
+    try {
+      emitAcpEvent(handlers, {
+        seq: 2,
+        connection_id: "spawned-conn",
+        type: "content_delta",
+        text: "hello ",
+      })
+      expect(liveText()).toBe("")
+
+      // The reconnect snapshot was generated after that delta reached the
+      // backend, so it already carries the text sitting in our window. Still
+      // `prompting`: the turn did not stop because the socket did.
+      h.denormalizeSnapshot.mockReturnValue({
+        connectionId: "spawned-conn",
+        status: "prompting",
+        sessionId: null,
+        modes: null,
+        configOptions: null,
+        availableCommands: null,
+        usage: null,
+        liveMessage: {
+          id: "live-1",
+          role: "assistant",
+          content: [{ type: "text", text: "hello " }],
+          startedAt: 0,
+        },
+        pendingPermission: null,
+        pendingAskQuestion: null,
+        pendingUserMessage: null,
+        promptCapabilities: null,
+        selectorsReady: false,
+        supportsFork: false,
+        configStale: false,
+        configStaleKind: null,
+        lastError: null,
+        eventSeq: 9,
+        activeDelegations: [],
+      })
+      h.acpGetSessionSnapshot.mockResolvedValue({ event_seq: 9 })
+      await act(async () => {
+        emitAcpEvent(handlers, {
+          seq: 4,
+          connection_id: "spawned-conn",
+          type: "content_delta",
+          text: "later",
+        })
+        await Promise.resolve()
+        await Promise.resolve()
+      })
+
+      act(() => {
+        vi.advanceTimersByTime(STREAM_FLUSH_MAX_MS)
+      })
+      expect(liveText()).toBe("hello ")
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it("promotes queued text before a completed gap snapshot", async () => {
+    const handlers = await mountStreamingOwner()
+    const { useConversationRuntimeStore, resetConversationRuntimeStore } =
+      await import("@/stores/conversation-runtime-store")
+    resetConversationRuntimeStore()
+    const published: string[] = []
+    h.actions!.registerLiveSinks(TAB, {
+      runtimeConversationId: 42,
+      canonical: (message, isLive) => {
+        published.push(
+          message?.content
+            .flatMap((block) => (block.type === "text" ? [block.text] : []))
+            .join("") ?? ""
+        )
+        useConversationRuntimeStore
+          .getState()
+          .actions.setLiveMessage(42, message, isLive)
+      },
+    })
+    vi.useFakeTimers()
+    try {
+      emitAcpEvent(handlers, {
+        seq: 2,
+        connection_id: "spawned-conn",
+        type: "content_delta",
+        text: "hello ",
+      })
+      expect(liveText()).toBe("")
+
+      // The reconnect snapshot was generated after that delta reached the
+      // backend, so it already carries the text sitting in our window. Still
+      // `prompting`: the turn did not stop because the socket did.
+      h.denormalizeSnapshot.mockReturnValue({
+        connectionId: "spawned-conn",
+        status: "connected",
+        sessionId: null,
+        modes: null,
+        configOptions: null,
+        availableCommands: null,
+        usage: null,
+        liveMessage: null,
+        pendingPermission: null,
+        pendingAskQuestion: null,
+        pendingUserMessage: null,
+        promptCapabilities: null,
+        selectorsReady: false,
+        supportsFork: false,
+        configStale: false,
+        configStaleKind: null,
+        lastError: null,
+        eventSeq: 9,
+        activeDelegations: [],
+      })
+      h.acpGetSessionSnapshot.mockResolvedValue({ event_seq: 9 })
+      await act(async () => {
+        emitAcpEvent(handlers, {
+          seq: 4,
+          connection_id: "spawned-conn",
+          type: "content_delta",
+          text: "later",
+        })
+        await Promise.resolve()
+        await Promise.resolve()
+      })
+
+      act(() => {
+        vi.advanceTimersByTime(STREAM_FLUSH_MAX_MS)
+      })
+      expect(published.filter((text) => text === "hello ")).toHaveLength(1)
+      const runtime = useConversationRuntimeStore
+        .getState()
+        .byConversationId.get(42)
+      expect(runtime?.localTurns.flatMap((turn) => turn.blocks)).toContainEqual(
+        {
+          type: "text",
+          text: "hello ",
+        }
+      )
+      expect(runtime?.liveMessage).toBeNull()
+    } finally {
+      vi.useRealTimers()
+      resetConversationRuntimeStore()
+    }
+  })
+
+  it.each([0, 1])(
+    "keeps simultaneous live sinks after disposing registration %i",
+    async (disposedIndex) => {
+      const handlers = await mountStreamingOwner()
+      const canonicalTexts: string[][] = [[], []]
+      const transcriptTexts: string[][] = [[], []]
+      const textOf = (message: LiveMessage | null) =>
+        message?.content
+          .flatMap((block) => (block.type === "text" ? [block.text] : []))
+          .join("") ?? ""
+      const disposers = canonicalTexts.map((texts, index) =>
+        h.actions!.registerLiveSinks(TAB, {
+          canonical: (message) => {
+            texts.push(textOf(message))
+          },
+          transcript: {
+            publish: (_frame, message) => {
+              transcriptTexts[index]!.push(textOf(message))
+            },
+            rebuild: (message) => {
+              transcriptTexts[index]!.push(textOf(message))
+            },
+            markCompleting: () => {},
+            clear: () => {},
+          },
+        })
+      )
+      vi.useFakeTimers()
+      try {
+        emitAcpEvent(handlers, {
+          seq: 2,
+          connection_id: "spawned-conn",
+          type: "content_delta",
+          text: "hello ",
+        })
+        act(() => {
+          vi.advanceTimersByTime(STREAM_FLUSH_MAX_MS)
+        })
+        expect(canonicalTexts.map((texts) => texts.at(-1))).toEqual([
+          "hello ",
+          "hello ",
+        ])
+        expect(transcriptTexts.map((texts) => texts.at(-1))).toEqual([
+          "hello ",
+          "hello ",
+        ])
+        disposers[disposedIndex]!()
+        disposers[disposedIndex]!()
+        emitAcpEvent(handlers, {
+          seq: 3,
+          connection_id: "spawned-conn",
+          type: "content_delta",
+          text: "world",
+        })
+        act(() => {
+          vi.advanceTimersByTime(STREAM_FLUSH_MAX_MS)
+        })
+        expect(canonicalTexts[1 - disposedIndex]!.at(-1)).toBe("hello world")
+        expect(transcriptTexts[1 - disposedIndex]!.at(-1)).toBe("hello world")
+        expect(canonicalTexts[disposedIndex]!.at(-1)).toBe("hello ")
+        expect(transcriptTexts[disposedIndex]!.at(-1)).toBe("hello ")
+      } finally {
+        disposers.forEach((dispose) => dispose())
+        vi.useRealTimers()
+      }
+    }
+  )
+
+  it("preserves accepted text and retries a failed gap snapshot without losing buffered events", async () => {
+    const handlers = await mountStreamingOwner()
+    const published: string[] = []
+    h.actions!.registerLiveMessageSink(TAB, (message) => {
+      published.push(
+        message?.content
+          .flatMap((block) => (block.type === "text" ? [block.text] : []))
+          .join("") ?? ""
+      )
+    })
+    vi.useFakeTimers()
+    try {
+      emitAcpEvent(handlers, {
+        seq: 2,
+        connection_id: "spawned-conn",
+        type: "content_delta",
+        text: "hello ",
+      })
+      act(() => {
+        vi.advanceTimersByTime(STREAM_FLUSH_MAX_MS)
+      })
+      h.acpConnect.mockClear()
+      h.acpGetSessionSnapshot
+        .mockRejectedValueOnce(new Error("temporary snapshot failure"))
+        .mockResolvedValue({ event_seq: 3 })
+      h.denormalizeSnapshot.mockReturnValue(
+        estimatorSnapshotPatch({
+          connectionId: "spawned-conn",
+          conversationId: 42,
+          sessionId: "sess-1",
+          status: "prompting",
+          eventSeq: 3,
+          liveMessage: {
+            id: "recovered-live",
+            role: "assistant",
+            content: [{ type: "text", text: "hello recovered " }],
+            startedAt: 0,
+          },
+        })
+      )
+      await act(async () => {
+        emitAcpEvent(handlers, {
+          seq: 4,
+          connection_id: "spawned-conn",
+          type: "content_delta",
+          text: "buffered ",
+        })
+        await Promise.resolve()
+        await Promise.resolve()
+      })
+      expect(liveText()).toBe("hello ")
+      expect(h.store!.getConnection(TAB)?.connectionId).toBe("spawned-conn")
+      emitAcpEvent(handlers, {
+        seq: 5,
+        connection_id: "spawned-conn",
+        type: "content_delta",
+        text: "tail",
+      })
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(1000)
+        h.runAnimationFrame()
+        await vi.advanceTimersByTimeAsync(STREAM_FLUSH_MAX_MS)
+      })
+      expect(liveText()).toBe("hello recovered buffered tail")
+      expect(published.at(-1)).toBe("hello recovered buffered tail")
+      expect(h.store!.getConnection(TAB)?.lastAppliedSeq).toBe(5)
+      expect(h.acpConnect).not.toHaveBeenCalled()
+      emitAcpEvent(handlers, {
+        seq: 6,
+        connection_id: "spawned-conn",
+        type: "content_delta",
+        text: "!",
+      })
+      act(() => {
+        vi.advanceTimersByTime(STREAM_FLUSH_MAX_MS)
+      })
+      expect(liveText()).toBe("hello recovered buffered tail!")
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
   it("lands coalesced deltas before a mid-turn snapshot replaces the message", async () => {
     const handlers = await mountStreamingOwner()
     vi.useFakeTimers()
@@ -9523,6 +9820,149 @@ describe("AcpConnectionsProvider frame transactions (raw order)", () => {
     }
   })
 
+  it.each([false, true])(
+    "completes stale-ID virtual owner B with split terminal %s",
+    async (splitTerminal) => {
+      const { useConversationRuntimeStore, resetConversationRuntimeStore } =
+        await import("@/stores/conversation-runtime-store")
+      resetConversationRuntimeStore()
+      const runtimeActions = useConversationRuntimeStore.getState().actions
+      // Production shape: draft tab streams under a virtual key while the
+      // persisted row (7) already has a prior external_id. A mid-turn detail
+      // refetch / conversation://changed can restamp that stale id onto the
+      // live runtime; turn_complete still carries the current ACP session.
+      const virtualConversationId = -1049581191
+      runtimeActions.setExternalId(
+        virtualConversationId,
+        "stale-persisted-sess"
+      )
+      runtimeActions.setDbConversationId(virtualConversationId, 7)
+      runtimeActions.appendOptimisticTurn(
+        virtualConversationId,
+        {
+          id: "user-stale-ext",
+          role: "user",
+          blocks: [{ type: "text", text: "cursor turn" }],
+          timestamp: "2026-09-11T02:26:30.000Z",
+        },
+        "user-stale-ext"
+      )
+      runtimeActions.setExternalId(7, "sess-1")
+
+      try {
+        await mountDesktopOwner("owner-conn", TAB, "sess-1", 7)
+        h.actions!.registerLiveSinks(TAB, {
+          runtimeConversationId: virtualConversationId,
+          canonical: (message, isLive) => {
+            runtimeActions.setLiveMessage(
+              virtualConversationId,
+              message,
+              isLive
+            )
+            return (
+              useConversationRuntimeStore
+                .getState()
+                .byConversationId.get(virtualConversationId)?.liveMessage ===
+              message
+            )
+          },
+        })
+
+        act(() => {
+          h.emitDesktopBatch(
+            batch(1, [
+              {
+                connection_id: "owner-conn",
+                seq: 1,
+                type: "session_started",
+                session_id: "sess-1",
+              },
+              {
+                connection_id: "owner-conn",
+                seq: 2,
+                type: "status_changed",
+                status: "prompting",
+              },
+              content("owner-conn", 3, "answer A"),
+            ])
+          )
+          h.runAnimationFrame()
+        })
+        expect(h.store!.getConnection(TAB)?.status).toBe("prompting")
+        expect(
+          useConversationRuntimeStore
+            .getState()
+            .byConversationId.get(virtualConversationId)?.liveMessage
+        ).toBeTruthy()
+
+        const terminalB: EventEnvelope = {
+          connection_id: "owner-conn",
+          seq: 8,
+          type: "turn_complete",
+          session_id: "sess-1",
+          stop_reason: "end_turn",
+          mark_awaiting_reply: false,
+        }
+        act(() => {
+          h.emitDesktopBatch(
+            batch(2, [
+              {
+                connection_id: "owner-conn",
+                seq: 4,
+                type: "turn_complete",
+                session_id: "sess-1",
+                stop_reason: "end_turn",
+                mark_awaiting_reply: true,
+              },
+              {
+                connection_id: "owner-conn",
+                seq: 5,
+                type: "user_message",
+                message_id: "user-b",
+                blocks: [{ type: "text", text: "turn B" }],
+              },
+              {
+                connection_id: "owner-conn",
+                seq: 6,
+                type: "status_changed",
+                status: "prompting",
+              },
+              content("owner-conn", 7, "answer B"),
+              ...(splitTerminal ? [] : [terminalB]),
+            ])
+          )
+          h.runAnimationFrame()
+        })
+
+        if (splitTerminal) {
+          act(() => {
+            h.emitDesktopBatch(batch(3, [terminalB]))
+            h.runAnimationFrame()
+          })
+        }
+        expect(h.store!.getConnection(TAB)?.status).toBe("connected")
+        const virtual = useConversationRuntimeStore
+          .getState()
+          .byConversationId.get(virtualConversationId)
+        expect(virtual?.liveMessage).toBeNull()
+        expect(virtual?.syncState).toBe("idle")
+        expect(virtual?.optimisticTurns).toEqual([])
+        expect(virtual?.localTurns.flatMap((turn) => turn.blocks)).toEqual(
+          expect.arrayContaining([
+            { type: "text", text: "answer A" },
+            { type: "text", text: "answer B" },
+          ])
+        )
+        expect(
+          useConversationRuntimeStore.getState().byConversationId.get(7)
+            ?.liveMessage
+        ).toBeNull()
+      } finally {
+        resetConversationRuntimeStore()
+      }
+    }
+  )
+
   it("settles a late end_turn on a virtual runtime whose persisted external_id is stale", async () => {
     const { useConversationRuntimeStore, resetConversationRuntimeStore } =
       await import("@/stores/conversation-runtime-store")
@@ -10502,6 +10942,116 @@ describe("AcpConnectionsProvider frame transactions (raw order)", () => {
         { role: "user", blocks: [{ type: "text", text: "turn B" }] },
         { role: "assistant", blocks: [{ type: "text", text: "answer B" }] },
       ])
+    } finally {
+      resetConversationRuntimeStore()
+    }
+  })
+
+  it("promotes the next turn when the previous turn was published in an earlier frame", async () => {
+    const { useConversationRuntimeStore, resetConversationRuntimeStore } =
+      await import("@/stores/conversation-runtime-store")
+    resetConversationRuntimeStore()
+    const runtimeActions = useConversationRuntimeStore.getState().actions
+    runtimeActions.setExternalId(42, "sess-1")
+    runtimeActions.appendOptimisticTurn(
+      42,
+      {
+        id: "user-a",
+        role: "user",
+        blocks: [{ type: "text", text: "turn A" }],
+        timestamp: "2026-08-25T07:31:49.000Z",
+      },
+      "turn-a"
+    )
+
+    try {
+      await mountDesktopOwner("owner-conn", TAB, "sess-1", 42)
+      h.actions!.registerLiveMessageSink(TAB, (message, isLive) => {
+        runtimeActions.setLiveMessage(42, message, isLive)
+        return (
+          useConversationRuntimeStore.getState().byConversationId.get(42)
+            ?.liveMessage === message
+        )
+      })
+
+      act(() => {
+        h.emitDesktopBatch(
+          batch(1, [
+            {
+              connection_id: "owner-conn",
+              seq: 1,
+              type: "status_changed",
+              status: "prompting",
+            },
+            content("owner-conn", 2, "answer A"),
+          ])
+        )
+        h.runAnimationFrame()
+      })
+      act(() => {
+        h.emitDesktopBatch(
+          batch(2, [
+            {
+              connection_id: "owner-conn",
+              seq: 3,
+              type: "turn_complete",
+              session_id: "sess-1",
+              stop_reason: "end_turn",
+              mark_awaiting_reply: false,
+            },
+            {
+              connection_id: "owner-conn",
+              seq: 4,
+              type: "user_message",
+              message_id: "user-b",
+              blocks: [{ type: "text", text: "turn B" }],
+            },
+            {
+              connection_id: "owner-conn",
+              seq: 5,
+              type: "status_changed",
+              status: "prompting",
+            },
+            content("owner-conn", 6, "answer B"),
+            {
+              connection_id: "owner-conn",
+              seq: 7,
+              type: "turn_complete",
+              session_id: "sess-1",
+              stop_reason: "end_turn",
+              mark_awaiting_reply: false,
+            },
+          ])
+        )
+        h.runAnimationFrame()
+      })
+
+      const runtime = useConversationRuntimeStore
+        .getState()
+        .byConversationId.get(42)
+      expect(
+        runtime?.localTurns.map((turn) => ({
+          role: turn.role,
+          blocks: turn.blocks,
+        }))
+      ).toEqual([
+        { role: "user", blocks: [{ type: "text", text: "turn A" }] },
+        { role: "assistant", blocks: [{ type: "text", text: "answer A" }] },
+        { role: "user", blocks: [{ type: "text", text: "turn B" }] },
+        { role: "assistant", blocks: [{ type: "text", text: "answer B" }] },
+      ])
+      expect(runtime?.optimisticTurns).toEqual([])
+      expect(runtime?.liveMessage).toBeNull()
+      const completedConnection = h.store!.getConnection(TAB)
+      expect(completedConnection?.liveMessage).toEqual(
+        expect.objectContaining({ id: expect.any(String) })
+      )
+      expect(completedConnection?.acceptedCompletionMessageId).toBe(
+        completedConnection?.liveMessage?.id
+      )
+      expect(
+        completedConnection?.acceptedCompletionRuntimeConversationIds
+      ).toEqual([42])
     } finally {
       resetConversationRuntimeStore()
     }
@@ -16059,6 +16609,128 @@ describe("AcpConnectionsProvider canonical observer aliases", () => {
     }
   })
 
+  it.each([
+    [false, 0],
+    [false, 1],
+    [true, 0],
+    [true, 1],
+  ] as const)(
+    "shares one real projection across aliases %s after disposing sink %i",
+    async (acrossAliases, disposedIndex) => {
+      const { createLiveTranscriptFrameSink, liveTranscriptStore } =
+        await import("@/stores/live-transcript-store")
+      const { useConversationRuntimeStore, resetConversationRuntimeStore } =
+        await import("@/stores/conversation-runtime-store")
+      resetConversationRuntimeStore()
+      liveTranscriptStore.reset()
+      const runtimeActions = useConversationRuntimeStore.getState().actions
+      runtimeActions.setExternalId(42, "sess-shared")
+      h.eventStreamValue = null
+      h.acpGetSessionSnapshot.mockResolvedValue({
+        connection_id: "broker-child",
+        event_seq: 0,
+      })
+      h.denormalizeSnapshot.mockReturnValue(
+        estimatorSnapshotPatch({
+          connectionId: "broker-child",
+          conversationId: 42,
+          status: "connected",
+          sessionId: "sess-shared",
+          eventSeq: 0,
+        })
+      )
+      h.acpFindConnectionForConversation.mockResolvedValue({
+        connection_id: "broker-child",
+        event_seq: 0,
+      })
+      await mountProvider()
+      await act(async () => {
+        await h.actions!.connect(
+          TAB,
+          "claude_code",
+          "/tmp/x",
+          "sess-shared",
+          42
+        )
+      })
+      const keys = acrossAliases ? ["broker-child", TAB] : [TAB, TAB]
+      const disposers = keys.map((key) =>
+        h.actions!.registerLiveSinks(key, {
+          runtimeConversationId: 42,
+          canonical: (message, isLive) => {
+            runtimeActions.setLiveMessage(42, message, isLive)
+            return (
+              useConversationRuntimeStore.getState().byConversationId.get(42)
+                ?.liveMessage === message
+            )
+          },
+          transcript: createLiveTranscriptFrameSink(42, "broker-child"),
+        })
+      )
+      const projectionText = () =>
+        [...(liveTranscriptStore.getConversation(42)?.segments.values() ?? [])]
+          .flatMap((segment) => (segment.type === "text" ? [segment.text] : []))
+          .join("")
+      try {
+        act(() => {
+          h.emitDesktopBatch(
+            batch(1, [
+              {
+                seq: 1,
+                connection_id: "broker-child",
+                type: "status_changed",
+                status: "prompting",
+              },
+              {
+                seq: 2,
+                connection_id: "broker-child",
+                type: "content_delta",
+                text: "answer A",
+              },
+            ])
+          )
+          h.runAnimationFrame()
+        })
+        expect(projectionText()).toBe("answer A")
+        act(() => {
+          h.emitDesktopBatch(
+            batch(2, [
+              {
+                seq: 3,
+                connection_id: "broker-child",
+                type: "content_delta",
+                text: " continues",
+              },
+            ])
+          )
+          h.runAnimationFrame()
+        })
+        expect(projectionText()).toBe("answer A continues")
+        disposers[disposedIndex]!()
+        disposers[disposedIndex]!()
+        act(() => {
+          h.emitDesktopBatch(
+            batch(3, [
+              {
+                seq: 4,
+                connection_id: "broker-child",
+                type: "content_delta",
+                text: " once",
+              },
+            ])
+          )
+          h.runAnimationFrame()
+        })
+        expect(projectionText()).toBe("answer A continues once")
+        expect(liveTranscriptStore.getConversation(42)?.lastAppliedSeq).toBe(4)
+      } finally {
+        disposers.forEach((dispose) => dispose())
+        liveTranscriptStore.reset()
+        resetConversationRuntimeStore()
+      }
+    }
+  )
+
   it("promotes an accepted user-stop completion in every canonical observer alias", async () => {
     const TAB2 = "conv-2-claude_code-99"
     const {
@@ -17118,9 +17790,6 @@ describe("AcpConnectionsProvider canonical observer aliases", () => {
   })
 
   it("sequence-gap rejected-snapshot recovery does not acpConnect for discovery errors", async () => {
-    // Task 5 r5: snapshot throw is not confirmed-dead. Cleanup local state but
-    // do not fire handoff re-entry (which would claim ownership via acpConnect)
-    // while the broker may still be live.
     h.acpFindConnectionForConversation.mockResolvedValue({
       connection_id: "broker-child",
       event_seq: 0,
@@ -17207,9 +17876,10 @@ describe("AcpConnectionsProvider canonical observer aliases", () => {
     })
 
     expect(h.acpConnect).not.toHaveBeenCalled()
-    // Local dead-entry cleanup still runs; ownership is not claimed.
-    expect(h.store!.getConnection("broker-child")).toBeUndefined()
-    expect(h.store!.getConnection(TAB)).toBeUndefined()
+    expect(h.store!.getConnection("broker-child")?.connectionId).toBe(
+      "broker-child"
+    )
+    expect(h.store!.getConnection(TAB)?.connectionId).toBe("broker-child")
   })
 
   it("desktop delivery-failure dead snapshot clears tab aliases", async () => {

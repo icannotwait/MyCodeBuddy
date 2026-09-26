@@ -860,6 +860,105 @@ describe("selectHistoricalTimelineTurns reference stability", () => {
 })
 
 describe("selectHistoricalTimelineTurns edge-case semantics", () => {
+  it.each(["owner", "viewer"] as const)(
+    "keeps the previous reply when a new %s prompt starts with a stale in-flight marker",
+    (sender) => {
+      seedRuntimeSession({
+        detail: detailWithTurns(
+          [userTurn("previous-prompt"), assistantTurn("previous-reply")],
+          { in_flight_user_turn_id: "previous-prompt" }
+        ),
+      })
+      const actions = useConversationRuntimeStore.getState().actions
+      const prompt = userTurn("next-prompt")
+      if (sender === "owner") {
+        actions.appendOptimisticTurn(CID, prompt, prompt.id)
+      } else {
+        actions.appendViewerUserTurn(CID, prompt)
+      }
+      actions.setLiveMessage(CID, liveMessage("next", "new reply"), true)
+
+      const historical = selectHistoricalTimelineTurns(
+        useConversationRuntimeStore.getState(),
+        CID
+      )
+      expect(historical.map((entry) => entry.turn.id)).toEqual([
+        "previous-prompt",
+        "previous-reply",
+        "next-prompt",
+      ])
+      expect(historical[1]?.isInFlightRound).toBe(false)
+    }
+  )
+
+  it.each([true, false])(
+    "keeps a promoted final before detail refreshes (new prompt: %s)",
+    (newPrompt) => {
+      seedRuntimeSession({
+        detail: detailWithTurns(
+          [userTurn("previous-prompt"), assistantTurn("partial", "head")],
+          { in_flight_user_turn_id: "previous-prompt" }
+        ),
+        optimisticTurns: [userTurn("previous-prompt")],
+        liveMessage: liveMessage("previous", "complete previous reply"),
+        syncState: "awaiting_persist",
+      })
+      const actions = useConversationRuntimeStore.getState().actions
+      actions.completeTurn(CID)
+      if (newPrompt) {
+        actions.appendOptimisticTurn(
+          CID,
+          userTurn("next-prompt"),
+          "next-prompt"
+        )
+      }
+      actions.setLiveMessage(CID, liveMessage("next", "new reply"), true)
+
+      const historical = selectHistoricalTimelineTurns(
+        useConversationRuntimeStore.getState(),
+        CID
+      )
+      expect(historical.map((entry) => entry.turn.id)).toEqual([
+        "previous-prompt",
+        "live-42-previous",
+        ...(newPrompt ? ["next-prompt"] : []),
+      ])
+      expect(historical[1]?.turn.blocks).toEqual([
+        { type: "text", text: "complete previous reply" },
+      ])
+      expect(historical[1]?.isInFlightRound).toBe(false)
+    }
+  )
+
+  it("keeps suppressing the current partial until a queued prompt starts", () => {
+    seedRuntimeSession({
+      detail: detailWithTurns(
+        [userTurn("current-prompt"), assistantTurn("partial")],
+        { in_flight_user_turn_id: "current-prompt" }
+      ),
+      liveMessage: liveMessage("current", "full reply"),
+    })
+    const actions = useConversationRuntimeStore.getState().actions
+    const prompt = userTurn("queued-prompt")
+    actions.appendOptimisticTurn(CID, prompt, prompt.id, { queuePending: true })
+    expect(
+      selectHistoricalTimelineTurns(
+        useConversationRuntimeStore.getState(),
+        CID
+      ).map((entry) => entry.turn.id)
+    ).toEqual(["current-prompt", "queued-prompt"])
+
+    // Activation reuses the optimistic array; the queue change must invalidate
+    // the historical cache even before the new live identity arrives.
+    actions.appendOptimisticTurn(CID, prompt, prompt.id)
+    expect(
+      selectHistoricalTimelineTurns(
+        useConversationRuntimeStore.getState(),
+        CID
+      ).map((entry) => entry.turn.id)
+    ).toEqual(["current-prompt", "partial", "queued-prompt"])
+  })
+
   it("suppresses persisted partial assistant turns while live is in hand", () => {
     seedRuntimeSession({
       detail: detailWithTurns(
@@ -3102,8 +3201,19 @@ describe("owner overlay retirement without live-* persist ids", () => {
         .getState()
         .byConversationId.get(CID)!
       expect(session.localTurns.some((t) => t.id === `live-${CID}-stub`)).toBe(
-        false
+        true
       )
+      const visibleBlocks = selectTimelineTurns(
+        useConversationRuntimeStore.getState(),
+        CID
+      ).flatMap(({ turn }) => turn.blocks)
+      expect(visibleBlocks).toContainEqual({
+        type: "tool_result",
+        tool_use_id: "tc-1",
+        output_preview: "ok",
+        is_error: false,
+      })
+      expect(visibleBlocks).toContainEqual({ type: "text", text: full })
       expect(
         session.detail?.turns
           .filter((t) => t.role === "assistant")

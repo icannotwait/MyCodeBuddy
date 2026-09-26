@@ -17,8 +17,8 @@
  * Streaming: while mounted, a runtime-bound provider sink mirrors accepted
  * canonical messages into `conversationId`, and the provider promotes admitted
  * completions in the same commit. Persistence also comes from the broker's DB
- * writes via `useConversationDetail`. On unmount the runtime session is dropped,
- * so the next mount starts from a fresh persisted fetch.
+ * writes via `useConversationDetail`. Unmount releases this viewer's
+ * subscriptions while retaining shared runtime data for other consumers.
  */
 
 import { useCallback, useEffect, useRef, useSyncExternalStore } from "react"
@@ -32,6 +32,7 @@ import {
   useConversationRuntimeActions,
   useConversationRuntimeStore,
 } from "@/stores/conversation-runtime-store"
+import { createLiveTranscriptFrameSink } from "@/stores/live-transcript-store"
 import {
   useAcpActions,
   useConnectionStore,
@@ -71,9 +72,8 @@ export function useConnectionStateById(
  * Binding the runtime id prevents another alias's terminal from projecting into
  * this viewer.
  *
- * **Close-mid-stream / reopen-after-complete.** The viewer owns this runtime
- * session, so its full unmount drops the session and forces the next open to
- * fetch persisted detail from scratch.
+ * **Close-mid-stream / reopen-after-complete.** Runtime data is shared with
+ * other consumers and retained on unmount. Each open refreshes persisted detail.
  *
  * The detail-fetch no longer races the streaming bridge: the viewer's mount
  * fetch uses `preserveLive: true`, so `FETCH_DETAIL_SUCCESS` keeps the bridged
@@ -88,8 +88,7 @@ export function useLiveTranscriptBridge(
   conversationId: number,
   connState: ConnectionState | undefined
 ) {
-  const { setLiveMessage, syncTurnMetadata, removeConversation } =
-    useConversationRuntimeActions()
+  const { setLiveMessage, syncTurnMetadata } = useConversationRuntimeActions()
   const { registerLiveSinks } = useAcpActions()
 
   const connectionId = connState?.connectionId ?? null
@@ -129,6 +128,7 @@ export function useLiveTranscriptBridge(
             .byConversationId.get(conversationId)?.liveMessage === message
         )
       },
+      transcript: createLiveTranscriptFrameSink(conversationId, connectionId),
     })
   }, [connectionId, conversationId, registerLiveSinks, setLiveMessage])
 
@@ -144,16 +144,12 @@ export function useLiveTranscriptBridge(
     startMetadataSync()
   }, [acceptedCompletionMessageId, startMetadataSync])
 
-  // Full teardown on viewer close: cancel any in-flight metadata sync, then
-  // drop the runtime session so the next open starts from a fresh
-  // `fetchDetail` instead of stale bridged state.
   useEffect(() => {
     return () => {
       syncCancelRef.current?.()
       syncCancelRef.current = null
-      removeConversation(conversationId)
     }
-  }, [conversationId, removeConversation])
+  }, [conversationId])
 }
 
 interface LiveTranscriptViewProps {
