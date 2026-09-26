@@ -5,7 +5,7 @@ use std::process::Stdio;
 use std::sync::{Arc, Mutex as StdMutex, OnceLock, Weak};
 use std::time::Duration;
 
-use sacp::schema::{
+use agent_client_protocol::schema::v1::{
     CreateTerminalRequest, CreateTerminalResponse, KillTerminalRequest, KillTerminalResponse,
     ReleaseTerminalRequest, ReleaseTerminalResponse, TerminalExitStatus, TerminalOutputRequest,
     TerminalOutputResponse, WaitForTerminalExitRequest, WaitForTerminalExitResponse,
@@ -109,9 +109,11 @@ pub enum TerminalRuntimeError {
 }
 
 impl TerminalRuntimeError {
-    pub fn into_rpc_error(self) -> sacp::Error {
+    pub fn into_rpc_error(self) -> agent_client_protocol::Error {
         match self {
-            Self::InvalidParams(message) => sacp::Error::invalid_params().data(message),
+            Self::InvalidParams(message) => {
+                agent_client_protocol::Error::invalid_params().data(message)
+            }
             Self::Spawn {
                 code,
                 executable,
@@ -121,7 +123,7 @@ impl TerminalRuntimeError {
             } => {
                 // Stable structured diagnostics only: base env, request env,
                 // and command text can contain credentials.
-                sacp::Error::new(
+                agent_client_protocol::Error::new(
                     -32603,
                     format!("failed to spawn terminal ({mode}): {os_error}"),
                 )
@@ -133,7 +135,7 @@ impl TerminalRuntimeError {
                     "osError": os_error,
                 }))
             }
-            Self::Internal(message) => sacp::util::internal_error(message),
+            Self::Internal(message) => agent_client_protocol::util::internal_error(message),
         }
     }
 }
@@ -1140,7 +1142,9 @@ mod tests {
     use crate::terminal::shell::{
         ResolvedShellSpec, ShellCommandStrategy, ShellDialect, ShellSource,
     };
-    use sacp::schema::{EnvVariable, SessionId, TerminalId, WaitForTerminalExitRequest};
+    use agent_client_protocol::schema::v1::{
+        EnvVariable, SessionId, TerminalId, WaitForTerminalExitRequest,
+    };
 
     fn test_runtime(base_env: BTreeMap<String, String>) -> TerminalRuntime {
         TerminalRuntime::new(
@@ -2130,7 +2134,7 @@ mod fork_contract_tests {
     use crate::terminal::shell::{
         ResolvedShellSpec, ShellCommandStrategy, ShellDialect, ShellSource,
     };
-    use sacp::schema::{EnvVariable, SessionId, WaitForTerminalExitRequest};
+    use agent_client_protocol::schema::v1::{EnvVariable, SessionId, WaitForTerminalExitRequest};
     use std::path::Path;
 
     #[cfg(windows)]
@@ -2273,7 +2277,7 @@ mod fork_contract_tests {
 
     async fn start_long_running(
         session: &str,
-    ) -> (Arc<TerminalRuntime>, SessionId, sacp::schema::TerminalId) {
+    ) -> (Arc<TerminalRuntime>, SessionId, agent_client_protocol::schema::v1::TerminalId) {
         let runtime = Arc::new(test_runtime(AgentType::Grok));
         let session_id = SessionId::new(session);
         let response = runtime

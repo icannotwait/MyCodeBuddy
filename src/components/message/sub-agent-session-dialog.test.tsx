@@ -289,6 +289,7 @@ function makeConnState(overrides: Partial<ConnectionState>): ConnectionState {
     sessionFailures: [],
     asyncTasks: [],
     error: null,
+    errorLevel: "error",
     loadError: null,
     loadErrorCode: null,
     loadErrorCommand: null,
@@ -306,6 +307,7 @@ function makeConnState(overrides: Partial<ConnectionState>): ConnectionState {
     backgroundSettleSyncingSince: null,
     outOfTurnToolCalls: null,
     sharedSession: null,
+    snapshotTruncation: null,
     ...overrides,
   }
 }

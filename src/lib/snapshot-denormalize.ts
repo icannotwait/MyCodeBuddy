@@ -10,6 +10,7 @@ import type {
   LiveMessage as WireLiveMessage,
   LiveSessionSnapshot,
   PendingPlanApprovalState,
+  SnapshotTruncation,
   PendingQuestionState,
   PromptCapabilitiesInfo,
   SessionConfigOptionInfo,
@@ -25,6 +26,7 @@ import type {
 } from "@/lib/types"
 import { filterSessionConfigOptions } from "@/lib/session-config-filter"
 
+import { routeAcpError, type AcpErrorLevel } from "@/lib/acp-error-presentation"
 import type {
   LiveContentBlock as LocalLiveContentBlock,
   LiveMessage as LocalLiveMessage,
@@ -145,13 +147,14 @@ export interface SnapshotPatch {
    *  Terminal rows included — they are the ids subsequent live deltas revise.
    *  `[]` when the server omitted the field. */
   asyncTasks: AsyncTaskRecord[]
-  /** Latest ACP runtime error carried by the snapshot. `null` means none. */
+  /** Latest ACP runtime error carried by the snapshot. `null` means none.
+   *  Raw backend text here; the connections provider localizes it by
+   *  `lastErrorCode` before hydrating, exactly as the live `error` event is. */
   lastError: string | null
-  /** Diagnostic evidence attached to `lastError` (agent stderr tail, unparsed
-   *  update counts) — only the inferred `turn_failed_empty*` family carries it.
-   *  Already redacted by the backend. Kept separate from `lastError` because
-   *  that string feeds the composer status tooltip, which must stay one line. */
-  lastErrorDetails: string | null
+  /** Stable code of `lastError` (e.g. `turn_failed_empty`), or `null`. */
+  lastErrorCode: string | null
+  /** How `lastError` is tinted — see `routeAcpError`. */
+  lastErrorLevel: AcpErrorLevel
   eventSeq: number
   /** Live sub-agent delegations carried by the snapshot. Consumed directly at
    *  the attach call sites to re-seed `DelegationProvider` bindings (see
@@ -187,6 +190,8 @@ export interface SnapshotPatch {
    */
   lastToolWatchdogDiagnostic: ToolWatchdogProjection | null
   sharedSession: SharedSessionProjectionView | null
+  /** Omission counts from the bounded snapshot. `null` when the server omitted the field. */
+  snapshotTruncation: SnapshotTruncation | null
 }
 
 const DEFAULT_PROMPT_CAPS: PromptCapabilitiesInfo = {
@@ -201,9 +206,7 @@ export function denormalizeSnapshot(wire: LiveSessionSnapshot): SnapshotPatch {
     toolMap.set(tc.id, tc)
   }
   const lastError = normalizeSnapshotLastError(wire.last_error)
-  const lastErrorDetails = wire.last_error?.details?.trim()
-    ? wire.last_error.details
-    : null
+  const lastErrorCode = wire.last_error?.code?.trim() || null
 
   return {
     connectionId: wire.connection_id,
@@ -253,7 +256,8 @@ export function denormalizeSnapshot(wire: LiveSessionSnapshot): SnapshotPatch {
     sessionFailures: wire.session_failures ?? [],
     asyncTasks: wire.async_tasks ?? [],
     lastError,
-    lastErrorDetails,
+    lastErrorCode,
+    lastErrorLevel: routeAcpError(lastErrorCode).level,
     eventSeq: wire.event_seq,
     activeDelegations: wire.active_delegations ?? [],
     delegationRoute: wire.delegation_route ?? null,
@@ -264,6 +268,7 @@ export function denormalizeSnapshot(wire: LiveSessionSnapshot): SnapshotPatch {
     sharedSession: wire.shared_session
       ? denormalizeSharedSession(wire.shared_session)
       : null,
+    snapshotTruncation: wire.truncation ?? null,
   }
 }
 

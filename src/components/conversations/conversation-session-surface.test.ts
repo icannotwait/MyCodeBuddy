@@ -41,6 +41,10 @@ import {
 } from "@/lib/api"
 import { emitAttachFileToSession } from "@/lib/session-attachment-events"
 import { completeLiveTranscriptTurn } from "@/stores/conversation-runtime-store"
+import {
+  reparentedViewRuntimeConversationId,
+  trackConversationView,
+} from "@/stores/tab-store"
 import type { RichComposerHandle } from "@/components/chat/composer/rich-composer"
 import { serializeDocToText } from "@/components/chat/composer/to-prompt-blocks"
 
@@ -628,6 +632,13 @@ const surfaceH = vi.hoisted(() => ({
   setSyncState: vi.fn(),
   requeueFront: vi.fn(),
   syncDelegateTerminalDetail: vi.fn(),
+  /** Cancel handle returned by the latest `syncTurnMetadata` call. */
+  syncCancel: vi.fn(),
+  syncTurnMetadata: vi.fn(() => {
+    const cancel = vi.fn()
+    surfaceH.syncCancel = cancel
+    return cancel
+  }),
   refetchDetail: vi.fn(),
   reloadDetail: vi.fn(),
   /**
@@ -1074,7 +1085,7 @@ vi.mock("@/stores/conversation-runtime-store", () => ({
       },
       refetchDetail: surfaceH.refetchDetail,
       reloadDetail: surfaceH.reloadDetail,
-      syncTurnMetadata: vi.fn(() => () => undefined),
+      syncTurnMetadata: surfaceH.syncTurnMetadata,
       syncDelegateTerminalDetail: surfaceH.syncDelegateTerminalDetail,
       removeConversation: surfaceH.removeConversation,
       setAcpLoadError: vi.fn(),
@@ -1599,6 +1610,8 @@ function resetSurfaceHarness() {
   surfaceH.setSyncState.mockClear()
   surfaceH.requeueFront.mockClear()
   surfaceH.syncDelegateTerminalDetail.mockClear()
+  surfaceH.syncTurnMetadata.mockClear()
+  surfaceH.syncCancel.mockClear()
   surfaceH.refetchDetail.mockClear()
   surfaceH.reloadDetail.mockClear()
   surfaceH.runtimeExternalId = null
@@ -1643,7 +1656,7 @@ describe("ConversationSessionSurface session failure wiring", () => {
   beforeEach(resetSurfaceHarness)
   afterEach(cleanup)
 
-  it("passes live failures and owner recovery actions to ConversationShell", async () => {
+  it("passes live failures to ConversationShell without a recovery action", async () => {
     const failure = terminalSessionFailure()
     surfaceH.sessionFailures = [failure]
     surfaceH.connStatus = "error"
@@ -1655,14 +1668,8 @@ describe("ConversationSessionSurface session failure wiring", () => {
     })
 
     expect(surfaceH.shellProps?.sessionFailures).toEqual([failure])
-    expect(surfaceH.shellProps?.onSessionFailureAction).toEqual(
-      expect.any(Function)
-    )
-    await act(async () => {
-      surfaceH.shellProps?.onSessionFailureAction?.("retry", failure)
-      await Promise.resolve()
-    })
-    expect(lifecycleCapture.handleReconnect).toHaveBeenCalledTimes(1)
+    expect(surfaceH.shellProps?.onSessionFailureAction).toBeUndefined()
+    expect(lifecycleCapture.handleReconnect).not.toHaveBeenCalled()
   })
 
   it("shows failures to viewers with local dismiss but no owner recovery action", async () => {
@@ -2021,6 +2028,12 @@ describe("ConversationSessionSurface useConnectionLifecycle options harness", ()
     cleanup()
   })
 
+  function tabRegistryState() {
+    return surfaceH.tabStoreState as Parameters<
+      typeof reparentedViewRuntimeConversationId
+    >[0]
+  }
+
   it("preserves the runtime during a split-group reparent unmount", () => {
     surfaceH.conversations = [fullSummary(42, "completed")]
     surfaceH.connStatus = "connected"
@@ -2055,6 +2068,111 @@ describe("ConversationSessionSurface useConnectionLifecycle options harness", ()
 
     expect(surfaceH.removeConversation).toHaveBeenCalledOnce()
     expect(surfaceH.removeConversation).toHaveBeenCalledWith(42)
+  })
+
+  it("keeps metadata sync running across a split-group reparent unmount", () => {
+    surfaceH.conversations = [fullSummary(42, "completed")]
+    surfaceH.connStatus = "prompting"
+    const view = render(
+      createElement(ConversationSessionSurface, {
+        ...surfaceProps(42),
+        groupId: "g-main",
+      })
+    )
+    surfaceH.connStatus = "connected"
+    act(() => {
+      surfaceH.notifyWorkspace?.()
+    })
+    expect(surfaceH.syncTurnMetadata).toHaveBeenCalledTimes(1)
+    expect(surfaceH.syncTurnMetadata).toHaveBeenCalledWith(42, 42)
+    const cancel = surfaceH.syncCancel
+    expect(cancel).not.toHaveBeenCalled()
+
+    surfaceH.tabStoreState.groupOf = { "tab-1": "g-next" }
+    surfaceH.tabStoreState.groupLayout = { type: "group", id: "g-next" }
+    act(() => view.unmount())
+
+    expect(cancel).not.toHaveBeenCalled()
+    expect(surfaceH.removeConversation).not.toHaveBeenCalled()
+  })
+
+  it("cancels metadata sync when the surface actually closes", () => {
+    surfaceH.conversations = [fullSummary(42, "completed")]
+    surfaceH.connStatus = "prompting"
+    const view = render(
+      createElement(ConversationSessionSurface, {
+        ...surfaceProps(42),
+        groupId: "g-main",
+      })
+    )
+    surfaceH.connStatus = "connected"
+    act(() => {
+      surfaceH.notifyWorkspace?.()
+    })
+    const cancel = surfaceH.syncCancel
+    expect(surfaceH.syncTurnMetadata).toHaveBeenCalledTimes(1)
+    act(() => view.unmount())
+    expect(cancel).toHaveBeenCalledTimes(1)
+    expect(surfaceH.removeConversation).toHaveBeenCalledWith(42)
+  })
+
+  it("prefers the tab runtime id over a reparented key and a positive db id", () => {
+    const releasePredecessor = trackConversationView("tab-1", "g-main", -7)
+    surfaceH.tabStoreState.tabs[0].runtimeConversationId = -3
+    surfaceH.tabStoreState.groupOf = { "tab-1": "g-next" }
+    surfaceH.tabStoreState.groupLayout = { type: "group", id: "g-next" }
+    surfaceH.conversations = [fullSummary(42, "completed")]
+    surfaceH.connStatus = "connected"
+    try {
+      render(
+        createElement(ConversationSessionSurface, {
+          ...surfaceProps(42),
+          groupId: "g-next",
+        })
+      )
+      expect(surfaceH.messageListProps?.conversationId).toBe(-3)
+    } finally {
+      releasePredecessor()
+    }
+  })
+
+  it("inherits the reparented runtime key when the tab has no explicit id", () => {
+    const releasePredecessor = trackConversationView("tab-1", "g-main", -7)
+    surfaceH.tabStoreState.groupOf = { "tab-1": "g-next" }
+    surfaceH.tabStoreState.groupLayout = { type: "group", id: "g-next" }
+    surfaceH.conversations = [fullSummary(42, "completed")]
+    surfaceH.connStatus = "connected"
+    try {
+      render(
+        createElement(ConversationSessionSurface, {
+          ...surfaceProps(42),
+          groupId: "g-next",
+        })
+      )
+      expect(surfaceH.messageListProps?.conversationId).toBe(-7)
+    } finally {
+      releasePredecessor()
+    }
+  })
+
+  it("does not register or inherit a runtime key without a group id", () => {
+    const releasePredecessor = trackConversationView("tab-1", "g-main", -7)
+    surfaceH.tabStoreState.groupOf = { "tab-1": "g-next" }
+    surfaceH.tabStoreState.groupLayout = { type: "group", id: "g-next" }
+    surfaceH.conversations = [fullSummary(42, "completed")]
+    surfaceH.connStatus = "connected"
+    try {
+      render(createElement(ConversationSessionSurface, surfaceProps(42)))
+      expect(surfaceH.messageListProps?.conversationId).toBe(42)
+      expect(
+        reparentedViewRuntimeConversationId(tabRegistryState(), "tab-1")
+      ).toBe(-7)
+    } finally {
+      releasePredecessor()
+    }
+    expect(
+      reparentedViewRuntimeConversationId(tabRegistryState(), "tab-1")
+    ).toBeNull()
   })
 
   it("renders the retained reply after a bound draft remounts in another group", async () => {

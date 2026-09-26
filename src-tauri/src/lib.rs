@@ -90,7 +90,8 @@ mod tauri_app {
         acp as acp_commands, app_update as app_update_commands, automation as automation_commands,
         background as background_commands, backup, browser as browser_commands,
         canvas as canvas_commands, chat_authoring as chat_authoring_commands,
-        chat_channel as chat_channel_commands, config_sync, conversation_popout, conversations,
+        chat_channel as chat_channel_commands, clipboard as clipboard_commands, config_sync,
+        conversation_popout, conversations,
         custom_skills as custom_skills_commands, deepseek_settings as deepseek_settings_commands,
         delegation as delegation_commands, experts as experts_commands,
         feedback as feedback_commands, file_io, folder_commands, folder_links, folders,
@@ -425,6 +426,8 @@ mod tauri_app {
                 acp_commands::acp_get_agent_status,
                 acp_commands::acp_env_diagnostics,
                 acp_commands::acp_clear_binary_cache,
+                acp_commands::acp_scan_leaked_temp,
+                acp_commands::acp_reclaim_leaked_temp,
                 acp_commands::acp_download_agent_binary,
                 acp_commands::acp_install_uv_tool,
                 acp_commands::acp_detect_agent_local_version,
@@ -624,6 +627,7 @@ mod tauri_app {
                 notification::open_system_notification_settings,
                 file_io::save_binary_file,
                 file_io::save_text_file,
+                clipboard_commands::copy_files_to_clipboard,
                 browser_commands::browser_capabilities,
                 browser_commands::browser_open_tab,
                 browser_commands::browser_close,
@@ -1150,6 +1154,7 @@ mod tauri_app {
             .plugin(tauri_plugin_notification::init())
             .manage(ConnectionManager::new())
             .manage(crate::browser::BrowserRegistry::default())
+            .manage(crate::browser::egress::EgressRegistry::default())
             .manage(crate::browser::BrowserDownloads::default())
             .manage(crate::browser::DocGuests::default())
             .manage(crate::browser::confirm::EvalConsent::new())

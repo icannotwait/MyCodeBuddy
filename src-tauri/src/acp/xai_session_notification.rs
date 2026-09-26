@@ -2,7 +2,7 @@
 //!
 //! See design: `docs/superpowers/specs/2026-07-14-grok-compact-slash-acp-surfacing-design.md`
 
-use sacp::UntypedMessage;
+use agent_client_protocol::UntypedMessage;
 
 /// Call-site policy for private extension emission.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -154,7 +154,7 @@ pub fn resolve_context_window_size_from_parts(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sacp::UntypedMessage;
+    use agent_client_protocol::UntypedMessage;
 
     fn notif(method: &str, update: serde_json::Value) -> UntypedMessage {
         UntypedMessage::new(

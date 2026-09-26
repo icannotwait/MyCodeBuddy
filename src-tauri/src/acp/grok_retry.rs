@@ -1,6 +1,6 @@
 use std::collections::VecDeque;
 
-use sacp::UntypedMessage;
+use agent_client_protocol::UntypedMessage;
 
 const MAX_FAILED_WINDOWS: usize = 16;
 
@@ -190,7 +190,7 @@ fn parse_event_sequence(event_id: &str) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sacp::UntypedMessage;
+    use agent_client_protocol::UntypedMessage;
 
     fn standard(
         kind: &str,

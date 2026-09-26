@@ -43,6 +43,11 @@ interface GeneratedImagesBlockProps {
    * definition such blocks always carry a present `image`.
    */
   status?: ToolCallStatus | null
+  /**
+   * Snapshot dropped the preview bytes. Neutral placeholder only — a real
+   * `failed` status still renders as a failure.
+   */
+  previewOmitted?: boolean
   className?: string
 }
 
@@ -69,15 +74,16 @@ export const GeneratedImagesBlock = memo(function GeneratedImagesBlock({
   revisedPrompt,
   image,
   status,
+  previewOmitted = false,
   className,
 }: GeneratedImagesBlockProps) {
   const t = useTranslations("Folder.chat.messageList")
   const [previewOpen, setPreviewOpen] = useState(false)
-  // Treat `failed` (and the unusual `completed`-without-image case) as
-  // failure so the user gets a clear error indicator instead of a
-  // perpetual skeleton when codex reports the call ended without an image.
+  // Treat `failed` (and a completed call with an ordinary empty result) as
+  // failure. An omitted snapshot preview is not a failure.
   const isFailed =
-    image === null && (status === "failed" || status === "completed")
+    image === null &&
+    (status === "failed" || (status === "completed" && !previewOmitted))
 
   const { canCopy, copy, download } = useImageActions()
 
@@ -152,6 +158,13 @@ export const GeneratedImagesBlock = memo(function GeneratedImagesBlock({
               <AlertCircle className="h-6 w-6 opacity-80" />
               <span>{t("imageGenerationFailed")}</span>
             </div>
+          </div>
+        ) : previewOmitted ? (
+          <div
+            className="flex h-64 w-64 max-w-full shrink-0 items-center justify-center rounded-md border border-dashed border-border/70 bg-muted/40 px-3 text-center text-xs text-muted-foreground"
+            role="status"
+          >
+            <span>{t("imagePreviewOmitted")}</span>
           </div>
         ) : (
           <div

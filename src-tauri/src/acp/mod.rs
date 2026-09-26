@@ -1,4 +1,6 @@
 pub mod agent_mentions;
+pub mod agent_process;
+pub mod agent_session;
 pub mod antigravity_login;
 pub mod autonomous_activity;
 pub mod background_watch;
@@ -14,6 +16,7 @@ pub mod codex_model_catalog;
 pub mod connection;
 pub mod cursor_acp_retry_compat;
 pub mod cursor_enrichment;
+pub mod cursor_ext;
 pub mod cursor_store;
 mod cursor_store_proto;
 pub mod custom_registry;

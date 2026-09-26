@@ -6,7 +6,7 @@
 
 use std::collections::BTreeMap;
 
-use sacp::schema::{CreateTerminalRequest, Meta};
+use agent_client_protocol::schema::v1::{CreateTerminalRequest, Meta};
 
 use crate::acp::error::AcpError;
 use crate::acp::terminal_runtime::TerminalRuntimeError;
@@ -61,7 +61,7 @@ pub fn adapter_for(_agent_type: AgentType) -> &'static dyn AcpTerminalAdapter {
 mod tests {
     use super::*;
     use crate::terminal::shell::test_support::pwsh_spec as test_pwsh_spec;
-    use sacp::schema::SessionId;
+    use agent_client_protocol::schema::v1::SessionId;
 
     #[test]
     fn generic_adapter_preserves_request_and_shell() {

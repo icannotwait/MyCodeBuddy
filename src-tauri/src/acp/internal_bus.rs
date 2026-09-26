@@ -68,14 +68,16 @@ impl Deref for InternalEventEnvelope {
 }
 
 /// Whether this payload must reach the lifecycle worker for correctness
-/// (status CAS, external_id bind, terminal teardown). Mirrored by
-/// `lifecycle::is_lifecycle_relevant` — keep both in sync.
+/// (status CAS, external_id bind, transcript rollover, terminal teardown).
+/// Mirrored by `lifecycle::is_lifecycle_relevant` — keep both in sync.
+/// There is one critical ingress; callers do not open a second broadcast.
 pub fn is_lifecycle_critical(payload: &AcpEvent) -> bool {
     matches!(
         payload,
         AcpEvent::SessionStarted { .. }
             | AcpEvent::TurnComplete { .. }
             | AcpEvent::ConversationLinked { .. }
+            | AcpEvent::TranscriptRolledOver { .. }
             | AcpEvent::StatusChanged {
                 status: ConnectionStatus::Disconnected
             }
@@ -374,6 +376,7 @@ fn critical_payload_label(payload: &AcpEvent) -> &'static str {
         AcpEvent::TurnComplete { .. } => "TurnComplete",
         AcpEvent::SessionStarted { .. } => "SessionStarted",
         AcpEvent::ConversationLinked { .. } => "ConversationLinked",
+        AcpEvent::TranscriptRolledOver { .. } => "TranscriptRolledOver",
         AcpEvent::StatusChanged {
             status: ConnectionStatus::Disconnected,
         } => "StatusChanged(Disconnected)",
@@ -664,6 +667,78 @@ mod tests {
             "ContentDelta must not enter the critical lane"
         );
         assert_eq!(metrics.critical_lane_emit_count.load(Ordering::Relaxed), 0);
+    }
+
+    fn rollover_envelope(conn: &str, seq: u64, transcript_id: &str) -> Arc<EventEnvelope> {
+        Arc::new(EventEnvelope {
+            seq,
+            connection_id: conn.into(),
+            payload: AcpEvent::TranscriptRolledOver {
+                transcript_id: transcript_id.into(),
+            },
+        })
+    }
+
+    fn rollover_internal(conn: &str, seq: u64, transcript_id: &str) -> Arc<InternalEventEnvelope> {
+        Arc::new(InternalEventEnvelope {
+            event: rollover_envelope(conn, seq, transcript_id),
+            completion: None,
+        })
+    }
+
+    /// Transcript rollover is correctness-critical: the filter admits it, and
+    /// the existing per-destination ingress delivers it to the worker even
+    /// when that destination is saturated.
+    #[tokio::test]
+    async fn transcript_rollover_is_critical_and_reaches_worker_under_backpressure() {
+        assert!(is_lifecycle_critical(&AcpEvent::TranscriptRolledOver {
+            transcript_id: "S2".into(),
+        }));
+
+        let metrics = Arc::new(EventBusMetrics::default());
+        let bus = InternalEventBus::new(metrics.clone());
+        let mut critical = bus.lifecycle_ingress().take_receiver("c-roll");
+        bus.send_lifecycle(rollover_envelope("c-roll", 1, "S2"), None)
+            .await;
+        let got = tokio::time::timeout(Duration::from_secs(1), critical.recv())
+            .await
+            .expect("rollover recv timed out")
+            .expect("critical closed");
+        assert!(matches!(
+            got.payload,
+            AcpEvent::TranscriptRolledOver { ref transcript_id } if transcript_id == "S2"
+        ));
+        assert_eq!(metrics.critical_lane_emit_count.load(Ordering::Relaxed), 1);
+
+        let ingress = LifecycleIngress::new_with_capacity(1);
+        let mut rx = ingress.take_receiver("c-roll");
+        let hold = Arc::new(tokio::sync::Barrier::new(2));
+        let hold_worker = Arc::clone(&hold);
+        let (got_tx, mut got_rx) = mpsc::channel::<String>(4);
+        tokio::spawn(async move {
+            hold_worker.wait().await;
+            while let Some(env) = rx.recv().await {
+                match &env.payload {
+                    AcpEvent::TranscriptRolledOver { transcript_id } => {
+                        got_tx.send(transcript_id.clone()).await.unwrap();
+                    }
+                    other => panic!("expected TranscriptRolledOver, got {other:?}"),
+                }
+            }
+        });
+
+        ingress
+            .send(rollover_internal("c-roll", 1, "S1"))
+            .await
+            .expect("S1 fits in capacity 1");
+        let mut send_s2 = std::pin::pin!(ingress.send(rollover_internal("c-roll", 2, "S2")));
+        assert_send_pending(&mut send_s2);
+        hold.wait().await;
+        send_s2
+            .await
+            .expect("S2 must complete after the worker drains");
+        assert_eq!(got_rx.recv().await.expect("S1"), "S1");
+        assert_eq!(got_rx.recv().await.expect("S2"), "S2");
     }
 
     #[tokio::test]

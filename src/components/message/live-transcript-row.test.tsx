@@ -824,4 +824,72 @@ describe("LiveTranscriptRow", () => {
       meta: histTool.meta ?? null,
     })
   })
+
+  it("shows an omitted snapshot image as a placeholder, not a failure", () => {
+    seedLiveTools(CID, [
+      tool("img-done", {
+        title: "Image generation",
+        status: "completed",
+        images: [
+          {
+            data: "",
+            mime_type: "image/png",
+            uri: "codeg:omitted-oversized-image",
+          },
+        ],
+      }),
+    ])
+    renderRow()
+    expect(
+      screen.getByText(
+        "The image preview was not included in this snapshot."
+      )
+    ).toBeInTheDocument()
+    expect(screen.queryByText("Image generation failed")).not.toBeInTheDocument()
+    expect(
+      screen.queryByRole("button", { name: "Download image" })
+    ).not.toBeInTheDocument()
+    expect(screen.queryByRole("img")).not.toBeInTheDocument()
+  })
+
+  it("shows the omission placeholder for an in-progress sentinel image", () => {
+    seedLiveTools(CID, [
+      tool("img-live", {
+        title: "Image generation",
+        status: "in_progress",
+        images: [
+          {
+            data: "",
+            mime_type: "image/png",
+            uri: "codeg:omitted-oversized-image",
+          },
+        ],
+      }),
+    ])
+    renderRow()
+    expect(
+      screen.getByText(
+        "The image preview was not included in this snapshot."
+      )
+    ).toBeInTheDocument()
+    expect(screen.queryByText("Generating image…")).not.toBeInTheDocument()
+    expect(screen.queryByText("Image generation failed")).not.toBeInTheDocument()
+  })
+
+  it("still treats a completed empty image without the sentinel as a failure", () => {
+    seedLiveTools(CID, [
+      tool("img-empty", {
+        title: "Image generation",
+        status: "completed",
+        images: [{ data: "", mime_type: "image/png", uri: null }],
+      }),
+    ])
+    renderRow()
+    expect(screen.getByText("Image generation failed")).toBeInTheDocument()
+    expect(
+      screen.queryByText(
+        "The image preview was not included in this snapshot."
+      )
+    ).not.toBeInTheDocument()
+  })
 })

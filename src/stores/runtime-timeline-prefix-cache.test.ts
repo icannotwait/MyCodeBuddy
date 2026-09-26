@@ -309,4 +309,22 @@ describe("liveOwnsActiveTurn strips only the ACTIVE round", () => {
       "a2",
     ])
   })
+
+  it("keeps a persisted reply until live actually renders an assistant", () => {
+    const detail = makeDetail([turn("u1", "user"), turn("a1", "assistant")])
+    seedSession(CID, {
+      detail,
+      liveOwnsActiveTurn: true,
+      liveMessage: { ...liveMsg("m1", ""), content: [] },
+    })
+    expect(getTimelineTurns(CID).some((entry) => entry.turn.id === "a1")).toBe(
+      true
+    )
+    useConversationRuntimeStore
+      .getState()
+      .actions.setLiveMessage(CID, liveMsg("m1", "answer"), true)
+    expect(getTimelineTurns(CID).some((entry) => entry.turn.id === "a1")).toBe(
+      false
+    )
+  })
 })

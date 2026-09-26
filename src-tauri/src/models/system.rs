@@ -4,6 +4,12 @@ use serde::{Deserialize, Serialize};
 pub struct SystemProxySettings {
     pub enabled: bool,
     pub proxy_url: Option<String>,
+    /// Hosts that connect directly instead of through the proxy, as a
+    /// comma-separated list. Exported as `NO_PROXY` behind the loopback hosts
+    /// codeg always adds (see [`crate::network::proxy::no_proxy_env_value`]).
+    /// `#[serde(default)]` so rows stored before this field existed still parse.
+    #[serde(default)]
+    pub no_proxy: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -73,7 +79,7 @@ pub struct TerminalShellOption {
     /// i18n key resolved by the frontend (`GeneralSettings.<label_key>`).
     pub label_key: String,
     /// Concrete value persisted into `SystemTerminalSettings.default_shell`.
-    /// `None` for `system` (use `resolve_shell()`) and `custom` (user supplies path).
+    /// `None` for `system` (platform default) and `custom` (user supplies path).
     pub value: Option<String>,
     /// Whether this shell is currently resolvable on the host. `false` lets
     /// the UI mark the option as "not installed" without preventing selection.
@@ -89,7 +95,11 @@ pub struct AvailableTerminalShells {
     /// Resolved path for the *selected* setting (not only system default).
     /// Explicit/custom values surface their resolved executable when available,
     /// otherwise the stored value; system surfaces the system snapshot path.
+    ///
+    /// `resolved_shell` is this same string under the upstream field name.
     pub effective_shell: String,
+    /// Same value as `effective_shell`. Older clients still read this name.
+    pub resolved_shell: String,
 }
 
 /// What the main window's close button does.

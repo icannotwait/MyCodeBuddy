@@ -74,6 +74,7 @@ import {
   ContextCompactionCard,
   isContextCompactionMeta,
 } from "./context-compaction-card"
+import { contextCompactionSummary } from "@/lib/context-compaction"
 import { FeedbackCheckResultCard } from "./feedback-check-result-card"
 import { SearchResultsOutput } from "./search-results-output"
 import {
@@ -2885,7 +2886,13 @@ export const ToolCallPart = memo(function ToolCallPart({
   // with `_meta.contextCompaction` (not addressed by tool name) → a subtle
   // status card instead of the generic tool shell.
   if (isContextCompactionMeta(part.meta)) {
-    return <ContextCompactionCard state={part.state} meta={part.meta} />
+    return (
+      <ContextCompactionCard
+        state={part.state}
+        meta={part.meta}
+        summary={contextCompactionSummary(part.meta, part.output)}
+      />
+    )
   }
 
   // Agent/subagent tools get a dedicated container rendering
@@ -3519,6 +3526,7 @@ export const ContentPartsRenderer = memo(function ContentPartsRenderer(
           revisedPrompt={part.revisedPrompt}
           image={part.image}
           status={part.status}
+          previewOmitted={part.previewOmitted}
         />
       )
     }

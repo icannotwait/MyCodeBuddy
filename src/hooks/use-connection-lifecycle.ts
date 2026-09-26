@@ -2,13 +2,13 @@
 
 import { useCallback, useEffect, useRef, useState } from "react"
 import { useTranslations } from "next-intl"
-import { toast } from "sonner"
 import {
   useAcpActions,
   type ConnectionIntent,
 } from "@/contexts/acp-connections-context"
 import { useTaskContext } from "@/contexts/task-context"
 import { useConnection, type UseConnectionReturn } from "@/hooks/use-connection"
+import { notify } from "@/lib/notify"
 import { TurnBusyError } from "@/lib/turn-busy"
 import { ContinuationWaitingError } from "@/lib/continuation-waiting"
 import { getCurrentEffectiveAppLocale } from "@/lib/i18n"
@@ -678,7 +678,15 @@ export function useConnectionLifecycle({
         const message =
           appError?.message ??
           (e instanceof Error ? e.message : String(e ?? "unknown error"))
-        toast.error(t("errors.sendPromptFailed", { error: message }))
+        notify({
+          level: "error",
+          key: `send-failed:${contextKey}`,
+          title: t("errors.sendPromptFailed", { error: message }),
+        })
+        // Let the caller settle its optimistic state (roll back the phantom
+        // user turn, drop out of awaiting_persist so the queue keeps
+        // flushing). Runs after the notification so the state rollback can't hide
+        // the failure.
         onSendFailed?.(e)
         if (conn.sharedSession) throw e
         return null

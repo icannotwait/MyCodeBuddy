@@ -10,7 +10,6 @@ import {
   type ReactNode,
 } from "react"
 import { useTranslations } from "next-intl"
-import { toast } from "sonner"
 import { getEventStream } from "@/lib/platform"
 import { getTransport, isRemoteDesktopMode } from "@/lib/transport"
 import { subscribeDesktopAcpEvents } from "@/lib/transport/desktop-acp-events"
@@ -77,6 +76,7 @@ import {
   acpGetEventMetrics,
   acpReplayStreamingPerfFixture,
   getSystemRenderingSettings,
+  openSettingsWindow,
   type AcpDisconnectLease,
   type AcpDisconnectOrigin,
 } from "@/lib/api"
@@ -173,6 +173,7 @@ import type {
   AcpPromptContext,
   PromptInputBlock,
   ToolCallImageWire,
+  SnapshotTruncation,
   TurnOutcome,
   UserMessageBlock,
   PromptEnqueueResult,
@@ -182,9 +183,14 @@ import type {
 import {
   dismissSessionFailures,
   hasSettleableRetryIncident,
+  knownSessionFailureActions,
+  latestActiveTerminalFailure,
   mergeSessionFailures,
+  sessionFailureCategoryLabelKey,
+  sessionFailureNotice,
   settleSessionFailures,
   upsertSessionFailure,
+  type SessionFailureAction,
   type SessionFailureSettleScope,
 } from "@/lib/session-failures"
 import type {
@@ -199,6 +205,15 @@ import {
   mergeAsyncTasks,
   upsertAsyncTask,
 } from "@/lib/async-tasks"
+import { presentSessionNotice, splitHeadline } from "@/lib/session-notices"
+import {
+  acpErrorNotifiesDesktop,
+  isTurnFailureCode,
+  routeAcpError,
+  type AcpErrorLevel,
+} from "@/lib/acp-error-presentation"
+import { dismissNotification, notify, type NotifyAction } from "@/lib/notify"
+import { useAlertContext, type AlertAction } from "@/contexts/alert-context"
 import { getAgentLabel } from "@/lib/custom-agents"
 import {
   localizeConfigOptionLabel,
@@ -225,7 +240,6 @@ import {
   saveConfigPreference,
 } from "@/lib/selector-prefs-storage"
 import { rememberModelLabels } from "@/lib/model-label-store"
-import { useAlertContext, type AlertAction } from "@/contexts/alert-context"
 import { useActiveFolder } from "@/contexts/active-folder-context"
 
 /**
@@ -436,7 +450,17 @@ export interface ConnectionState {
    *  because the adapter keeps revising a finished task; the strip filters to
    *  the live ones itself. */
   asyncTasks: AsyncTaskRecord[]
+  /**
+   * One-line localized message for this session's current turn / connection
+   * error — what the connection-status popover shows. Only `session`-kind
+   * codes land here (see `routeAcpError`): the verdict on a click (a refused
+   * mode switch, a dropped image) is a notification and nothing more. The
+   * error itself was notified when it happened; this is the state it left.
+   * Cleared when the next prompt starts.
+   */
   error: string | null
+  /** `error` (red) or `warning` (amber) — how the popover tints `error`. */
+  errorLevel: AcpErrorLevel
   /**
    * Recoverable attach-protocol error. The agent process is still alive.
    * Cleared on a successful snapshot hydrate or when the user/WS retries.
@@ -618,6 +642,11 @@ export interface ConnectionState {
   ownerWindowLabel?: string | null
   /** Server-broker lease and authoritative queue projection. */
   sharedSession: SharedConnectionState | null
+  /**
+   * Omission counts from the latest accepted snapshot. `null` until a snapshot
+   * arrives, and a stale snapshot must not replace a newer value.
+   */
+  snapshotTruncation: SnapshotTruncation | null
 }
 
 export interface SharedConnectionState {
@@ -1163,7 +1192,13 @@ type Action =
       contextKey: string
       retry: ClaudeApiRetryState | null
     }
-  | { type: "ERROR"; contextKey: string; message: string }
+  | {
+      // A `session`-kind `error` event (see `routeAcpError`), localized.
+      type: "ERROR"
+      contextKey: string
+      message: string
+      level: AcpErrorLevel
+    }
   | {
       type: "ATTACH_ERROR"
       contextKey: string
@@ -1450,6 +1485,127 @@ export function __resetDesktopDeliveryFailedForTests(): void {
 
 export function __resetStreamingConfigForProviderTests(): void {
   __resetStreamingPerformanceConfigForTests()
+}
+
+/** Test-only: keep `pushMapped` on the rAF so one act can mix sources. */
+let holdIngestorFlushForTests = false
+export function __setHoldIngestorFlushForTests(hold: boolean): void {
+  if (process.env.NODE_ENV !== "test") return
+  holdIngestorFlushForTests = hold
+}
+
+type AcpTranslate = (
+  key: string,
+  params?: Record<string, string | number>
+) => string
+
+/**
+ * Localize a backend `error` by its stable `code`. Live events and a
+ * snapshot's `last_error` share this so a late attach reads the same sentence.
+ * Continuation codes stay param-free (cold projection uses the same keys).
+ * Unknown codes fall back to the raw message.
+ */
+function localizeBackendErrorMessage(
+  translate: AcpTranslate,
+  code: string | null | undefined,
+  message: string,
+  agentLabel: string
+): string {
+  if (isContinuationFailureCode(code)) {
+    return translate(continuationFailureI18nKey(code))
+  }
+  switch (code) {
+    case "initialize_timeout":
+      return translate("backendErrors.initializeTimeout", { agent: agentLabel })
+    case "mcp_rejected_by_agent":
+      return translate("backendErrors.mcpRejectedByAgent", {
+        agent: agentLabel,
+        message,
+      })
+    case "agent_auth_required":
+      return translate("backendErrors.agentAuthRequired", { agent: agentLabel })
+    case "sdk_not_installed":
+      return translate("blocked.sdkMissing", { agent: agentLabel })
+    case "platform_not_supported":
+      return translate("blocked.unavailable", { agent: agentLabel })
+    case "process_exited":
+      return translate("backendErrors.processExited", { agent: agentLabel })
+    case "spawn_failed":
+      return translate("backendErrors.spawnFailed", {
+        agent: agentLabel,
+        message,
+      })
+    case "download_failed":
+      return translate("backendErrors.downloadFailed", {
+        agent: agentLabel,
+        message,
+      })
+    case "turn_failed_refusal":
+      return translate("backendErrors.turnFailedRefusal", { agent: agentLabel })
+    case "turn_failed_max_tokens":
+      return translate("backendErrors.turnFailedMaxTokens", {
+        agent: agentLabel,
+      })
+    case "turn_failed_max_turn_requests":
+      return translate("backendErrors.turnFailedMaxTurnRequests", {
+        agent: agentLabel,
+      })
+    case "turn_failed_unknown":
+      return translate("backendErrors.turnFailedUnknown", { agent: agentLabel })
+    case "turn_failed_auth_required":
+      return translate("backendErrors.turnFailedAuthRequired", {
+        agent: agentLabel,
+      })
+    case "turn_failed_empty":
+      return translate("backendErrors.turnFailedEmpty", { agent: agentLabel })
+    case "turn_failed_empty_protocol":
+      return translate("backendErrors.turnFailedEmptyProtocol", {
+        agent: agentLabel,
+      })
+    case "turn_failed_empty_metadata":
+      return translate("backendErrors.turnFailedEmptyMetadata", {
+        agent: agentLabel,
+      })
+    case "grok_model_switch_incompatible_agent":
+      return translate("backendErrors.grokModelSwitchIncompatibleAgent", {
+        agent: agentLabel,
+      })
+    case "set_mode_failed":
+      return translate("backendErrors.setModeFailed", { agent: agentLabel })
+    case "set_config_option_failed":
+      return translate("backendErrors.setConfigOptionFailed", {
+        agent: agentLabel,
+      })
+    case "goal_control_failed":
+      return translate("backendErrors.goalControlFailed", { agent: agentLabel })
+    case "image_dropped":
+      return translate("backendErrors.imageDropped", { agent: agentLabel })
+    case "session_load_fallback":
+      return translate("backendErrors.sessionLoadFallback", {
+        agent: agentLabel,
+      })
+    default:
+      return message
+  }
+}
+
+/** Route + localize one backend error. `evidence` stays out of `text`. */
+function presentBackendError(
+  translate: AcpTranslate,
+  code: string | null | undefined,
+  message: string,
+  details: string | null | undefined,
+  agentLabel: string
+) {
+  const route = routeAcpError(code)
+  const text = localizeBackendErrorMessage(translate, code, message, agentLabel)
+  const raw = (message ?? "").trim()
+  return {
+    route,
+    text,
+    reason: route.rawAsDetail && raw && raw !== text ? raw : undefined,
+    evidence: details?.trim() || undefined,
+  }
 }
 const MAX_LIVE_TOOL_RAW_OUTPUT_CHARS = 200_000
 const MAX_BUFFERED_UNMAPPED_EVENTS_PER_CONNECTION = 64
@@ -2306,6 +2462,7 @@ function reduceSingleAction(
         asyncTasks: [],
         error: null,
         attachError: null,
+        errorLevel: "error",
         loadError: null,
         loadErrorCode: null,
         loadErrorCommand: null,
@@ -2331,6 +2488,7 @@ function reduceSingleAction(
         ownerOperationId: action.ownerOperationId ?? null,
         ownerWindowLabel: action.ownerWindowLabel ?? null,
         sharedSession: action.sharedSession ?? null,
+        snapshotTruncation: null,
       })
       return next
     }
@@ -2603,6 +2761,7 @@ function reduceSingleAction(
         asyncTasks: [],
         error: null,
         attachError: null,
+        errorLevel: "error",
         loadError: null,
         loadErrorCode: null,
         loadErrorCommand: null,
@@ -2625,6 +2784,7 @@ function reduceSingleAction(
         toolWatchdogMaxVersions: {},
         lastToolWatchdogDiagnostic: null,
         sharedSession: null,
+        snapshotTruncation: null,
       })
       return next
     }
@@ -2922,12 +3082,14 @@ function reduceSingleAction(
         conversationId: mergedConversationId,
         sessionFailures: mergedSessionFailures,
         asyncTasks: mergedAsyncTasks,
-        // Recover the latest runtime error only from a fresh snapshot. The
-        // stale path above deliberately preserves the current cleared value.
+        // Fresh snapshot only. The stale path above keeps a cleared in-memory
+        // error. Like `status`, this is state — never a notification.
         error: action.patch.lastError,
+        errorLevel: action.patch.lastErrorLevel,
         attachError: null,
         lastAppliedSeq: action.patch.eventSeq,
         sharedSession: mergedSharedSession,
+        snapshotTruncation: action.patch.snapshotTruncation ?? null,
       })
       effects?.push(() =>
         publishRequestUsage(mergedConversationId, EMPTY_REQUEST_USAGE)
@@ -4112,6 +4274,7 @@ function reduceSingleAction(
         ...conn,
         claudeApiRetry: null,
         error: action.message,
+        errorLevel: action.level,
       })
       return next
     }
@@ -4695,9 +4858,8 @@ function prepareMappedEnvelope(
   const actions: FrameAction[] = []
   const afterCommit: Array<() => void> = []
   const e = envelope
-  afterCommit.push(() => {
-    playEventSound(e)
-  })
+  // Sound and OS notifications are owned by the post-commit source gate.
+  // Replaying a frame a tick later must not depend on a stack mute.
 
   switch (e.type) {
     case "shared_session_phase_changed":
@@ -4834,6 +4996,13 @@ function prepareMappedEnvelope(
         requestId: e.request_id,
       })
       break
+    case "permission_queue_depth":
+      actions.push({
+        type: "PERMISSION_QUEUE_DEPTH",
+        contextKey,
+        depth: e.depth,
+      })
+      break
     case "question_request":
       actions.push({
         type: "SET_ASK_QUESTION",
@@ -4843,15 +5012,6 @@ function prepareMappedEnvelope(
           questions: e.questions,
           created_at: new Date().toISOString(),
         },
-      })
-      afterCommit.push(() => {
-        const fn = env.folderName
-        void notifyDesktop("question_request", {
-          title: fn ? `${fn} - Codeg` : "Codeg",
-          body: env.t("notificationQuestion", {
-            agent: getAgentLabel(snapshot.agentType),
-          }),
-        })
       })
       break
     case "question_resolved":
@@ -4896,7 +5056,6 @@ function prepareMappedEnvelope(
       const settled = e.settled
       const detailRefetch = e.detail_refetch === true
       const transcriptReset = e.transcript_reset === true
-      const agentType = snapshot.agentType
       afterCommit.push(() => {
         const conversationId = getConversationIdByExternalIdFromStore(sessionId)
         if ((turns && turns.length > 0) || transcriptReset) {
@@ -4935,47 +5094,17 @@ function prepareMappedEnvelope(
               preserveLive: true,
             })
         }
-        if (settled && settled.length > 0) {
-          const agentLabel = getAgentLabel(agentType)
-          const fn = env.folderName
-          const title = fn ? `${fn} - Codeg` : "Codeg"
-          const count = settled.length
-          const many = env.tChat("backgroundTasks.notifySettledMany", {
-            agent: agentLabel,
-            count,
-          })
-          const single = settled[0]!
-          void notifyDesktop("background_task", {
-            body:
-              count === 1
-                ? `${agentLabel}: ${
-                    single.summary ??
-                    env.tChat("backgroundTasks.settledFallback", {
-                      status: single.status,
-                    })
-                  }`
-                : many,
-            redactedBody:
-              count === 1
-                ? env.tChat("backgroundTasks.notifySettledOne", {
-                    agent: agentLabel,
-                  })
-                : many,
-            title,
-          })
-          if (conversationId != null) {
-            const runtimeActions =
-              useConversationRuntimeStore.getState().actions
-            for (const item of settled) {
-              if (!item.tool_use_id) continue
-              runtimeActions.resolveBackgroundTask(conversationId, {
-                toolUseId: item.tool_use_id,
-                taskId: item.task_id,
-                status: item.status,
-                summary: item.summary ?? null,
-                result: item.result ?? null,
-              })
-            }
+        if (settled && settled.length > 0 && conversationId != null) {
+          const runtimeActions = useConversationRuntimeStore.getState().actions
+          for (const item of settled) {
+            if (!item.tool_use_id) continue
+            runtimeActions.resolveBackgroundTask(conversationId, {
+              toolUseId: item.tool_use_id,
+              taskId: item.task_id,
+              status: item.status,
+              summary: item.summary ?? null,
+              result: item.result ?? null,
+            })
           }
         }
       })
@@ -4990,15 +5119,6 @@ function prepareMappedEnvelope(
         fallback_title: env.t("toolFallbackTitle"),
         fallback_kind: "tool",
         options: e.options,
-      })
-      const agentLabel = getAgentLabel(snapshot.agentType)
-      const fn = env.folderName
-      afterCommit.push(() => {
-        const title = fn ? `${fn} - Codeg` : "Codeg"
-        void notifyDesktop("permission_request", {
-          title,
-          body: `${agentLabel}: ${env.tChat("permissionDialog.subtitle")}`,
-        })
       })
       break
     }
@@ -5068,37 +5188,10 @@ function prepareMappedEnvelope(
       })
       break
     }
-    case "config_option_rejected": {
-      // Arrives immediately before the `session_config_options` carrying the
-      // value the agent actually adopted, so the notice and the selector
-      // settle together.
-      const agentType = snapshot.agentType
-      afterCommit.push(() => {
-        const option = localizeConfigOptionLabel(
-          agentType,
-          e.config_id,
-          e.option_name,
-          env.vocabularyT
-        )
-        const value = (id: string | undefined, fallback: string) =>
-          localizeConfigValueLabel(
-            agentType,
-            e.config_id,
-            id,
-            fallback,
-            env.vocabularyT
-          )
-        toast.warning(
-          env.t("configOptionAdjusted", {
-            agent: agentType ? getAgentLabel(agentType) : "",
-            option,
-            requested: value(e.requested_value, e.requested),
-            actual: value(e.actual_value, e.actual),
-          })
-        )
-      })
+    case "config_option_rejected":
+      // No store mutation. The verdict toast is an after-commit effect, gated
+      // on delivery source so a replay does not re-announce it.
       break
-    }
     case "session_config_stale":
       actions.push({
         type: "CONFIG_STALE_CHANGED",
@@ -5128,28 +5221,7 @@ function prepareMappedEnvelope(
         contextKey,
         projection,
       })
-      // Desktop-only hidden-app system notification once per (lease_id, version).
-      // Server/Web never dispatches a browser Notification for watchdog warnings.
-      // No tool input / command / prompt in title or body.
-      if (
-        (projection.phase === "warning" || projection.phase === "grace") &&
-        getTransport().isDesktop()
-      ) {
-        const conversationId = snapshot.conversationId ?? null
-        const agentLabel = getAgentLabel(snapshot.agentType)
-        const fn = env.folderName
-        const leaseId = projection.lease_id
-        const version = projection.version
-        afterCommit.push(() => {
-          maybeNotifyToolWatchdog(
-            leaseId,
-            version,
-            fn ? `${fn} - DrawCode` : "DrawCode",
-            `${agentLabel}: a foreground tool appears stalled`,
-            conversationId
-          )
-        })
-      }
+      // OS notification is owned by the post-commit source gate.
       break
     }
     case "selectors_ready": {
@@ -5203,6 +5275,9 @@ function prepareMappedEnvelope(
         contextKey,
         record: e.record,
       })
+      break
+    case "session_notice":
+      // Fire-and-forget. Nothing is stored; the toast is post-commit.
       break
     case "async_task":
       actions.push({
@@ -5272,110 +5347,27 @@ function prepareMappedEnvelope(
           }
         }
       }
-      const agentLabel = getAgentLabel(snapshot.agentType)
-      const fn = env.folderName
-      afterCommit.push(() => {
-        const title = fn ? `${fn} - Codeg` : "Codeg"
-        void notifyDesktop("turn_complete", {
-          title,
-          body: env.t("notificationTurnComplete", { agent: agentLabel }),
-        })
-      })
       break
     }
     case "error": {
       const agentLabel = getAgentLabel(snapshot.agentType)
-      const localizedMessage = (() => {
-        // Shared mapping with cold detail projection — keep in sync via
-        // continuationFailureI18nKey so live events cannot drift.
-        if (isContinuationFailureCode(e.code)) {
-          return env.t(continuationFailureI18nKey(e.code))
-        }
-        switch (e.code) {
-          case "initialize_timeout":
-            return env.t("backendErrors.initializeTimeout", {
-              agent: agentLabel,
-            })
-          case "sdk_not_installed":
-            return env.t("blocked.sdkMissing", { agent: agentLabel })
-          case "platform_not_supported":
-            return env.t("blocked.unavailable", { agent: agentLabel })
-          case "process_exited":
-            return env.t("backendErrors.processExited", { agent: agentLabel })
-          case "spawn_failed":
-            return env.t("backendErrors.spawnFailed", {
-              agent: agentLabel,
-              message: e.message,
-            })
-          case "download_failed":
-            return env.t("backendErrors.downloadFailed", {
-              agent: agentLabel,
-              message: e.message,
-            })
-          case "turn_failed_refusal":
-            return env.t("backendErrors.turnFailedRefusal", {
-              agent: agentLabel,
-            })
-          case "turn_failed_max_tokens":
-            return env.t("backendErrors.turnFailedMaxTokens", {
-              agent: agentLabel,
-            })
-          case "turn_failed_max_turn_requests":
-            return env.t("backendErrors.turnFailedMaxTurnRequests", {
-              agent: agentLabel,
-            })
-          case "turn_failed_unknown":
-            return env.t("backendErrors.turnFailedUnknown", {
-              agent: agentLabel,
-            })
-          case "turn_failed_auth_required":
-            return env.t("backendErrors.turnFailedAuthRequired", {
-              agent: agentLabel,
-            })
-          case "turn_failed_empty":
-            return env.t("backendErrors.turnFailedEmpty", { agent: agentLabel })
-          case "turn_failed_empty_protocol":
-            return env.t("backendErrors.turnFailedEmptyProtocol", {
-              agent: agentLabel,
-            })
-          case "turn_failed_empty_metadata":
-            return env.t("backendErrors.turnFailedEmptyMetadata", {
-              agent: agentLabel,
-            })
-          case "grok_model_switch_incompatible_agent":
-            return env.t("backendErrors.grokModelSwitchIncompatibleAgent", {
-              agent: agentLabel,
-            })
-          default:
-            return e.message
-        }
-      })()
-      const evidence = e.details?.trim() || undefined
-      const tooltipMessage = evidence
-        ? `${localizedMessage} ${env.t("backendErrors.detailsInAlerts")}`
-        : localizedMessage
-      actions.push({ type: "ERROR", contextKey, message: tooltipMessage })
-      afterCommit.push(() => {
-        env.pushAlert(
-          "error",
-          env.t("eventErrorTitle"),
-          localizedMessage,
-          undefined,
-          evidence
-        )
-        const fn = env.folderName
-        const title = fn ? `${fn} - Codeg` : "Codeg"
-        void notifyDesktop("error", {
-          title,
-          body: env.t("notificationError", {
-            agent: agentLabel,
-            message: localizedMessage,
-          }),
-          redactedBody: env.t("notificationErrorRedacted", {
-            agent: agentLabel,
-          }),
+      const { route, text } = presentBackendError(
+        env.t,
+        e.code,
+        e.message,
+        null,
+        agentLabel
+      )
+      // Transcript cards already show this. Action verdicts are notifications
+      // only. Session errors become standing state — without evidence text.
+      if (route.kind === "session") {
+        actions.push({
+          type: "ERROR",
+          contextKey,
+          message: text,
+          level: route.level,
         })
-      })
+      }
       break
     }
     case "session_load_failed": {
@@ -5562,6 +5554,7 @@ function onlyCursorChanged(
     before.availableCommands === after.availableCommands &&
     before.usage === after.usage &&
     before.error === after.error &&
+    before.errorLevel === after.errorLevel &&
     before.loadError === after.loadError &&
     before.loadErrorCode === after.loadErrorCode &&
     before.loadErrorCommand === after.loadErrorCommand &&
@@ -6395,10 +6388,34 @@ export interface ConnectPendingInfo {
   workingDir: string | null
 }
 
+/**
+ * Why the last `connect()` for a key failed: the error state of that
+ * surface's connection-status heart, and what keeps its notification's Retry
+ * live (see `notifyConnectError`).
+ *
+ * Same side-table shape as `ConnectPendingInfo`, for the same reason: a failed
+ * connect never produced a `ConnectionsMap` entry, so there is no
+ * `ConnectionState` to hang the failure on. Set by `connect()` alongside the
+ * notification; cleared, and its toast dismissed, when the next attempt
+ * starts, when the key is disconnected, or on `disconnectAll`.
+ */
+export interface ConnectErrorInfo {
+  agentType: AgentType
+  /** One line naming what failed ("Codex connection failed", "Claude Code's
+   *  ACP adapter is not installed"). */
+  title: string
+  /** Why, when there is more to say than the title. */
+  detail: string | null
+  /** The fix lives in Settings → Agents (install, enable, configure). */
+  opensAgentSettings: boolean
+}
+
 interface InternalStore {
   connections: ConnectionsMap
   /** contextKey → the in-flight `connect()` for it (see ConnectPendingInfo). */
   connectPending: Map<string, ConnectPendingInfo>
+  /** contextKey → why its last `connect()` failed (see ConnectErrorInfo). */
+  connectErrors: Map<string, ConnectErrorInfo>
   activeKey: string | null
   keyListeners: Map<string, Set<() => void>>
   activeKeyListeners: Set<() => void>
@@ -6412,6 +6429,9 @@ export interface ConnectionStoreApi {
    *  returned object is reference-stable for the lifetime of that connect, so
    *  it is safe as a `useSyncExternalStore` snapshot. */
   getConnectPending(key: string): ConnectPendingInfo | undefined
+  /** Why the last `connect()` for this key failed, or undefined. Reference-
+   *  stable until the next change, like `getConnectPending`. */
+  getConnectError(key: string): ConnectErrorInfo | undefined
   getActiveKey(): string | null
   subscribeKey(key: string, cb: () => void): () => void
   subscribeActiveKey(cb: () => void): () => void
@@ -6631,14 +6651,25 @@ export interface AcpActionsValue {
    */
   dismissConfigStale(contextKey: string): void
   /**
-   * Close AIR failure strips (client-local, like `dismissConfigStale`) — one
-   * call per strip, carrying every record that strip stood for. The records
-   * stay in the table as their revision watermarks, so this silences only what
-   * was on screen: a failure that is still real re-arms via a higher revision.
-   * Unlike the recovery actions this is NOT gated on owning the session — a
-   * viewer dismissing a strip only edits its own projection.
+   * Close AIR retry-incident strips (client-local, like `dismissConfigStale`)
+   * — one call per strip, carrying every record that strip stood for. The
+   * records stay in the table as their revision watermarks, so this silences
+   * only what was on screen: a failure that is still real re-arms via a higher
+   * revision. Unlike the recovery actions this is NOT gated on owning the
+   * session — a viewer dismissing a strip only edits its own projection.
    */
   dismissSessionFailures(contextKey: string, ids: string[]): void
+  /**
+   * Answer the recovery buttons that need the conversation view itself — a
+   * failure notification's "retry" (re-send the last prompt) and "new
+   * session". The view that owns `contextKey`'s session registers while it is
+   * mounted; a notification only offers those buttons while one is, and a
+   * click after it unmounted does nothing. Returns the unregister function.
+   */
+  registerSessionFailureActions(
+    contextKey: string,
+    handler: (action: SessionFailureAction) => void
+  ): () => void
 }
 
 function disconnectLeaseWithOrigin(
@@ -6748,6 +6779,43 @@ function isSharedSessionConfigConflict(error: unknown): boolean {
   )
 }
 
+/**
+ * One account of a failed turn (see `notifyTurnFailure`): an AIR terminal
+ * record — the adapter's own wording and recovery buttons — or codeg's
+ * `turn_failed_*` verdict, which may carry the agent's stderr tail.
+ */
+type TurnFailurePart =
+  | {
+      kind: "typed"
+      recordId: string
+      title: string
+      description?: string
+      actions: NotifyAction[]
+    }
+  | { kind: "verdict"; title: string; evidence?: string }
+
+/** A connect failure's notification key: one per surface. */
+function connectErrorNotificationKey(contextKey: string): string {
+  return `acp-connect:${contextKey}`
+}
+
+/** What a connection's current turn has told about its failures. */
+interface TurnFailureState {
+  /** Every notification this turn raised — what the next prompt retires. */
+  keys: Set<string>
+  /** AIR terminal record id → its notification's key. */
+  typedKeys: Map<string, string>
+  /** The latest typed account — the one a later verdict belongs with. */
+  lastTyped?: {
+    key: string
+    title: string
+    description?: string
+    actions: NotifyAction[]
+  }
+  /** codeg's verdict; `paired` once a typed account carries it. */
+  verdict?: { key: string; evidence?: string; paired: boolean }
+}
+
 // ── Provider ──
 
 export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
@@ -6756,16 +6824,43 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
   // re-label lives under its own catalogue (see `lib/agent-label-vocabulary`).
   const vocabularyT = useTranslations("AgentVocabulary")
   const tChat = useTranslations("Folder.chat")
-  const { pushAlert } = useAlertContext()
+  const tFailure = useTranslations("Folder.chat.sessionFailure")
   const { activeFolder: folder } = useActiveFolder()
   const folderNameRef = useRef(folder?.name)
   useEffect(() => {
     folderNameRef.current = folder?.name
   }, [folder?.name])
+  const { pushAlert } = useAlertContext()
   const pushAlertRef = useRef(pushAlert)
   useEffect(() => {
     pushAlertRef.current = pushAlert
   }, [pushAlert])
+  // Identity until `presentSnapshotPatch` is assigned later this render.
+  // Hydrate callbacks are stable and read the ref at call time.
+  const presentSnapshotPatchRef = useRef<
+    (contextKey: string, patch: SnapshotPatch) => SnapshotPatch
+  >((_contextKey, patch) => patch)
+  // Notice / OS / sound effects for one accepted frame. Assigned after the
+  // turn-failure callbacks exist; `commitEventFrame` only reads `.current`.
+  const applyAcceptedEventEffectsRef = useRef<
+    (
+      event: EventEnvelope,
+      byConnection: Map<string, AcceptedConnectionFrame>,
+      previous: ConnectionsMap,
+      next: ConnectionsMap,
+      shadows: Map<string, SessionFailureRecord[]>,
+      admittedTurnCompletes: ReadonlySet<string>
+    ) => void
+  >(() => {})
+  // contextKey → the conversation view's answer to a failure notification's
+  // "retry" / "new session" (see `registerSessionFailureActions`).
+  const sessionFailureActionsRef = useRef(
+    new Map<string, (action: SessionFailureAction) => void>()
+  )
+  // connectionId → what its current turn has told about its failures (see
+  // `notifyTurnFailure`); retired when the next prompt starts.
+  const turnFailuresRef = useRef(new Map<string, TurnFailureState>())
+  const turnFailureSerialRef = useRef(0)
 
   // Desktop notification click → select/focus the affected conversation.
   // Event name: `notification-navigate`
@@ -6847,6 +6942,7 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
   const storeRef = useRef<InternalStore>({
     connections: new Map(),
     connectPending: new Map(),
+    connectErrors: new Map(),
     activeKey: null,
     keyListeners: new Map(),
     activeKeyListeners: new Set(),
@@ -6857,12 +6953,6 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
   // bypass this entirely — their events are routed by the per-subscription
   // handlers registered in `attachSubscriptionsRef`.
   const reverseMapRef = useRef(new Map<string, string>())
-
-  // contextKey → diagnostic evidence already surfaced as an alert. The same
-  // error reaches us twice: live on the wire, and again in `last_error` on
-  // every re-attach snapshot. Without this a browser refresh would re-raise
-  // the alert each time.
-  const alertedErrorDetailsRef = useRef(new Map<string, string>())
 
   // contextKey → active EventStream subscription handle. Populated only for
   // connections established via the Subscribe-with-Snapshot attach
@@ -6929,6 +7019,9 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
   // duplicate, so a reconnect landing mid-connect would vanish silently.
   const connectSettledWaitersRef = useRef(new Map<string, Array<() => void>>())
   const connectRef = useRef<AcpActionsValue["connect"] | null>(null)
+  // `reconnect` for callbacks created before it is (a connect failure's
+  // "Retry").
+  const reconnectRef = useRef<AcpActionsValue["reconnect"] | null>(null)
 
   // Cancelable observer/handoff discovery delays (contextKey → cancel).
   const observerDelayCancelsRef = useRef(new Map<string, () => void>())
@@ -7148,24 +7241,6 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
         kind: "missing_config" | "disabled" | "unavailable" | "sdk_missing"
         reason: string
       }
-
-  const buildOpenAgentsSettingsAction = useCallback(
-    (agentType?: AgentType): AlertAction => {
-      const payload =
-        typeof agentType === "string"
-          ? JSON.stringify({
-              section: "agents",
-              agentType,
-            })
-          : "agents"
-      return {
-        label: t("actions.openAgentsSettings"),
-        kind: "open_agents_settings",
-        payload,
-      }
-    },
-    [t]
-  )
 
   const resolveConnectBlockState = useCallback(
     (agent: AcpAgentStatus | null): ConnectBlockState => {
@@ -8132,8 +8207,29 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
       for (const connection of prepared.renderChangedConnections) {
         notifyConnectionKeys(connection.contextKey)
       }
+      const byConnection = new Map(
+        frame.connections.map((part) => [part.connectionId, part])
+      )
+      // Seq of a turn_complete `admitTurnComplete` accepted. A refusal never
+      // reaches the reducer, so it is absent here.
+      const admittedTurnCompletes = new Set<string>()
+      for (const step of prepared.connectionSteps) {
+        if (step.completionRuntimeConversationIds == null) continue
+        admittedTurnCompletes.add(
+          `${step.connectionFrame.connectionId}:${step.connectionFrame.highestSeq}`
+        )
+      }
+      const failureShadows = new Map<string, SessionFailureRecord[]>()
       for (const event of frame.rawEventsInDeliveryOrder) {
         notifyRawSubscribers(event)
+        applyAcceptedEventEffectsRef.current(
+          event,
+          byConnection,
+          previous,
+          next,
+          failureShadows,
+          admittedTurnCompletes
+        )
       }
       // Desktop path has no EventStream onDetached: broker exit arrives as
       // status_changed(disconnected). Fire the same one-shot handoff re-entry
@@ -8173,6 +8269,69 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
       notifyKeyListeners(key)
     },
     [notifyKeyListeners]
+  )
+
+  /** Publish (or retire) why the last `connect()` for a key failed — see
+   *  `ConnectErrorInfo`. Same per-key listener set as `setConnectPending`.
+   *  Retiring one (a new attempt starting, the surface letting go) also takes
+   *  its notification's toast off the screen: it no longer says what is true,
+   *  and its Retry would act on nothing. */
+  const setConnectError = useCallback(
+    (key: string, info: ConnectErrorInfo | null) => {
+      const { connectErrors } = storeRef.current
+      if (info === null) {
+        if (!connectErrors.delete(key)) return
+        dismissNotification(connectErrorNotificationKey(key))
+      } else {
+        connectErrors.set(key, info)
+      }
+      notifyKeyListeners(key)
+    },
+    [notifyKeyListeners]
+  )
+
+  /**
+   * Tell the user a `connect()` failed — the notification that goes with
+   * `setConnectError` (which the connection-status heart shows). "Open Agents
+   * settings" when the fix lives there; "Retry" re-runs the connect, on the
+   * toast only, and only while this failure is still the key's latest — the
+   * surface closing or a newer attempt starting retires it, and a retry then
+   * would spawn an agent for a tab that is gone, or race the attempt running.
+   */
+  const notifyConnectError = useCallback(
+    (contextKey: string, info: ConnectErrorInfo) => {
+      const actions: NotifyAction[] = []
+      if (info.opensAgentSettings) {
+        actions.push({
+          label: t("actions.openAgentsSettings"),
+          onClick: () => {
+            openSettingsWindow("agents", { agentType: info.agentType }).catch(
+              (err) => {
+                console.error("[AcpConnections] open agent settings:", err)
+              }
+            )
+          },
+        })
+      }
+      actions.push({
+        label: t("actions.retry"),
+        onClick: () => {
+          if (storeRef.current.connectErrors.get(contextKey) !== info) return
+          void reconnectRef.current?.(contextKey).catch(() => {
+            // A failed retry publishes (and notifies) its own failure.
+          })
+        },
+        toastOnly: true,
+      })
+      notify({
+        level: "error",
+        key: connectErrorNotificationKey(contextKey),
+        title: info.title,
+        description: info.detail,
+        actions,
+      })
+    },
+    [t]
   )
 
   // ── Dispatch (replaces useReducer dispatch) ──
@@ -8339,6 +8498,9 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
       },
       getConnectPending(key: string) {
         return storeRef.current.connectPending.get(key)
+      },
+      getConnectError(key: string) {
+        return storeRef.current.connectErrors.get(key)
       },
       getActiveKey() {
         return storeRef.current.activeKey
@@ -8547,6 +8709,181 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
     [flushStreamingQueue]
   )
 
+  const registerSessionFailureActions = useCallback(
+    (contextKey: string, handler: (action: SessionFailureAction) => void) => {
+      const handlers = sessionFailureActionsRef.current
+      handlers.set(contextKey, handler)
+      return () => {
+        if (handlers.get(contextKey) === handler) handlers.delete(contextKey)
+      }
+    },
+    []
+  )
+
+  /** The mounted view answering `connectionId`'s failure buttons, if any.
+   *  Matched by connection rather than by the key a notification was raised
+   *  under: one connection can feed several surfaces, and only the owner's
+   *  view registers. */
+  const sessionFailureHandlerFor = useCallback((connectionId: string) => {
+    for (const [key, handler] of sessionFailureActionsRef.current) {
+      if (
+        storeRef.current.connections.get(key)?.connectionId === connectionId
+      ) {
+        return handler
+      }
+    }
+    return null
+  }, [])
+
+  /**
+   * A failure record's recovery buttons, for its notification. "Sign in" opens
+   * the agent's settings page and works from anywhere, the alert list
+   * included. "Retry" (re-send the last prompt) and "new session" need the
+   * conversation view: offered only while one is registered, looked up again
+   * at click time, and kept to the toast — later, in the list, they would act
+   * on whatever the conversation has become since.
+   */
+  const sessionFailureNotifyActions = useCallback(
+    (
+      connectionId: string,
+      agentType: AgentType,
+      record: SessionFailureRecord
+    ): NotifyAction[] => {
+      const actions: NotifyAction[] = []
+      for (const action of knownSessionFailureActions(record)) {
+        if (action === "login") {
+          actions.push({
+            label: tFailure("action.login"),
+            onClick: () => {
+              openSettingsWindow("agents", { agentType }).catch((err) => {
+                console.error("[AcpConnections] open agent settings:", err)
+              })
+            },
+          })
+        } else if (sessionFailureHandlerFor(connectionId)) {
+          actions.push({
+            label: tFailure(
+              action === "retry" ? "action.retry" : "action.newSession"
+            ),
+            onClick: () => sessionFailureHandlerFor(connectionId)?.(action),
+            toastOnly: true,
+          })
+        }
+      }
+      return actions
+    },
+    [sessionFailureHandlerFor, tFailure]
+  )
+
+  /**
+   * Tell a failed turn once. claude and codex report one failure twice — their
+   * typed AIR record, and codeg's `turn_failed_*` verdict on the same turn —
+   * in either order; the two are shown as ONE toast and ONE alert: the typed
+   * account's wording and buttons, the verdict's evidence behind the alert's
+   * disclosure. A verdict after the typed account only adds that evidence to
+   * the latest one's alert (the toast on screen already says it better); a
+   * typed account after a lone verdict takes that verdict's notification over.
+   * Any OTHER record — a second failure in the same turn, a session-level one
+   * while idle — is its own notification, and revisions of a record update it.
+   *
+   * The toast-only buttons (re-send the prompt, open a new session) act on the
+   * turn that failed, so they go inert once the next prompt starts — which
+   * also takes the turn's toasts off the screen (see `retireTurnFailures`).
+   */
+  const notifyTurnFailure = useCallback(
+    (connectionId: string, part: TurnFailurePart) => {
+      const states = turnFailuresRef.current
+      let state = states.get(connectionId)
+      if (!state) {
+        state = { keys: new Set(), typedKeys: new Map() }
+        states.set(connectionId, state)
+      }
+      const newKey = () =>
+        `acp-turn-failure:${connectionId}:${++turnFailureSerialRef.current}`
+
+      if (part.kind === "verdict") {
+        const typed = state.lastTyped
+        if (typed) {
+          state.verdict = {
+            key: typed.key,
+            evidence: part.evidence,
+            paired: true,
+          }
+          notify({
+            level: "error",
+            ...typed,
+            evidence: part.evidence,
+            bellOnly: true,
+          })
+          return
+        }
+        const key = state.verdict?.key ?? newKey()
+        state.verdict = { key, evidence: part.evidence, paired: false }
+        state.keys.add(key)
+        notify({
+          level: "error",
+          key,
+          title: part.title,
+          evidence: part.evidence,
+        })
+        return
+      }
+
+      let key = state.typedKeys.get(part.recordId)
+      if (!key) {
+        if (state.verdict && !state.verdict.paired) {
+          key = state.verdict.key
+          state.verdict.paired = true
+        } else {
+          key = newKey()
+        }
+      }
+      state.typedKeys.set(part.recordId, key)
+      state.keys.add(key)
+      const turnKey = key
+      const actions = part.actions.map((action) =>
+        action.toastOnly
+          ? {
+              ...action,
+              onClick: () => {
+                if (
+                  turnFailuresRef.current.get(connectionId)?.keys.has(turnKey)
+                ) {
+                  action.onClick()
+                }
+              },
+            }
+          : action
+      )
+      state.lastTyped = {
+        key,
+        title: part.title,
+        description: part.description,
+        actions,
+      }
+      notify({
+        level: "error",
+        key,
+        title: part.title,
+        description: part.description,
+        evidence:
+          state.verdict?.key === key ? state.verdict.evidence : undefined,
+        actions,
+      })
+    },
+    []
+  )
+
+  /** The turn is over for good — a new prompt, or the connection released:
+   *  its failure toasts come off the screen (the alert list keeps them), and
+   *  their toast-only buttons go inert with them. */
+  const retireTurnFailures = useCallback((connectionId: string) => {
+    const state = turnFailuresRef.current.get(connectionId)
+    if (!state) return
+    turnFailuresRef.current.delete(connectionId)
+    for (const key of state.keys) dismissNotification(key)
+  }, [])
+
   const waitForListenerReady = useCallback(async () => {
     const phase = listenerPhaseRef.current
     if (phase === "ready") return
@@ -8669,7 +9006,10 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
             return
           }
           flushStreamingQueue(contextKey)
-          const patch = denormalizeSnapshot(snapshot)
+          const patch = presentSnapshotPatchRef.current(
+            contextKey,
+            denormalizeSnapshot(snapshot)
+          )
           dispatch({ type: "HYDRATE_FROM_SNAPSHOT", contextKey, patch })
           seedDelegationsFromSnapshotRef.current(
             patch.connectionId,
@@ -8775,7 +9115,10 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
               removeDeadCanonicalAndFireHandoff(contextKey, range.connection_id)
               return
             }
-            const patch = denormalizeSnapshot(snapshot)
+            const patch = presentSnapshotPatchRef.current(
+              contextKey,
+              denormalizeSnapshot(snapshot)
+            )
             dispatch({ type: "HYDRATE_FROM_SNAPSHOT", contextKey, patch })
             seedDelegationsFromSnapshotRef.current(
               patch.connectionId,
@@ -8788,6 +9131,7 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
               type: "ERROR",
               contextKey,
               message: failMessage,
+              level: "error",
             })
           } catch (err) {
             console.warn(
@@ -8855,10 +9199,12 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
       // Desktop-sourced deltas (unmapped-buffer drain) also stay on the
       // ingestor so transcript frames keep `deliverySource: "desktop"`.
       // The flush window only holds live attach ticks (`emitAcpEvent`).
-      if (!streamingOnly || source === "desktop") {
+      // Replay (and desktop) must enter the ingestor so provenance survives
+      // a deferred commit. Only live attach ticks use the flush window.
+      if (!streamingOnly || source !== "live") {
         flushStreamingQueue(contextKey)
         ingestor.pushMapped(contextKey, events, source)
-        if (flush) ingestor.flushNow()
+        if (flush && !holdIngestorFlushForTests) ingestor.flushNow()
         return
       }
 
@@ -8871,7 +9217,7 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
           (conn && stamped.seq > conn.lastAppliedSeq + 1)
         ) {
           ingestor.pushMapped(contextKey, [stamped], source)
-          if (flush) ingestor.flushNow()
+          if (flush && !holdIngestorFlushForTests) ingestor.flushNow()
           continue
         }
         if (
@@ -8958,44 +9304,373 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
   )
   seedDelegationsFromSnapshotRef.current = seedDelegationsFromSnapshot
 
-  // Surface diagnostic evidence carried by a snapshot's `last_error`.
-  //
-  // Alerts are live-only, so a client that attached AFTER the error fired
-  // (browser refresh, second tab, cold attach mid-session) would otherwise
-  // never learn why the turn came back empty — the snapshot is its only
-  // channel. Scoped to errors that actually carry evidence, i.e. the inferred
-  // `turn_failed_empty*` family, so attaching to a connection with any older
-  // error doesn't start raising alerts it never used to.
-  //
-  // Same routing rules as the live path: evidence goes to the alert only,
-  // never to `conn.error` (composer tooltip) and never to an OS notification.
-  // Held in a ref, following `pushAlertRef` above: the attach/hydrate
-  // callbacks below are deliberately identity-stable (an empty dep array keeps
-  // a re-render from tearing down and re-establishing live subscriptions), so
-  // they must not close over a `t`-dependent callback directly.
-  const surfaceSnapshotErrorDetails = useCallback(
+  const applyAcceptedEventEffects = useCallback(
     (
-      contextKey: string,
-      patch: import("@/lib/snapshot-denormalize").SnapshotPatch
+      event: EventEnvelope,
+      byConnection: Map<string, AcceptedConnectionFrame>,
+      previous: ConnectionsMap,
+      next: ConnectionsMap,
+      shadows: Map<string, SessionFailureRecord[]>,
+      admittedTurnCompletes: ReadonlySet<string>
     ) => {
-      const evidence = patch.lastErrorDetails?.trim()
-      if (!evidence) return
-      if (alertedErrorDetailsRef.current.get(contextKey) === evidence) return
-      alertedErrorDetailsRef.current.set(contextKey, evidence)
-      pushAlertRef.current(
-        "error",
-        t("eventErrorTitle"),
-        patch.lastError ?? undefined,
-        undefined,
-        evidence
+      const source = byConnection
+        .get(event.connection_id)
+        ?.eventDeliverySourceBySeq?.get(event.seq)
+      // Missing provenance fails closed. Never treat it as desktop.
+      const mayNotify = source === "desktop" || source === "live"
+      const turnCompleteAdmitted =
+        event.type === "turn_complete" &&
+        admittedTurnCompletes.has(`${event.connection_id}:${event.seq}`)
+      const part = byConnection.get(event.connection_id)
+      const translate = t as unknown as AcpTranslate
+      const contextKey = resolveContextKeyForConnection(
+        event.connection_id,
+        part?.contextKey ?? event.connection_id,
+        reverseMapRef.current,
+        previous
       )
+      const pre = previous.get(contextKey)
+      const resolvedKey = pre
+        ? contextKey
+        : resolveContextKeyForConnection(
+            event.connection_id,
+            part?.contextKey ?? event.connection_id,
+            reverseMapRef.current,
+            next
+          )
+      // Prefer the pre-frame connection. A connection created in this frame
+      // is only on the post-commit map.
+      const conn = pre ?? next.get(resolvedKey)
+      // The row `prepareEventFrame` updates. Two store rows can share one
+      // connectionId; the first of those is not this surface's watermark.
+      const shadowKey = pre ? contextKey : resolvedKey
+      const shadow = (): SessionFailureRecord[] => {
+        const existing = shadows.get(shadowKey)
+        if (existing) return existing
+        const seeded = pre?.sessionFailures.slice() ?? []
+        shadows.set(shadowKey, seeded)
+        return seeded
+      }
+      const replaceShadow = (table: SessionFailureRecord[]) => {
+        shadows.set(shadowKey, table)
+      }
+      const desktopTitle = () => {
+        const fn = folderNameRef.current
+        return fn ? `${fn} - Codeg` : "Codeg"
+      }
+
+      // One owner: live streaming deltas that bypass the ingestor play in
+      // `pushMappedEvents`. Everything accepted into this frame plays here.
+      // A refused turn_complete is not an accepted completion.
+      if (
+        mayNotify &&
+        (event.type !== "turn_complete" || turnCompleteAdmitted)
+      ) {
+        playEventSound(event)
+      }
+
+      switch (event.type) {
+        case "status_changed":
+          if (event.status === "prompting") {
+            replaceShadow(settleSessionFailures(shadow(), "all"))
+            retireTurnFailures(conn?.connectionId ?? event.connection_id)
+          }
+          break
+        case "content_delta":
+        case "thinking":
+        case "tool_call":
+          replaceShadow(settleSessionFailures(shadow(), "retry_incidents"))
+          break
+        case "turn_complete": {
+          if (!turnCompleteAdmitted) break
+          if (event.stop_reason === "end_turn") {
+            replaceShadow(settleSessionFailures(shadow(), "warnings"))
+          }
+          if (!mayNotify || event.stop_reason !== "end_turn" || !conn) break
+          const agentLabel = getAgentLabel(conn.agentType)
+          const title = desktopTitle()
+          const failure = latestActiveTerminalFailure(shadow())
+          if (failure) {
+            void notifyDesktop("error", {
+              title,
+              body: translate("notificationError", {
+                agent: agentLabel,
+                message:
+                  failure.title.trim() ||
+                  tFailure("category.unknown"),
+              }),
+              redactedBody: translate("notificationErrorRedacted", {
+                agent: agentLabel,
+              }),
+            })
+          } else {
+            void notifyDesktop("turn_complete", {
+              title,
+              body: translate("notificationTurnComplete", { agent: agentLabel }),
+            })
+          }
+          break
+        }
+        case "question_request":
+          if (mayNotify && conn) {
+            void notifyDesktop("question_request", {
+              title: desktopTitle(),
+              body: translate("notificationQuestion", {
+                agent: getAgentLabel(conn.agentType),
+              }),
+            })
+          }
+          break
+        case "permission_request":
+          if (mayNotify && conn) {
+            const agentLabel = getAgentLabel(conn.agentType)
+            void notifyDesktop("permission_request", {
+              title: desktopTitle(),
+              body: `${agentLabel}: ${tChat("permissionDialog.subtitle")}`,
+            })
+          }
+          break
+        case "background_activity":
+          if (mayNotify && conn && event.settled && event.settled.length > 0) {
+            const agentLabel = getAgentLabel(conn.agentType)
+            const count = event.settled.length
+            const many = tChat("backgroundTasks.notifySettledMany", {
+              agent: agentLabel,
+              count,
+            })
+            const single = event.settled[0]!
+            void notifyDesktop("background_task", {
+              body:
+                count === 1
+                  ? `${agentLabel}: ${
+                      single.summary ??
+                      tChat("backgroundTasks.settledFallback", {
+                        status: single.status,
+                      })
+                    }`
+                  : many,
+              redactedBody:
+                count === 1
+                  ? tChat("backgroundTasks.notifySettledOne", {
+                      agent: agentLabel,
+                    })
+                  : many,
+              title: desktopTitle(),
+            })
+          }
+          break
+        case "tool_watchdog_changed": {
+          const projection = event.projection
+          if (
+            mayNotify &&
+            conn &&
+            (projection.phase === "warning" || projection.phase === "grace") &&
+            getTransport().isDesktop()
+          ) {
+            const fn = folderNameRef.current
+            maybeNotifyToolWatchdog(
+              projection.lease_id,
+              projection.version,
+              fn ? `${fn} - DrawCode` : "DrawCode",
+              `${getAgentLabel(conn.agentType)}: a foreground tool appears stalled`,
+              conn.conversationId ?? null
+            )
+          }
+          break
+        }
+        case "session_failure": {
+          const table = shadow()
+          const stored = table.find((f) => f.id === event.record.id)
+          const noticeKind = sessionFailureNotice(stored, event.record)
+          replaceShadow(upsertSessionFailure(table, event.record))
+          if (!mayNotify || noticeKind == null || !conn) break
+          const headline = splitHeadline(event.record.title, event.record.details)
+          const title = translate("noticeTitle", {
+            agent: getAgentLabel(conn.agentType),
+            title:
+              headline?.title ??
+              tFailure(sessionFailureCategoryLabelKey(event.record.category)),
+          })
+          const description = headline
+            ? headline.description
+            : event.record.details?.trim() || undefined
+          if (noticeKind === "advisory") {
+            notify({
+              level: "warning",
+              key: `acp-failure:${conn.connectionId}:${event.record.id}`,
+              title,
+              description,
+            })
+            break
+          }
+          notifyTurnFailure(conn.connectionId, {
+            kind: "typed",
+            recordId: event.record.id,
+            title,
+            description,
+            actions: conn.isViewer
+              ? []
+              : sessionFailureNotifyActions(
+                  conn.connectionId,
+                  conn.agentType,
+                  event.record
+                ),
+          })
+          break
+        }
+        case "session_notice": {
+          if (!mayNotify) break
+          const notice = presentSessionNotice(
+            conn?.connectionId ?? event.connection_id,
+            event.notice
+          )
+          if (!notice) break
+          notify({
+            level: notice.level,
+            key: notice.id,
+            title: conn
+              ? translate("noticeTitle", {
+                  agent: getAgentLabel(conn.agentType),
+                  title: notice.title,
+                })
+              : notice.title,
+            description: notice.description,
+          })
+          break
+        }
+        case "config_option_rejected": {
+          if (!mayNotify) break
+          const agentType = conn?.agentType
+          const option = localizeConfigOptionLabel(
+            agentType,
+            event.config_id,
+            event.option_name,
+            vocabularyT
+          )
+          const value = (id: string | undefined, fallback: string) =>
+            localizeConfigValueLabel(
+              agentType,
+              event.config_id,
+              id,
+              fallback,
+              vocabularyT
+            )
+          notify({
+            level: "warning",
+            key: `acp-config-adjusted:${conn?.connectionId ?? event.connection_id}:${event.config_id}`,
+            title: translate("configOptionAdjusted", {
+              agent: agentType ? getAgentLabel(agentType) : "",
+              option,
+              requested: value(event.requested_value, event.requested),
+              actual: value(event.actual_value, event.actual),
+            }),
+          })
+          break
+        }
+        case "error": {
+          const agentLabel = conn
+            ? getAgentLabel(conn.agentType)
+            : getAgentLabel(event.agent_type as AgentType)
+          const presented = presentBackendError(
+            translate,
+            event.code,
+            event.message,
+            event.details,
+            agentLabel
+          )
+          if (presented.route.kind === "transcript") break
+          if (mayNotify && conn && acpErrorNotifiesDesktop(presented.route)) {
+            void notifyDesktop("error", {
+              title: desktopTitle(),
+              body: translate("notificationError", {
+                agent: agentLabel,
+                message: presented.text,
+              }),
+              redactedBody: translate("notificationErrorRedacted", {
+                agent: agentLabel,
+              }),
+            })
+          }
+          if (!mayNotify) break
+          const connKey = conn?.connectionId ?? event.connection_id
+          if (isTurnFailureCode(event.code)) {
+            notifyTurnFailure(connKey, {
+              kind: "verdict",
+              title: presented.text,
+              evidence: presented.evidence,
+            })
+            break
+          }
+          notify({
+            level: presented.route.level,
+            key: `acp-error:${connKey}:${event.code || event.message}`,
+            title: presented.text,
+            description: presented.reason,
+            evidence: presented.evidence,
+          })
+          break
+        }
+        default:
+          break
+      }
+    },
+    [
+      notifyTurnFailure,
+      retireTurnFailures,
+      sessionFailureNotifyActions,
+      t,
+      tChat,
+      tFailure,
+      vocabularyT,
+    ]
+  )
+  applyAcceptedEventEffectsRef.current = applyAcceptedEventEffects
+
+  // Present a snapshot's `last_error` the way the live `error` event would
+  // have been presented, before the patch hydrates the store.
+  //
+  // The wire carries the backend's raw English message plus its stable code;
+  // hydrating that as-is made a refreshed browser (or a second client, or a
+  // cold attach mid-session) show a different, untranslated sentence than the
+  // client that watched the error happen. And only a `session`-kind error is
+  // session state at all: an action verdict or a transcript card, replayed as
+  // the session's standing error, would invent a problem.
+  //
+  // Held in a ref: the attach/hydrate callbacks below are deliberately
+  // identity-stable (an empty dep array keeps a re-render from tearing down
+  // and re-establishing live subscriptions), so they must not close over a
+  // `t`-dependent callback directly.
+  const presentSnapshotPatch = useCallback(
+    (contextKey: string, patch: SnapshotPatch): SnapshotPatch => {
+      // `null` is "no error". A patch that omits the field (test doubles, an
+      // older snapshot) is the same: there is nothing to localize.
+      if (typeof patch.lastError !== "string") return patch
+      const route = routeAcpError(patch.lastErrorCode)
+      const conn = storeRef.current.connections.get(contextKey)
+      if (route.kind !== "session") {
+        // Never session state when it happened. The backend keeps only its
+        // LATEST error, so this says nothing about a session error from before
+        // it — keep whatever this client still holds (a fresh client simply
+        // holds nothing).
+        return {
+          ...patch,
+          lastError: conn?.error ?? null,
+          lastErrorLevel: conn?.errorLevel ?? "error",
+        }
+      }
+      const translate = t as unknown as AcpTranslate
+      const { text } = presentBackendError(
+        translate,
+        patch.lastErrorCode,
+        patch.lastError,
+        null,
+        conn ? getAgentLabel(conn.agentType) : ""
+      )
+      return { ...patch, lastError: text, lastErrorLevel: route.level }
     },
     [t]
   )
-  const surfaceSnapshotErrorDetailsRef = useRef(surfaceSnapshotErrorDetails)
-  useEffect(() => {
-    surfaceSnapshotErrorDetailsRef.current = surfaceSnapshotErrorDetails
-  }, [surfaceSnapshotErrorDetails])
+  presentSnapshotPatchRef.current = presentSnapshotPatch
 
   // Open a Subscribe-with-Snapshot stream for `connectionId` and route its
   // frames into the store under `contextKey`. Returns the subscription
@@ -9110,7 +9785,11 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
           // should see the same state it would have seen with no coalescing
           // at all.
           flushStreamingQueue(contextKey)
-          const patch = denormalizeSnapshot(snapshot)
+          const rawPatch = denormalizeSnapshot(snapshot)
+          const patch = presentSnapshotPatchRef.current(
+            contextKey,
+            rawPatch
+          )
           const detailRevision = patch.backgroundDetailRevision ?? 0
           const transcriptGeneration = patch.backgroundTranscriptGeneration ?? 0
           const recoverBackgroundDetail =
@@ -9134,7 +9813,6 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
             patch
           )
           dispatch({ type: "HYDRATE_FROM_SNAPSHOT", contextKey, patch })
-          surfaceSnapshotErrorDetailsRef.current(contextKey, patch)
           lastActivityRef.current.set(contextKey, Date.now())
           seedDelegationsFromSnapshot(
             patch.connectionId,
@@ -9915,7 +10593,10 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
             continue
           }
 
-          const patch = denormalizeSnapshot(snapshotPayload)
+          const patch = presentSnapshotPatchRef.current(
+            contextKey,
+            denormalizeSnapshot(snapshotPayload)
+          )
           if (
             storeRef.current.connections.get(contextKey)?.connectionId !==
             connectionId
@@ -10011,7 +10692,12 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
           null
         try {
           const snapshot = await acpGetSessionSnapshot(connectionId)
-          if (snapshot) patch = denormalizeSnapshot(snapshot)
+          if (snapshot) {
+            patch = presentSnapshotPatchRef.current(
+              contextKey,
+              denormalizeSnapshot(snapshot)
+            )
+          }
         } catch (e) {
           console.warn(
             "[acp-context] claim ownership snapshot failed for",
@@ -10412,14 +11098,15 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
         return false
       }
       if (patch) {
+        const hydrated = presentSnapshotPatchRef.current(connectionId, patch)
         const leftoverRuntimeIds = leftoverLiveRuntimeIdsForHydrate(
           storeRef.current.connections.get(connectionId),
-          patch
+          hydrated
         )
         dispatch({
           type: "HYDRATE_FROM_SNAPSHOT",
           contextKey: connectionId,
-          patch,
+          patch: hydrated,
         })
         seedDelegationsFromSnapshot(
           patch.connectionId,
@@ -10596,6 +11283,18 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
         agentType,
         workingDir: workingDir ?? null,
       })
+      // A new attempt retires the last one's failure: the heart gives way to
+      // the `connecting` state and turns red again only if THIS attempt fails
+      // too.
+      setConnectError(contextKey, null)
+      // Publish THIS attempt's failure — unless the surface let go of the
+      // attempt meanwhile (`disconnect()` marks it abandoned): a late
+      // rejection must not report a failure over whatever it does next.
+      const publishConnectError = (info: ConnectErrorInfo) => {
+        if (abandonedKeysRef.current.has(contextKey)) return
+        setConnectError(contextKey, info)
+        notifyConnectError(contextKey, info)
+      }
 
       let configuredAgent: AcpAgentStatus | null = null
       try {
@@ -10885,41 +11584,47 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
         // not installed. The session page must never trigger a download
         // or install — if the agent is not ready, prompt the user to
         // install it from Agent Settings instead.
+        //
+        // Every failure below is published with `publishConnectError` — a
+        // notification with the settings / retry actions, and the error state
+        // of the surface's connection-status heart. It is thrown as an
+        // "alerted" error so the catch-all at the bottom doesn't publish a
+        // second, vaguer copy of it.
         try {
           configuredAgent = await acpGetAgentStatus(agentType)
         } catch (error) {
           const reason = t("unableReadAgentConfig", {
             message: normalizeErrorMessage(error),
           })
-          const failedTitle = t("connectFailedTitle", {
-            agent: getAgentLabel(agentType),
+          publishConnectError({
+            agentType,
+            title: t("connectFailedTitle", { agent: getAgentLabel(agentType) }),
+            detail: reason,
+            opensAgentSettings: true,
           })
-          pushAlertRef.current(
-            "error",
-            failedTitle,
-            `${reason}\n${t("agentsSetupHint")}`,
-            [buildOpenAgentsSettingsAction(agentType)]
-          )
           throw createAlertedError(reason)
         }
 
         const blocked = resolveConnectBlockState(configuredAgent)
         if (blocked.kind !== "none") {
-          const failedTitle = t("connectFailedTitle", {
-            agent: getAgentLabel(agentType),
-          })
-          const detail =
+          // "…is not installed" is a whole headline on its own; the other
+          // blocks read as the reason a connect failed.
+          publishConnectError(
             blocked.kind === "sdk_missing"
-              ? t("withSetupHint", {
-                  message: blocked.reason,
-                  hint: t("agentsSetupHint"),
-                })
-              : `${blocked.reason}\n${t("agentsSetupHint")}`
-          pushAlertRef.current(
-            "error",
-            blocked.kind === "sdk_missing" ? blocked.reason : failedTitle,
-            detail,
-            [buildOpenAgentsSettingsAction(agentType)]
+              ? {
+                  agentType,
+                  title: blocked.reason,
+                  detail: null,
+                  opensAgentSettings: true,
+                }
+              : {
+                  agentType,
+                  title: t("connectFailedTitle", {
+                    agent: getAgentLabel(agentType),
+                  }),
+                  detail: blocked.reason,
+                  opensAgentSettings: true,
+                }
           )
           throw createAlertedError(blocked.reason)
         }
@@ -11349,9 +12054,8 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
             dispatch({
               type: "HYDRATE_FROM_SNAPSHOT",
               contextKey,
-              patch: snapshotPatch,
+              patch: presentSnapshotPatchRef.current(contextKey, snapshotPatch),
             })
-            surfaceSnapshotErrorDetailsRef.current(contextKey, snapshotPatch)
             // Recover delegation bindings from the snapshot here too. On
             // Tauri the firehose also delivers the events (so this is an
             // idempotent no-op), but it keeps RemoteDesktop and the legacy
@@ -11413,20 +12117,21 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
             appError?.code === "sdk_not_installed" ||
             message.includes("is not installed")
           if (sdkMissing) {
-            pushAlertRef.current(
-              "error",
-              configuredAgent?.is_acp_adapter
+            publishConnectError({
+              agentType,
+              title: configuredAgent?.is_acp_adapter
                 ? t("blocked.adapterMissing", { agent: agentLabel })
                 : t("blocked.sdkMissing", { agent: agentLabel }),
-              t("agentsSetupHint"),
-              [buildOpenAgentsSettingsAction(agentType)]
-            )
+              detail: t("agentsSetupHint"),
+              opensAgentSettings: true,
+            })
           } else {
-            pushAlertRef.current(
-              "error",
-              t("connectFailedTitle", { agent: agentLabel }),
-              message
-            )
+            publishConnectError({
+              agentType,
+              title: t("connectFailedTitle", { agent: agentLabel }),
+              detail: message,
+              opensAgentSettings: false,
+            })
           }
         }
         if (!superseded) {
@@ -11469,9 +12174,9 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
     [
       aliasKeysFor,
       applyMappedEnvelope,
-      buildOpenAgentsSettingsAction,
       canonicalKey,
       clearAliasesPointingTo,
+      captureIdentityBeforeRemoval,
       connectAsViewer,
       consumeBufferedEvents,
       dispatch,
@@ -11482,9 +12187,11 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
       markConnectionGone,
       recoverAfterSnapshotHydrate,
       releaseObserverAlias,
+      notifyConnectError,
       resolveConnectBlockState,
       seedDelegationsFromSnapshot,
       setActiveKey,
+      setConnectError,
       setConnectPending,
       setupAttachSubscription,
       t,
@@ -11503,6 +12210,8 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
       // Cancel in-flight observer discovery delays and handoff re-entry.
       cancelObserverDelay(contextKey)
       clearHandoffWatcher(contextKey)
+      // The last attempt's failure no longer describes this surface.
+      setConnectError(contextKey, null)
       // Always mark abandoned when connect is in flight for this key — even if
       // we only release an observer alias below. Mid-lookup discovery can still
       // complete after the delay is cancelled; without abandonedKeys the
@@ -11519,6 +12228,18 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
         // connect() is still in flight with no store entry yet — abandoned
         // already set above when connectingKeys has the key.
         return false
+      }
+      // The connection's failure toasts are over once it is torn down (the
+      // owner letting go kills the agent) or no surface is left on it — not
+      // while a viewer closes and another surface still shows it.
+      const connectionStillShown = Array.from(
+        storeRef.current.connections
+      ).some(
+        ([key, other]) =>
+          key !== contextKey && other.connectionId === conn.connectionId
+      )
+      if (!conn.isViewer || !connectionStillShown) {
+        retireTurnFailures(conn.connectionId)
       }
       // Before either branch drops the entry: an explicit teardown is also how
       // a `reconnect` starts, and the session it resumes may only ever have
@@ -11648,6 +12369,8 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
       clearAliasesPointingTo,
       dispatch,
       releaseObserverAlias,
+      retireTurnFailures,
+      setConnectError,
       teardownAttachSubscription,
     ]
   )
@@ -11843,6 +12566,8 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
     [connect, disconnect, resolveReconnectRequest, waitForConnectSettled]
   )
 
+  reconnectRef.current = reconnect
+
   const dismissConfigStale = useCallback(
     (contextKey: string) => {
       dispatch({ type: "DISMISS_CONFIG_STALE", contextKey })
@@ -11915,16 +12640,27 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
     // REMOVE_ALL; this call is the one ahead of the await below, which is the
     // window a still-armed timer would fire in.
     discardStreamingQueues()
-    // Context keys are reused across backends, so a surviving entry here would
-    // suppress the first snapshot alert of an unrelated session.
-    alertedErrorDetailsRef.current.clear()
+    // Context keys are reused across backends: a connect failure recorded for
+    // one must not greet whatever session reuses its key.
+    for (const key of Array.from(storeRef.current.connectErrors.keys())) {
+      setConnectError(key, null)
+    }
     // Same reuse hazard: remembered connect params must not let a reconnect
     // resurrect the previous backend's session under a recycled key.
     lastConnectParamsRef.current.clear()
+    for (const connectionId of Array.from(turnFailuresRef.current.keys())) {
+      retireTurnFailures(connectionId)
+    }
     rekeyGenerationRef.current.clear()
     await Promise.all(promises)
     dispatch({ type: "REMOVE_ALL" })
-  }, [discardStreamingQueues, dispatch, teardownAttachSubscription])
+  }, [
+    discardStreamingQueues,
+    dispatch,
+    retireTurnFailures,
+    setConnectError,
+    teardownAttachSubscription,
+  ])
 
   const sendPrompt = useCallback(
     async (
@@ -12403,7 +13139,7 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
           dispatch({
             type: "HYDRATE_FROM_SNAPSHOT",
             contextKey: connectionId,
-            patch,
+            patch: presentSnapshotPatchRef.current(connectionId, patch),
           })
           // Same recovery the other three snapshot consumers do
           // (`setupAttachSubscription.onSnapshot`, `connectAsViewer`,
@@ -12504,6 +13240,7 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
       getReconnectInfo,
       dismissConfigStale,
       dismissSessionFailures: dismissSessionFailuresAction,
+      registerSessionFailureActions,
     }),
     [
       connect,
@@ -12535,6 +13272,7 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
       getReconnectInfo,
       dismissConfigStale,
       dismissSessionFailuresAction,
+      registerSessionFailureActions,
     ]
   )
 

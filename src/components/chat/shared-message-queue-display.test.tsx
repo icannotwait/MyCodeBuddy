@@ -144,6 +144,7 @@ function snapshotPatch(
       activeTurn,
       leaseExpiresAt: null,
     },
+    snapshotTruncation: null,
   }
 }
 

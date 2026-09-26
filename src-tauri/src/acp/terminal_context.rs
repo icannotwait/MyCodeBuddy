@@ -8,7 +8,7 @@ use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use sacp::schema::{ContentBlock, Meta, TextContent};
+use agent_client_protocol::schema::v1::{ContentBlock, Meta, TextContent};
 
 use crate::acp::connection::{agent_delivers_wire_mcp, locate_codeg_mcp_binary};
 use crate::acp::delegation::route::{

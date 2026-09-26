@@ -21,7 +21,11 @@ import {
 import { useAcpAgents } from "@/hooks/use-acp-agents"
 import { useAppWorkspaceStore } from "@/stores/app-workspace-store"
 import { useTabActions, useTabStore } from "@/contexts/tab-context"
-import { isReparentUnmount } from "@/stores/tab-store"
+import {
+  isReparentUnmount,
+  reparentedViewRuntimeConversationId,
+  trackConversationView,
+} from "@/stores/tab-store"
 import { copyTextToClipboard, randomUUID } from "@/lib/utils"
 import { buildAskPrompt } from "@/lib/message-quote"
 import {
@@ -80,7 +84,6 @@ import {
 } from "@/lib/terminal-reconnect"
 import { TurnBusyError } from "@/lib/turn-busy"
 import { toErrorMessage } from "@/lib/app-error"
-import type { SessionFailureAction } from "@/lib/session-failures"
 import { continuationFailureI18nKey } from "@/lib/continuation-waiting"
 import { consumeDelegatedChildTabIntent } from "@/lib/delegated-child-tab-intent"
 import {
@@ -432,14 +435,21 @@ export const ConversationSessionSurface = memo(
     const connectionStore = useConnectionStore()
 
     // Stable runtime session key — set once at mount, never changes.
-    // For new conversations this is a virtual (negative) ID; for existing
-    // conversations opened from the sidebar it equals the real DB ID.
+    // Explicit tab identity wins. A split-group reparent otherwise keeps the
+    // predecessor's key. Popout and canvas have no group id and start fresh.
     const [effectiveConversationId] = useState(
       () =>
         ownTab?.runtimeConversationId ??
+        (groupId != null
+          ? reparentedViewRuntimeConversationId(useTabStore.getState(), tabId)
+          : null) ??
         conversationId ??
         buildVirtualConversationId(`draft-${tabId}`)
     )
+    useEffect(() => {
+      if (groupId == null) return
+      return trackConversationView(tabId, groupId, effectiveConversationId)
+    }, [tabId, groupId, effectiveConversationId])
     const [createdConversationId, setCreatedConversationId] = useState<
       number | null
     >(null)
@@ -2511,23 +2521,6 @@ export const ConversationSessionSurface = memo(
       workingDirForConnection,
     ])
 
-    const handleSessionFailureAction = useCallback(
-      (action: SessionFailureAction) => {
-        switch (action) {
-          case "retry":
-            void handleReconnect()
-            break
-          case "login":
-            handleOpenAgentsSettings()
-            break
-          case "new_session":
-            handleOpenNewSession()
-            break
-        }
-      },
-      [handleOpenAgentsSettings, handleOpenNewSession, handleReconnect]
-    )
-
     const handleSessionFailureDismiss = useCallback(
       (ids: string[]) => {
         acpActions.dismissSessionFailures(tabId, ids)
@@ -2840,11 +2833,7 @@ export const ConversationSessionSurface = memo(
         error={shellConnectionError}
         claudeApiRetry={conn.claudeApiRetry}
         sessionFailures={conn.sessionFailures}
-        onSessionFailureAction={
-          !conn.isViewer && !interactionLocked
-            ? handleSessionFailureAction
-            : undefined
-        }
+        snapshotTruncation={conn.snapshotTruncation}
         onSessionFailureDismiss={handleSessionFailureDismiss}
         asyncTasks={conn.asyncTasks}
         onStopAsyncTask={
