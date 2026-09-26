@@ -40,3 +40,35 @@ WebSocket，再携带原连接 ID、租约和消息游标接入；服务进程�
 不要仅为隐藏重连提示而关闭租约清理。默认客户端租约为 90 秒，普通共享会话
 空闲回收为 900 秒；`CODEG_ACP_IDLE_TIMEOUT_SECS=0` 也不会关闭租约到期及
 临时会话清理。临时连接、探测连接和已完成子任务的正常清理不等于当前会话故障。
+
+## 租约心跳调试日志
+
+这些日志只说明 30 秒 `{action:"ping"}` 有没有发出，以及服务端有没有续约。
+租约时长、续约结果和回收策略不变。
+
+浏览器 DevTools Console 过滤 `[lease-heartbeat]`，并把级别调到 Verbose。
+`console.debug` 在默认的 Info 视图里不显示。
+
+- `[WebEventStream][lease-heartbeat] start` / `stop` / `not started`：
+  共享与非共享订阅数量、缩短后的 connection / subscription id，以及是否带有
+  generation 和 leaseId。没有 `shared` 的观察者或委托子会话不会启动心跳。
+- `[WebEventStream][lease-heartbeat] tick sent` / `tick skipped`：
+  跳过原因是 `ws not open`、`destroyed`、`no shared subs` 或 `send failed`。
+- `[WebTransport][lease-heartbeat] wake probe sent` / `wake probe skipped`：
+  页面回到前台或 `online` 时的探测。跳过原因是 `hidden`、`not connected`、
+  `ws closed`、`destroyed` 或 `send failed`。
+
+服务端默认级别是 info，不会写出续约摘要。行在 stderr 和
+`codeg-server.<date>.log` 里。`CODEG_LOG` 优先于 `RUST_LOG`；只设置其中一个：
+
+```bash
+RUST_LOG=codeg_lib::web::ws=debug
+```
+
+示例（不含 lease id）：
+
+```text
+[WS][lease] ping had nothing to renew subscriptions=2 unbound=2
+[WS][lease] ping bindings=1 renewed=1 detached=0 subscriptions=2 unbound=1 outcomes=[connection=<id> generation=4 renewed]
+[WS][lease] ping bindings=1 renewed=0 detached=1 subscriptions=1 unbound=0 outcomes=[connection=<id> generation=4 detached:lease_expired]
+```
