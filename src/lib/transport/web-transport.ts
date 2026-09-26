@@ -72,6 +72,8 @@ const WS_BACKOFF_MAX_MS = 32_000
 // unreachable (keep retrying). Bounded so a SYN black-hole (dead server still
 // completing the TCP handshake) can't hang the "Reconnect now" button.
 const HEALTH_PROBE_TIMEOUT_MS = 8_000
+// Detect a stalled proxy before the default 90s ACP client lease expires.
+const WS_RESPONSE_TIMEOUT_MS = 15_000
 
 // Connection health of the web transport, surfaced to React via
 // `subscribeConnection`/`getConnectionSnapshot` so a single global dialog can
@@ -102,6 +104,8 @@ export class WebTransport implements Transport {
   private handlers = new Map<string, Set<(payload: unknown) => void>>()
   private baseUrl: string
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null
+  private handshakeTimer: ReturnType<typeof setTimeout> | null = null
+  private pongTimer: ReturnType<typeof setTimeout> | null = null
   private wsFailCount = 0
   private readyPromise!: Promise<void>
   private readyResolve!: () => void
@@ -483,11 +487,47 @@ export class WebTransport implements Transport {
     if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return false
     try {
       this.ws.send(JSON.stringify(frame))
+      if ("action" in frame && frame.action === "ping" && !this.pongTimer) {
+        this.pongTimer = setTimeout(() => {
+          this.pongTimer = null
+          // Background timers may be suspended. Probe afresh on visibility
+          // restore instead of treating a sleeping page as a failed server.
+          if (document.visibilityState === "hidden") return
+          this.recoverWs("heartbeat_timeout")
+        }, WS_RESPONSE_TIMEOUT_MS)
+      }
       return true
     } catch (err) {
       console.warn("[WebTransport] sendWsFrame failed:", err)
+      this.recoverWs("send_failed")
       return false
     }
+  }
+
+  private clearPongTimer(): void {
+    if (this.pongTimer !== null) clearTimeout(this.pongTimer)
+    this.pongTimer = null
+  }
+
+  private readonly probeOnWake = (): void => {
+    if (
+      this.destroyed ||
+      document.visibilityState === "hidden" ||
+      this.connState !== "connected" ||
+      !this.wsOpen
+    ) {
+      return
+    }
+    this.clearPongTimer()
+    this.sendWsFrame({ action: "ping" })
+  }
+
+  private recoverWs(reason: string): void {
+    if (this.destroyed || this.connState === "unauthorized") return
+    console.warn("[WebTransport] recovering WebSocket:", reason)
+    this.teardownWs()
+    this.setConnState("reconnecting")
+    this.scheduleReconnect()
   }
 
   // Returns false when there's no token to connect with (caller decides how to
@@ -503,9 +543,17 @@ export class WebTransport implements Transport {
     this.teardownWs()
 
     const wsUrl = this.baseUrl.replace(/^http/, "ws") + "/ws/events"
-    this.ws = new WebSocket(wsUrl, buildCodegWebSocketProtocols(token))
+    const ws = new WebSocket(wsUrl, buildCodegWebSocketProtocols(token))
+    this.ws = ws
+    this.handshakeTimer = setTimeout(
+      () => this.recoverWs("handshake_timeout"),
+      WS_RESPONSE_TIMEOUT_MS
+    )
+    window.addEventListener("online", this.probeOnWake)
+    document.addEventListener("visibilitychange", this.probeOnWake)
 
     this.ws.onopen = () => {
+      if (this.ws !== ws) return
       this.wsOpen = true
       // NB: connection health is NOT flipped to "connected" here. `onopen`
       // only means the socket is physically up; the application-level
@@ -529,6 +577,7 @@ export class WebTransport implements Transport {
     }
 
     this.ws.onmessage = (msg) => {
+      if (this.ws !== ws) return
       try {
         if (shouldSkipOversizedWsFrame(msg.data)) {
           console.warn(
@@ -549,11 +598,16 @@ export class WebTransport implements Transport {
           typeof parsed === "object" &&
           "type" in (parsed as object)
         ) {
+          if ((parsed as { type: unknown }).type === "pong") {
+            this.clearPongTimer()
+          }
           this.eventStreamInstance?.handleServerFrame(parsed)
           return
         }
         const event = parsed as WebEvent
         if (event.channel === WS_READY_CHANNEL) {
+          if (this.handshakeTimer !== null) clearTimeout(this.handshakeTimer)
+          this.handshakeTimer = null
           this.readyResolve()
           // Application-level ready: the link is fully usable again. Reset the
           // backoff counter and clear the reconnect dialog. Reset happens here
@@ -590,11 +644,10 @@ export class WebTransport implements Transport {
     }
 
     this.ws.onclose = () => {
-      this.ws = null
-      this.wsOpen = false
+      if (this.ws !== ws) return
+      this.teardownWs()
       // New subscribers (and any concurrent subscribe() calls in flight)
       // must wait for the next connection's `__ready__` before resolving.
-      this.resetReady()
       // A close fired by destroy()/teardownWs() detaches handlers first, so
       // this runs only for genuine drops. Surface "reconnecting" immediately
       // (honest, instant) and let the backoff loop + health probe drive
@@ -606,7 +659,7 @@ export class WebTransport implements Transport {
     }
 
     this.ws.onerror = () => {
-      this.ws?.close()
+      if (this.ws === ws) this.recoverWs("socket_error")
     }
 
     return true
@@ -695,6 +748,16 @@ export class WebTransport implements Transport {
   // Shared by connectWs (pre-rebuild), reconnectNow, markUnauthorized, and
   // destroy. Idempotent — a no-op when there's no live socket.
   private teardownWs() {
+    // Keep pending ready waiters across failed handshakes. Only a socket
+    // that actually readied has a settled promise that needs replacing.
+    if (this.ws && this.handshakeTimer === null && !this.destroyed) {
+      this.resetReady()
+    }
+    if (this.handshakeTimer !== null) clearTimeout(this.handshakeTimer)
+    this.handshakeTimer = null
+    this.clearPongTimer()
+    window.removeEventListener("online", this.probeOnWake)
+    document.removeEventListener("visibilitychange", this.probeOnWake)
     if (this.ws) {
       this.ws.onopen = null
       this.ws.onmessage = null

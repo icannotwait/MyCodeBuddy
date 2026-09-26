@@ -149,6 +149,30 @@ fn main() -> ExitCode {
 }
 
 async fn async_main() -> ExitCode {
+    let port: u16 = std::env::var("CODEG_PORT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(3080);
+    let host = std::env::var("CODEG_HOST").unwrap_or_else(|_| "0.0.0.0".to_string());
+
+    // Reserve the port before any startup reconciliation or background work.
+    // A duplicate launch must not mutate the live server's database and only
+    // then discover the port conflict. Keep this listener until axum serves it.
+    let addr = format!("{}:{}", host, port);
+    let listener = match tokio::net::TcpListener::bind(&addr).await {
+        Ok(listener) => listener,
+        Err(e) => {
+            tracing::error!("[SERVER] Failed to bind {}: {}", addr, e);
+            return ExitCode::FAILURE;
+        }
+    };
+    if let Err(e) = codeg_lib::web::socket_inherit::mark_listener_non_inheritable(&listener) {
+        tracing::warn!(
+            "[SERVER][WARN] failed to mark listener non-inheritable: {}",
+            e
+        );
+    }
+
     // Sweep stale ACP binary cache trash (rename-aside fallback artifacts).
     // Detached OS thread: cannot block startup, panics are caught and dropped,
     // errors are silenced, no subprocesses spawned.
@@ -160,11 +184,6 @@ async fn async_main() -> ExitCode {
         });
     });
 
-    let port: u16 = std::env::var("CODEG_PORT")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(3080);
-    let host = std::env::var("CODEG_HOST").unwrap_or_else(|_| "0.0.0.0".to_string());
     // CODEG_DATA_DIR was already resolved and absolutized in `main()` so
     // all path resolvers across the process see the same root. Read it
     // back rather than re-deriving the default.
@@ -725,23 +744,6 @@ async fn async_main() -> ExitCode {
         shutdown_signal,
     );
 
-    // Bind
-    let addr = format!("{}:{}", host, port);
-    let listener = match tokio::net::TcpListener::bind(&addr).await {
-        Ok(listener) => listener,
-        Err(e) => {
-            tracing::error!("[SERVER] Failed to bind {}: {}", addr, e);
-            return ExitCode::from(1);
-        }
-    };
-
-    if let Err(e) = codeg_lib::web::socket_inherit::mark_listener_non_inheritable(&listener) {
-        tracing::warn!(
-            "[SERVER][WARN] failed to mark listener non-inheritable: {}",
-            e
-        );
-    }
-
     let local_addr = listener.local_addr().ok();
     let actual_port = local_addr.map(|a| a.port()).unwrap_or(port);
     // `CODEG_HOST` may be `localhost` or a bracketed IPv6 (`[::1]`); advertise
@@ -849,6 +851,32 @@ fn default_data_dir() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn occupied_port_exits_before_initializing_data_directory() {
+        let occupied = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = occupied.local_addr().unwrap().port().to_string();
+        let temp = tempfile::tempdir().unwrap();
+        // Any attempt to open the database here fails: a duplicate server
+        // must reject the occupied port before touching persistent state.
+        let data_dir = temp.path().join("not-a-directory");
+        std::fs::write(&data_dir, b"untouched").unwrap();
+        temp_env::with_vars(
+            [
+                ("CODEG_HOST", Some("127.0.0.1")),
+                ("CODEG_PORT", Some(port.as_str())),
+                ("CODEG_DATA_DIR", data_dir.to_str()),
+            ],
+            || {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap();
+                assert_eq!(runtime.block_on(async_main()), ExitCode::FAILURE);
+            },
+        );
+        assert_eq!(std::fs::read(data_dir).unwrap(), b"untouched");
+    }
 
     #[test]
     fn removed_completion_protocol_environment_exits_with_code_two() {
