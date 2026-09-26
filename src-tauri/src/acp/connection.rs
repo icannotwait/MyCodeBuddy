@@ -5593,6 +5593,21 @@ pub(crate) fn agent_delivers_wire_mcp(agent_type: AgentType) -> bool {
     !matches!(agent_type, AgentType::Pi)
 }
 
+/// Agents launched without an injected wire `codeg-mcp` companion.
+///
+/// No ready lease is registered for them. [`finish_route_ready`] must continue
+/// Connected instead of failing the shared session with
+/// `companion_initialization_failed` (`codeg delegation ready lease missing`).
+///
+/// - **Antigravity:** its ACP server does not spawn `session/new.mcpServers`.
+/// - **Pi** (any agent where [`agent_delivers_wire_mcp`] is false): pi-acp
+///   accepts `mcpServers` but drops it, so injecting codeg-mcp never produces
+///   a lease. `CODEG_ACP_HOST_TOOLS=agent` also skips the check by turning
+///   delegation off; that env knob is not required for these agents.
+fn skips_wire_companion(agent_type: AgentType) -> bool {
+    agent_type == AgentType::Antigravity || !agent_delivers_wire_mcp(agent_type)
+}
+
 /// Load MCP servers configured for `agent_type` and convert them into the
 /// ACP wire format. Errors and unsupported entries are logged and skipped so
 /// a single malformed entry never blocks a session from starting.
@@ -6741,14 +6756,18 @@ async fn finish_route_ready(
     if delegation_enabled(route_plan.expose_codeg_delegation, host_tools) || pending_lease.is_some()
     {
         let Some(mut waiter) = pending_lease.take() else {
-            // Antigravity: inject_codeg_mcp is intentionally skipped, so no
-            // companion lease exists. Continue Connected without delegation
-            // instead of failing the shared session as unavailable.
-            // Wire companion unsupported for agy (does not spawn mcpServers);
-            // do not wait on lease. File mcp_config companion deferred.
-            if state.read().await.agent_type == AgentType::Antigravity {
+            // No wire companion was injected, so no ready lease can arrive.
+            // Continue Connected without delegation instead of failing the
+            // shared session as unavailable.
+            //
+            // Antigravity does not spawn mcpServers (file mcp_config companion
+            // deferred). Pi and any other agent that does not deliver wire MCP
+            // drops `session/new.mcpServers`, so codeg-mcp is never injected.
+            let agent_type = state.read().await.agent_type;
+            if skips_wire_companion(agent_type) {
                 tracing::warn!(
-                    "[ACP][Google Antigravity] continuing Connected without delegation after intentional codeg-mcp skip (ready lease missing)"
+                    "[ACP][{}] continuing Connected without delegation after intentional codeg-mcp skip (ready lease missing)",
+                    agent_type
                 );
                 emit_with_state(
                     state,
@@ -7503,56 +7522,62 @@ async fn run_connection(
             // state so connection teardown can revoke it. Skipped entirely
             // for agents that don't accept MCP over the wire (above).
             //
-            // Antigravity: treat wire companion as unsupported. agy ACP does
-            // not spawn session/new.mcpServers, so inject+ready-lease would
-            // hang ~30s waiting for a lease that never arrives. Always skip
-            // inject here; finish_route_ready continues Connected when the
-            // ready-lease is missing for Antigravity. User MCP via
+            // Skip wire companion injection when the agent cannot host it.
+            // Antigravity does not spawn session/new.mcpServers (inject + a
+            // ready lease would hang ~30s). Pi accepts mcpServers and drops
+            // it. `skips_wire_companion` is the same set `finish_route_ready`
+            // exempts when the ready lease is missing. User MCP via
             // ~/.gemini/config/mcp_config.json is separate; a file-based
-            // companion write was considered and deferred.
-            let mut delegate_injection =
+            // Antigravity companion write was considered and deferred.
+            let mut delegate_injection = if skips_wire_companion(agent_type) {
                 if agent_type == AgentType::Antigravity {
                     tracing::info!(
                         "[ACP] skipping codeg-mcp inject for Antigravity (agy does not spawn wire mcpServers; companion unsupported)"
                     );
-                    None
-                } else if agent_supports_mcp && agent_delivers_wire_mcp(agent_type) {
-                    if let Some(inj) = delegation_injection.as_ref() {
-                        tracing::info!(
-                            agent_type = ?agent_type,
-                            connection_id = %conn_id,
-                            mcp_servers_before = mcp_servers.len(),
-                            "[ACP] injecting codeg-mcp companion"
-                        );
-                        let injected = inject_codeg_mcp(
-                            &mut mcp_servers,
-                            inj,
-                            &conn_id,
-                            &cwd,
-                            agent_type,
-                            host_tools,
-                            &route_plan,
-                            &connection_incarnation_id,
-                            is_delegation_child,
-                            delegation_can_spawn_child,
-                            workflow_child_mcp_binding.as_ref(),
-                        )
-                        .await;
-                        tracing::info!(
-                            agent_type = ?agent_type,
-                            connection_id = %conn_id,
-                            mcp_servers_after = mcp_servers.len(),
-                            delegation_lease = injected.as_ref().map(|i| i.delegation_lease.is_some()),
-                            injected = injected.is_some(),
-                            "[ACP] codeg-mcp companion inject result"
-                        );
-                        injected
-                    } else {
-                        None
-                    }
+                } else {
+                    tracing::info!(
+                        "[ACP][{}] skipping codeg-mcp inject (agent does not deliver wire MCP; companion unsupported)",
+                        agent_type
+                    );
+                }
+                None
+            } else if agent_supports_mcp {
+                if let Some(inj) = delegation_injection.as_ref() {
+                    tracing::info!(
+                        agent_type = ?agent_type,
+                        connection_id = %conn_id,
+                        mcp_servers_before = mcp_servers.len(),
+                        "[ACP] injecting codeg-mcp companion"
+                    );
+                    let injected = inject_codeg_mcp(
+                        &mut mcp_servers,
+                        inj,
+                        &conn_id,
+                        &cwd,
+                        agent_type,
+                        host_tools,
+                        &route_plan,
+                        &connection_incarnation_id,
+                        is_delegation_child,
+                        delegation_can_spawn_child,
+                        workflow_child_mcp_binding.as_ref(),
+                    )
+                    .await;
+                    tracing::info!(
+                        agent_type = ?agent_type,
+                        connection_id = %conn_id,
+                        mcp_servers_after = mcp_servers.len(),
+                        delegation_lease = injected.as_ref().map(|i| i.delegation_lease.is_some()),
+                        injected = injected.is_some(),
+                        "[ACP] codeg-mcp companion inject result"
+                    );
+                    injected
                 } else {
                     None
-                };
+                }
+            } else {
+                None
+            };
             {
                 let companion = delegate_injection.as_ref().map(|injected| {
                     (
@@ -34322,6 +34347,141 @@ mod tests {
             "actual delegation lease must be consumed"
         );
         assert!(state.read().await.delegation_route.delegation_available);
+    }
+
+    /// Unmanaged Pi (and Antigravity) expose Codeg delegation but never inject
+    /// a wire companion, so a missing ready lease must still reach Connected.
+    /// Agents that do inject wire MCP keep failing closed on a missing lease.
+    #[tokio::test]
+    async fn finish_route_ready_missing_lease_follows_wire_companion_policy() {
+        use crate::acp::delegation::route::{
+            resolve_route, DelegationConnectionOrigin, RouteResolutionInput, SuppressionCapability,
+        };
+
+        assert!(skips_wire_companion(AgentType::Pi));
+        assert!(!agent_delivers_wire_mcp(AgentType::Pi));
+        assert!(skips_wire_companion(AgentType::Antigravity));
+        for agent in [
+            AgentType::Codex,
+            AgentType::ClaudeCode,
+            AgentType::OpenCode,
+            AgentType::Grok,
+        ] {
+            assert!(agent_delivers_wire_mcp(agent), "{agent} delivers wire MCP");
+            assert!(
+                !skips_wire_companion(agent),
+                "{agent} still requires a ready lease"
+            );
+        }
+
+        // Production unmanaged plan: delegation master switch on, no MCP gate.
+        let unmanaged = |agent_type| {
+            resolve_route(RouteResolutionInput {
+                agent_type,
+                origin: DelegationConnectionOrigin::Root,
+                session_override: None,
+                global_policy: DelegationRoutePolicy::Codeg,
+                delegation_enabled: true,
+                suppression: SuppressionCapability::unsupported(
+                    RouteDegradedReason::NativeSuppressionUnsupported,
+                ),
+                agent_mcp_supported: agent_delivers_wire_mcp(agent_type),
+                companion_binary_available: true,
+            })
+            .expect("unmanaged route")
+        };
+
+        for agent in [AgentType::Pi, AgentType::Antigravity] {
+            let plan = unmanaged(agent);
+            assert!(!plan.managed, "{agent} is unmanaged");
+            assert!(
+                plan.expose_codeg_delegation,
+                "{agent} still exposes delegation when the master switch is on"
+            );
+            let (result, outcome, available, route_after) =
+                finish_ready_without_lease(agent, &plan).await;
+            result.unwrap_or_else(|err| panic!("{agent} must reach Connected, got {err}"));
+            assert!(
+                matches!(outcome, RouteBootstrapOutcome::Ready),
+                "{agent} bootstrap must be Ready"
+            );
+            assert!(
+                !available,
+                "{agent} has no companion, so delegation stays unavailable"
+            );
+            assert_eq!(route_after.effective, plan.effective);
+            assert_eq!(route_after.requested, plan.requested);
+            assert_eq!(route_after.managed, plan.managed);
+            assert!(route_after.degraded_reason.is_none());
+        }
+
+        // Control: unmanaged OpenCode and managed Codex both inject wire MCP.
+        // A missing lease is still companion initialization failure. Default
+        // host-tools policy keeps delegation on (the ops workaround
+        // CODEG_ACP_HOST_TOOLS=agent is not applied here).
+        for (agent, plan) in [
+            (AgentType::OpenCode, unmanaged(AgentType::OpenCode)),
+            (AgentType::Codex, codeg_plan(AgentType::Codex)),
+        ] {
+            assert!(plan.expose_codeg_delegation, "{agent}");
+            assert!(delegation_enabled(
+                plan.expose_codeg_delegation,
+                HostToolsPolicy::Default
+            ));
+            let (result, outcome, available, _) = finish_ready_without_lease(agent, &plan).await;
+            let err = result.expect_err("{agent} must fail closed without a lease");
+            assert!(
+                err.to_string()
+                    .contains("codeg delegation ready lease missing"),
+                "{agent} error was {err}"
+            );
+            assert!(matches!(
+                outcome,
+                RouteBootstrapOutcome::RouteSpecific(
+                    RouteDegradedReason::CompanionInitializationFailed
+                )
+            ));
+            assert!(!available, "{agent} must not mark delegation available");
+        }
+    }
+
+    async fn finish_ready_without_lease(
+        agent_type: AgentType,
+        plan: &DelegationRoutePlan,
+    ) -> (
+        Result<(), sacp::Error>,
+        RouteBootstrapOutcome,
+        bool,
+        crate::acp::session_state::DelegationRouteSnapshot,
+    ) {
+        let state = Arc::new(tokio::sync::RwLock::new(SessionState::new(
+            format!("lease-{agent_type:?}"),
+            agent_type,
+            None,
+            "win".into(),
+            None,
+        )));
+        state.write().await.set_route_plan_snapshot(plan);
+        let mut pending_lease = None;
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let route_bootstrap_tx = Arc::new(tokio::sync::Mutex::new(Some(tx)));
+        let result = finish_route_ready(
+            &state,
+            &EventEmitter::Noop,
+            plan,
+            HostToolsPolicy::Default,
+            &mut pending_lease,
+            &route_bootstrap_tx,
+        )
+        .await;
+        let outcome = rx.await.expect("bootstrap outcome");
+        let guard = state.read().await;
+        (
+            result,
+            outcome,
+            guard.delegation_route.delegation_available,
+            guard.delegation_route.clone(),
+        )
     }
 
     // Enabled custom agents are appended; disabled custom agents are omitted.
