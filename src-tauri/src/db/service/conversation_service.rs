@@ -998,20 +998,68 @@ pub async fn update_external_id(
     Ok(())
 }
 
+/// What a bind attempt did to the live row.
+///
+/// `Skipped` is not a successful bind that preserved nothing. The row was
+/// not updated: either it is gone, or a guarded call found a different
+/// `external_id` than `expected_old`. `Bound` means the row now holds the
+/// requested id; `preserved_id` is the history row when a split was required.
+#[derive(Debug, PartialEq, Eq)]
+pub enum BindExternalIdOutcome {
+    Skipped,
+    Bound { preserved_id: Option<i32> },
+}
+
 pub async fn bind_external_id(
     conn: &DatabaseConnection,
     conversation_id: i32,
     external_id: &str,
     continues: &[String],
 ) -> Result<Option<i32>, DbError> {
+    match bind_external_id_inner(conn, conversation_id, external_id, continues, None).await? {
+        BindExternalIdOutcome::Skipped => Ok(None),
+        BindExternalIdOutcome::Bound { preserved_id } => Ok(preserved_id),
+    }
+}
+
+/// Bind `external_id` only while the live row still holds `expected_old`.
+///
+/// The compare runs inside the same writer-locked transaction as the bind.
+/// A mismatch returns [`BindExternalIdOutcome::Skipped`] and writes nothing,
+/// so a stale rollover cannot replace a session that landed in between.
+pub async fn bind_external_id_if_current(
+    conn: &DatabaseConnection,
+    conversation_id: i32,
+    expected_old: &str,
+    external_id: &str,
+    continues: &[String],
+) -> Result<BindExternalIdOutcome, DbError> {
+    bind_external_id_inner(
+        conn,
+        conversation_id,
+        external_id,
+        continues,
+        Some(expected_old),
+    )
+    .await
+}
+
+async fn bind_external_id_inner(
+    conn: &DatabaseConnection,
+    conversation_id: i32,
+    external_id: &str,
+    continues: &[String],
+    expected_old: Option<&str>,
+) -> Result<BindExternalIdOutcome, DbError> {
     use sea_orm::sea_query::Expr;
     use sea_orm::TransactionTrait;
 
     let external_id = external_id.to_string();
     let continues: Vec<String> = continues.to_vec();
-    // The closure below MOVES `external_id`; keep a copy for the conflict
+    // The closure below MOVES these values; keep a copy for the conflict
     // message, which is built after the transaction has returned.
     let requested_id = external_id.clone();
+    let expected_old = expected_old.map(str::to_owned);
     let outcome = conn
         .transaction::<_, BindTxOutcome, sea_orm::DbErr>(|txn| {
             Box::pin(async move {
@@ -1029,9 +1077,10 @@ pub async fn bind_external_id(
                     .await?;
                 if claimed.rows_affected == 0 {
                     // Gone or soft-deleted. Every caller treats "no live row" as
-                    // nothing to do, so this stays Ok — same contract the old
-                    // `update_external_id` had.
-                    return Ok(BindTxOutcome::Bound(None));
+                    // nothing to do. The unguarded wrapper still returns
+                    // `Ok(None)`; the guarded wrapper reports `Skipped` so a
+                    // miss is not a bind that preserved no history row.
+                    return Ok(BindTxOutcome::Skipped);
                 }
 
                 // Read under the write lock: pristine values, and no other
@@ -1042,6 +1091,16 @@ pub async fn bind_external_id(
                     .ok_or_else(|| {
                         sea_orm::DbErr::Custom(format!("conversation {conversation_id} not found"))
                     })?;
+
+                // Guarded rollover: the id we read before this transaction must
+                // still be the row's id. Checked before any split or re-point
+                // so a stale caller cannot bind and then discover the race.
+                if expected_old
+                    .as_deref()
+                    .is_some_and(|expected| current.external_id.as_deref() != Some(expected))
+                {
+                    return Ok(BindTxOutcome::Skipped);
+                }
 
                 let previous = current.external_id.clone();
                 let repoints_away = matches!(
@@ -1222,7 +1281,8 @@ pub async fn bind_external_id(
             | sea_orm::TransactionError::Transaction(e) => DbError::Database(e),
         })?;
     match outcome {
-        BindTxOutcome::Bound(preserved) => Ok(preserved),
+        BindTxOutcome::Bound(preserved_id) => Ok(BindExternalIdOutcome::Bound { preserved_id }),
+        BindTxOutcome::Skipped => Ok(BindExternalIdOutcome::Skipped),
         // Raised AFTER the transaction commits rather than by rolling it back:
         // the only statement it ran is the self-assigning claim, which changes
         // no value, so commit and rollback are indistinguishable on disk and
@@ -1254,6 +1314,8 @@ enum BindTxOutcome {
     /// The row holds `external_id`. `Some(id)` when the outgoing session had to
     /// be split onto a new row to stay reachable.
     Bound(Option<i32>),
+    /// Nothing written: no live row, or `expected_old` did not match.
+    Skipped,
     /// Another row already holds `(external_id, agent_type)`. Nothing written.
     Refused { holder_row_id: i32 },
 }
@@ -2700,6 +2762,37 @@ mod tests {
             .all(conn)
             .await
             .expect("query by external_id")
+    }
+
+    #[tokio::test]
+    async fn rollover_cas_does_not_replace_a_newer_session() {
+        let db = fresh_in_memory_db().await;
+        let folder = seed_folder(&db, "/tmp/rollover-cas").await;
+        let row = create(&db.conn, folder, AgentType::ClaudeCode, None, None)
+            .await
+            .unwrap();
+        bind_external_id(&db.conn, row.id, "S1", &[]).await.unwrap();
+        bind_external_id_if_current(&db.conn, row.id, "S1", "S2", &["S1".into()])
+            .await
+            .unwrap();
+        let stale = bind_external_id_if_current(&db.conn, row.id, "S1", "stale", &["S1".into()])
+            .await
+            .unwrap();
+        assert_eq!(stale, BindExternalIdOutcome::Skipped);
+        let current = conversation::Entity::find_by_id(row.id)
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(current.external_id.as_deref(), Some("S2"));
+        assert_eq!(
+            conversation::Entity::find()
+                .all(&db.conn)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
     }
 
     #[tokio::test]

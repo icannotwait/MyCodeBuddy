@@ -87,10 +87,10 @@ fn broker_tool_overflow_tx() -> BrokerToolOverflowTx {
 #[allow(dead_code)] // reserved for lifecycle-worker filtering
 fn is_lifecycle_relevant(event: &AcpEvent) -> bool {
     // Keep in sync with `internal_bus::is_lifecycle_critical` (critical lane).
-    // Non-terminal `Error` is also worker-relevant for logging paths that still
-    // forward it, but the critical lane only carries `terminal: true` Errors
-    // (see `is_lifecycle_critical`). Worker still accepts any Error via the
-    // broader match used historically for terminal-or-not branching.
+    // `TranscriptRolledOver` is critical there, so this predicate admits it
+    // without a second broadcast entry. Non-terminal `Error` is also
+    // worker-relevant for logging paths that still forward it, but the
+    // critical lane only carries `terminal: true` Errors.
     is_lifecycle_critical(event)
         || matches!(
             event,
@@ -396,7 +396,8 @@ async fn handle_turn_complete_internal(
             conversation_service::finish_end_turn_if_in_progress(&txn, cid, mark_awaiting_reply)
                 .await?
         }
-        "refusal" | "max_tokens" | "max_turn_requests" | "unknown" | "empty" | "auth_required" => {
+        "refusal" | "max_tokens" | "max_turn_requests" | "unknown" | "empty" | "auth_required"
+        | "rejected" => {
             conversation_service::update_status_if_with_patch(
                 &txn,
                 cid,
@@ -457,6 +458,7 @@ async fn handle_turn_complete_internal(
     let expected_after_cas: Option<ConversationStatus> = match stop_reason {
         "end_turn" if cas_patch.is_some() => Some(ConversationStatus::PendingReview),
         "refusal" | "max_tokens" | "max_turn_requests" | "unknown" | "empty" | "auth_required"
+        | "rejected"
             if cas_patch.is_some() =>
         {
             Some(ConversationStatus::Cancelled)
@@ -823,20 +825,26 @@ pub(crate) async fn handle_event(
             // backend patch.
             // The target status depends on the stop reason: `end_turn` is the
             // only success case and goes to `PendingReview`. `refusal`,
-            // `max_tokens`, `max_turn_requests`, `unknown`, `empty`, and
-            // `auth_required` indicate the turn failed (often a backend/gateway
-            // error masquerading as `Refusal` per the ACP spec gap, or — common
-            // with OpenCode — a silent EndTurn that produced no output), so
-            // we flip to `Cancelled` and pair the transition with an
+            // `max_tokens`, `max_turn_requests`, `unknown`, `empty`,
+            // `auth_required` and `rejected` indicate the turn failed (often a
+            // backend/gateway error masquerading as `Refusal` per the ACP spec
+            // gap, or — common with OpenCode — a silent EndTurn that produced no
+            // output), so we flip to `Cancelled` and pair the transition with an
             // `AcpEvent::Error` toast emitted upstream by `connection.rs`.
-            // `auth_required` is the one whose CONNECTION survives (the agent
-            // refused the prompt with ACP's -32000 and wants the user to sign
-            // in), but the turn is just as dead as the others — leaving the row
-            // out of this arm would strand it at InProgress for good.
+            // `auth_required` and `rejected` are the ones whose CONNECTION
+            // survives (the agent rejected the prompt — with ACP's -32000 when
+            // it wants the user to sign in, with anything else when it simply
+            // would not run this one), but their turn is just as dead as the
+            // others — leaving those rows out of this arm would strand them at
+            // InProgress for good.
             // `cancelled` is already written by `manager.cancel()` (eager
             // CAS InProgress → Cancelled at the user-cancel entry point), so
             // we leave it alone here. `completed` transitions remain
             // frontend-driven.
+            // `rejected` is a new upstream stop reason. Delegate rows still
+            // return before this CAS — the broker owns their status. Only a
+            // non-delegate row is cancelled here, so the new reason does not
+            // pull status ownership back off the broker.
             let Some((state_arc, emitter)) =
                 manager.get_state_and_emitter(&envelope.connection_id).await
             else {
@@ -927,7 +935,7 @@ pub(crate) async fn handle_event(
                     .await?
                 }
                 "refusal" | "max_tokens" | "max_turn_requests" | "unknown" | "empty"
-                | "auth_required" => {
+                | "auth_required" | "rejected" => {
                     conversation_service::update_status_if_with_patch(
                         db_conn,
                         cid,
@@ -996,6 +1004,90 @@ pub(crate) async fn handle_event(
                 }
             }
             Ok(())
+        }
+        AcpEvent::TranscriptRolledOver { transcript_id } => {
+            // Claude `/clear` wrote a new transcript uuid. The ACP session id
+            // on SessionState stays the original id (prompts still use it).
+            // Persist on the connection worker's FIFO: look the connection up
+            // by the envelope id, and skip when that connection is gone or no
+            // longer bound to the same conversation. The outgoing id is the
+            // row's current DB external_id — never SessionState.external_id,
+            // which still names the original ACP session after `/clear`.
+            let Some((state_arc, _)) = manager.get_state_and_emitter(&envelope.connection_id).await
+            else {
+                return Ok(());
+            };
+            let Some(cid) = state_arc.read().await.conversation_id else {
+                tracing::debug!(
+                    connection_id = %envelope.connection_id,
+                    transcript_id = %transcript_id,
+                    "[lifecycle] transcript rollover skipped; connection has no bound conversation"
+                );
+                return Ok(());
+            };
+            let current = match conversation_service::get_by_id(db_conn, cid).await {
+                Ok(row) => row,
+                Err(error) => {
+                    tracing::debug!(
+                        connection_id = %envelope.connection_id,
+                        conversation_id = cid,
+                        transcript_id = %transcript_id,
+                        error = %error,
+                        "[lifecycle] transcript rollover skipped; no active conversation row"
+                    );
+                    return Ok(());
+                }
+            };
+            let Some((state_arc, emitter)) =
+                manager.get_state_and_emitter(&envelope.connection_id).await
+            else {
+                return Ok(());
+            };
+            if state_arc.read().await.conversation_id != Some(cid) {
+                tracing::debug!(
+                    connection_id = %envelope.connection_id,
+                    conversation_id = cid,
+                    transcript_id = %transcript_id,
+                    "[lifecycle] transcript rollover skipped; connection binding changed"
+                );
+                return Ok(());
+            }
+            let Some(expected_old) = current.external_id.filter(|id| !id.is_empty()) else {
+                tracing::debug!(
+                    connection_id = %envelope.connection_id,
+                    conversation_id = cid,
+                    transcript_id = %transcript_id,
+                    "[lifecycle] transcript rollover skipped; external_id is not bound yet"
+                );
+                return Ok(());
+            };
+            if expected_old == *transcript_id {
+                return Ok(());
+            }
+            match conversation_service::bind_external_id_if_current(
+                db_conn,
+                cid,
+                &expected_old,
+                transcript_id,
+                &[expected_old.clone()],
+            )
+            .await?
+            {
+                conversation_service::BindExternalIdOutcome::Skipped => Ok(()),
+                conversation_service::BindExternalIdOutcome::Bound { preserved_id } => {
+                    crate::commands::conversations::emit_conversation_upsert(
+                        &emitter, db_conn, cid,
+                    )
+                    .await;
+                    crate::commands::conversations::emit_preserved_conversation(
+                        &emitter,
+                        db_conn,
+                        preserved_id,
+                    )
+                    .await;
+                    Ok(())
+                }
+            }
         }
         // Other events don't need cross-connection DB persistence today; extend
         // this dispatcher with new arms as the lifecycle scope grows.
@@ -1156,6 +1248,9 @@ async fn forward_turn_complete_to_broker(
         "empty" => DelegationOutcome::from_err(DelegationError::ChildEmpty, Some(conversation_id)),
         "auth_required" => {
             DelegationOutcome::from_err(DelegationError::ChildAuthRequired, Some(conversation_id))
+        }
+        "rejected" => {
+            DelegationOutcome::from_err(DelegationError::ChildRejected, Some(conversation_id))
         }
         other => DelegationOutcome::from_err(
             DelegationError::ChildUnknown(other.to_string()),
@@ -3654,6 +3749,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn handle_event_clear_rollover_repoints_external_id_in_place() {
+        let db = test_helpers::fresh_in_memory_db().await;
+        let folder_id = test_helpers::seed_folder(&db, "/tmp/test-clear-rollover").await;
+        let conv =
+            conversation_service::create(&db.conn, folder_id, AgentType::ClaudeCode, None, None)
+                .await
+                .unwrap();
+        conversation_service::bind_external_id(&db.conn, conv.id, "old-sess", &[])
+            .await
+            .unwrap();
+        let mgr = ConnectionManager::new();
+        {
+            let mut map = mgr.connections.lock().await;
+            let conn = fake_connection_with_state("c1", Some(conv.id));
+            conn.state.write().await.external_id = Some("old-sess".into());
+            map.insert("c1".to_string(), conn);
+        }
+        let env = EventEnvelope {
+            seq: 1,
+            connection_id: "c1".to_string(),
+            payload: AcpEvent::TranscriptRolledOver {
+                transcript_id: "new-sess".into(),
+            },
+        };
+        handle_event(&db.conn, &mgr, &env, None).await.unwrap();
+        let reloaded = conversation_service::get_by_id(&db.conn, conv.id)
+            .await
+            .unwrap();
+        assert_eq!(reloaded.external_id.as_deref(), Some("new-sess"));
+
+        // A second rollover must also stay in place (ACP id still old-sess).
+        let env2 = EventEnvelope {
+            seq: 2,
+            connection_id: "c1".to_string(),
+            payload: AcpEvent::TranscriptRolledOver {
+                transcript_id: "newer-sess".into(),
+            },
+        };
+        handle_event(&db.conn, &mgr, &env2, None).await.unwrap();
+        let reloaded = conversation_service::get_by_id(&db.conn, conv.id)
+            .await
+            .unwrap();
+        assert_eq!(reloaded.external_id.as_deref(), Some("newer-sess"));
+    }
+
+    #[tokio::test]
     async fn handle_event_session_started_broadcasts_conversation_upsert() {
         // SessionStarted persists external_id; it must ALSO re-broadcast the
         // full summary on `conversation://changed` so every client's sidebar
@@ -5504,6 +5645,12 @@ mod tests {
         }));
         assert!(is_lifecycle_relevant(&AcpEvent::NativeSessionTitle {
             title: "Fix login".into(),
+        }));
+        assert!(is_lifecycle_relevant(&AcpEvent::TranscriptRolledOver {
+            transcript_id: "new-sess".into(),
+        }));
+        assert!(is_lifecycle_critical(&AcpEvent::TranscriptRolledOver {
+            transcript_id: "S2".into(),
         }));
         assert!(is_lifecycle_relevant(&AcpEvent::StatusChanged {
             status: ConnectionStatus::Disconnected,

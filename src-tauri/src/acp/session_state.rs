@@ -1,6 +1,7 @@
 //! 会话级状态结构。后端权威：流式累积、in-flight tool calls、待处理 permission 等
 //! 全部住在这里。Phase 2 的 snapshot 端点直接从此处读取 live 部分。
 
+use std::cmp::Reverse;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -1313,7 +1314,7 @@ impl SessionState {
                     // The AIR task table is keyed to the session we just left.
                     // Its rows can never settle here again: the adapter
                     // publishes their terminal frames on the OLD session id, and
-                    // `ActiveSessionHandler` stops routing that id to this
+                    // `AgentSession`'s router stops routing that id to this
                     // connection the moment we attach to the new one. Keeping
                     // them would leave the strip showing tasks that can never
                     // finish and — because a live row exempts this connection
@@ -2143,6 +2144,20 @@ impl SessionState {
                         .insert(record.id.clone(), record.clone());
                 }
             }
+            AcpEvent::SessionNotice { .. } => {
+                // Deliberately keeps NOTHING. Unlike its `SessionFailure`
+                // neighbour a notice is not a record: the RFD gives it no id to
+                // merge on, no revision to reject and no history position, and
+                // says outright that an agent must not rely on one being
+                // received or seen. So there is nothing for the snapshot to
+                // carry — a client that attaches mid-session has not missed
+                // state, it has missed an event, and re-raising a past toast on
+                // every attach would be worse than silence.
+                //
+                // How a notice is presented (a toast, kept in the client's own
+                // alert list) is the client's business: storing one here
+                // would bring it back on every snapshot.
+            }
             AcpEvent::AsyncTask { delta } => {
                 // The SAME merge the frontend reducer applies, so a client
                 // seeded from the snapshot and one that watched every delta
@@ -2175,7 +2190,8 @@ impl SessionState {
             | AcpEvent::TurnRetrying { .. }
             | AcpEvent::UserPromptSent { .. }
             | AcpEvent::RequestUsage { .. }
-            | AcpEvent::NativeSessionTitle { .. } => {
+            | AcpEvent::NativeSessionTitle { .. }
+            | AcpEvent::TranscriptRolledOver { .. } => {
                 // 这些事件不直接修改 SessionState 的可见字段。
                 // UserPromptSent 是纯通知事件，仅供 chat-channel 推送消费。
                 // TurnRetrying 与 Claude 的 api_retry 一样是前端瞬态提示（重试横幅），
@@ -2768,6 +2784,70 @@ impl SessionState {
         marker
     }
 
+    /// Project tool `meta`, keeping `codeg.delegation` whole when it fits.
+    ///
+    /// The association is not a bulky result. If the rest of `meta` does not
+    /// fit, the association still ships and the other fields take the existing
+    /// truncation marker path. If the association itself does not fit, it is
+    /// omitted whole — never sliced into a wrong task id. `active_delegations`
+    /// remains the authoritative card.
+    fn project_tool_meta(
+        value: &serde_json::Value,
+        remaining_payload_bytes: &mut usize,
+        truncation: &mut SnapshotTruncation,
+    ) -> serde_json::Value {
+        let Some(delegation) = value.get("codeg.delegation") else {
+            return Self::project_snapshot_json(value, remaining_payload_bytes, truncation);
+        };
+
+        let whole_bytes = Self::json_encoded_len(value);
+        if whole_bytes <= *remaining_payload_bytes {
+            *remaining_payload_bytes -= whole_bytes;
+            return value.clone();
+        }
+
+        let association = serde_json::json!({ "codeg.delegation": delegation });
+        let association_bytes = Self::json_encoded_len(&association);
+        let mut rest = value.clone();
+        if let Some(map) = rest.as_object_mut() {
+            map.remove("codeg.delegation");
+        }
+        let rest_empty = !rest.is_object() || rest.as_object().is_some_and(|map| map.is_empty());
+
+        if association_bytes <= *remaining_payload_bytes {
+            *remaining_payload_bytes -= association_bytes;
+            if rest_empty {
+                return association;
+            }
+            let truncated_before = truncation.truncated_text_fields;
+            let rest_projected =
+                Self::project_snapshot_json(&rest, remaining_payload_bytes, truncation);
+            let collapsed = truncation.truncated_text_fields > truncated_before
+                && rest_projected
+                    .get("truncated")
+                    .and_then(serde_json::Value::as_bool)
+                    == Some(true);
+            if collapsed {
+                return association;
+            }
+            if let Some(mut merged) = rest_projected.as_object().cloned() {
+                merged.insert("codeg.delegation".to_owned(), delegation.clone());
+                return serde_json::Value::Object(merged);
+            }
+            return association;
+        }
+
+        // Do not run the string truncator over the association. A sliced
+        // task id would look like a different task.
+        truncation.truncated_text_fields += 1;
+        if rest_empty {
+            let marker = Self::truncated_json_marker();
+            Self::charge_or_zero(remaining_payload_bytes, Self::json_encoded_len(&marker));
+            return marker;
+        }
+        Self::project_snapshot_json(&rest, remaining_payload_bytes, truncation)
+    }
+
     fn project_tool_output(
         output: &ToolCallOutput,
         remaining_payload_bytes: &mut usize,
@@ -2812,9 +2892,10 @@ impl SessionState {
             locations: entry.locations.as_ref().map(|value| {
                 Self::project_snapshot_json(value, remaining_payload_bytes, truncation)
             }),
-            meta: entry.meta.as_ref().map(|value| {
-                Self::project_snapshot_json(value, remaining_payload_bytes, truncation)
-            }),
+            meta: entry
+                .meta
+                .as_ref()
+                .map(|value| Self::project_tool_meta(value, remaining_payload_bytes, truncation)),
             images: entry
                 .images
                 .iter()
@@ -3037,6 +3118,72 @@ impl SessionState {
             .collect()
     }
 
+    /// Arrival rank from `live_message` `ToolCallRef`s. A later duplicate id
+    /// keeps the later index. Rank 0 means the id is not in the live message.
+    fn tool_call_arrival_ranks(&self) -> BTreeMap<&str, usize> {
+        self.live_message
+            .as_ref()
+            .into_iter()
+            .flat_map(|message| message.content.iter().enumerate())
+            .filter_map(|(index, block)| match block {
+                LiveContentBlock::ToolCallRef { tool_call_id } => {
+                    Some((tool_call_id.as_str(), index + 1))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Permission-linked tool id only when `tool_call.toolCallId` is a string.
+    /// A missing or non-string field is not guessed from `tool_call_id`.
+    fn permission_linked_tool_id(&self) -> Option<&str> {
+        self.pending_permission.as_ref().and_then(|pending| {
+            pending
+                .tool_call
+                .get("toolCallId")
+                .and_then(serde_json::Value::as_str)
+        })
+    }
+
+    fn tool_snapshot_priority(
+        status: &ToolCallStatus,
+        permission_id: Option<&str>,
+        id: &str,
+    ) -> u8 {
+        if permission_id.is_some_and(|linked| linked == id) {
+            0
+        } else if !matches!(status, ToolCallStatus::Completed | ToolCallStatus::Failed) {
+            1
+        } else {
+            2
+        }
+    }
+
+    /// Tools admitted into the bounded snapshot, in budget-allocation order:
+    /// permission-linked, then non-terminal, then most recently arrived
+    /// finished calls. Callers sort the projected vector back by id.
+    fn selected_snapshot_tools(&self, limits: SnapshotLimits) -> Vec<&ToolCallState> {
+        let arrival = self.tool_call_arrival_ranks();
+        let permission_id = self.permission_linked_tool_id();
+        let mut tools: Vec<&ToolCallState> = self.active_tool_calls.values().collect();
+        tools.sort_by(|left, right| {
+            let left_key = (
+                Self::tool_snapshot_priority(&left.status, permission_id, &left.id),
+                Reverse(arrival.get(left.id.as_str()).copied().unwrap_or(0)),
+                left.id.as_str(),
+            );
+            let right_key = (
+                Self::tool_snapshot_priority(&right.status, permission_id, &right.id),
+                Reverse(arrival.get(right.id.as_str()).copied().unwrap_or(0)),
+                right.id.as_str(),
+            );
+            left_key.cmp(&right_key)
+        });
+        let keep = limits.tool_calls.min(tools.len());
+        tools.truncate(keep);
+        tools
+    }
+
     fn snapshot_structural_reserve(&self, limits: SnapshotLimits) -> usize {
         const BASE_BYTES: usize = 32 * 1024;
         const TOOL_BYTES: usize = 512;
@@ -3056,9 +3203,8 @@ impl SessionState {
             .map(Self::pending_user_image_count)
             .unwrap_or(0);
         let image_count = self
-            .active_tool_calls
-            .values()
-            .take(limits.tool_calls)
+            .selected_snapshot_tools(limits)
+            .iter()
             .fold(0usize, |total, tool| {
                 total.saturating_add(tool.images.len())
             })
@@ -3115,10 +3261,17 @@ impl SessionState {
             );
         let mut image_slots_used = 0;
         let mut retained_image_payloads = 0;
-        let active_tool_calls: Vec<_> = self
-            .active_tool_calls
-            .values()
-            .take(limits.tool_calls)
+        // Permission is answered by the user before finished tool output is
+        // interesting. Project it first so a huge completed result cannot
+        // exhaust the request. A `tool_call` that itself exceeds the remaining
+        // budget still goes through `project_snapshot_json` (marker, not a
+        // forged partial permission).
+        let pending_permission = self.pending_permission.as_ref().map(|pending| {
+            Self::project_pending_permission(pending, &mut remaining_payload_bytes, &mut truncation)
+        });
+        let mut active_tool_calls: Vec<_> = self
+            .selected_snapshot_tools(limits)
+            .into_iter()
             .map(|entry| {
                 Self::project_tool_call(
                     entry,
@@ -3134,6 +3287,7 @@ impl SessionState {
             .active_tool_calls
             .len()
             .saturating_sub(active_tool_calls.len());
+        active_tool_calls.sort_by(|left, right| left.id.cmp(&right.id));
         let pending_user_message = self.pending_user_message.as_ref().map(|message| {
             Self::project_pending_user_message(
                 message,
@@ -3145,9 +3299,6 @@ impl SessionState {
             )
         });
         truncation.omitted_images = total_images.saturating_sub(retained_image_payloads);
-        let pending_permission = self.pending_permission.as_ref().map(|pending| {
-            Self::project_pending_permission(pending, &mut remaining_payload_bytes, &mut truncation)
-        });
         let last_error = self.last_error.as_ref().map(|error| {
             Self::project_last_error(error, &mut remaining_payload_bytes, &mut truncation)
         });
@@ -3276,7 +3427,14 @@ pub(crate) fn background_keepalive_max_age() -> chrono::Duration {
         std::env::var("CODEG_ACP_BACKGROUND_KEEPALIVE_MAX_SECS")
             .ok()
             .and_then(|v| v.trim().parse::<i64>().ok())
-            .filter(|v| *v >= 0)
+            // `chrono::Duration::seconds` below is an `expect` over
+            // `try_seconds`, so it PANICS past `i64::MAX / 1000`. This value is
+            // read on the 60-second idle sweep and on every background-watch
+            // tick, so an out-of-range env value would abort the process from a
+            // timer with nobody at the keyboard, and a panic there leaves no
+            // trace of which setting caused it. Out of range is invalid input
+            // like any other, so it takes the documented default.
+            .filter(|v| *v >= 0 && chrono::Duration::try_seconds(*v).is_some())
             .unwrap_or(3600)
     });
     chrono::Duration::seconds(secs)
@@ -4177,7 +4335,7 @@ mod tests {
 
     /// A fork attaches to a NEW session id on the same process. The old
     /// session's task rows can never settle here again — their terminal frames
-    /// are published on the id `ActiveSessionHandler` has stopped routing to
+    /// are published on the id the `AgentSession` router has stopped routing to
     /// this connection — so they must go, or the strip shows work that never
     /// finishes and the keep-alive pins the CLI open.
     #[test]
@@ -5774,6 +5932,233 @@ mod tests {
         assert_eq!(ids, vec!["tc-a", "tc-m", "tc-z"]);
     }
 
+    /// Open a tool call and finish it, with `output_bytes` of tool output.
+    /// `settled` false leaves it in progress (still streaming its output).
+    fn run_tool_call(s: &mut SessionState, id: &str, output_bytes: usize, settled: bool) {
+        s.apply_event(&AcpEvent::ToolCall {
+            tool_call_id: id.into(),
+            title: format!("Read src/{id}.rs"),
+            kind: "read".into(),
+            status: "in_progress".into(),
+            content: None,
+            raw_input: Some(format!("{{\"file_path\":\"src/{id}.rs\"}}")),
+            raw_input_is_model_authored: None,
+            raw_output: None,
+            locations: Some(serde_json::json!([{ "path": format!("src/{id}.rs") }])),
+            meta: Some(serde_json::json!({ "codeg.delegation": { "status": "completed" } })),
+            images: None,
+        });
+        let status = if settled { "completed" } else { "in_progress" };
+        s.apply_event(&AcpEvent::ToolCallUpdate {
+            tool_call_id: id.into(),
+            title: None,
+            status: Some(status.to_string()),
+            content: None,
+            raw_input: None,
+            raw_input_is_model_authored: None,
+            raw_output: Some("o".repeat(output_bytes)),
+            raw_output_append: None,
+            locations: None,
+            meta: None,
+            images: None,
+        });
+    }
+
+    /// The ordinary turn stays byte-identical: nothing is trimmed while the
+    /// table fits the budget, so the wire shape is exactly what it always was.
+    #[test]
+    fn snapshot_carries_every_tool_call_whole_while_it_fits_the_budget() {
+        let mut s = fresh_state();
+        for i in 0..20 {
+            run_tool_call(&mut s, &format!("tc-{i:03}"), 4 * 1024, true);
+        }
+
+        let snap = s.to_snapshot();
+        assert_eq!(snap.active_tool_calls.len(), 20);
+        for tc in &snap.active_tool_calls {
+            let live = &s.active_tool_calls[&tc.id];
+            assert_eq!(
+                serde_json::to_value(tc).unwrap(),
+                serde_json::to_value(live).unwrap(),
+                "{} must ship exactly as held",
+                tc.id
+            );
+        }
+    }
+
+    /// A long turn keeps the running call and the most recent finished calls
+    /// inside the tool cap. Older finished cards are omitted and counted.
+    /// Pending permission, questions, plans, delegations, and the watchdog
+    /// stay on their own projections, so a missing tool card is not "no task".
+    #[test]
+    fn snapshot_bounds_finished_tool_call_payload_on_a_long_turn() {
+        const CALLS: usize = 300;
+        const OUTPUT_BYTES: usize = 16 * 1024;
+        let mut s = fresh_state();
+        for i in 0..CALLS {
+            run_tool_call(&mut s, &format!("tc-{i:04}"), OUTPUT_BYTES, true);
+        }
+        run_tool_call(&mut s, "tc-running", OUTPUT_BYTES, false);
+
+        assert_eq!(s.active_tool_calls.len(), CALLS + 1);
+        let snap = s.to_snapshot();
+        let limits = SnapshotLimits::default();
+        let encoded = serde_json::to_vec(&snap).expect("serialize snapshot");
+        assert!(
+            encoded.len() <= limits.payload_bytes,
+            "snapshot {} exceeds {}",
+            encoded.len(),
+            limits.payload_bytes
+        );
+        assert_eq!(snap.active_tool_calls.len(), limits.tool_calls);
+        let truncation = snap.truncation.as_ref().expect("omissions reported");
+        assert_eq!(
+            truncation.omitted_tool_calls,
+            (CALLS + 1) - limits.tool_calls
+        );
+        let ids: Vec<&str> = snap
+            .active_tool_calls
+            .iter()
+            .map(|tc| tc.id.as_str())
+            .collect();
+        assert!(ids.contains(&"tc-running"));
+        assert!(ids.contains(&"tc-0299"));
+        assert!(!ids.contains(&"tc-0000"));
+        let mut sorted = ids.clone();
+        sorted.sort_unstable();
+        assert_eq!(ids, sorted);
+        let running = snap
+            .active_tool_calls
+            .iter()
+            .find(|tc| tc.id == "tc-running")
+            .expect("running call selected");
+        assert_eq!(running.status, ToolCallStatus::InProgress);
+        match running.output.as_ref() {
+            Some(ToolCallOutput::Text { content }) => assert_eq!(content.len(), OUTPUT_BYTES),
+            other => panic!("running output kept whole, got {other:?}"),
+        }
+        assert_eq!(s.active_tool_calls.len(), CALLS + 1);
+    }
+
+    /// In-progress output is projected before finished output, so a running
+    /// call that still fits the payload budget keeps its result whole.
+    #[test]
+    fn snapshot_keeps_a_running_tool_call_ahead_of_finished_output() {
+        let mut s = fresh_state();
+        for i in 0..200 {
+            run_tool_call(&mut s, &format!("tc-{i:04}"), 16 * 1024, true);
+        }
+        let huge = 2 * 1024 * 1024 + 1024;
+        run_tool_call(&mut s, "tc-huge", huge, false);
+
+        let snap = s.to_snapshot();
+        let limits = SnapshotLimits::default();
+        let encoded = serde_json::to_vec(&snap).expect("serialize snapshot");
+        assert!(encoded.len() <= limits.payload_bytes);
+        assert_eq!(snap.active_tool_calls.len(), limits.tool_calls);
+        assert_eq!(
+            snap.truncation.as_ref().unwrap().omitted_tool_calls,
+            201 - limits.tool_calls
+        );
+        let huge_tc = snap
+            .active_tool_calls
+            .iter()
+            .find(|tc| tc.id == "tc-huge")
+            .expect("running call selected");
+        assert_eq!(huge_tc.status, ToolCallStatus::InProgress);
+        match huge_tc.output.as_ref() {
+            Some(ToolCallOutput::Text { content }) => assert_eq!(content.len(), huge),
+            other => panic!("running output must stay whole when it fits, got {other:?}"),
+        }
+        assert!(snap.active_tool_calls.iter().all(|tc| tc.id != "tc-0000"));
+        assert_eq!(s.active_tool_calls.len(), 201);
+    }
+
+    /// An image on a finished call past the tool cap is an omission, not a
+    /// card shipped with empty bytes that the client would render as failure.
+    #[test]
+    fn snapshot_counts_an_image_on_a_tool_call_past_the_cap() {
+        let mut s = fresh_state();
+        let image_data = "R0lGODlhAQABAAAAACw=".repeat(64);
+        s.apply_event(&AcpEvent::ToolCall {
+            tool_call_id: "tc-image".into(),
+            title: "Image generation".into(),
+            kind: "other".into(),
+            status: "in_progress".into(),
+            content: None,
+            raw_input: Some("{\"prompt\":\"a cat\"}".into()),
+            raw_input_is_model_authored: None,
+            raw_output: None,
+            locations: None,
+            meta: None,
+            images: None,
+        });
+        s.apply_event(&AcpEvent::ToolCallUpdate {
+            tool_call_id: "tc-image".into(),
+            title: None,
+            status: Some("completed".into()),
+            content: None,
+            raw_input: None,
+            raw_input_is_model_authored: None,
+            raw_output: Some("o".repeat(16 * 1024)),
+            raw_output_append: None,
+            locations: None,
+            meta: None,
+            images: Some(vec![ToolCallImageInfo {
+                data: image_data.clone(),
+                mime_type: "image/png".into(),
+                uri: None,
+            }]),
+        });
+        for i in 0..300 {
+            run_tool_call(&mut s, &format!("tc-{i:04}"), 16 * 1024, true);
+        }
+
+        let snap = s.to_snapshot();
+        let limits = SnapshotLimits::default();
+        assert!(snap.active_tool_calls.iter().all(|tc| tc.id != "tc-image"));
+        let truncation = snap.truncation.as_ref().expect("omissions reported");
+        assert!(truncation.omitted_images >= 1);
+        assert_eq!(truncation.omitted_tool_calls, 301 - limits.tool_calls);
+        assert!(serde_json::to_vec(&snap).unwrap().len() <= limits.payload_bytes);
+        assert_eq!(
+            s.active_tool_calls["tc-image"].images[0].data.len(),
+            image_data.len(),
+            "live image bytes stay intact"
+        );
+    }
+
+    /// Three hundred in-progress calls still overflow the 128 slot cap. The
+    /// newest 128 ship; the rest are an explicit omission, not a full table.
+    #[test]
+    fn snapshot_omits_active_tools_past_the_cap_with_an_explicit_count() {
+        let mut s = fresh_state();
+        for i in 0..300 {
+            run_tool_call(&mut s, &format!("tc-{i:04}"), 16 * 1024, false);
+        }
+
+        let snap = s.to_snapshot();
+        let limits = SnapshotLimits::default();
+        assert_eq!(s.active_tool_calls.len(), 300);
+        assert_eq!(snap.active_tool_calls.len(), limits.tool_calls);
+        assert_eq!(
+            snap.truncation.as_ref().unwrap().omitted_tool_calls,
+            300 - limits.tool_calls
+        );
+        let ids: Vec<&str> = snap
+            .active_tool_calls
+            .iter()
+            .map(|tc| tc.id.as_str())
+            .collect();
+        let expected: Vec<String> = (172..300).map(|i| format!("tc-{i:04}")).collect();
+        assert_eq!(ids, expected.iter().map(String::as_str).collect::<Vec<_>>());
+        assert!(snap
+            .active_tool_calls
+            .iter()
+            .all(|tc| tc.status == ToolCallStatus::InProgress && tc.output.is_some()));
+        assert!(serde_json::to_vec(&snap).unwrap().len() <= limits.payload_bytes);
+    }
+
     #[test]
     fn snapshot_enforces_aggregate_budget_and_reports_omissions() {
         const MIB: usize = 1024 * 1024;
@@ -5847,6 +6232,17 @@ mod tests {
             limits.payload_bytes
         );
         assert_eq!(snapshot.active_tool_calls.len(), 12);
+        assert_eq!(
+            snapshot
+                .active_tool_calls
+                .iter()
+                .map(|tool| tool.id.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "tool-000", "tool-001", "tool-002", "tool-003", "tool-004", "tool-005", "tool-006",
+                "tool-007", "tool-008", "tool-009", "tool-010", "tool-011",
+            ]
+        );
         let truncation = snapshot.truncation.as_ref().expect("omissions reported");
         assert_eq!(truncation.omitted_tool_calls, 288);
         assert_eq!(truncation.omitted_images, 300);
@@ -5889,6 +6285,459 @@ mod tests {
             },
             output_bytes_before
         );
+    }
+
+    #[test]
+    fn snapshot_prefers_the_in_progress_tool_when_only_one_slot_remains() {
+        const MIB: usize = 1024 * 1024;
+        let mut s = fresh_state();
+        s.live_message = Some(LiveMessage {
+            id: "live-budget".into(),
+            role: MessageRole::Assistant,
+            content: vec![LiveContentBlock::Text {
+                text: "界".repeat(MIB / "界".len() + 1),
+                parent_tool_use_id: None,
+            }],
+            started_at: Utc::now(),
+        });
+        for index in 0..300 {
+            let id = format!("tool-{index:03}");
+            let status = if index == 299 {
+                ToolCallStatus::InProgress
+            } else {
+                ToolCallStatus::Completed
+            };
+            s.active_tool_calls.insert(
+                id.clone(),
+                ToolCallState {
+                    id,
+                    kind: ToolKind::Other,
+                    label: "budget fixture".into(),
+                    status,
+                    input: (index == 0).then(|| {
+                        serde_json::json!({
+                            "payload": "i".repeat(MIB),
+                        })
+                    }),
+                    output: (index == 0).then(|| ToolCallOutput::Text {
+                        content: "o".repeat(MIB),
+                    }),
+                    content: None,
+                    locations: None,
+                    meta: None,
+                    images: vec![ToolCallImageInfo {
+                        data: "a".repeat(256),
+                        mime_type: "image/png".into(),
+                        uri: None,
+                    }],
+                    raw_input: RawJsonAccumulator::default(),
+                },
+            );
+        }
+        let limits = SnapshotLimits {
+            payload_bytes: 96 * 1024,
+            tool_calls: 1,
+            images: 17,
+            failures: 8,
+            watchdog_tombstones: 8,
+        };
+
+        let snapshot = s.to_snapshot_with_limits(limits);
+        assert_eq!(snapshot.active_tool_calls[0].id, "tool-299");
+        assert_eq!(
+            snapshot.truncation.as_ref().unwrap().omitted_tool_calls,
+            299
+        );
+        assert!(serde_json::to_vec(&snapshot).unwrap().len() <= limits.payload_bytes);
+        assert_eq!(s.active_tool_calls.len(), 300);
+        assert_eq!(
+            s.active_tool_calls["tool-299"].status,
+            ToolCallStatus::InProgress
+        );
+        assert_eq!(
+            s.active_tool_calls
+                .values()
+                .filter(|tool| tool.status == ToolCallStatus::Completed)
+                .count(),
+            299
+        );
+    }
+
+    #[test]
+    fn snapshot_prefers_permission_linked_tool_over_in_progress() {
+        let mut s = fresh_state();
+        s.pending_permission = Some(PendingPermissionState {
+            request_id: "perm-1".into(),
+            tool_call_id: "not-consulted".into(),
+            tool_call: serde_json::json!({ "toolCallId": "tool-finished" }),
+            options: vec![],
+            created_at: Utc::now(),
+            queued: 0,
+        });
+        for (id, status) in [
+            ("tool-live", ToolCallStatus::InProgress),
+            ("tool-finished", ToolCallStatus::Completed),
+        ] {
+            s.active_tool_calls.insert(
+                id.into(),
+                ToolCallState {
+                    id: id.into(),
+                    kind: ToolKind::Other,
+                    label: id.into(),
+                    status,
+                    input: None,
+                    output: None,
+                    content: None,
+                    locations: None,
+                    meta: None,
+                    images: Vec::new(),
+                    raw_input: RawJsonAccumulator::default(),
+                },
+            );
+        }
+        let limits = SnapshotLimits {
+            payload_bytes: 64 * 1024,
+            tool_calls: 1,
+            images: 4,
+            failures: 4,
+            watchdog_tombstones: 4,
+        };
+        let snapshot = s.to_snapshot_with_limits(limits);
+        assert_eq!(snapshot.active_tool_calls.len(), 1);
+        assert_eq!(snapshot.active_tool_calls[0].id, "tool-finished");
+        assert_eq!(snapshot.truncation.as_ref().unwrap().omitted_tool_calls, 1);
+    }
+
+    #[test]
+    fn snapshot_does_not_guess_a_permission_tool_id_that_is_not_a_string() {
+        let mut s = fresh_state();
+        s.pending_permission = Some(PendingPermissionState {
+            request_id: "perm-1".into(),
+            tool_call_id: "tool-finished".into(),
+            tool_call: serde_json::json!({ "toolCallId": 7 }),
+            options: vec![],
+            created_at: Utc::now(),
+            queued: 0,
+        });
+        for (id, status) in [
+            ("tool-finished", ToolCallStatus::Completed),
+            ("tool-live", ToolCallStatus::InProgress),
+        ] {
+            s.active_tool_calls.insert(
+                id.into(),
+                ToolCallState {
+                    id: id.into(),
+                    kind: ToolKind::Other,
+                    label: id.into(),
+                    status,
+                    input: None,
+                    output: None,
+                    content: None,
+                    locations: None,
+                    meta: None,
+                    images: Vec::new(),
+                    raw_input: RawJsonAccumulator::default(),
+                },
+            );
+        }
+        let limits = SnapshotLimits {
+            payload_bytes: 64 * 1024,
+            tool_calls: 1,
+            images: 4,
+            failures: 4,
+            watchdog_tombstones: 4,
+        };
+        let snapshot = s.to_snapshot_with_limits(limits);
+        assert_eq!(snapshot.active_tool_calls[0].id, "tool-live");
+    }
+
+    #[test]
+    fn snapshot_prefers_the_most_recent_finished_tool() {
+        let mut s = fresh_state();
+        run_tool_call(&mut s, "tc-old", 32, true);
+        run_tool_call(&mut s, "tc-new", 32, true);
+        let limits = SnapshotLimits {
+            payload_bytes: 64 * 1024,
+            tool_calls: 1,
+            images: 1,
+            failures: 1,
+            watchdog_tombstones: 1,
+        };
+        let snapshot = s.to_snapshot_with_limits(limits);
+        assert_eq!(snapshot.active_tool_calls[0].id, "tc-new");
+        assert_eq!(snapshot.truncation.as_ref().unwrap().omitted_tool_calls, 1);
+        assert_eq!(s.active_tool_calls.len(), 2);
+    }
+
+    #[test]
+    fn snapshot_gives_budget_to_in_progress_tools_before_finished_output() {
+        let mut s = fresh_state();
+        s.active_tool_calls.insert(
+            "tool-finished".into(),
+            ToolCallState {
+                id: "tool-finished".into(),
+                kind: ToolKind::Other,
+                label: "finished".into(),
+                status: ToolCallStatus::Completed,
+                input: None,
+                output: Some(ToolCallOutput::Text {
+                    content: "F".repeat(80_000),
+                }),
+                content: None,
+                locations: None,
+                meta: None,
+                images: Vec::new(),
+                raw_input: RawJsonAccumulator::default(),
+            },
+        );
+        s.active_tool_calls.insert(
+            "tool-live".into(),
+            ToolCallState {
+                id: "tool-live".into(),
+                kind: ToolKind::Other,
+                label: "live".into(),
+                status: ToolCallStatus::InProgress,
+                input: None,
+                output: Some(ToolCallOutput::Text {
+                    content: "live-output".into(),
+                }),
+                content: None,
+                locations: None,
+                meta: None,
+                images: Vec::new(),
+                raw_input: RawJsonAccumulator::default(),
+            },
+        );
+        let limits = SnapshotLimits {
+            payload_bytes: 48 * 1024,
+            tool_calls: 2,
+            images: 1,
+            failures: 1,
+            watchdog_tombstones: 1,
+        };
+        let snapshot = s.to_snapshot_with_limits(limits);
+        let live = snapshot
+            .active_tool_calls
+            .iter()
+            .find(|tool| tool.id == "tool-live")
+            .expect("in-progress call selected");
+        match live.output.as_ref() {
+            Some(ToolCallOutput::Text { content }) => assert_eq!(content, "live-output"),
+            other => panic!("in-progress output was starved, got {other:?}"),
+        }
+        assert!(serde_json::to_vec(&snapshot).unwrap().len() <= limits.payload_bytes);
+    }
+
+    #[test]
+    fn snapshot_projects_pending_permission_before_finished_tool_output() {
+        let mut s = fresh_state();
+        s.pending_permission = Some(PendingPermissionState {
+            request_id: "perm-1".into(),
+            tool_call_id: "tc-finished".into(),
+            tool_call: serde_json::json!({
+                "toolCallId": "tc-finished",
+                "rawInput": { "patch": "keep-this-permission" },
+            }),
+            options: vec![],
+            created_at: Utc::now(),
+            queued: 0,
+        });
+        s.active_tool_calls.insert(
+            "tc-finished".into(),
+            ToolCallState {
+                id: "tc-finished".into(),
+                kind: ToolKind::Other,
+                label: "finished".into(),
+                status: ToolCallStatus::Completed,
+                input: None,
+                output: Some(ToolCallOutput::Text {
+                    content: "Z".repeat(80_000),
+                }),
+                content: None,
+                locations: None,
+                meta: None,
+                images: Vec::new(),
+                raw_input: RawJsonAccumulator::default(),
+            },
+        );
+        let limits = SnapshotLimits {
+            payload_bytes: 48 * 1024,
+            tool_calls: 1,
+            images: 1,
+            failures: 1,
+            watchdog_tombstones: 1,
+        };
+        let snapshot = s.to_snapshot_with_limits(limits);
+        let permission = snapshot.pending_permission.as_ref().expect("permission");
+        assert_eq!(
+            permission.tool_call["rawInput"]["patch"],
+            "keep-this-permission"
+        );
+        assert!(permission.tool_call.get("truncated").is_none());
+        assert!(serde_json::to_vec(&snapshot).unwrap().len() <= limits.payload_bytes);
+        assert_eq!(
+            s.pending_permission.as_ref().unwrap().tool_call["rawInput"]["patch"],
+            "keep-this-permission"
+        );
+    }
+
+    #[test]
+    fn snapshot_marks_a_permission_that_itself_exceeds_the_budget() {
+        let mut s = fresh_state();
+        let patch = "P".repeat(80_000);
+        s.pending_permission = Some(PendingPermissionState {
+            request_id: "perm-1".into(),
+            tool_call_id: "tc".into(),
+            tool_call: serde_json::json!({ "rawInput": { "patch": patch } }),
+            options: vec![],
+            created_at: Utc::now(),
+            queued: 0,
+        });
+        let limits = SnapshotLimits {
+            payload_bytes: 36 * 1024,
+            tool_calls: 1,
+            images: 1,
+            failures: 1,
+            watchdog_tombstones: 1,
+        };
+        let snapshot = s.to_snapshot_with_limits(limits);
+        let tool_call = &snapshot.pending_permission.expect("permission").tool_call;
+        assert_eq!(tool_call["truncated"], true);
+        assert!(tool_call.get("rawInput").is_none());
+        let rendered = serde_json::to_string(tool_call).unwrap();
+        assert!(!rendered.contains(&patch));
+        assert!(serde_json::to_vec(&snapshot).unwrap().len() <= limits.payload_bytes);
+        assert_eq!(
+            s.pending_permission.as_ref().unwrap().tool_call["rawInput"]["patch"]
+                .as_str()
+                .unwrap()
+                .len(),
+            patch.len()
+        );
+    }
+
+    #[test]
+    fn snapshot_keeps_delegation_meta_when_sibling_fields_do_not_fit() {
+        let mut s = fresh_state();
+        s.active_tool_calls.insert(
+            "tool-meta".into(),
+            ToolCallState {
+                id: "tool-meta".into(),
+                kind: ToolKind::Other,
+                label: "meta".into(),
+                status: ToolCallStatus::InProgress,
+                input: None,
+                output: None,
+                content: None,
+                locations: None,
+                meta: Some(serde_json::json!({
+                    "codeg.delegation": {
+                        "task_id": "task-keep-me",
+                        "child_connection_id": "child-1"
+                    },
+                    "blob": "B".repeat(200_000),
+                })),
+                images: Vec::new(),
+                raw_input: RawJsonAccumulator::default(),
+            },
+        );
+        let limits = SnapshotLimits {
+            payload_bytes: 40 * 1024,
+            tool_calls: 4,
+            images: 1,
+            failures: 1,
+            watchdog_tombstones: 1,
+        };
+        let snapshot = s.to_snapshot_with_limits(limits);
+        let meta = snapshot.active_tool_calls[0]
+            .meta
+            .as_ref()
+            .expect("meta projected");
+        assert_eq!(meta["codeg.delegation"]["task_id"], "task-keep-me");
+        assert!(meta.get("blob").is_none());
+        assert!(serde_json::to_vec(&snapshot).unwrap().len() <= limits.payload_bytes);
+        assert_eq!(
+            s.active_tool_calls["tool-meta"].meta.as_ref().unwrap()["blob"]
+                .as_str()
+                .unwrap()
+                .len(),
+            200_000
+        );
+    }
+
+    #[test]
+    fn snapshot_omits_a_delegation_association_that_does_not_fit_without_slicing_it() {
+        let task_id = "T".repeat(100_000);
+        let mut s = fresh_state();
+        s.active_tool_calls.insert(
+            "tool-assoc".into(),
+            ToolCallState {
+                id: "tool-assoc".into(),
+                kind: ToolKind::Other,
+                label: "assoc".into(),
+                status: ToolCallStatus::InProgress,
+                input: None,
+                output: None,
+                content: None,
+                locations: None,
+                meta: Some(serde_json::json!({
+                    "codeg.delegation": { "task_id": task_id },
+                })),
+                images: Vec::new(),
+                raw_input: RawJsonAccumulator::default(),
+            },
+        );
+        let limits = SnapshotLimits {
+            payload_bytes: 40 * 1024,
+            tool_calls: 1,
+            images: 1,
+            failures: 1,
+            watchdog_tombstones: 1,
+        };
+        let snapshot = s.to_snapshot_with_limits(limits);
+        let meta = snapshot.active_tool_calls[0].meta.as_ref().unwrap();
+        let rendered = serde_json::to_string(meta).unwrap();
+        assert!(!rendered.contains(&task_id));
+        assert!(!rendered.contains("…[truncated]"));
+        assert_eq!(meta["truncated"], true);
+        assert!(serde_json::to_vec(&snapshot).unwrap().len() <= limits.payload_bytes);
+        assert_eq!(
+            s.active_tool_calls["tool-assoc"].meta.as_ref().unwrap()["codeg.delegation"]["task_id"]
+                .as_str()
+                .unwrap()
+                .len(),
+            100_000
+        );
+    }
+
+    #[test]
+    fn snapshot_keeps_active_delegations_when_the_parent_tool_card_is_omitted() {
+        let mut s = fresh_state();
+        s.apply_event(&delegation_started("parent-tool", 42));
+        for i in 0..130 {
+            run_tool_call(&mut s, &format!("tc-{i:04}"), 32, true);
+        }
+        let limits = SnapshotLimits {
+            payload_bytes: 256 * 1024,
+            tool_calls: 1,
+            images: 1,
+            failures: 1,
+            watchdog_tombstones: 1,
+        };
+        let snapshot = s.to_snapshot_with_limits(limits);
+        assert_eq!(snapshot.active_tool_calls.len(), 1);
+        assert!(snapshot
+            .active_tool_calls
+            .iter()
+            .all(|tool| tool.id != "parent-tool"));
+        assert_eq!(snapshot.active_delegations.len(), 1);
+        assert_eq!(snapshot.active_delegations[0].task_id, "task-1");
+        assert_eq!(
+            snapshot.active_delegations[0].parent_tool_use_id,
+            "parent-tool"
+        );
+        assert_eq!(s.active_delegations.len(), 1);
+        assert!(serde_json::to_vec(&snapshot).unwrap().len() <= limits.payload_bytes);
     }
 
     #[test]

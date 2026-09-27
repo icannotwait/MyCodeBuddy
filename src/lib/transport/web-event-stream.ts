@@ -83,10 +83,27 @@ interface ActiveSub {
   handlers: AttachHandlers
 }
 
+const LEASE_HEARTBEAT_LOG = "[WebEventStream][lease-heartbeat]"
+
+type LeaseHeartbeatSub = {
+  subscriptionId: string
+  connectionId: string
+  shared: boolean
+  generation: number | null
+  hasLeaseId: boolean
+}
+
+type LeaseHeartbeatSummary = {
+  shared: number
+  nonShared: number
+  subs: LeaseHeartbeatSub[]
+}
+
 export class WebEventStream implements EventStream {
   private subs = new Map<string, ActiveSub>()
   private unbindWsReady: (() => void) | null
   private sharedHeartbeat: ReturnType<typeof setInterval> | null = null
+  private idleHeartbeatKey: string | null = null
   private destroyed = false
 
   constructor(private host: AttachTransportHost) {
@@ -264,19 +281,110 @@ export class WebEventStream implements EventStream {
   }
 
   private syncSharedHeartbeat(): void {
-    const needsHeartbeat =
-      !this.destroyed && [...this.subs.values()].some((sub) => sub.shared)
+    const summary = leaseSubscriptionSummary(this.subs)
+    const needsHeartbeat = !this.destroyed && summary.shared > 0
     if (needsHeartbeat && this.sharedHeartbeat === null) {
       this.sharedHeartbeat = setInterval(() => {
-        if (this.host.isWsOpen()) {
-          this.host.sendFrame({ action: "ping" })
-        }
+        this.tickSharedHeartbeat()
       }, 30_000)
-    } else if (!needsHeartbeat && this.sharedHeartbeat !== null) {
+      this.idleHeartbeatKey = null
+      console.debug(`${LEASE_HEARTBEAT_LOG} start`, summary)
+      return
+    }
+    if (!needsHeartbeat && this.sharedHeartbeat !== null) {
       clearInterval(this.sharedHeartbeat)
       this.sharedHeartbeat = null
+      this.idleHeartbeatKey = null
+      console.debug(`${LEASE_HEARTBEAT_LOG} stop`, {
+        reason: this.destroyed ? "destroyed" : "no shared subs",
+        ...summary,
+      })
+      return
+    }
+    if (!needsHeartbeat) {
+      this.logHeartbeatNotStarted(summary)
     }
   }
+
+  private tickSharedHeartbeat(): void {
+    const summary = leaseSubscriptionSummary(this.subs)
+    const counts = {
+      shared: summary.shared,
+      nonShared: summary.nonShared,
+    }
+    if (this.destroyed) {
+      console.debug(`${LEASE_HEARTBEAT_LOG} tick skipped`, {
+        reason: "destroyed",
+        ...counts,
+      })
+      return
+    }
+    if (summary.shared === 0) {
+      console.debug(`${LEASE_HEARTBEAT_LOG} tick skipped`, {
+        reason: "no shared subs",
+        ...counts,
+      })
+      return
+    }
+    if (!this.host.isWsOpen()) {
+      console.debug(`${LEASE_HEARTBEAT_LOG} tick skipped`, {
+        reason: "ws not open",
+        ...counts,
+      })
+      return
+    }
+    const sent = this.host.sendFrame({ action: "ping" })
+    if (sent) {
+      console.debug(`${LEASE_HEARTBEAT_LOG} tick sent`, counts)
+      return
+    }
+    console.debug(`${LEASE_HEARTBEAT_LOG} tick skipped`, {
+      reason: "send failed",
+      ...counts,
+    })
+  }
+
+  private logHeartbeatNotStarted(summary: LeaseHeartbeatSummary): void {
+    const key = heartbeatIdleKey(this.destroyed, summary)
+    if (key === this.idleHeartbeatKey) return
+    this.idleHeartbeatKey = key
+    console.debug(`${LEASE_HEARTBEAT_LOG} not started`, {
+      reason: this.destroyed ? "destroyed" : "no shared subs",
+      ...summary,
+    })
+  }
+}
+
+function shortId(id: string): string {
+  return id.length <= 8 ? id : id.slice(0, 8)
+}
+
+function leaseSubscriptionSummary(
+  subs: Map<string, ActiveSub>
+): LeaseHeartbeatSummary {
+  const rows = [...subs.entries()].map(([subscriptionId, sub]) => ({
+    subscriptionId: shortId(subscriptionId),
+    connectionId: shortId(sub.connectionId),
+    shared: sub.shared !== undefined,
+    generation: sub.shared?.generation ?? null,
+    hasLeaseId: Boolean(sub.shared?.leaseId),
+  }))
+  const shared = rows.filter((row) => row.shared).length
+  return {
+    shared,
+    nonShared: rows.length - shared,
+    subs: rows,
+  }
+}
+
+function heartbeatIdleKey(
+  destroyed: boolean,
+  summary: LeaseHeartbeatSummary
+): string {
+  const ids = summary.subs
+    .map((sub) => `${sub.subscriptionId}:${sub.shared ? 1 : 0}`)
+    .join(",")
+  return `${destroyed ? 1 : 0}|${summary.shared}|${summary.nonShared}|${ids}`
 }
 
 function isAttachFrame(frame: unknown): frame is ServerAttachFrame {

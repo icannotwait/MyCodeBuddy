@@ -274,11 +274,11 @@ export interface ConversationRuntimeSession {
   lastTurnOwned: boolean
 
   // Read-only delegation-child viewer marker. When true, `getTimelineTurns`
-  // suppresses the persisted copy of the (single) reply turn while this
-  // session has a live or just-promoted reply — so the sub-agent dialog shows
-  // the kickoff + live/local reply exactly once, never a persisted partial
-  // beside the live stream. Off for normal panels (which never set it), so
-  // their multi-turn history is untouched. See `getTimelineTurns`.
+  // suppresses the persisted copy of the active reply while this session is
+  // showing a live assistant turn or holds a just-promoted assistant in
+  // `localTurns`. An empty live message renders nothing and must not hide the
+  // persisted reply. Off for normal panels (which never set it). See
+  // `getTimelineTurns`.
   liveOwnsActiveTurn: boolean
 
   // Known kickoff prompt text for a delegation-child viewer (the parent's
@@ -397,10 +397,12 @@ const initialState: ConversationRuntimeState = {
 const EMPTY_TIMELINE: ConversationTimelineTurn[] = []
 
 /**
- * Cache key for the historical (non-streaming) timeline. Intentionally excludes
- * live message *content* so content-only `SET_LIVE_MESSAGE` appends reuse the
- * same historical array + entry references. Live identity (`id` / `startedAt`)
- * still invalidates once at turn start and once at handoff.
+ * Cache key for the historical (non-streaming) timeline. Ordinary live token
+ * text is excluded so content-only `SET_LIVE_MESSAGE` appends reuse the same
+ * historical array and entry references. Live identity (`id` / `startedAt`)
+ * still invalidates once at turn start and once at handoff. `liveShowsReply`
+ * and `steeringContentSignature` are the only live-content facts this scan
+ * reads. The live message object itself is not part of the key.
  */
 interface HistoricalTimelineCacheKey {
   detail: DbConversationDetail | null
@@ -415,6 +417,13 @@ interface HistoricalTimelineCacheKey {
   delegationKickoffText: string | null
   liveMessageId: string | null
   liveStartedAt: number | null
+  /** True when the built live stream contains an assistant turn. */
+  liveShowsReply: boolean
+  /**
+   * Steering blocks only: text, blocks, and createdAt via `steeredContentKey`.
+   * A normal text delta does not change this.
+   */
+  steeringContentSignature: string
 }
 
 interface HistoricalTimelineCacheEntry {
@@ -441,12 +450,33 @@ function sameHistoricalKey(
     left.liveOwnsActiveTurn === right.liveOwnsActiveTurn &&
     left.delegationKickoffText === right.delegationKickoffText &&
     left.liveMessageId === right.liveMessageId &&
-    left.liveStartedAt === right.liveStartedAt
+    left.liveStartedAt === right.liveStartedAt &&
+    left.liveShowsReply === right.liveShowsReply &&
+    left.steeringContentSignature === right.steeringContentSignature
   )
 }
 
+/**
+ * Stable signature of steering blocks only (text, blocks, createdAt).
+ * A normal text delta does not change it, and the live message object is
+ * not stored on the historical key.
+ */
+function steeringContentSignature(liveMessage: LiveMessage | null): string {
+  if (!liveMessage) return ""
+  let signature = ""
+  for (const block of liveMessage.content) {
+    if (block.type !== "steering") continue
+    signature += steeredContentKey(block.text, block.blocks)
+    signature += "\x1e"
+    signature += block.createdAt
+    signature += "\x1f"
+  }
+  return signature
+}
+
 function buildHistoricalKey(
-  session: ConversationRuntimeSession
+  session: ConversationRuntimeSession,
+  liveShowsReply: boolean
 ): HistoricalTimelineCacheKey {
   return {
     detail: session.detail,
@@ -461,6 +491,8 @@ function buildHistoricalKey(
     delegationKickoffText: session.delegationKickoffText,
     liveMessageId: session.liveMessage?.id ?? null,
     liveStartedAt: session.liveMessage?.startedAt ?? null,
+    liveShowsReply,
+    steeringContentSignature: steeringContentSignature(session.liveMessage),
   }
 }
 
@@ -3430,8 +3462,8 @@ function reducer(
       // an in-flight id stamp only ever touches the tail, never a page).
       const existingIds = new Set(detail.turns.map((t) => t.id))
       const prependTurns = page.turns.filter((t) => !existingIds.has(t.id))
-      // A NEW detail object on purpose: `timelinePrefixCache` is keyed by
-      // detail identity, so an in-place turns mutation would render stale.
+      // A NEW detail object on purpose: the historical timeline cache compares
+      // detail by identity, so an in-place turns mutation would render stale.
       const nextDetail: DbConversationDetail = {
         ...detail,
         turns: [...prependTurns, ...detail.turns],
@@ -5658,6 +5690,23 @@ const VIEWER_DETAIL_SYNC_DELAYS_MS = [0, 300, 700, 1500, 2500] as const
 // wipe), and so SessionStarted/ConversationLinked bind can land.
 const SETTLED_TURN_HYDRATE_DELAYS_MS = [80, 300, 700, 1500, 2500] as const
 
+// ─── Post-turn metadata reparse ──────────────────────────────────────────
+// Backoff for `syncTurnMetadata`, which re-reads the agent's transcript after
+// a reply settles. It races the same flush the viewer sync above does — the
+// ACP turn-end arrives off the wire's stop-reason, while the agent's CLI
+// writes its own log afterwards, in batches (deepseek compresses one zstd
+// frame per batch, so a reply's `turn/end` — the record carrying its usage AND
+// its completion clock — can stay unreadable for several seconds; a longer
+// session makes the wait longer still). This used to be two attempts, 1.5s
+// then 3s: past 4.5s the reply's footer simply stayed empty (no model, no
+// tokens, no time) and every earlier reply of the session stayed unnameable —
+// `source_turn_id` is only placeable while the parse is 1:1 with what this
+// client streamed, so a parse that is still behind greys out their "fork from
+// here" as "not ready yet" for good. Both only recovered by reopening the
+// conversation, which re-renders straight from a fresh parse. So the poll now
+// backs off across ~30s and stops as soon as the transcript has caught up.
+const TURN_METADATA_SYNC_DELAYS_MS = [1500, 3000, 5000, 8000, 13000] as const
+
 // Active viewer-sync polls, keyed by conversationId, so a fresh nudge supersedes
 // an in-flight poll (never stacks) and `removeConversation` / store reset can
 // cancel a poll whose tab has closed.
@@ -6077,17 +6126,19 @@ function collectInFlightPersistedToolCalls(
 
 /**
  * Historical (non-streaming) timeline: phases 1–3 only. Cached per conversation
- * with a key that excludes live content so streaming token appends keep the
- * same historical array and entry references.
+ * with a key that excludes ordinary live token text so streaming appends keep
+ * the same historical array and entry references. `liveShowsReply` and the
+ * steering-content signature are part of the key because this scan reads them.
  */
 function computeHistoricalTimeline(
   state: ConversationRuntimeState,
-  conversationId: number
+  conversationId: number,
+  liveShowsReply: boolean
 ): ConversationTimelineTurn[] {
   const session = state.byConversationId.get(conversationId)
   if (!session) return EMPTY_TIMELINE
 
-  const key = buildHistoricalKey(session)
+  const key = buildHistoricalKey(session, liveShowsReply)
   const cached = historicalTimelineCache.get(conversationId)
   if (cached && sameHistoricalKey(cached.key, key)) {
     return cached.value
@@ -6105,10 +6156,9 @@ function computeHistoricalTimeline(
   // one reply. (A hypothetical multi-turn child would have earlier replies
   // hidden during the live/grace window — not a case the viewer supports.)
   //
-  // Identity-only live fields (`liveMessageId` / `liveStartedAt`) gate the
-  // same branches that previously checked `session.liveMessage !== null`, so
-  // content-only live updates do not recompute this path.
-  const liveMessageId = key.liveMessageId
+  // Ordinary token text stays out of the key, so a text delta does not
+  // recompute this path. `liveShowsReply` and the steering signature do,
+  // because the suppressions below read those rather than the message object.
   const liveStartedAt = key.liveStartedAt
   const rawPersistedTurns = session.detail?.turns ?? []
   const alignment = session.liveOwnsActiveTurn
@@ -6191,18 +6241,30 @@ function computeHistoricalTimeline(
           : session.localTurns.slice(group.start, group.end)
       )
     : session.localTurns
+  // A persisted copy of a message the user sent mid-turn is not a round
+  // boundary. Skip it only when this round has proved the copy is steering
+  // (content + time, and the live message holds the round from before the
+  // interruption). Do not skip every user turn with the same text.
+  const steeredCopyIds = collectSteeredPersistedCopyIds(session)
+  const liveStreamedRoundStart = steeredCopyIds
+    ? liveMessageOpensBeforeFirstSteer(session.liveMessage)
+    : false
+  const roundAnchorSkipIds =
+    liveStreamedRoundStart && steeredCopyIds ? steeredCopyIds : null
+  const isRoundBoundaryUserTurn = (turn: MessageTurn): boolean =>
+    turn.role === "user" && !roundAnchorSkipIds?.has(turn.id)
   const hasLiveOrLocalReply =
     session.liveOwnsActiveTurn &&
-    (liveMessageId !== null || session.localTurns.length > 0)
-  // Scoped to the active round: strip only what follows the LAST persisted
-  // user turn. For a one-shot delegation child that is exactly the old
-  // "from the first assistant turn" rule. For a multi-round session the old
-  // rule erased every earlier round while streaming.
+    (liveShowsReply ||
+      session.localTurns.some((turn) => turn.role === "assistant"))
+  // Scoped to the active round: strip only what follows the last real round
+  // boundary. For a one-shot delegation child that is the first-assistant
+  // rule. Earlier rounds stay.
   let stripFrom = -1
   if (hasLiveOrLocalReply) {
     let lastUserIdx = -1
     for (let i = persistedWithLocalReplacement.length - 1; i >= 0; i--) {
-      if (persistedWithLocalReplacement[i]!.role === "user") {
+      if (isRoundBoundaryUserTurn(persistedWithLocalReplacement[i]!)) {
         lastUserIdx = i
         break
       }
@@ -6231,13 +6293,12 @@ function computeHistoricalTimeline(
   // into `detail` it sits beside the live reply (a separate assistant turn
   // under a `live-…` id), and `mergeConsecutiveAssistantTurns` concatenates
   // the two — so the already-persisted head (e.g. the first reasoning block)
-  // renders twice. Hide that persisted partial, but ONLY while `liveMessage`
-  // is in hand: the live stream carries the full reply (the attach snapshot is
-  // built atomically and includes it), so this only ever hides from render
-  // what the live stream is concurrently showing — never dropping a reply we
-  // can't re-show. The moment the turn ends, `liveMessage` clears and the
-  // persisted copy (now complete) renders normally; the brief promote→refetch
-  // grace window can show a transient visible duplicate, never a hidden turn.
+  // renders twice. Hide that persisted partial, but ONLY while the live message
+  // is actually SHOWING a reply (`liveShowsReply`): that is what makes this a
+  // choice between two renderings of one reply rather than a deletion. The
+  // moment the turn ends, `liveMessage` clears and the persisted copy (now
+  // complete) renders normally; the brief promote→refetch grace window can show
+  // a transient visible duplicate, never a hidden turn.
   //
   // The in-flight prompt is identified authoritatively by the backend, which
   // reports the id of the persisted user turn it stamped as the in-flight one
@@ -6262,12 +6323,25 @@ function computeHistoricalTimeline(
           !(session.queuedOptimisticTurnIds ?? []).includes(turn.id)
       ))
   const inFlightPromptId = staleInFlightPrompt ? null : stampedPromptId
-  const inFlightPromptIdx =
-    !hasLiveOrLocalReply && liveMessageId !== null && inFlightPromptId !== null
-      ? persistedTurns.findIndex(
-          (t) => t.role === "user" && t.id === inFlightPromptId
-        )
-      : -1
+  // Hide the persisted partial only while the live stream is showing a reply.
+  // When the stamp is missing, anchor on the newest user turn this client can
+  // prove opened the round — not a steered copy, and not every same-text user
+  // turn. Reachable only once a copy is in detail and the live message holds
+  // the round from before the interruption.
+  const canSuppressInFlightPartial = !hasLiveOrLocalReply && liveShowsReply
+  let inFlightPromptIdx = -1
+  if (canSuppressInFlightPartial && inFlightPromptId !== null) {
+    inFlightPromptIdx = persistedTurns.findIndex(
+      (t) => t.role === "user" && t.id === inFlightPromptId
+    )
+  } else if (canSuppressInFlightPartial && roundAnchorSkipIds) {
+    for (let i = persistedTurns.length - 1; i >= 0; i--) {
+      if (isRoundBoundaryUserTurn(persistedTurns[i]!)) {
+        inFlightPromptIdx = i
+        break
+      }
+    }
+  }
   const visiblePersistedTurns =
     inFlightPromptIdx === -1
       ? persistedTurns
@@ -6411,49 +6485,46 @@ function appendCanonicalStreamingTurns(
   historical: ConversationTimelineTurn[],
   conversationId: number,
   liveMessage: LiveMessage,
-  agentType?: AgentType | null
+  agentType?: AgentType | null,
+  built?: BuiltStreamingTurns
 ): ConversationTimelineTurn[] {
-  const built = buildStreamingTurnsFromLiveMessage(
-    conversationId,
-    liveMessage,
-    {
+  const streaming =
+    built ??
+    buildStreamingTurnsFromLiveMessage(conversationId, liveMessage, {
       agentType: agentType ?? null,
-    }
-  )
+    })
   const result = historical.slice()
-  for (const [index, turn] of built.turns.entries()) {
+  for (const [index, turn] of streaming.turns.entries()) {
     result.push({
       key: `streaming-${conversationId}-${liveMessage.id}-${index}`,
       turn,
       phase: "streaming",
-      inProgressToolCallIds: built.inProgressToolCallIds,
+      inProgressToolCallIds: streaming.inProgressToolCallIds,
     })
   }
   return dedupeTimeline(result)
 }
 
 /**
- * Hide the persisted copy of a message the user sent mid-turn, when the live
- * stream is already showing it.
+ * Ids of the DETAIL's own copies of the messages the user sent mid-turn, i.e.
+ * the persisted user turns that the live stream is already showing as steered
+ * messages. `null` when this turn steered nothing (the overwhelmingly common
+ * case), so every caller below is free in an ordinary turn.
  *
  * The agent writes a steered message into its own transcript, so a detail
  * fetch that lands DURING the turn brings it back as an ordinary user turn —
- * under a parser id, which no id-keyed dedup can match to the live copy. Both
- * would render.
- *
- * The live copy is the one to keep: it sits between the two halves of the
- * reply, where the message was actually sent, while the persisted copy is
- * appended after the in-flight prompt with the reply's first half suppressed
- * around it (see `visiblePersistedTurns`), which would put the interruption
- * before the text it interrupted.
+ * under a parser id, which no id-keyed dedup can match to the live copy. Three
+ * separate rules need to know which persisted turns those are:
+ * `suppressPersistedSteeredPrompts` hides them, and the two round anchors in
+ * `computeHistoricalTimeline` must not mistake one for the start of a new round.
  *
  * Matched on CONTENT, the same way `APPEND_VIEWER_USER_TURN` reconciles the two
  * id namespaces of one prompt — but content ALONE cannot say which message it
  * matched. Steered text is short and repeatable ("continue", "stop", "not
- * done"), so a bare content match reaches back and hides the identical prompt
- * the user sent three rounds ago, for as long as the turn runs. Suppressing a
- * user turn is the one failure that hides a message rather than duplicating
- * it, so the match is bounded by WHEN:
+ * done"), so a bare content match reaches back and finds the identical prompt
+ * the user sent three rounds ago. Suppressing a user turn is the one failure
+ * that hides a message rather than duplicating it, so the match is bounded by
+ * WHEN:
  *
  *   - each `steering` block carries the note's `created_at`, taken on the
  *     agent's machine BEFORE the backend handed it the text (an invariant of
@@ -6463,23 +6534,16 @@ function appendCanonicalStreamingTurns(
  *     including this round's own prompt, which the agent wrote before the user
  *     steered.
  *
- * Candidates are further limited to turns the DETAIL projected, so every
- * timestamp compared comes from the agent's own clock; a promoted `localTurns`
- * copy (client clock, and kept across a mid-turn refetch by `preserveLive`) is
- * never a candidate. Anything unreadable — no parseable instant on either side
- * — suppresses nothing, leaving the two copies to coexist: a visible duplicate,
+ * Candidates are limited to turns the DETAIL projected, so every timestamp
+ * compared comes from the agent's own clock; a promoted `localTurns` copy
+ * (client clock, and kept across a mid-turn refetch by `preserveLive`) is never
+ * a candidate. Anything unreadable — no parseable instant on either side —
+ * matches nothing, leaving the two copies to coexist: a visible duplicate,
  * never a hidden message.
- *
- * Deliberately NOT anchored on `detail.in_flight_user_turn_id`: the backend
- * stamps that by matching the pending prompt against the transcript TAIL (see
- * `apply_in_flight_message_id`), and once the agent has written the steered
- * message the tail is that message, not the prompt — so the stamp is gone in
- * exactly the shape this function exists for.
  */
-function suppressPersistedSteeredPrompts(
-  prefix: ConversationTimelineTurn[],
+function collectSteeredPersistedCopyIds(
   session: ConversationRuntimeSession
-): ConversationTimelineTurn[] {
+): Set<string> | null {
   // Content key → the earliest instant a copy of it could have been written.
   // Read from the blocks rather than from the built turns: a block with no
   // readable stamp shows under the turn's start time, and treating THAT as the
@@ -6496,27 +6560,83 @@ function suppressPersistedSteeredPrompts(
     if (known === undefined || at < known) steeredAt.set(key, at)
     if (at < earliestSteerAt) earliestSteerAt = at
   }
-  if (!steeredAt) return prefix
+  if (!steeredAt) return null
   const detailTurns = session.detail?.turns
-  if (!detailTurns) return prefix
-  // Ids are unique across the timeline's phases (a same-id copy in another
-  // phase is the same turn — see `dedupeTimeline`), so membership alone tells
-  // a detail-projected turn from a locally promoted one.
-  const detailUserIds = new Set<string>()
+  if (!detailTurns) return null
+  let ids: Set<string> | null = null
   for (const turn of detailTurns) {
-    if (turn.role === "user") detailUserIds.add(turn.id)
-  }
-  const filtered = prefix.filter((item) => {
-    if (item.phase !== "persisted" || item.turn.role !== "user") return true
-    if (!detailUserIds.has(item.turn.id)) return true
+    if (turn.role !== "user") continue
     // Cheap gate first: everything written before the earliest steer is out,
     // so history never reaches the content key (which serializes full text and
-    // full image data, and this runs on every streaming batch).
-    const at = Date.parse(item.turn.timestamp)
-    if (!Number.isFinite(at) || at < earliestSteerAt) return true
-    const steered = steeredAt.get(userTurnContentKey(item.turn))
-    return steered === undefined || at < steered
-  })
+    // full image data, and this runs whenever the prefix is rebuilt).
+    const at = Date.parse(turn.timestamp)
+    if (!Number.isFinite(at) || at < earliestSteerAt) continue
+    const steered = steeredAt.get(userTurnContentKey(turn))
+    if (steered === undefined || at < steered) continue
+    ids ??= new Set<string>()
+    ids.add(turn.id)
+  }
+  return ids
+}
+
+/**
+ * Whether this session's live message opens on the reply rather than on the
+ * interruption: it holds at least one block from BEFORE the first mid-turn
+ * message, so it is showing the round from its start and can stand in for
+ * every persisted turn of it.
+ *
+ * The gate on moving a round anchor past a steered copy, because doing that
+ * hides the persisted turns between the copy and the real prompt. A live
+ * message that begins at the interruption is not evidence for them: a session
+ * that adopts a snapshot mid-turn starts from the backend's live message, which
+ * carries no `steering` block at all (see `snapshot-denormalize`), so a steer
+ * arriving afterwards can be the first thing this client ever saw of the turn.
+ * Hiding the reply's persisted first half there would put it nowhere.
+ */
+function liveMessageOpensBeforeFirstSteer(
+  liveMessage: LiveMessage | null
+): boolean {
+  for (const block of liveMessage?.content ?? []) {
+    if (block.type === "steering") return false
+    // Parented subagent output never reaches the main thread (see
+    // `buildStreamingTurnsFromLiveMessage`), so it is not evidence that this
+    // client holds the reply either.
+    if (
+      (block.type === "text" || block.type === "thinking") &&
+      block.parentToolUseId
+    ) {
+      continue
+    }
+    return true
+  }
+  return false
+}
+
+/**
+ * Hide the persisted copies of the messages the user sent mid-turn, since the
+ * live stream is already showing them.
+ *
+ * The live copy is the one to keep: it sits between the two halves of the
+ * reply, where the message was actually sent, while the persisted copy is
+ * appended after the in-flight prompt with the reply's first half suppressed
+ * around it (see `visiblePersistedTurns`), which would put the interruption
+ * before the text it interrupted.
+ *
+ * Ids are unique across the timeline's phases (a same-id copy in another phase
+ * is the same turn — see `dedupeTimeline`), so id membership alone tells a
+ * detail-projected turn from a locally promoted one.
+ */
+function suppressPersistedSteeredPrompts(
+  prefix: ConversationTimelineTurn[],
+  steeredCopyIds: ReadonlySet<string> | null
+): ConversationTimelineTurn[] {
+  if (!steeredCopyIds) return prefix
+  const filtered = prefix.filter(
+    (item) =>
+      item.phase !== "persisted" ||
+      item.turn.role !== "user" ||
+      !steeredCopyIds.has(item.turn.id)
+  )
   return filtered.length === prefix.length ? prefix : filtered
 }
 
@@ -6529,16 +6649,38 @@ function computeTimeline(
   state: ConversationRuntimeState,
   conversationId: number
 ): ConversationTimelineTurn[] {
-  const historical = computeHistoricalTimeline(state, conversationId)
   const session = state.byConversationId.get(conversationId)
-  if (!session) return historical
-  const head = suppressPersistedSteeredPrompts(historical, session)
-  if (!session.liveMessage) return head
+  if (!session) return EMPTY_TIMELINE
+
+  const agentType = resolveSessionAgentType(session)
+  const liveMessage = session.liveMessage
+  const built = liveMessage
+    ? buildStreamingTurnsFromLiveMessage(conversationId, liveMessage, {
+        agentType: agentType ?? null,
+      })
+    : undefined
+  // A user turn here is a mid-turn steer, not a reply. Do not guess from
+  // `content.length > 0`: an empty live message, or one whose blocks this
+  // build drops, shows no assistant and must suppress nothing.
+  const liveShowsReply =
+    built?.turns.some((turn) => turn.role === "assistant") ?? false
+
+  const historical = computeHistoricalTimeline(
+    state,
+    conversationId,
+    liveShowsReply
+  )
+  const head = suppressPersistedSteeredPrompts(
+    historical,
+    collectSteeredPersistedCopyIds(session)
+  )
+  if (!liveMessage || !built) return head
   return appendCanonicalStreamingTurns(
     head,
     conversationId,
-    session.liveMessage,
-    resolveSessionAgentType(session)
+    liveMessage,
+    agentType,
+    built
   )
 }
 
@@ -7564,14 +7706,45 @@ export const useConversationRuntimeStore = create<ConversationRuntimeStore>()((
     const runtimeId = runtimeConversationId ?? dbConversationId
     let cancelled = false
     let timerId: ReturnType<typeof setTimeout> | null = null
+    // Highest attempt whose timer has been armed. Keeps the schedule a single
+    // chain: only the newest timer is held in `timerId`, so a second call for
+    // the same attempt (a throwing `then` handler reaching the `catch` after
+    // it already scheduled) would strand an uncancellable one.
+    let armed = -1
+    // Rounds spent waiting on a reply whose record IS on disk but whose usage
+    // is not (see the retry decision below). Counted separately from `armed`
+    // so the allowance is the same wherever in the schedule that state first
+    // shows up.
+    let usageOnlyRounds = 0
+
+    // Advance the backoff, unless this sync was cancelled, already moved on,
+    // or has run out of attempts. Hoisted so the attempt below can call it;
+    // `trySync` is initialized before the first timer is ever armed.
+    function scheduleNext(attempt: number): void {
+      if (cancelled) return
+      const next = attempt + 1
+      if (next >= TURN_METADATA_SYNC_DELAYS_MS.length) return
+      if (next <= armed) return
+      trySync(next)
+    }
 
     const trySync = (attempt: number) => {
-      const delay = attempt === 0 ? 1500 : 3000
+      armed = attempt
       timerId = setTimeout(() => {
         if (cancelled) return
         const session = get().byConversationId.get(runtimeId)
         if (!session || session.localTurns.length === 0) return
-        if (session.syncState === "awaiting_persist") return
+        // A prompt is in flight again — the user typed ahead inside our
+        // backoff, or the queue auto-flushed the moment the reply settled.
+        // Patching is unsafe mid-turn, but ABANDONING the schedule is worse:
+        // the reply that just finished may still be unflushed, and this poll
+        // is the only thing that would ever fill in its stats. Skip the
+        // roundtrip, keep the schedule. (A completion cancels this sync and
+        // starts a fresh one, so nothing double-runs.)
+        if (session.syncState === "awaiting_persist") {
+          scheduleNext(attempt)
+          return
+        }
 
         // Windowed fetch anchored at the batch boundary: the response then
         // holds exactly this batch's turns (plus anything appended after),
@@ -7585,7 +7758,10 @@ export const useConversationRuntimeStore = create<ConversationRuntimeStore>()((
             if (cancelled) return
             const cur = get().byConversationId.get(runtimeId)
             if (!cur || cur.localTurns.length === 0) return
-            if (cur.syncState === "awaiting_persist") return
+            if (cur.syncState === "awaiting_persist") {
+              scheduleNext(attempt)
+              return
+            }
 
             const localAssistantIndices: number[] = []
             for (let i = 0; i < cur.localTurns.length; i++) {
@@ -7637,6 +7813,18 @@ export const useConversationRuntimeStore = create<ConversationRuntimeStore>()((
                       parsed.turns[parsed.turns.length - 1]?.role ===
                       "assistant",
                   })
+            // An unverified window is worth another look ONLY when the
+            // transcript is behind: `fromIndex` clamps to the total, so an
+            // offset SHORT of the boundary means the batch has not reached
+            // disk yet and a later round can verify. Every other mismatch is
+            // permanent for this batch — the boundary hash is absent (captured
+            // under a legacy detail) or the prefix was rewritten at the same
+            // offset (compaction) — and patches stay `[]` however long we
+            // poll, so five reparses would buy nothing.
+            const windowUnverifiableForGood =
+              responseWindowed &&
+              !windowVerified &&
+              !(boundaryIndex != null && parsed.turns_offset < boundaryIndex)
 
             // Preserve broker-stamped tool metadata (including delegation
             // task previews/runtime projection) using the same history-aware
@@ -7679,29 +7867,56 @@ export const useConversationRuntimeStore = create<ConversationRuntimeStore>()((
               })
             }
 
-            // Retry once if the MOST RECENT local assistant turn still lacks
-            // usage — its transcript may not have flushed yet. Keying on the
-            // last EMITTED patch is wrong when the latest local turn is the
-            // unflushed one: an earlier reply's patch (with usage) would
-            // suppress the retry the latest turn needs.
+            // How far behind the transcript still is, judged on the NEWEST
+            // local reply — read from the STORE, not from this round's
+            // patches, so a value an earlier round already pinned counts as
+            // covered (first-write-wins).
+            //
+            // NOTHING at all (no usage, no completion time): the parse either
+            // does not hold that reply yet, or holds it UNFINALIZED — deepseek
+            // attaches both from the single `turn/end` record, which can land
+            // several frames after the reply's text. That is also the state
+            // that withholds `source_turn_id` from EVERY reply of the batch
+            // (see `idIsPlaceable`), i.e. what leaves the earlier replies'
+            // "fork from here" greyed out as "not ready yet" — so it gets the
+            // whole schedule.
+            //
+            // Usage ALONE missing is a much shorter wait: the reply's own
+            // record is on disk (it carried the completion time) and only a
+            // trailing metering record is outstanding — codex writes
+            // `token_count` as the line after the agent message. One extra
+            // look covers that, and capping it there keeps an agent that never
+            // reports usage at all (Cursor) from polling out the full schedule
+            // on every single turn.
+            //
+            // A SURPLUS — the parser split the reply, or an out-of-turn record
+            // landed — is deliberately not a retry signal: it leaves turns
+            // unnamed for the rest of the session however long we poll, and it
+            // patches the newest reply, so it stops here.
+            const after = get().byConversationId.get(runtimeId)
             const lastLocalAssistantIndex =
               localAssistantIndices[localAssistantIndices.length - 1]
-            const latestCoverage =
+            const newest =
               lastLocalAssistantIndex === undefined
                 ? undefined
-                : patches.find((p) => p.index === lastLocalAssistantIndex)
-            if (
-              lastLocalAssistantIndex !== undefined &&
-              !latestCoverage?.usage &&
-              attempt < 1
-            ) {
-              trySync(attempt + 1)
+                : after?.localTurns[lastLocalAssistantIndex]
+            if (newest != null && newest.usage == null) {
+              if (newest.completed_at == null) {
+                if (!windowUnverifiableForGood) scheduleNext(attempt)
+              } else if (usageOnlyRounds < 1) {
+                usageOnlyRounds += 1
+                scheduleNext(attempt)
+              }
             }
           })
           .catch(() => {
-            // Silent — localTurns content remains visible
+            // A failed read is transient (the transcript may be mid-write, or
+            // the window fetch raced a compaction): stay on the schedule
+            // rather than dropping the reply's metadata for good. Never
+            // surfaces an error — localTurns content remains visible.
+            scheduleNext(attempt)
           })
-      }, delay)
+      }, TURN_METADATA_SYNC_DELAYS_MS[attempt])
     }
 
     trySync(0)
@@ -8046,6 +8261,44 @@ export function getRuntimeSession(
   )
 }
 
+// Sessions a view released on unmount, each waiting one task for its removal.
+const pendingSessionReleases = new Map<number, ReturnType<typeof setTimeout>>()
+
+/**
+ * Remove a runtime session once the current task is over, unless a view claims
+ * it first (`claimRuntimeSession`).
+ *
+ * This is how a conversation view gives up its session on unmount, because an
+ * unmount cannot tell that a view is about to mount straight back onto the
+ * same session: React StrictMode replays the effects of every fresh mount in
+ * development, and the desktop/mobile layout swap remounts every view in one
+ * commit. Neither moves the tab, so neither is a reparent, and removing the
+ * session on the spot emptied the transcript under the view that came back —
+ * its live-message sink recreates the session with live data and no detail,
+ * and `fetchDetail` skips a session that already has live data.
+ */
+export function releaseRuntimeSession(conversationId: number): void {
+  const pending = pendingSessionReleases.get(conversationId)
+  if (pending != null) clearTimeout(pending)
+  pendingSessionReleases.set(
+    conversationId,
+    setTimeout(() => {
+      pendingSessionReleases.delete(conversationId)
+      useConversationRuntimeStore
+        .getState()
+        .actions.removeConversation(conversationId)
+    }, 0)
+  )
+}
+
+/** Keep a session a view is mounting on: cancels its pending release. */
+export function claimRuntimeSession(conversationId: number): void {
+  const pending = pendingSessionReleases.get(conversationId)
+  if (pending == null) return
+  clearTimeout(pending)
+  pendingSessionReleases.delete(conversationId)
+}
+
 /** Resolve a runtime conversation id from an agent's external session id. */
 export function getConversationIdByExternalIdFromStore(
   externalId: string
@@ -8066,14 +8319,31 @@ export function getTimelineTurns(
 
 /**
  * Historical timeline only (no streaming phase). Cached with a key that
- * excludes live content so content-only live appends return the exact same
- * array and entry references.
+ * excludes ordinary live token text so content-only live appends return the
+ * exact same array and entry references. A change in `liveShowsReply` or the
+ * steering-content signature still misses.
  */
 export function selectHistoricalTimelineTurns(
   state: ConversationRuntimeState,
-  conversationId: number
+  conversationId: number,
+  liveShowsReply?: boolean
 ): ConversationTimelineTurn[] {
-  return computeHistoricalTimeline(state, conversationId)
+  if (liveShowsReply !== undefined) {
+    return computeHistoricalTimeline(state, conversationId, liveShowsReply)
+  }
+  const session = state.byConversationId.get(conversationId)
+  // No live message renders no assistant. Do not use this false when a live
+  // message exists and the caller did not pass the boolean — that would hide
+  // a persisted reply the full timeline still shows, or the reverse.
+  if (!session?.liveMessage) {
+    return computeHistoricalTimeline(state, conversationId, false)
+  }
+  const showsReply = buildStreamingTurnsFromLiveMessage(
+    conversationId,
+    session.liveMessage,
+    { agentType: resolveSessionAgentType(session) }
+  ).turns.some((turn) => turn.role === "assistant")
+  return computeHistoricalTimeline(state, conversationId, showsReply)
 }
 
 /**

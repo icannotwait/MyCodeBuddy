@@ -81,6 +81,28 @@ const WS_RESPONSE_TIMEOUT_MS = 15_000
 // the browser↔server transport link, not an agent session.
 export type WebConnState = "connected" | "reconnecting" | "unauthorized"
 
+const WAKE_PROBE_LOG = "[WebTransport][lease-heartbeat]"
+
+function logWakeProbe(
+  result: "sent" | "skipped",
+  reason?:
+    | "destroyed"
+    | "hidden"
+    | "not connected"
+    | "ws closed"
+    | "send failed",
+  state?: WebConnState
+): void {
+  if (result === "sent") {
+    console.debug(`${WAKE_PROBE_LOG} wake probe sent`)
+    return
+  }
+  console.debug(`${WAKE_PROBE_LOG} wake probe skipped`, {
+    reason,
+    ...(state ? { state } : {}),
+  })
+}
+
 interface WebEvent {
   channel: string
   payload: unknown
@@ -510,16 +532,28 @@ export class WebTransport implements Transport {
   }
 
   private readonly probeOnWake = (): void => {
-    if (
-      this.destroyed ||
-      document.visibilityState === "hidden" ||
-      this.connState !== "connected" ||
-      !this.wsOpen
-    ) {
+    if (this.destroyed) {
+      logWakeProbe("skipped", "destroyed")
+      return
+    }
+    if (document.visibilityState === "hidden") {
+      logWakeProbe("skipped", "hidden")
+      return
+    }
+    if (this.connState !== "connected") {
+      logWakeProbe("skipped", "not connected", this.connState)
+      return
+    }
+    if (!this.wsOpen) {
+      logWakeProbe("skipped", "ws closed")
       return
     }
     this.clearPongTimer()
-    this.sendWsFrame({ action: "ping" })
+    if (this.sendWsFrame({ action: "ping" })) {
+      logWakeProbe("sent")
+      return
+    }
+    logWakeProbe("skipped", "send failed")
   }
 
   private recoverWs(reason: string): void {

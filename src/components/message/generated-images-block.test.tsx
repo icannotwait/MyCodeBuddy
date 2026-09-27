@@ -39,6 +39,65 @@ describe("GeneratedImagesBlock heading", () => {
     expect(screen.queryByText("Image generation")).not.toBeInTheDocument()
   })
 
+  it("shows omission copy for a completed snapshot without a preview", () => {
+    render(
+      <NextIntlClientProvider locale="en" messages={enMessages}>
+        <GeneratedImagesBlock
+          revisedPrompt={null}
+          image={null}
+          status="completed"
+          previewOmitted
+        />
+      </NextIntlClientProvider>
+    )
+    expect(
+      screen.getByText(
+        "The image preview was not included in this snapshot."
+      )
+    ).toBeInTheDocument()
+    expect(screen.queryByText("Image generation failed")).not.toBeInTheDocument()
+    expect(
+      screen.queryByRole("button", { name: "Download image" })
+    ).not.toBeInTheDocument()
+  })
+
+  it("still shows a real failure when the tool failed and the preview was omitted", () => {
+    render(
+      <NextIntlClientProvider locale="en" messages={enMessages}>
+        <GeneratedImagesBlock
+          revisedPrompt={null}
+          image={null}
+          status="failed"
+          previewOmitted
+        />
+      </NextIntlClientProvider>
+    )
+    expect(screen.getByText("Image generation failed")).toBeInTheDocument()
+    expect(
+      screen.queryByText(
+        "The image preview was not included in this snapshot."
+      )
+    ).not.toBeInTheDocument()
+  })
+
+  it("treats a completed empty result without the omission flag as a failure", () => {
+    render(
+      <NextIntlClientProvider locale="en" messages={enMessages}>
+        <GeneratedImagesBlock
+          revisedPrompt={null}
+          image={null}
+          status="completed"
+        />
+      </NextIntlClientProvider>
+    )
+    expect(screen.getByText("Image generation failed")).toBeInTheDocument()
+    expect(
+      screen.queryByText(
+        "The image preview was not included in this snapshot."
+      )
+    ).not.toBeInTheDocument()
+  })
+
   it("bounds a long heading to one line and keeps the full text reachable", () => {
     // The heading is agent-authored now, so it can be arbitrarily long.
     const long = "Read file '/Users/x/very/long/path/to/a-page-capture.png'"

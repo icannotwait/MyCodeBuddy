@@ -43,6 +43,7 @@ import { mermaidComponents } from "./mermaid-block"
 import { rehypePluginsAllowingCodeg } from "./rehype-allow-codeg"
 import { remarkAutolinkLocalPaths } from "./remark-autolink-local-paths"
 import { remarkTrimCjkAutolinkTail } from "./remark-cjk-autolink-tail"
+import { withRelativeFileLinks } from "./rehype-relative-file-links"
 import { remarkRewriteFileUriLinks } from "./remark-file-uri-links"
 import {
   detectHeavyPlugins,
@@ -526,9 +527,11 @@ const remarkPluginsForGrokSessionImagesWithLocalPaths = [
 // Streamdown's default rehype pipeline strips `codeg://` reference hrefs in
 // sanitization (rendering them as "[blocked]"); re-derive it so they survive to
 // MarkdownLink → ReferenceBadge. See rehype-allow-codeg for the full rationale.
-const rehypePlugins = rehypePluginsAllowingCodeg(defaultRehypePlugins)
+const rehypePlugins = rehypePluginsAllowingCodeg(
+  withRelativeFileLinks(defaultRehypePlugins)
+)
 const grokSessionImageRehypePlugins = rehypePluginsAllowingCodeg(
-  defaultRehypePlugins,
+  withRelativeFileLinks(defaultRehypePlugins),
   { grokSessionImages: true }
 )
 
@@ -608,6 +611,28 @@ function useNearViewport(enabled: boolean): {
 const FINISHED_MODE = "static" as const
 const FINISHED_PARSE_INCOMPLETE_MARKDOWN = false
 
+/**
+ * How remend repairs an unclosed link while the text is still streaming: it
+ * shows the link's text, and nothing else, until the closing `)` arrives.
+ *
+ * remend's default instead points the partial link at the placeholder
+ * `streamdown:incomplete-link`. sanitize does not allow that scheme, so it
+ * drops the href, and harden turns the bare anchor into "label [blocked]" — on
+ * every link, for as long as its destination is still arriving. Worse,
+ * Streamdown memoizes list items, paragraphs and headings by their source span
+ * alone, and the placeholder is 26 characters long: a link whose destination
+ * is 26 characters too, and that ends its list item, paragraph or heading,
+ * spans the same source before and after it closes, so the element never
+ * repaints and the link stays "[blocked]" until the turn ends. As bare text the
+ * unclosed link is always shorter than the closed one, so closing it always
+ * moves the span and the element repaints.
+ *
+ * A caller may tune remend's other repairs, but not this one.
+ */
+export const LIVE_REMEND = {
+  linkMode: "text-only",
+} as const satisfies NonNullable<MessageResponseProps["remend"]>
+
 function MessageResponseImpl({
   className,
   children,
@@ -617,6 +642,7 @@ function MessageResponseImpl({
   // `mode="streaming" parseIncompleteMarkdown`. See FINISHED_MODE above.
   mode = FINISHED_MODE,
   parseIncompleteMarkdown = FINISHED_PARSE_INCOMPLETE_MARKDOWN,
+  remend,
   ...props
 }: MessageResponseProps) {
   const normalized = useMemo(
@@ -673,6 +699,7 @@ function MessageResponseImpl({
         )}
         plugins={plugins}
         {...props}
+        remend={remend ? { ...remend, ...LIVE_REMEND } : LIVE_REMEND}
         key={pipelineKey}
         rehypePlugins={selectedRehypePlugins}
         // App-selected remark plugins are authoritative so a caller's

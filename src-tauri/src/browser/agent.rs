@@ -1450,7 +1450,7 @@ mod tests {
             },
         };
         assert!(act_call(&keyless)
-            .contains(".act(\"g\", null, {\"key\":\"Enter\",\"kind\":\"press\"}))"));
+            .contains(".act(\"g\", null, {\"kind\":\"press\",\"key\":\"Enter\"}))"));
 
         let locate = locate_call("g", "e1");
         assert!(locate.contains(".locate(\"g\", \"e1\"))"));

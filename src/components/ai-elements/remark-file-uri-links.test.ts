@@ -56,6 +56,40 @@ describe("remarkRewriteFileUriLinks", () => {
     expect(rewrite("file:///C%3A/repo/app.ts")).toBe("/C%3A/repo/app.ts")
   })
 
+  it("leaves a bare relative path to the rehype step (not a drive path)", () => {
+    // `C:` needs a following slash to be a drive path. A relative path gets
+    // past sanitize as it is; the `./` it needs is added after sanitize, in
+    // rehype-relative-file-links, where raw HTML anchors are covered too.
+    expect(rewrite("src/main.rs")).toBe("src/main.rs")
+    expect(rewrite("notes.md")).toBe("notes.md")
+    expect(rewrite("./index.html")).toBe("./index.html")
+  })
+
+  it("puts a root file position behind a slash so sanitize keeps it", () => {
+    // `a.ts:12` reads as a URL with the scheme `a.ts:`; `./a.ts:12` does not.
+    expect(rewrite("a.ts:12")).toBe("./a.ts:12")
+    expect(rewrite("index.html:3:7")).toBe("./index.html:3:7")
+    expect(rewrite(".env:2")).toBe("./.env:2")
+    expect(rewrite(".env:3")).toBe("./.env:3")
+    expect(rewrite("Makefile:40")).toBe("./Makefile:40")
+    expect(rewrite("Makefile:40:2")).toBe("./Makefile:40:2")
+    // With a directory the colon already sits behind a slash.
+    expect(rewrite("src/a.ts:12")).toBe("src/a.ts:12")
+  })
+
+  it("leaves a host with a port, and other schemes, as they are", () => {
+    for (const url of [
+      "localhost:3000",
+      "example.com:8080",
+      "10.0.0.1:80",
+      "tel:12345",
+      "mailto:a@b.c",
+      "a.ts:L12",
+    ]) {
+      expect(rewrite(url)).toBe(url)
+    }
+  })
+
   it("leaves file images and their reference definitions unchanged", () => {
     const tree: Node = {
       type: "root",
@@ -77,6 +111,27 @@ describe("remarkRewriteFileUriLinks", () => {
     const before = structuredClone(tree)
     remarkRewriteFileUriLinks()(tree)
     expect(tree).toEqual(before)
+  })
+
+  it("rewrites a reference definition the same way", () => {
+    const tree: Node = {
+      type: "root",
+      children: [
+        {
+          type: "paragraph",
+          children: [
+            {
+              type: "linkReference",
+              identifier: "pos",
+              children: [{ type: "text" }],
+            },
+          ],
+        },
+        { type: "definition", identifier: "pos", url: "a.ts:12" },
+      ],
+    }
+    remarkRewriteFileUriLinks()(tree)
+    expect(tree.children![1].url).toBe("./a.ts:12")
   })
 
   it("emits a UNC file:// URI as a backslash UNC path (unambiguously local)", () => {

@@ -7,7 +7,27 @@ import {
 } from "@testing-library/react"
 import { NextIntlClientProvider } from "next-intl"
 import { beforeEach, describe, expect, it, vi } from "vitest"
-import enJson from "@/i18n/messages/en.json"
+
+// Shared by the module mock and by `shellsResolving` below, so a test that
+// re-stubs the call can vary the resolved shell without restating the rows.
+// `vi.hoisted` because the `vi.mock` factory is lifted above every plain
+// `const` in this file.
+const shellOptions = vi.hoisted(() => [
+  {
+    id: "system",
+    label_key: "terminalSystemDefault",
+    value: null,
+    exists: true,
+    accepts_custom_path: false,
+  },
+  {
+    id: "custom",
+    label_key: "terminalShellCustom",
+    value: null,
+    exists: true,
+    accepts_custom_path: true,
+  },
+])
 
 vi.mock("@/lib/api", () => ({
   getSystemTerminalSettings: vi.fn(async () => ({
@@ -17,22 +37,7 @@ vi.mock("@/lib/api", () => ({
   getAvailableTerminalShells: vi.fn(async () => ({
     resolved_shell: "/bin/zsh",
     effective_shell: "/bin/zsh",
-    options: [
-      {
-        id: "system",
-        label_key: "terminalSystemDefault",
-        value: null,
-        exists: true,
-        accepts_custom_path: false,
-      },
-      {
-        id: "custom",
-        label_key: "terminalShellCustom",
-        value: null,
-        exists: true,
-        accepts_custom_path: true,
-      },
-    ],
+    options: shellOptions,
   })),
   getSystemRenderingSettings: vi.fn(async () => ({
     disable_hardware_acceleration: false,
@@ -40,28 +45,6 @@ vi.mock("@/lib/api", () => ({
   updateSystemRenderingSettings: vi.fn(async (v: unknown) => v),
   updateSystemTerminalSettings: vi.fn(async (v: unknown) => v),
   probeTerminalShellPath: vi.fn(async () => true),
-  getDelegationSettings: vi.fn(async () => ({
-    enabled: false,
-    depth_limit: 1,
-    completed_cache_max_mb: 512,
-    agent_defaults: {},
-  })),
-  setDelegationSettings: vi.fn(async (v: unknown) => v),
-  getDelegationProfileCatalog: vi.fn(async () => ({ profiles: [] })),
-  setDelegationBundle: vi.fn(async (v: unknown) => v),
-  acpListAgents: vi.fn(async () => []),
-  getFeedbackSettings: vi.fn(async () => ({ enabled: false })),
-  setFeedbackSettings: vi.fn(async (v: unknown) => v),
-  getQuestionSettings: vi.fn(async () => ({ enabled: true })),
-  setQuestionSettings: vi.fn(async (v: unknown) => v),
-  getSessionInfoSettings: vi.fn(async () => ({ enabled: true })),
-  getBrowserToolsSettings: vi.fn(async () => ({ enabled: false })),
-  setSessionInfoSettings: vi.fn(async (v: unknown) => v),
-  getChatAuthoringSettings: vi.fn(async () => ({
-    automations_enabled: false,
-    work_tasks_enabled: false,
-  })),
-  setChatAuthoringSettings: vi.fn(async (v: unknown) => v),
   getSystemCloseBehaviorSettings: vi.fn(async () => ({
     behavior: "ask" as const,
     tray_available: true,
@@ -72,16 +55,8 @@ vi.mock("@/lib/api", () => ({
   })),
 }))
 
-vi.mock("sonner", () => ({
-  toast: { success: vi.fn(), error: vi.fn(), message: vi.fn() },
-}))
-vi.mock("@/lib/platform", () => ({
-  isDesktop: () => true,
-  // The delegation and agent-tools sections subscribe to their settings-change
-  // broadcasts so a form left open converges instead of reverting a write made
-  // elsewhere (the status-bar codeg-mcp popover).
-  subscribe: () => Promise.resolve(() => {}),
-}))
+vi.mock("sonner", () => ({ toast: { success: vi.fn(), error: vi.fn() } }))
+vi.mock("@/lib/platform", () => ({ isDesktop: () => true }))
 vi.mock("@/lib/transport", () => ({
   getActiveRemoteConnectionId: () => null,
   // Read by the desktop-notification section to decide whether permission is
@@ -103,9 +78,8 @@ vi.mock("@/hooks/use-platform", () => ({
   }),
 }))
 vi.mock("@/lib/updater", () => ({ relaunchApp: vi.fn() }))
-vi.mock("@/hooks/use-feedback-enabled", () => ({
-  primeFeedbackEnabled: vi.fn(),
-}))
+
+import { toast } from "sonner"
 
 // Fork-only section; the upstream "mounts every section" suite does not assert it.
 vi.mock("@/components/settings/conversation-experience-settings", () => ({
@@ -159,7 +133,7 @@ const enMessages = {
       "Centralized preferences for the default terminal, rendering acceleration, notifications, and multi-agent delegation.",
     terminalTitle: "Default Terminal",
     terminalDescription:
-      "Choose the shell used for new terminal tabs and new ACP agent tool execution. Running terminals and ACP connections keep their current shell; reconnect an ACP session to apply changes.",
+      "Choose the shell used for new terminal tabs and new ACP agent tool execution. Running terminals and ACP connections keep their current shell; reconnect an ACP session to apply changes. Agents with a shell of their own (Codex, Claude Code) run commands inside their own process, where this setting cannot reach them.",
     terminalSystemDefault: "System default",
     terminalPowerShell7: "PowerShell 7 (pwsh)",
     terminalWindowsPowerShell: "Windows PowerShell",
@@ -344,8 +318,16 @@ const enMessages = {
       delete: "Delete",
     },
   },
-  BrowserSettings: enJson.BrowserSettings,
-  CloseBehaviorSettings: enJson.CloseBehaviorSettings,
+  CloseBehaviorSettings: {
+    title: "Close Button Behavior",
+    description: "Choose what the main window's close button does.",
+    trayUnavailable:
+      "This system has no usable tray, so the close button always exits codeg.",
+    behaviorAsk: "Ask every time",
+    behaviorMinimize: "Minimize to tray",
+    behaviorExit: "Exit codeg",
+    saveFailed: "Failed to save close behavior: {message}",
+  },
 } as const
 
 type AvailableTerminalShells = {
@@ -405,6 +387,7 @@ describe("GeneralSettings terminal shell", () => {
   it("shows the selected effective shell and expanded scope", async () => {
     mockGetSettings.mockResolvedValue({
       default_shell: "pwsh.exe",
+      colorize_command_output: false,
     })
     mockGetShells.mockResolvedValue({
       options: [
@@ -432,6 +415,7 @@ describe("GeneralSettings terminal shell", () => {
   it("persists CMD and renders the refreshed effective shell", async () => {
     mockGetSettings.mockResolvedValue({
       default_shell: "pwsh.exe",
+      colorize_command_output: false,
     })
     mockGetShells
       .mockResolvedValueOnce({
@@ -442,7 +426,10 @@ describe("GeneralSettings terminal shell", () => {
         options: baseOptions,
         effective_shell: "C:\\Windows\\System32\\cmd.exe",
       })
-    mockUpdateSettings.mockResolvedValue({ default_shell: "cmd.exe" })
+    mockUpdateSettings.mockResolvedValue({
+      default_shell: "cmd.exe",
+      colorize_command_output: false,
+    })
 
     renderWithIntl()
 
@@ -458,6 +445,7 @@ describe("GeneralSettings terminal shell", () => {
     await waitFor(() => {
       expect(mockUpdateSettings).toHaveBeenCalledWith({
         default_shell: "cmd.exe",
+        colorize_command_output: false,
       })
     })
 
@@ -475,6 +463,15 @@ function renderSettings() {
   )
 }
 
+/** The options list as the backend returns it, resolving to `path`. */
+function shellsResolving(path: string) {
+  return {
+    resolved_shell: path,
+    effective_shell: path,
+    options: shellOptions,
+  }
+}
+
 /**
  * The page is a stack of sections rendered through the shared
  * `SettingsSection` / `SettingCard` / `SettingRow` grammar, so what is worth
@@ -488,7 +485,10 @@ describe("GeneralSettings", () => {
     mockGetSettings.mockReset()
     mockGetShells.mockReset()
     mockUpdateSettings.mockReset()
-    mockGetSettings.mockResolvedValue({ default_shell: null })
+    mockGetSettings.mockResolvedValue({
+      default_shell: null,
+      colorize_command_output: false,
+    })
     mockGetShells.mockResolvedValue({
       resolved_shell: "/bin/zsh",
       effective_shell: "/bin/zsh",
@@ -526,20 +526,22 @@ describe("GeneralSettings", () => {
       "Disable hardware acceleration",
       "Desktop notifications",
       "Notification sounds",
-      "Multi-Agent Collaboration",
-      "In-conversation tools",
-      "Built-in browser",
     ]) {
       expect(screen.getByRole("heading", { name: heading })).toBeInTheDocument()
     }
 
-    // Sibling toggles keep their label association through SettingRow.
-    expect(screen.getByLabelText("Enable delegation")).toBeInTheDocument()
-    expect(screen.getByLabelText("Live Feedback")).toBeInTheDocument()
-    expect(screen.getByLabelText("Ask user question")).toBeInTheDocument()
-    expect(screen.getByLabelText("Get session info")).toBeInTheDocument()
-    expect(screen.getByLabelText("Create automations")).toBeInTheDocument()
-    expect(screen.getByLabelText("Create to-do tasks")).toBeInTheDocument()
+    // Moved out to their own pages (`collaboration-settings.test.tsx`,
+    // `browser-settings.test.tsx`), which is the whole point of the split:
+    // "general" now names what the page holds.
+    for (const heading of [
+      "Multi-Agent Collaboration",
+      "In-conversation tools",
+      "Built-in browser",
+    ]) {
+      expect(
+        screen.queryByRole("heading", { name: heading })
+      ).not.toBeInTheDocument()
+    }
   })
 
   /**
@@ -604,6 +606,7 @@ describe("GeneralSettings", () => {
    */
   it("keeps a just-saved shell when the options refresh fails", async () => {
     vi.mocked(updateSystemTerminalSettings).mockClear()
+    vi.mocked(toast.error).mockClear()
     // A stored path outside the option list renders the custom-path row, which
     // is the save route that needs no Select interaction.
     vi.mocked(getSystemTerminalSettings).mockResolvedValueOnce({
@@ -631,6 +634,11 @@ describe("GeneralSettings", () => {
       })
     )
 
+    // ...and the user is not told the save failed. It didn't: the row is
+    // written, the shell is already live. Reporting the refresh as a failed
+    // save sends them to re-save a setting that is already stored.
+    expect(vi.mocked(toast.error)).not.toHaveBeenCalled()
+
     const colorize = screen.getByLabelText("Colorize command output")
     await waitFor(() => expect(colorize).toBeEnabled())
     fireEvent.click(colorize)
@@ -640,6 +648,92 @@ describe("GeneralSettings", () => {
         default_shell: "/opt/fish2",
         colorize_command_output: true,
       })
+    )
+  })
+
+  /**
+   * The picker moves ahead of the save so it feels immediate, which makes a
+   * REJECTED save the one state where it can name a shell nothing uses — not
+   * the line under it, not a new terminal tab, not an agent's command. The
+   * toast that said so scrolls away; the wrong selection does not.
+   */
+  it("puts the picker back when the save is rejected", async () => {
+    vi.mocked(getSystemTerminalSettings).mockResolvedValueOnce({
+      default_shell: "/opt/fish",
+      colorize_command_output: false,
+    })
+    vi.mocked(getAvailableTerminalShells).mockResolvedValueOnce(
+      shellsResolving("/opt/fish")
+    )
+    vi.mocked(updateSystemTerminalSettings).mockRejectedValueOnce(
+      new Error("disk full")
+    )
+
+    renderSettings()
+
+    // A stored path outside the option list selects the custom row, so there
+    // is a second option to switch away to.
+    const picker = await screen.findByLabelText("Default Terminal")
+    expect(picker).toHaveTextContent("Custom path")
+
+    fireEvent.keyDown(picker, { key: "Enter" })
+    fireEvent.click(await screen.findByText("System default"))
+
+    await waitFor(() =>
+      expect(vi.mocked(updateSystemTerminalSettings)).toHaveBeenLastCalledWith({
+        default_shell: null,
+        colorize_command_output: false,
+      })
+    )
+    await waitFor(() => expect(picker).toHaveTextContent("Custom path"))
+    // The stored shell is untouched, so the line under the picker keeps
+    // naming it — picker and line agree again.
+    expect(
+      screen.getByText(
+        "Effective shell for new terminals and ACP connections: /opt/fish"
+      )
+    ).toBeInTheDocument()
+  })
+
+  /**
+   * The line under the picker is the only place the page says what the choice
+   * actually resolves to, and the backend answers that per selection — so the
+   * page has to re-read it after every save. Leaving the first answer on
+   * screen is what made the line read as a constant (always the host's
+   * `COMSPEC`/`SHELL`) however the picker was set, which reads as "this
+   * setting does nothing".
+   */
+  it("re-reads the resolved shell after a save", async () => {
+    vi.mocked(getSystemTerminalSettings).mockResolvedValueOnce({
+      default_shell: "/opt/fish",
+      colorize_command_output: false,
+    })
+    vi.mocked(getAvailableTerminalShells).mockResolvedValueOnce(
+      shellsResolving("/opt/fish")
+    )
+
+    renderSettings()
+
+    expect(
+      await screen.findByText(
+        "Effective shell for new terminals and ACP connections: /opt/fish"
+      )
+    ).toBeInTheDocument()
+
+    const path = screen.getByLabelText("Shell path")
+    fireEvent.change(path, { target: { value: "/opt/fish2" } })
+    vi.mocked(getAvailableTerminalShells).mockResolvedValueOnce(
+      shellsResolving("/opt/fish2")
+    )
+    const shellRow = path.parentElement as HTMLElement
+    fireEvent.click(within(shellRow).getByRole("button", { name: "Save" }))
+
+    await waitFor(() =>
+      expect(
+        screen.getByText(
+          "Effective shell for new terminals and ACP connections: /opt/fish2"
+        )
+      ).toBeInTheDocument()
     )
   })
 

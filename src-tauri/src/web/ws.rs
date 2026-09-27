@@ -378,10 +378,13 @@ async fn handle_client_msg(
             }
         }
         ClientMsg::Ping => {
+            let subscription_count = subscriptions.len();
             let mut bindings = Vec::new();
             let mut seen = HashSet::new();
+            let mut unbound = 0usize;
             for subscription in subscriptions.values() {
                 let Some(binding) = subscription.binding.as_ref() else {
+                    unbound += 1;
                     continue;
                 };
                 let key = binding_key(binding);
@@ -394,6 +397,10 @@ async fn handle_client_msg(
                 .shared_session_broker()
                 .renew_leases(&bindings)
                 .await;
+            tracing::debug!(
+                "{}",
+                lease_ping_log_line(subscription_count, unbound, &bindings, &outcomes)
+            );
             let outcome_by_key: HashMap<_, _> = bindings
                 .into_iter()
                 .zip(outcomes)
@@ -427,6 +434,63 @@ async fn handle_client_msg(
             }
             let _ = outbound_tx.send(ServerMsg::Pong).await;
         }
+    }
+}
+
+/// One summary line per application `{action:"ping"}`. Lease ids are omitted;
+/// connection id and generation are enough to correlate a renew or detach.
+fn lease_ping_log_line(
+    subscription_count: usize,
+    unbound: usize,
+    bindings: &[LeaseSocketBinding],
+    outcomes: &[LeaseRenewalOutcome],
+) -> String {
+    if bindings.is_empty() {
+        return format!(
+            "[WS][lease] ping had nothing to renew subscriptions={subscription_count} unbound={unbound}"
+        );
+    }
+    let mut renewed = 0usize;
+    let mut detached = 0usize;
+    let mut parts = Vec::with_capacity(bindings.len());
+    for (binding, outcome) in bindings.iter().zip(outcomes.iter()) {
+        match outcome {
+            LeaseRenewalOutcome::Renewed(_) => {
+                renewed += 1;
+                parts.push(format!(
+                    "connection={} generation={} renewed",
+                    binding.connection_id, binding.generation
+                ));
+            }
+            LeaseRenewalOutcome::Detached(reason) => {
+                detached += 1;
+                parts.push(format!(
+                    "connection={} generation={} detached:{}",
+                    binding.connection_id,
+                    binding.generation,
+                    detach_reason_label(*reason)
+                ));
+            }
+        }
+    }
+    format!(
+        "[WS][lease] ping bindings={} renewed={} detached={} subscriptions={subscription_count} unbound={unbound} outcomes=[{}]",
+        bindings.len(),
+        renewed,
+        detached,
+        parts.join("; ")
+    )
+}
+
+fn detach_reason_label(reason: DetachReason) -> &'static str {
+    match reason {
+        DetachReason::ConnectionGone => "connection_gone",
+        DetachReason::GenerationStale => "generation_stale",
+        DetachReason::LeaseMissing => "lease_missing",
+        DetachReason::LeaseExpired => "lease_expired",
+        DetachReason::SessionReplaced => "session_replaced",
+        DetachReason::Lagged => "lagged",
+        DetachReason::ServerShutdown => "server_shutdown",
     }
 }
 
@@ -493,5 +557,44 @@ mod tests {
         apply_cleanup_signal(&mut subs, "missing", 1);
 
         assert!(subs.contains_key("other"));
+    }
+
+    #[test]
+    fn lease_ping_log_line_summarizes_without_lease_ids() {
+        let expires = chrono::Utc::now();
+        let renewed = LeaseSocketBinding {
+            connection_id: "conn-renewed".to_string(),
+            generation: 4,
+            lease_id: "secret-lease-renewed".to_string(),
+            lease_expires_at: expires,
+        };
+        let detached = LeaseSocketBinding {
+            connection_id: "conn-detached".to_string(),
+            generation: 9,
+            lease_id: "secret-lease-detached".to_string(),
+            lease_expires_at: expires,
+        };
+        let empty = lease_ping_log_line(2, 2, &[], &[]);
+        assert!(empty.contains("ping had nothing to renew"));
+        assert!(empty.contains("subscriptions=2"));
+        assert!(empty.contains("unbound=2"));
+
+        let line = lease_ping_log_line(
+            3,
+            1,
+            &[renewed.clone(), detached.clone()],
+            &[
+                LeaseRenewalOutcome::Renewed(renewed),
+                LeaseRenewalOutcome::Detached(DetachReason::LeaseExpired),
+            ],
+        );
+        assert!(line.contains("bindings=2"));
+        assert!(line.contains("renewed=1"));
+        assert!(line.contains("detached=1"));
+        assert!(line.contains("subscriptions=3"));
+        assert!(line.contains("unbound=1"));
+        assert!(line.contains("connection=conn-renewed generation=4 renewed"));
+        assert!(line.contains("connection=conn-detached generation=9 detached:lease_expired"));
+        assert!(!line.contains("secret-lease"));
     }
 }

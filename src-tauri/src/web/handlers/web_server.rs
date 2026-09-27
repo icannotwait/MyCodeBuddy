@@ -141,6 +141,16 @@ fn server_rollback_available() -> bool {
     false
 }
 
+#[cfg(feature = "tauri-runtime")]
+fn server_self_update_blocker() -> Option<AppCommandError> {
+    None
+}
+
+#[cfg(not(feature = "tauri-runtime"))]
+fn server_self_update_blocker() -> Option<AppCommandError> {
+    None
+}
+
 pub async fn check_app_update() -> Result<Json<AppUpdateCheckResult>, AppCommandError> {
     use crate::update::{runtime, version};
 
@@ -190,6 +200,15 @@ pub struct ServerUpdateStatus {
     /// This server speaks the detached `app_update_state` protocol. See
     /// [`AppUpdateCheckResult::live_progress`].
     pub live_progress: bool,
+    /// Why an in-place update cannot run here even though the platform
+    /// supports one — today an install location this process cannot write
+    /// (when the write is refused outright, a rollback can't run either). The
+    /// very error the update would fail with, so the UI can offer the manual
+    /// route and say why before anyone clicks. Only here, not on
+    /// [`check_app_update`]: one source keeps an older answer from overwriting
+    /// a newer one. Absent when nothing is in the way, and on older servers.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub self_update_blocker: Option<AppCommandError>,
 }
 
 /// Local-only counterpart to [`check_app_update`]: reports what this process
@@ -206,6 +225,7 @@ pub async fn app_update_status() -> Json<ServerUpdateStatus> {
         restart_delay_ms: runtime::restart_delay_ms(),
         rollback_available: server_rollback_available(),
         live_progress: true,
+        self_update_blocker: server_self_update_blocker(),
     })
 }
 
@@ -218,5 +238,51 @@ mod tests {
         let Json(status) = app_update_status().await;
         assert!(!status.self_update_supported);
         assert!(!status.rollback_available);
+    }
+
+    #[test]
+    fn status_carries_the_blocker_in_the_shape_the_ui_reads() {
+        // `selfUpdateBlocker` and the snake_case error fields inside it are what
+        // `getServerUpdateStatus` consumers parse; a rename here would silently
+        // bring back the doomed "Upgrade" button.
+        let blocker = AppCommandError::permission_denied(
+            "Update target is not writable: /usr/local/bin",
+        )
+        .with_i18n(
+            "SystemSettings.updateErrors.permissionDenied",
+            std::collections::BTreeMap::from([(
+                "path".to_string(),
+                "/usr/local/bin".to_string(),
+            )]),
+        );
+        let status = ServerUpdateStatus {
+            current_version: "0.32.0".to_string(),
+            self_update_supported: true,
+            capability: crate::update::runtime::UpdateCapability::Supervised,
+            runtime: "standalone".to_string(),
+            restart_delay_ms: 2000,
+            rollback_available: false,
+            live_progress: true,
+            self_update_blocker: Some(blocker),
+        };
+
+        let wire = serde_json::to_value(&status).unwrap();
+        let blocker = &wire["selfUpdateBlocker"];
+        assert_eq!(blocker["code"], "permission_denied");
+        assert_eq!(
+            blocker["i18n_key"],
+            "SystemSettings.updateErrors.permissionDenied"
+        );
+        assert_eq!(blocker["i18n_params"]["path"], "/usr/local/bin");
+
+        // Nothing in the way: the field is absent, as on older servers.
+        let clear = ServerUpdateStatus {
+            self_update_blocker: None,
+            ..status
+        };
+        assert!(serde_json::to_value(&clear)
+            .unwrap()
+            .get("selfUpdateBlocker")
+            .is_none());
     }
 }

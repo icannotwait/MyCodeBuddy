@@ -194,9 +194,15 @@ export function adaptLiveToolPart(info: ToolCallInfo): AdaptedToolCallPart {
   }
 }
 
+/** Snapshot stand-in for an image whose bytes were not included. Not a URL. */
+const OMITTED_OVERSIZED_IMAGE_URI = "codeg:omitted-oversized-image"
+
 function imageDisplayFromTool(info: ToolCallInfo): UserImageDisplay | null {
   const img = info.images?.[0]
+  // Empty data is not a picture. The omission sentinel must not be passed
+  // through as a name or uri — `new URL` / `<img src>` would request it.
   if (!img?.data || !img.mime_type) return null
+  if (img.uri === OMITTED_OVERSIZED_IMAGE_URI) return null
   const ext = img.mime_type.split("/")[1]?.split("+")[0] ?? "image"
   return {
     name: img.uri?.trim() ? img.uri : `image.${ext}`,
@@ -204,6 +210,10 @@ function imageDisplayFromTool(info: ToolCallInfo): UserImageDisplay | null {
     mime_type: img.mime_type,
     uri: img.uri ?? null,
   }
+}
+
+function liveImagePreviewOmitted(info: ToolCallInfo): boolean {
+  return info.images?.[0]?.uri === OMITTED_OVERSIZED_IMAGE_URI
 }
 
 /** Drain delivery→paint samples after live-footer React commits (P2 path). */
@@ -451,6 +461,7 @@ const LiveGeneratedImageSegment = memo(function LiveGeneratedImageSegment({
       revisedPrompt={extractRevisedPrompt(tool.content)}
       image={imageDisplayFromTool(tool)}
       status={narrowToolCallStatus(tool.status)}
+      previewOmitted={liveImagePreviewOmitted(tool)}
     />
   )
 })
