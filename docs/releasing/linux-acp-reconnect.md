@@ -17,6 +17,12 @@ WebSocket，再携带原连接 ID、租约和消息游标接入；服务进程�
   标识，避免后一次申请替换前一个视图的租约；发送消息使用对应的标识。
 - 已持有共享租约的连接重新附着时，自动补齐已有 generation / leaseId，
   保留原有的 30 秒续约心跳。
+- 共享 owner 的续约不依赖 legacy `acp_touch_connection`。该调用对
+  broker 管理的连接不会刷新空闲时钟；前端保活若把它的 `false` 当成
+  进程已退出，会拆掉附着订阅，30 秒 ping 随之停止，90 秒租约到期后
+  界面显示断开，ACP 子进程仍在。回合结束（`turn_complete`）本身不会
+  停心跳。租约到期会打
+  `[ACP][lease] expired leases without renew connection=<id> count=<n>`。
 
 ## 部署时需要处理的事项
 

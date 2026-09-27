@@ -10389,6 +10389,13 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
         if (!conn) return
         if (conn.status === "disconnected" || conn.status === "error") return
         if (conn.isDelegationChild) return
+        // Broker-owned roots fence legacy `touch()` so it cannot bump idle
+        // activity. A false result is that fence, not proof the ACP child
+        // exited. Marking the owner gone detaches the shared subscription
+        // and `syncSharedHeartbeat` stops, so the 90s client lease expires
+        // while the process stays up — including after a turn returns to
+        // `connected`. Shared liveness is the lease ping plus WS detach.
+        if (conn.sharedSession) return
         toTouch.push({ contextKey: canonical, connectionId: conn.connectionId })
       }
       if (currentActiveKey) consider(currentActiveKey)
@@ -11710,8 +11717,11 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
           (existing.status === "prompting" || existing.status === "connecting")
         ) {
           const staleId = existing.connectionId
+          const sharedOwner = existing.sharedSession != null
           const rekeysBefore = rekeyGenerationRef.current.get(contextKey) ?? 0
-          if (!(await isConnectionLiveOnBackend(staleId))) {
+          // Same fence as the keepalive loop: a shared owner must not lose
+          // its attach subscription because legacy touch returned false.
+          if (!sharedOwner && !(await isConnectionLiveOnBackend(staleId))) {
             markConnectionGone(existingKey, staleId)
           }
           existingKey = canonicalKey(contextKey)

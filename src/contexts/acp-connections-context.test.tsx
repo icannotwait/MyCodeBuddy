@@ -3120,6 +3120,58 @@ describe("AcpConnectionsProvider shared server roots", () => {
       shared: { generation: 1, leaseId: "lease-1" },
     })
   })
+
+  it("keeps the shared owner attached after turn complete when legacy touch is fenced", async () => {
+    vi.useFakeTimers()
+    try {
+      h.isDesktop = false
+      await mountProvider()
+      await act(async () => {
+        await h.actions!.connect(TAB, "claude_code", "/work", "sess", 42)
+      })
+      const detach = (
+        h.attach.mock.results[0]?.value as {
+          detach: ReturnType<typeof vi.fn>
+        }
+      )?.detach
+      const handlers = latestAttachHandlers()
+      emitAcpEvent(handlers, {
+        seq: 1,
+        connection_id: "conn",
+        type: "status_changed",
+        status: "prompting",
+      })
+      emitAcpEvent(handlers, {
+        seq: 2,
+        connection_id: "conn",
+        type: "turn_complete",
+        session_id: "sess",
+        stop_reason: "end_turn",
+        mark_awaiting_reply: false,
+      })
+      expect(h.store!.getConnection(TAB)?.status).toBe("connected")
+
+      act(() => {
+        h.actions!.setActiveKey(TAB)
+        h.actions!.registerOpenTabKeys(new Set([TAB]))
+      })
+      acpTouchConnectionMock.mockResolvedValue(false)
+
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(CONNECTION_KEEPALIVE_INTERVAL_MS)
+      })
+
+      expect(acpTouchConnectionMock).not.toHaveBeenCalled()
+      expect(detach).not.toHaveBeenCalled()
+      expect(h.store!.getConnection(TAB)?.status).toBe("connected")
+      expect(h.store!.getConnection(TAB)?.sharedSession).toMatchObject({
+        generation: 1,
+        leaseId: "lease-1",
+      })
+    } finally {
+      vi.useRealTimers()
+    }
+  })
 })
 
 function makeSummary(
@@ -18086,6 +18138,37 @@ describe("AcpConnectionsProvider canonical observer aliases", () => {
       })
 
       expect(acpTouchConnectionMock).toHaveBeenCalledWith("broker-child")
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it("marks a non-shared connection gone when legacy touch reports it dead", async () => {
+    vi.useFakeTimers()
+    try {
+      await mountProvider()
+      await act(async () => {
+        await h.actions!.connect(TAB, "claude_code", "/tmp/x", "sess-1", 42)
+      })
+      const detach = (
+        h.attach.mock.results[0]?.value as {
+          detach: ReturnType<typeof vi.fn>
+        }
+      )?.detach
+      act(() => {
+        h.actions!.setActiveKey(TAB)
+        h.actions!.registerOpenTabKeys(new Set([TAB]))
+      })
+      acpTouchConnectionMock.mockClear()
+      acpTouchConnectionMock.mockResolvedValue(false)
+
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(CONNECTION_KEEPALIVE_INTERVAL_MS)
+      })
+
+      expect(acpTouchConnectionMock).toHaveBeenCalledWith("spawned-conn")
+      expect(detach).toHaveBeenCalled()
+      expect(h.store!.getConnection(TAB)?.status).toBe("disconnected")
     } finally {
       vi.useRealTimers()
     }
