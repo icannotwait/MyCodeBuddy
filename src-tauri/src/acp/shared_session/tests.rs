@@ -5192,11 +5192,18 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn idle_legacy_disconnect_touch_and_explicit_termination_are_fenced() {
         let fixture = idle_ready_fixture().await;
+        let activity_before = fixture.state.read().await.last_activity_at;
         assert!(
-            !fixture
+            fixture
                 .manager
                 .touch(&fixture.attachment.connection_id)
-                .await
+                .await,
+            "a live shared root is still present; touch must not report it dead"
+        );
+        assert_eq!(
+            fixture.state.read().await.last_activity_at,
+            activity_before,
+            "shared touch must not bump the legacy idle clock"
         );
         assert!(matches!(
             fixture

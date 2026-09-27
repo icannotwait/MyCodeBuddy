@@ -4397,20 +4397,28 @@ impl ConnectionManager {
         }
     }
 
-    /// Bump `last_activity_at` for a live connection so the idle sweep
-    /// won't reap it. Used by the frontend keepalive loop to protect
+    /// Bump `last_activity_at` for a live legacy connection so the idle
+    /// sweep won't reap it. Used by the frontend keepalive loop to protect
     /// connections backing currently-open conversation tabs (the
     /// frontend is the only side that knows which tabs the user has
     /// open). Silently no-ops if the connection is missing or already
     /// in a terminal state — touch must never resurrect a dead
     /// connection or contend with the spawn/disconnect paths.
+    ///
+    /// Broker-owned roots do not bump `last_activity_at`. Their idle and
+    /// lease clocks stay on the shared session. A live root still returns
+    /// true so callers do not treat the fence as "the ACP child exited".
+    /// Replacement tombstones and terminal phases return false.
     pub async fn touch(&self, conn_id: &str) -> bool {
         if self
             .shared_session_broker
             .is_managed_connection(conn_id)
             .await
         {
-            return false;
+            return self
+                .shared_session_broker
+                .managed_connection_is_live(conn_id)
+                .await;
         }
         let state_arc = {
             let connections = self.connections.lock().await;

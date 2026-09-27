@@ -2486,6 +2486,13 @@ impl SharedSessionBroker {
                     match record.try_lock() {
                         Ok(mut record) => {
                             let expired = record.prune_expired_leases(now);
+                            if !expired.is_empty() {
+                                tracing::info!(
+                                    "[ACP][lease] expired leases without renew connection={} count={}",
+                                    record.connection_id,
+                                    expired.len()
+                                );
+                            }
                             self.metrics.remove_active_leases(expired.len());
                             self.metrics.record_lease_expired(expired.len());
                             expired_ids.extend(expired);
@@ -2910,6 +2917,27 @@ impl SharedSessionBroker {
         let index = self.index.lock().await;
         index.by_connection.contains_key(connection_id)
             || index.has_replaced_connection(connection_id)
+    }
+
+    /// Whether a broker-managed connection still has a non-terminal session.
+    /// Replacement tombstones have no record and are not live. A contended
+    /// record lock counts as live so an in-flight turn is not classified
+    /// dead. Does not bump activity clocks or renew leases.
+    pub async fn managed_connection_is_live(&self, connection_id: &str) -> bool {
+        let record = {
+            let index = self.index.lock().await;
+            index.record_for_connection(connection_id).cloned()
+        };
+        let Some(record) = record else {
+            return false;
+        };
+        match record.try_lock() {
+            Ok(record) => !matches!(
+                record.phase,
+                SharedSessionPhase::Failed { .. } | SharedSessionPhase::Closing
+            ),
+            Err(_) => true,
+        }
     }
 
     pub(crate) async fn install_registered(

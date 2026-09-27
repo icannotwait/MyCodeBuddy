@@ -240,6 +240,37 @@ describe("WebEventStream reconnect mode", () => {
     stream.destroy()
   })
 
+  it("keeps the 30s shared renew after a turn completes", () => {
+    vi.useFakeTimers()
+    const f = hostFixture()
+    const stream = new WebEventStream(f.host)
+    const sub = stream.attach(
+      "conn",
+      { shared: { generation: 4, leaseId: "lease-4" } },
+      handlers
+    )
+    stream.handleServerFrame({
+      type: "event",
+      subscription_id: sub.subscriptionId,
+      envelope: {
+        seq: 2,
+        connection_id: "conn",
+        type: "turn_complete",
+        session_id: "sess",
+        stop_reason: "end_turn",
+        mark_awaiting_reply: false,
+      },
+    })
+    f.sendFrame.mockClear()
+
+    vi.advanceTimersByTime(30_000)
+    expect(f.sendFrame).toHaveBeenCalledWith({ action: "ping" })
+    f.sendFrame.mockClear()
+    vi.advanceTimersByTime(30_000)
+    expect(f.sendFrame).toHaveBeenCalledWith({ action: "ping" })
+    stream.destroy()
+  })
+
   it("pings every 30 seconds only while a shared subscription exists", () => {
     vi.useFakeTimers()
     const f = hostFixture()
