@@ -2418,16 +2418,37 @@ async fn dispatch_racing_queue_cancel_has_exactly_one_terminal_owner() {
         },
         cancel
     );
-    tokio::task::yield_now().await;
-    let dispatched = match commands.try_recv() {
-        Ok(ConnectionCommand::Prompt { .. }) => true,
-        Ok(_) => panic!("unexpected command in dispatch/cancel race"),
-        Err(tokio::sync::mpsc::error::TryRecvError::Empty) => false,
-        Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
-            panic!("command lane disconnected")
+    let cancel_removed_item = cancel_response.status == StatusCode::OK;
+    let cancel_code = cancel_response.body.get("code").and_then(Value::as_str);
+    let dispatch_claimed = cancel_response.status == StatusCode::CONFLICT
+        && cancel_code == Some("queue_item_already_dispatching");
+    assert!(
+        cancel_removed_item || dispatch_claimed,
+        "queued cancel must remove the item or lose to dispatch: {cancel_response:?}"
+    );
+    // The broker records Dispatching before the prompt command is queued, so
+    // the cancel response can lose the race before a single try_recv sees it.
+    let dispatched = if dispatch_claimed {
+        match tokio::time::timeout(Duration::from_secs(2), commands.recv())
+            .await
+            .expect("dispatch claim must deliver the prompt command")
+        {
+            Some(ConnectionCommand::Prompt { .. }) => true,
+            Some(_) => panic!("unexpected command in dispatch/cancel race"),
+            None => panic!("command lane disconnected"),
+        }
+    } else {
+        match commands.try_recv() {
+            Ok(ConnectionCommand::Prompt { .. }) => {
+                panic!("cancel removed the queue item but a prompt was still dispatched")
+            }
+            Ok(_) => panic!("unexpected command in dispatch/cancel race"),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty) => false,
+            Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
+                panic!("command lane disconnected")
+            }
         }
     };
-    assert_eq!(cancel_response.status == StatusCode::OK, !dispatched);
     if dispatched {
         cancel_response
             .assert_status_conflict()
