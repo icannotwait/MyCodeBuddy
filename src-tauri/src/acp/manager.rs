@@ -5867,11 +5867,39 @@ impl ConnectionManager {
         };
 
         // The first link was rekeyed inside the cancellation shield before its
-        // event. The already-linked path only needs idempotent reconciliation.
+        // event. Shared admission (`validate_and_bind_shared_prompt_target`)
+        // can set `conversation_id` before this function runs, so a brand-new
+        // row whose ACP session already started is `already_linked` and never
+        // enters that bind. SessionStarted skipped the DB write while
+        // `conversation_id` was still None. Persist the in-memory session id
+        // now so a long first turn stays reopenable before TurnComplete.
+        // Rows that already hold an external_id are left alone.
         if already_linked {
-            if let Some(cid) = state_arc.read().await.conversation_id {
+            let (cid, live_session_id) = {
+                let state = state_arc.read().await;
+                (state.conversation_id, state.external_id.clone())
+            };
+            if let Some(cid) = cid {
                 self.bind_shared_conversation_if_present(conn_id, cid)
                     .await?;
+                if let Some(session_id) = live_session_id.filter(|id| !id.is_empty()) {
+                    if let Err(error) = crate::acp::lifecycle::settle_unbound_live_external_id(
+                        &db.conn,
+                        &emitter,
+                        cid,
+                        &session_id,
+                    )
+                    .await
+                    {
+                        tracing::warn!(
+                            connection_id = %conn_id,
+                            conversation_id = cid,
+                            session_id = %session_id,
+                            error = %error,
+                            "[manager] already-linked prompt could not settle unbound external_id"
+                        );
+                    }
+                }
             }
         }
 
@@ -21354,6 +21382,157 @@ mod tests {
                 "second event must be ConversationStatusChanged(Cancelled) after send failure, got {other:?}"
             ),
         }
+    }
+
+    /// Conversation 102: shared admission linked the row before the first
+    /// prompt, SessionStarted had already stored the Grok session id in
+    /// memory, and the DB row was still `external_id = NULL` /
+    /// `message_count = 0`. The already-linked path must persist that id
+    /// before TurnComplete so a long first turn can be reopened.
+    #[tokio::test]
+    async fn send_prompt_linked_already_linked_settles_unbound_external_id() {
+        use crate::db::test_helpers;
+        let db = test_helpers::fresh_in_memory_db().await;
+        let folder_id = test_helpers::seed_folder(&db, "/tmp/already-unbound").await;
+        let pre = conversation_service::create(&db.conn, folder_id, AgentType::Grok, None, None)
+            .await
+            .unwrap();
+        assert!(pre.external_id.is_none());
+        assert_eq!(pre.message_count, 0);
+
+        let mgr = ConnectionManager::new();
+        let (broadcaster, mut global_rx) = make_test_broadcaster();
+        let conn_id = "conn-already-unbound";
+        let session_id = "01a0e0c8-4a51-7510-bc4d-8f16b681ac81";
+        insert_fake_connection(
+            &mgr,
+            conn_id,
+            AgentType::Grok,
+            Some(PathBuf::from("/tmp/already-unbound")),
+            EventEmitter::test_web_only(broadcaster.clone()),
+        )
+        .await;
+        {
+            let state = mgr.get_state(conn_id).await.unwrap();
+            let mut state = state.write().await;
+            state.conversation_id = Some(pre.id);
+            state.external_id = Some(session_id.to_string());
+        }
+        let mut rx = subscribe_conn_stream(&mgr, conn_id).await;
+        let before = count_conversation_rows(&db).await;
+
+        let _ = mgr
+            .send_prompt_linked(
+                &db,
+                conn_id,
+                one_text_block(),
+                Some(folder_id),
+                Some(pre.id),
+                None,
+                None,
+            )
+            .await;
+
+        assert_eq!(count_conversation_rows(&db).await, before);
+        let row = conversation_service::get_by_id(&db.conn, pre.id)
+            .await
+            .unwrap();
+        assert_eq!(row.external_id.as_deref(), Some(session_id));
+        assert_eq!(row.message_count, 0);
+        assert_eq!(row.status, "cancelled");
+        assert!(
+            drain_has_upsert_with_external_id(&mut global_rx, pre.id, session_id),
+            "already-linked settle must broadcast external_id before TurnComplete"
+        );
+
+        // Still the already-linked fast path: no ConversationLinked, only the
+        // status flip and the send-failure rollback.
+        let env_in_progress = recv_first_acp_event(&mut rx).await;
+        match env_in_progress.payload {
+            AcpEvent::ConversationStatusChanged {
+                conversation_id,
+                status,
+            } => {
+                assert_eq!(conversation_id, pre.id);
+                assert_eq!(status, ConversationStatus::InProgress);
+            }
+            other => {
+                panic!("already-linked settle must not emit ConversationLinked, got {other:?}")
+            }
+        }
+        let env_cancelled = recv_first_acp_event(&mut rx).await;
+        match env_cancelled.payload {
+            AcpEvent::ConversationStatusChanged {
+                conversation_id,
+                status,
+            } => {
+                assert_eq!(conversation_id, pre.id);
+                assert_eq!(status, ConversationStatus::Cancelled);
+            }
+            other => panic!(
+                "second event must be ConversationStatusChanged(Cancelled) after send failure, got {other:?}"
+            ),
+        }
+    }
+
+    /// A follow-up on an already-bound row must not repoint or split history
+    /// just because the live connection still has a session id.
+    #[tokio::test]
+    async fn send_prompt_linked_already_linked_keeps_bound_external_id() {
+        use crate::db::test_helpers;
+        let db = test_helpers::fresh_in_memory_db().await;
+        let folder_id = test_helpers::seed_folder(&db, "/tmp/already-bound").await;
+        let pre = conversation_service::create(&db.conn, folder_id, AgentType::Grok, None, None)
+            .await
+            .unwrap();
+        conversation_service::bind_external_id(&db.conn, pre.id, "kept-session", &[])
+            .await
+            .unwrap();
+
+        let mgr = ConnectionManager::new();
+        let (broadcaster, mut global_rx) = make_test_broadcaster();
+        let conn_id = "conn-already-bound";
+        insert_fake_connection(
+            &mgr,
+            conn_id,
+            AgentType::Grok,
+            Some(PathBuf::from("/tmp/already-bound")),
+            EventEmitter::test_web_only(broadcaster.clone()),
+        )
+        .await;
+        {
+            let state = mgr.get_state(conn_id).await.unwrap();
+            let mut state = state.write().await;
+            state.conversation_id = Some(pre.id);
+            state.external_id = Some("01a0e0c8-4a51-7510-bc4d-8f16b681ac81".to_string());
+        }
+        let before = count_conversation_rows(&db).await;
+
+        let _ = mgr
+            .send_prompt_linked(
+                &db,
+                conn_id,
+                one_text_block(),
+                Some(folder_id),
+                Some(pre.id),
+                None,
+                None,
+            )
+            .await;
+
+        assert_eq!(count_conversation_rows(&db).await, before);
+        let row = conversation_service::get_by_id(&db.conn, pre.id)
+            .await
+            .unwrap();
+        assert_eq!(row.external_id.as_deref(), Some("kept-session"));
+        assert!(
+            !drain_has_upsert_with_external_id(
+                &mut global_rx,
+                pre.id,
+                "01a0e0c8-4a51-7510-bc4d-8f16b681ac81",
+            ),
+            "already-bound row must not be repointed at the live session id"
+        );
     }
 
     // ---------- Phase: status centralization ----------

@@ -703,6 +703,53 @@ async fn bind_live_external_id(
     .await
 }
 
+/// Persist `session_id` onto a conversation that is already linked in memory
+/// but still has a null `external_id`, then broadcast the summary.
+///
+/// Shared prompt admission writes `SessionState.conversation_id` before
+/// `send_prompt_linked`, so the first-link bind and the `ConversationLinked`
+/// catch-up never run. `SessionStarted` also skips its write when it fires
+/// before that link. The update matches only a still-null `external_id`, so a
+/// row that already holds a session — or a concurrent writer that just bound
+/// one — is left unchanged. The TurnComplete unbound settle remains the
+/// safety net when this settle does not run.
+pub(crate) async fn settle_unbound_live_external_id(
+    db_conn: &DatabaseConnection,
+    emitter: &EventEmitter,
+    conversation_id: i32,
+    session_id: &str,
+) -> Result<(), DbError> {
+    if session_id.is_empty() {
+        return Ok(());
+    }
+    let Some(before) = crate::db::entities::conversation::Entity::find_by_id(conversation_id)
+        .filter(crate::db::entities::conversation::Column::DeletedAt.is_null())
+        .one(db_conn)
+        .await?
+    else {
+        return Ok(());
+    };
+    if before.external_id.is_some() {
+        return Ok(());
+    }
+    bind_live_external_id(db_conn, conversation_id, session_id).await?;
+    let after = crate::db::entities::conversation::Entity::find_by_id(conversation_id)
+        .filter(crate::db::entities::conversation::Column::DeletedAt.is_null())
+        .one(db_conn)
+        .await?;
+    if after.as_ref().and_then(|row| row.external_id.as_deref()) != Some(session_id) {
+        return Ok(());
+    }
+    tracing::info!(
+        conversation_id,
+        session_id = %session_id,
+        "[lifecycle] settled live external_id onto an already-linked unbound conversation"
+    );
+    crate::commands::conversations::emit_conversation_upsert(emitter, db_conn, conversation_id)
+        .await;
+    Ok(())
+}
+
 async fn bind_unbound_completion_external_id(
     db_conn: &DatabaseConnection,
     conversation_id: i32,
@@ -865,9 +912,11 @@ pub(crate) async fn handle_event(
             // skip the DB write, leaving `external_id=None` / `message_count=0`
             // so get_folder_conversation cannot find the agent transcript
             // (Grok ~/.grok/sessions/…, Cursor store, Antigravity
-            // ~/.gemini/antigravity-acp/conversations/…). By TurnComplete the
-            // live session id is known — persist it now so a post-turn hydrate
-            // can read history off disk.
+            // ~/.gemini/antigravity-acp/conversations/…). An already-linked
+            // prompt settles a known live session id before the turn is sent.
+            // This write remains the safety net when that settle did not run.
+            // By TurnComplete the live session id is known — persist it now so
+            // a post-turn hydrate can read history off disk.
             //
             // Bind on every stop reason, not only `end_turn`. Antigravity (and
             // others) can finish as `empty` / `refusal` / `cancelled` after
