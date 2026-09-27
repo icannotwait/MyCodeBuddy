@@ -145,6 +145,7 @@ describe("WebTransport silent disconnect recovery", () => {
   it("recovers a socket that stops answering heartbeats without closing", async () => {
     const { t, ws } = connectReady()
     const sub = attachShared(t)
+    ws.onmessage?.({ data: JSON.stringify({ type: "pong" }) })
     fetchMock.mockResolvedValue(ok200())
     await vi.advanceTimersByTimeAsync(30_000)
     expect(ws.sent).toContain(JSON.stringify({ action: "ping" }))
@@ -170,6 +171,7 @@ describe("WebTransport silent disconnect recovery", () => {
   it("keeps an idle healthy agent attached when the server answers ping", async () => {
     const { t, ws } = connectReady()
     attachShared(t)
+    ws.onmessage?.({ data: JSON.stringify({ type: "pong" }) })
     for (let i = 0; i < 4; i++) {
       await vi.advanceTimersByTimeAsync(30_000)
       ws.onmessage?.({ data: JSON.stringify({ type: "pong" }) })
@@ -226,6 +228,7 @@ describe("WebTransport silent disconnect recovery", () => {
   it("removes heartbeat timers and wake listeners on destroy", async () => {
     const { t, ws } = connectReady()
     attachShared(t)
+    ws.onmessage?.({ data: JSON.stringify({ type: "pong" }) })
     await vi.advanceTimersByTimeAsync(30_000)
     t.destroy()
     const sentCount = ws.sent.length
@@ -239,6 +242,7 @@ describe("WebTransport silent disconnect recovery", () => {
   it("ignores old socket callbacks after recovering a failed send", async () => {
     const { t, ws } = connectReady()
     attachShared(t)
+    ws.onmessage?.({ data: JSON.stringify({ type: "pong" }) })
     const lateMessage = ws.onmessage
     const lateClose = ws.onclose
     vi.spyOn(ws, "send").mockImplementation(() => {

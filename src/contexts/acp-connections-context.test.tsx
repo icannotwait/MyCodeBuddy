@@ -151,7 +151,8 @@ const h = vi.hoisted(() => {
     },
     // Stable across renders so tests can assert on what the error handler
     // routes to the status-bar alert vs. to the OS notification.
-    sendSystemNotification: vi.fn(async () => undefined),    notifyDesktop: vi.fn(async () => true),
+    sendSystemNotification: vi.fn(async () => undefined),
+    notifyDesktop: vi.fn(async () => true),
     playEventSound: vi.fn(),
     toastWarning: vi.fn(),
     toastError: vi.fn(),
@@ -215,9 +216,9 @@ vi.mock("@/lib/desktop-notification", () => ({
 }))
 
 vi.mock("@/lib/notification-sound", async () => {
-  const actual = await vi.importActual<typeof import("@/lib/notification-sound")>(
-    "@/lib/notification-sound"
-  )
+  const actual = await vi.importActual<
+    typeof import("@/lib/notification-sound")
+  >("@/lib/notification-sound")
   return {
     ...actual,
     playEventSound: (envelope: unknown) => h.playEventSound(envelope),
@@ -2490,6 +2491,77 @@ describe("AcpConnectionsProvider shared server roots", () => {
     expect(h.acpConnectOrAttach).not.toHaveBeenCalled()
   })
 
+  it("keeps the owner attach when the shared subscription is still bound", async () => {
+    h.isDesktop = false
+    h.acpConnectOrAttach.mockResolvedValue(sharedResponse())
+    await mountProvider()
+    await act(async () => {
+      await h.actions!.connect(TAB, "claude_code", "/work", "sess", 42)
+    })
+    h.attach.mockClear()
+    h.acpConnectOrAttach.mockClear()
+
+    await act(async () => {
+      await h.actions!.connect(TAB, "claude_code", "/work", "sess", 42)
+    })
+
+    expect(h.acpConnectOrAttach).not.toHaveBeenCalled()
+    expect(h.attach).not.toHaveBeenCalled()
+  })
+
+  it("re-attaches the stored lease when the owner subscription was dropped", async () => {
+    h.isDesktop = false
+    h.acpConnectOrAttach.mockResolvedValue(sharedResponse())
+    await mountProvider()
+    await act(async () => {
+      await h.actions!.connect(TAB, "claude_code", "/work", "sess", 42)
+    })
+    const handlers = latestAttachHandlers()
+    h.attach.mockClear()
+    h.acpConnectOrAttach.mockClear()
+    act(() => {
+      handlers.onAttachError("oversized_frame", true)
+    })
+
+    await act(async () => {
+      await h.actions!.connect(TAB, "claude_code", "/work", "sess", 42)
+    })
+
+    expect(h.acpConnectOrAttach).not.toHaveBeenCalled()
+    expect(h.attach).toHaveBeenCalledTimes(1)
+    expect(h.attach.mock.calls[0]?.[1]).toMatchObject({
+      shared: { generation: 1, leaseId: "lease-1" },
+    })
+  })
+
+  it("attaches a fresh shared lease after lease_expired clears the store", async () => {
+    h.isDesktop = false
+    let resolveReconnect!: (response: ReturnType<typeof sharedResponse>) => void
+    const reconnectResponse = new Promise<ReturnType<typeof sharedResponse>>(
+      (resolve) => {
+        resolveReconnect = resolve
+      }
+    )
+    h.acpConnectOrAttach
+      .mockResolvedValueOnce(sharedResponse())
+      .mockReturnValueOnce(reconnectResponse)
+    await mountProvider()
+    await act(async () => {
+      await h.actions!.connect(TAB, "claude_code", "/work", "sess", 42)
+    })
+
+    act(() => latestAttachHandlers().onDetached("lease_expired"))
+    expect(h.store!.getConnection(TAB)).toBeUndefined()
+
+    resolveReconnect(sharedResponse({ leaseId: "lease-fresh" }))
+    await waitFor(() => expect(h.attach).toHaveBeenCalledTimes(2))
+
+    expect(h.acpConnectOrAttach).toHaveBeenCalledTimes(2)
+    expect(h.attach.mock.calls[1]?.[1]).toMatchObject({
+      shared: { generation: 1, leaseId: "lease-fresh" },
+    })
+  })
+
   it("retains the event cursor when a shared detach reattaches to the same generation", async () => {
     h.isDesktop = false
     h.acpConnectOrAttach
@@ -4643,9 +4715,9 @@ describe("AcpConnectionsProvider AIR session-failure lifecycle", () => {
       } as EventEnvelope)
     })
 
-    expect(h.store!.getConnection("spawned-conn")?.sessionFailures[0]).toMatchObject(
-      { revision: 1, title: "live surface", resolved: false }
-    )
+    expect(
+      h.store!.getConnection("spawned-conn")?.sessionFailures[0]
+    ).toMatchObject({ revision: 1, title: "live surface", resolved: false })
     expect(h.store!.getConnection(TAB)?.sessionFailures[0]).toMatchObject({
       revision: 5,
       title: "stale watermark",
@@ -8868,8 +8940,8 @@ describe("AcpConnectionsProvider Grok cross-agent-type model switch", () => {
       type: "session_notice",
       notice: { severity: "warning", title: "Auto mode unavailable" },
     })
-    expect(h.toastWarning).toHaveBeenCalledTimes(1)  })
-
+    expect(h.toastWarning).toHaveBeenCalledTimes(1)
+  })
 
   it("notifies only the live warning when one frame mixes replay and live", async () => {
     const handlers = await connectGrokOwner()
@@ -9702,7 +9774,9 @@ describe("HYDRATE_FROM_SNAPSHOT last_error recovery", () => {
     expect(h.recordAlert).toHaveBeenCalledWith(
       expect.objectContaining({
         evidence: details,
-        message: expect.stringMatching(/^backendErrors\.turnFailedEmptyProtocol/),
+        message: expect.stringMatching(
+          /^backendErrors\.turnFailedEmptyProtocol/
+        ),
       })
     )
     const notifyCalls = h.notifyDesktop.mock.calls
@@ -14157,10 +14231,7 @@ describe("AcpConnectionsProvider frame transactions (raw order)", () => {
     expect(conn.status).toBe("connected")
     expect(conn.lastAppliedSeq).toBe(7)
     // The accepted error still notifies (before status cleared the field).
-    expect(h.toastError).toHaveBeenCalledWith(
-      "turn blew up",
-      expect.anything()
-    )
+    expect(h.toastError).toHaveBeenCalledWith("turn blew up", expect.anything())
   })
 
   it("applies plan approval and retrying events through the frame ingestor", async () => {
@@ -22709,7 +22780,6 @@ describe("AIR session failures are told as notifications", () => {
       '"error": "overloaded"\n}\nTry again later.'
     )
   })
-
 
   it("pairs a typed failure and a verdict that commit in the same frame", async () => {
     const handlers = await connectOwner()

@@ -58,10 +58,14 @@ WebSocket，再携带原连接 ID、租约和消息游标接入；服务进程�
 这些日志只说明 30 秒 `{action:"ping"}` 有没有发出，以及服务端有没有续约。
 租约时长、续约结果和回收策略不变。
 
-它们只走 debug，默认 info 看不到。浏览器用 `console.debug`，服务端用
-`tracing::debug!`。成功续约和每一次 ping 都不会打 info。
+成功续约和每一次 ping 仍走 debug，默认 info 看不到。浏览器用
+`console.debug`，服务端用 `tracing::debug!`。共享订阅刚附着或 WebSocket
+重连后会立刻再发一次 `{action:"ping"}`，不等 30 秒定时器；定时器仍是
+30 秒。若共享订阅还在、socket 已打开，但这枚 ping 发不出去，或 30 秒
+定时器创建失败，浏览器会 `console.warn` 一次
+`[WebEventStream][lease-heartbeat] not armed`（同一组订阅不重复）。
 
-要看到这些行，两处都要打开 debug：
+`not armed` 是 `console.warn`，默认 Info 就能看到。其余行仍要打开 debug：
 
 1. 浏览器 DevTools Console 过滤 `[lease-heartbeat]`，并把级别调到 Verbose。
    默认 Info 视图不显示 `console.debug`。
@@ -77,8 +81,12 @@ RUST_LOG=codeg_lib::web::ws=debug
 - `[WebEventStream][lease-heartbeat] start` / `stop` / `not started`：
   共享与非共享订阅数量、缩短后的 connection / subscription id，以及是否带有
   generation 和 leaseId。没有 `shared` 的观察者或委托子会话不会启动心跳。
+- `[WebEventStream][lease-heartbeat] renew sent`：共享订阅刚附着，或
+  WebSocket 重连后立刻续约。
 - `[WebEventStream][lease-heartbeat] tick sent` / `tick skipped`：
-  跳过原因是 `ws not open`、`destroyed`、`no shared subs` 或 `send failed`。
+  跳过原因是 `ws not open`、`destroyed` 或 `no shared subs`。
+- `[WebEventStream][lease-heartbeat] not armed`：socket 已打开但 ping
+  发不出去，或 30 秒定时器创建失败。同一组订阅只警告一次。
 - `[WebTransport][lease-heartbeat] wake probe sent` / `wake probe skipped`：
   页面回到前台或 `online` 时的探测。跳过原因是 `hidden`、`not connected`、
   `ws closed`、`destroyed` 或 `send failed`。
