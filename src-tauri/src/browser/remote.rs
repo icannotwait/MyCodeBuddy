@@ -107,7 +107,7 @@ pub async fn prepare(
     crate::commands::browser::on_main_until_result(
         app,
         "Failed to prepare the remote browser profile",
-        |done| crate::browser::shim::macos::prepare_loopback_rules(done),
+        crate::browser::shim::macos::prepare_loopback_rules,
     )
     .await?;
     // The profile as its tabs will find it — its store pointed at the
