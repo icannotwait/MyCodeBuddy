@@ -19328,15 +19328,17 @@ impl<Counterpart: Role> HandleDispatchFrom<Counterpart> for ClaimNullSessionIds 
     }
 }
 
-/// True when `params.sessionId` exists and is JSON `null` — the one shape
-/// [`ClaimNullSessionIds`] exists for. A MISSING `sessionId` is a
+/// True when a session-id field exists and is JSON `null` — the one shape
+/// [`ClaimNullSessionIds`] exists for. ACP spells this `sessionId`; the
+/// snake-case alias is accepted because Grok's setup bridge has emitted both
+/// spellings across CLI builds. A MISSING session id is a
 /// perfectly ordinary connection-level notification (`_auth/status_update`,
 /// grok's `_x.ai/settings/update`) and must keep flowing.
 fn has_null_session_id(message: &UntypedMessage) -> bool {
-    message
-        .params()
-        .get("sessionId")
-        .is_some_and(serde_json::Value::is_null)
+    let params = message.params();
+    ["sessionId", "session_id"]
+        .iter()
+        .any(|key| params.get(*key).is_some_and(serde_json::Value::is_null))
 }
 
 /// `_auth/status_update` — the agent reporting which identity IT is logged in
@@ -31396,6 +31398,20 @@ mod tests {
         )
         .unwrap();
         assert!(!has_null_session_id(&settings));
+    }
+
+    #[test]
+    fn null_session_id_recognizes_snake_case_alias() {
+        let raw = UntypedMessage::new(
+            "_x.ai/session/setup",
+            serde_json::json!({
+                "method": "session/new",
+                "phase": "auth",
+                "session_id": serde_json::Value::Null
+            }),
+        )
+        .unwrap();
+        assert!(has_null_session_id(&raw));
     }
 
     /// A REQUEST with a null `sessionId` is parked by the runtime like any
