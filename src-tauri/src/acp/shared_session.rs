@@ -2931,13 +2931,16 @@ impl SharedSessionBroker {
         let Some(record) = record else {
             return false;
         };
-        match record.try_lock() {
-            Ok(record) => !matches!(
-                record.phase,
+        // Bind the answer before the `Arc` drops. A tail `match` on
+        // `try_lock()` keeps the guard alive across that drop.
+        let live = match record.try_lock() {
+            Ok(guard) => !matches!(
+                guard.phase,
                 SharedSessionPhase::Failed { .. } | SharedSessionPhase::Closing
             ),
             Err(_) => true,
-        }
+        };
+        live
     }
 
     pub(crate) async fn install_registered(
