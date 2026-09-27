@@ -424,6 +424,12 @@ interface HistoricalTimelineCacheKey {
    * A normal text delta does not change this.
    */
   steeringContentSignature: string
+  /**
+   * Invalidates the hide-persisted-reply decision when a truncated snapshot
+   * replaces a complete live message with the same id.
+   */
+  liveSnapshotOmittedToolCalls: number
+  liveSnapshotOmittedLiveToolRefs: number
 }
 
 interface HistoricalTimelineCacheEntry {
@@ -452,7 +458,10 @@ function sameHistoricalKey(
     left.liveMessageId === right.liveMessageId &&
     left.liveStartedAt === right.liveStartedAt &&
     left.liveShowsReply === right.liveShowsReply &&
-    left.steeringContentSignature === right.steeringContentSignature
+    left.steeringContentSignature === right.steeringContentSignature &&
+    left.liveSnapshotOmittedToolCalls === right.liveSnapshotOmittedToolCalls &&
+    left.liveSnapshotOmittedLiveToolRefs ===
+      right.liveSnapshotOmittedLiveToolRefs
   )
 }
 
@@ -493,6 +502,10 @@ function buildHistoricalKey(
     liveStartedAt: session.liveMessage?.startedAt ?? null,
     liveShowsReply,
     steeringContentSignature: steeringContentSignature(session.liveMessage),
+    liveSnapshotOmittedToolCalls:
+      session.liveMessage?.snapshotOmittedToolCalls ?? 0,
+    liveSnapshotOmittedLiveToolRefs:
+      session.liveMessage?.snapshotOmittedLiveToolRefs ?? 0,
   }
 }
 
@@ -6257,11 +6270,16 @@ function computeHistoricalTimeline(
     session.liveOwnsActiveTurn &&
     (liveShowsReply ||
       session.localTurns.some((turn) => turn.role === "assistant"))
+  // A truncated attach snapshot still carries tool_call refs the projection
+  // dropped. The saved transcript is what fills those cards, so a child
+  // viewer must not strip that persisted reply while the gap is open.
+  const liveOmitsReferencedTools =
+    (session.liveMessage?.snapshotOmittedLiveToolRefs ?? 0) > 0
   // Scoped to the active round: strip only what follows the last real round
   // boundary. For a one-shot delegation child that is the first-assistant
   // rule. Earlier rounds stay.
   let stripFrom = -1
-  if (hasLiveOrLocalReply) {
+  if (hasLiveOrLocalReply && !liveOmitsReferencedTools) {
     let lastUserIdx = -1
     for (let i = persistedWithLocalReplacement.length - 1; i >= 0; i--) {
       if (isRoundBoundaryUserTurn(persistedWithLocalReplacement[i]!)) {
@@ -6293,12 +6311,14 @@ function computeHistoricalTimeline(
   // into `detail` it sits beside the live reply (a separate assistant turn
   // under a `live-…` id), and `mergeConsecutiveAssistantTurns` concatenates
   // the two — so the already-persisted head (e.g. the first reasoning block)
-  // renders twice. Hide that persisted partial, but ONLY while the live message
-  // is actually SHOWING a reply (`liveShowsReply`): that is what makes this a
-  // choice between two renderings of one reply rather than a deletion. The
-  // moment the turn ends, `liveMessage` clears and the persisted copy (now
-  // complete) renders normally; the brief promote→refetch grace window can show
-  // a transient visible duplicate, never a hidden turn.
+  // renders twice. Hide that persisted partial, but ONLY while the live
+  // message is actually SHOWING a reply (`liveShowsReply`) and every tool
+  // ref resolved. A truncated attach snapshot is not the full reply:
+  // `snapshotOmittedLiveToolRefs > 0` means cards the live message still
+  // names are missing, and the saved turn is what fills them. The moment the
+  // turn ends, `liveMessage` clears and the persisted copy (now complete)
+  // renders normally; the brief promote→refetch grace window can show a
+  // transient visible duplicate, never a hidden turn.
   //
   // The in-flight prompt is identified authoritatively by the backend, which
   // reports the id of the persisted user turn it stamped as the in-flight one
@@ -6323,12 +6343,8 @@ function computeHistoricalTimeline(
           !(session.queuedOptimisticTurnIds ?? []).includes(turn.id)
       ))
   const inFlightPromptId = staleInFlightPrompt ? null : stampedPromptId
-  // Hide the persisted partial only while the live stream is showing a reply.
-  // When the stamp is missing, anchor on the newest user turn this client can
-  // prove opened the round — not a steered copy, and not every same-text user
-  // turn. Reachable only once a copy is in detail and the live message holds
-  // the round from before the interruption.
-  const canSuppressInFlightPartial = !hasLiveOrLocalReply && liveShowsReply
+  const canSuppressInFlightPartial =
+    !hasLiveOrLocalReply && liveShowsReply && !liveOmitsReferencedTools
   let inFlightPromptIdx = -1
   if (canSuppressInFlightPartial && inFlightPromptId !== null) {
     inFlightPromptIdx = persistedTurns.findIndex(
@@ -6645,6 +6661,113 @@ function suppressPersistedSteeredPrompts(
  * streaming turns. Streaming appends produce a new array each call; historical
  * entries remain reference-stable across content-only live updates.
  */
+function concatPersistedProse(
+  turns: MessageTurn[],
+  kind: "text" | "thinking"
+): string {
+  let out = ""
+  for (const turn of turns) {
+    for (const block of turn.blocks) {
+      if (block.type === kind) out += block.text
+    }
+  }
+  return out
+}
+
+function concatLiveProse(
+  content: LiveContentBlock[],
+  kind: "text" | "thinking"
+): string {
+  let out = ""
+  for (const block of content) {
+    if (block.type !== kind || block.parentToolUseId) continue
+    out += block.text
+  }
+  return out
+}
+
+/**
+ * `""` drops the live prose (the saved turn already has it). A non-empty
+ * string is the live tail past that saved prefix. `null` means the two
+ * copies don't share a prefix, so the live prose stays.
+ */
+function proseBeyondPersisted(live: string, persisted: string): string | null {
+  if (persisted.length === 0) return null
+  if (live === persisted || persisted.startsWith(live)) return ""
+  if (live.startsWith(persisted)) return live.slice(persisted.length)
+  return null
+}
+
+/**
+ * When the attach snapshot omitted live tool refs, the saved turn is shown
+ * beside the live message. Drop tool cards the saved turn already has, and
+ * drop prose that is a prefix of that turn, so the two copies don't paint
+ * the same delegation card twice.
+ */
+function reconcileLiveMessageWithPersistedTools(
+  live: LiveMessage,
+  historical: ConversationTimelineTurn[]
+): LiveMessage {
+  const liveToolIds = new Set<string>()
+  for (const block of live.content) {
+    if (block.type === "tool_call") liveToolIds.add(block.info.tool_call_id)
+  }
+  if (liveToolIds.size === 0) return live
+
+  const overlapping: MessageTurn[] = []
+  const persistedIds = new Set<string>()
+  for (const item of historical) {
+    if (item.turn.role !== "assistant") continue
+    let overlaps = false
+    for (const block of item.turn.blocks) {
+      if (
+        block.type === "tool_use" &&
+        block.tool_use_id &&
+        liveToolIds.has(block.tool_use_id)
+      ) {
+        overlaps = true
+        persistedIds.add(block.tool_use_id)
+      }
+    }
+    if (overlaps) overlapping.push(item.turn)
+  }
+  if (persistedIds.size === 0) return live
+
+  const textBeyond = proseBeyondPersisted(
+    concatLiveProse(live.content, "text"),
+    concatPersistedProse(overlapping, "text")
+  )
+  const thinkingBeyond = proseBeyondPersisted(
+    concatLiveProse(live.content, "thinking"),
+    concatPersistedProse(overlapping, "thinking")
+  )
+  const content: LiveContentBlock[] = []
+  for (const block of live.content) {
+    if (block.type === "tool_call") {
+      if (!persistedIds.has(block.info.tool_call_id)) content.push(block)
+      continue
+    }
+    if (block.type === "text" && !block.parentToolUseId) {
+      if (textBeyond === null) content.push(block)
+      continue
+    }
+    if (block.type === "thinking" && !block.parentToolUseId) {
+      if (thinkingBeyond === null) content.push(block)
+      continue
+    }
+    content.push(block)
+  }
+  if (textBeyond) content.push({ type: "text", text: textBeyond })
+  if (thinkingBeyond) content.push({ type: "thinking", text: thinkingBeyond })
+  if (
+    content.length === live.content.length &&
+    content.every((block, index) => block === live.content[index])
+  ) {
+    return live
+  }
+  return { ...live, content }
+}
+
 function computeTimeline(
   state: ConversationRuntimeState,
   conversationId: number
@@ -6653,9 +6776,9 @@ function computeTimeline(
   if (!session) return EMPTY_TIMELINE
 
   const agentType = resolveSessionAgentType(session)
-  const liveMessage = session.liveMessage
-  const built = liveMessage
-    ? buildStreamingTurnsFromLiveMessage(conversationId, liveMessage, {
+  const rawLiveMessage = session.liveMessage
+  const built = rawLiveMessage
+    ? buildStreamingTurnsFromLiveMessage(conversationId, rawLiveMessage, {
         agentType: agentType ?? null,
       })
     : undefined
@@ -6674,13 +6797,18 @@ function computeTimeline(
     historical,
     collectSteeredPersistedCopyIds(session)
   )
-  if (!liveMessage || !built) return head
+  if (!rawLiveMessage || !built) return head
+  const liveMessage =
+    (rawLiveMessage.snapshotOmittedLiveToolRefs ?? 0) > 0
+      ? reconcileLiveMessageWithPersistedTools(rawLiveMessage, head)
+      : rawLiveMessage
+  if (liveMessage.content.length === 0) return head
   return appendCanonicalStreamingTurns(
     head,
     conversationId,
     liveMessage,
     agentType,
-    built
+    liveMessage === rawLiveMessage ? built : undefined
   )
 }
 
@@ -6734,9 +6862,19 @@ export const useConversationRuntimeStore = create<ConversationRuntimeStore>()((
     if (session?.detail || session?.detailLoading) return
     if (sessionHasPendingCancel(session)) return
 
-    // Skip fetch if session has active data (ongoing conversation)
+    // Skip fetch if session has active data (ongoing conversation). A live
+    // message from a truncated attach snapshot is not that complete turn:
+    // omitted tool calls, and especially omitted live refs, have to come
+    // from the saved transcript.
+    const snapshotOmittedToolCalls =
+      session?.liveMessage?.snapshotOmittedToolCalls ?? 0
+    const snapshotOmittedLiveToolRefs =
+      session?.liveMessage?.snapshotOmittedLiveToolRefs ?? 0
+    const snapshotToolGap =
+      snapshotOmittedToolCalls > 0 || snapshotOmittedLiveToolRefs > 0
     if (
       session &&
+      !snapshotToolGap &&
       (session.optimisticTurns.length > 0 ||
         session.liveMessage !== null ||
         session.localTurns.length > 0)
@@ -6759,7 +6897,10 @@ export const useConversationRuntimeStore = create<ConversationRuntimeStore>()((
         }
         // Terminal sync may have been requested while detail was still empty:
         // force preserveLive so the first commit cannot wipe live buffers.
-        const preserveLive = pendingDelegateTerminalSync.has(conversationId)
+        // A truncated snapshot fetch is the same shape: disk fills the gaps,
+        // and wiping the live message would drop the streaming tail.
+        const preserveLive =
+          pendingDelegateTerminalSync.has(conversationId) || snapshotToolGap
         dispatch({
           type: "FETCH_DETAIL_SUCCESS",
           conversationId,

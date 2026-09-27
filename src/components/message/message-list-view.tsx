@@ -1766,6 +1766,18 @@ export function MessageListView({
   const useIncrementalLive = useStreamingPerformanceFlag(
     "incremental_live_transcript"
   )
+  const snapshotOmittedToolCalls = useConversationRuntimeStore(
+    useCallback(
+      (s) => {
+        const live = s.byConversationId.get(conversationId)?.liveMessage
+        return Math.max(
+          live?.snapshotOmittedToolCalls ?? 0,
+          live?.snapshotOmittedLiveToolRefs ?? 0
+        )
+      },
+      [conversationId]
+    )
+  )
   const showThinking = useAgentThinkingVisibility(agentType)
   const historyWindow = useConversationRuntimeStore(
     useCallback(
@@ -2637,6 +2649,17 @@ export function MessageListView({
           ref={selectionBoxRef}
           className="relative flex h-full min-h-0 flex-col"
         >
+          {snapshotOmittedToolCalls > 0 ? (
+            <p
+              className="mx-4 mt-2 shrink-0 rounded-md border border-amber-500/40 bg-amber-500/10 px-3 py-2 text-xs text-foreground"
+              data-testid="snapshot-omitted-tool-calls"
+              role="status"
+            >
+              {t("snapshotOmittedToolCalls", {
+                count: snapshotOmittedToolCalls,
+              })}
+            </p>
+          ) : null}
           <MessageThread
             className="flex-1 min-h-0"
             resize={

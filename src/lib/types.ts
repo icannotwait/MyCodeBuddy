@@ -4489,14 +4489,23 @@ export interface LiveSessionSnapshot {
   /**
    * Counts removed or shortened by the bounded snapshot projection.
    * Absent on older payloads (then treated as no omission).
+   * `omitted_tool_calls > 0` means `active_tool_calls` is not the full
+   * in-memory set. `omitted_live_tool_refs > 0` means the live message still
+   * points at tool calls that were not included.
    */
   truncation?: SnapshotTruncation | null
   event_seq: number
 }
 
-/** Loss information for a bounded snapshot projection. */
+/**
+ * Loss information for a bounded snapshot projection. Absent when the
+ * projection kept every counted collection. `omitted_live_tool_refs` is `0`
+ * on snapshots from servers that predate the field.
+ */
 export interface SnapshotTruncation {
   omitted_tool_calls: number
+  /** Live-message refs whose tool state was not included. Older servers omit it. */
+  omitted_live_tool_refs?: number
   omitted_images: number
   omitted_failures: number
   omitted_watchdog_tombstones: number

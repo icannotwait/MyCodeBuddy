@@ -3563,7 +3563,8 @@
         "waitingForSubagents": "等待子任務中…",
         "backgroundContinuation": "後台續寫",
         "loadOlderHistory": "載入更早的訊息",
-        "loadBackgroundActivity": "載入背景活動"
+        "loadBackgroundActivity": "載入背景活動",
+        "snapshotOmittedToolCalls": "目前的即時檢視省略了 {count} 個工具呼叫。已載入已儲存的訊息來補上缺口。"
       },
       "liveTurnStats": {
         "thinking": "思考中...",

@@ -3563,7 +3563,8 @@
         "waitingForSubagents": "Warte auf Subagenten…",
         "backgroundContinuation": "Hintergrund-Fortsetzung",
         "loadOlderHistory": "Frühere Nachrichten laden",
-        "loadBackgroundActivity": "Hintergrundaktivität laden"
+        "loadBackgroundActivity": "Hintergrundaktivität laden",
+        "snapshotOmittedToolCalls": "Diese Live-Ansicht hat {count} Tool-Aufrufe ausgelassen. Gespeicherte Nachrichten füllen die Lücken."
       },
       "liveTurnStats": {
         "thinking": "Denkt nach...",

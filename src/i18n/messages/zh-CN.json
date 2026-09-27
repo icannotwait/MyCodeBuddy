@@ -3563,7 +3563,8 @@
         "waitingForSubagents": "等待子任务中…",
         "backgroundContinuation": "后台续写",
         "loadOlderHistory": "加载更早的消息",
-        "loadBackgroundActivity": "加载后台活动"
+        "loadBackgroundActivity": "加载后台活动",
+        "snapshotOmittedToolCalls": "当前实时视图省略了 {count} 个工具调用。已加载已保存的消息来补齐缺口。"
       },
       "liveTurnStats": {
         "thinking": "思考中...",

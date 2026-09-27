@@ -2,7 +2,7 @@
 //! 全部住在这里。Phase 2 的 snapshot 端点直接从此处读取 live 部分。
 
 use std::cmp::Reverse;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -1021,10 +1021,19 @@ impl Default for SnapshotLimits {
     }
 }
 
+/// Bytes reserved per projected tool call for id, kind, status, and envelope,
+/// independent of truncated input and output.
+const SNAPSHOT_TOOL_STRUCT_BYTES: usize = 512;
+
 /// Loss information for a bounded snapshot projection.
 #[derive(Default, Debug, Clone, Serialize, Deserialize)]
 pub struct SnapshotTruncation {
     pub omitted_tool_calls: usize,
+    /// Live-message `tool_call_ref`s whose tool state was not included.
+    /// Distinct from `omitted_tool_calls`, which also counts active calls the
+    /// current turn does not reference. `0` on snapshots from older servers.
+    #[serde(default)]
+    pub omitted_live_tool_refs: usize,
     pub omitted_images: usize,
     pub omitted_failures: usize,
     pub omitted_watchdog_tombstones: usize,
@@ -1034,11 +1043,58 @@ pub struct SnapshotTruncation {
 impl SnapshotTruncation {
     fn is_empty(&self) -> bool {
         self.omitted_tool_calls == 0
+            && self.omitted_live_tool_refs == 0
             && self.omitted_images == 0
             && self.omitted_failures == 0
             && self.omitted_watchdog_tombstones == 0
             && self.truncated_text_fields == 0
     }
+}
+
+fn label_names_delegation_tool(label: &str) -> bool {
+    let lower = label.to_ascii_lowercase();
+    const NAMES: [&str; 3] = [
+        "delegate_to_agent",
+        "continue_delegation",
+        "get_delegation_status",
+    ];
+    NAMES.iter().any(|name| {
+        lower == *name
+            || lower.strip_suffix(name).is_some_and(|prefix| {
+                prefix
+                    .chars()
+                    .next_back()
+                    .is_some_and(|ch| !ch.is_ascii_alphanumeric())
+            })
+    })
+}
+
+fn tool_state_is_delegation_projection(tool: &ToolCallState) -> bool {
+    if label_names_delegation_tool(&tool.label) {
+        return true;
+    }
+    tool.meta.as_ref().is_some_and(|meta| {
+        meta.get("codeg.delegation")
+            .is_some_and(|value| !value.is_null())
+    })
+}
+
+fn live_message_tool_ref_ids(message: &LiveMessage) -> Vec<&str> {
+    let mut seen = HashSet::new();
+    let mut ids = Vec::new();
+    for block in &message.content {
+        if let LiveContentBlock::ToolCallRef { tool_call_id } = block {
+            if seen.insert(tool_call_id.as_str()) {
+                ids.push(tool_call_id.as_str());
+            }
+        }
+    }
+    ids
+}
+
+struct SnapshotToolSelection<'a> {
+    tools: Vec<&'a ToolCallState>,
+    omitted_live_tool_refs: usize,
 }
 
 impl SessionState {
@@ -3159,7 +3215,7 @@ impl SessionState {
         }
     }
 
-    /// Tools admitted into the bounded snapshot, in budget-allocation order:
+    /// Tools admitted into the numeric cap, in budget-allocation order:
     /// permission-linked, then non-terminal, then most recently arrived
     /// finished calls. Callers sort the projected vector back by id.
     fn selected_snapshot_tools(&self, limits: SnapshotLimits) -> Vec<&ToolCallState> {
@@ -3184,9 +3240,56 @@ impl SessionState {
         tools
     }
 
-    fn snapshot_structural_reserve(&self, limits: SnapshotLimits) -> usize {
+    /// Numeric-cap selection, plus live-referenced delegation *tools* the cap
+    /// would have dropped. Ordinary calls, including fixtures that only stamp
+    /// `codeg.delegation` onto a read, stay inside `limits.tool_calls`.
+    /// `delegate_to_agent` / `continue_delegation` / `get_delegation_status`
+    /// cards the live message still names are kept up to the payload's
+    /// structural ceiling. Refs that still do not fit are
+    /// `omitted_live_tool_refs`.
+    fn select_snapshot_tool_calls(&self, limits: SnapshotLimits) -> SnapshotToolSelection<'_> {
+        let mut tools = self.selected_snapshot_tools(limits);
+        let mut selected: HashSet<&str> = tools.iter().map(|tool| tool.id.as_str()).collect();
+        let referenced = self
+            .live_message
+            .as_ref()
+            .map(live_message_tool_ref_ids)
+            .unwrap_or_default();
+        let hard_ceiling = (limits.payload_bytes / SNAPSHOT_TOOL_STRUCT_BYTES)
+            .max(limits.tool_calls)
+            .max(1);
+        for id in referenced.iter().rev() {
+            if tools.len() >= hard_ceiling {
+                break;
+            }
+            if selected.contains(*id) {
+                continue;
+            }
+            let Some(tool) = self.active_tool_calls.get(*id) else {
+                continue;
+            };
+            if !label_names_delegation_tool(&tool.label) {
+                continue;
+            }
+            selected.insert(tool.id.as_str());
+            tools.push(tool);
+        }
+        let omitted_live_tool_refs = referenced
+            .iter()
+            .filter(|id| !selected.contains(*id))
+            .count();
+        SnapshotToolSelection {
+            tools,
+            omitted_live_tool_refs,
+        }
+    }
+
+    fn snapshot_structural_reserve(
+        &self,
+        limits: SnapshotLimits,
+        projected_tools: &[&ToolCallState],
+    ) -> usize {
         const BASE_BYTES: usize = 32 * 1024;
-        const TOOL_BYTES: usize = 512;
         const IMAGE_BYTES: usize = 128;
         const FAILURE_BYTES: usize = 256;
         const WATCHDOG_BYTES: usize = 96;
@@ -3202,8 +3305,7 @@ impl SessionState {
             .as_ref()
             .map(Self::pending_user_image_count)
             .unwrap_or(0);
-        let image_count = self
-            .selected_snapshot_tools(limits)
+        let image_count = projected_tools
             .iter()
             .fold(0usize, |total, tool| {
                 total.saturating_add(tool.images.len())
@@ -3212,10 +3314,9 @@ impl SessionState {
             .min(limits.images);
         BASE_BYTES
             .saturating_add(
-                self.active_tool_calls
+                projected_tools
                     .len()
-                    .min(limits.tool_calls)
-                    .saturating_mul(TOOL_BYTES),
+                    .saturating_mul(SNAPSHOT_TOOL_STRUCT_BYTES),
             )
             .saturating_add(image_count.saturating_mul(IMAGE_BYTES))
             .saturating_add(
@@ -3242,10 +3343,13 @@ impl SessionState {
 
     /// Build the bounded wire projection without mutating the live session.
     pub fn to_snapshot_with_limits(&self, limits: SnapshotLimits) -> LiveSessionSnapshot {
-        let mut truncation = SnapshotTruncation::default();
-        let reserve = self.snapshot_structural_reserve(limits);
+        let selection = self.select_snapshot_tool_calls(limits);
+        let mut truncation = SnapshotTruncation {
+            omitted_live_tool_refs: selection.omitted_live_tool_refs,
+            ..SnapshotTruncation::default()
+        };
+        let reserve = self.snapshot_structural_reserve(limits, &selection.tools);
         let mut remaining_payload_bytes = limits.payload_bytes.saturating_sub(reserve);
-        let live_message = self.project_live_message(&mut remaining_payload_bytes, &mut truncation);
 
         let total_images = self
             .active_tool_calls
@@ -3269,20 +3373,37 @@ impl SessionState {
         let pending_permission = self.pending_permission.as_ref().map(|pending| {
             Self::project_pending_permission(pending, &mut remaining_payload_bytes, &mut truncation)
         });
-        let mut active_tool_calls: Vec<_> = self
-            .selected_snapshot_tools(limits)
-            .into_iter()
-            .map(|entry| {
-                Self::project_tool_call(
+        // Delegation cards carry the child-conversation link in `meta`. Project
+        // those tool states before live text can spend the payload budget.
+        // Other calls stay in admission order (in-progress before finished)
+        // and are projected after the live message.
+        let mut active_tool_calls = Vec::with_capacity(selection.tools.len());
+        let mut deferred_tools = Vec::new();
+        for entry in &selection.tools {
+            if tool_state_is_delegation_projection(entry) {
+                active_tool_calls.push(Self::project_tool_call(
                     entry,
                     limits,
                     &mut remaining_payload_bytes,
                     &mut image_slots_used,
                     &mut retained_image_payloads,
                     &mut truncation,
-                )
-            })
-            .collect();
+                ));
+            } else {
+                deferred_tools.push(*entry);
+            }
+        }
+        let live_message = self.project_live_message(&mut remaining_payload_bytes, &mut truncation);
+        for entry in deferred_tools {
+            active_tool_calls.push(Self::project_tool_call(
+                entry,
+                limits,
+                &mut remaining_payload_bytes,
+                &mut image_slots_used,
+                &mut retained_image_payloads,
+                &mut truncation,
+            ));
+        }
         truncation.omitted_tool_calls = self
             .active_tool_calls
             .len()
@@ -3681,6 +3802,8 @@ fn extract_tool_call_id(tool_call: &serde_json::Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashSet;
+
     use crate::acp::types::{
         AcpEvent, AsyncTaskDelta, AsyncTaskUsage, ConnectionStatus, DelegationResultSummary,
         EventEnvelope, PromptCapabilitiesInfo, SessionConfigKindInfo, SessionConfigOptionInfo,
@@ -6601,7 +6724,11 @@ mod tests {
             watchdog_tombstones: 1,
         };
         let snapshot = s.to_snapshot_with_limits(limits);
-        let tool_call = &snapshot.pending_permission.expect("permission").tool_call;
+        let tool_call = &snapshot
+            .pending_permission
+            .as_ref()
+            .expect("permission")
+            .tool_call;
         assert_eq!(tool_call["truncated"], true);
         assert!(tool_call.get("rawInput").is_none());
         let rendered = serde_json::to_string(tool_call).unwrap();
@@ -6848,6 +6975,174 @@ mod tests {
         assert_eq!(s.tool_watchdog_max_versions.len(), 1002);
     }
 
+    fn snapshot_tool(id: &str, label: &str) -> ToolCallState {
+        ToolCallState {
+            id: id.to_string(),
+            kind: ToolKind::Other,
+            label: label.to_string(),
+            status: ToolCallStatus::Completed,
+            input: None,
+            output: None,
+            content: None,
+            locations: None,
+            meta: None,
+            images: Vec::new(),
+            raw_input: RawJsonAccumulator::default(),
+        }
+    }
+
+    /// Field case: a mid-turn parent with more tool calls than the numeric cap,
+    /// including delegation cards whose ids sort after the lexicographic prefix.
+    /// Those cards must still be in the projection, and the in-memory session
+    /// stays complete.
+    #[test]
+    fn snapshot_keeps_live_referenced_delegation_tools_past_the_count_cap() {
+        let mut s = fresh_state();
+        let mut refs = Vec::new();
+        for index in 0..160 {
+            let id = format!("call-{index:04x}");
+            // Indices 0..=2 are older than the newest 128 calls, so recency
+            // admission would drop them. They must still ship as delegation
+            // cards. The later ids are inside that window either way.
+            let label = if matches!(index, 0 | 140 | 159) {
+                "delegate_to_agent"
+            } else if index == 1 || index == 147 {
+                "continue_delegation"
+            } else if index == 2 || index == 151 {
+                "mcp__codeg-mcp__get_delegation_status"
+            } else {
+                "read_file"
+            };
+            let mut tool = snapshot_tool(&id, label);
+            if label == "delegate_to_agent" || label == "continue_delegation" {
+                tool.meta = Some(serde_json::json!({
+                    "codeg.delegation": {
+                        "child_conversation_id": 70 + (index as i32),
+                        "status": if index == 159 { "running" } else { "completed" }
+                    }
+                }));
+            }
+            refs.push(LiveContentBlock::ToolCallRef {
+                tool_call_id: id.clone(),
+            });
+            s.active_tool_calls.insert(id, tool);
+        }
+        // An unreferenced call must not displace a live ref once the numeric
+        // cap is exceeded by the refs themselves.
+        s.active_tool_calls.insert(
+            "call-zzzz-unreferenced".into(),
+            snapshot_tool("call-zzzz-unreferenced", "bash"),
+        );
+        s.live_message = Some(LiveMessage {
+            id: "live-many-tools".into(),
+            role: MessageRole::Assistant,
+            content: refs,
+            started_at: Utc::now(),
+        });
+
+        let limits = SnapshotLimits {
+            tool_calls: 128,
+            ..SnapshotLimits::default()
+        };
+        let snapshot = s.to_snapshot_with_limits(limits);
+        let projected: HashSet<&str> = snapshot
+            .active_tool_calls
+            .iter()
+            .map(|tool| tool.id.as_str())
+            .collect();
+
+        assert_eq!(s.active_tool_calls.len(), 161);
+        assert!(
+            projected.len() > 128,
+            "delegation cards outside the numeric cap must still be projected"
+        );
+        assert!(!projected.contains("call-zzzz-unreferenced"));
+        for index in [0, 1, 2, 140, 147, 151, 159] {
+            let id = format!("call-{index:04x}");
+            assert!(
+                projected.contains(id.as_str()),
+                "live ref {id} was dropped from the snapshot"
+            );
+        }
+        let running = snapshot
+            .active_tool_calls
+            .iter()
+            .find(|tool| tool.id == "call-009f")
+            .expect("running delegate_to_agent");
+        assert_eq!(
+            running.meta.as_ref().unwrap()["codeg.delegation"]["child_conversation_id"],
+            70 + 159
+        );
+        let truncation = snapshot.truncation.expect("older ordinary refs omitted");
+        assert!(truncation.omitted_tool_calls > 0);
+        assert!(
+            truncation.omitted_live_tool_refs > 0,
+            "ordinary refs past the numeric cap stay visible as a gap"
+        );
+        assert_eq!(truncation.omitted_live_tool_refs, 160 - projected.len());
+        let live_refs = snapshot
+            .live_message
+            .as_ref()
+            .unwrap()
+            .content
+            .iter()
+            .filter(|block| matches!(block, LiveContentBlock::ToolCallRef { .. }))
+            .count();
+        assert_eq!(live_refs, 160);
+    }
+
+    #[test]
+    fn snapshot_reports_omitted_live_refs_when_refs_exceed_the_frame_ceiling() {
+        let mut s = fresh_state();
+        let mut refs = Vec::new();
+        for index in 0..83 {
+            let id = format!("call-{index:04x}");
+            let label = if index >= 80 {
+                "delegate_to_agent"
+            } else {
+                "read_file"
+            };
+            refs.push(LiveContentBlock::ToolCallRef {
+                tool_call_id: id.clone(),
+            });
+            s.active_tool_calls
+                .insert(id.clone(), snapshot_tool(&id, label));
+        }
+        // Lexicographically first, so the old prefix would have kept it and
+        // dropped the late delegation ids.
+        s.live_message = Some(LiveMessage {
+            id: "live-ceiling".into(),
+            role: MessageRole::Assistant,
+            content: refs,
+            started_at: Utc::now(),
+        });
+        let limits = SnapshotLimits {
+            payload_bytes: 64 * 1024,
+            tool_calls: 4,
+            images: 4,
+            failures: 4,
+            watchdog_tombstones: 4,
+        };
+        let snapshot = s.to_snapshot_with_limits(limits);
+        let projected: HashSet<&str> = snapshot
+            .active_tool_calls
+            .iter()
+            .map(|tool| tool.id.as_str())
+            .collect();
+        assert!(projected.contains("call-0050"));
+        assert!(projected.contains("call-0051"));
+        assert!(projected.contains("call-0052"));
+        assert!(
+            !projected.contains("call-0000"),
+            "oldest non-delegation ref must yield to the ceiling"
+        );
+        assert!(projected.contains("call-004f"), "most recent read stays");
+        let truncation = snapshot.truncation.expect("ceiling reported");
+        assert!(truncation.omitted_live_tool_refs > 0);
+        assert_eq!(truncation.omitted_live_tool_refs, 83 - projected.len());
+        assert_eq!(s.active_tool_calls.len(), 83);
+    }
+
     fn serialized_snapshot_frame(snapshot: &LiveSessionSnapshot) -> Vec<u8> {
         serde_json::to_vec(&crate::web::ws_attach::ServerMsg::Snapshot {
             subscription_id: "subscription".into(),
@@ -6951,7 +7246,7 @@ mod tests {
             ToolCallState {
                 id: "tool-json".into(),
                 kind: ToolKind::Other,
-                label: "json shape".into(),
+                label: "delegate_to_agent".into(),
                 status: ToolCallStatus::InProgress,
                 input: Some(serde_json::json!({
                     "command": "ls",
@@ -6963,6 +7258,27 @@ mod tests {
                 meta: Some(serde_json::json!({
                     "codeg.delegation": { "child_connection_id": "child-1" }
                 })),
+                images: Vec::new(),
+                raw_input: RawJsonAccumulator::default(),
+            },
+        );
+        // Projected after live text. A huge turn must still leave truncated
+        // JSON as an object, not a string, once the text budget is spent.
+        s.active_tool_calls.insert(
+            "tool-json-deferred".into(),
+            ToolCallState {
+                id: "tool-json-deferred".into(),
+                kind: ToolKind::Other,
+                label: "json shape".into(),
+                status: ToolCallStatus::InProgress,
+                input: Some(serde_json::json!({
+                    "command": "cat",
+                    "args": ["README.md"],
+                })),
+                output: None,
+                content: None,
+                locations: Some(serde_json::json!({ "path": "README.md" })),
+                meta: Some(serde_json::json!({ "note": "keep-object" })),
                 images: Vec::new(),
                 raw_input: RawJsonAccumulator::default(),
             },
@@ -6980,10 +7296,31 @@ mod tests {
             .active_tool_calls
             .iter()
             .find(|tool| tool.id == "tool-json")
-            .expect("tool projected");
+            .expect("delegation tool projected");
         assert_projected_json_keeps_object_shape("input", tool.input.as_ref());
         assert_projected_json_keeps_object_shape("meta", tool.meta.as_ref());
         assert_projected_json_keeps_object_shape("locations", tool.locations.as_ref());
+        assert_eq!(
+            tool.meta
+                .as_ref()
+                .and_then(|meta| meta.pointer("/codeg.delegation/child_connection_id"))
+                .and_then(|value| value.as_str()),
+            Some("child-1"),
+            "delegation meta is projected before live text and must survive"
+        );
+        let deferred = snapshot
+            .active_tool_calls
+            .iter()
+            .find(|tool| tool.id == "tool-json-deferred")
+            .expect("deferred tool projected");
+        assert_projected_json_keeps_object_shape("deferred input", deferred.input.as_ref());
+        assert_projected_json_keeps_object_shape("deferred meta", deferred.meta.as_ref());
+        assert_projected_json_keeps_object_shape("deferred locations", deferred.locations.as_ref());
+        assert_eq!(
+            deferred.input.as_ref(),
+            Some(&serde_json::json!({ "truncated": true })),
+            "JSON projected after the live-text budget must stay an object marker"
+        );
         let plan_entries = snapshot
             .live_message
             .as_ref()

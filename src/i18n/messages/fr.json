@@ -3563,7 +3563,8 @@
         "waitingForSubagents": "En attente des sous-agents…",
         "backgroundContinuation": "Suite en arrière-plan",
         "loadOlderHistory": "Charger les messages précédents",
-        "loadBackgroundActivity": "Charger l'activité en arrière-plan"
+        "loadBackgroundActivity": "Charger l'activité en arrière-plan",
+        "snapshotOmittedToolCalls": "Cette vue en direct a omis {count} appels d'outil. Les messages enregistrés comblent ces trous."
       },
       "liveTurnStats": {
         "thinking": "Réflexion...",

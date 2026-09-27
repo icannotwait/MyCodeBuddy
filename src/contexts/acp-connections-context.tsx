@@ -386,6 +386,17 @@ export interface LiveMessage {
   role: "assistant" | "tool"
   content: LiveContentBlock[]
   startedAt: number
+  /**
+   * Active tool calls the attach snapshot did not include. `0` or absent
+   * when this message was not hydrated from a truncated snapshot.
+   */
+  snapshotOmittedToolCalls?: number
+  /**
+   * `tool_call_ref`s in that snapshot whose tool state was missing. Hydrate
+   * will not receive a follow-up `tool_call` for those ids, so the saved
+   * transcript has to fill them.
+   */
+  snapshotOmittedLiveToolRefs?: number
 }
 
 // ── Per-connection state ──
@@ -9395,9 +9406,7 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
               title,
               body: translate("notificationError", {
                 agent: agentLabel,
-                message:
-                  failure.title.trim() ||
-                  tFailure("category.unknown"),
+                message: failure.title.trim() || tFailure("category.unknown"),
               }),
               redactedBody: translate("notificationErrorRedacted", {
                 agent: agentLabel,
@@ -9406,7 +9415,9 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
           } else {
             void notifyDesktop("turn_complete", {
               title,
-              body: translate("notificationTurnComplete", { agent: agentLabel }),
+              body: translate("notificationTurnComplete", {
+                agent: agentLabel,
+              }),
             })
           }
           break
@@ -9484,7 +9495,10 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
           const noticeKind = sessionFailureNotice(stored, event.record)
           replaceShadow(upsertSessionFailure(table, event.record))
           if (!mayNotify || noticeKind == null || !conn) break
-          const headline = splitHeadline(event.record.title, event.record.details)
+          const headline = splitHeadline(
+            event.record.title,
+            event.record.details
+          )
           const title = translate("noticeTitle", {
             agent: getAgentLabel(conn.agentType),
             title:
@@ -9699,15 +9713,29 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
       const leftoverIds = options.leftoverRuntimeIds
       const shouldRecoverBackground =
         options.recoverBackgroundDetail || options.resetBackgroundTranscript
+      const omittedToolCalls =
+        patch.snapshotOmittedToolCalls ??
+        patch.liveMessage?.snapshotOmittedToolCalls ??
+        0
+      const omittedLiveRefs =
+        patch.snapshotOmittedLiveToolRefs ??
+        patch.liveMessage?.snapshotOmittedLiveToolRefs ??
+        0
+      // A live message that survived hydrate is not a reason to skip disk
+      // when the snapshot itself says tool calls were left out.
+      const snapshotToolGap =
+        patch.liveMessage != null &&
+        (omittedToolCalls > 0 || omittedLiveRefs > 0)
       const shouldRefetch =
         shouldRecoverBackground ||
+        snapshotToolGap ||
         (options.isInitialColdHydrate && leftoverIds.length > 0)
       if (!shouldRefetch && leftoverIds.length === 0) return
 
       const refetchIds = new Set<number>(
         options.isInitialColdHydrate ? leftoverIds : []
       )
-      if (shouldRecoverBackground) {
+      if (shouldRecoverBackground || snapshotToolGap) {
         const backgroundId = resolveBackgroundHydrateConversationId(patch)
         if (backgroundId != null) refetchIds.add(backgroundId)
       }
@@ -9800,10 +9828,7 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
           // at all.
           flushStreamingQueue(contextKey)
           const rawPatch = denormalizeSnapshot(snapshot)
-          const patch = presentSnapshotPatchRef.current(
-            contextKey,
-            rawPatch
-          )
+          const patch = presentSnapshotPatchRef.current(contextKey, rawPatch)
           const detailRevision = patch.backgroundDetailRevision ?? 0
           const transcriptGeneration = patch.backgroundTranscriptGeneration ?? 0
           const recoverBackgroundDetail =

@@ -3563,7 +3563,8 @@
         "waitingForSubagents": "サブエージェントを待機中…",
         "backgroundContinuation": "バックグラウンド継続",
         "loadOlderHistory": "以前のメッセージを読み込む",
-        "loadBackgroundActivity": "バックグラウンドの動作を読み込む"
+        "loadBackgroundActivity": "バックグラウンドの動作を読み込む",
+        "snapshotOmittedToolCalls": "このライブ表示ではツール呼び出しが {count} 件省略されています。保存済みのメッセージで不足分を補います。"
       },
       "liveTurnStats": {
         "thinking": "考え中...",
