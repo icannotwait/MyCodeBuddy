@@ -988,7 +988,10 @@ pub fn navigate_core(
     let surface = surface_of(registry, tab_id)?;
     let current = registry.state(tab_id);
     // A document guest shows one file; it is not an address bar.
-    if current.as_ref().is_some_and(|state| state.kind == TabKind::Document) {
+    if current
+        .as_ref()
+        .is_some_and(|state| state.kind == TabKind::Document)
+    {
         return Err(AppCommandError::invalid_input(
             "a document view cannot be navigated to another address",
         ));
@@ -2964,7 +2967,11 @@ pub async fn pick_element_core(
     tab_id: &str,
 ) -> Result<handoff::PageHandoff, AppCommandError> {
     let Some((surface, generation, profile)) = registry.read(tab_id, |tab| {
-        (tab.surface.clone(), tab.generation, tab.state.profile.clone())
+        (
+            tab.surface.clone(),
+            tab.generation,
+            tab.state.profile.clone(),
+        )
     }) else {
         return Err(AppCommandError::not_found(format!(
             "browser tab {tab_id} not found"
@@ -3006,7 +3013,8 @@ pub async fn pick_element_core(
     };
     // Everything below says where the page is — the block, the link, the
     // picture — and says it as the agent's host knows it (a remote tab).
-    picked.href = crate::browser::remote::host_address(profile.as_deref(), &picked.href).into_owned();
+    picked.href =
+        crate::browser::remote::host_address(profile.as_deref(), &picked.href).into_owned();
     let text = handoff::render_element(&picked);
     let (url, _) = handoff::redact_url(&picked.href);
     // A picture of the element, when it has a box on screen and the page said
@@ -3110,7 +3118,11 @@ pub async fn capture_page_core(
     tab_id: &str,
 ) -> Result<handoff::PageHandoff, AppCommandError> {
     let Some((surface, title, profile)) = registry.read(tab_id, |tab| {
-        (tab.surface.clone(), tab.state.title.clone(), tab.state.profile.clone())
+        (
+            tab.surface.clone(),
+            tab.state.title.clone(),
+            tab.state.profile.clone(),
+        )
     }) else {
         return Err(AppCommandError::not_found(format!(
             "browser tab {tab_id} not found"
@@ -3170,14 +3182,25 @@ pub fn page_console_core(
             limit: Some(crate::browser::console::CONSOLE_RING_CAPACITY),
         };
         let readout = tab.console.read(&query, &tab.state.url, |_| true);
-        (tab.state.url.clone(), readout.entries, readout.dropped, tab.state.profile.clone())
+        (
+            tab.state.url.clone(),
+            readout.entries,
+            readout.dropped,
+            tab.state.profile.clone(),
+        )
     });
     let Some((url, entries, dropped, profile)) = answer else {
         return Err(AppCommandError::not_found(format!(
             "browser tab {tab_id} not found"
         )));
     };
-    Ok(console_handoff(profile.as_deref(), &url, entries, dropped, errors_only))
+    Ok(console_handoff(
+        profile.as_deref(),
+        &url,
+        entries,
+        dropped,
+        errors_only,
+    ))
 }
 
 /// The console lines a tab of `profile` read out, as the block that goes to
@@ -4191,18 +4214,26 @@ mod tests {
     #[test]
     fn a_tab_goes_into_the_profile_asked_for_or_its_connection_s() {
         let ok = || Ok(());
-        assert_eq!(open_tab_profile(None, None, ok).unwrap(), TabProfile::Named("default".into()));
+        assert_eq!(
+            open_tab_profile(None, None, ok).unwrap(),
+            TabProfile::Named("default".into())
+        );
         assert_eq!(
             open_tab_profile(Some("p-abc".into()), None, ok).unwrap(),
             TabProfile::Named("p-abc".into())
         );
         // The connection decides, whatever profile came along with it.
-        assert_eq!(open_tab_profile(Some("p-abc".into()), Some(4), ok).unwrap(), TabProfile::Remote(4));
+        assert_eq!(
+            open_tab_profile(Some("p-abc".into()), Some(4), ok).unwrap(),
+            TabProfile::Remote(4)
+        );
         // A remote profile is never named from outside: only its connection
         // opens it, after its egress is in place.
         assert!(open_tab_profile(Some("remote-4".into()), None, ok).is_err());
         // An open refused anyway is refused before anything is started.
-        let refused = open_tab_profile(None, Some(4), || Err(AppCommandError::invalid_input("bad url")));
+        let refused = open_tab_profile(None, Some(4), || {
+            Err(AppCommandError::invalid_input("bad url"))
+        });
         assert_eq!(refused.unwrap_err().message, "bad url");
     }
 
@@ -4444,15 +4475,23 @@ mod tests {
 
         let remote = console_handoff(Some("remote-7"), page, entries.clone(), 0, true);
         assert_eq!(remote.url, "http://localhost:3000/app?token=REDACTED");
-        assert!(remote.text.contains("- page: http://localhost:3000/app?token=REDACTED\n"));
-        assert!(remote.text.contains("(http://localhost:3000/src/main.js:12:5)"));
-        assert!(remote.text.contains("(https://cdn.example.com/lib.js:12:5)"));
+        assert!(remote
+            .text
+            .contains("- page: http://localhost:3000/app?token=REDACTED\n"));
+        assert!(remote
+            .text
+            .contains("(http://localhost:3000/src/main.js:12:5)"));
+        assert!(remote
+            .text
+            .contains("(https://cdn.example.com/lib.js:12:5)"));
         assert!(!remote.text.contains("remote.localhost"), "{}", remote.text);
         assert_eq!(remote.count, 2);
 
         let local = console_handoff(Some("default"), page, entries, 0, true);
         assert_eq!(local.url, "http://remote.localhost:3000/app?token=REDACTED");
-        assert!(local.text.contains("(http://remote.localhost:3000/src/main.js:12:5)"));
+        assert!(local
+            .text
+            .contains("(http://remote.localhost:3000/src/main.js:12:5)"));
     }
 
     #[test]

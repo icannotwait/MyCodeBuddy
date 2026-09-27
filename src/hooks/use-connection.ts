@@ -30,6 +30,7 @@ import type {
   AsyncTaskRecord,
   SessionFailureRecord,
   SessionModeStateInfo,
+  SnapshotTruncation,
   PromptInputBlock,
   PromptEnqueueResult,
 } from "@/lib/types"
@@ -93,6 +94,8 @@ export interface UseConnectionReturn {
    *  (see `lib/async-tasks.ts`). Retained after they settle; the strip filters
    *  to the live ones. `[]` when the connection has none. */
   asyncTasks: AsyncTaskRecord[]
+  /** Omission counts from the latest accepted snapshot. `null` until one arrives. */
+  snapshotTruncation: SnapshotTruncation | null
   error: string | null
   loadError: string | null
   loadErrorCode: string | null
@@ -303,6 +306,7 @@ export function useConnection(contextKey: string): UseConnectionReturn {
   const claudeApiRetry = connection?.claudeApiRetry ?? null
   const sessionFailures = connection?.sessionFailures ?? EMPTY_SESSION_FAILURES
   const asyncTasks = connection?.asyncTasks ?? EMPTY_ASYNC_TASKS
+  const snapshotTruncation = connection?.snapshotTruncation ?? null
   const error = connection?.error ?? null
   const loadError = connection?.loadError ?? null
   const loadErrorCode = connection?.loadErrorCode ?? null
@@ -428,6 +432,7 @@ export function useConnection(contextKey: string): UseConnectionReturn {
       claudeApiRetry,
       sessionFailures,
       asyncTasks,
+      snapshotTruncation,
       error,
       loadError,
       loadErrorCode,
@@ -476,6 +481,7 @@ export function useConnection(contextKey: string): UseConnectionReturn {
       claudeApiRetry,
       sessionFailures,
       asyncTasks,
+      snapshotTruncation,
       error,
       loadError,
       loadErrorCode,

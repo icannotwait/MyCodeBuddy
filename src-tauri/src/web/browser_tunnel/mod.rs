@@ -44,7 +44,11 @@ pub async fn ws_handler(
 ) -> Response {
     let policy = TunnelPolicy::current();
     if policy == TunnelPolicy::Off {
-        return (StatusCode::FORBIDDEN, "the browser tunnel is off on this server").into_response();
+        return (
+            StatusCode::FORBIDDEN,
+            "the browser tunnel is off on this server",
+        )
+            .into_response();
     }
     ws.protocols([TUNNEL_PROTOCOL])
         .on_upgrade(move |socket| session(socket, policy, shutdown))
@@ -58,7 +62,11 @@ async fn session(socket: WebSocket, policy: TunnelPolicy, shutdown: Arc<Shutdown
     let (frames, mut outgoing) = mpsc::channel::<Frame>(OUTGOING_QUEUE);
     let writer = tokio::spawn(async move {
         while let Some(frame) = outgoing.recv().await {
-            if sink.send(Message::Binary(frame.encode().into())).await.is_err() {
+            if sink
+                .send(Message::Binary(frame.encode().into()))
+                .await
+                .is_err()
+            {
                 break;
             }
         }
@@ -178,7 +186,13 @@ async fn open_stream(
         }
         Some(Err((code, message))) => {
             tracing::debug!("[browser-tunnel] stream {id} to {host}:{port}: {message}");
-            let _ = frames.send(Frame::Close { stream: id, code, message }).await;
+            let _ = frames
+                .send(Frame::Close {
+                    stream: id,
+                    code,
+                    message,
+                })
+                .await;
         }
         None => {}
     }

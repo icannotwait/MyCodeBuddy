@@ -263,9 +263,11 @@ pub(crate) fn add_no_proxy_to_launch_env(
     merged: &mut BTreeMap<String, String>,
     inherited: &[(String, String)],
 ) {
-    let carries_proxy = PROXY_ENV_KEYS
-        .iter()
-        .any(|key| merged.get(*key).is_some_and(|value| !value.trim().is_empty()));
+    let carries_proxy = PROXY_ENV_KEYS.iter().any(|key| {
+        merged
+            .get(*key)
+            .is_some_and(|value| !value.trim().is_empty())
+    });
     if !carries_proxy {
         return;
     }
@@ -408,7 +410,11 @@ mod tests {
         for proxy_key in ["HTTP_PROXY", "https_proxy", "ALL_PROXY"] {
             let mut merged = launch_env(&[(proxy_key, "http://10.0.0.2:3128")]);
             add_no_proxy_to_launch_env(&mut merged, &[]);
-            assert_eq!(no_proxy_pair(&merged), (Some(LOOPBACK), Some(LOOPBACK)), "{proxy_key}");
+            assert_eq!(
+                no_proxy_pair(&merged),
+                (Some(LOOPBACK), Some(LOOPBACK)),
+                "{proxy_key}"
+            );
         }
     }
 

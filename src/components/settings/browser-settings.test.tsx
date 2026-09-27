@@ -499,7 +499,9 @@ describe("BrowserSettings", () => {
     expect(
       await screen.findByText("Using http://127.0.0.1:7890")
     ).toBeInTheDocument()
-    expect(screen.queryByText(/Restart codeg/)).not.toBeInTheDocument()
+    expect(
+      screen.queryByText(/Restart MyCodeBuddy for browser tabs/)
+    ).not.toBeInTheDocument()
   })
 
   it("explains when the proxy needs a restart or is not usable", async () => {
@@ -514,7 +516,9 @@ describe("BrowserSettings", () => {
     expect(
       await screen.findByText("Using socks5://10.0.0.1:1080")
     ).toBeInTheDocument()
-    expect(screen.getByText(/Restart codeg/)).toBeInTheDocument()
+    expect(
+      screen.getByText(/Restart MyCodeBuddy for browser tabs/)
+    ).toBeInTheDocument()
     unmount()
 
     mocks.browserCapabilitiesNow.mockResolvedValue(

@@ -841,11 +841,11 @@ describe("LiveTranscriptRow", () => {
     ])
     renderRow()
     expect(
-      screen.getByText(
-        "The image preview was not included in this snapshot."
-      )
+      screen.getByText("The image preview was not included in this snapshot.")
     ).toBeInTheDocument()
-    expect(screen.queryByText("Image generation failed")).not.toBeInTheDocument()
+    expect(
+      screen.queryByText("Image generation failed")
+    ).not.toBeInTheDocument()
     expect(
       screen.queryByRole("button", { name: "Download image" })
     ).not.toBeInTheDocument()
@@ -868,12 +868,12 @@ describe("LiveTranscriptRow", () => {
     ])
     renderRow()
     expect(
-      screen.getByText(
-        "The image preview was not included in this snapshot."
-      )
+      screen.getByText("The image preview was not included in this snapshot.")
     ).toBeInTheDocument()
     expect(screen.queryByText("Generating image…")).not.toBeInTheDocument()
-    expect(screen.queryByText("Image generation failed")).not.toBeInTheDocument()
+    expect(
+      screen.queryByText("Image generation failed")
+    ).not.toBeInTheDocument()
   })
 
   it("still treats a completed empty image without the sentinel as a failure", () => {
@@ -887,9 +887,7 @@ describe("LiveTranscriptRow", () => {
     renderRow()
     expect(screen.getByText("Image generation failed")).toBeInTheDocument()
     expect(
-      screen.queryByText(
-        "The image preview was not included in this snapshot."
-      )
+      screen.queryByText("The image preview was not included in this snapshot.")
     ).not.toBeInTheDocument()
   })
 })

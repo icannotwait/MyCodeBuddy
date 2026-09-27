@@ -697,12 +697,12 @@ describe("FileWorkspaceTabBar — the add-tab '+'", () => {
   // to a remote codeg-server runs its terminals on that host.
   it("does not offer this computer's servers in a remote workspace window", async () => {
     remoteDesktop = true
-    mocks.browserListServices.mockResolvedValue([
+    browserMocks.browserListServices.mockResolvedValue([
       detectedService("http://localhost:5173/"),
     ])
     renderStrip()
     await openAddMenu()
-    expect(mocks.browserListServices).not.toHaveBeenCalled()
+    expect(browserMocks.browserListServices).not.toHaveBeenCalled()
     expect(screen.queryByText("Local servers")).toBeNull()
   })
 

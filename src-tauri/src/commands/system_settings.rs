@@ -1275,7 +1275,10 @@ mod tests {
         for blank in ["", " , ;\n", "，、 "] {
             let normalized =
                 normalize_proxy_settings(enabled_proxy_bypassing(blank)).expect("blank is valid");
-            assert_eq!(normalized.no_proxy, None, "{blank:?} leaves nothing to store");
+            assert_eq!(
+                normalized.no_proxy, None,
+                "{blank:?} leaves nothing to store"
+            );
         }
     }
 

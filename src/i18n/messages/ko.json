@@ -3154,6 +3154,8 @@
         "configOptionAdjusted": "{agent}이(가) {option}을(를) {requested} 대신 {actual}(으)로 설정했습니다",
         "desktopDeliveryNegotiateFailed": "Could not negotiate desktop event delivery. Restart the application.",
         "desktopDeliverySubscribeFailed": "Failed to subscribe to desktop ACP events. Restart the application.",
+        "eventErrorTitle": "Event delivery failed",
+        "agentsSetupHint": "Install it in Agents settings, then connect again.",
         "desktopDeliveryFailedRestart": "Desktop event delivery failed. Restart the application to continue — reloading the conversation is not enough.",
         "noticeTitle": "{agent}: {title}"
       },

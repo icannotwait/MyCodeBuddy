@@ -950,8 +950,7 @@ mod tests {
         // The reloadable filter, not a bare `EnvFilter`: the real stack's first
         // layer is a `reload::Layer`, and a per-layer filter beneath one is the
         // combination this test exists to pin.
-        let (reloadable, _handle) =
-            reload::Layer::new(EnvFilter::builder().parse_lossy("trace"));
+        let (reloadable, _handle) = reload::Layer::new(EnvFilter::builder().parse_lossy("trace"));
         let subscriber = Registry::default()
             .with(reloadable)
             .with(filter_fn(|meta| !is_credential_dump_target(meta.target())))
@@ -1004,7 +1003,11 @@ mod tests {
         let rendered = EnvFilter::builder()
             .parse_lossy(env_override_directives("debug"))
             .to_string();
-        for pin in ["kill_tree=warn", "agent_client_protocol=warn", "sqlx::query=warn"] {
+        for pin in [
+            "kill_tree=warn",
+            "agent_client_protocol=warn",
+            "sqlx::query=warn",
+        ] {
             assert!(
                 rendered.contains(pin),
                 "{pin} clamp must survive a global debug override: {rendered}"
@@ -1070,31 +1073,50 @@ mod tests {
         // ...but the same target asking for MORE is still refused: that is the
         // firehose this whole clamp exists to keep shut.
         assert!(
-            env_override_directives("agent_client_protocol=trace").contains("agent_client_protocol=warn"),
+            env_override_directives("agent_client_protocol=trace")
+                .contains("agent_client_protocol=warn"),
             "a crate-wide trace request must still be clamped"
         );
         // A compound expression's bare level is the ceiling for targets it
         // doesn't name.
         let compound = env_override_directives("off,codeg_lib::acp=trace");
         assert!(compound.contains("agent_client_protocol=off"), "{compound}");
-        assert!(!compound.contains("agent_client_protocol=warn"), "{compound}");
+        assert!(
+            !compound.contains("agent_client_protocol=warn"),
+            "{compound}"
+        );
         let error_compound = env_override_directives("error,codeg_lib::acp=info");
-        assert!(error_compound.contains("agent_client_protocol=error"), "{error_compound}");
-        assert!(!error_compound.contains("agent_client_protocol=warn"), "{error_compound}");
+        assert!(
+            error_compound.contains("agent_client_protocol=error"),
+            "{error_compound}"
+        );
+        assert!(
+            !error_compound.contains("agent_client_protocol=warn"),
+            "{error_compound}"
+        );
         // No bare level at all: EnvFilter leaves unmatched targets disabled, so a
         // ceiling of `off` is the honest answer — emitting `warn` here would turn
         // agent_client_protocol ON in an expression that never asked for it.
         let targeted = env_override_directives("codeg_lib::acp=info");
         assert!(targeted.contains("agent_client_protocol=off"), "{targeted}");
-        assert!(!targeted.contains("agent_client_protocol=warn"), "{targeted}");
+        assert!(
+            !targeted.contains("agent_client_protocol=warn"),
+            "{targeted}"
+        );
     }
 
     #[test]
     fn env_level_for_target_resolves_like_env_filter_would() {
         // Exact target beats the global, and the last exact wins.
-        assert_eq!(env_level_for_target("info,agent_client_protocol=off", "agent_client_protocol"), LogLevel::Off);
         assert_eq!(
-            env_level_for_target("agent_client_protocol=warn,agent_client_protocol=debug", "agent_client_protocol"),
+            env_level_for_target("info,agent_client_protocol=off", "agent_client_protocol"),
+            LogLevel::Off
+        );
+        assert_eq!(
+            env_level_for_target(
+                "agent_client_protocol=warn,agent_client_protocol=debug",
+                "agent_client_protocol"
+            ),
             LogLevel::Debug
         );
         // A later but BROADER directive can't displace a narrower earlier one.
@@ -1110,24 +1132,39 @@ mod tests {
         // A MORE specific target doesn't either — EnvFilter prefers it for events
         // beneath it, which is the escape hatch.
         assert_eq!(
-            env_level_for_target("info,agent_client_protocol::jsonrpc=trace", "agent_client_protocol"),
+            env_level_for_target(
+                "info,agent_client_protocol::jsonrpc=trace",
+                "agent_client_protocol"
+            ),
             LogLevel::Info
         );
         // Span/field syntax falls through to the global by design.
         assert_eq!(
-            env_level_for_target("info,agent_client_protocol[span]=trace", "agent_client_protocol"),
+            env_level_for_target(
+                "info,agent_client_protocol[span]=trace",
+                "agent_client_protocol"
+            ),
             LogLevel::Info
         );
         // Nothing applicable at all ⇒ off, not unbounded.
-        assert_eq!(env_level_for_target("other=trace", "agent_client_protocol"), LogLevel::Off);
-        assert_eq!(env_level_for_target("", "agent_client_protocol"), LogLevel::Off);
+        assert_eq!(
+            env_level_for_target("other=trace", "agent_client_protocol"),
+            LogLevel::Off
+        );
+        assert_eq!(
+            env_level_for_target("", "agent_client_protocol"),
+            LogLevel::Off
+        );
         // Case is tolerated in a level.
         assert_eq!(
             env_level_for_target("INFO,agent_client_protocol=WARN", "agent_client_protocol"),
             LogLevel::Warn
         );
         // Malformed `=level` is dropped, like `parse_lossy` does.
-        assert_eq!(env_level_for_target("=info", "agent_client_protocol"), LogLevel::Off);
+        assert_eq!(
+            env_level_for_target("=info", "agent_client_protocol"),
+            LogLevel::Off
+        );
     }
 
     /// `EnvFilter` normalizes whitespace NOWHERE: `Directive::parse` walks
@@ -1141,7 +1178,11 @@ mod tests {
     /// drift apart silently.
     #[test]
     fn padded_directives_are_inert_to_both_the_filter_and_the_ceiling() {
-        for expr in ["info ,agent_client_protocol =off", " info,agent_client_protocol = off", "info , agent_client_protocol=off"] {
+        for expr in [
+            "info ,agent_client_protocol =off",
+            " info,agent_client_protocol = off",
+            "info , agent_client_protocol=off",
+        ] {
             let level = env_level_for_target(expr, "agent_client_protocol");
             assert_eq!(
                 level,
@@ -1182,14 +1223,26 @@ mod tests {
         );
         let rendered = env_override_directives("off,agent_client_protocol=bogus");
         assert!(rendered.contains("agent_client_protocol=off"), "{rendered}");
-        assert!(!rendered.contains("agent_client_protocol=warn"), "{rendered}");
+        assert!(
+            !rendered.contains("agent_client_protocol=warn"),
+            "{rendered}"
+        );
 
         // Numeric spellings go through `usize` in `LevelFilter::from_str`, so
         // these are levels, not garbage — and `00` is `off`, not `trace`.
-        assert_eq!(env_level_for_target("agent_client_protocol=00", "agent_client_protocol"), LogLevel::Off);
-        assert_eq!(env_level_for_target("agent_client_protocol=005", "agent_client_protocol"), LogLevel::Trace);
+        assert_eq!(
+            env_level_for_target("agent_client_protocol=00", "agent_client_protocol"),
+            LogLevel::Off
+        );
+        assert_eq!(
+            env_level_for_target("agent_client_protocol=005", "agent_client_protocol"),
+            LogLevel::Trace
+        );
         // Out-of-range numbers are invalid, so that directive drops.
-        assert_eq!(env_level_for_target("off,agent_client_protocol=9", "agent_client_protocol"), LogLevel::Off);
+        assert_eq!(
+            env_level_for_target("off,agent_client_protocol=9", "agent_client_protocol"),
+            LogLevel::Off
+        );
         // A padded level is invalid to `LevelFilter::from_str`, so it drops too.
         assert_eq!(
             env_level_for_target("off,agent_client_protocol= warn", "agent_client_protocol"),
@@ -1203,14 +1256,29 @@ mod tests {
     #[test]
     fn env_level_for_target_understands_every_directive_form() {
         // Numeric levels (`LevelFilter::from_str`): 0=off .. 5=trace.
-        assert_eq!(env_level_for_target("5", "agent_client_protocol"), LogLevel::Trace);
-        assert_eq!(env_level_for_target("0", "agent_client_protocol"), LogLevel::Off);
-        assert_eq!(env_level_for_target("agent_client_protocol=2", "agent_client_protocol"), LogLevel::Warn);
+        assert_eq!(
+            env_level_for_target("5", "agent_client_protocol"),
+            LogLevel::Trace
+        );
+        assert_eq!(
+            env_level_for_target("0", "agent_client_protocol"),
+            LogLevel::Off
+        );
+        assert_eq!(
+            env_level_for_target("agent_client_protocol=2", "agent_client_protocol"),
+            LogLevel::Warn
+        );
         // A bare target with no level means TRACE for it (directive.rs:163).
-        assert_eq!(env_level_for_target("agent_client_protocol", "agent_client_protocol"), LogLevel::Trace);
+        assert_eq!(
+            env_level_for_target("agent_client_protocol", "agent_client_protocol"),
+            LogLevel::Trace
+        );
         // So does `target=` with the level omitted (directive.rs:203) — NOT the
         // `ERROR` that `LevelFilter::from_str("")` alone would give.
-        assert_eq!(env_level_for_target("agent_client_protocol=", "agent_client_protocol"), LogLevel::Trace);
+        assert_eq!(
+            env_level_for_target("agent_client_protocol=", "agent_client_protocol"),
+            LogLevel::Trace
+        );
 
         // EnvFilter matches targets by raw `starts_with`, so a shorter directive
         // target also governs longer ones: `tungstenite=off` covers
@@ -1232,7 +1300,12 @@ mod tests {
         );
 
         // And the clamp still refuses "louder" for each of these forms.
-        for expr in ["agent_client_protocol", "agent_client_protocol=", "agent_client_protocol=5", "5"] {
+        for expr in [
+            "agent_client_protocol",
+            "agent_client_protocol=",
+            "agent_client_protocol=5",
+            "5",
+        ] {
             assert!(
                 env_override_directives(expr).contains("agent_client_protocol=warn"),
                 "{expr} must still be clamped to warn"
@@ -1253,7 +1326,10 @@ mod tests {
         })
         .to_string();
         assert!(rendered.contains("agent_client_protocol=off"), "{rendered}");
-        assert!(!rendered.contains("agent_client_protocol=warn"), "{rendered}");
+        assert!(
+            !rendered.contains("agent_client_protocol=warn"),
+            "{rendered}"
+        );
     }
 
     #[test]
@@ -1287,8 +1363,14 @@ mod tests {
         let rendered = EnvFilter::builder()
             .parse_lossy(env_override_directives("agent_client_protocol=trace"))
             .to_string();
-        assert!(rendered.contains("agent_client_protocol=warn"), "{rendered}");
-        assert!(!rendered.contains("agent_client_protocol=trace"), "{rendered}");
+        assert!(
+            rendered.contains("agent_client_protocol=warn"),
+            "{rendered}"
+        );
+        assert!(
+            !rendered.contains("agent_client_protocol=trace"),
+            "{rendered}"
+        );
     }
 
     #[test]

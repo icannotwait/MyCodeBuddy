@@ -190,7 +190,11 @@ impl BridgeConfig {
             bind_host: bind_host.to_string(),
             // A hostname-addressed bridge binds nothing, so it claims no pool
             // either — including the default one nobody asked for.
-            ports: if host_pattern.is_some() { Vec::new() } else { ports },
+            ports: if host_pattern.is_some() {
+                Vec::new()
+            } else {
+                ports
+            },
             public_host,
             host_pattern,
             reserved: vec![codeg_port],
@@ -312,7 +316,9 @@ fn is_hostname(host: &str) -> bool {
                 && label.len() <= 63
                 && !label.starts_with('-')
                 && !label.ends_with('-')
-                && label.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+                && label
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'-')
         })
 }
 
@@ -562,8 +568,7 @@ static HOST_MODE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool:
 /// Whether this process has ever handed out a bridge hostname. Never goes
 /// back to false: those names stay refused after the bridge is switched off
 /// or pointed somewhere else, which is the whole point of `BRIDGE.minted`.
-static NAMES_HANDED_OUT: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
+static NAMES_HANDED_OUT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Set (or, with `None`, switch off) the bridge. Switching off closes every
 /// listener; changing the configuration keeps the listeners already bound.
@@ -625,7 +630,14 @@ pub async fn open(
         return Err(BridgeError::Reserved(target_port));
     }
     if let Some(pattern) = &config.host_pattern {
-        return open_by_host(&config, pattern, target_port, tab_id, workbench_host, generation);
+        return open_by_host(
+            &config,
+            pattern,
+            target_port,
+            tab_id,
+            workbench_host,
+            generation,
+        );
     }
     if let Some(existing) = lock(&BRIDGE.listeners).get(&target_port).cloned() {
         return Ok(existing.grant(tab_id, config.public_host.clone(), None));
@@ -914,8 +926,7 @@ fn unclaimed_is_the_bridges(
     names.iter().any(|name| {
         minted.contains(name)
             || pattern.is_some_and(|pattern| {
-                matches!(pattern, HostPattern::Template { .. })
-                    && pattern.target_of(name).is_some()
+                matches!(pattern, HostPattern::Template { .. }) && pattern.target_of(name).is_some()
             })
     })
 }
@@ -1461,14 +1472,7 @@ fn addressed_authority(headers: &HeaderMap, trust_forwarded: bool) -> Option<Str
     };
     match forwarded {
         Some(host) => Some(host.to_string()),
-        None => Some(
-            headers
-                .get(header::HOST)?
-                .to_str()
-                .ok()?
-                .trim()
-                .to_string(),
-        ),
+        None => Some(headers.get(header::HOST)?.to_str().ok()?.trim().to_string()),
     }
 }
 
@@ -1947,11 +1951,20 @@ mod tests {
         let auto = HostPattern::Subdomain;
         let template = HostPattern::parse("p{port}-codeg.example.com").unwrap();
 
-        assert_eq!(auto.render(3000, "codeg.example.com").as_deref(), Some("3000.codeg.example.com"));
-        assert_eq!(auto.render(3000, "LOCALHOST").as_deref(), Some("3000.localhost"));
+        assert_eq!(
+            auto.render(3000, "codeg.example.com").as_deref(),
+            Some("3000.codeg.example.com")
+        );
+        assert_eq!(
+            auto.render(3000, "LOCALHOST").as_deref(),
+            Some("3000.localhost")
+        );
         assert_eq!(auto.target_of("3000.codeg.example.com"), Some(3000));
         assert_eq!(auto.target_of("3000.LOCALHOST"), Some(3000));
-        assert_eq!(template.render(5173, "ignored").as_deref(), Some("p5173-codeg.example.com"));
+        assert_eq!(
+            template.render(5173, "ignored").as_deref(),
+            Some("p5173-codeg.example.com")
+        );
         assert_eq!(template.target_of("p5173-codeg.example.com"), Some(5173));
 
         // `auto` has nothing to build on: an address is not a name, and a
@@ -1968,7 +1981,10 @@ mod tests {
         assert_eq!(template.target_of("codeg.example.com"), None);
         assert_eq!(template.target_of("p-codeg.example.com"), None);
         // Neither is a near miss, in either direction.
-        assert_eq!(template.target_of("p5173-codeg.example.com.evil.test"), None);
+        assert_eq!(
+            template.target_of("p5173-codeg.example.com.evil.test"),
+            None
+        );
         assert_eq!(template.target_of("evil.p5173-codeg.example.com"), None);
         assert_eq!(auto.target_of("3000"), None);
         assert_eq!(auto.target_of("3000."), None);
@@ -1984,8 +2000,14 @@ mod tests {
 
     #[test]
     fn a_hostname_is_read_out_of_the_authority() {
-        assert_eq!(hostname_of("3000.codeg.example:8080").as_deref(), Some("3000.codeg.example"));
-        assert_eq!(hostname_of(" 3000.Codeg.Example ").as_deref(), Some("3000.codeg.example"));
+        assert_eq!(
+            hostname_of("3000.codeg.example:8080").as_deref(),
+            Some("3000.codeg.example")
+        );
+        assert_eq!(
+            hostname_of(" 3000.Codeg.Example ").as_deref(),
+            Some("3000.codeg.example")
+        );
         // Addresses are not names — `3000.` in front of one names nothing.
         assert_eq!(hostname_of("[::1]:3080"), None);
         assert_eq!(hostname_of("127.0.0.1:3080"), None);
@@ -2008,7 +2030,10 @@ mod tests {
         let hosts = config(None, Some("auto")).unwrap();
         assert!(hosts.ports.is_empty());
         assert_eq!(hosts.host_pattern, Some(HostPattern::Subdomain));
-        assert!(config(Some("3081-3090"), Some("auto")).unwrap().ports.is_empty());
+        assert!(config(Some("3081-3090"), Some("auto"))
+            .unwrap()
+            .ports
+            .is_empty());
         // An empty pattern is no pattern.
         assert_eq!(config(None, Some("   ")).unwrap().host_pattern, None);
         // Either switch turns the bridge off, and an unreadable value in
@@ -2027,31 +2052,41 @@ mod tests {
             }
             builder.body(Body::empty()).unwrap()
         };
-        let direct = |pairs: &[(&str, &'static str)]| {
-            addressed_hostnames(&request(pairs, "/x"), false)
-        };
-        let proxied = |pairs: &[(&str, &'static str)]| {
-            addressed_hostnames(&request(pairs, "/x"), true)
-        };
+        let direct =
+            |pairs: &[(&str, &'static str)]| addressed_hostnames(&request(pairs, "/x"), false);
+        let proxied =
+            |pairs: &[(&str, &'static str)]| addressed_hostnames(&request(pairs, "/x"), true);
 
-        assert_eq!(direct(&[("host", "3000.Codeg.Test:8080")]), ["3000.codeg.test"]);
+        assert_eq!(
+            direct(&[("host", "3000.Codeg.Test:8080")]),
+            ["3000.codeg.test"]
+        );
         // A forwarding header a page added to its own request does not
         // replace the `Host` it cannot drop — both are read, so naming the
         // workbench in one cannot carry the request off the bridge.
         assert_eq!(
-            proxied(&[("host", "3000.codeg.test"), ("x-forwarded-host", "codeg.test")]),
+            proxied(&[
+                ("host", "3000.codeg.test"),
+                ("x-forwarded-host", "codeg.test")
+            ]),
             ["3000.codeg.test", "codeg.test"]
         );
         // A proxy that appends rather than replaces, and one that sends the
         // header twice: every value counts.
         assert_eq!(
-            proxied(&[("host", "codeg:3080"), ("x-forwarded-host", "evil.test, 3000.codeg.test")]),
+            proxied(&[
+                ("host", "codeg:3080"),
+                ("x-forwarded-host", "evil.test, 3000.codeg.test")
+            ]),
             ["codeg", "evil.test", "3000.codeg.test"]
         );
         // Without a declared proxy in front, forwarding headers are nobody's
         // word for anything.
         assert_eq!(
-            direct(&[("host", "3000.codeg.test"), ("x-forwarded-host", "codeg.test")]),
+            direct(&[
+                ("host", "3000.codeg.test"),
+                ("x-forwarded-host", "codeg.test")
+            ]),
             ["3000.codeg.test"]
         );
         // HTTP/2 carries the authority in the request line, with no `Host`
@@ -2084,29 +2119,65 @@ mod tests {
 
         // A wildcard the operator handed over: the bridge answers for every
         // name under it, open target or not, handed out or not.
-        assert!(unclaimed_is_the_bridges(Some(&template), &names(&["3000.preview.example.com"]), &none));
+        assert!(unclaimed_is_the_bridges(
+            Some(&template),
+            &names(&["3000.preview.example.com"]),
+            &none
+        ));
         assert!(unclaimed_is_the_bridges(
             Some(&template),
             &names(&["codeg.example.com", "3000.preview.example.com"]),
             &none
         ));
-        assert!(!unclaimed_is_the_bridges(Some(&template), &names(&["codeg.example.com"]), &none));
-        assert!(!unclaimed_is_the_bridges(Some(&template), &names(&["preview.example.com"]), &none));
+        assert!(!unclaimed_is_the_bridges(
+            Some(&template),
+            &names(&["codeg.example.com"]),
+            &none
+        ));
+        assert!(!unclaimed_is_the_bridges(
+            Some(&template),
+            &names(&["preview.example.com"]),
+            &none
+        ));
         // `auto` claims nothing it did not hand out: the shape alone would
         // take a workbench on `3000.codeg.test` away from codeg.
-        assert!(!unclaimed_is_the_bridges(Some(&auto), &names(&["3000.codeg.test"]), &none));
+        assert!(!unclaimed_is_the_bridges(
+            Some(&auto),
+            &names(&["3000.codeg.test"]),
+            &none
+        ));
         assert!(!unclaimed_is_the_bridges(Some(&auto), &names(&[]), &none));
         // But once it has handed a name out, the name is the bridge's for
         // as long as this process runs — the target can idle away, the
         // origin the page ran on does not.
-        assert!(unclaimed_is_the_bridges(Some(&auto), &names(&["3000.codeg.test"]), &handed_out));
-        assert!(!unclaimed_is_the_bridges(Some(&auto), &names(&["3001.codeg.test"]), &handed_out));
+        assert!(unclaimed_is_the_bridges(
+            Some(&auto),
+            &names(&["3000.codeg.test"]),
+            &handed_out
+        ));
+        assert!(!unclaimed_is_the_bridges(
+            Some(&auto),
+            &names(&["3001.codeg.test"]),
+            &handed_out
+        ));
         // And it stays the bridge's with no configuration at all behind it:
         // switching the bridge off, or pointing it somewhere else, does not
         // reach the browser's memory of that origin.
-        assert!(unclaimed_is_the_bridges(None, &names(&["3000.codeg.test"]), &handed_out));
-        assert!(!unclaimed_is_the_bridges(None, &names(&["3001.codeg.test"]), &handed_out));
-        assert!(!unclaimed_is_the_bridges(None, &names(&["3000.preview.example.com"]), &none));
+        assert!(unclaimed_is_the_bridges(
+            None,
+            &names(&["3000.codeg.test"]),
+            &handed_out
+        ));
+        assert!(!unclaimed_is_the_bridges(
+            None,
+            &names(&["3001.codeg.test"]),
+            &handed_out
+        ));
+        assert!(!unclaimed_is_the_bridges(
+            None,
+            &names(&["3000.preview.example.com"]),
+            &none
+        ));
     }
 
     #[test]

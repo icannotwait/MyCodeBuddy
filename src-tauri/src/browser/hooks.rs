@@ -106,9 +106,10 @@ pub fn page_requested_close(app: &AppHandle, tab_id: &str) {
             return;
         }
         tracing::info!("[browser] tab {tab_id}: closed by the page");
-        let close = crate::commands::browser::close_core_if(&app, &registry, &tab_id, None, |tab| {
-            tab.generation == generation
-        });
+        let close =
+            crate::commands::browser::close_core_if(&app, &registry, &tab_id, None, |tab| {
+                tab.generation == generation
+            });
         if let Err(err) = close {
             tracing::warn!("[browser] tab {tab_id}: close requested by the page failed: {err}");
         }
@@ -340,7 +341,11 @@ pub fn navigation_failed(app: &AppHandle, tab_id: &str, mut failure: LoadFailure
     // engine only that its proxy said no (see `browser::remote`).
     if failure.provisional && failure.kind == BrowserErrorKind::Failed {
         if let Some(state) = registry.state(tab_id) {
-            let url = failure.url.clone().filter(|u| !u.is_empty()).unwrap_or(state.requested_url);
+            let url = failure
+                .url
+                .clone()
+                .filter(|u| !u.is_empty())
+                .unwrap_or(state.requested_url);
             if let Some(kind) = state
                 .profile
                 .as_deref()

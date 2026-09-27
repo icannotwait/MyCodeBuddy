@@ -73,7 +73,9 @@ async fn spawn_echo() -> u16 {
     let port = listener.local_addr().unwrap().port();
     tokio::spawn(async move {
         loop {
-            let Ok((conn, _)) = listener.accept().await else { return };
+            let Ok((conn, _)) = listener.accept().await else {
+                return;
+            };
             tokio::spawn(async move {
                 let (mut rd, mut wr) = conn.into_split();
                 let _ = tokio::io::copy(&mut rd, &mut wr).await;
@@ -103,7 +105,9 @@ async fn socks_connect(socks: SocketAddr, host: &str, port: u16) -> (TcpStream, 
 #[tokio::test]
 async fn a_connection_reaches_the_upstream_by_name_and_ends_cleanly() {
     let server = spawn_server().await;
-    let egress = Egress::start(loader(server.addr, TUNNEL_PATH, TOKEN)).await.unwrap();
+    let egress = Egress::start(loader(server.addr, TUNNEL_PATH, TOKEN))
+        .await
+        .unwrap();
     let echo = spawn_echo().await;
 
     let (mut conn, code) = socks_connect(egress.socks_addr(), "localhost", echo).await;
@@ -123,7 +127,9 @@ async fn a_connection_reaches_the_upstream_by_name_and_ends_cleanly() {
 #[tokio::test]
 async fn many_streams_move_megabytes_at_once_within_their_windows() {
     let server = spawn_server().await;
-    let egress = Egress::start(loader(server.addr, TUNNEL_PATH, TOKEN)).await.unwrap();
+    let egress = Egress::start(loader(server.addr, TUNNEL_PATH, TOKEN))
+        .await
+        .unwrap();
     let echo = spawn_echo().await;
 
     let streams = (0..8u8).map(|n| {
@@ -156,7 +162,9 @@ async fn many_streams_move_megabytes_at_once_within_their_windows() {
 #[tokio::test]
 async fn a_port_nobody_listens_on_is_refused_in_socks_terms() {
     let server = spawn_server().await;
-    let egress = Egress::start(loader(server.addr, TUNNEL_PATH, TOKEN)).await.unwrap();
+    let egress = Egress::start(loader(server.addr, TUNNEL_PATH, TOKEN))
+        .await
+        .unwrap();
     let port = {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         listener.local_addr().unwrap().port()
@@ -171,25 +179,44 @@ async fn a_port_nobody_listens_on_is_refused_in_socks_terms() {
 async fn what_the_server_is_decides_the_status() {
     let server = spawn_server().await;
 
-    let older = Egress::start(loader(server.addr, "/ws/not-here", TOKEN)).await.unwrap();
+    let older = Egress::start(loader(server.addr, "/ws/not-here", TOKEN))
+        .await
+        .unwrap();
     assert_eq!(older.connect().await, Err(EgressStatus::Unsupported));
     let (_, code) = socks_connect(older.socks_addr(), "localhost", 80).await;
-    assert_eq!(code, 0x03, "network unreachable while the tunnel is missing");
+    assert_eq!(
+        code, 0x03,
+        "network unreachable while the tunnel is missing"
+    );
 
-    let older_with_app = Egress::start(loader(server.addr, "/spa-fallback", TOKEN)).await.unwrap();
-    assert_eq!(older_with_app.connect().await, Err(EgressStatus::Unsupported));
+    let older_with_app = Egress::start(loader(server.addr, "/spa-fallback", TOKEN))
+        .await
+        .unwrap();
+    assert_eq!(
+        older_with_app.connect().await,
+        Err(EgressStatus::Unsupported)
+    );
 
-    let off = Egress::start(loader(server.addr, "/forbidden", TOKEN)).await.unwrap();
+    let off = Egress::start(loader(server.addr, "/forbidden", TOKEN))
+        .await
+        .unwrap();
     assert_eq!(off.connect().await, Err(EgressStatus::Disabled));
 
-    let wrong = Egress::start(loader(server.addr, TUNNEL_PATH, "not-the-token")).await.unwrap();
-    assert!(matches!(wrong.connect().await, Err(EgressStatus::Down { .. })));
+    let wrong = Egress::start(loader(server.addr, TUNNEL_PATH, "not-the-token"))
+        .await
+        .unwrap();
+    assert!(matches!(
+        wrong.connect().await,
+        Err(EgressStatus::Down { .. })
+    ));
 }
 
 #[tokio::test]
 async fn a_dropped_tunnel_is_opened_again_by_the_next_connection() {
     let server = spawn_server().await;
-    let egress = Egress::start(loader(server.addr, TUNNEL_PATH, TOKEN)).await.unwrap();
+    let egress = Egress::start(loader(server.addr, TUNNEL_PATH, TOKEN))
+        .await
+        .unwrap();
     let echo = spawn_echo().await;
     let (_, code) = socks_connect(egress.socks_addr(), "localhost", echo).await;
     assert_eq!(code, 0);
@@ -236,8 +263,14 @@ async fn the_probe_tells_a_proxied_page_from_one_that_went_around_the_proxy() {
     let body = String::from_utf8(body).unwrap();
     assert!(body.starts_with("HTTP/1.1 200"), "{body}");
     assert!(body.contains("'/codeg-egress-probe/n1'"), "{body}");
-    assert!(body.contains("+ '/direct'"), "the page addresses loopback literals: {body}");
-    assert!(body.contains("new WebSocket("), "the page opens its WebSocket: {body}");
+    assert!(
+        body.contains("+ '/direct'"),
+        "the page addresses loopback literals: {body}"
+    );
+    assert!(
+        body.contains("new WebSocket("),
+        "the page opens its WebSocket: {body}"
+    );
 
     let (mut ws, code) = socks_connect(egress.socks_addr(), "remote.localhost", port).await;
     assert_eq!(code, 0);
@@ -253,7 +286,10 @@ async fn the_probe_tells_a_proxied_page_from_one_that_went_around_the_proxy() {
     assert!(String::from_utf8_lossy(&answer).starts_with("HTTP/1.1 101"));
 
     let visit = egress.await_probe("n1", Duration::from_secs(2)).await;
-    assert!(visit.page && visit.websocket && !visit.bypassed, "{visit:?}");
+    assert!(
+        visit.page && visit.websocket && !visit.bypassed,
+        "{visit:?}"
+    );
 
     // Around the proxy: plain HTTP straight to the port.
     let mut direct = TcpStream::connect(egress.socks_addr()).await.unwrap();
@@ -301,7 +337,10 @@ async fn a_reset_tunnel_follows_the_connection_to_its_new_address() {
     // The old server is gone: only a tunnel to the new one can carry this.
     first.shutdown.trigger();
     let (mut conn, code) = socks_connect(egress.socks_addr(), "localhost", echo).await;
-    assert_eq!(code, 0, "the next connection should open a tunnel to the new address");
+    assert_eq!(
+        code, 0,
+        "the next connection should open a tunnel to the new address"
+    );
     conn.write_all(b"moved").await.unwrap();
     conn.shutdown().await.unwrap();
     let mut back = Vec::new();
@@ -313,9 +352,14 @@ async fn a_reset_tunnel_follows_the_connection_to_its_new_address() {
 #[tokio::test]
 async fn a_closed_egress_stops_listening() {
     let server = spawn_server().await;
-    let egress = Egress::start(loader(server.addr, TUNNEL_PATH, TOKEN)).await.unwrap();
+    let egress = Egress::start(loader(server.addr, TUNNEL_PATH, TOKEN))
+        .await
+        .unwrap();
     let socks = egress.socks_addr();
     egress.close().await;
     tokio::time::sleep(Duration::from_millis(50)).await;
-    assert!(TcpStream::connect(socks).await.is_err(), "the listener should be gone");
+    assert!(
+        TcpStream::connect(socks).await.is_err(),
+        "the listener should be gone"
+    );
 }

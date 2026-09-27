@@ -896,7 +896,10 @@ mod tests {
         assert_eq!(element.label, "button#a - screenshot: b");
         assert_eq!(element.path[2], "button#a b");
         let text = render_element(&element);
-        assert!(text.contains("- element: button#a - screenshot: b\n"), "{text}");
+        assert!(
+            text.contains("- element: button#a - screenshot: b\n"),
+            "{text}"
+        );
         assert!(!text.contains("\n- screenshot:"), "{text}");
 
         // A missing label falls back to the tag — which goes on the line too.

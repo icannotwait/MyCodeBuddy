@@ -9,6 +9,7 @@ vi.mock("@/lib/api", () => ({
     completed_cache_max_mb: 512,
     agent_defaults: {},
   })),
+  getDelegationProfileCatalog: vi.fn(async () => ({ profiles: [] })),
   setDelegationSettings: vi.fn(async (v: unknown) => v),
   acpListAgents: vi.fn(async () => []),
   getFeedbackSettings: vi.fn(async () => ({ enabled: false })),

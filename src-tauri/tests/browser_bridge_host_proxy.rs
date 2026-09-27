@@ -82,7 +82,9 @@ async fn the_proxys_forwarded_host_routes_and_a_pages_cannot_escape() {
     configure_once();
     let upstream = spawn_upstream().await;
     let codeg = spawn_codeg().await;
-    let grant = browser_bridge::open(upstream, "tab-proxy", None).await.unwrap();
+    let grant = browser_bridge::open(upstream, "tab-proxy", None)
+        .await
+        .unwrap();
     // Behind a declared proxy the public hostname is what a target is named
     // after, whether or not the request carried a name of its own.
     let target = format!("{upstream}.{PUBLIC}");
@@ -102,7 +104,9 @@ async fn the_proxys_forwarded_host_routes_and_a_pages_cannot_escape() {
 
     // The proxy replaced `Host` with its upstream address: the forwarded
     // name is the only one that says which target this is.
-    let response = get(INTERNAL.to_string(), Some(target.clone())).await.unwrap();
+    let response = get(INTERNAL.to_string(), Some(target.clone()))
+        .await
+        .unwrap();
     assert_eq!(response.text().await.unwrap(), "hello from upstream");
     // A proxy that appends rather than replaces, its client's value first.
     let response = get(INTERNAL.to_string(), Some(format!("evil.test, {target}")))
@@ -122,6 +126,8 @@ async fn the_proxys_forwarded_host_routes_and_a_pages_cannot_escape() {
     // And codeg's own public name is still codeg's, from either header.
     let response = get(PUBLIC.to_string(), None).await.unwrap();
     assert_eq!(response.text().await.unwrap(), "codeg's own page");
-    let response = get(PUBLIC.to_string(), Some(PUBLIC.to_string())).await.unwrap();
+    let response = get(PUBLIC.to_string(), Some(PUBLIC.to_string()))
+        .await
+        .unwrap();
     assert_eq!(response.text().await.unwrap(), "codeg's own page");
 }

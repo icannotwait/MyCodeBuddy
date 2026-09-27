@@ -373,7 +373,11 @@ pub fn build_cursor_task_response(params: &Value) -> Value {
 /// `cursor/generate_image` — no image renderer yet. If Cursor already wrote a
 /// file, acknowledge the path; otherwise reject so the agent does not hang.
 pub fn build_cursor_generate_image_response(params: &Value) -> Value {
-    match params.get("filePath").and_then(|v| v.as_str()).map(str::trim) {
+    match params
+        .get("filePath")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+    {
         Some(path) if !path.is_empty() => {
             cursor_outcome_with("generated", json!({ "filePath": path }))
         }
@@ -410,15 +414,23 @@ mod tests {
 
     #[test]
     fn request_types_match_cursor_docs_methods() {
-        assert!(CursorAskQuestionRequest::matches_method("cursor/ask_question"));
-        assert!(CursorCreatePlanRequest::matches_method("cursor/create_plan"));
-        assert!(CursorUpdateTodosRequest::matches_method("cursor/update_todos"));
+        assert!(CursorAskQuestionRequest::matches_method(
+            "cursor/ask_question"
+        ));
+        assert!(CursorCreatePlanRequest::matches_method(
+            "cursor/create_plan"
+        ));
+        assert!(CursorUpdateTodosRequest::matches_method(
+            "cursor/update_todos"
+        ));
         assert!(CursorTaskRequest::matches_method("cursor/task"));
         assert!(CursorGenerateImageRequest::matches_method(
             "cursor/generate_image"
         ));
         assert!(!CursorTaskRequest::matches_method("session/prompt"));
-        assert!(!CursorTaskRequest::matches_method("_x.ai/ask_user_question"));
+        assert!(!CursorTaskRequest::matches_method(
+            "_x.ai/ask_user_question"
+        ));
     }
 
     #[test]

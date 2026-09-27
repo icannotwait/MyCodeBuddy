@@ -37,6 +37,7 @@ vi.mock("@/components/ai-elements/message", () => ({
     </div>
   ),
   normalizeMathDelimiters: (children: React.ReactNode) => children,
+  LIVE_REMEND: { linkMode: "text-only" },
 }))
 
 vi.mock("@/components/ai-elements/terminal", () => ({

@@ -872,6 +872,20 @@ pub fn visible_user_text(text: &str) -> Option<String> {
     (!visible.is_empty()).then(|| visible.to_string())
 }
 
+/// One streamed user chunk, with envelopes removed but edge spaces kept.
+///
+/// [`visible_user_text`] trims. Replay delivers `"after "` and `"images"` as
+/// separate chunks, so trimming each one deletes the space between them.
+/// A whitespace-only chunk is still dropped; the caller trims the assembled
+/// block once the prose run closes.
+pub fn visible_user_chunk(text: &str) -> Option<String> {
+    let stripped = strip_codeg_terminal_context(text);
+    if is_pure_mandatory_route_text(&stripped) || stripped.trim().is_empty() {
+        return None;
+    }
+    Some(stripped.into_owned())
+}
+
 /// Sanitize a native AI/session title so a complete context envelope cannot
 /// become a list title. Truncate only after this returns `Some`.
 pub fn visible_title(title: Option<String>) -> Option<String> {

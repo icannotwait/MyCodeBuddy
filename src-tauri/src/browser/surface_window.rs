@@ -63,7 +63,8 @@ fn in_profile<'a>(
     let builder = builder
         .data_directory(profile::directory(profile))
         .additional_browser_args(
-            &profile::windows_args_for(profile).map_err(|e| tauri::Error::Io(std::io::Error::other(e)))?,
+            &profile::windows_args_for(profile)
+                .map_err(|e| tauri::Error::Io(std::io::Error::other(e)))?,
         );
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     let builder = {
@@ -97,10 +98,18 @@ fn in_profile<'a>(
 /// profile's folder, arguments and proxy exactly as they are. None of a tab's
 /// hooks: the page is the listener's own and goes nowhere else.
 #[cfg_attr(
-    any(target_os = "macos", all(target_os = "windows", feature = "browser-child")),
+    any(
+        target_os = "macos",
+        all(target_os = "windows", feature = "browser-child")
+    ),
     allow(dead_code)
 )]
-pub fn open_probe(app: &AppHandle, label: &str, profile: &str, url: Url) -> tauri::Result<WebviewWindow> {
+pub fn open_probe(
+    app: &AppHandle,
+    label: &str,
+    profile: &str,
+    url: Url,
+) -> tauri::Result<WebviewWindow> {
     let builder = WebviewWindowBuilder::new(app, label, WebviewUrl::External(url))
         .title("codeg")
         .visible(false)

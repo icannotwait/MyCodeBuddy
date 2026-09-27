@@ -1118,7 +1118,7 @@ pub(crate) async fn handle_event(
                 cid,
                 &expected_old,
                 transcript_id,
-                &[expected_old.clone()],
+                std::slice::from_ref(&expected_old),
             )
             .await?
             {

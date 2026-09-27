@@ -2277,7 +2277,11 @@ mod fork_contract_tests {
 
     async fn start_long_running(
         session: &str,
-    ) -> (Arc<TerminalRuntime>, SessionId, agent_client_protocol::schema::v1::TerminalId) {
+    ) -> (
+        Arc<TerminalRuntime>,
+        SessionId,
+        agent_client_protocol::schema::v1::TerminalId,
+    ) {
         let runtime = Arc::new(test_runtime(AgentType::Grok));
         let session_id = SessionId::new(session);
         let response = runtime

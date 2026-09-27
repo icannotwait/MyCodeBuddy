@@ -31,7 +31,9 @@ pub enum FileSystemRuntimeError {
 impl FileSystemRuntimeError {
     pub fn into_rpc_error(self) -> agent_client_protocol::Error {
         match self {
-            Self::InvalidParams(message) => agent_client_protocol::Error::invalid_params().data(message),
+            Self::InvalidParams(message) => {
+                agent_client_protocol::Error::invalid_params().data(message)
+            }
             Self::Internal(message) => agent_client_protocol::util::internal_error(message),
         }
     }

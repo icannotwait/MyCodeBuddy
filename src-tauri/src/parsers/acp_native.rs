@@ -47,7 +47,7 @@ use crate::models::agent::AgentType;
 use crate::models::conversation::{ConversationDetail, ConversationSummary, SessionStats};
 use crate::models::message::{ContentBlock, ImageData, MessageTurn, TurnRole, TurnUsage};
 use crate::parsers::{
-    sanitize_user_blocks, user_turn_block, user_turn_block_from_wire, visible_user_text,
+    sanitize_user_blocks, user_turn_block, user_turn_block_from_wire, visible_user_chunk,
     AgentParser, ParseError,
 };
 
@@ -421,6 +421,9 @@ pub fn project_turns(entries: &[TranscriptEntry]) -> Vec<MessageTurn> {
     for entry in entries {
         match entry.k {
             EntryKind::Prompt => {
+                if user_prose_open {
+                    trim_open_user_prose(&mut turns);
+                }
                 flush(&mut pending, &mut turns, &mut seq);
                 let blocks = prompt_blocks(&entry.p);
                 if !blocks.is_empty() {
@@ -449,6 +452,9 @@ pub fn project_turns(entries: &[TranscriptEntry]) -> Vec<MessageTurn> {
                 user_prose_open = false;
             }
             EntryKind::TurnEnd => {
+                if user_prose_open {
+                    trim_open_user_prose(&mut turns);
+                }
                 if let Some(p) = pending.as_mut() {
                     apply_turn_end(p, &entry.p);
                     p.last_at_ms = entry.t;
@@ -485,7 +491,37 @@ pub fn project_turns(entries: &[TranscriptEntry]) -> Vec<MessageTurn> {
         }
     }
     flush(&mut pending, &mut turns, &mut seq);
+    if user_prose_open {
+        trim_open_user_prose(&mut turns);
+    }
     turns
+}
+
+fn trim_open_user_prose(turns: &mut [MessageTurn]) {
+    let Some(last) = turns.last_mut() else {
+        return;
+    };
+    if !matches!(last.role, TurnRole::User) {
+        return;
+    }
+    let Some(ContentBlock::Text { text }) = last.blocks.last_mut() else {
+        return;
+    };
+    let trimmed = text.trim();
+    if trimmed.len() != text.len() {
+        *text = trimmed.to_string();
+    }
+}
+
+fn continues_open_user_prose(update: &SessionUpdate) -> bool {
+    matches!(
+        update,
+        SessionUpdate::UserMessageChunk(chunk)
+            if matches!(
+                chunk.content,
+                agent_client_protocol::schema::v1::ContentBlock::Text(_)
+            )
+    )
 }
 
 fn flush(pending: &mut Option<PendingTurn>, turns: &mut Vec<MessageTurn>, seq: &mut usize) {
@@ -573,6 +609,9 @@ fn apply_update(
             pending.get_or_insert_with(|| PendingTurn::new(turn_start_hint.take().unwrap_or(at_ms)))
         };
     }
+    if *user_prose_open && !continues_open_user_prose(&update) {
+        trim_open_user_prose(turns);
+    }
     match update {
         SessionUpdate::UserMessageChunk(chunk) => {
             // Live path: codeg already recorded the outgoing prompt, so the
@@ -586,7 +625,7 @@ fn apply_update(
                 return;
             };
             if let PromptInputBlock::Text { text } = &mut input {
-                let Some(visible) = visible_user_text(text) else {
+                let Some(visible) = visible_user_chunk(text) else {
                     return;
                 };
                 *text = visible;

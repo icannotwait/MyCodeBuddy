@@ -3154,6 +3154,8 @@
         "configOptionAdjusted": "{agent} 把{option}设成了 {actual}，而不是 {requested}",
         "desktopDeliveryNegotiateFailed": "无法协商桌面事件投递。请重启应用。",
         "desktopDeliverySubscribeFailed": "订阅桌面 ACP 事件失败。请重启应用。",
+        "eventErrorTitle": "事件投递失败",
+        "agentsSetupHint": "请在 Agents 设置中安装后再连接。",
         "desktopDeliveryFailedRestart": "桌面事件投递失败。请重启整个应用以继续——仅重新加载会话不够。",
         "noticeTitle": "{agent}：{title}"
       },

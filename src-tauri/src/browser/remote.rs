@@ -79,11 +79,15 @@ pub async fn prepare(
     let connection = remote_workspace_connection_service::get(&db.conn, connection_id)
         .await
         .map_err(AppCommandError::db)?
-        .ok_or_else(|| AppCommandError::not_found(format!("Remote connection {connection_id} not found")))?;
+        .ok_or_else(|| {
+            AppCommandError::not_found(format!("Remote connection {connection_id} not found"))
+        })?;
     let host = display_host(&connection.base_url);
     let egress = app
         .state::<EgressRegistry>()
-        .ensure(connection_id, || tunnel_loader(db.conn.clone(), connection_id))
+        .ensure(connection_id, || {
+            tunnel_loader(db.conn.clone(), connection_id)
+        })
         .await
         .map_err(AppCommandError::io)?;
     if egress.claim_reporting() {
@@ -100,9 +104,11 @@ pub async fn prepare(
     profile::set_remote_egress(&profile_id, egress.socks_addr(), &host);
     egress.connect().await.map_err(tunnel_refusal)?;
     #[cfg(target_os = "macos")]
-    crate::commands::browser::on_main_until_result(app, "Failed to prepare the remote browser profile", |done| {
-        crate::browser::shim::macos::prepare_loopback_rules(done)
-    })
+    crate::commands::browser::on_main_until_result(
+        app,
+        "Failed to prepare the remote browser profile",
+        |done| crate::browser::shim::macos::prepare_loopback_rules(done),
+    )
     .await?;
     // The profile as its tabs will find it — its store pointed at the
     // listener, its folder in place — before the probe's page is built in
@@ -122,7 +128,9 @@ pub async fn prepare(
 pub async fn forget_connection(app: &AppHandle, connection_id: i32) {
     let profile_id = profile::remote_profile_id(connection_id);
     if let Some(registry) = app.try_state::<crate::browser::BrowserRegistry>() {
-        if let Err(err) = crate::commands::browser::remove_profile_core(app, &registry, &profile_id).await {
+        if let Err(err) =
+            crate::commands::browser::remove_profile_core(app, &registry, &profile_id).await
+        {
             tracing::debug!("[browser] could not remove {profile_id} with its connection: {err}");
         }
     }
@@ -158,7 +166,10 @@ fn tunnel_loader(db: sea_orm::DatabaseConnection, connection_id: i32) -> TargetL
                 .map_err(|e| e.to_string())?
                 .ok_or_else(|| "the remote connection no longer exists".to_string())?;
             Ok(TunnelTarget {
-                ws_url: crate::commands::remote_proxy::http_url_to_ws_url(&connection.base_url, TUNNEL_PATH),
+                ws_url: crate::commands::remote_proxy::http_url_to_ws_url(
+                    &connection.base_url,
+                    TUNNEL_PATH,
+                ),
                 token: connection.token,
                 headers: connection.headers.to_header_map(),
             })
@@ -224,7 +235,11 @@ async fn verify(
     let nonce = uuid::Uuid::new_v4().simple().to_string();
     // Windows and Linux proxy `localhost` like any name, which is the thing
     // to prove there; macOS never does, and its tabs use the alias.
-    let host = if cfg!(target_os = "macos") { ALIAS_HOST } else { "localhost" };
+    let host = if cfg!(target_os = "macos") {
+        ALIAS_HOST
+    } else {
+        "localhost"
+    };
     let url = egress.probe_url(host, &nonce);
     let page = ProbePage::open(app, owner, profile_id, &url, &nonce)
         .await
@@ -232,7 +247,9 @@ async fn verify(
     let visit = egress.await_probe(&nonce, PROBE_TIMEOUT).await;
     drop(page);
     if visit.bypassed {
-        tracing::warn!("[browser] {profile_id}: the probe went around the proxy; remote tabs stay closed");
+        tracing::warn!(
+            "[browser] {profile_id}: the probe went around the proxy; remote tabs stay closed"
+        );
         *verdict = Some(ProbeVerdict::Bypassed);
         return Err(bypassed());
     }
@@ -272,7 +289,10 @@ enum ProbeSurface {
     Child(crate::browser::surface_child::ChildHandle),
     /// Linux, and Windows without the embedded surface: a window that is
     /// never shown, as the profile's tabs are owned windows there.
-    #[cfg(not(any(target_os = "macos", all(target_os = "windows", feature = "browser-child"))))]
+    #[cfg(not(any(
+        target_os = "macos",
+        all(target_os = "windows", feature = "browser-child")
+    )))]
     Window(tauri::WebviewWindow),
 }
 
@@ -286,13 +306,22 @@ impl ProbePage {
         key: &str,
     ) -> Result<Self, String> {
         let (tx, rx) = tokio::sync::oneshot::channel();
-        let (profile_id, url, owned_key) = (profile_id.to_string(), url.to_string(), key.to_string());
+        let (profile_id, url, owned_key) =
+            (profile_id.to_string(), url.to_string(), key.to_string());
         app.run_on_main_thread(move || {
-            let _ = tx.send(crate::browser::shim::macos::open_probe_view(&profile_id, &url, &owned_key));
+            let _ = tx.send(crate::browser::shim::macos::open_probe_view(
+                &profile_id,
+                &url,
+                &owned_key,
+            ));
         })
         .map_err(|e| e.to_string())?;
-        rx.await.map_err(|_| "the probe page was dropped".to_string())??;
-        Ok(Self { app: app.clone(), page: ProbeSurface::View(key.to_string()) })
+        rx.await
+            .map_err(|_| "the probe page was dropped".to_string())??;
+        Ok(Self {
+            app: app.clone(),
+            page: ProbeSurface::View(key.to_string()),
+        })
     }
 
     #[cfg(all(target_os = "windows", feature = "browser-child"))]
@@ -305,17 +334,30 @@ impl ProbePage {
     ) -> Result<Self, String> {
         let probe_id = format!("egress-probe-{key}");
         let label = crate::browser::tab_label(&probe_id);
-        let bounds = crate::browser::types::Bounds { x: 0.0, y: 0.0, width: 1.0, height: 1.0 };
-        let handle = crate::browser::surface_child::create(app, owner, &probe_id, &label, bounds, true, false, profile_id)
-            .map_err(|e| e.to_string())?;
+        let bounds = crate::browser::types::Bounds {
+            x: 0.0,
+            y: 0.0,
+            width: 1.0,
+            height: 1.0,
+        };
+        let handle = crate::browser::surface_child::create(
+            app, owner, &probe_id, &label, bounds, true, false, profile_id,
+        )
+        .map_err(|e| e.to_string())?;
         // Owned from here: a failed load still closes the webview.
-        let page = Self { app: app.clone(), page: ProbeSurface::Child(handle) };
+        let page = Self {
+            app: app.clone(),
+            page: ProbeSurface::Child(handle),
+        };
         let ProbeSurface::Child(handle) = &page.page;
         handle.load_url(url).map_err(|e| e.to_string())?;
         Ok(page)
     }
 
-    #[cfg(not(any(target_os = "macos", all(target_os = "windows", feature = "browser-child"))))]
+    #[cfg(not(any(
+        target_os = "macos",
+        all(target_os = "windows", feature = "browser-child")
+    )))]
     async fn open(
         app: &AppHandle,
         _owner: &tauri::WebviewWindow,
@@ -326,7 +368,10 @@ impl ProbePage {
         let url = Url::parse(url).map_err(|e| e.to_string())?;
         let label = format!("{}egress-probe-{key}", crate::browser::TAB_LABEL_PREFIX);
         crate::browser::surface_window::open_probe(app, &label, profile_id, url)
-            .map(|window| Self { app: app.clone(), page: ProbeSurface::Window(window) })
+            .map(|window| Self {
+                app: app.clone(),
+                page: ProbeSurface::Window(window),
+            })
             .map_err(|e| e.to_string())
     }
 }
@@ -337,16 +382,19 @@ impl Drop for ProbePage {
             #[cfg(target_os = "macos")]
             ProbeSurface::View(key) => {
                 let key = key.clone();
-                let _ = self
-                    .app
-                    .run_on_main_thread(move || crate::browser::shim::macos::close_probe_view(&key));
+                let _ = self.app.run_on_main_thread(move || {
+                    crate::browser::shim::macos::close_probe_view(&key)
+                });
             }
             #[cfg(all(target_os = "windows", feature = "browser-child"))]
             ProbeSurface::Child(handle) => {
                 let _ = &self.app;
                 let _ = handle.close();
             }
-            #[cfg(not(any(target_os = "macos", all(target_os = "windows", feature = "browser-child"))))]
+            #[cfg(not(any(
+                target_os = "macos",
+                all(target_os = "windows", feature = "browser-child")
+            )))]
             ProbeSurface::Window(window) => {
                 let _ = &self.app;
                 let _ = window.destroy();
@@ -417,12 +465,17 @@ pub fn alias_for(url: &Url) -> Option<Url> {
         return None;
     }
     let loopback = match url.host()? {
-        url::Host::Domain(name) => name.strip_suffix('.').unwrap_or(name).eq_ignore_ascii_case("localhost"),
+        url::Host::Domain(name) => name
+            .strip_suffix('.')
+            .unwrap_or(name)
+            .eq_ignore_ascii_case("localhost"),
         url::Host::Ipv4(ip) => ip.is_loopback() || ip.is_unspecified(),
         url::Host::Ipv6(ip) => {
             ip.is_loopback()
                 || ip.is_unspecified()
-                || ip.to_ipv4_mapped().is_some_and(|v4| v4.is_loopback() || v4.is_unspecified())
+                || ip
+                    .to_ipv4_mapped()
+                    .is_some_and(|v4| v4.is_loopback() || v4.is_unspecified())
         }
     };
     if !loopback {
@@ -443,7 +496,9 @@ pub fn redirect_to_alias(app: &AppHandle, tab_id: &str, alias: Url) {
         let Some(registry) = handle.try_state::<crate::browser::BrowserRegistry>() else {
             return;
         };
-        if let Err(err) = crate::commands::browser::navigate_core(&handle, &registry, &tab_id, alias.as_str()) {
+        if let Err(err) =
+            crate::commands::browser::navigate_core(&handle, &registry, &tab_id, alias.as_str())
+        {
             tracing::debug!("[browser] tab {tab_id}: could not follow the alias: {err}");
         }
     });
@@ -463,14 +518,38 @@ mod tests {
             aliased("http://localhost:3000/a?b=1#c").as_deref(),
             Some("http://remote.localhost:3000/a?b=1#c")
         );
-        assert_eq!(aliased("https://LOCALHOST./x").as_deref(), Some("https://remote.localhost/x"));
-        assert_eq!(aliased("http://127.0.0.1:5173/").as_deref(), Some("http://remote.localhost:5173/"));
-        assert_eq!(aliased("http://127.9.9.9/").as_deref(), Some("http://remote.localhost/"));
-        assert_eq!(aliased("http://[::1]:8080/").as_deref(), Some("http://remote.localhost:8080/"));
-        assert_eq!(aliased("http://[::ffff:127.0.0.1]:1/").as_deref(), Some("http://remote.localhost:1/"));
-        assert_eq!(aliased("http://0.0.0.0:3000/").as_deref(), Some("http://remote.localhost:3000/"));
-        assert_eq!(aliased("http://[::]:3000/").as_deref(), Some("http://remote.localhost:3000/"));
-        assert_eq!(aliased("ws://localhost:24678/hmr").as_deref(), Some("ws://remote.localhost:24678/hmr"));
+        assert_eq!(
+            aliased("https://LOCALHOST./x").as_deref(),
+            Some("https://remote.localhost/x")
+        );
+        assert_eq!(
+            aliased("http://127.0.0.1:5173/").as_deref(),
+            Some("http://remote.localhost:5173/")
+        );
+        assert_eq!(
+            aliased("http://127.9.9.9/").as_deref(),
+            Some("http://remote.localhost/")
+        );
+        assert_eq!(
+            aliased("http://[::1]:8080/").as_deref(),
+            Some("http://remote.localhost:8080/")
+        );
+        assert_eq!(
+            aliased("http://[::ffff:127.0.0.1]:1/").as_deref(),
+            Some("http://remote.localhost:1/")
+        );
+        assert_eq!(
+            aliased("http://0.0.0.0:3000/").as_deref(),
+            Some("http://remote.localhost:3000/")
+        );
+        assert_eq!(
+            aliased("http://[::]:3000/").as_deref(),
+            Some("http://remote.localhost:3000/")
+        );
+        assert_eq!(
+            aliased("ws://localhost:24678/hmr").as_deref(),
+            Some("ws://remote.localhost:24678/hmr")
+        );
         assert_eq!(
             aliased("http://user:pw@localhost:3000/").as_deref(),
             Some("http://user:pw@remote.localhost:3000/")
@@ -497,8 +576,14 @@ mod tests {
     #[test]
     fn only_a_remote_profile_on_macos_is_rewritten() {
         let url = Url::parse("http://localhost:3000/").unwrap();
-        assert_eq!(egress_address("default", &url).as_str(), "http://localhost:3000/");
-        assert_eq!(egress_address("p-abc", &url).as_str(), "http://localhost:3000/");
+        assert_eq!(
+            egress_address("default", &url).as_str(),
+            "http://localhost:3000/"
+        );
+        assert_eq!(
+            egress_address("p-abc", &url).as_str(),
+            "http://localhost:3000/"
+        );
         let remote = egress_address("remote-7", &url);
         if cfg!(target_os = "macos") {
             assert_eq!(remote.as_str(), "http://remote.localhost:3000/");
@@ -514,10 +599,16 @@ mod tests {
             host_address(remote, "http://remote.localhost:3000/a?b=1#c"),
             "http://localhost:3000/a?b=1#c"
         );
-        assert_eq!(host_address(remote, "https://u:p@remote.localhost/x"), "https://u:p@localhost/x");
+        assert_eq!(
+            host_address(remote, "https://u:p@remote.localhost/x"),
+            "https://u:p@localhost/x"
+        );
         // What the alias took a loopback address to, it gives back.
         let aliased = alias_for(&Url::parse("http://localhost:5173/app").unwrap()).unwrap();
-        assert_eq!(host_address(remote, aliased.as_str()), "http://localhost:5173/app");
+        assert_eq!(
+            host_address(remote, aliased.as_str()),
+            "http://localhost:5173/app"
+        );
         for raw in [
             "http://localhost:3000/",
             "http://app.localhost/",
@@ -532,13 +623,19 @@ mod tests {
         }
         // A tab of any other profile keeps its address, alias or not.
         for profile in [None, Some("default"), Some("p-abc")] {
-            assert_eq!(host_address(profile, "http://remote.localhost:3000/"), "http://remote.localhost:3000/");
+            assert_eq!(
+                host_address(profile, "http://remote.localhost:3000/"),
+                "http://remote.localhost:3000/"
+            );
         }
     }
 
     #[test]
     fn a_connection_is_named_by_host_and_port() {
-        assert_eq!(display_host("https://box.example.com:8443/"), "box.example.com:8443");
+        assert_eq!(
+            display_host("https://box.example.com:8443/"),
+            "box.example.com:8443"
+        );
         assert_eq!(display_host("http://10.0.0.2"), "10.0.0.2");
         assert_eq!(display_host("http://[fd00::2]:3080"), "[fd00::2]:3080");
         assert_eq!(display_host("not a url"), "not a url");

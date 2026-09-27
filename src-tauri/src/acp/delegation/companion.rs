@@ -2852,7 +2852,28 @@ fn render_workflow_result(outcome: &Value) -> Value {
     })
 }
 
+/// Object keys in sorted order, so a `preserve_order` build emits the same
+/// bytes as serde_json's default map. The page-mode pins were recorded that
+/// way; sorting only this payload leaves the JSON-RPC envelope (`jsonrpc`,
+/// `id`, `result`) in struct field order.
+fn canonical_json_value(value: &Value) -> Value {
+    match value {
+        Value::Array(items) => Value::Array(items.iter().map(canonical_json_value).collect()),
+        Value::Object(map) => {
+            let mut keys: Vec<&String> = map.keys().collect();
+            keys.sort();
+            let mut sorted = serde_json::Map::new();
+            for key in keys {
+                sorted.insert(key.clone(), canonical_json_value(&map[key]));
+            }
+            Value::Object(sorted)
+        }
+        other => other.clone(),
+    }
+}
+
 fn render_orchestration_binding_page(outcome: &Value) -> Value {
+    let outcome = canonical_json_value(outcome);
     let is_error = outcome.get("error").is_some();
     let text = if is_error {
         outcome
@@ -2861,17 +2882,20 @@ fn render_orchestration_binding_page(outcome: &Value) -> Value {
             .unwrap_or("orchestration binding query failed")
             .to_string()
     } else {
-        serde_json::to_string(outcome).unwrap_or_else(|_| outcome.to_string())
+        serde_json::to_string(&outcome).unwrap_or_else(|_| outcome.to_string())
     };
+    // `text` before `type`: alphabetical, which is also the order a map
+    // without `preserve_order` would emit.
     json!({
-        "content": [{ "type": "text", "text": text }],
+        "content": [{ "text": text, "type": "text" }],
         "isError": is_error,
-        "structuredContent": outcome.clone(),
+        "structuredContent": outcome,
     })
 }
 
 const ORCHESTRATION_BINDING_CURSOR_BUDGET_PLACEHOLDER: &str = "AAAAAAAAAAAAAAAAAAAAAA";
 
+#[allow(clippy::large_enum_variant)] // Response is returned immediately; the retry arm is a u16.
 enum OrchestrationBindingBudgetDecision {
     Response(JsonRpcResponse),
     RetryWithPageLimit(u16),

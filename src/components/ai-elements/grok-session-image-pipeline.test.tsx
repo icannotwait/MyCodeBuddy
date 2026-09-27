@@ -164,7 +164,7 @@ describe("MessageResponse Grok session image pipeline", () => {
 
     expect(
       await screen.findByRole("button", { name: "file: local" })
-    ).toHaveAttribute("title", "docs/foo.ts")
+    ).toHaveAttribute("title", "./docs/foo.ts")
     expect(screen.getByRole("button", { name: "file: local" })).toHaveAttribute(
       "data-resource-kind",
       "file"

@@ -468,7 +468,10 @@ mod tests {
         let s = "aa\u{4f60}\u{597d}";
         for max in 0..s.len() {
             let cut = truncate(s, max);
-            let kept = cut.split("... [truncated").next().expect("split yields one");
+            let kept = cut
+                .split("... [truncated")
+                .next()
+                .expect("split yields one");
             assert!(
                 s.starts_with(kept),
                 "max={max} kept {kept:?}, which is not a prefix of {s:?}"

@@ -209,12 +209,10 @@ mod tests {
                 let mut session = AgentSession::attach(&cx, response)?;
                 assert_eq!(&*session.session_id().0, "s1");
 
-                let first = tokio::time::timeout(
-                    std::time::Duration::from_secs(5),
-                    session.read_update(),
-                )
-                .await
-                .expect("the parked update is replayed into the new router")?;
+                let first =
+                    tokio::time::timeout(std::time::Duration::from_secs(5), session.read_update())
+                        .await
+                        .expect("the parked update is replayed into the new router")?;
                 // Nothing else is routed here: the other session's frame stays
                 // parked for a router of its own.
                 let nothing_more = tokio::time::timeout(

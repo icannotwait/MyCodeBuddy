@@ -7017,7 +7017,7 @@ mod tests {
             if label == "delegate_to_agent" || label == "continue_delegation" {
                 tool.meta = Some(serde_json::json!({
                     "codeg.delegation": {
-                        "child_conversation_id": 70 + (index as i32),
+                        "child_conversation_id": 70 + index,
                         "status": if index == 159 { "running" } else { "completed" }
                     }
                 }));

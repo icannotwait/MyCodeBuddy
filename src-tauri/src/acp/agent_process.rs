@@ -419,20 +419,19 @@ impl AcpAgent {
                     .stdout(std::process::Stdio::piped())
                     .stderr(std::process::Stdio::piped());
 
-                let mut child = cmd.spawn().map_err(agent_client_protocol::Error::into_internal_error)?;
+                let mut child = cmd
+                    .spawn()
+                    .map_err(agent_client_protocol::Error::into_internal_error)?;
 
-                let child_stdin = child
-                    .stdin
-                    .take()
-                    .ok_or_else(|| agent_client_protocol::util::internal_error("Failed to open stdin"))?;
-                let child_stdout = child
-                    .stdout
-                    .take()
-                    .ok_or_else(|| agent_client_protocol::util::internal_error("Failed to open stdout"))?;
-                let child_stderr = child
-                    .stderr
-                    .take()
-                    .ok_or_else(|| agent_client_protocol::util::internal_error("Failed to open stderr"))?;
+                let child_stdin = child.stdin.take().ok_or_else(|| {
+                    agent_client_protocol::util::internal_error("Failed to open stdin")
+                })?;
+                let child_stdout = child.stdout.take().ok_or_else(|| {
+                    agent_client_protocol::util::internal_error("Failed to open stdout")
+                })?;
+                let child_stderr = child.stderr.take().ok_or_else(|| {
+                    agent_client_protocol::util::internal_error("Failed to open stderr")
+                })?;
 
                 Ok((child_stdin, child_stdout, child_stderr, child))
             }
@@ -587,7 +586,10 @@ fn monitor_child(
 
         // Wait for the child to exit
         let status = guard.wait().await.map_err(|e| {
-            agent_client_protocol::util::internal_error(format!("Failed to wait for process: {}", e))
+            agent_client_protocol::util::internal_error(format!(
+                "Failed to wait for process: {}",
+                e
+            ))
         })?;
 
         if status.success() {
@@ -717,10 +719,8 @@ impl<Counterpart: AcpAgentCounterpartRole> ConnectTo<Counterpart> for AcpAgent {
 
         // Race the protocol against child process exit
         // If the child exits early (e.g., with an error), we return that error
-        let protocol_future = ConnectTo::<Counterpart>::connect_to(
-            Lines::new(outgoing_sink, incoming_lines),
-            client,
-        );
+        let protocol_future =
+            ConnectTo::<Counterpart>::connect_to(Lines::new(outgoing_sink, incoming_lines), client);
 
         tokio::select! {
             result = protocol_future => result,
@@ -743,7 +743,9 @@ impl AcpAgent {
         let args: Vec<String> = args.into_iter().map(|s| s.to_string()).collect();
 
         if args.is_empty() {
-            return Err(agent_client_protocol::util::internal_error("Arguments cannot be empty"));
+            return Err(agent_client_protocol::util::internal_error(
+                "Arguments cannot be empty",
+            ));
         }
 
         let mut env = vec![];
@@ -776,11 +778,7 @@ impl AcpAgent {
             .to_string();
 
         Ok(AcpAgent {
-            server: McpServer::Stdio(
-                McpServerStdio::new(name, command)
-                    .args(cmd_args)
-                    .env(env),
-            ),
+            server: McpServer::Stdio(McpServerStdio::new(name, command).args(cmd_args).env(env)),
             debug_callback: None,
             current_dir: None,
             spawn_callback: None,

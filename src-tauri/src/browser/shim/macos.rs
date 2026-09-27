@@ -22,11 +22,11 @@ use objc2_foundation::{
     NSURLErrorFailingURLErrorKey, NSURL, NSUUID,
 };
 use objc2_web_kit::{
-    WKContentWorld, WKFindConfiguration, WKFindResult, WKNavigation, WKNavigationAction,
-    WKNavigationActionPolicy, WKNavigationDelegate, WKScriptMessage, WKScriptMessageHandler,
-    WKSnapshotConfiguration, WKUIDelegate, WKUserContentController, WKUserScript,
-    WKUserScriptInjectionTime, WKWebView, WKWebViewConfiguration, WKWebsiteDataRecord,
-    WKWebsiteDataStore, WKContentRuleList, WKContentRuleListStore,
+    WKContentRuleList, WKContentRuleListStore, WKContentWorld, WKFindConfiguration, WKFindResult,
+    WKNavigation, WKNavigationAction, WKNavigationActionPolicy, WKNavigationDelegate,
+    WKScriptMessage, WKScriptMessageHandler, WKSnapshotConfiguration, WKUIDelegate,
+    WKUserContentController, WKUserScript, WKUserScriptInjectionTime, WKWebView,
+    WKWebViewConfiguration, WKWebsiteDataRecord, WKWebsiteDataStore,
 };
 use tauri_runtime_wry::wry::{self, WebViewExtMacOS};
 
@@ -985,7 +985,9 @@ impl CodegUIDelegate {
         sink: PageCloseSink,
         mtm: MainThreadMarker,
     ) -> Retained<Self> {
-        let this = mtm.alloc::<Self>().set_ivars(UIDelegateIvars { inner, sink });
+        let this = mtm
+            .alloc::<Self>()
+            .set_ivars(UIDelegateIvars { inner, sink });
         // SAFETY: plain NSObject init.
         unsafe { msg_send![super(this), init] }
     }
@@ -1104,11 +1106,17 @@ pub fn profile_configuration(
         configuration
     };
     if profile::is_remote_profile(profile_id) {
-        let rules = LOOPBACK_RULE_LIST.with(|slot| slot.borrow().clone()).ok_or_else(|| {
-            format!("browser profile {profile_id} cannot keep its pages off this computer yet")
-        })?;
+        let rules = LOOPBACK_RULE_LIST
+            .with(|slot| slot.borrow().clone())
+            .ok_or_else(|| {
+                format!("browser profile {profile_id} cannot keep its pages off this computer yet")
+            })?;
         // SAFETY: main thread; the controller is the configuration's own.
-        unsafe { configuration.userContentController().addContentRuleList(&rules) };
+        unsafe {
+            configuration
+                .userContentController()
+                .addContentRuleList(&rules)
+        };
     }
     Ok(configuration)
 }
@@ -1167,7 +1175,9 @@ thread_local! {
 /// Compile the loopback rules if that has not been done this run; `done`
 /// hears how it went, on the main thread. A remote profile's tabs cannot be
 /// built before this succeeds (`profile_configuration`).
-pub fn prepare_loopback_rules(done: Box<dyn Fn(Result<(), String>) + 'static>) -> Result<(), String> {
+pub fn prepare_loopback_rules(
+    done: Box<dyn Fn(Result<(), String>) + 'static>,
+) -> Result<(), String> {
     let mtm = mtm()?;
     if LOOPBACK_RULE_LIST.with(|slot| slot.borrow().is_some()) {
         done(Ok(()));

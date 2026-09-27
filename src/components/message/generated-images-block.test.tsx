@@ -51,11 +51,11 @@ describe("GeneratedImagesBlock heading", () => {
       </NextIntlClientProvider>
     )
     expect(
-      screen.getByText(
-        "The image preview was not included in this snapshot."
-      )
+      screen.getByText("The image preview was not included in this snapshot.")
     ).toBeInTheDocument()
-    expect(screen.queryByText("Image generation failed")).not.toBeInTheDocument()
+    expect(
+      screen.queryByText("Image generation failed")
+    ).not.toBeInTheDocument()
     expect(
       screen.queryByRole("button", { name: "Download image" })
     ).not.toBeInTheDocument()
@@ -74,9 +74,7 @@ describe("GeneratedImagesBlock heading", () => {
     )
     expect(screen.getByText("Image generation failed")).toBeInTheDocument()
     expect(
-      screen.queryByText(
-        "The image preview was not included in this snapshot."
-      )
+      screen.queryByText("The image preview was not included in this snapshot.")
     ).not.toBeInTheDocument()
   })
 
@@ -92,9 +90,7 @@ describe("GeneratedImagesBlock heading", () => {
     )
     expect(screen.getByText("Image generation failed")).toBeInTheDocument()
     expect(
-      screen.queryByText(
-        "The image preview was not included in this snapshot."
-      )
+      screen.queryByText("The image preview was not included in this snapshot.")
     ).not.toBeInTheDocument()
   })
 

@@ -58,7 +58,9 @@ fn base(grant: &BridgeGrant) -> String {
 async fn switching_the_bridge_off_closes_everything_and_refuses_new_opens() {
     configure();
     let upstream = spawn_upstream().await;
-    let grant = browser_bridge::open(upstream, "tab-off", None).await.unwrap();
+    let grant = browser_bridge::open(upstream, "tab-off", None)
+        .await
+        .unwrap();
     browser_bridge::configure(None);
     assert_eq!(browser_bridge::listener_count(), 0);
     assert!(matches!(
@@ -81,7 +83,9 @@ async fn switching_the_bridge_off_closes_everything_and_refuses_new_opens() {
         host_pattern: None,
         reserved: vec![1],
     }));
-    let again = browser_bridge::open(upstream, "tab-on", None).await.unwrap();
+    let again = browser_bridge::open(upstream, "tab-on", None)
+        .await
+        .unwrap();
     assert_ne!(port_of(&again), 0);
     let response = client()
         .get(format!("http://localhost:{}/hello", port_of(&again)))

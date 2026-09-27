@@ -1781,20 +1781,22 @@ impl ConnectionManager {
         connection_id: &str,
     ) -> Option<SharedRuntimeWorkSnapshot> {
         let state = self.get_state(connection_id).await?;
-        let (mut snapshot, conversation_id) = {
-            let state = state.read().await;
-            (
-                state.shared_runtime_work_snapshot(None),
-                state.conversation_id,
-            )
+        // Sample `turn_in_flight` after the workflow lookup. That lookup
+        // awaits, and a prompt enqueued during the wait was claimed against a
+        // stale `false` captured on the way in. Windows' current-thread
+        // runtime hits that window even when the dispatcher re-samples just
+        // before claim.
+        let conversation_id = state.read().await.conversation_id;
+        let conversation_write_error = if let Some(conversation_id) = conversation_id {
+            require_writable_conversation_workflow(&db.conn, conversation_id)
+                .await
+                .err()
+                .map(|error| stable_conversation_write_error(&error))
+        } else {
+            None
         };
-        if let Some(conversation_id) = conversation_id {
-            snapshot.conversation_write_error =
-                require_writable_conversation_workflow(&db.conn, conversation_id)
-                    .await
-                    .err()
-                    .map(|error| stable_conversation_write_error(&error));
-        }
+        let mut snapshot = state.read().await.shared_runtime_work_snapshot(None);
+        snapshot.conversation_write_error = conversation_write_error;
         Some(snapshot)
     }
 

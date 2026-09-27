@@ -57,25 +57,28 @@ async fn spawn_upstream() -> u16 {
             .unwrap()
     }
     async fn ws(ws: WebSocketUpgrade) -> Response {
-        ws.protocols(["vite-hmr"]).on_upgrade(|mut socket| async move {
-            while let Some(Ok(message)) = socket.recv().await {
-                match message {
-                    Message::Text(text) => {
-                        if socket
-                            .send(Message::Text(format!("echo:{text}").into()))
-                            .await
-                            .is_err()
-                        {
-                            break;
+        ws.protocols(["vite-hmr"])
+            .on_upgrade(|mut socket| async move {
+                while let Some(Ok(message)) = socket.recv().await {
+                    match message {
+                        Message::Text(text) => {
+                            if socket
+                                .send(Message::Text(format!("echo:{text}").into()))
+                                .await
+                                .is_err()
+                            {
+                                break;
+                            }
                         }
+                        Message::Close(_) => break,
+                        _ => {}
                     }
-                    Message::Close(_) => break,
-                    _ => {}
                 }
-            }
-        })
+            })
     }
-    let app = Router::new().route("/hello", get(hello)).route("/ws", get(ws));
+    let app = Router::new()
+        .route("/hello", get(hello))
+        .route("/ws", get(ws));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
     tokio::spawn(async move {
@@ -126,7 +129,10 @@ fn cookie_for(grant: &BridgeGrant) -> String {
 fn authority(grant: &BridgeGrant, codeg_port: u16) -> String {
     format!(
         "{}:{codeg_port}",
-        grant.bridge_host.as_deref().expect("a hostname-addressed bridge")
+        grant
+            .bridge_host
+            .as_deref()
+            .expect("a hostname-addressed bridge")
     )
 }
 
@@ -160,7 +166,10 @@ async fn a_target_is_named_by_hostname_and_bound_to_nothing() {
     let err = browser_bridge::open(RESERVED_PORT, "tab-reserved", Some(WORKBENCH))
         .await
         .unwrap_err();
-    assert!(matches!(err, BridgeError::Reserved(RESERVED_PORT)), "{err:?}");
+    assert!(
+        matches!(err, BridgeError::Reserved(RESERVED_PORT)),
+        "{err:?}"
+    );
 }
 
 #[tokio::test]
@@ -176,7 +185,10 @@ async fn the_page_comes_through_codegs_own_listener() {
     // The entry sets this target's cookie and answers with a page that
     // navigates itself — not a redirect, which would arrive `same-site`.
     let response = client()
-        .get(format!("http://127.0.0.1:{codeg}{}?to=%2Fhello", grant.entry_path))
+        .get(format!(
+            "http://127.0.0.1:{codeg}{}?to=%2Fhello",
+            grant.entry_path
+        ))
         .header(header::HOST, &host)
         .send()
         .await
@@ -212,7 +224,10 @@ async fn the_page_comes_through_codegs_own_listener() {
 
     // The probe the workbench makes before it shows the frame.
     let response = client()
-        .get(format!("http://127.0.0.1:{codeg}{}", browser_bridge::PING_PATH))
+        .get(format!(
+            "http://127.0.0.1:{codeg}{}",
+            browser_bridge::PING_PATH
+        ))
         .header(header::HOST, &host)
         .send()
         .await
@@ -242,9 +257,13 @@ async fn codeg_and_the_dev_servers_never_answer_for_each_other() {
 
     // Codeg's own name still reaches codeg, and a target's name never does —
     // not its pages and not its API, whatever the request carries.
-    let response = get("/", format!("{WORKBENCH}:{codeg}"), false).await.unwrap();
+    let response = get("/", format!("{WORKBENCH}:{codeg}"), false)
+        .await
+        .unwrap();
     assert_eq!(response.text().await.unwrap(), "codeg's own page");
-    let response = get("/api/whoami", format!("{WORKBENCH}:{codeg}"), false).await.unwrap();
+    let response = get("/api/whoami", format!("{WORKBENCH}:{codeg}"), false)
+        .await
+        .unwrap();
     assert_eq!(response.text().await.unwrap(), "codeg's own api");
     let response = get("/api/whoami", host.clone(), true).await.unwrap();
     assert_ne!(response.text().await.unwrap(), "codeg's own api");
@@ -263,7 +282,9 @@ async fn codeg_and_the_dev_servers_never_answer_for_each_other() {
         .unwrap();
     assert_eq!(response.text().await.unwrap(), "codeg's own page");
     // A hostname that is not the bridge's passes straight through.
-    let response = get("/", format!("app.{WORKBENCH}:{codeg}"), false).await.unwrap();
+    let response = get("/", format!("app.{WORKBENCH}:{codeg}"), false)
+        .await
+        .unwrap();
     assert_eq!(response.text().await.unwrap(), "codeg's own page");
     // Including the one the browser would send with no name at all.
     let response = get("/", format!("127.0.0.1:{codeg}"), false).await.unwrap();
@@ -297,7 +318,9 @@ async fn only_a_name_codeg_handed_out_is_the_bridges() {
     // The same port one label in front of a host no grant was ever rendered
     // from is not this target's — codeg answers, as it would for any other
     // name it was reached at.
-    let response = get(format!("{upstream}.elsewhere.test:{codeg}")).await.unwrap();
+    let response = get(format!("{upstream}.elsewhere.test:{codeg}"))
+        .await
+        .unwrap();
     assert_eq!(response.text().await.unwrap(), "codeg's own page");
     // Including a workbench whose own hostname starts with a number: under
     // the shape rule its every request would have been the bridge's.
@@ -305,7 +328,9 @@ async fn only_a_name_codeg_handed_out_is_the_bridges() {
     assert_eq!(response.text().await.unwrap(), "codeg's own page");
     // The name that was handed out still works, and a second one is minted
     // for a workbench reached at a second hostname.
-    let response = get(format!("{upstream}.{WORKBENCH}:{codeg}")).await.unwrap();
+    let response = get(format!("{upstream}.{WORKBENCH}:{codeg}"))
+        .await
+        .unwrap();
     assert_eq!(response.text().await.unwrap(), "hello from upstream");
     let second = browser_bridge::open(upstream, "tab-other-base", Some("other.test"))
         .await
@@ -343,7 +368,9 @@ async fn a_forwarding_header_decides_nothing_without_a_proxy_in_front() {
 
     // `Host` names this target, whatever the request claims it was
     // forwarded from.
-    let response = get(host.clone(), format!("{WORKBENCH}:{codeg}")).await.unwrap();
+    let response = get(host.clone(), format!("{WORKBENCH}:{codeg}"))
+        .await
+        .unwrap();
     assert_eq!(response.text().await.unwrap(), "hello from upstream");
     // And the other way: from codeg's own name, a forwarding header naming
     // a target reaches nothing of the bridge's.
@@ -385,33 +412,50 @@ async fn only_this_targets_own_page_may_ask() {
         // this host-only name.
         Some(format!("codeg-bridge-{}={}", upstream + 1, cap_of(&grant))),
     ] {
-        let response = send(cookie.clone(), Some("same-origin"), None).await.unwrap();
+        let response = send(cookie.clone(), Some("same-origin"), None)
+            .await
+            .unwrap();
         assert_eq!(response.status(), StatusCode::FORBIDDEN, "{cookie:?}");
     }
 
     // With it, the browser still has to say the page asked.
     assert_eq!(
-        send(Some(ok.clone()), Some("same-origin"), None).await.unwrap().status(),
+        send(Some(ok.clone()), Some("same-origin"), None)
+            .await
+            .unwrap()
+            .status(),
         StatusCode::OK
     );
     assert_eq!(
-        send(Some(ok.clone()), Some("none"), None).await.unwrap().status(),
+        send(Some(ok.clone()), Some("none"), None)
+            .await
+            .unwrap()
+            .status(),
         StatusCode::OK
     );
     // Another target's page, or the workbench: `same-site`, and refused —
     // the cookie would not reach them, but the answer does not depend on it.
     assert_eq!(
-        send(Some(ok.clone()), Some("same-site"), None).await.unwrap().status(),
+        send(Some(ok.clone()), Some("same-site"), None)
+            .await
+            .unwrap()
+            .status(),
         StatusCode::FORBIDDEN
     );
     assert_eq!(
-        send(Some(ok.clone()), Some("cross-site"), None).await.unwrap().status(),
+        send(Some(ok.clone()), Some("cross-site"), None)
+            .await
+            .unwrap()
+            .status(),
         StatusCode::FORBIDDEN
     );
     // No Fetch Metadata (a plain-http deployment): the Origin must name the
     // authority this request was addressed to.
     assert_eq!(
-        send(Some(ok.clone()), None, Some(format!("http://{host}"))).await.unwrap().status(),
+        send(Some(ok.clone()), None, Some(format!("http://{host}")))
+            .await
+            .unwrap()
+            .status(),
         StatusCode::OK
     );
     assert_eq!(

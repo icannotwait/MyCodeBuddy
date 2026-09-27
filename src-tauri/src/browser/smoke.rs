@@ -257,7 +257,10 @@ async fn execute(app: &AppHandle, cmd: &Value) -> Result<Value, String> {
                         .and_then(Value::as_bool)
                         .unwrap_or(false),
                     surface,
-                    devtools: cmd.get("devtools").and_then(Value::as_bool).unwrap_or(false),
+                    devtools: cmd
+                        .get("devtools")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false),
                     profile,
                 },
             )
@@ -279,11 +282,16 @@ async fn execute(app: &AppHandle, cmd: &Value) -> Result<Value, String> {
             Ok(json!(connection.id))
         }
         "browser_egress_status" => {
-            let connection_id = cmd.get("connection_id").and_then(Value::as_i64).ok_or("missing connection_id")?;
+            let connection_id = cmd
+                .get("connection_id")
+                .and_then(Value::as_i64)
+                .ok_or("missing connection_id")?;
             let connection_id = i32::try_from(connection_id).map_err(err_string)?;
             let egresses = app.state::<crate::browser::egress::EgressRegistry>();
             Ok(match egresses.get(connection_id) {
-                Some(egress) => json!({ "status": egress.status(), "socks": egress.socks_addr().to_string() }),
+                Some(egress) => {
+                    json!({ "status": egress.status(), "socks": egress.socks_addr().to_string() })
+                }
                 None => Value::Null,
             })
         }

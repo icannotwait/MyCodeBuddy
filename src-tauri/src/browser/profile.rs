@@ -96,13 +96,23 @@ pub fn set_remote_egress(profile_id: &str, socks: std::net::SocketAddr, host: &s
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .get_or_insert_with(HashMap::new)
-        .insert(profile_id.to_string(), RemoteEgress { socks, host: host.to_string() });
+        .insert(
+            profile_id.to_string(),
+            RemoteEgress {
+                socks,
+                host: host.to_string(),
+            },
+        );
 }
 
 /// The remote profile's connection is gone: nothing may be built in the
 /// profile any more (`prepare` refuses a remote profile without an egress).
 pub fn forget_remote_egress(profile_id: &str) {
-    if let Some(map) = REMOTE_EGRESS.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+    if let Some(map) = REMOTE_EGRESS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_mut()
+    {
         map.remove(profile_id);
     }
 }
@@ -352,7 +362,9 @@ pub fn windows_args_for(profile_id: &str) -> Result<String, String> {
     }
     #[cfg(not(target_os = "windows"))]
     {
-        Ok(windows_browser_args(current_proxy().ok().flatten().as_ref()))
+        Ok(windows_browser_args(
+            current_proxy().ok().flatten().as_ref(),
+        ))
     }
 }
 
@@ -451,7 +463,9 @@ pub fn prepare(app: &AppHandle, profile_id: &str) -> Result<(), String> {
             proxy_or_none(current_proxy())
         };
         let profile_id = profile_id.to_string();
-        run_on_main(app, move || crate::browser::shim::macos::ensure_profile(&profile_id, proxy))?
+        run_on_main(app, move || {
+            crate::browser::shim::macos::ensure_profile(&profile_id, proxy)
+        })?
     }
     #[cfg(not(target_os = "macos"))]
     {
@@ -1105,17 +1119,26 @@ mod tests {
         assert!(windows_args_for(&id).is_err());
         assert_eq!(remote_host(&id), None);
 
-        set_remote_egress(&id, "127.0.0.1:45678".parse().unwrap(), "box.example.com:8443");
+        set_remote_egress(
+            &id,
+            "127.0.0.1:45678".parse().unwrap(),
+            "box.example.com:8443",
+        );
         let proxy = proxy_for(&id).unwrap().unwrap();
         assert_eq!(proxy.to_url_string(), "socks5://127.0.0.1:45678");
         let args = windows_args_for(&id).unwrap();
-        assert!(args.contains(" --proxy-server=socks5://127.0.0.1:45678"), "{args}");
+        assert!(
+            args.contains(" --proxy-server=socks5://127.0.0.1:45678"),
+            "{args}"
+        );
         assert!(args.ends_with(" --proxy-bypass-list=<-loopback>"), "{args}");
         assert_eq!(remote_host(&id).as_deref(), Some("box.example.com:8443"));
         // Only a remote profile has a remote host.
         set_remote_egress("p-abc", "127.0.0.1:1".parse().unwrap(), "elsewhere");
         assert_eq!(remote_host("p-abc"), None);
-        assert!(!windows_args_for(DEFAULT_PROFILE_ID).unwrap().contains("<-loopback>"));
+        assert!(!windows_args_for(DEFAULT_PROFILE_ID)
+            .unwrap()
+            .contains("<-loopback>"));
     }
 
     #[test]

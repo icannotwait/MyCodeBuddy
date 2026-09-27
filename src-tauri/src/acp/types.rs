@@ -1118,9 +1118,7 @@ pub fn attachment_names_from_prompt(blocks: &[PromptInputBlock]) -> Option<Strin
         .filter_map(|b| match b {
             PromptInputBlock::ResourceLink { name, .. } => Some(name.clone()),
             PromptInputBlock::Resource { uri, .. } => Some(attachment_display_name(uri)),
-            PromptInputBlock::Image { uri, .. } => {
-                uri.as_deref().map(attachment_display_name)
-            }
+            PromptInputBlock::Image { uri, .. } => uri.as_deref().map(attachment_display_name),
             PromptInputBlock::Text { .. } => None,
         })
         .filter(|name| !name.trim().is_empty())
@@ -1299,7 +1297,9 @@ pub fn prompt_block_from_wire(item: &serde_json::Value) -> Option<PromptInputBlo
             let uri = string(resource, "uri");
             let mime_type = mime(resource);
             let blob = string(resource, "blob");
-            let is_image = mime_type.as_deref().is_some_and(|m| m.starts_with("image/"));
+            let is_image = mime_type
+                .as_deref()
+                .is_some_and(|m| m.starts_with("image/"));
             // Nothing to show: no uri to name it by, and no bytes to draw it
             // from. (Kept identical to `acp_native::prompt_block_from_content`,
             // the typed reader for the same content off the replay channel.)
@@ -2554,7 +2554,10 @@ mod envelope_tests {
         }) else {
             panic!("a text resource projects to text");
         };
-        assert!(text.ends_with("  1. box: 2×2 CSS px at (1, 1)\n</context>"), "{text}");
+        assert!(
+            text.ends_with("  1. box: 2×2 CSS px at (1, 1)\n</context>"),
+            "{text}"
+        );
     }
 
     /// A page can write the block's own delimiters into its title or an id.
@@ -2580,7 +2583,10 @@ mod envelope_tests {
         assert_eq!(text.matches("<context ref=\"").count(), 1, "{text}");
         assert_eq!(text.matches("</context").count(), 1, "{text}");
         assert!(text.ends_with("\n</context>"), "{text}");
-        assert!(text.contains("- page: Report ‹context ref=\"x\"> — http://x/"), "{text}");
+        assert!(
+            text.contains("- page: Report ‹context ref=\"x\"> — http://x/"),
+            "{text}"
+        );
         assert!(text.contains("- element: div#a‹/context>b"), "{text}");
     }
 
@@ -2595,8 +2601,10 @@ mod envelope_tests {
             blob: None,
         };
         let read_back = prompt_block_from_wire(
-            &serde_json::to_value(crate::acp::connection::map_prompt_blocks(vec![block.clone()]))
-                .expect("serializes")[0],
+            &serde_json::to_value(crate::acp::connection::map_prompt_blocks(vec![
+                block.clone()
+            ]))
+            .expect("serializes")[0],
         )
         .expect("renderable");
         assert_eq!(
@@ -2685,9 +2693,7 @@ mod envelope_tests {
     #[test]
     fn wire_blocks_read_back_as_the_prompt_blocks_they_were_sent_as() {
         let sent = vec![
-            PromptInputBlock::Text {
-                text: "hi".into(),
-            },
+            PromptInputBlock::Text { text: "hi".into() },
             PromptInputBlock::Image {
                 data: "QUJD".into(),
                 mime_type: "image/jpeg".into(),
@@ -2746,7 +2752,11 @@ mod envelope_tests {
             serde_json::json!({"type": "resource_link", "name": "no uri"}),
             serde_json::json!({"type": "audio", "data": "QUJD", "mimeType": "audio/wav"}),
         ] {
-            assert_eq!(prompt_block_from_wire(&unrenderable), None, "{unrenderable}");
+            assert_eq!(
+                prompt_block_from_wire(&unrenderable),
+                None,
+                "{unrenderable}"
+            );
         }
         // An image resource is renderable on its bytes alone, uri or not.
         assert!(prompt_block_from_wire(&serde_json::json!({

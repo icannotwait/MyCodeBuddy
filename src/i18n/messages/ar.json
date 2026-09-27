@@ -3154,6 +3154,8 @@
         "configOptionAdjusted": "ضبط {agent} {option} على {actual} بدلاً من {requested}",
         "desktopDeliveryNegotiateFailed": "Could not negotiate desktop event delivery. Restart the application.",
         "desktopDeliverySubscribeFailed": "Failed to subscribe to desktop ACP events. Restart the application.",
+        "eventErrorTitle": "Event delivery failed",
+        "agentsSetupHint": "Install it in Agents settings, then connect again.",
         "desktopDeliveryFailedRestart": "Desktop event delivery failed. Restart the application to continue — reloading the conversation is not enough.",
         "noticeTitle": "{agent}: {title}"
       },

@@ -132,7 +132,7 @@ describe("WebEventStream reconnect mode", () => {
       handlers
     )
 
-    expect(f.sendFrame).toHaveBeenLastCalledWith(
+    expect(f.sendFrame).toHaveBeenCalledWith(
       expect.objectContaining({
         action: "attach",
         connection_id: "conn",
@@ -140,6 +140,7 @@ describe("WebEventStream reconnect mode", () => {
         lease_id: "lease-4",
       })
     )
+    expect(f.sendFrame).toHaveBeenLastCalledWith({ action: "ping" })
 
     f.sendFrame.mockClear()
     f.reconnect()

@@ -80,7 +80,11 @@ impl CloseCode {
 pub enum Frame {
     /// Desktop → server: connect this stream to `host:port`. `host` is a DNS
     /// name or an IP literal (IPv6 without brackets).
-    Open { stream: u32, host: String, port: u16 },
+    Open {
+        stream: u32,
+        host: String,
+        port: u16,
+    },
     /// Server → desktop: the connection is up; bytes may flow.
     Opened { stream: u32 },
     /// Either way: bytes of the stream, within the sender's credit.
@@ -92,7 +96,11 @@ pub enum Frame {
     /// still reads what arrives.
     Eof { stream: u32 },
     /// Either way: the stream is over, in both directions.
-    Close { stream: u32, code: CloseCode, message: String },
+    Close {
+        stream: u32,
+        code: CloseCode,
+        message: String,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -135,7 +143,11 @@ impl Frame {
         if host.is_empty() || host.len() > MAX_HOST_LEN || port == 0 {
             return None;
         }
-        Some(Self::Open { stream, host: host.to_string(), port })
+        Some(Self::Open {
+            stream,
+            host: host.to_string(),
+            port,
+        })
     }
 
     pub fn stream(&self) -> u32 {
@@ -167,7 +179,11 @@ impl Frame {
                 // `Frame::open` refuses a longer host; one built by hand that
                 // is longer anyway goes out empty, which the peer refuses,
                 // rather than cut down to somebody else's name.
-                let host = if host.len() <= MAX_HOST_LEN { host.as_bytes() } else { &[] };
+                let host = if host.len() <= MAX_HOST_LEN {
+                    host.as_bytes()
+                } else {
+                    &[]
+                };
                 out.push(host.len() as u8);
                 out.extend_from_slice(host);
             }
@@ -202,18 +218,28 @@ impl Frame {
                     .ok_or(FrameError::Malformed("open host length does not match"))?;
                 let host = std::str::from_utf8(host)
                     .map_err(|_| FrameError::Malformed("open host is not UTF-8"))?;
-                Self::Open { stream, host: host.to_string(), port }
+                Self::Open {
+                    stream,
+                    host: host.to_string(),
+                    port,
+                }
             }
             k if k == Kind::Opened as u8 => {
                 expect_empty(payload, "opened carries no payload")?;
                 Self::Opened { stream }
             }
-            k if k == Kind::Data as u8 => Self::Data { stream, payload: payload.to_vec() },
+            k if k == Kind::Data as u8 => Self::Data {
+                stream,
+                payload: payload.to_vec(),
+            },
             k if k == Kind::Window as u8 => {
                 let credit: [u8; 4] = payload
                     .try_into()
                     .map_err(|_| FrameError::Malformed("window credit is four bytes"))?;
-                Self::Window { stream, credit: u32::from_be_bytes(credit) }
+                Self::Window {
+                    stream,
+                    credit: u32::from_be_bytes(credit),
+                }
             }
             k if k == Kind::Eof as u8 => {
                 expect_empty(payload, "eof carries no payload")?;
@@ -223,7 +249,8 @@ impl Frame {
                 let (&code, message) = payload
                     .split_first()
                     .ok_or(FrameError::Malformed("close without a code"))?;
-                let code = CloseCode::from_u8(code).ok_or(FrameError::Malformed("unknown close code"))?;
+                let code =
+                    CloseCode::from_u8(code).ok_or(FrameError::Malformed("unknown close code"))?;
                 Self::Close {
                     stream,
                     code,
@@ -265,29 +292,66 @@ mod tests {
 
     #[test]
     fn every_kind_survives_a_round_trip() {
-        round_trip(Frame::Open { stream: 1, host: "localhost".into(), port: 3000 });
-        round_trip(Frame::Open { stream: 7, host: "::1".into(), port: 443 });
+        round_trip(Frame::Open {
+            stream: 1,
+            host: "localhost".into(),
+            port: 3000,
+        });
+        round_trip(Frame::Open {
+            stream: 7,
+            host: "::1".into(),
+            port: 443,
+        });
         round_trip(Frame::Opened { stream: 1 });
-        round_trip(Frame::Data { stream: 2, payload: b"GET / HTTP/1.1\r\n".to_vec() });
-        round_trip(Frame::Data { stream: 2, payload: Vec::new() });
-        round_trip(Frame::Window { stream: 3, credit: INITIAL_WINDOW });
+        round_trip(Frame::Data {
+            stream: 2,
+            payload: b"GET / HTTP/1.1\r\n".to_vec(),
+        });
+        round_trip(Frame::Data {
+            stream: 2,
+            payload: Vec::new(),
+        });
+        round_trip(Frame::Window {
+            stream: 3,
+            credit: INITIAL_WINDOW,
+        });
         round_trip(Frame::Eof { stream: u32::MAX });
-        round_trip(Frame::Close { stream: 4, code: CloseCode::NotAllowed, message: "policy".into() });
-        round_trip(Frame::Close { stream: 4, code: CloseCode::Normal, message: String::new() });
+        round_trip(Frame::Close {
+            stream: 4,
+            code: CloseCode::NotAllowed,
+            message: "policy".into(),
+        });
+        round_trip(Frame::Close {
+            stream: 4,
+            code: CloseCode::Normal,
+            message: String::new(),
+        });
     }
 
     #[test]
     fn the_header_is_kind_then_big_endian_stream() {
-        let bytes = Frame::Window { stream: 0x0102_0304, credit: 0x0a0b_0c0d }.encode();
+        let bytes = Frame::Window {
+            stream: 0x0102_0304,
+            credit: 0x0a0b_0c0d,
+        }
+        .encode();
         assert_eq!(bytes, [4, 1, 2, 3, 4, 0x0a, 0x0b, 0x0c, 0x0d]);
-        let bytes = Frame::Open { stream: 1, host: "a".into(), port: 80 }.encode();
+        let bytes = Frame::Open {
+            stream: 1,
+            host: "a".into(),
+            port: 80,
+        }
+        .encode();
         assert_eq!(bytes, [1, 0, 0, 0, 1, 0, 80, 1, b'a']);
     }
 
     #[test]
     fn malformed_frames_are_refused_rather_than_guessed_at() {
         assert_eq!(Frame::decode(&[1, 0, 0]), Err(FrameError::Truncated));
-        assert_eq!(Frame::decode(&[99, 0, 0, 0, 1]), Err(FrameError::UnknownKind(99)));
+        assert_eq!(
+            Frame::decode(&[99, 0, 0, 0, 1]),
+            Err(FrameError::UnknownKind(99))
+        );
         // Host length says 5, one byte follows.
         assert!(Frame::decode(&[1, 0, 0, 0, 1, 0, 80, 5, b'a']).is_err());
         // Host length says 1, two bytes follow.
@@ -307,17 +371,29 @@ mod tests {
         assert!(Frame::open(1, &"a".repeat(MAX_HOST_LEN), 1).is_some());
         assert!(Frame::open(1, &"a".repeat(MAX_HOST_LEN + 1), 1).is_none());
         // Built by hand past the limit: sent without a host, not shortened.
-        let frame = Frame::Open { stream: 1, host: "a".repeat(300), port: 1 };
+        let frame = Frame::Open {
+            stream: 1,
+            host: "a".repeat(300),
+            port: 1,
+        };
         assert_eq!(
             Frame::decode(&frame.encode()).unwrap(),
-            Frame::Open { stream: 1, host: String::new(), port: 1 }
+            Frame::Open {
+                stream: 1,
+                host: String::new(),
+                port: 1
+            }
         );
     }
 
     #[test]
     fn a_long_close_message_is_cut_at_a_character_boundary() {
         let message = "é".repeat(MAX_CLOSE_MESSAGE);
-        let frame = Frame::Close { stream: 1, code: CloseCode::Failed, message };
+        let frame = Frame::Close {
+            stream: 1,
+            code: CloseCode::Failed,
+            message,
+        };
         let Frame::Close { message, .. } = Frame::decode(&frame.encode()).unwrap() else {
             panic!("not a close")
         };

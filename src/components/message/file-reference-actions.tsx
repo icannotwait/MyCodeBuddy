@@ -255,7 +255,11 @@ function FileReferenceActionsMenu({ target }: { target: string }) {
     const name = relative.split("/").pop() || relative
     void (async () => {
       try {
-        const result = await downloadWorkspaceFile(folderPath, relative, name)
+        const result = await downloadWorkspaceFile(
+          normalizeAbsPath(folderPath),
+          relative,
+          name
+        )
         // Web hands off to the browser's download manager ("started"), which
         // shows its own progress — a toast there would just be noise. Only the
         // remote-desktop save-dialog path has an outcome worth reporting.

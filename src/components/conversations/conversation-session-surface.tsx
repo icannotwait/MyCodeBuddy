@@ -2795,13 +2795,6 @@ export const ConversationSessionSurface = memo(
       [msgQueue, feedbackSteer, mqRemove, feedback.channel, tCmp]
     )
 
-    // Locked delegates without a canonical connection should show the waiting
-    // row rather than a stale generic ACP owner disconnect error.
-    const shellConnectionError =
-      isDelegateConversation && interactionLocked && conn.connectionId == null
-        ? null
-        : conn.error
-
     return (
       <ConversationShell
         topBanner={
@@ -2830,7 +2823,6 @@ export const ConversationSessionSurface = memo(
         defaultPath={workingDirForConnection}
         folderId={ownFolderId}
         agentName={getAgentLabel(selectedAgent)}
-        error={shellConnectionError}
         claudeApiRetry={conn.claudeApiRetry}
         sessionFailures={conn.sessionFailures}
         snapshotTruncation={conn.snapshotTruncation}

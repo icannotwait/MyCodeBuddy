@@ -155,6 +155,10 @@ async fn a_name_that_was_handed_out_never_becomes_codegs() {
         let response = get(format!("{RESERVED_PORT}.{WORKBENCH}:{codeg}"), false)
             .await
             .unwrap();
-        assert_eq!(response.text().await.unwrap(), "codeg's own page", "off: {off}");
+        assert_eq!(
+            response.text().await.unwrap(),
+            "codeg's own page",
+            "off: {off}"
+        );
     }
 }

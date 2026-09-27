@@ -806,7 +806,10 @@ mod tests {
         // A removal that still applies keeps the takeover.
         assert!(!is_effectively_empty(&excluding(&["gpt-5.5"]), &s));
         // Mixed: the live one wins.
-        assert!(!is_effectively_empty(&excluding(&["gpt-5.4", "gpt-5.5"]), &s));
+        assert!(!is_effectively_empty(
+            &excluding(&["gpt-5.4", "gpt-5.5"]),
+            &s
+        ));
         // codex 0.155.1 DELETED gpt-5.2 and gpt-5.4-mini outright rather than
         // hiding them, which is the other way a stored exclusion goes stale. A
         // slug that is not in the catalog at all cannot be listable either, so

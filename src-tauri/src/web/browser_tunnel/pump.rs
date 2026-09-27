@@ -115,7 +115,13 @@ where
                     }
                     *slot = Some(code);
                 }
-                let _ = frames.send(Frame::Close { stream: id, code, message }).await;
+                let _ = frames
+                    .send(Frame::Close {
+                        stream: id,
+                        code,
+                        message,
+                    })
+                    .await;
                 failed.cancel();
             }
         }
@@ -146,7 +152,14 @@ where
                     Ok(n) => {
                         credit.fetch_sub(n as u32, Ordering::AcqRel);
                         let payload = buf[..n].to_vec();
-                        if frames.send(Frame::Data { stream: id, payload }).await.is_err() {
+                        if frames
+                            .send(Frame::Data {
+                                stream: id,
+                                payload,
+                            })
+                            .await
+                            .is_err()
+                        {
                             return;
                         }
                     }
@@ -177,7 +190,15 @@ where
                 }
                 let n = bytes.len() as u32;
                 unconsumed.fetch_sub(n, Ordering::AcqRel);
-                if n > 0 && frames.send(Frame::Window { stream: id, credit: n }).await.is_err() {
+                if n > 0
+                    && frames
+                        .send(Frame::Window {
+                            stream: id,
+                            credit: n,
+                        })
+                        .await
+                        .is_err()
+                {
                     return;
                 }
             }
@@ -249,7 +270,11 @@ where
         (_, Some(code)) => PumpEnd::Failed(code),
         (PumpEnd::Done, None) => {
             let _ = frames
-                .send(Frame::Close { stream: id, code: CloseCode::Normal, message: String::new() })
+                .send(Frame::Close {
+                    stream: id,
+                    code: CloseCode::Normal,
+                    message: String::new(),
+                })
                 .await;
             PumpEnd::Done
         }
@@ -277,7 +302,12 @@ mod tests {
         let (events, events_rx) = mpsc::unbounded_channel();
         let (frames_tx, frames) = mpsc::channel(64);
         let pump = tokio::spawn(pump(pumped, 9, events_rx, frames_tx));
-        Harness { app, events, frames, pump }
+        Harness {
+            app,
+            events,
+            frames,
+            pump,
+        }
     }
 
     #[tokio::test]
@@ -286,14 +316,25 @@ mod tests {
         h.app.write_all(b"request").await.unwrap();
         assert_eq!(
             h.frames.recv().await.unwrap(),
-            Frame::Data { stream: 9, payload: b"request".to_vec() }
+            Frame::Data {
+                stream: 9,
+                payload: b"request".to_vec()
+            }
         );
-        h.events.send(StreamEvent::Data(b"response".to_vec())).unwrap();
+        h.events
+            .send(StreamEvent::Data(b"response".to_vec()))
+            .unwrap();
         let mut got = [0u8; 8];
         h.app.read_exact(&mut got).await.unwrap();
         assert_eq!(&got, b"response");
         // Written onward, so granted back.
-        assert_eq!(h.frames.recv().await.unwrap(), Frame::Window { stream: 9, credit: 8 });
+        assert_eq!(
+            h.frames.recv().await.unwrap(),
+            Frame::Window {
+                stream: 9,
+                credit: 8
+            }
+        );
 
         // Both sides say they are done sending.
         h.app.shutdown().await.unwrap();
@@ -302,7 +343,10 @@ mod tests {
         assert_eq!(h.pump.await.unwrap(), PumpEnd::Done);
         assert!(matches!(
             h.frames.recv().await.unwrap(),
-            Frame::Close { code: CloseCode::Normal, .. }
+            Frame::Close {
+                code: CloseCode::Normal,
+                ..
+            }
         ));
     }
 
@@ -317,7 +361,10 @@ mod tests {
         h.app.write_all(b"still talking").await.unwrap();
         assert_eq!(
             h.frames.recv().await.unwrap(),
-            Frame::Data { stream: 9, payload: b"still talking".to_vec() }
+            Frame::Data {
+                stream: 9,
+                payload: b"still talking".to_vec()
+            }
         );
     }
 
@@ -335,7 +382,8 @@ mod tests {
         }
         assert_eq!(sent, INITIAL_WINDOW as usize);
         // Nothing more without credit.
-        let more = tokio::time::timeout(std::time::Duration::from_millis(100), h.frames.recv()).await;
+        let more =
+            tokio::time::timeout(std::time::Duration::from_millis(100), h.frames.recv()).await;
         assert!(more.is_err(), "sent past the window: {more:?}");
         h.events.send(StreamEvent::Window(1000)).unwrap();
         let Frame::Data { payload, .. } = h.frames.recv().await.unwrap() else {
@@ -348,12 +396,20 @@ mod tests {
     async fn a_peer_that_sends_past_its_window_is_closed() {
         let mut h = harness(16);
         // The application reads nothing, so nothing is granted back.
-        h.events.send(StreamEvent::Data(vec![0u8; INITIAL_WINDOW as usize])).unwrap();
+        h.events
+            .send(StreamEvent::Data(vec![0u8; INITIAL_WINDOW as usize]))
+            .unwrap();
         h.events.send(StreamEvent::Data(vec![0u8; 1])).unwrap();
         assert_eq!(h.pump.await.unwrap(), PumpEnd::Failed(CloseCode::Protocol));
         let mut saw_close = false;
         while let Ok(frame) = h.frames.try_recv() {
-            if matches!(frame, Frame::Close { code: CloseCode::Protocol, .. }) {
+            if matches!(
+                frame,
+                Frame::Close {
+                    code: CloseCode::Protocol,
+                    ..
+                }
+            ) {
                 saw_close = true;
             }
         }
@@ -365,20 +421,32 @@ mod tests {
     #[tokio::test]
     async fn a_graceful_close_does_not_cut_off_the_data_before_it() {
         let mut h = harness(1024);
-        h.events.send(StreamEvent::Data(b"the last words".to_vec())).unwrap();
+        h.events
+            .send(StreamEvent::Data(b"the last words".to_vec()))
+            .unwrap();
         h.events.send(StreamEvent::Eof).unwrap();
-        h.events.send(StreamEvent::Close(CloseCode::Normal, String::new())).unwrap();
+        h.events
+            .send(StreamEvent::Close(CloseCode::Normal, String::new()))
+            .unwrap();
         let mut rest = Vec::new();
         h.app.read_to_end(&mut rest).await.unwrap();
         assert_eq!(rest, b"the last words");
-        assert_eq!(h.pump.await.unwrap(), PumpEnd::ClosedByPeer(CloseCode::Normal));
+        assert_eq!(
+            h.pump.await.unwrap(),
+            PumpEnd::ClosedByPeer(CloseCode::Normal)
+        );
     }
 
     #[tokio::test]
     async fn a_close_from_the_peer_ends_the_pump_and_drops_the_connection() {
         let mut h = harness(1024);
-        h.events.send(StreamEvent::Close(CloseCode::Refused, String::new())).unwrap();
-        assert_eq!(h.pump.await.unwrap(), PumpEnd::ClosedByPeer(CloseCode::Refused));
+        h.events
+            .send(StreamEvent::Close(CloseCode::Refused, String::new()))
+            .unwrap();
+        assert_eq!(
+            h.pump.await.unwrap(),
+            PumpEnd::ClosedByPeer(CloseCode::Refused)
+        );
         let mut rest = Vec::new();
         // The pump's end of the pipe is gone: the application reads EOF.
         h.app.read_to_end(&mut rest).await.unwrap();

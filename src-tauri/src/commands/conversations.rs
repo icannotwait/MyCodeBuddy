@@ -2061,7 +2061,7 @@ pub async fn get_folder_conversation_core(
                 conversation_id,
                 &previous,
                 &next,
-                &[previous.clone()],
+                std::slice::from_ref(&previous),
             )
             .await
             {

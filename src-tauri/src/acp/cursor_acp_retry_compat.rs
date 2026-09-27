@@ -123,7 +123,8 @@ const RUN_OPTIONS_ANCHOR: &str = concat!(
 /// Declarator that binds the `ConversationAction` the run options are built
 /// for. Its local is the one thing the injected policy has to name, so it is
 /// read out of the bundle rather than remembered.
-const ACTION_LOCAL_DECL: &str = r#"(\w+)=new \w+\.ConversationAction\(\{action:\{case:"userMessageAction""#;
+const ACTION_LOCAL_DECL: &str =
+    r#"(\w+)=new \w+\.ConversationAction\(\{action:\{case:"userMessageAction""#;
 
 /// codeg's own earlier splice, which named the local from a table instead of
 /// from the bundle. Matched so the wrong-local installs it left behind can be
@@ -753,7 +754,9 @@ mod tests {
     );
 
     fn chunk(run_options: &str) -> String {
-        format!("exports.modules={{{AGENT_SESSION_MODULE}(e,t,o){{placeholder {run_options} end}}}}")
+        format!(
+            "exports.modules={{{AGENT_SESSION_MODULE}(e,t,o){{placeholder {run_options} end}}}}"
+        )
     }
 
     fn write_bundle(dir: &Path, content: &str) -> PathBuf {
@@ -839,7 +842,10 @@ mod tests {
             "backgroundTaskCompletionAction",
             "goalContinuationAction",
         ] {
-            assert!(policy.contains(&format!("\"{case}\"!==y.action.case")), "{case}");
+            assert!(
+                policy.contains(&format!("\"{case}\"!==y.action.case")),
+                "{case}"
+            );
         }
     }
 
@@ -857,7 +863,10 @@ mod tests {
              &&\"backgroundTaskCompletionAction\"!==y.action.case\
              &&\"goalContinuationAction\"!==y.action.case,onConnectionStateChange",
         );
-        assert!(broken.contains("enableAgentRetries:"), "fixture must be spliced");
+        assert!(
+            broken.contains("enableAgentRetries:"),
+            "fixture must be spliced"
+        );
         write_bundle(tmp.path(), &chunk(&broken));
 
         assert_eq!(

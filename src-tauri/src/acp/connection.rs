@@ -5,26 +5,26 @@ use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
+use crate::acp::agent_process::AcpAgent;
+use crate::acp::agent_session::AgentSession;
 use agent_client_protocol::schema::v1::{
     BlobResourceContents, CancelNotification, ClientCapabilities, ClientSessionCapabilities,
-    CompactionCapabilities, ContentBlock, ContentChunk,
-    CreateTerminalRequest, CreateTerminalResponse, ElicitationCapabilities,
-    ElicitationFormCapabilities, EmbeddedResource, EmbeddedResourceResource,
-    FileSystemCapabilities, ImageContent, InitializeRequest, KillTerminalRequest,
-    KillTerminalResponse, LoadSessionRequest, LoadSessionResponse, Meta, NewSessionRequest,
-    NewSessionResponse, NoticeCapabilities, PermissionOption, PermissionOptionKind, Plan,
-    PlanEntryPriority, PlanEntryStatus, PromptRequest, ReadTextFileRequest,
-    ReadTextFileResponse,
-    ReleaseTerminalRequest, ReleaseTerminalResponse, RequestPermissionOutcome,
-    RequestPermissionRequest, RequestPermissionResponse, ResourceLink, ResumeSessionRequest,
-    ResumeSessionResponse, SelectedPermissionOutcome, SessionConfigKind, SessionConfigOption,
-    SessionConfigOptionCategory, SessionConfigOptionValue, SessionConfigSelectGroup,
-    SessionConfigSelectOption, SessionConfigSelectOptions, SessionId, SessionModeState,
-    SessionNotification, SessionUpdate, SetSessionConfigOptionRequest,
-    SetSessionModeRequest, StopReason, TerminalExitStatus,
-    TerminalOutputRequest, TerminalOutputResponse, TextContent, TextResourceContents,
-    ToolCallContent, ToolKind, WaitForTerminalExitRequest, WaitForTerminalExitResponse,
-    WriteTextFileRequest, WriteTextFileResponse,
+    CompactionCapabilities, ContentBlock, ContentChunk, CreateTerminalRequest,
+    CreateTerminalResponse, ElicitationCapabilities, ElicitationFormCapabilities, EmbeddedResource,
+    EmbeddedResourceResource, FileSystemCapabilities, ImageContent, InitializeRequest,
+    KillTerminalRequest, KillTerminalResponse, LoadSessionRequest, LoadSessionResponse, Meta,
+    NewSessionRequest, NewSessionResponse, NoticeCapabilities, PermissionOption,
+    PermissionOptionKind, Plan, PlanEntryPriority, PlanEntryStatus, PromptRequest,
+    ReadTextFileRequest, ReadTextFileResponse, ReleaseTerminalRequest, ReleaseTerminalResponse,
+    RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse, ResourceLink,
+    ResumeSessionRequest, ResumeSessionResponse, SelectedPermissionOutcome, SessionConfigKind,
+    SessionConfigOption, SessionConfigOptionCategory, SessionConfigOptionValue,
+    SessionConfigSelectGroup, SessionConfigSelectOption, SessionConfigSelectOptions, SessionId,
+    SessionModeState, SessionNotification, SessionUpdate, SetSessionConfigOptionRequest,
+    SetSessionModeRequest, StopReason, TerminalExitStatus, TerminalOutputRequest,
+    TerminalOutputResponse, TextContent, TextResourceContents, ToolCallContent, ToolKind,
+    WaitForTerminalExitRequest, WaitForTerminalExitResponse, WriteTextFileRequest,
+    WriteTextFileResponse,
 };
 use agent_client_protocol::schema::v1::{
     HttpHeader, McpServer, McpServerHttp, McpServerSse, McpServerStdio, AGENT_METHOD_NAMES,
@@ -36,8 +36,6 @@ use agent_client_protocol::{
     HandleDispatchFrom, Handled, JsonRpcRequest, RequestCancellation, Responder, Role,
     UntypedMessage,
 };
-use crate::acp::agent_process::AcpAgent;
-use crate::acp::agent_session::AgentSession;
 use tokio::sync::{mpsc, oneshot, watch, RwLock};
 
 use crate::acp::agent_mentions::append_agent_routes;
@@ -74,8 +72,7 @@ use crate::acp::types::{
     PromptCapabilitiesInfo, PromptInputBlock, SessionConfigBooleanInfo, SessionConfigKindInfo,
     SessionConfigOptionInfo, SessionConfigSelectGroupInfo, SessionConfigSelectInfo,
     SessionConfigSelectOptionInfo, SessionFailureRecord, SessionModeInfo, SessionModeStateInfo,
-    SessionNotice,
-    ToolCallImageInfo, UserMessageBlock,
+    SessionNotice, ToolCallImageInfo, UserMessageBlock,
 };
 use crate::auto_title::{ConnectionLaunchContext, ConnectionPurpose};
 use crate::logging::throttle::LeadingEdgeThrottle;
@@ -1495,9 +1492,14 @@ fn tag_new_session_failure(
     agent_type: AgentType,
     mcp_servers: &[McpServer],
 ) -> agent_client_protocol::Error {
-    if matches!(err.code, agent_client_protocol::schema::v1::ErrorCode::AuthRequired) {
+    if matches!(
+        err.code,
+        agent_client_protocol::schema::v1::ErrorCode::AuthRequired
+    ) {
         tracing::warn!("[ACP][{agent_type}] session/new refused with authRequired: {err}");
-        return agent_client_protocol::util::internal_error(format!("{err}{AUTH_REQUIRED_SENTINEL}"));
+        return agent_client_protocol::util::internal_error(format!(
+            "{err}{AUTH_REQUIRED_SENTINEL}"
+        ));
     }
     tag_mcp_suspect(err, agent_type, mcp_servers)
 }
@@ -2794,9 +2796,12 @@ async fn build_agent(
                 .unwrap_or(false);
             let agent_name = meta.name.to_string();
             Ok(
-                AcpAgent::new(agent_client_protocol::schema::v1::McpServer::Stdio(server)).with_debug(
-                    agent_debug_callback(agent_name, Arc::clone(stderr_tail), stdio_debug_enabled),
-                ),
+                AcpAgent::new(agent_client_protocol::schema::v1::McpServer::Stdio(server))
+                    .with_debug(agent_debug_callback(
+                        agent_name,
+                        Arc::clone(stderr_tail),
+                        stdio_debug_enabled,
+                    )),
             )
         }
         AgentDistribution::Uvx {
@@ -3505,6 +3510,7 @@ struct DrainedPermissions {
 }
 
 /// Where a card stood when it left [`PermissionQueue`].
+#[allow(clippy::large_enum_variant)] // Shown keeps the promoted card by value.
 enum Departure {
     /// It was on screen; `next` is the card promoted into its place, if any.
     Shown { next: Option<QueuedPermission> },
@@ -4816,7 +4822,9 @@ async fn set_grok_model(
         reasoning_effort.as_deref(),
     );
     let untyped_req = UntypedMessage::new("session/set_model", params).map_err(|e| {
-        agent_client_protocol::util::internal_error(format!("Failed to build set_model request: {e}"))
+        agent_client_protocol::util::internal_error(format!(
+            "Failed to build set_model request: {e}"
+        ))
     })?;
     cx.send_request_to(Agent, untyped_req).block_task().await?;
     Ok(())
@@ -5986,14 +5994,18 @@ async fn send_session_response<Resp: serde::de::DeserializeOwned>(
     params: impl serde::Serialize,
 ) -> Result<(Resp, Option<serde_json::Value>, Option<String>), agent_client_protocol::Error> {
     let request = UntypedMessage::new(method, params).map_err(|e| {
-        agent_client_protocol::util::internal_error(format!("Failed to build {method} request: {e}"))
+        agent_client_protocol::util::internal_error(format!(
+            "Failed to build {method} request: {e}"
+        ))
     })?;
     let mut raw = cx.send_request_to(Agent, request).block_task().await?;
     let models = raw.get("models").cloned();
     let returned_id = crate::acp::session_attach::extract_session_id_from_raw_response(&raw);
     strip_unknown_config_options(&mut raw, method);
     let response = serde_json::from_value(raw).map_err(|e| {
-        agent_client_protocol::util::internal_error(format!("Failed to parse {method} response: {e}"))
+        agent_client_protocol::util::internal_error(format!(
+            "Failed to parse {method} response: {e}"
+        ))
     })?;
     Ok((response, models, returned_id))
 }
@@ -6032,7 +6044,6 @@ async fn send_load_session_capturing_id(
         send_session_response(cx, AGENT_METHOD_NAMES.session_load, req).await?;
     Ok((response, returned_id))
 }
-
 
 /// Emit SessionLoadFailed(unresumable) + Error status and stop bootstrap without
 /// SessionStarted (preserves durable external_id; no prompt enqueue).
@@ -6548,6 +6559,7 @@ fn record_session_channel_loss(injection: Option<&DelegationInjection>, connecti
     }
 }
 
+#[cfg(test)]
 fn handle_idle_session_update_error(
     _evidence: Option<&ParentConnectionExitEvidence>,
     _connection_id: &str,
@@ -7207,7 +7219,10 @@ fn canonical_spec_to_mcp_server(name: &str, spec: &serde_json::Value) -> Result<
             if let Some(env_obj) = obj.get("env").and_then(serde_json::Value::as_object) {
                 let env_vars: Vec<agent_client_protocol::schema::v1::EnvVariable> = env_obj
                     .iter()
-                    .filter_map(|(k, v)| v.as_str().map(|s| agent_client_protocol::schema::v1::EnvVariable::new(k, s)))
+                    .filter_map(|(k, v)| {
+                        v.as_str()
+                            .map(|s| agent_client_protocol::schema::v1::EnvVariable::new(k, s))
+                    })
                     .collect();
                 if !env_vars.is_empty() {
                     server = server.env(env_vars);
@@ -9861,24 +9876,30 @@ async fn handle_cursor_ask_question(
     // that apart from "this host never showed it" will proceed as if the user
     // had a say. The reason text is structural — never any of the payload.
     let Some((questions, ask_cfg)) = access else {
-        let _ = responder.respond(crate::acp::cursor_ext::cursor_ask_skip_response_with_reason(
-            "the host's question bridge is unavailable; the user was not asked",
-        ));
+        let _ = responder.respond(
+            crate::acp::cursor_ext::cursor_ask_skip_response_with_reason(
+                "the host's question bridge is unavailable; the user was not asked",
+            ),
+        );
         return;
     };
     if !ask_cfg.is_enabled().await {
-        let _ = responder.respond(crate::acp::cursor_ext::cursor_ask_skip_response_with_reason(
-            "the host's interactive question card is disabled; the user was not asked",
-        ));
+        let _ = responder.respond(
+            crate::acp::cursor_ext::cursor_ask_skip_response_with_reason(
+                "the host's interactive question card is disabled; the user was not asked",
+            ),
+        );
         return;
     }
     let parsed = match crate::acp::cursor_ext::parse_cursor_ask_questions(&req.0) {
         Ok(parsed) => parsed,
         Err(e) => {
             tracing::warn!("[cursor ask] rejecting malformed ext request: {e}");
-            let _ = responder.respond(crate::acp::cursor_ext::cursor_ask_skip_response_with_reason(
-                &format!("the host could not render this ask: {e}"),
-            ));
+            let _ = responder.respond(
+                crate::acp::cursor_ext::cursor_ask_skip_response_with_reason(&format!(
+                    "the host could not render this ask: {e}"
+                )),
+            );
             return;
         }
     };
@@ -9952,15 +9973,16 @@ async fn handle_cursor_create_plan(
         let _ = responder.respond(crate::acp::cursor_ext::cursor_create_plan_disconnect_response());
         return;
     };
-    let (plan_markdown, tool_call_id) = match crate::acp::cursor_ext::parse_cursor_create_plan(&req.0)
-    {
-        Ok(parsed) => parsed,
-        Err(e) => {
-            tracing::warn!("[cursor plan] rejecting malformed ext request: {e}");
-            let _ = responder.respond(crate::acp::cursor_ext::cursor_create_plan_disconnect_response());
-            return;
-        }
-    };
+    let (plan_markdown, tool_call_id) =
+        match crate::acp::cursor_ext::parse_cursor_create_plan(&req.0) {
+            Ok(parsed) => parsed,
+            Err(e) => {
+                tracing::warn!("[cursor plan] rejecting malformed ext request: {e}");
+                let _ = responder
+                    .respond(crate::acp::cursor_ext::cursor_create_plan_disconnect_response());
+                return;
+            }
+        };
     let Some(registered) = access
         .register_plan_approval(connection_id, tool_call_id, plan_markdown)
         .await
@@ -10012,9 +10034,7 @@ fn handle_cursor_generate_image(
         "[cursor image] cursor/generate_image keys={:?}",
         crate::acp::cursor_ext::param_keys(&req.0)
     );
-    let _ = responder.respond(crate::acp::cursor_ext::build_cursor_generate_image_response(
-        &req.0,
-    ));
+    let _ = responder.respond(crate::acp::cursor_ext::build_cursor_generate_image_response(&req.0));
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -10597,9 +10617,10 @@ fn config_option_rejects_value(option: &SessionConfigOption, value: &str) -> boo
     // Grouped and ungrouped are one flat namespace here, the same way
     // `config_option_rejection` reads them.
     let mut advertised = match &select.options {
-        SessionConfigSelectOptions::Ungrouped(options) => {
-            options.iter().map(|o| o.value.to_string()).collect::<Vec<_>>()
-        }
+        SessionConfigSelectOptions::Ungrouped(options) => options
+            .iter()
+            .map(|o| o.value.to_string())
+            .collect::<Vec<_>>(),
         SessionConfigSelectOptions::Grouped(groups) => groups
             .iter()
             .flat_map(|group| group.options.iter().map(|o| o.value.to_string()))
@@ -10727,7 +10748,9 @@ async fn send_goal_control(
         "action": action,
     });
     let untyped_req = UntypedMessage::new(method, params).map_err(|e| {
-        agent_client_protocol::util::internal_error(format!("Failed to build goal_control request: {e}"))
+        agent_client_protocol::util::internal_error(format!(
+            "Failed to build goal_control request: {e}"
+        ))
     })?;
     cx.send_request_to(Agent, untyped_req).block_task().await?;
     Ok(())
@@ -12437,7 +12460,7 @@ async fn handle_fork_or_exit(
         prompt_ledger,
         terminal_prompt_context,
         delegation_injection,
-        &stderr_tail,
+        stderr_tail,
     )
     .await;
     terminal_runtime.release_all_for_session(&new_sid).await;
@@ -12470,7 +12493,7 @@ async fn handle_fork_or_exit(
         prompt_ledger,
         terminal_prompt_context,
         delegation_injection,
-        &stderr_tail,
+        stderr_tail,
     ))
     .await
 }
@@ -12703,6 +12726,7 @@ async fn finalize_turn_terminal(
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn finalize_turn_terminal_reported(
     source: TurnTerminalSource<'_>,
     suspension: &mut Option<SuspensionLease>,
@@ -12873,6 +12897,7 @@ async fn finalize_turn_terminal_with_permissions(
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn finalize_turn_terminal_with_permissions_reported(
     source: TurnTerminalSource<'_>,
     suspension: &mut Option<SuspensionLease>,
@@ -13080,7 +13105,7 @@ fn start_ancillary_command(
                         AcpEvent::Error {
                             message: format!("Failed to set mode: {error}"),
                             agent_type: agent_type.to_string(),
-                            code: None,
+                            code: Some(SET_MODE_FAILED_ERROR_CODE.to_string()),
                             details: None,
                             terminal: false,
                         },
@@ -13118,7 +13143,7 @@ fn start_ancillary_command(
                     AcpEvent::Error {
                         message: format!("Failed to set config option: {error}"),
                         agent_type: agent_type.to_string(),
-                        code: None,
+                        code: Some(SET_CONFIG_OPTION_FAILED_ERROR_CODE.to_string()),
                         details: None,
                         terminal: false,
                     },
@@ -13140,7 +13165,10 @@ struct BoundPromptFinalization {
 
 #[allow(clippy::too_many_arguments)]
 async fn finalize_bound_prompt_response(
-    prompt_result: Result<agent_client_protocol::schema::v1::PromptResponse, agent_client_protocol::Error>,
+    prompt_result: Result<
+        agent_client_protocol::schema::v1::PromptResponse,
+        agent_client_protocol::Error,
+    >,
     suspension: &mut Option<SuspensionLease>,
     state: &Arc<RwLock<SessionState>>,
     emitter: &EventEmitter,
@@ -13169,7 +13197,11 @@ async fn finalize_bound_prompt_response(
                 error.code,
                 agent_client_protocol::schema::v1::ErrorCode::AuthRequired
             );
-            let reason_str = if auth_required { "auth_required" } else { "rejected" };
+            let reason_str = if auth_required {
+                "auth_required"
+            } else {
+                "rejected"
+            };
             tracing::warn!(
                 "[ACP] session/prompt refused ({error}); ending the turn and keeping the session"
             );
@@ -13546,7 +13578,10 @@ fn classify_session_load_failure(
     if message.contains("This Codex session was created by the legacy CLI runtime") {
         return Some("legacy_cli_session");
     }
-    if matches!(code, agent_client_protocol::schema::v1::ErrorCode::ResourceNotFound) {
+    if matches!(
+        code,
+        agent_client_protocol::schema::v1::ErrorCode::ResourceNotFound
+    ) {
         return Some("resource_not_found");
     }
     // codex-acp on an archived rollout: the -32603 body reads
@@ -13624,8 +13659,7 @@ fn session_load_error_action(
 /// [`classify_session_load_failure`] (a `session/load` that can't be retried)
 /// and [`prompt_rejection_is_terminal`] (a `session/prompt` rejection that no
 /// later prompt on this connection could survive either).
-const SESSION_GONE_MARKERS: &[&str] =
-    &["process exited", "session has ended", "Session not found"];
+const SESSION_GONE_MARKERS: &[&str] = &["process exited", "session has ended", "Session not found"];
 
 /// Whether a `session/prompt` rejection means the CONNECTION is dead, or only
 /// this turn.
@@ -13662,10 +13696,16 @@ const SESSION_GONE_MARKERS: &[&str] =
 /// the early return a sign-out prompt that happened to quote one of the markers
 /// would start tearing connections down.
 fn prompt_rejection_is_terminal(e: &agent_client_protocol::Error) -> bool {
-    if matches!(e.code, agent_client_protocol::schema::v1::ErrorCode::AuthRequired) {
+    if matches!(
+        e.code,
+        agent_client_protocol::schema::v1::ErrorCode::AuthRequired
+    ) {
         return false;
     }
-    if matches!(e.code, agent_client_protocol::schema::v1::ErrorCode::ResourceNotFound) {
+    if matches!(
+        e.code,
+        agent_client_protocol::schema::v1::ErrorCode::ResourceNotFound
+    ) {
         return true;
     }
     if lost_the_connection(e) {
@@ -16163,10 +16203,12 @@ fn inject_start_line(value: &mut serde_json::Value, cwd: Option<&str>) -> bool {
     let fp = obj
         .get("file_path")
         .or_else(|| obj.get("path"))
+        .or_else(|| obj.get("filePath"))
         .and_then(|v| v.as_str())
         .map(|s| s.to_string());
     let old_str = obj
         .get("old_string")
+        .or_else(|| obj.get("oldString"))
         .and_then(|v| v.as_str())
         .map(|s| s.to_string());
     if let (Some(fp), Some(old_str)) = (fp, old_str) {
@@ -16479,15 +16521,23 @@ fn stamp_codex_search_action(
 ///
 /// Same parity rule as Grok and pi (see [`grok_live_tool_output`]): whenever
 /// `content` carries anything, it IS OpenCode's own rendering of this result —
-/// return `None` and let it render. Only with no `content` is the envelope
-/// unwrapped, mirroring `parsers/opencode.rs`: `output`, else the failure
-/// `error`, else `metadata.output` (a command writing only to stderr leaves
-/// `state.output` empty while the combined stream stays in the metadata). An
-/// unrecognized payload still stringifies as before, so no result is ever lost.
+/// return `None` and let it render. `read` is the exception: `content` has
+/// already stripped the line numbers, and only `metadata.display` still has
+/// `{start_line, content}` (see [`crate::parsers::opencode::structure_read_output`]).
+/// Only with no `content` is any other envelope unwrapped, mirroring
+/// `parsers/opencode.rs`: `output`, else the failure `error`, else
+/// `metadata.output` (a command writing only to stderr leaves `state.output`
+/// empty while the combined stream stays in the metadata). An unrecognized
+/// payload still stringifies as before, so no result is ever lost.
 fn opencode_live_tool_output(
     content: &Option<String>,
     raw_output: &Option<serde_json::Value>,
 ) -> Option<String> {
+    if let Some(structured) = crate::parsers::opencode::structure_read_output(
+        raw_output.as_ref().and_then(|raw| raw.get("metadata")),
+    ) {
+        return Some(structured);
+    }
     if content.as_deref().is_some_and(|c| !c.trim().is_empty()) {
         return None;
     }
@@ -17745,7 +17795,10 @@ fn version_at_least(version: &str, min: &str) -> bool {
 /// the pinned npx package (see `commands::acp::acp_get_agent_status_core`) —
 /// report an `agent_info.version` at or above the registry minimum? Fail
 /// closed on a missing `agent_info` or an unparseable version.
-fn steering_version_ok(agent_info: Option<&agent_client_protocol::schema::v1::Implementation>, min: &str) -> bool {
+fn steering_version_ok(
+    agent_info: Option<&agent_client_protocol::schema::v1::Implementation>,
+    min: &str,
+) -> bool {
     agent_info.is_some_and(|info| version_at_least(&info.version, min))
 }
 
@@ -18475,7 +18528,9 @@ fn map_claude_sdk_ext_notification(notification: &UntypedMessage) -> Option<AcpE
     })
 }
 
-/// Shared empty-rewrite used by all three turn-completion sites.
+/// Empty-turn rewrite the production path applies inside `finish_turn_reason`.
+/// Kept for the tests that pin the `"end_turn"` → `"empty"` mapping directly.
+#[cfg(test)]
 fn rewrite_end_turn_if_empty(raw_reason: &str, turn_had_agent_output: bool) -> &str {
     if raw_reason == "end_turn" && !turn_had_agent_output {
         "empty"
@@ -19293,7 +19348,9 @@ fn has_null_session_id(message: &UntypedMessage) -> bool {
 /// [`handle_auth_status_update`]). Only `authStatus` is modelled; the payload is
 /// kept as a raw value so a new `kind` or an added field can never turn a
 /// well-formed push into a deserialization failure.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, agent_client_protocol::JsonRpcNotification)]
+#[derive(
+    Debug, Clone, serde::Serialize, serde::Deserialize, agent_client_protocol::JsonRpcNotification,
+)]
 #[notification(method = "_auth/status_update")]
 #[serde(rename_all = "camelCase")]
 struct AuthStatusUpdateNotification {
@@ -19511,9 +19568,7 @@ enum ReadyUpdateSource<'borrow> {
 }
 
 impl<'borrow> ReadyUpdateSource<'borrow> {
-    async fn try_next_ready(
-        &mut self,
-    ) -> Option<Result<Dispatch, agent_client_protocol::Error>> {
+    async fn try_next_ready(&mut self) -> Option<Result<Dispatch, agent_client_protocol::Error>> {
         match self {
             ReadyUpdateSource::Live(session) => {
                 tokio::time::timeout(std::time::Duration::ZERO, session.read_update())
@@ -19590,139 +19645,129 @@ async fn drain_ready_in_prompt_updates(
             break;
         };
         let dispatch = fix_usage_update_nulls(dispatch);
-                if let Dispatch::Notification(notification) = &dispatch {
-                    maybe_emit_request_usage(state, emitter, notification).await;
-                    if reconcile_grok_retry_dispatch(
-                        agent_type,
-                        notification,
-                        grok_retry_reconciler,
-                        state,
-                        emitter,
-                        turn_had_agent_output,
+        if let Dispatch::Notification(notification) = &dispatch {
+            maybe_emit_request_usage(state, emitter, notification).await;
+            if reconcile_grok_retry_dispatch(
+                agent_type,
+                notification,
+                grok_retry_reconciler,
+                state,
+                emitter,
+                turn_had_agent_output,
+            )
+            .await
+            {
+                continue;
+            }
+        }
+        if parse_extension_turn_completed(&dispatch).is_some() {
+            tracing::debug!(
+                secondary_terminal_suppressed = true,
+                kind = "extension_turn_completed",
+                "pre-finalize drain"
+            );
+            continue;
+        }
+        if grok_ext_notification_is_turn_output(&dispatch, agent_type) {
+            *turn_had_agent_output = true;
+            probe.saw_agent_output = true;
+        }
+        let h = emitter.clone();
+        let st = Arc::clone(state);
+        let runtime = terminal_runtime.clone();
+        let session_id = sid.clone();
+        // Same pre-dispatch seam as the in-turn arm. These frames are
+        // not `SessionNotification`s `emit_conversation_update` renders,
+        // and a biased `prompt_result` can deliver them only through
+        // this drain. Consume them so MatchDispatch does not also emit.
+        if let Some(delta) = air_async_task_delta(&dispatch) {
+            *turn_had_agent_output |= delta.spawned;
+            probe.saw_agent_output |= delta.spawned;
+            emit_with_state(&st, &h, AcpEvent::AsyncTask { delta }).await;
+        } else if let Some(notice) = session_notice(&dispatch) {
+            emit_with_state(&st, &h, AcpEvent::SessionNotice { notice }).await;
+        } else if let Some(event) = session_compaction_event(&dispatch) {
+            probe.saw_agent_output = true;
+            *turn_had_agent_output = true;
+            emit_with_state(&st, &h, event).await;
+        } else if let Err(e) = MatchDispatch::new(dispatch)
+            .if_notification(async |notif: SessionNotification| {
+                observe_terminal_assoc_from_update(
+                    &notif.update,
+                    session_id.0.as_ref(),
+                    terminal_assoc.as_ref(),
+                );
+                let should_poll_now = track_terminal_tool_calls(
+                    agent_type,
+                    &notif.update,
+                    tracked_terminal_tool_calls,
+                );
+                let bound = merge_terminal_assoc_binds(
+                    session_id.0.as_ref(),
+                    terminal_assoc.as_ref(),
+                    tracked_terminal_tool_calls,
+                );
+                // I2: sync accumulated association before frontend emit.
+                if should_poll_now || !bound.is_empty() {
+                    tool_watchdog_sync_tracked_terminals(&st, tracked_terminal_tool_calls).await;
+                }
+                if is_agent_output_update(agent_type, &notif.update) {
+                    *turn_had_agent_output = true;
+                    probe.saw_agent_output = true;
+                }
+                record_transcript_update(agent_type, &session_id.0, &notif.update);
+                mark_agent_activity_for_update(&st, &notif.update, chrono::Utc::now()).await;
+                maybe_emit_grok_total_tokens_usage(&st, &h, agent_type, notif.meta.as_ref()).await;
+                emit_conversation_update(
+                    &st,
+                    &h,
+                    agent_type,
+                    notif.update,
+                    cwd_opt,
+                    raw_output_cache,
+                    cb_state,
+                    Some(tracked_terminal_tool_calls),
+                )
+                .await;
+                if should_poll_now || !bound.is_empty() {
+                    poll_tracked_terminal_tool_calls(
+                        runtime.as_ref(),
+                        &session_id,
+                        &st,
+                        &h,
+                        tracked_terminal_tool_calls,
                     )
-                    .await
-                    {
-                        continue;
-                    }
+                    .await;
                 }
-                if parse_extension_turn_completed(&dispatch).is_some() {
-                    tracing::debug!(
-                        secondary_terminal_suppressed = true,
-                        kind = "extension_turn_completed",
-                        "pre-finalize drain"
-                    );
-                    continue;
-                }
-                if grok_ext_notification_is_turn_output(&dispatch, agent_type) {
-                    *turn_had_agent_output = true;
-                    probe.saw_agent_output = true;
-                }
-                let h = emitter.clone();
-                let st = Arc::clone(state);
-                let runtime = terminal_runtime.clone();
-                let session_id = sid.clone();
-                // Same pre-dispatch seam as the in-turn arm. These frames are
-                // not `SessionNotification`s `emit_conversation_update` renders,
-                // and a biased `prompt_result` can deliver them only through
-                // this drain. Consume them so MatchDispatch does not also emit.
-                if let Some(delta) = air_async_task_delta(&dispatch) {
-                    *turn_had_agent_output |= delta.spawned;
-                    probe.saw_agent_output |= delta.spawned;
-                    emit_with_state(&st, &h, AcpEvent::AsyncTask { delta }).await;
-                } else if let Some(notice) = session_notice(&dispatch) {
-                    emit_with_state(&st, &h, AcpEvent::SessionNotice { notice }).await;
-                } else if let Some(event) = session_compaction_event(&dispatch) {
-                    probe.saw_agent_output = true;
-                    *turn_had_agent_output = true;
-                    emit_with_state(&st, &h, event).await;
-                } else if let Err(e) = MatchDispatch::new(dispatch)
-                    .if_notification(async |notif: SessionNotification| {
-                        observe_terminal_assoc_from_update(
-                            &notif.update,
-                            session_id.0.as_ref(),
-                            terminal_assoc.as_ref(),
-                        );
-                        let should_poll_now = track_terminal_tool_calls(
-                            agent_type,
-                            &notif.update,
-                            tracked_terminal_tool_calls,
-                        );
-                        let bound = merge_terminal_assoc_binds(
-                            session_id.0.as_ref(),
-                            terminal_assoc.as_ref(),
-                            tracked_terminal_tool_calls,
-                        );
-                        // I2: sync accumulated association before frontend emit.
-                        if should_poll_now || !bound.is_empty() {
-                            tool_watchdog_sync_tracked_terminals(&st, tracked_terminal_tool_calls)
-                                .await;
-                        }
-                        if is_agent_output_update(agent_type, &notif.update) {
-                            *turn_had_agent_output = true;
-                            probe.saw_agent_output = true;
-                        }
-                        record_transcript_update(agent_type, &session_id.0, &notif.update);
-                        mark_agent_activity_for_update(&st, &notif.update, chrono::Utc::now())
-                            .await;
-                        maybe_emit_grok_total_tokens_usage(
-                            &st,
-                            &h,
-                            agent_type,
-                            notif.meta.as_ref(),
-                        )
-                        .await;
-                        emit_conversation_update(
-                            &st,
-                            &h,
-                            agent_type,
-                            notif.update,
-                            cwd_opt,
-                            raw_output_cache,
-                            cb_state,
-                            Some(tracked_terminal_tool_calls),
-                        )
-                        .await;
-                        if should_poll_now || !bound.is_empty() {
-                            poll_tracked_terminal_tool_calls(
-                                runtime.as_ref(),
-                                &session_id,
-                                &st,
-                                &h,
-                                tracked_terminal_tool_calls,
-                            )
-                            .await;
-                        }
-                        Ok(())
-                    })
-                    .await
-                    .otherwise(async |dispatch| {
-                        if maybe_emit_live_ext_notification(
-                            &st,
-                            &h,
-                            agent_type,
-                            dispatch,
-                            crate::acp::xai_session_notification::PrivateExtEmitMode::InPrompt,
-                            compact_text_emitted_this_turn,
-                        )
-                        .await
-                        {
-                            *turn_had_agent_output = true;
-                            probe.saw_agent_output = true;
-                            st.write().await.mark_agent_activity(chrono::Utc::now());
-                            tracing::debug!(
-                                drain_hit_private_compact = true,
-                                "pre-finalize drain mapped ContentDelta"
-                            );
-                        }
-                        Ok(())
-                    })
-                    .await
+                Ok(())
+            })
+            .await
+            .otherwise(async |dispatch| {
+                if maybe_emit_live_ext_notification(
+                    &st,
+                    &h,
+                    agent_type,
+                    dispatch,
+                    crate::acp::xai_session_notification::PrivateExtEmitMode::InPrompt,
+                    compact_text_emitted_this_turn,
+                )
+                .await
                 {
-                    probe.note_dropped(&e);
-                    tracing::warn!(
-                        "[ACP] Ignoring dispatch parse error during pre-finalize drain: {e}"
+                    *turn_had_agent_output = true;
+                    probe.saw_agent_output = true;
+                    st.write().await.mark_agent_activity(chrono::Utc::now());
+                    tracing::debug!(
+                        drain_hit_private_compact = true,
+                        "pre-finalize drain mapped ContentDelta"
                     );
                 }
+                Ok(())
+            })
+            .await
+        {
+            probe.note_dropped(&e);
+            tracing::warn!("[ACP] Ignoring dispatch parse error during pre-finalize drain: {e}");
+        }
     }
 }
 
@@ -20416,14 +20461,12 @@ async fn emit_conversation_update(
             // `rawInput = {command, cwd}` on the opening frame, so this could
             // only ever fire there on a frame that lost it, where the title
             // would be a worse reconstruction than the reducer's prior input.
-            let pi_bash_input = if own_raw_input.is_none()
-                && hosted_shell
-                && matches!(agent_type, AgentType::Pi)
-            {
-                pi_bash_input_from_title(Some(tc.title.as_str()))
-            } else {
-                None
-            };
+            let pi_bash_input =
+                if own_raw_input.is_none() && hosted_shell && matches!(agent_type, AgentType::Pi) {
+                    pi_bash_input_from_title(Some(tc.title.as_str()))
+                } else {
+                    None
+                };
             let content = serialize_tool_call_content(content_blocks, synthesized_edit.is_none())
                 .map(|c| unwrap_codebuddy_deferred_output(agent_type, &c).unwrap_or(c))
                 // pi announces a command with an empty result, which pi-acp
@@ -20488,13 +20531,8 @@ async fn emit_conversation_update(
             let grok_spawn = grok_meta_marks_spawn_subagent(agent_type, tc.meta.as_ref());
             // OpenCode's only authoritative statement of WHICH tool this is
             // arrives on this opening frame's title (see fn doc).
-            let meta = stamp_opencode_tool_name(
-                agent_type,
-                &status,
-                &tc.raw_input,
-                &tc.title,
-                tc.meta,
-            );
+            let meta =
+                stamp_opencode_tool_name(agent_type, &status, &tc.raw_input, &tc.title, tc.meta);
             let meta = stamp_codex_search_action(agent_type, &tc.kind, hosted_shell, meta)
                 .map(serde_json::Value::Object);
             raw_output_cache.remove_if_final(&tool_call_id, Some(status.as_str()));
@@ -20691,14 +20729,12 @@ async fn emit_conversation_update(
             // title is the bare "bash"). Re-synthesize whenever a titled frame
             // shows up; the reducer keeps the prior input on the title-less ones.
             // Gated on pi for the same reason as the ToolCall arm.
-            let pi_bash_input = if own_raw_input.is_none()
-                && hosted_shell
-                && matches!(agent_type, AgentType::Pi)
-            {
-                pi_bash_input_from_title(tcu.fields.title.as_deref())
-            } else {
-                None
-            };
+            let pi_bash_input =
+                if own_raw_input.is_none() && hosted_shell && matches!(agent_type, AgentType::Pi) {
+                    pi_bash_input_from_title(tcu.fields.title.as_deref())
+                } else {
+                    None
+                };
             let content = content_blocks
                 .and_then(|c| serialize_tool_call_content(c, synthesized_edit.is_none()))
                 .map(|c| unwrap_codebuddy_deferred_output(agent_type, &c).unwrap_or(c))
@@ -21010,7 +21046,9 @@ async fn emit_conversation_update(
                 .filter(|cmd| seen.insert(cmd.name.clone()))
                 .map(|cmd| {
                     let input_hint = cmd.input.as_ref().map(|input| match input {
-                        agent_client_protocol::schema::v1::AvailableCommandInput::Unstructured(u) => u.hint.clone(),
+                        agent_client_protocol::schema::v1::AvailableCommandInput::Unstructured(
+                            u,
+                        ) => u.hint.clone(),
                         _ => String::new(),
                     });
                     AvailableCommandInfo {
@@ -21673,7 +21711,10 @@ mod tests {
             )
             .is_none());
         assert!(queue.published_plan_review_tool_call_ids.is_empty());
-        assert!(matches!(queue.withdraw("waiting-plan"), Some(Departure::Queued)));
+        assert!(matches!(
+            queue.withdraw("waiting-plan"),
+            Some(Departure::Queued)
+        ));
         assert!(queue.published_plan_review_tool_call_ids.is_empty());
         let drained = queue.drain();
         assert!(drained.published_plan_review_tool_call_ids.is_empty());
@@ -21708,10 +21749,15 @@ mod tests {
         admit_stub_permission(&mut queue, &log, "c");
 
         assert!(matches!(queue.withdraw("b"), Some(Departure::Queued)));
-        assert_eq!(queue.showing.as_deref(), Some("a"), "the screen is untouched");
+        assert_eq!(
+            queue.showing.as_deref(),
+            Some("a"),
+            "the screen is untouched"
+        );
         assert_eq!(queue.waiting_len(), 1);
         assert_eq!(
-            queue.resolve("a", "allow".into())
+            queue
+                .resolve("a", "allow".into())
                 .next
                 .map(|c| c.request_id)
                 .as_deref(),
@@ -21917,7 +21963,6 @@ mod tests {
         assert!(perms.lock().await.showing.is_none());
     }
 
-
     /// Records the questions an elicitation registers and cancels, and never
     /// answers any — only a withdrawal can settle them.
     #[derive(Default)]
@@ -22066,7 +22111,10 @@ mod tests {
     }
 
     impl agent_client_protocol::ConnectTo<Client> for PermissionRequestProbeAgent {
-        async fn connect_to(self, client: impl agent_client_protocol::ConnectTo<Agent>) -> Result<(), agent_client_protocol::Error> {
+        async fn connect_to(
+            self,
+            client: impl agent_client_protocol::ConnectTo<Agent>,
+        ) -> Result<(), agent_client_protocol::Error> {
             Agent
                 .builder()
                 .connect_with(client, async move |cx: ConnectionTo<Client>| {
@@ -22788,15 +22836,53 @@ mod tests {
             .any(|event| matches!(event.payload, AcpEvent::ToolCall { .. })));
     }
 
+    struct HeldPrompt {
+        text: String,
+        responder: Responder<agent_client_protocol::schema::v1::PromptResponse>,
+    }
+
+    fn held_prompt_text(request: &PromptRequest) -> String {
+        request
+            .prompt
+            .iter()
+            .filter_map(|block| match block {
+                agent_client_protocol::schema::v1::ContentBlock::Text(text) => {
+                    Some(text.text.as_str())
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn take_held_prompt(
+        prompts: &std::sync::Mutex<Vec<HeldPrompt>>,
+        needle: &str,
+    ) -> Responder<agent_client_protocol::schema::v1::PromptResponse> {
+        let mut prompts = prompts.lock().unwrap();
+        let index = prompts
+            .iter()
+            .position(|held| held.text.contains(needle))
+            .unwrap_or_else(|| panic!("missing held prompt containing {needle}"));
+        prompts.remove(index).responder
+    }
+
     struct SuspensionLoopMockAgent {
-        prompts: Arc<std::sync::Mutex<Vec<Responder<agent_client_protocol::schema::v1::PromptResponse>>>>,
-        modes: Arc<std::sync::Mutex<Vec<Responder<agent_client_protocol::schema::v1::SetSessionModeResponse>>>>,
+        prompts: Arc<std::sync::Mutex<Vec<HeldPrompt>>>,
+        modes: Arc<
+            std::sync::Mutex<
+                Vec<Responder<agent_client_protocol::schema::v1::SetSessionModeResponse>>,
+            >,
+        >,
         agent_connection: Arc<std::sync::Mutex<Option<ConnectionTo<Client>>>>,
         cancel_count: Arc<std::sync::atomic::AtomicUsize>,
     }
 
     impl agent_client_protocol::ConnectTo<Client> for SuspensionLoopMockAgent {
-        async fn connect_to(self, client: impl agent_client_protocol::ConnectTo<Agent>) -> Result<(), agent_client_protocol::Error> {
+        async fn connect_to(
+            self,
+            client: impl agent_client_protocol::ConnectTo<Agent>,
+        ) -> Result<(), agent_client_protocol::Error> {
             use std::sync::atomic::Ordering;
 
             let prompt_responders = self.prompts;
@@ -22807,11 +22893,16 @@ mod tests {
             Agent
                 .builder()
                 .on_receive_request(
-                    async move |_request: PromptRequest,
-                                responder: Responder<agent_client_protocol::schema::v1::PromptResponse>,
+                    async move |request: PromptRequest,
+                                responder: Responder<
+                        agent_client_protocol::schema::v1::PromptResponse,
+                    >,
                                 connection: ConnectionTo<Client>| {
                         *prompt_connection.lock().unwrap() = Some(connection);
-                        prompt_responders.lock().unwrap().push(responder);
+                        prompt_responders.lock().unwrap().push(HeldPrompt {
+                            text: held_prompt_text(&request),
+                            responder,
+                        });
                         Ok(())
                     },
                     on_receive_request!(),
@@ -23002,10 +23093,7 @@ mod tests {
             .builder()
             .connect_with(mock_agent, async move |cx| {
                 let session_id = SessionId::new("session-1".to_string());
-                let mut session = AgentSession::attach(
-                    &cx,
-                    NewSessionResponse::new(session_id),
-                )?;
+                let mut session = AgentSession::attach(&cx, NewSessionResponse::new(session_id))?;
                 if seed_aux_stop_reason {
                     // The mock holds the prompt responder and never answers, so
                     // this must not be awaited on the loop task. AgentSession
@@ -23019,10 +23107,7 @@ mod tests {
                                 "auxiliary terminal producer",
                             ))],
                         );
-                        let _ = prompt_cx
-                            .send_request_to(Agent, request)
-                            .block_task()
-                            .await;
+                        let _ = prompt_cx.send_request_to(Agent, request).block_task().await;
                     });
                 }
                 let shell = test_placeholder_terminal_shell();
@@ -23573,9 +23658,11 @@ mod tests {
             .expect("mock agent connection")
             .send_notification(extension)
             .unwrap();
-        let auxiliary = prompts.lock().unwrap().remove(0);
+        let auxiliary = take_held_prompt(&prompts, "auxiliary terminal producer");
         auxiliary
-            .respond(agent_client_protocol::schema::v1::PromptResponse::new(StopReason::EndTurn))
+            .respond(agent_client_protocol::schema::v1::PromptResponse::new(
+                StopReason::EndTurn,
+            ))
             .unwrap();
         for _ in 0..20 {
             tokio::task::yield_now().await;
@@ -23585,9 +23672,11 @@ mod tests {
             Err(tokio::sync::oneshot::error::TryRecvError::Empty)
         ));
 
-        let bound = prompts.lock().unwrap().remove(0);
+        let bound = take_held_prompt(&prompts, "bound parent prompt");
         bound
-            .respond(agent_client_protocol::schema::v1::PromptResponse::new(StopReason::Cancelled))
+            .respond(agent_client_protocol::schema::v1::PromptResponse::new(
+                StopReason::Cancelled,
+            ))
             .unwrap();
         let ack = tokio::time::timeout(std::time::Duration::from_secs(1), receiver)
             .await
@@ -23671,9 +23760,11 @@ mod tests {
             modes.lock().unwrap().len() == 1
         })
         .await;
-        let bound = prompts.lock().unwrap().remove(0);
+        let bound = prompts.lock().unwrap().remove(0).responder;
         bound
-            .respond(agent_client_protocol::schema::v1::PromptResponse::new(StopReason::Cancelled))
+            .respond(agent_client_protocol::schema::v1::PromptResponse::new(
+                StopReason::Cancelled,
+            ))
             .unwrap();
         for _ in 0..20 {
             tokio::task::yield_now().await;
@@ -23792,7 +23883,10 @@ mod tests {
             .lock()
             .unwrap()
             .remove(0)
-            .respond(agent_client_protocol::schema::v1::PromptResponse::new(StopReason::Cancelled))
+            .responder
+            .respond(agent_client_protocol::schema::v1::PromptResponse::new(
+                StopReason::Cancelled,
+            ))
             .unwrap();
         // Bounded non-starvation under a native duplicate-control producer, not a
         // 1s latency SLA. Match the 5s causal barriers above so loaded CI can
@@ -23964,7 +24058,10 @@ mod tests {
             .lock()
             .unwrap()
             .remove(0)
-            .respond(agent_client_protocol::schema::v1::PromptResponse::new(StopReason::Cancelled))
+            .responder
+            .respond(agent_client_protocol::schema::v1::PromptResponse::new(
+                StopReason::Cancelled,
+            ))
             .unwrap();
         drop(cmd_tx);
         for _ in 0..200 {
@@ -26279,7 +26376,9 @@ mod tests {
             state,
             &EventEmitter::Noop,
             AgentType::Codex,
-            SessionUpdate::SessionInfoUpdate(agent_client_protocol::schema::v1::SessionInfoUpdate::new().meta(meta)),
+            SessionUpdate::SessionInfoUpdate(
+                agent_client_protocol::schema::v1::SessionInfoUpdate::new().meta(meta),
+            ),
             None,
             &mut raw_output_cache,
             cb_state,
@@ -26455,7 +26554,8 @@ mod tests {
                 }
             }}
         }));
-        let response = agent_client_protocol::schema::v1::PromptResponse::new(StopReason::EndTurn).meta(response_meta);
+        let response = agent_client_protocol::schema::v1::PromptResponse::new(StopReason::EndTurn)
+            .meta(response_meta);
         let mut suspension = None;
         let terminal_assoc = Arc::new(std::sync::Mutex::new(TerminalAssocFallback::new(false)));
         let terminal_runtime = Arc::new(TerminalRuntime::new(
@@ -26533,7 +26633,6 @@ mod tests {
         assert_eq!(failure.severity, "error");
         assert!(!failure.resolved);
     }
-
 
     #[tokio::test]
     async fn auth_required_prompt_rejection_keeps_the_session_addressable() {
@@ -27853,7 +27952,11 @@ mod tests {
                 "Yes",
                 PermissionOptionKind::AllowOnce,
             ),
-            agent_client_protocol::schema::v1::PermissionOption::new("reject", "No", PermissionOptionKind::RejectOnce),
+            agent_client_protocol::schema::v1::PermissionOption::new(
+                "reject",
+                "No",
+                PermissionOptionKind::RejectOnce,
+            ),
         ]
     }
 
@@ -28021,7 +28124,10 @@ mod tests {
         // If order is inverted (classify first), this fails — and so would the
         // dual-error harness that calls the same helper.
         assert_eq!(
-            classify_session_load_failure(agent_client_protocol::schema::v1::ErrorCode::ResourceNotFound, "load failed",),
+            classify_session_load_failure(
+                agent_client_protocol::schema::v1::ErrorCode::ResourceNotFound,
+                "load failed",
+            ),
             Some("resource_not_found"),
         );
         assert_eq!(
@@ -28106,7 +28212,10 @@ mod tests {
              019bf0c4-4d1a-7c3e-9f21-6a0e5b8d2c47 is archived. Run `codex \
              unarchive 019bf0c4-4d1a-7c3e-9f21-6a0e5b8d2c47` to restore it.\"\n}";
         assert_eq!(
-            classify_session_load_failure(agent_client_protocol::schema::v1::ErrorCode::InternalError, archived),
+            classify_session_load_failure(
+                agent_client_protocol::schema::v1::ErrorCode::InternalError,
+                archived
+            ),
             Some("session_archived"),
         );
 
@@ -28149,7 +28258,10 @@ mod tests {
              01a0626c-c601-78f1-a13d-2b26dd168501 already has an active \
              writer\"\n}";
         assert_eq!(
-            classify_session_load_failure(agent_client_protocol::schema::v1::ErrorCode::InternalError, busy),
+            classify_session_load_failure(
+                agent_client_protocol::schema::v1::ErrorCode::InternalError,
+                busy
+            ),
             Some("session_busy"),
         );
 
@@ -29521,7 +29633,10 @@ mod tests {
             "terminal/release",
         ] {
             let error = unadvertised_channel_error(method);
-            assert_eq!(error.code, agent_client_protocol::Error::method_not_found().code);
+            assert_eq!(
+                error.code,
+                agent_client_protocol::Error::method_not_found().code
+            );
             let text = error.to_string();
             // The knob has to be named: a bare "Method not found" on a channel
             // that worked yesterday reads as a codeg bug, not as a setting.
@@ -30147,7 +30262,7 @@ mod tests {
         use crate::acp::terminal_assoc::TerminalAssocFallback;
         use crate::acp::terminal_runtime::TerminalRuntime;
         use crate::web::event_bridge::{EventEmitter, WebEventBroadcaster};
-        use agent_client_protocol::schema::v1::{SessionId, StopReason};
+        use agent_client_protocol::schema::v1::SessionId;
 
         let state = Arc::new(RwLock::new(SessionState::new(
             "conn-test".into(),
@@ -32175,14 +32290,18 @@ mod tests {
         ))
         .expect("codex notice");
         assert_eq!(codex.severity, "warning");
-        assert!(codex.title.starts_with("Model metadata for `codeg-probe-unknown-model`"));
+        assert!(codex
+            .title
+            .starts_with("Model metadata for `codeg-probe-unknown-model`"));
         assert_eq!(codex.description, None);
 
         let codex_multiline = session_notice(&from_wire(
             r#"{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"01a0cc1b-7aa2-78e3-8e55-c9ab3b7f506e","update":{"sessionUpdate":"notice","severity":"warning","title":"Falling back from WebSockets to HTTPS transport. unexpected status 401 Unauthorized: {\n  \"error\": {\n    \"me, url: wss://api.openai.com/v1/responses, cf-ray: a3f623f1398b2eaf-LAX, request id: req_350561679b9e4cf6895346dd25919bd9, auth error: 401, auth error code: invalid_api_key"}}}"#,
         ))
         .expect("codex transport notice");
-        assert!(codex_multiline.title.starts_with("Falling back from WebSockets"));
+        assert!(codex_multiline
+            .title
+            .starts_with("Falling back from WebSockets"));
         assert!(codex_multiline.title.contains('\n'));
     }
 
@@ -32190,7 +32309,11 @@ mod tests {
     /// nothing to show, and a toast with an empty body is worse than silence.
     #[test]
     fn a_notice_without_a_usable_title_is_dropped() {
-        for title in [serde_json::json!(""), serde_json::json!("   "), serde_json::Value::Null] {
+        for title in [
+            serde_json::json!(""),
+            serde_json::json!("   "),
+            serde_json::Value::Null,
+        ] {
             assert!(
                 session_notice(&async_task_notif(serde_json::json!({
                     "sessionUpdate": "notice",
@@ -32229,11 +32352,13 @@ mod tests {
             "title": "not a notice",
         })))
         .is_none());
-        assert!(session_compaction_event(&async_task_notif(serde_json::json!({
-            "sessionUpdate": "agent_message_chunk",
-            "compactionId": "cmp_1",
-        })))
-        .is_none());
+        assert!(
+            session_compaction_event(&async_task_notif(serde_json::json!({
+                "sessionUpdate": "agent_message_chunk",
+                "compactionId": "cmp_1",
+            })))
+            .is_none()
+        );
         // Neither rides anything but `session/update` — an extension method
         // that happens to nest the same shape must not be swallowed.
         let other_method = Dispatch::Notification(
@@ -32280,10 +32405,22 @@ mod tests {
                     .as_ref()
                     .and_then(|m| m.get("contextCompaction"))
                     .expect("card payload");
-                assert_eq!(payload.get("trigger").and_then(|v| v.as_str()), Some("automatic"));
-                assert_eq!(payload.get("preTokens").and_then(|v| v.as_u64()), Some(180000));
-                assert_eq!(payload.get("postTokens").and_then(|v| v.as_u64()), Some(42000));
-                assert_eq!(payload.get("durationMs").and_then(|v| v.as_u64()), Some(3200));
+                assert_eq!(
+                    payload.get("trigger").and_then(|v| v.as_str()),
+                    Some("automatic")
+                );
+                assert_eq!(
+                    payload.get("preTokens").and_then(|v| v.as_u64()),
+                    Some(180000)
+                );
+                assert_eq!(
+                    payload.get("postTokens").and_then(|v| v.as_u64()),
+                    Some(42000)
+                );
+                assert_eq!(
+                    payload.get("durationMs").and_then(|v| v.as_u64()),
+                    Some(3200)
+                );
             }
             other => panic!("expected a ToolCallUpdate, got {other:?}"),
         }
@@ -32302,7 +32439,9 @@ mod tests {
             })))
             .expect("compaction event");
             match event {
-                AcpEvent::ToolCallUpdate { status: got, meta, .. } => {
+                AcpEvent::ToolCallUpdate {
+                    status: got, meta, ..
+                } => {
                     assert_eq!(got.as_deref(), Some(status));
                     assert!(
                         meta.as_ref()
@@ -32366,7 +32505,8 @@ mod tests {
         assert_eq!(raw_output.as_deref(), Some("We refactored the parser."));
         assert_eq!(raw_output_append, None, "the settled summary REPLACES");
         assert_eq!(
-            meta.as_ref().and_then(|m| m.get(COMPACTION_SUMMARY_META_KEY)),
+            meta.as_ref()
+                .and_then(|m| m.get(COMPACTION_SUMMARY_META_KEY)),
             Some(&serde_json::Value::Bool(true))
         );
 
@@ -32386,7 +32526,8 @@ mod tests {
         };
         assert_eq!(raw_output, None);
         assert_eq!(
-            meta.as_ref().and_then(|m| m.get(COMPACTION_SUMMARY_META_KEY)),
+            meta.as_ref()
+                .and_then(|m| m.get(COMPACTION_SUMMARY_META_KEY)),
             Some(&serde_json::Value::Bool(true))
         );
 
@@ -32664,7 +32805,11 @@ mod tests {
                 .unwrap(),
             )
         };
-        for variant in ["image_dropped", "auto_compact_completed", "auto_compact_failed"] {
+        for variant in [
+            "image_dropped",
+            "auto_compact_completed",
+            "auto_compact_failed",
+        ] {
             assert!(
                 grok_ext_notification_skipped_on_replay(&notif(variant), AgentType::Grok),
                 "{variant} must not replay into the live state"
@@ -32704,7 +32849,10 @@ mod tests {
             }) => {
                 assert_eq!(message, "Context compaction failed: API error (status 503)");
                 assert_eq!(code.as_deref(), Some(COMPACTION_FAILED_ERROR_CODE));
-                assert!(!terminal, "a failed compaction must not kill the connection");
+                assert!(
+                    !terminal,
+                    "a failed compaction must not kill the connection"
+                );
             }
             other => panic!("expected the companion Error, got {other:?}"),
         }
@@ -33289,7 +33437,8 @@ mod tests {
         ));
         // The agent answered to say its session/process is gone.
         for marker in SESSION_GONE_MARKERS {
-            let e = agent_client_protocol::Error::internal_error().data(format!("Claude Code {marker} — sorry"));
+            let e = agent_client_protocol::Error::internal_error()
+                .data(format!("Claude Code {marker} — sorry"));
             assert!(prompt_rejection_is_terminal(&e), "{e}");
         }
         // The runtime's own synthesized error: the response channel was dropped, so
@@ -33535,7 +33684,6 @@ mod tests {
         assert!(meta.contains_key("codeg.dev/terminal"));
     }
 
-
     fn stdio_server(name: &str) -> McpServer {
         McpServer::Stdio(McpServerStdio::new(
             name,
@@ -33649,7 +33797,9 @@ mod tests {
     #[test]
     fn a_non_auth_refusal_still_takes_the_mcp_path() {
         let tagged = tag_new_session_failure(
-            agent_client_protocol::util::internal_error("session/new failed: unknown field `mcpServers`"),
+            agent_client_protocol::util::internal_error(
+                "session/new failed: unknown field `mcpServers`",
+            ),
             AgentType::Custom("my-agent"),
             &[stdio_server("codeg")],
         )
@@ -34077,13 +34227,15 @@ mod tests {
         // Exact shape Grok returns when switching to a model whose agentType
         // differs from the established conversation's (captured from a live
         // `session/set_model` probe against grok 0.2.98).
-        let err = agent_client_protocol::Error::new(-32600, "Cannot switch to model ...").data(serde_json::json!({
-            "code": "MODEL_SWITCH_INCOMPATIBLE_AGENT",
-            "activeAgentType": "grok-build-plan",
-            "requiredAgentType": "cursor",
-            "modelId": "grok-composer-2.5-fast",
-            "suggestion": "start_new_session"
-        }));
+        let err = agent_client_protocol::Error::new(-32600, "Cannot switch to model ...").data(
+            serde_json::json!({
+                "code": "MODEL_SWITCH_INCOMPATIBLE_AGENT",
+                "activeAgentType": "grok-build-plan",
+                "requiredAgentType": "cursor",
+                "modelId": "grok-composer-2.5-fast",
+                "suggestion": "start_new_session"
+            }),
+        );
         assert!(is_grok_incompatible_agent_switch(&err));
 
         // A different data.code, or no data at all, must NOT be swallowed —
@@ -34091,7 +34243,9 @@ mod tests {
         let other = agent_client_protocol::Error::new(-32603, "boom")
             .data(serde_json::json!({ "code": "SOMETHING_ELSE" }));
         assert!(!is_grok_incompatible_agent_switch(&other));
-        assert!(!is_grok_incompatible_agent_switch(&agent_client_protocol::Error::internal_error()));
+        assert!(!is_grok_incompatible_agent_switch(
+            &agent_client_protocol::Error::internal_error()
+        ));
     }
 
     #[test]
@@ -34185,7 +34339,6 @@ mod tests {
         assert_eq!(p["_meta"]["reasoningEffort"], "high");
     }
 
-
     // ── config-option verdicts ──────────────────────────────────────────────
     //
     // `session/set_config_option` is advisory: the agent answers with the option
@@ -34252,7 +34405,9 @@ mod tests {
 
     #[test]
     fn config_option_rejection_is_silent_when_the_pick_landed() {
-        assert!(config_option_rejection(&rejection_fixture("high"), "thought_level", "high").is_none());
+        assert!(
+            config_option_rejection(&rejection_fixture("high"), "thought_level", "high").is_none()
+        );
     }
 
     #[test]
@@ -34964,13 +35119,7 @@ mod tests {
     #[test]
     fn opencode_tool_name_is_stamped_only_on_the_arg_less_opening_frame() {
         let stamped = |status: &str, raw_input: serde_json::Value, title: &str| {
-            stamp_opencode_tool_name(
-                AgentType::OpenCode,
-                status,
-                &Some(raw_input),
-                title,
-                None,
-            )
+            stamp_opencode_tool_name(AgentType::OpenCode, status, &Some(raw_input), title, None)
         };
         // The real opening frame: `pending`, `rawInput: {}`, title = tool id.
         assert_eq!(
@@ -34986,15 +35135,16 @@ mod tests {
         // the COMPLETED state — display title, populated input — so the empty
         // -input gate is what keeps the marker off it.
         assert_eq!(
-            stamped("pending", serde_json::json!({"pattern": "*.txt"}), "notes.txt"),
+            stamped(
+                "pending",
+                serde_json::json!({"pattern": "*.txt"}),
+                "notes.txt"
+            ),
             None
         );
         // Later frames in the lifecycle: nothing to record, the reducer keeps
         // the opening frame's meta.
-        assert_eq!(
-            stamped("in_progress", serde_json::json!({}), "glob"),
-            None
-        );
+        assert_eq!(stamped("in_progress", serde_json::json!({}), "glob"), None);
         assert_eq!(stamped("pending", serde_json::json!({}), "   "), None);
     }
 
@@ -35028,7 +35178,10 @@ mod tests {
         )
         .expect("meta");
         assert_eq!(with_sibling["vendor"], serde_json::json!({ "x": 1 }));
-        assert_eq!(with_sibling["opencode"], serde_json::json!({ "toolName": "read" }));
+        assert_eq!(
+            with_sibling["opencode"],
+            serde_json::json!({ "toolName": "read" })
+        );
 
         let preexisting = stamp_opencode_tool_name(
             AgentType::OpenCode,
@@ -35808,7 +35961,10 @@ mod tests {
             raw_output.is_none(),
             "the aggregated output repeats what the delta delivered: {raw_output:?}"
         );
-        assert!(cb.hosted_terminal_calls.is_empty(), "a final status releases the entry");
+        assert!(
+            cb.hosted_terminal_calls.is_empty(),
+            "a final status releases the entry"
+        );
     }
 
     /// Only codex's own `search` command actions carry the marker the
@@ -35833,7 +35989,10 @@ mod tests {
         let existing = serde_json::json!({"other": 1}).as_object().cloned();
         let kept = stamp_codex_search_action(AgentType::Codex, &ToolKind::Search, false, existing);
         assert!(marked(&kept));
-        assert_eq!(kept.as_ref().and_then(|m| m.get("other")), Some(&serde_json::json!(1)));
+        assert_eq!(
+            kept.as_ref().and_then(|m| m.get("other")),
+            Some(&serde_json::json!(1))
+        );
 
         for (agent, kind, hosted) in [
             (AgentType::ClaudeCode, ToolKind::Search, false),
@@ -37534,17 +37693,14 @@ mod tests {
         }
     }
 
-
     /// A launch that carries a proxy leaves with the loopback exception, in
     /// both spellings — the agent's own local services must never be sent to
     /// it. The proxy comes from the per-agent row so the test does not depend
     /// on this machine's environment; `*` is what an inherited `NO_PROXY=*` yields.
     #[test]
     fn a_proxied_launch_env_carries_the_loopback_exception() {
-        let runtime_env = BTreeMap::from([(
-            "HTTP_PROXY".to_string(),
-            "http://10.0.0.2:3128".to_string(),
-        )]);
+        let runtime_env =
+            BTreeMap::from([("HTTP_PROXY".to_string(), "http://10.0.0.2:3128".to_string())]);
         let merged = merge_agent_env_with_color(false, &[], &runtime_env, None);
         for key in ["NO_PROXY", "no_proxy"] {
             let value = merged_value(&merged, key).unwrap_or_default();
@@ -39012,7 +39168,10 @@ mod tests {
     }
 
     impl agent_client_protocol::ConnectTo<Client> for ResumeContractMockAgent {
-        async fn connect_to(self, client: impl agent_client_protocol::ConnectTo<Agent>) -> Result<(), agent_client_protocol::Error> {
+        async fn connect_to(
+            self,
+            client: impl agent_client_protocol::ConnectTo<Agent>,
+        ) -> Result<(), agent_client_protocol::Error> {
             use agent_client_protocol::schema::v1::{
                 AgentCapabilities, InitializeRequest, InitializeResponse, PromptRequest,
                 PromptResponse, SessionCapabilities, SessionResumeCapabilities,
@@ -39064,7 +39223,10 @@ mod tests {
                                     responder.respond(body.clone())
                                 }
                                 ResumeContractRpcOutcome::Err { code, message } => responder
-                                    .respond_with_error(agent_client_protocol::Error::new(*code, message.clone())),
+                                    .respond_with_error(agent_client_protocol::Error::new(
+                                        *code,
+                                        message.clone(),
+                                    )),
                             }
                         }
                         "session/load" => {
@@ -39074,7 +39236,10 @@ mod tests {
                                     responder.respond(body.clone())
                                 }
                                 ResumeContractRpcOutcome::Err { code, message } => responder
-                                    .respond_with_error(agent_client_protocol::Error::new(*code, message.clone())),
+                                    .respond_with_error(agent_client_protocol::Error::new(
+                                        *code,
+                                        message.clone(),
+                                    )),
                             }
                         }
                         "session/new" => {
@@ -39083,9 +39248,11 @@ mod tests {
                                 "sessionId": "should-not-be-called"
                             }))
                         }
-                        other => responder.respond_with_error(agent_client_protocol::util::internal_error(format!(
-                            "unexpected method in resume contract mock: {other}"
-                        ))),
+                        other => responder.respond_with_error(
+                            agent_client_protocol::util::internal_error(format!(
+                                "unexpected method in resume contract mock: {other}"
+                            )),
+                        ),
                     },
                     agent_client_protocol::on_receive_request!(),
                 )
@@ -39833,7 +40000,10 @@ mod tests {
         );
         // Sanity: this code *would* short-circuit on Default attach.
         assert_eq!(
-            classify_session_load_failure(agent_client_protocol::schema::v1::ErrorCode::ResourceNotFound, "load failed",),
+            classify_session_load_failure(
+                agent_client_protocol::schema::v1::ErrorCode::ResourceNotFound,
+                "load failed",
+            ),
             Some("resource_not_found"),
         );
         let obs = run_resume_existing_contract(mock, "sess-dead", counters, Some(settle)).await;
