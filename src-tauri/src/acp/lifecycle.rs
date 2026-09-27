@@ -15,7 +15,7 @@ use std::sync::atomic::Ordering;
 use std::sync::{Arc, OnceLock, Weak};
 use std::time::Duration;
 
-use sea_orm::{DatabaseConnection, EntityTrait, TransactionTrait};
+use sea_orm::{ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter, TransactionTrait};
 use tokio::sync::{broadcast, mpsc};
 
 use crate::acp::cursor_enrichment::CursorStoreEnricher;
