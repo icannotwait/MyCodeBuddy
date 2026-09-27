@@ -149,6 +149,97 @@ describe("WebEventStream reconnect mode", () => {
     )
   })
 
+  it("renews as soon as a shared subscription is armed", () => {
+    const f = hostFixture()
+    const stream = new WebEventStream(f.host)
+    stream.attach(
+      "conn",
+      { shared: { generation: 4, leaseId: "lease-4" } },
+      handlers
+    )
+
+    const actions = f.sendFrame.mock.calls.map(
+      (call) => (call[0] as { action: string }).action
+    )
+    expect(actions).toEqual(["attach", "ping"])
+    stream.destroy()
+  })
+
+  it("pings again immediately after a shared subscription is reattached", () => {
+    const f = hostFixture()
+    const stream = new WebEventStream(f.host)
+    stream.attach(
+      "conn",
+      { shared: { generation: 4, leaseId: "lease-4" } },
+      handlers
+    )
+    f.sendFrame.mockClear()
+    f.reconnect()
+
+    const actions = f.sendFrame.mock.calls.map(
+      (call) => (call[0] as { action: string }).action
+    )
+    expect(actions).toEqual(["attach", "ping"])
+    expect(f.sendFrame).toHaveBeenCalledWith(
+      expect.objectContaining({ generation: 4, lease_id: "lease-4" })
+    )
+    stream.destroy()
+  })
+
+  it("warns once when an open socket cannot send the shared renew", () => {
+    vi.useFakeTimers()
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {})
+    const f = hostFixture()
+    f.sendFrame.mockImplementation((frame: { action?: string }) => {
+      return frame.action !== "ping"
+    })
+    const stream = new WebEventStream(f.host)
+    stream.attach(
+      "conn",
+      { shared: { generation: 4, leaseId: "lease-4" } },
+      handlers
+    )
+    vi.advanceTimersByTime(30_000)
+
+    const notArmed = warn.mock.calls.filter((call) =>
+      String(call[0]).includes("not armed")
+    )
+    expect(notArmed).toHaveLength(1)
+    expect(notArmed[0]?.[1]).toMatchObject({ reason: "send failed", shared: 1 })
+    stream.destroy()
+    warn.mockRestore()
+  })
+
+  it("resumes renewals after lease expiry when a fresh shared attach lands", () => {
+    vi.useFakeTimers()
+    const f = hostFixture()
+    const stream = new WebEventStream(f.host)
+    const sub = stream.attach(
+      "conn",
+      { shared: { generation: 4, leaseId: "lease-4" } },
+      handlers
+    )
+    stream.handleServerFrame({
+      type: "detached",
+      subscription_id: sub.subscriptionId,
+      reason: "lease_expired",
+    })
+    f.sendFrame.mockClear()
+    vi.advanceTimersByTime(60_000)
+    expect(f.sendFrame).not.toHaveBeenCalled()
+
+    stream.attach(
+      "conn",
+      { shared: { generation: 5, leaseId: "lease-5" } },
+      handlers
+    )
+    expect(f.sendFrame).toHaveBeenCalledWith({ action: "ping" })
+    f.sendFrame.mockClear()
+    vi.advanceTimersByTime(30_000)
+    expect(f.sendFrame).toHaveBeenCalledWith({ action: "ping" })
+    stream.destroy()
+  })
+
   it("pings every 30 seconds only while a shared subscription exists", () => {
     vi.useFakeTimers()
     const f = hostFixture()

@@ -11355,6 +11355,34 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
             existing.status !== "disconnected" &&
             existing.status !== "error"
           ) {
+            // The store can still hold a lease after the WS subscription was
+            // dropped (attach error, missed reattach). Put that binding back
+            // on the socket explicitly — do not wait for a later caller that
+            // only copies `sharedSession` when the argument was omitted.
+            const binding = {
+              generation: existing.sharedSession.generation,
+              leaseId: existing.sharedSession.leaseId,
+            }
+            const retry = attachRetryRef.current.get(contextKey)
+            const hasLiveSharedAttach =
+              attachSubscriptionsRef.current.has(contextKey) &&
+              retry?.shared?.generation === binding.generation &&
+              retry?.shared?.leaseId === binding.leaseId
+            if (!hasLiveSharedAttach) {
+              const sinceSeq =
+                existing.lastAppliedSeq > 0
+                  ? existing.lastAppliedSeq
+                  : undefined
+              dispatch({ type: "CLEAR_ATTACH_ERROR", contextKey })
+              teardownAttachSubscription(contextKey)
+              setupAttachSubscription(
+                contextKey,
+                existing.connectionId,
+                sinceSeq,
+                "resume",
+                binding
+              )
+            }
             return
           }
           if (existing) {
@@ -11435,6 +11463,9 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
           const attachSinceSeq = sameGeneration
             ? activeRequest.sharedReconnect?.sinceSeq
             : undefined
+          // Fresh broker lease, passed in explicitly. After lease_expired the
+          // store entry is already gone, so this must not depend on copying
+          // `sharedSession` back out of memory.
           setupAttachSubscription(
             contextKey,
             response.connectionId,

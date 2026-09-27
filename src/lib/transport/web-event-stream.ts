@@ -104,6 +104,7 @@ export class WebEventStream implements EventStream {
   private unbindWsReady: (() => void) | null
   private sharedHeartbeat: ReturnType<typeof setInterval> | null = null
   private idleHeartbeatKey: string | null = null
+  private heartbeatWarnKey: string | null = null
   private destroyed = false
 
   constructor(private host: AttachTransportHost) {
@@ -134,6 +135,10 @@ export class WebEventStream implements EventStream {
       this.sendAttach(subscriptionId)
     }
     this.syncSharedHeartbeat()
+    // Renew as soon as the binding is on an open socket. Waiting for the
+    // first 30s tick leaves the ~90s lease unrenewed when that timer is
+    // deferred, and a later wake probe then pings a socket with no sub.
+    if (options.shared) this.sendSharedRenew("armed")
     return {
       subscriptionId,
       detach: () => this.detach(subscriptionId),
@@ -278,15 +283,30 @@ export class WebEventStream implements EventStream {
     for (const subscriptionId of this.subs.keys()) {
       this.sendAttach(subscriptionId)
     }
+    // The new socket has the attach bindings only after the frames above.
+    // Ping immediately so renewals resume without waiting out a throttled
+    // interval that was armed on the previous socket.
+    this.sendSharedRenew("reattach")
   }
 
   private syncSharedHeartbeat(): void {
     const summary = leaseSubscriptionSummary(this.subs)
     const needsHeartbeat = !this.destroyed && summary.shared > 0
     if (needsHeartbeat && this.sharedHeartbeat === null) {
-      this.sharedHeartbeat = setInterval(() => {
-        this.tickSharedHeartbeat()
-      }, 30_000)
+      let timer: ReturnType<typeof setInterval> | null = null
+      try {
+        timer = setInterval(() => {
+          this.tickSharedHeartbeat()
+        }, 30_000)
+      } catch (err) {
+        this.warnHeartbeatOnce("timer failed", summary, err)
+        return
+      }
+      if (timer === null) {
+        this.warnHeartbeatOnce("timer failed", summary)
+        return
+      }
+      this.sharedHeartbeat = timer
       this.idleHeartbeatKey = null
       console.debug(`${LEASE_HEARTBEAT_LOG} start`, summary)
       return
@@ -333,14 +353,57 @@ export class WebEventStream implements EventStream {
       })
       return
     }
-    const sent = this.host.sendFrame({ action: "ping" })
+    const sent = this.sendSharedRenew("tick")
     if (sent) {
       console.debug(`${LEASE_HEARTBEAT_LOG} tick sent`, counts)
-      return
     }
-    console.debug(`${LEASE_HEARTBEAT_LOG} tick skipped`, {
-      reason: "send failed",
-      ...counts,
+  }
+
+  /**
+   * One `{action:"ping"}` for every live shared subscription on this socket.
+   * No-op when nothing is bound. A failed send on an open socket is warned
+   * once per subscription set; a closed socket stays on the debug path
+   * because the next `onWsReady` reattach renews.
+   */
+  private sendSharedRenew(reason: "armed" | "reattach" | "tick"): boolean {
+    const summary = leaseSubscriptionSummary(this.subs)
+    if (this.destroyed || summary.shared === 0) return false
+    if (!this.host.isWsOpen()) {
+      console.debug(`${LEASE_HEARTBEAT_LOG} renew skipped`, {
+        reason: "ws not open",
+        trigger: reason,
+        shared: summary.shared,
+      })
+      return false
+    }
+    const sent = this.host.sendFrame({ action: "ping" })
+    if (sent) {
+      this.heartbeatWarnKey = null
+      if (reason !== "tick") {
+        console.debug(`${LEASE_HEARTBEAT_LOG} renew sent`, {
+          trigger: reason,
+          shared: summary.shared,
+        })
+      }
+      return true
+    }
+    this.warnHeartbeatOnce("send failed", summary)
+    return false
+  }
+
+  private warnHeartbeatOnce(
+    reason: string,
+    summary: LeaseHeartbeatSummary,
+    err?: unknown
+  ): void {
+    const key = `${reason}|${heartbeatIdleKey(this.destroyed, summary)}`
+    if (key === this.heartbeatWarnKey) return
+    this.heartbeatWarnKey = key
+    console.warn(`${LEASE_HEARTBEAT_LOG} not armed`, {
+      reason,
+      shared: summary.shared,
+      nonShared: summary.nonShared,
+      ...(err !== undefined ? { error: err } : {}),
     })
   }
 
