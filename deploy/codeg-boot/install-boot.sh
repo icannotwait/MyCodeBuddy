@@ -10,7 +10,7 @@ mkdir -p "$DEST" /workspace/heartbeat /workspace/codeg-data /workspace/codeg-dis
 # Only ship known scripts; never rsync whole tree with backups.
 for f in ensure-acp-agents.sh codeg-watchdog.sh codeg-supervisor.sh \
          start-codeg-server.sh start-codeg-tunnel.sh start-webdav.sh \
-         reload-watchdog-once.sh; do
+         reload-watchdog-once.sh auto-sync-boot.sh; do
   if [ ! -f "$SRC/$f" ]; then
     echo "missing $SRC/$f" >&2
     exit 1

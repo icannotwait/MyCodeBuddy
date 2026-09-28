@@ -28,13 +28,10 @@ LOG=$HB/ensure-acp-agents.log
 LOCK=$HB/ensure-acp-agents.lock
 TOKEN_FILE=$DATA/CODEG_TOKEN
 API=http://127.0.0.1:3080
-# Registry pin for Grok after 0.31.0 sync
-GROK_PKG='@xai-official/grok@1.0.34'
-GROK_VER='1.0.34'
-# Antigravity binary pin (dl.google.com; system DNS may fake-ip this host)
-ANTIGRAVITY_VER='1.2.1'
-ANTIGRAVITY_ZIP_URL="https://dl.google.com/agy-extensions/releases/linux/agy-acp-server-${ANTIGRAVITY_VER}-linux-x86_64.zip"
-CURSOR_VER='2026.09.15-d2fe57e'
+# Versions come from the running codeg-server registry (acp_list_agents.registry_version).
+# Optional overrides: CODEG_ANTIGRAVITY_VER / CODEG_CURSOR_VER / CODEG_GROK_VER
+GROK_PKG_BASE='@xai-official/grok'
+
 
 mkdir -p "$HB" "$MIRROR" "$CACHE" "$GROK_MIRROR"
 
@@ -198,8 +195,11 @@ fi
 if [ -d "$GROK_MIRROR" ] && [ "$(ls -A "$GROK_MIRROR" 2>/dev/null)" ]; then
   mkdir -p "$GROK_BIN_DIR"
   sync_dir "$GROK_MIRROR" "$GROK_BIN_DIR" || true
-  if [ -x "$GROK_BIN_DIR/grok-$GROK_VER" ]; then
-    ln -sfn "grok-$GROK_VER" "$GROK_BIN_DIR/grok"
+  if [ -x "$GROK_BIN_DIR/grok" ]; then
+    :
+  elif ls "$GROK_BIN_DIR"/grok-* >/dev/null 2>&1; then
+    latest=$(ls -1 "$GROK_BIN_DIR"/grok-* | sort -V | tail -n1)
+    ln -sfn "$(basename "$latest")" "$GROK_BIN_DIR/grok"
   fi
 fi
 
@@ -209,7 +209,7 @@ if [ -d "$GROK_BIN_DIR" ] && [ "$(ls -A "$GROK_BIN_DIR" 2>/dev/null)" ]; then
   sync_dir "$GROK_BIN_DIR" "$GROK_MIRROR"
 fi
 
-# --- 3) Downloads if server up ---
+# --- 3) Downloads if server up: follow registry_version from live server ---
 if ! port_up; then
   log "skip download: 3080 down"
   exit 0
@@ -225,104 +225,119 @@ if [ -z "$TOKEN" ]; then
 fi
 export CODEG_TOKEN_FILE="$TOKEN_FILE"
 
-agents_to_fix=""
-if command -v python3 >/dev/null 2>&1; then
-  agents_to_fix=$(python3 - <<'PY' 2>/dev/null || true
-import json, urllib.request, sys, os
-token=open(os.environ["CODEG_TOKEN_FILE"]).read().strip()
-req=urllib.request.Request(
+# Emit lines: <dist> <agent_type> <registry_version> <installed_or_->
+# Need update when enabled and registry_version set and installed != registry.
+PLAN=$(python3 - <<'PY' 2>/dev/null || true
+import json, urllib.request, os, sys
+token = open(os.environ["CODEG_TOKEN_FILE"]).read().strip()
+req = urllib.request.Request(
   "http://127.0.0.1:3080/api/acp_list_agents",
   data=b"{}",
-  headers={"Authorization":"Bearer "+token,"Content-Type":"application/json"},
+  headers={"Authorization": "Bearer " + token, "Content-Type": "application/json"},
   method="POST",
 )
 try:
-  agents=json.load(urllib.request.urlopen(req, timeout=30))
+  agents = json.load(urllib.request.urlopen(req, timeout=30))
 except Exception as e:
   sys.stderr.write(str(e))
   sys.exit(1)
-need=[]
+ov = {
+  "antigravity": os.environ.get("CODEG_ANTIGRAVITY_VER", "").strip(),
+  "cursor": os.environ.get("CODEG_CURSOR_VER", "").strip(),
+  "grok": os.environ.get("CODEG_GROK_VER", "").strip(),
+}
 for a in agents:
   if not a.get("enabled"):
     continue
-  if a.get("distribution_type") != "binary":
+  at = a.get("agent_type") or ""
+  dist = a.get("distribution_type") or ""
+  if dist not in ("binary", "npx"):
     continue
-  if a.get("installed_version"):
+  if at not in ("antigravity", "cursor", "grok"):
     continue
-  need.append(a["agent_type"])
-print(" ".join(need))
+  reg = (ov.get(at) or a.get("registry_version") or "").strip()
+  if not reg:
+    continue
+  inst = (a.get("installed_version") or "").strip() or "-"
+  if inst == reg:
+    continue
+  print(f"{dist} {at} {reg} {inst}")
 PY
-) || agents_to_fix="antigravity cursor"
-fi
-[ -z "$agents_to_fix" ] && agents_to_fix=""
+)
 
-# Always ensure pinned binary agents exist as COMPLETE installs (empty version dirs do not count)
-for a in antigravity cursor; do
-  case "$a" in
+if [ -z "${PLAN:-}" ]; then
+  log "registry: nothing to update (enabled agents match registry_version)"
+else
+  log "registry plan: $(echo "$PLAN" | tr '\n' ';')"
+fi
+
+while IFS= read -r line; do
+  [ -n "$line" ] || continue
+  # shellcheck disable=SC2086
+  set -- $line
+  dist=$1 agent=$2 want=$3 inst=${4:--}
+
+  case "$agent" in
     antigravity)
+      ANTIGRAVITY_VER=$want
+      ANTIGRAVITY_ZIP_URL="https://dl.google.com/agy-extensions/releases/linux/agy-acp-server-${ANTIGRAVITY_VER}-linux-x86_64.zip"
       if antigravity_installed "$ANTIGRAVITY_VER"; then
+        log "antigravity $ANTIGRAVITY_VER already on disk (api said installed=$inst)"
         continue
       fi
+      if install_antigravity_direct; then
+        continue
+      fi
+      log "antigravity direct install failed; falling back to API download version=$want"
       ;;
     cursor)
-      folder=cursor; want=$CURSOR_VER
-      # cursor ships a single binary tree; require non-empty version dir
-      if [ -d "$CACHE/$folder/$want" ] && [ -n "$(ls -A "$CACHE/$folder/$want" 2>/dev/null)" ]; then
+      if [ -d "$CACHE/cursor/$want" ] && [ -n "$(ls -A "$CACHE/cursor/$want" 2>/dev/null)" ]; then
+        log "cursor $want already on disk (api said installed=$inst)"
         continue
       fi
       ;;
-    *) continue ;;
-  esac
-  case " $agents_to_fix " in
-    *" $a "*) ;;
-    *) agents_to_fix="$agents_to_fix $a" ;;
-  esac
-done
-
-agents_to_fix=$(echo "$agents_to_fix" | tr ' ' '\n' | awk 'NF' | sort -u | tr '\n' ' ')
-
-for agent in $agents_to_fix; do
-  if [ "$agent" = "antigravity" ]; then
-    # Prefer direct DoH/--resolve path: codeg's own downloader uses system DNS,
-    # which fake-ips dl.google.com and hangs on this box.
-    if install_antigravity_direct; then
+    grok)
+      GROK_VER=$want
+      GROK_PKG="${GROK_PKG_BASE}@${GROK_VER}"
+      if command -v npm >/dev/null 2>&1; then
+        if ! "$GROK_BIN_DIR/grok" --version 2>/dev/null | grep -q "$GROK_VER"; then
+          log "installing $GROK_PKG via npm (installed=$inst registry=$want)"
+          npm install -g "$GROK_PKG" >>"$LOG" 2>&1 || log "npm install grok failed"
+        fi
+      fi
+      if [ -x "$GROK_BIN_DIR/grok-$GROK_VER" ]; then
+        ln -sfn "grok-$GROK_VER" "$GROK_BIN_DIR/grok"
+        mkdir -p "$GROK_MIRROR"
+        sync_dir "$GROK_BIN_DIR" "$GROK_MIRROR"
+        log "mirrored grok bins -> $GROK_MIRROR"
+      elif command -v grok >/dev/null 2>&1; then
+        grok --version >>"$LOG" 2>&1 || true
+        if [ -x "$GROK_BIN_DIR/grok-$GROK_VER" ]; then
+          ln -sfn "grok-$GROK_VER" "$GROK_BIN_DIR/grok"
+          sync_dir "$GROK_BIN_DIR" "$GROK_MIRROR"
+        fi
+      fi
       continue
-    fi
-    log "antigravity direct install failed; falling back to API download"
-  fi
+      ;;
+  esac
+
   tid="ensure-$(date +%s)-$agent"
-  log "downloading $agent taskId=$tid"
+  log "downloading $agent version=$want taskId=$tid (was $inst)"
   code=$(curl -sS -m 900 -o /tmp/ensure-acp-$agent.body -w '%{http_code}' -X POST "$API/api/acp_download_agent_binary" \
     -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
-    -d "{\"agentType\":\"$agent\",\"taskId\":\"$tid\"}" 2>/tmp/ensure-acp-$agent.err || echo "000")
+    -d "{\"agentType\":\"$agent\",\"version\":\"$want\",\"taskId\":\"$tid\"}" 2>/tmp/ensure-acp-$agent.err || echo "000")
   if [ "$code" = "200" ]; then
-    log "download $agent ok"
+    log "download $agent@$want ok"
   else
-    log "download $agent failed http=$code body=$(head -c 200 /tmp/ensure-acp-$agent.body 2>/dev/null) err=$(head -c 120 /tmp/ensure-acp-$agent.err 2>/dev/null)"
+    log "download $agent@$want failed http=$code body=$(head -c 200 /tmp/ensure-acp-$agent.body 2>/dev/null) err=$(head -c 120 /tmp/ensure-acp-$agent.err 2>/dev/null)"
   fi
-done
+done <<EOF
+$PLAN
+EOF
 
-# --- 4) Grok npx pin + durable binary mirror ---
-if command -v npm >/dev/null 2>&1; then
-  if ! "$GROK_BIN_DIR/grok" --version 2>/dev/null | grep -q "$GROK_VER"; then
-    log "installing $GROK_PKG via npm"
-    npm install -g "$GROK_PKG" >>"$LOG" 2>&1 || log "npm install grok failed"
-  fi
-fi
-# Ensure symlink + mirror
-if [ -x "$GROK_BIN_DIR/grok-$GROK_VER" ]; then
-  ln -sfn "grok-$GROK_VER" "$GROK_BIN_DIR/grok"
-  mkdir -p "$GROK_MIRROR"
+# --- 4) Keep grok symlink/mirror warm even when already matching registry ---
+if [ -d "$GROK_BIN_DIR" ] && [ "$(ls -A "$GROK_BIN_DIR" 2>/dev/null)" ]; then
   sync_dir "$GROK_BIN_DIR" "$GROK_MIRROR"
-  log "mirrored grok bins -> $GROK_MIRROR"
-elif command -v grok >/dev/null 2>&1; then
-  # Trigger decompress by running once
-  grok --version >>"$LOG" 2>&1 || true
-  if [ -x "$GROK_BIN_DIR/grok-$GROK_VER" ]; then
-    ln -sfn "grok-$GROK_VER" "$GROK_BIN_DIR/grok"
-    sync_dir "$GROK_BIN_DIR" "$GROK_MIRROR"
-    log "mirrored grok bins after launch -> $GROK_MIRROR"
-  fi
 fi
 
 # Final mirror of agent cache

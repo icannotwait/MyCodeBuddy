@@ -141,6 +141,19 @@ while true; do
   if [ $((loop % 10)) -eq 0 ] && [ -x "$BOOT/ensure-acp-agents.sh" ]; then
     "$BOOT/ensure-acp-agents.sh" 9>&- || true
   fi
+  # Same cadence: sync boot scripts from git/GitHub (auto-sync self-rate-limits to 1h)
+  if [ $((loop % 10)) -eq 0 ] && [ -x "$BOOT/auto-sync-boot.sh" ]; then
+    "$BOOT/auto-sync-boot.sh" 9>&- || true
+    if [ -f "$HB/boot-sync.reload" ]; then
+      rm -f "$HB/boot-sync.reload"
+      echo "$(TZ=Asia/Shanghai date '+%Y-%m-%d %H:%M:%S CST') boot scripts updated; reloading watchdog" >>"$LOG"
+      # Replace this process with a fresh watchdog so the new script is loaded.
+      if [ -x "$BOOT/reload-watchdog-once.sh" ]; then
+        nohup "$BOOT/reload-watchdog-once.sh" >/dev/null 2>&1 9>&- &
+        exit 0
+      fi
+    fi
+  fi
 
   sleep 60 9>&-
 done
