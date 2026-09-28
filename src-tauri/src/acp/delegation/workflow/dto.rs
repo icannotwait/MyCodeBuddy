@@ -161,6 +161,9 @@ pub struct WorkflowNodeSnapshot {
     pub returned_reviewer_count: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
+    /// Original Simple plan task title; child session title enrichment does not change it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_title: Option<String>,
     pub status: ProjectedNodeStatus,
     #[serde(default)]
     pub sync_state: WorkflowNodeSyncState,
@@ -665,6 +668,7 @@ mod tests {
                 required_reviewer_count: None,
                 returned_reviewer_count: None,
                 title: None,
+                task_title: None,
                 status: ProjectedNodeStatus::Estimated,
                 sync_state: WorkflowNodeSyncState::InSync,
                 projection_warning_codes: vec![],

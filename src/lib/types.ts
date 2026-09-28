@@ -1227,6 +1227,8 @@ export interface WorkflowNodeSnapshot {
   effort?: string | null
   profile_id?: string | null
   task_index?: number | null
+  /** Original plan task title, independent of delegated session titles. */
+  task_title?: string | null
   task_risk_level?: "normal" | "high" | null
   task_risk_reason_codes: string[]
   required_reviewer_count?: number | null

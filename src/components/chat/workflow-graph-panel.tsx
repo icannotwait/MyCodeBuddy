@@ -338,14 +338,14 @@ function hasUnambiguousNodeIds(
 
 function SimpleTaskExecution({
   node,
+  taskTitle,
   roleLabel,
-  showTitle,
   current,
   allowOpen,
 }: {
   node: WorkflowNodeSnapshot
+  taskTitle: string
   roleLabel: string
-  showTitle: boolean
   current: boolean
   allowOpen: boolean
 }) {
@@ -354,6 +354,7 @@ function SimpleTaskExecution({
   const tDel = useTranslations("Folder.chat.delegation")
   const nowMs = useNowMs(isLiveNodeStatus(node.status))
   const elapsed = totalElapsedMs(node, nowMs)
+  const effort = node.effort?.trim()
   const model =
     node.model?.trim().replace(/^(?:codex|claude)[\s/:-]+/i, "") ||
     (node.agent_type ? getAgentLabel(node.agent_type) : null) ||
@@ -403,7 +404,7 @@ function SimpleTaskExecution({
         current && "bg-blue-500/5"
       )}
     >
-      <div className="grid min-w-0 grid-cols-[minmax(0,1.3fr)_minmax(0,1fr)_3rem_1.5rem] items-center gap-2 text-left text-xs">
+      <div className="grid min-w-0 grid-cols-[calc(25%-0.5rem)_minmax(0,1fr)_2.25rem_1.5rem] items-center gap-2 text-left text-xs">
         <span className="flex min-w-0 items-center gap-1.5">
           <span
             role="img"
@@ -434,12 +435,24 @@ function SimpleTaskExecution({
               </span>
             )}
           </span>
-          <span className="min-w-0 break-all" dir="auto">
-            {model}
+          <span className="flex min-w-0 flex-wrap items-center gap-x-1.5 gap-y-0.5">
+            <span className="min-w-0 break-all" dir="auto">
+              {model}
+            </span>
+            {effort && (
+              <span
+                className="rounded bg-muted px-1 py-0.5 text-[10px] leading-3 [overflow-wrap:anywhere]"
+                aria-label={t("effortLabel", { effort })}
+                title={t("effortLabel", { effort })}
+                dir="auto"
+              >
+                {effort}
+              </span>
+            )}
           </span>
         </span>
         <span
-          className="translate-x-2 whitespace-nowrap text-left text-[11px] tabular-nums text-muted-foreground"
+          className="whitespace-nowrap text-left text-[11px] tabular-nums text-muted-foreground"
           dir="ltr"
         >
           {elapsed != null ? formatCompactElapsed(elapsed) : "—"}
@@ -448,8 +461,8 @@ function SimpleTaskExecution({
           <button
             type="button"
             data-testid={`simple-task-open-${node.node_id}`}
-            aria-label={t("openSession")}
-            title={t("openSession")}
+            aria-label={`${t("openSession")} · ${taskTitle} · ${roleLabel}`}
+            title={`${t("openSession")} · ${taskTitle} · ${roleLabel}`}
             className="inline-flex size-6 items-center justify-center rounded text-muted-foreground hover:bg-muted hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
             onClick={() => {
               void openDelegatedChildSession({
@@ -465,14 +478,6 @@ function SimpleTaskExecution({
           <span />
         )}
       </div>
-      {showTitle && (
-        <p
-          className="ps-5 text-[11px] text-muted-foreground [overflow-wrap:anywhere]"
-          dir="auto"
-        >
-          {nodeDisplayTitle(node)}
-        </p>
-      )}
       {(editSummary || node.tool_call_count != null) && (
         <p className="flex flex-wrap gap-x-3 ps-5 text-[11px] text-muted-foreground">
           {editSummary && <span>{editSummary}</span>}
@@ -533,6 +538,9 @@ function SimpleWorkflowTaskPanel({
     () => buildWorkflowNodeRows(snapshot.nodes, "tasks"),
     [snapshot.nodes]
   )
+  const taskTitle = (row: (typeof rows)[number]) =>
+    row.nodes.find((node) => node.task_title?.trim())?.task_title?.trim() ||
+    t("taskIndex", { index: row.taskIndex ?? rows.indexOf(row) + 1 })
   const completed = rows.filter((row) =>
     row.nodes.every((node) => node.status === "completed")
   ).length
@@ -670,9 +678,6 @@ function SimpleWorkflowTaskPanel({
           </p>
         )}
         {rows.map((row, rowIndex) => {
-          const primary =
-            row.nodes.find((node) => node.role === "implementer") ??
-            row.nodes[0]
           const reviewerCount = row.nodes.filter(
             (node) => node.role === "reviewer"
           ).length
@@ -692,7 +697,7 @@ function SimpleWorkflowTaskPanel({
                 "min-w-0 overflow-hidden rounded-xl border bg-card",
                 current && "border-blue-500/40"
               )}
-              aria-label={nodeDisplayTitle(primary)}
+              aria-label={taskTitle(row)}
             >
               <div className="flex items-start gap-1.5 border-b border-border/60 px-3 py-2">
                 <span className="mt-0.5 inline-flex size-3.5 shrink-0 items-center justify-start rounded bg-muted text-[10px] font-medium tabular-nums text-muted-foreground">
@@ -702,7 +707,7 @@ function SimpleWorkflowTaskPanel({
                   className="min-w-0 text-[13px] font-semibold leading-5 [overflow-wrap:anywhere]"
                   dir="auto"
                 >
-                  {nodeDisplayTitle(primary)}
+                  {taskTitle(row)}
                 </h3>
               </div>
               {waitingFor.length > 0 && (
@@ -712,7 +717,7 @@ function SimpleWorkflowTaskPanel({
                       .map((dependency) =>
                         dependency.taskIndex != null
                           ? t("taskIndex", { index: dependency.taskIndex })
-                          : nodeDisplayTitle(dependency.nodes[0])
+                          : taskTitle(dependency)
                       )
                       .join(" · "),
                   })}
@@ -731,13 +736,11 @@ function SimpleWorkflowTaskPanel({
                     <SimpleTaskExecution
                       key={`${node.node_id}-${nodeIndex}`}
                       node={node}
+                      taskTitle={taskTitle(row)}
                       roleLabel={
                         node.role === "reviewer" && reviewerCount > 1
                           ? `${role} ${reviewerIndex}`
                           : role
-                      }
-                      showTitle={
-                        nodeDisplayTitle(node) !== nodeDisplayTitle(primary)
                       }
                       current={snapshot.current_node_ids.includes(node.node_id)}
                       allowOpen={idsAreUnambiguous}

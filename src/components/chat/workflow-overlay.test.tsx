@@ -749,19 +749,39 @@ function simplePanelView(
 }
 
 describe("Simple workflow task overview", () => {
-  it("keeps a single reviewer's distinct title visible before a summary arrives", () => {
+  it("uses the plan task title and hides child session titles", () => {
     const graph = simpleDagGraph()
     graph.nodes = graph.nodes
       .filter((item) => item.task_index === 1)
-      .map((item) => ({ ...item, summary: null }))
+      .map((item) => ({
+        ...item,
+        task_title: "Cancellation and retry",
+        summary: null,
+      }))
     const reviewer = graph.nodes.find((item) => item.role === "reviewer")!
     reviewer.title = "Check cancellation and retry behavior"
-    render(simplePanelView(graph, 88))
+    const view = render(simplePanelView(graph, 88))
     expect(
-      within(
-        screen.getByTestId(`workflow-task-node-${reviewer.node_id}`)
-      ).getByText(reviewer.title)
+      screen.getByRole("heading", { name: "Cancellation and retry" })
     ).toBeVisible()
+    for (const item of graph.nodes)
+      expect(screen.queryByText(item.title!)).not.toBeInTheDocument()
+    view.rerender(
+      simplePanelView(
+        {
+          ...graph,
+          nodes: graph.nodes.map((item) => ({
+            ...item,
+            title: "Renamed session",
+          })),
+        },
+        88
+      )
+    )
+    expect(
+      screen.getByRole("heading", { name: "Cancellation and retry" })
+    ).toBeVisible()
+    expect(screen.queryByText("Renamed session")).not.toBeInTheDocument()
   })
 
   it("shows every task, parallel review, result and compact metric without selection", () => {
@@ -784,6 +804,7 @@ describe("Simple workflow task overview", () => {
     const review = screen.getByTestId("workflow-task-node-t2-primary")
     expect(within(review).getByText("sonnet-4.6")).toBeVisible()
     expect(within(review).getByText("1h35m")).toBeVisible()
+    expect(within(review).getByText("high")).toBeVisible()
     expect(within(review).getByRole("img", { name: "Running" })).toBeVisible()
     expect(within(review).queryByText("Running")).not.toBeInTheDocument()
     expect(within(review).queryByText(/Agent:|Model:/)).not.toBeInTheDocument()
@@ -848,7 +869,11 @@ describe("Simple workflow task overview", () => {
     expect(openWorkflowFile).toHaveBeenCalledWith(
       "/repo/.superpowers/sdd/88/progress.md"
     )
-    await userEvent.click(screen.getByTestId("simple-task-open-t2-aux"))
+    await userEvent.click(
+      screen.getByRole("button", {
+        name: "Open conversation · Task 2 · Review 2",
+      })
+    )
     expect(openDelegatedChildSession).toHaveBeenCalledWith(
       expect.objectContaining({ childConversationId: 203 })
     )
@@ -883,7 +908,7 @@ describe("Simple workflow task overview", () => {
     expect(screen.getByTestId("simple-projection-warning")).toBeVisible()
     expect(screen.getAllByTestId(/^workflow-task-node-/)).toHaveLength(2)
     expect(
-      screen.queryByRole("button", { name: "Open conversation" })
+      screen.queryByRole("button", { name: /^Open conversation/ })
     ).not.toBeInTheDocument()
   })
 
@@ -893,9 +918,7 @@ describe("Simple workflow task overview", () => {
       node({ node_id: "unindexed", title: "Unindexed task", task_index: null }),
     ]
     const view = render(simplePanelView(graph, 88))
-    expect(
-      screen.getByRole("heading", { name: "Unindexed task" })
-    ).toBeVisible()
+    expect(screen.getByRole("heading", { name: "Task 1" })).toBeVisible()
     view.rerender(simplePanelView({ ...graph, nodes: [], edges: [] }, 88))
     expect(screen.getByText("No Plan tasks found")).toBeVisible()
     expect(screen.queryAllByTestId(/^workflow-task-group-/)).toHaveLength(0)

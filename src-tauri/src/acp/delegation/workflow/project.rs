@@ -983,6 +983,7 @@ fn project_node_from_binding(
         required_reviewer_count: None,
         returned_reviewer_count: None,
         title,
+        task_title: None,
         status,
         sync_state: WorkflowNodeSyncState::InSync,
         projection_warning_codes: vec![],
@@ -1038,6 +1039,7 @@ fn project_node_from_manifest_only(
         required_reviewer_count: None,
         returned_reviewer_count: None,
         title: first_display_title([mn.title.as_deref()]),
+        task_title: None,
         status: ProjectedNodeStatus::Estimated,
         sync_state: WorkflowNodeSyncState::InSync,
         projection_warning_codes: vec![],
@@ -1921,6 +1923,7 @@ fn append_orphan_observed_nodes(
             required_reviewer_count: None,
             returned_reviewer_count: None,
             title: orphan_title,
+            task_title: None,
             status,
             sync_state: WorkflowNodeSyncState::InSync,
             projection_warning_codes: vec![],
@@ -2746,11 +2749,19 @@ fn simple_route_agent_and_profile(expected_key: &str) -> (Option<String>, Option
     }
 }
 
+const MAX_SIMPLE_TITLE_CHARS: usize = 200;
+
 fn simple_route_display_title(task_title: &str, route_label: &str) -> String {
-    const MAX_SIMPLE_ROUTE_TITLE_CHARS: usize = 200;
     redact_display_string(&format!("{task_title}: {route_label}"))
         .chars()
-        .take(MAX_SIMPLE_ROUTE_TITLE_CHARS)
+        .take(MAX_SIMPLE_TITLE_CHARS)
+        .collect()
+}
+
+fn simple_task_display_title(task_title: &str) -> String {
+    redact_display_string(task_title)
+        .chars()
+        .take(MAX_SIMPLE_TITLE_CHARS)
         .collect()
 }
 
@@ -2851,6 +2862,7 @@ fn project_simple_route_node(
         required_reviewer_count: None,
         returned_reviewer_count: None,
         title: Some(simple_route_display_title(&task.title, spec.title_label)),
+        task_title: Some(simple_task_display_title(&task.title)),
         status,
         sync_state: if simple_warnings_affect_sync(&node_warning_codes) {
             WorkflowNodeSyncState::OutOfSync
@@ -3352,6 +3364,7 @@ async fn project_simple_mode(
             required_reviewer_count: None,
             returned_reviewer_count: None,
             title: Some(redact_display_string(&task.title)),
+            task_title: Some(simple_task_display_title(&task.title)),
             status,
             sync_state: if simple_warnings_affect_sync(&node_warning_codes) {
                 WorkflowNodeSyncState::OutOfSync
@@ -3632,6 +3645,7 @@ async fn project_observed_only(
             required_reviewer_count: None,
             returned_reviewer_count: None,
             title: observed_title,
+            task_title: None,
             status,
             sync_state: WorkflowNodeSyncState::InSync,
             projection_warning_codes: vec![],
@@ -4196,6 +4210,67 @@ mod tests {
         )
         .await
         .expect("register routed Simple descriptor");
+    }
+
+    #[test]
+    fn simple_task_display_title_redacts_and_caps_unicode_chars() {
+        assert_eq!(
+            simple_task_display_title(&"漢".repeat(205)),
+            "漢".repeat(200)
+        );
+        let title = simple_task_display_title("Open /secret/project/keys.pem");
+        assert!(title.contains("[redacted]"));
+        assert!(!title.contains("keys.pem"));
+    }
+
+    #[tokio::test]
+    async fn simple_route_task_title_survives_child_rename() {
+        use sea_orm::{ActiveModelTrait, Set};
+
+        let (db, parent) = seed_parent().await;
+        let routing = simple_multi_task_routing_fixture(&[(1, "normal")]);
+        register_routed_simple_fixture(&db, parent, &routing, &[(1, "Original plan task")], None)
+            .await;
+        let child_id = insert_run(
+            &db,
+            parent,
+            "named-child",
+            Some("task|1|implementer|codex|none"),
+            DelegationRunStatus::Running,
+            1,
+            None,
+            None,
+            "codex",
+        )
+        .await;
+        let child = crate::db::entities::conversation::Entity::find_by_id(child_id)
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .unwrap();
+        let mut child: crate::db::entities::conversation::ActiveModel = child.into();
+        child.title = Set(Some("Renamed child session".into()));
+        child.update(&db.conn).await.unwrap();
+
+        let snapshot = project_workflow_graph_core(&db, parent)
+            .await
+            .expect("routed Simple snapshot");
+        let implementer = snapshot
+            .nodes
+            .iter()
+            .find(|node| node.node_id == "simple-task-1-implementer")
+            .expect("implementer route");
+        let reviewer = snapshot
+            .nodes
+            .iter()
+            .find(|node| node.node_id == "simple-task-1-reviewer-primary")
+            .expect("reviewer route");
+        assert_eq!(implementer.title.as_deref(), Some("Renamed child session"));
+        assert_eq!(
+            implementer.task_title.as_deref(),
+            Some("Original plan task")
+        );
+        assert_eq!(reviewer.task_title.as_deref(), Some("Original plan task"));
     }
 
     #[test]
@@ -7424,6 +7499,7 @@ mod tests {
             required_reviewer_count: None,
             returned_reviewer_count: None,
             title: None,
+            task_title: None,
             status: ProjectedNodeStatus::Completed,
             sync_state: WorkflowNodeSyncState::InSync,
             projection_warning_codes: vec![],
@@ -8259,6 +8335,10 @@ mod tests {
         assert_eq!(pending.compatibility, WorkflowCompatibility::Simple);
         assert_eq!(pending.overall_state, WorkflowOverallState::Pending);
         assert_eq!(pending.current_node_ids, vec!["simple-task-1"]);
+        assert_eq!(
+            pending.nodes[0].task_title.as_deref(),
+            Some("Durable mismatch")
+        );
         assert!(
             pending.gates.is_empty(),
             "Simple mode must not create gates"
@@ -8296,6 +8376,7 @@ mod tests {
             .find(|node| node.task_index == Some(1))
             .expect("first task");
         assert_eq!(first.status, ProjectedNodeStatus::Completed);
+        assert_eq!(first.task_title.as_deref(), Some("Durable mismatch"));
         assert_eq!(first.sync_state, WorkflowNodeSyncState::OutOfSync);
         assert!(first
             .projection_warning_codes
@@ -8311,6 +8392,7 @@ mod tests {
             .find(|node| node.task_index == Some(2))
             .expect("second task");
         assert_eq!(second.status, ProjectedNodeStatus::InProgress);
+        assert_eq!(second.task_title.as_deref(), Some("Active work"));
         assert!(second
             .projection_warning_codes
             .iter()
