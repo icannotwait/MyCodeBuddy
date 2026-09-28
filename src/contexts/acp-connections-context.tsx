@@ -10483,6 +10483,54 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
           )
         }
       },
+      releaseWebOwnerAttach: async (conversationId) => {
+        if (conversationId <= 0) return
+        const abandon: string[] = []
+        const inflight = inflightConnectRequestsRef.current
+        for (const [contextKey, request] of inflight) {
+          if (request.conversationId === conversationId) {
+            abandon.push(contextKey)
+          }
+        }
+        const pending = pendingConnectRequestsRef.current
+        for (const [contextKey, request] of pending) {
+          if (request.conversationId === conversationId) {
+            abandon.push(contextKey)
+          }
+        }
+        for (const contextKey of abandon) {
+          abandonedKeysRef.current.add(contextKey)
+          pending.delete(contextKey)
+        }
+        const releases: Promise<void>[] = []
+        const entries = [...storeRef.current.connections]
+        for (const [contextKey, conn] of entries) {
+          if (conn.conversationId !== conversationId) continue
+          if (conn.isDelegationChild) continue
+          const shared = conn.sharedSession
+          teardownAttachSubscription(contextKey)
+          reverseMapRef.current.delete(conn.connectionId)
+          pendingUnmappedEventsRef.current.delete(conn.connectionId)
+          lastActivityRef.current.delete(contextKey)
+          clearAliasesPointingTo(contextKey)
+          if (conn.connectionId !== contextKey) {
+            clearAliasesPointingTo(conn.connectionId)
+          }
+          // Lease only. Terminating or acpDisconnect would kill the agent
+          // the pop-out is about to own.
+          if (shared && !conn.isViewer) {
+            releases.push(
+              acpReleaseLease(
+                conn.connectionId,
+                shared.generation,
+                shared.leaseId
+              ).catch(() => {})
+            )
+          }
+          dispatch({ type: "CONNECTION_REMOVED", contextKey })
+        }
+        await Promise.all(releases)
+      },
       hasReleasedForReclaim: (conversationId, operationId) => {
         const snap = releasedForReclaimRef.current.get(
           releaseKey(conversationId, operationId)

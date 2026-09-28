@@ -86,6 +86,8 @@ const popoutFailureMessages = {
   popupBlocked:
     "Your browser blocked the conversation pop-out. Allow pop-ups and try again.",
   handoffFailed: "Failed to pop out conversation",
+  stillOpen:
+    "This conversation is open in a pop-out window. Close that window before opening it here.",
   runtimeRestartRequired:
     "WebView2 was updated. Restart DrawCode before using conversation pop-out. Restarting interrupts currently running tasks.",
   restartAction: "Restart DrawCode",

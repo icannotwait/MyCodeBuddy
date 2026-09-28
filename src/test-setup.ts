@@ -1,4 +1,10 @@
 import "@testing-library/jest-dom/vitest"
+import { afterEach } from "vitest"
+import { __resetWebPopoutPresenceForTests } from "@/lib/conversation-popout-web-presence"
+
+afterEach(() => {
+  __resetWebPopoutPresenceForTests()
+})
 
 const hasStorageMethods = (storage: Storage | undefined): storage is Storage =>
   typeof storage?.getItem === "function" &&

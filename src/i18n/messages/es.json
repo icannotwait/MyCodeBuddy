@@ -6477,6 +6477,7 @@
     "cannotPopOutDraft": "Start the session before popping out",
     "popOutHandoffFailed": "Failed to pop out conversation",
     "popOutPopupBlocked": "El navegador bloqueó la ventana emergente de la conversación. Permite las ventanas emergentes y vuelve a intentarlo.",
+    "popOutStillOpen": "Esta conversación está abierta en una ventana emergente. Ciérrala antes de abrirla aquí.",
     "runtimeRestartRequired": "WebView2 se actualizó. Reinicia DrawCode antes de abrir una conversación en otra ventana. Reiniciar interrumpe las tareas en curso.",
     "restartDrawCode": "Reiniciar DrawCode",
     "restartFailed": "No se pudo reiniciar DrawCode. Inténtalo de nuevo.",

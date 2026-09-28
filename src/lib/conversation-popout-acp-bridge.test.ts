@@ -11,6 +11,7 @@ import {
   markTransferringOut,
   registerPopoutAcpBridge,
   releaseConnectionWithoutDisconnect,
+  releaseWebOwnerAttach,
   setSuppressFrontendDisconnect,
 } from "@/lib/conversation-popout-acp-bridge"
 
@@ -43,6 +44,21 @@ describe("conversation-popout-acp-bridge", () => {
     await releaseConnectionWithoutDisconnect(3, "op")
     expect(release).toHaveBeenCalledWith(3, "op")
     expect(getTransferFence(3)?.mainReleased).toBe(true)
+  })
+
+  it("awaits releaseWebOwnerAttach without marking a desktop transfer fence", async () => {
+    const release = vi.fn(async () => {})
+    registerPopoutAcpBridge({
+      releaseConnectionWithoutDisconnect: () => {},
+      releaseWebOwnerAttach: release,
+    })
+    await releaseWebOwnerAttach(9)
+    expect(release).toHaveBeenCalledWith(9)
+    expect(isTransferringOut(9)).toBe(false)
+  })
+
+  it("no-ops releaseWebOwnerAttach when no bridge is registered", async () => {
+    await expect(releaseWebOwnerAttach(9)).resolves.toBeUndefined()
   })
 
   it("delegates reclaimAfterAbort when bridge implements it", async () => {

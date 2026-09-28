@@ -69,6 +69,7 @@ describe("tab strip conversation pop-out wiring", () => {
     for (const key of [
       "popOutPopupBlocked",
       "popOutHandoffFailed",
+      "popOutStillOpen",
       "runtimeRestartRequired",
       "restartDrawCode",
       "restartFailed",

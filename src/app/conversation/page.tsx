@@ -35,6 +35,7 @@ import {
   claimConnectionOwnership,
   setSuppressFrontendDisconnect,
 } from "@/lib/conversation-popout-acp-bridge"
+import { bindWebPopoutOwnerPresence } from "@/lib/conversation-popout-web-presence"
 import { isDesktop, isLocalDesktop, subscribe } from "@/lib/platform"
 import type { AgentType, DbConversationDetail, FolderDetail } from "@/lib/types"
 import { RemoteConnectionGate } from "@/contexts/remote-connection-context"
@@ -93,6 +94,17 @@ function ConversationPageInner() {
       setError(t("localDesktopOnly"))
     }
   }, [routeMode, t])
+
+  // Web pop-out is the interactive owner for as long as this document lives.
+  // Presence lets the workspace close its tab and refuse a second attach.
+  useEffect(() => {
+    if (routeMode !== "web" || !parsed || parsed.kind !== "web") return
+    return bindWebPopoutOwnerPresence({
+      conversationId: parsed.conversationId,
+      folderId: parsed.folderId,
+      agentType: parsed.agentType,
+    })
+  }, [parsed, routeMode])
 
   // 1–2: Load conversation + folder metadata
   useEffect(() => {

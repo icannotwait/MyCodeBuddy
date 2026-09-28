@@ -12,6 +12,7 @@ import { notifyConversationPopoutFailure } from "@/lib/conversation-popout-notif
 const messages = {
   popupBlocked: "Popup blocked",
   handoffFailed: "Handoff failed",
+  stillOpen: "Pop-out still open",
   runtimeRestartRequired: "Restart required",
   restartAction: "Restart DrawCode",
   restartFailed: "Restart failed",
@@ -76,6 +77,12 @@ it("catches relaunch rejection inside the action and reports failure", async () 
   )
   expect(toastMock.error).toHaveBeenLastCalledWith("Restart failed")
   consoleError.mockRestore()
+})
+
+it("tells the user when a web pop-out is still the owner", () => {
+  notifyConversationPopoutFailure({ code: "web_popout_still_open" }, messages)
+
+  expect(toastMock.error).toHaveBeenCalledWith("Pop-out still open")
 })
 
 it("keeps popup-blocked and generic failures on their existing copy", () => {

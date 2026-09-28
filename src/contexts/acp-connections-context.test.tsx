@@ -15742,6 +15742,36 @@ describe("AcpConnectionsProvider pop-out ownership bridge", () => {
     expect(h.store!.getConnection(TAB)).toBeUndefined()
   })
 
+  it("releaseWebOwnerAttach releases a shared lease without killing the agent", async () => {
+    const { releaseWebOwnerAttach, __resetTransferFencesForTests } =
+      await import("@/lib/conversation-popout-acp-bridge")
+    __resetTransferFencesForTests()
+    h.isDesktop = false
+    h.acpConnectOrAttach.mockResolvedValue(sharedResponse())
+    h.acpReleaseLease.mockResolvedValue(undefined)
+
+    await mountProvider()
+    await act(async () => {
+      await h.actions!.connect(TAB, "claude_code", "/tmp/x", "sess-1", 42)
+    })
+    expect(h.store!.getConnection(TAB)?.sharedSession).toMatchObject({
+      generation: 1,
+      leaseId: "lease-1",
+    })
+
+    h.acpDisconnect.mockClear()
+    h.acpTerminateSharedSession.mockClear()
+    h.acpReleaseLease.mockClear()
+    await act(async () => {
+      await releaseWebOwnerAttach(42)
+    })
+
+    expect(h.acpReleaseLease).toHaveBeenCalledWith("conn", 1, "lease-1")
+    expect(h.acpDisconnect).not.toHaveBeenCalled()
+    expect(h.acpTerminateSharedSession).not.toHaveBeenCalled()
+    expect(h.store!.getConnection(TAB)).toBeUndefined()
+  })
+
   it("claimConnectionOwnership attaches as owner without spawning a second agent", async () => {
     const { claimConnectionOwnership, __resetTransferFencesForTests } =
       await import("@/lib/conversation-popout-acp-bridge")

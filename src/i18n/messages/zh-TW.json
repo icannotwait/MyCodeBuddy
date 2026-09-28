@@ -6477,6 +6477,7 @@
     "cannotPopOutDraft": "請先開始會話再彈出",
     "popOutHandoffFailed": "彈出會話失敗",
     "popOutPopupBlocked": "瀏覽器封鎖了會話彈出視窗。請允許彈出視窗後再試一次。",
+    "popOutStillOpen": "此會話已在彈出視窗中開啟。請先關閉該視窗，再在此處開啟。",
     "runtimeRestartRequired": "WebView2 已更新。請先重新啟動 DrawCode，再使用會話彈出視窗。重新啟動會中斷目前執行中的工作。",
     "restartDrawCode": "重新啟動 DrawCode",
     "restartFailed": "DrawCode 無法重新啟動，請再試一次。",
