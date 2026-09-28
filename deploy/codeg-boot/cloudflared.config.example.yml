@@ -1,0 +1,9 @@
+# Place at $HOME/.cloudflared/config.yml (or set CF_CONFIG).
+# Do NOT commit real tunnel credentials JSON or cert.pem.
+tunnel: <TUNNEL_UUID>
+credentials-file: /home/<USER>/.cloudflared/<TUNNEL_UUID>.json
+
+ingress:
+  - hostname: <PUBLIC_HOSTNAME>
+    service: http://127.0.0.1:3080
+  - service: http_status:404

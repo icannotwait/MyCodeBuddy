@@ -423,6 +423,11 @@ archives (`codeg-server-linux-x64.tar.gz` and siblings) are also available for
 operators who prefer not to compile locally; signed self-update uses the same
 assets when enabled on a running server.
 
+Linux drawcode hosts can sync the small boot scripts (watchdog, tunnel, ACP
+restore) from [`deploy/codeg-boot`](deploy/codeg-boot/README.md) with
+`./deploy/codeg-boot/install-boot.sh`. Tokens, tunnel credentials, and binary
+caches stay on the machine.
+
 Docker deployments upgrade by pulling source and rebuilding/recreating the
 container, for example
 `git pull && docker compose up --build -d --force-recreate`.
