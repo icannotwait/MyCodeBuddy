@@ -29,6 +29,11 @@ const tabMocks = vi.hoisted(() => {
     accepted: true,
     version: 1,
   }))
+  const closeTab = vi.fn((id: string) => {
+    const index = rawTabs.findIndex((tab) => tab.id === id)
+    if (index >= 0) rawTabs.splice(index, 1)
+  })
+  const setState = vi.fn()
   const detachTab = vi.fn(() => ({
     ok: true as const,
     nextActiveId: "b",
@@ -82,6 +87,8 @@ const tabMocks = vi.hoisted(() => {
   }
   return {
     detachTab,
+    closeTab,
+    setState,
     restoreDetachedTab,
     flushOpenedTabsSave,
     rawTabs,
@@ -94,9 +101,11 @@ vi.mock("@/stores/tab-store", () => ({
     getState: () => ({
       rawTabs: tabMocks.rawTabs,
       detachTab: tabMocks.detachTab,
+      closeTab: tabMocks.closeTab,
       restoreDetachedTab: tabMocks.restoreDetachedTab,
       flushOpenedTabsSave: tabMocks.flushOpenedTabsSave,
     }),
+    setState: (...args: unknown[]) => tabMocks.setState(...args),
   },
 }))
 
@@ -115,9 +124,16 @@ import {
   isPopOutInFlight,
   isPopOutPopupBlockedError,
   isPopOutRuntimeRestartRequiredError,
+  isWebPopoutStillOpenError,
   popOutConversation,
   shouldShowConversationPopout,
+  WebPopoutStillOpenError,
 } from "@/lib/conversation-popout"
+import {
+  publishWebPopoutOpened,
+  webPopoutConversationIdsBlockingMain,
+  __setWebPopoutTimingsForTests,
+} from "@/lib/conversation-popout-web-presence"
 import {
   __resetTransferFencesForTests,
   isTransferringOut,
@@ -252,13 +268,21 @@ describe("web conversation pop-out", () => {
     vi.mocked(api.completeConversationPopoutOperation).mockClear()
     tabMocks.resetRawTabs()
     tabMocks.detachTab.mockClear()
+    tabMocks.closeTab.mockClear()
+    tabMocks.setState.mockClear()
     __resetTransferFencesForTests()
     __resetPopoutRuntimeForTests()
+    __setWebPopoutTimingsForTests(null)
   })
 
-  it("opens once, keeps the main tab, and enters no desktop handoff stage", async () => {
-    const tabsBefore = [...tabMocks.rawTabs]
-    const open = vi.spyOn(window, "open").mockReturnValue({} as Window)
+  it("opens once, drops the main tab, and enters no desktop handoff stage", async () => {
+    const releaseWebOwnerAttach = vi.fn()
+    registerPopoutAcpBridge({
+      releaseConnectionWithoutDisconnect: () => {},
+      releaseWebOwnerAttach,
+    })
+    const popup = { closed: false, focus: vi.fn() } as unknown as Window
+    const open = vi.spyOn(window, "open").mockReturnValue(popup)
 
     try {
       await popOutConversation({
@@ -272,13 +296,101 @@ describe("web conversation pop-out", () => {
         "conversation-1"
       )
       expect(open).toHaveBeenCalledTimes(1)
-      expect(tabMocks.rawTabs).toEqual(tabsBefore)
+      expect(tabMocks.closeTab).toHaveBeenCalledWith("a")
+      expect(tabMocks.rawTabs.map((tab) => tab.id)).toEqual(["b"])
+      expect(releaseWebOwnerAttach).toHaveBeenCalledWith(1)
+      expect(webPopoutConversationIdsBlockingMain().has(1)).toBe(true)
       expect(tabMocks.detachTab).not.toHaveBeenCalled()
       expect(isTransferringOut(1)).toBe(false)
       expect(subscribe).not.toHaveBeenCalled()
       expect(api.focusConversationWindow).not.toHaveBeenCalled()
       expect(api.openConversationWindow).not.toHaveBeenCalled()
       expect(api.completeConversationPopoutOperation).not.toHaveBeenCalled()
+    } finally {
+      open.mockRestore()
+    }
+  })
+
+  it("focuses a live pop-out instead of opening a second owner window", async () => {
+    const popup = { closed: false, focus: vi.fn() } as unknown as Window
+    const open = vi.spyOn(window, "open").mockReturnValue(popup)
+
+    try {
+      await popOutConversation({
+        conversationId: 1,
+        folderId: 1,
+        agentType: "claude_code",
+      })
+      open.mockClear()
+      tabMocks.closeTab.mockClear()
+
+      await popOutConversation({
+        conversationId: 1,
+        folderId: 1,
+        agentType: "claude_code",
+      })
+
+      expect(open).not.toHaveBeenCalled()
+      expect(popup.focus).toHaveBeenCalled()
+    } finally {
+      open.mockRestore()
+    }
+  })
+
+  it("refuses reopen while a pop-out is alive but cannot be focused", async () => {
+    __setWebPopoutTimingsForTests({ ackTimeoutMs: 20 })
+    publishWebPopoutOpened({
+      conversationId: 1,
+      folderId: 1,
+      agentType: "claude_code",
+    })
+    const open = vi.spyOn(window, "open").mockReturnValue({
+      closed: false,
+      focus: vi.fn(),
+    } as unknown as Window)
+
+    try {
+      await expect(
+        popOutConversation({
+          conversationId: 1,
+          folderId: 1,
+          agentType: "claude_code",
+        })
+      ).rejects.toBeInstanceOf(WebPopoutStillOpenError)
+      expect(open).not.toHaveBeenCalled()
+      expect(tabMocks.closeTab).toHaveBeenCalledWith("a")
+      expect(isWebPopoutStillOpenError(new WebPopoutStillOpenError())).toBe(
+        true
+      )
+    } finally {
+      open.mockRestore()
+    }
+  })
+
+  it("opens again after the remembered pop-out window closes", async () => {
+    const first = { closed: false, focus: vi.fn() } as unknown as Window
+    const second = { closed: false, focus: vi.fn() } as unknown as Window
+    const open = vi
+      .spyOn(window, "open")
+      .mockReturnValueOnce(first)
+      .mockReturnValueOnce(second)
+
+    try {
+      await popOutConversation({
+        conversationId: 1,
+        folderId: 1,
+        agentType: "claude_code",
+      })
+      first.closed = true
+
+      await popOutConversation({
+        conversationId: 1,
+        folderId: 1,
+        agentType: "claude_code",
+      })
+
+      expect(open).toHaveBeenCalledTimes(2)
+      expect(second.closed).toBe(false)
     } finally {
       open.mockRestore()
     }
@@ -302,6 +414,7 @@ describe("web conversation pop-out", () => {
       expect(rejected).toMatchObject({ code: "popup_blocked" })
       expect(open).toHaveBeenCalledTimes(1)
       expect(tabMocks.detachTab).not.toHaveBeenCalled()
+      expect(tabMocks.closeTab).not.toHaveBeenCalled()
       expect(isTransferringOut(1)).toBe(false)
       expect(subscribe).not.toHaveBeenCalled()
       expect(api.openConversationWindow).not.toHaveBeenCalled()
@@ -323,6 +436,7 @@ describe("web conversation pop-out", () => {
       ).rejects.toThrow("invalid_agent_type")
       expect(open).not.toHaveBeenCalled()
       expect(tabMocks.detachTab).not.toHaveBeenCalled()
+      expect(tabMocks.closeTab).not.toHaveBeenCalled()
       expect(subscribe).not.toHaveBeenCalled()
       expect(api.openConversationWindow).not.toHaveBeenCalled()
     } finally {

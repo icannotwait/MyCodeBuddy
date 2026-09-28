@@ -6477,6 +6477,7 @@
     "cannotPopOutDraft": "Start the session before popping out",
     "popOutHandoffFailed": "Failed to pop out conversation",
     "popOutPopupBlocked": "브라우저가 대화 팝아웃을 차단했습니다. 팝업을 허용한 후 다시 시도하세요.",
+    "popOutStillOpen": "이 대화는 팝아웃 창에서 열려 있습니다. 여기서 열려면 먼저 그 창을 닫으세요.",
     "runtimeRestartRequired": "WebView2가 업데이트되었습니다. 대화 팝아웃을 사용하기 전에 DrawCode를 다시 시작하세요. 다시 시작하면 현재 실행 중인 작업이 중단됩니다.",
     "restartDrawCode": "DrawCode 다시 시작",
     "restartFailed": "DrawCode를 다시 시작하지 못했습니다. 다시 시도하세요.",

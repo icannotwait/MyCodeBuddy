@@ -18,12 +18,21 @@ import {
   markTransferringOut,
   reclaimAfterAbort,
   releaseConnectionWithoutDisconnect,
+  releaseWebOwnerAttach,
   type ReclaimAfterAbortLease,
 } from "@/lib/conversation-popout-acp-bridge"
 import {
   conversationWindowLabel,
   parseConversationRouteAgentType,
 } from "@/lib/conversation-popout-detached-bootstrap"
+import {
+  focusOrRefuseWebPopout,
+  publishWebPopoutOpened,
+  rememberWebPopoutWindow,
+  webPopoutConversationIdsBlockingMain,
+  __resetWebPopoutPresenceForTests,
+  type WebPopoutFocusResult,
+} from "@/lib/conversation-popout-web-presence"
 import { isDesktop, isLocalDesktop, subscribe } from "@/lib/platform"
 import type { AgentType } from "@/lib/types"
 import { useTabStore, type DetachRestoreToken } from "@/stores/tab-store"
@@ -80,6 +89,26 @@ export function isPopOutPopupBlockedError(
     (typeof error === "object" &&
       error != null &&
       (error as { code?: unknown }).code === "popup_blocked")
+  )
+}
+
+export class WebPopoutStillOpenError extends Error {
+  readonly code = "web_popout_still_open" as const
+
+  constructor() {
+    super("web_popout_still_open")
+    this.name = "WebPopoutStillOpenError"
+  }
+}
+
+export function isWebPopoutStillOpenError(
+  error: unknown
+): error is WebPopoutStillOpenError {
+  return (
+    error instanceof WebPopoutStillOpenError ||
+    (typeof error === "object" &&
+      error != null &&
+      (error as { code?: unknown }).code === "web_popout_still_open")
   )
 }
 
@@ -144,6 +173,7 @@ export function __resetPopoutRuntimeForTests(): void {
   recoveryGeneration += 1
   abortTerminalTimeoutMs = 30_000
   abortPollIntervalMs = 50
+  __resetWebPopoutPresenceForTests()
 }
 
 /** Test helper: await any background late-terminal recoveries. */
@@ -969,8 +999,65 @@ async function compensate(args: {
 }
 
 /**
+ * Drop this document's owner attach and remove the conversation tab so the
+ * web pop-out is the only interactive owner. Does not close the workspace.
+ */
+async function releaseMainSurfaceForWebPopout(
+  conversationId: number
+): Promise<void> {
+  await releaseWebOwnerAttach(conversationId)
+  const tabIds = useTabStore
+    .getState()
+    .rawTabs.filter((tab) => tab.conversationId === conversationId)
+    .map((tab) => tab.id)
+  for (const tabId of tabIds) {
+    useTabStore.getState().closeTab(tabId)
+  }
+}
+
+function selectWebPopoutSidebar(
+  conversationId: number,
+  agentType: AgentType
+): void {
+  useTabStore.setState({
+    sidebarSelection: { id: conversationId, agentType },
+  })
+}
+
+/**
+ * While a web pop-out is alive, main must not open that conversation as an
+ * owner. Focus the pop-out when possible; otherwise report `refused`.
+ */
+export async function guardMainWebPopoutReopen(args: {
+  conversationId: number
+  agentType: AgentType
+}): Promise<WebPopoutFocusResult> {
+  if (isDesktop() || args.conversationId <= 0) return "absent"
+  const decision = await focusOrRefuseWebPopout(args.conversationId)
+  if (decision === "absent") return "absent"
+  await releaseMainSurfaceForWebPopout(args.conversationId)
+  return decision
+}
+
+/** Close workspace tabs that a live web pop-out already owns. */
+export function releaseWorkspaceTabsBlockingWebPopout(): void {
+  if (isDesktop()) return
+  for (const conversationId of webPopoutConversationIdsBlockingMain()) {
+    const ownsTab = useTabStore
+      .getState()
+      .rawTabs.some((tab) => tab.conversationId === conversationId)
+    if (!ownsTab) continue
+    void releaseMainSurfaceForWebPopout(conversationId)
+  }
+}
+
+/**
  * Orchestrate pop-out: open → ready → release without disconnect → detach +
  * CAS → complete. Re-check closed after every await stage.
+ *
+ * Web skips the desktop transfer fence. A successful `window.open` publishes
+ * presence, releases this document's shared owner lease, and closes only that
+ * conversation tab. The pop-out page stays `own_or_observe`.
  */
 export async function popOutConversation(args: {
   conversationId: number
@@ -994,13 +1081,25 @@ export async function popOutConversation(args: {
       throw new Error(enablement.reason)
     }
 
+    const existing = await focusOrRefuseWebPopout(args.conversationId)
+    if (existing !== "absent") {
+      await releaseMainSurfaceForWebPopout(args.conversationId)
+      selectWebPopoutSidebar(args.conversationId, args.agentType)
+      if (existing === "refused") throw new WebPopoutStillOpenError()
+      return
+    }
+
     const opened = window.open(
       buildWebConversationPopoutUrl(args),
       conversationWindowLabel(args.conversationId)
     )
-    if (opened == null) {
+    if (opened == null || opened.closed) {
       throw new PopOutPopupBlockedError()
     }
+    publishWebPopoutOpened(args)
+    rememberWebPopoutWindow(args.conversationId, opened)
+    await releaseMainSurfaceForWebPopout(args.conversationId)
+    selectWebPopoutSidebar(args.conversationId, args.agentType)
     return
   }
 

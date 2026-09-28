@@ -46,6 +46,7 @@ import {
   pushClosedTab,
   snapshotConversationTab,
 } from "@/lib/closed-tab-stack"
+import { webPopoutConversationIdsBlockingMain } from "@/lib/conversation-popout-web-presence"
 import type {
   AgentType,
   ConversationChange,
@@ -190,6 +191,14 @@ export interface TabStoreState {
    * main tab becomes the intentional selection (open/activate/switch).
    */
   sidebarSelection: SidebarConversationSelection | null
+  /**
+   * Bumped when main refuses to reopen a conversation a web pop-out still
+   * owns. The workspace guard toasts `seq` so repeat refusals still notify.
+   */
+  webPopoutReopenRefusal: {
+    conversationId: number
+    seq: number
+  } | null
   previewReplacedTabIds: string[]
   draftRetargetRequests: DraftRetargetRequest[]
   tabsHydrated: boolean
@@ -450,6 +459,7 @@ let lastSavedPayload: string | null = null
 let saveTimer: ReturnType<typeof setTimeout> | null = null
 let saveChain: Promise<unknown> = Promise.resolve()
 let activationSeqCounter = 0
+let webPopoutRefusalSeq = 0
 
 /**
  * Next monotonic activation order. Advances past both the module counter and
@@ -1417,6 +1427,7 @@ function initialTabState() {
     rawTabs: [] as TabItemInternal[],
     activeTabId: null as string | null,
     sidebarSelection: null as SidebarConversationSelection | null,
+    webPopoutReopenRefusal: null as TabStoreState["webPopoutReopenRefusal"],
     previewReplacedTabIds: [] as string[],
     draftRetargetRequests: [] as DraftRetargetRequest[],
     tabsHydrated: false,
@@ -1455,17 +1466,47 @@ export const useTabStore = create<TabStoreState>()((set, get) => ({
     }
 
     // No-mirror: on local desktop, await focus of an existing detached window
-    // before adding/activating a main tab. Dynamic import avoids a circular
-    // dependency with conversation-popout (which imports this store).
-    // focusDetachedConversation itself no-ops when not local desktop.
+    // before adding/activating a main tab. On web, a live pop-out is the only
+    // owner — focus it or refuse, and never start a second own_or_observe.
+    // Dynamic import avoids a circular dependency with conversation-popout
+    // (which imports this store).
     //
     // Serialize with pop-out transfer via epoch + fence/cache. Capture epoch
     // before any focus await; after awaits only create a main tab if the epoch
     // is unchanged, not in flight, focus still misses, and cache is empty.
     // Avoid multi-probe races: a stale false that spanned a full transfer
     // advances the epoch and must not open a main/detached mirror.
+    const blockLiveWebPopout = async (): Promise<boolean> => {
+      const { guardMainWebPopoutReopen } =
+        await import("@/lib/conversation-popout")
+      if (typeof guardMainWebPopoutReopen !== "function") return false
+      const decision = await guardMainWebPopoutReopen({
+        conversationId,
+        agentType,
+      })
+      if (decision === "absent") return false
+      const owned = get().rawTabs.filter(
+        (tab) => tab.conversationId === conversationId
+      )
+      for (const tab of owned) get().closeTab(tab.id)
+      webPopoutRefusalSeq += 1
+      set({
+        sidebarSelection: { id: conversationId, agentType },
+        ...(decision === "refused"
+          ? {
+              webPopoutReopenRefusal: {
+                conversationId,
+                seq: webPopoutRefusalSeq,
+              },
+            }
+          : {}),
+      })
+      return true
+    }
+
     if (conversationId > 0) {
       try {
+        if (await blockLiveWebPopout()) return false
         const {
           focusDetachedConversation,
           isPopOutInFlight,
@@ -1507,6 +1548,11 @@ export const useTabStore = create<TabStoreState>()((set, get) => ({
           markDetachedSidebarSelection()
           return false
         }
+      } catch {
+        /* ignore when module unavailable (SSR / tests without mock) */
+      }
+      try {
+        if (await blockLiveWebPopout()) return false
       } catch {
         /* ignore when module unavailable (SSR / tests without mock) */
       }
@@ -2767,9 +2813,11 @@ export const useTabStore = create<TabStoreState>()((set, get) => ({
         }
         const stamped = active ? stampActiveTab(limited, active) : limited
         const evicted = limited.length < preTrim.length
+        const visible = omitLiveWebPopoutTabs(stamped, active)
 
         // Pre-trim seed when eviction occurred so runSaveEffect sees a mismatch
-        // and arms one normalization CAS of survivors.
+        // and arms one normalization CAS of survivors. Omitting a live web
+        // pop-out keeps the pre-omit payload so the save persists that close.
         if (evicted) {
           lastSavedPayload = JSON.stringify(
             buildPersistItems(preTrim, restoredActive)
@@ -2780,8 +2828,8 @@ export const useTabStore = create<TabStoreState>()((set, get) => ({
 
         // tabsHydrated must be true BEFORE runSaveEffect (it no-ops otherwise).
         set({
-          rawTabs: stamped,
-          activeTabId: active,
+          rawTabs: visible.tabs,
+          activeTabId: visible.activeId,
           tabsHydrated: true,
           ...(Object.keys(draftGroups).length > 0
             ? { groupOf: { ...get().groupOf, ...draftGroups } }
@@ -3482,6 +3530,49 @@ registerBackendScopedStoreReset(resetTabStore)
  * module coordination vars keeps the semantics identical to the former
  * `applyRemoteSnapshot` callback).
  */
+/**
+ * A live web pop-out owns the conversation. Drop it from the tab set before
+ * React mounts a second `own_or_observe` client. Drafts stay.
+ */
+function omitLiveWebPopoutTabs(
+  tabs: TabItemInternal[],
+  activeId: string | null
+): { tabs: TabItemInternal[]; activeId: string | null; omitted: boolean } {
+  const blocking = webPopoutConversationIdsBlockingMain()
+  if (blocking.size === 0) {
+    return { tabs, activeId, omitted: false }
+  }
+  const next = tabs.filter(
+    (tab) => tab.conversationId == null || !blocking.has(tab.conversationId)
+  )
+  if (next.length === tabs.length) {
+    return { tabs, activeId, omitted: false }
+  }
+  let active = activeId
+  if (active && !next.some((tab) => tab.id === active)) {
+    active = next[0]?.id ?? null
+  }
+  if (next.length > 0) {
+    return {
+      tabs: active ? stampActiveTab(next, active) : next,
+      activeId: active,
+      omitted: true,
+    }
+  }
+  if (useAppWorkspaceStore.getState().folders.length === 0) {
+    return { tabs: [], activeId: null, omitted: true }
+  }
+  const preferred = tabs.find(
+    (tab) => tab.conversationId != null && blocking.has(tab.conversationId)
+  )
+  const replacement = makeReplacementDraftTab(preferred)
+  return {
+    tabs: stampActiveTab([replacement], replacement.id),
+    activeId: replacement.id,
+    omitted: true,
+  }
+}
+
 function applyRemoteSnapshot(change: TabsChanged) {
   // Stale-safe: a snapshot older than what we've applied must not move the UI or
   // version backwards. Equal versions still reconcile.
@@ -3670,11 +3761,13 @@ function applyRemoteSnapshot(change: TabsChanged) {
   }
   const stamped = finalActive ? stampActiveTab(limited, finalActive) : limited
   const evicted = limited.length < preTrim.length
+  const visible = omitLiveWebPopoutTabs(stamped, finalActive)
 
   // When the merge diverged from the server, do not seed a no-op baseline —
   // the save effect must push the local close / unsynced bind against the
   // version we just learned. Eviction still seeds the pre-trim payload so
-  // the follow-up CAS persists survivors.
+  // the follow-up CAS persists survivors. A web-popout omit keeps the
+  // pre-omit payload for the same reason.
   if (diverged) {
     lastSavedPayload = null
   } else if (evicted) {
@@ -3683,7 +3776,10 @@ function applyRemoteSnapshot(change: TabsChanged) {
     lastSavedPayload = JSON.stringify(buildPersistItems(stamped, finalActive))
   }
 
-  useTabStore.setState({ rawTabs: stamped, activeTabId: finalActive })
+  useTabStore.setState({
+    rawTabs: visible.tabs,
+    activeTabId: visible.activeId,
+  })
   recomputeTabs()
 
   if (evicted) {

@@ -3,6 +3,7 @@ import { toast } from "sonner"
 import {
   isPopOutPopupBlockedError,
   isPopOutRuntimeRestartRequiredError,
+  isWebPopoutStillOpenError,
 } from "@/lib/conversation-popout"
 import { relaunchApp } from "@/lib/updater"
 
@@ -12,6 +13,7 @@ export const CONVERSATION_POPOUT_RUNTIME_RESTART_TOAST_ID =
 export interface ConversationPopoutFailureMessages {
   popupBlocked: string
   handoffFailed: string
+  stillOpen: string
   runtimeRestartRequired: string
   restartAction: string
   restartFailed: string
@@ -41,8 +43,10 @@ export function notifyConversationPopoutFailure(
   }
 
   toast.error(
-    isPopOutPopupBlockedError(error)
-      ? messages.popupBlocked
-      : messages.handoffFailed
+    isWebPopoutStillOpenError(error)
+      ? messages.stillOpen
+      : isPopOutPopupBlockedError(error)
+        ? messages.popupBlocked
+        : messages.handoffFailed
   )
 }

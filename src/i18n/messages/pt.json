@@ -6477,6 +6477,7 @@
     "cannotPopOutDraft": "Start the session before popping out",
     "popOutHandoffFailed": "Failed to pop out conversation",
     "popOutPopupBlocked": "O navegador bloqueou a janela da conversa. Permita pop-ups e tente novamente.",
+    "popOutStillOpen": "Esta conversa está aberta numa janela pop-out. Feche essa janela antes de a abrir aqui.",
     "runtimeRestartRequired": "O WebView2 foi atualizado. Reinicie o DrawCode antes de destacar uma conversa. A reinicialização interrompe as tarefas em execução.",
     "restartDrawCode": "Reiniciar o DrawCode",
     "restartFailed": "Não foi possível reiniciar o DrawCode. Tente novamente.",

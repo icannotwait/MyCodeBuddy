@@ -68,6 +68,12 @@ export type PopoutAcpBridge = {
     operationId: string
   ) => boolean
   /**
+   * Web pop-out: drop this document's owner attach for the conversation.
+   * Shared sessions release the client lease and must not terminate the
+   * process. Never `acpDisconnect` — the pop-out window becomes the owner.
+   */
+  releaseWebOwnerAttach?: (conversationId: number) => void | Promise<void>
+  /**
    * Detached: attach as owner UI for a live connection (after rebind), or
    * no-op for cold (connectionId null). Must not spawn a second agent.
    */
@@ -171,6 +177,18 @@ export async function releaseConnectionWithoutDisconnect(
   if (impl) {
     await impl(conversationId, operationId)
   }
+}
+
+/**
+ * Web pop-out handoff: stop this document being an `own_or_observe` client.
+ * No-op when the provider has not registered (tests / detached bootstrap).
+ */
+export async function releaseWebOwnerAttach(
+  conversationId: number
+): Promise<void> {
+  if (conversationId <= 0) return
+  const impl = bridge?.releaseWebOwnerAttach
+  if (impl) await impl(conversationId)
 }
 
 /**

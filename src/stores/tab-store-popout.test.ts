@@ -1,6 +1,10 @@
 import { beforeEach, describe, expect, it, vi } from "vitest"
 
 const focusDetachedConversation = vi.fn(async (_id: number) => false)
+const guardMainWebPopoutReopen = vi.fn(
+  async (_args: { conversationId: number; agentType: string }) =>
+    "absent" as "absent" | "focused" | "refused"
+)
 const isPopOutInFlight = vi.fn((_id: number) => false)
 const isTransferringOut = vi.fn((_id: number | null | undefined) => false)
 const isConversationDetachedCache = vi.fn((_id: number) => false)
@@ -28,12 +32,18 @@ vi.mock("@/lib/conversation-popout", () => ({
   isPopOutInFlight: (id: number) => isPopOutInFlight(id),
   isConversationDetachedCache: (id: number) => isConversationDetachedCache(id),
   getTransferEpoch: (id: number) => getTransferEpoch(id),
+  guardMainWebPopoutReopen: (args: {
+    conversationId: number
+    agentType: string
+  }) => guardMainWebPopoutReopen(args),
 }))
 
 vi.mock("@/lib/conversation-popout-acp-bridge", () => ({
   isTransferringOut: (id: number | null | undefined) => isTransferringOut(id),
 }))
 
+import { listOpenedTabs } from "@/lib/api"
+import { publishWebPopoutOpened } from "@/lib/conversation-popout-web-presence"
 import { resetTabStore, useTabStore } from "@/stores/tab-store"
 
 describe("detachTab", () => {
@@ -107,6 +117,8 @@ describe("openTab focus-before-open", () => {
     resetTabStore()
     focusDetachedConversation.mockReset()
     focusDetachedConversation.mockResolvedValue(false)
+    guardMainWebPopoutReopen.mockReset()
+    guardMainWebPopoutReopen.mockResolvedValue("absent")
     isPopOutInFlight.mockReset()
     isPopOutInFlight.mockReturnValue(false)
     isTransferringOut.mockReset()
@@ -364,6 +376,53 @@ describe("openTab focus-before-open", () => {
     expect(focusCalls).toBe(2)
   })
 
+  it("refuses a web pop-out that is still open and does not add a main tab", async () => {
+    guardMainWebPopoutReopen.mockResolvedValue("refused")
+    useTabStore.setState({
+      rawTabs: [
+        {
+          id: "live",
+          kind: "conversation",
+          folderId: 1,
+          conversationId: 42,
+          agentType: "claude_code",
+          title: "Live",
+          isPinned: true,
+          activationSeq: 1,
+        },
+      ],
+      activeTabId: "live",
+    })
+
+    const openedMain = await useTabStore
+      .getState()
+      .openTab(1, 42, "claude_code", true, "Live")
+
+    expect(openedMain).toBe(false)
+    expect(useTabStore.getState().rawTabs).toEqual([])
+    expect(useTabStore.getState().webPopoutReopenRefusal).toMatchObject({
+      conversationId: 42,
+    })
+    expect(useTabStore.getState().sidebarSelection).toEqual({
+      id: 42,
+      agentType: "claude_code",
+    })
+    expect(focusDetachedConversation).not.toHaveBeenCalled()
+  })
+
+  it("focuses a live web pop-out without toasting a refusal", async () => {
+    guardMainWebPopoutReopen.mockResolvedValue("focused")
+
+    const openedMain = await useTabStore
+      .getState()
+      .openTab(1, 42, "claude_code", true, "Detached")
+
+    expect(openedMain).toBe(false)
+    expect(useTabStore.getState().rawTabs).toEqual([])
+    expect(useTabStore.getState().webPopoutReopenRefusal).toBeNull()
+    expect(focusDetachedConversation).not.toHaveBeenCalled()
+  })
+
   it("detached cache set after focus miss skips main tab", async () => {
     focusDetachedConversation.mockImplementation(async () => {
       isConversationDetachedCache.mockReturnValue(true)
@@ -376,5 +435,72 @@ describe("openTab focus-before-open", () => {
 
     expect(openedMain).toBe(false)
     expect(useTabStore.getState().rawTabs).toEqual([])
+  })
+})
+
+describe("hydrate while a web pop-out is alive", () => {
+  beforeEach(() => {
+    resetTabStore()
+    vi.mocked(listOpenedTabs).mockReset()
+    vi.mocked(listOpenedTabs).mockResolvedValue({ version: 1, items: [] })
+  })
+
+  it("does not restore a conversation the pop-out still owns", async () => {
+    publishWebPopoutOpened({
+      conversationId: 42,
+      folderId: 1,
+      agentType: "claude_code",
+    })
+    vi.mocked(listOpenedTabs).mockResolvedValueOnce({
+      version: 2,
+      items: [
+        {
+          id: 1,
+          folder_id: 1,
+          conversation_id: 42,
+          agent_type: "claude_code",
+          position: 0,
+          is_active: true,
+          is_pinned: true,
+        },
+      ],
+    })
+
+    const dispose = useTabStore.getState().hydrate()
+    await vi.waitFor(() => {
+      expect(useTabStore.getState().tabsHydrated).toBe(true)
+    })
+
+    expect(
+      useTabStore.getState().rawTabs.some((tab) => tab.conversationId === 42)
+    ).toBe(false)
+    dispose()
+  })
+
+  it("restores the conversation after the pop-out record is gone", async () => {
+    vi.mocked(listOpenedTabs).mockResolvedValueOnce({
+      version: 2,
+      items: [
+        {
+          id: 1,
+          folder_id: 1,
+          conversation_id: 42,
+          agent_type: "claude_code",
+          position: 0,
+          is_active: true,
+          is_pinned: true,
+        },
+      ],
+    })
+
+    const dispose = useTabStore.getState().hydrate()
+    await vi.waitFor(() => {
+      expect(useTabStore.getState().tabsHydrated).toBe(true)
+    })
+
+    expect(
+      useTabStore.getState().rawTabs.some((tab) => tab.conversationId === 42)
+    ).toBe(true)
+    dispose()
   })
 })

@@ -6477,6 +6477,7 @@
     "cannotPopOutDraft": "Start the session before popping out",
     "popOutHandoffFailed": "Failed to pop out conversation",
     "popOutPopupBlocked": "Le navigateur a bloqué l'ouverture de la conversation. Autorisez les fenêtres contextuelles, puis réessayez.",
+    "popOutStillOpen": "Cette conversation est ouverte dans une fenêtre externe. Fermez-la avant de l'ouvrir ici.",
     "runtimeRestartRequired": "WebView2 a été mis à jour. Redémarrez DrawCode avant de détacher une conversation. Le redémarrage interrompt les tâches en cours.",
     "restartDrawCode": "Redémarrer DrawCode",
     "restartFailed": "DrawCode n’a pas pu redémarrer. Réessayez.",

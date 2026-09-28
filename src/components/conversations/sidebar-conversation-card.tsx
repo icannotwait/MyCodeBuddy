@@ -260,6 +260,7 @@ export const SidebarConversationCard = memo(function SidebarConversationCard({
       notifyConversationPopoutFailure(err, {
         popupBlocked: tPop("popOutPopupBlocked"),
         handoffFailed: tPop("popOutHandoffFailed"),
+        stillOpen: tPop("popOutStillOpen"),
         runtimeRestartRequired: tPop("runtimeRestartRequired"),
         restartAction: tPop("restartDrawCode"),
         restartFailed: tPop("restartFailed"),

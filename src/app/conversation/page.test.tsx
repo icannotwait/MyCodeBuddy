@@ -100,6 +100,7 @@ vi.mock("./_components/detached-shell", () => ({
   seedDetachedSessionTab: (...args: unknown[]) => h.seedSessionTab(...args),
 }))
 
+import { webPopoutConversationIdsBlockingMain } from "@/lib/conversation-popout-web-presence"
 import * as conversationPage from "./page"
 
 const { default: ConversationPage } = conversationPage
@@ -188,6 +189,7 @@ describe("ConversationPageInner route bootstrap", () => {
     expect(h.subscribe).not.toHaveBeenCalled()
     expect(h.getPopoutOperation).not.toHaveBeenCalled()
     expect(h.emit).not.toHaveBeenCalled()
+    expect(webPopoutConversationIdsBlockingMain().has(42)).toBe(true)
   })
 
   it.each([

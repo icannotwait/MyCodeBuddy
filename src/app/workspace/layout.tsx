@@ -29,6 +29,7 @@ import {
 import { DelegationProvider } from "@/contexts/delegation-context"
 import { ConversationRuntimeProvider } from "@/contexts/conversation-runtime-context"
 import { TabProvider, useTabStore, useTabActions } from "@/contexts/tab-context"
+import { WebPopoutWorkspaceGuard } from "@/components/conversations/web-popout-workspace-guard"
 import { selectIsSplit } from "@/stores/tab-store"
 import { SidebarProvider, useSidebarContext } from "@/contexts/sidebar-context"
 import { SearchDialogProvider } from "@/contexts/search-dialog-context"
@@ -1294,6 +1295,7 @@ function WorkspaceLayoutInner({ children }: { children: React.ReactNode }) {
                 <ConversationRuntimeProvider>
                   <WorkspaceProvider>
                     <TabProvider>
+                      <WebPopoutWorkspaceGuard />
                       <WorkspaceDocumentTitle />
                       <TabKeysSync />
                       <BrowserEventsBridge />
