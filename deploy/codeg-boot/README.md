@@ -55,10 +55,13 @@ See also the handoff doc pattern under your private notes
 `ensure-acp-agents.sh`. The sync script itself rate-limits to once per hour
 (`CODEG_BOOT_SYNC_INTERVAL_SECS`, default `3600`).
 
-It prefers a local `MyCodeBuddy` checkout (`git fetch` + `deploy/codeg-boot`),
-and falls back to public `raw.githubusercontent.com` if needed. It only
-overwrites known scripts under `/workspace/codeg-boot` — never secrets or ACP
-caches. When scripts change, the watchdog reloads itself via
+It prefers a local `MyCodeBuddy` checkout. After `git fetch` it copies each
+known script with `git cat-file -e` and
+`git show <ref>:deploy/codeg-boot/scripts/<file>` into a staging dir. That
+reads blobs only, so the checkout's index and worktree stay clean. If git
+cannot supply the scripts it falls back to public `raw.githubusercontent.com`.
+It only overwrites known scripts under `/workspace/codeg-boot` — never secrets
+or ACP caches. When scripts change, the watchdog reloads itself via
 `reload-watchdog-once.sh`.
 
 Disable by removing execute bit: `chmod a-x /workspace/codeg-boot/auto-sync-boot.sh`.
@@ -73,3 +76,19 @@ only downloads/upgrades when `installed_version` differs.
 So after you deploy a new `codeg-dist` that bumps Cursor / Antigravity / Grok
 in registry, the next watchdog `ensure-acp` cycle pulls those versions.
 Optional overrides: `CODEG_ANTIGRAVITY_VER`, `CODEG_CURSOR_VER`, `CODEG_GROK_VER`.
+
+A failed direct download or failed API download backs off that agent only.
+The stamp `/workspace/heartbeat/ensure-acp-<agent>.fail` stores the failure
+time and the next wait (start `3600` seconds, double each failure, cap
+`21600`). While the wait is active the script skips that agent's download
+and continues with the others. Success deletes the stamp. Overrides:
+`CODEG_ACP_BACKOFF_BASE_SECS`, `CODEG_ACP_BACKOFF_CAP_SECS`.
+
+If the wanted version is already on disk but `installed_version` still
+differs, the script does not stop at "already on disk". Antigravity and
+Cursor call `POST /api/acp_download_agent_binary` for that version (a complete
+server cache hit does not re-download). After a direct Antigravity unzip, it
+re-reads `acp_list_agents` and uses the same API download when the server
+still disagrees. Grok is an npx agent, so the binary download endpoint
+rejects it; the script calls `POST /api/acp_detect_agent_local_version` and,
+if the probed version is still wrong, `POST /api/acp_prepare_npx_agent`.
