@@ -3404,7 +3404,6 @@ async fn project_simple_mode(
         });
         prior_node_ids = vec![node_id];
     }
-    enrich_nodes_display_from_children(conn, &mut nodes).await;
 
     let final_review = progress
         .snapshot
@@ -3431,7 +3430,7 @@ async fn project_simple_mode(
                     | SimpleFinalReviewStatus::Blocked
             )
         );
-    let overall_state = if any_blocked {
+    let mut overall_state = if any_blocked {
         WorkflowOverallState::Blocked
     } else if all_completed {
         WorkflowOverallState::Completed
@@ -3454,7 +3453,7 @@ async fn project_simple_mode(
         })
         .map(|node| node.node_id.clone())
         .collect::<Vec<_>>();
-    let current_node_ids = if let Some(active_task_index) =
+    let mut current_node_ids = if let Some(active_task_index) =
         active_task_index.filter(|task_index| plan_indices.contains(task_index))
     {
         let active_nodes = nodes
@@ -3518,6 +3517,53 @@ async fn project_simple_mode(
     } else {
         current
     };
+    // Registration changes the task source, not the observed document history.
+    let document_runs = parent_runs
+        .iter()
+        .filter(|run| {
+            match run
+                .work_unit_key
+                .as_deref()
+                .and_then(parse_recognized_work_unit_key)
+            {
+                Some(ParsedWorkUnitKey::Design { .. } | ParsedWorkUnitKey::DesignFixer { .. }) => {
+                    true
+                }
+                Some(
+                    ParsedWorkUnitKey::PlanAuthor { rel_plan_path, .. }
+                    | ParsedWorkUnitKey::PlanReviewer { rel_plan_path, .. },
+                ) => safe_plan_rel_path.as_deref() == Some(rel_plan_path.as_str()),
+                _ => false,
+            }
+        })
+        .cloned()
+        .collect();
+    let (document_nodes, mut phases) = project_observed_runs(document_runs);
+    let (active_document_ids, active_document_phase) =
+        select_current_nodes(&document_nodes, &[], &[]);
+    let current_phase_id = if active_document_ids.is_empty() {
+        (!current_node_ids.is_empty()).then(|| "tasks".into())
+    } else {
+        // A pending task is not active while the plan is still being authored/reviewed.
+        current_node_ids.retain(|id| {
+            nodes.iter().any(|node| {
+                node.node_id == *id && !matches!(node.status, ProjectedNodeStatus::Pending)
+            })
+        });
+        current_node_ids.extend(active_document_ids);
+        if !any_blocked {
+            overall_state = WorkflowOverallState::InProgress;
+        }
+        active_document_phase
+    };
+    phases.push(WorkflowPhaseSnapshot {
+        id: "tasks".into(),
+        kind: Some("tasks".into()),
+        title: None,
+    });
+    nodes.extend(document_nodes);
+    enrich_nodes_display_from_children(conn, &mut nodes).await;
+
     Ok(Some(WorkflowGraphSnapshot {
         schema_version: WORKFLOW_GRAPH_SNAPSHOT_SCHEMA_VERSION,
         workflow_id: None,
@@ -3537,13 +3583,9 @@ async fn project_simple_mode(
         ),
         archived: None,
         projection_warning_codes,
-        current_phase_id: (!current_node_ids.is_empty()).then(|| "tasks".into()),
+        current_phase_id,
         current_node_ids,
-        phases: vec![WorkflowPhaseSnapshot {
-            id: "tasks".into(),
-            kind: Some("tasks".into()),
-            title: None,
-        }],
+        phases,
         nodes,
         edges,
         gates: vec![],
@@ -3561,9 +3603,43 @@ async fn project_observed_only(
         .await
         .map_err(db_err)?;
 
+    let (mut nodes, phases) = project_observed_runs(runs);
+    if nodes.is_empty() {
+        return Ok(None);
+    }
+
+    enrich_nodes_display_from_children(conn, &mut nodes).await;
+
+    let (current_node_ids, current_phase_id) = select_current_nodes(&nodes, &[], &[]);
+
+    Ok(Some(WorkflowGraphSnapshot {
+        schema_version: WORKFLOW_GRAPH_SNAPSHOT_SCHEMA_VERSION,
+        workflow_id: None,
+        workflow_kind: WORKFLOW_KIND_BRAINSTORM_TO_DELIVERY.to_string(),
+        manifest_revision: None,
+        graph_revision: None,
+        manifest_state: None,
+        completion_protocol: None,
+        completion: None,
+        compatibility: WorkflowCompatibility::ObservedOnly,
+        overall_state: WorkflowOverallState::ObservedOnly,
+        simple: None,
+        archived: None,
+        projection_warning_codes: vec![],
+        current_phase_id,
+        current_node_ids,
+        phases,
+        nodes,
+        edges: vec![],
+        gates: vec![],
+    }))
+}
+
+fn project_observed_runs(
+    runs: Vec<delegation_task_run::Model>,
+) -> (Vec<WorkflowNodeSnapshot>, Vec<WorkflowPhaseSnapshot>) {
     // Group by work_unit_key; only A1-recognized keys (A11). Pre-A1 / NULL → skip.
     let mut by_key: HashMap<String, Vec<delegation_task_run::Model>> = HashMap::new();
-    let mut any_recognized = false;
     for run in runs {
         let Some(key) = run.work_unit_key.as_deref() else {
             continue; // A9 NULL
@@ -3571,13 +3647,8 @@ async fn project_observed_only(
         let Some(parsed) = parse_recognized_work_unit_key(key) else {
             continue; // A11/B7 pre-A1 → not observed-only
         };
-        any_recognized = true;
         let _ = parsed;
         by_key.entry(key.to_string()).or_default().push(run);
-    }
-
-    if !any_recognized {
-        return Ok(None);
     }
 
     let mut nodes: Vec<WorkflowNodeSnapshot> = Vec::new();
@@ -3700,31 +3771,7 @@ async fn project_observed_only(
         .collect();
     phases.sort_by(|a, b| a.id.cmp(&b.id));
 
-    enrich_nodes_display_from_children(conn, &mut nodes).await;
-
-    let (current_node_ids, current_phase_id) = select_current_nodes(&nodes, &[], &[]);
-
-    Ok(Some(WorkflowGraphSnapshot {
-        schema_version: WORKFLOW_GRAPH_SNAPSHOT_SCHEMA_VERSION,
-        workflow_id: None,
-        workflow_kind: WORKFLOW_KIND_BRAINSTORM_TO_DELIVERY.to_string(),
-        manifest_revision: None,
-        graph_revision: None,
-        manifest_state: None,
-        completion_protocol: None,
-        completion: None,
-        compatibility: WorkflowCompatibility::ObservedOnly,
-        overall_state: WorkflowOverallState::ObservedOnly,
-        simple: None,
-        archived: None,
-        projection_warning_codes: vec![],
-        current_phase_id,
-        current_node_ids,
-        phases,
-        nodes,
-        edges: vec![],
-        gates: vec![],
-    }))
+    (nodes, phases)
 }
 
 fn parsed_meta(parsed: &ParsedWorkUnitKey) -> (String, String, Option<u32>) {
@@ -8250,6 +8297,96 @@ mod tests {
             DerivedBranchTip::Pending,
             "highest completed task_index wins even with empty digest → Pending, not earlier A"
         );
+    }
+
+    #[tokio::test]
+    async fn simple_projection_retains_document_stages_after_registration() {
+        let (db, parent) = seed_parent().await;
+        let workspace = parent_workspace(&db, parent).await;
+        std::fs::write(
+            Path::new(&workspace).join("docs/simple-plan.md"),
+            "## Task 1: Implement feature\n",
+        )
+        .unwrap();
+        for (task_id, key, status) in [
+            (
+                "design-review",
+                "design|docs/design.md|reviewer|codex|none",
+                DelegationRunStatus::Completed,
+            ),
+            (
+                "plan-author",
+                "plan|docs/simple-plan.md|author|codex|none",
+                DelegationRunStatus::Completed,
+            ),
+            (
+                "plan-review",
+                "plan|docs/simple-plan.md|reviewer|codex|none",
+                DelegationRunStatus::Running,
+            ),
+            (
+                "other-plan",
+                "plan|docs/other-plan.md|reviewer|codex|none",
+                DelegationRunStatus::Running,
+            ),
+        ] {
+            insert_run(
+                &db,
+                parent,
+                task_id,
+                Some(key),
+                status,
+                1,
+                None,
+                None,
+                "codex",
+            )
+            .await;
+        }
+        let before = project_workflow_graph_core(&db, parent).await.unwrap();
+        assert_eq!(before.compatibility, WorkflowCompatibility::ObservedOnly);
+        assert_eq!(before.nodes.len(), 4);
+        super::super::simple::register_simple_workflow(
+            &db.conn,
+            parent,
+            "docs/simple-plan.md",
+            None,
+        )
+        .await
+        .unwrap();
+        let after = project_workflow_graph_core(&db, parent).await.unwrap();
+        assert_eq!(after.compatibility, WorkflowCompatibility::Simple);
+        assert_eq!(after.nodes.len(), 4);
+        assert_eq!(
+            after
+                .nodes
+                .iter()
+                .filter(|node| node.task_index.is_some())
+                .count(),
+            1
+        );
+        for task_id in ["design-review", "plan-author", "plan-review"] {
+            let old = before
+                .nodes
+                .iter()
+                .find(|node| node.latest_task_id.as_deref() == Some(task_id))
+                .unwrap();
+            let new = after
+                .nodes
+                .iter()
+                .find(|node| node.latest_task_id.as_deref() == Some(task_id))
+                .unwrap();
+            assert_eq!(new.node_id, old.node_id);
+            assert_eq!(new.status, old.status);
+            assert_eq!(
+                new.latest_child_conversation_id,
+                old.latest_child_conversation_id
+            );
+        }
+        assert_eq!(after.current_phase_id.as_deref(), Some("plan"));
+        assert_eq!(after.overall_state, WorkflowOverallState::InProgress);
+        assert_eq!(after.current_node_ids.len(), 1);
+        assert!(after.gates.is_empty());
     }
 
     #[tokio::test]

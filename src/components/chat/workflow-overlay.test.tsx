@@ -748,6 +748,71 @@ function simplePanelView(
   )
 }
 
+it("keeps design review and plan authoring/review visible without counting them as tasks", async () => {
+  const snapshot = simpleGraph()
+  const taskCount = snapshot.nodes.length
+  snapshot.nodes.unshift(
+    node({
+      node_id: "design-review",
+      is_observed: true,
+      phase_id: "design",
+      role: "reviewer",
+      status: "completed",
+      summary: "Design checked",
+      latest_child_conversation_id: 81,
+    }),
+    node({
+      node_id: "plan-review",
+      is_observed: true,
+      phase_id: "plan",
+      role: "reviewer",
+      status: "running",
+      summary: "Checking implementation plan",
+      latest_child_conversation_id: 82,
+    }),
+    node({
+      node_id: "plan-author",
+      is_observed: true,
+      phase_id: "plan",
+      role: "author",
+      status: "completed",
+      summary: "Implementation plan written",
+      latest_child_conversation_id: 83,
+    })
+  )
+  render(simplePanelView(snapshot, 42))
+
+  const design = screen.getByTestId("workflow-graph-lane-design")
+  const plan = screen.getByTestId("workflow-graph-lane-plan")
+  expect(within(design).getByText("Design checked")).toBeVisible()
+  expect(within(plan).getByText("Authoring")).toBeVisible()
+  expect(within(plan).getByText("Review")).toBeVisible()
+  expect(
+    Array.from(
+      plan.querySelectorAll("[data-testid^='workflow-task-node-']")
+    ).map((el) => el.getAttribute("data-testid"))
+  ).toEqual([
+    "workflow-task-node-plan-author",
+    "workflow-task-node-plan-review",
+  ])
+  expect(screen.getByRole("progressbar")).toHaveAttribute(
+    "aria-valuemax",
+    String(taskCount)
+  )
+  expect(screen.getByRole("progressbar")).toHaveAttribute("aria-valuenow", "1")
+  expect(
+    within(screen.getByTestId("workflow-graph-lane-tasks")).queryByText(
+      "Design checked"
+    )
+  ).toBeNull()
+  await userEvent.click(
+    within(plan).getByTestId("simple-task-open-plan-review")
+  )
+  expect(openDelegatedChildSession).toHaveBeenCalledWith(
+    expect.objectContaining({ childConversationId: 82 })
+  )
+})
+
 describe("Simple workflow task overview", () => {
   it("uses the plan task title and hides child session titles", () => {
     const graph = simpleDagGraph()

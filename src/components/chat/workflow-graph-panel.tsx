@@ -535,9 +535,24 @@ function SimpleWorkflowTaskPanel({
       hasBlockingSimpleWarning(node.projection_warning_codes)
     )
   const rows = useMemo(
-    () => buildWorkflowNodeRows(snapshot.nodes, "tasks"),
+    () =>
+      buildWorkflowNodeRows(
+        snapshot.nodes.filter(
+          (node) => node.phase_id !== "design" && node.phase_id !== "plan"
+        ),
+        "tasks"
+      ),
     [snapshot.nodes]
   )
+  const documentPhases = (["design", "plan"] as const)
+    .map((kind) => ({
+      kind,
+      nodes: buildWorkflowNodeRows(
+        snapshot.nodes.filter((node) => node.phase_id === kind),
+        kind
+      ).flatMap((row) => row.nodes),
+    }))
+    .filter((phase) => phase.nodes.length > 0)
   const taskTitle = (row: (typeof rows)[number]) =>
     row.nodes.find((node) => node.task_title?.trim())?.task_title?.trim() ||
     t("taskIndex", { index: row.taskIndex ?? rows.indexOf(row) + 1 })
@@ -667,6 +682,52 @@ function SimpleWorkflowTaskPanel({
           )}
         </div>
       )}
+      {documentPhases.map((phase) => {
+        const reviewerCount = phase.nodes.filter(
+          (node) => node.role === "reviewer"
+        ).length
+        let reviewerIndex = 0
+        return (
+          <section
+            key={phase.kind}
+            data-testid={`workflow-graph-lane-${phase.kind}`}
+            aria-label={t(`phase.${phase.kind}`)}
+            className={cn(
+              "min-w-0 overflow-hidden rounded-xl border bg-card",
+              phase.nodes.some((node) =>
+                snapshot.current_node_ids.includes(node.node_id)
+              ) && "border-blue-500/40"
+            )}
+          >
+            <h3 className="border-b border-border/60 px-3 py-2 text-[13px] font-semibold leading-5">
+              {t(`phase.${phase.kind}`)}
+            </h3>
+            <div className="divide-y divide-border/50">
+              {phase.nodes.map((node, index) => {
+                const role =
+                  node.role === "author" || node.role === "reviewer"
+                    ? t(`nodeRole.${node.role}`)
+                    : node.role || t(`phase.${phase.kind}`)
+                if (node.role === "reviewer") reviewerIndex += 1
+                return (
+                  <SimpleTaskExecution
+                    key={`${node.node_id}-${index}`}
+                    node={node}
+                    taskTitle={t(`phase.${phase.kind}`)}
+                    roleLabel={
+                      node.role === "reviewer" && reviewerCount > 1
+                        ? `${role} ${reviewerIndex}`
+                        : role
+                    }
+                    current={snapshot.current_node_ids.includes(node.node_id)}
+                    allowOpen={idsAreUnambiguous}
+                  />
+                )
+              })}
+            </div>
+          </section>
+        )
+      })}
       <section
         className="min-w-0 space-y-2"
         data-testid="workflow-graph-lane-tasks"
