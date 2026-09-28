@@ -58,23 +58,27 @@ stage_clean() {
   mkdir -p "$TMP"
 }
 
-# Materialize deploy/codeg-boot from local clone without switching branches.
+# Read deploy/codeg-boot blobs from the local clone. git show / cat-file only —
+# never checkout, so the MyCodeBuddy index and worktree stay untouched.
 fetch_via_git() {
   [ -d "$REPO/.git" ] || return 1
   if ! git -C "$REPO" fetch --quiet "$REMOTE" "$BRANCH" 2>>"$LOG"; then
     return 1
   fi
-  if ! git -C "$REPO" checkout -q "$REF" -- deploy/codeg-boot 2>>"$LOG"; then
-    return 1
-  fi
-  local src="$REPO/deploy/codeg-boot/scripts"
-  [ -d "$src" ] || return 1
   stage_clean
-  local f
+  local f spec
   for f in "${SCRIPTS[@]}"; do
-    if [ -f "$src/$f" ]; then
-      cp -a "$src/$f" "$TMP/$f"
+    spec="$REF:deploy/codeg-boot/scripts/$f"
+    if ! git -C "$REPO" cat-file -e "$spec" 2>>"$LOG"; then
+      log "git: absent $spec"
+      continue
     fi
+    if ! git -C "$REPO" show "$spec" >"$TMP/$f.part" 2>>"$LOG"; then
+      rm -f "$TMP/$f.part"
+      log "git show failed $spec"
+      continue
+    fi
+    mv "$TMP/$f.part" "$TMP/$f"
   done
   [ -s "$TMP/codeg-watchdog.sh" ] && [ -s "$TMP/ensure-acp-agents.sh" ]
 }

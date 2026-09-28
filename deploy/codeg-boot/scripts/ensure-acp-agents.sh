@@ -12,6 +12,13 @@
 #
 # Grok is npx (@xai-official/grok); its native binary lands in ~/.grok/bin.
 # We also mirror those binaries under acp-binaries-mirror/grok-bin/.
+#
+# Download failures back off per agent (stamp $HB/ensure-acp-<agent>.fail).
+# When the wanted files are already on disk but acp_list_agents still reports
+# a different installed_version, binary agents re-register via
+# acp_download_agent_binary (cache hit is a no-op). Grok is npx, so that
+# endpoint rejects it: refresh with acp_detect_agent_local_version and, if
+# the probed version is still wrong, acp_prepare_npx_agent.
 set -uo pipefail
 export PATH=/workspace/bin:/exec-daemon:$HOME/.local/bin:$PATH
 
@@ -42,6 +49,159 @@ fi
 
 ts() { date '+%Y-%m-%d %H:%M:%S %Z'; }
 log() { echo "$(ts) $*" >>"$LOG"; }
+
+# Per-agent download backoff. Stamp line: "<unix_ts> <next_backoff_secs>".
+BACKOFF_BASE=${CODEG_ACP_BACKOFF_BASE_SECS:-3600}
+BACKOFF_CAP=${CODEG_ACP_BACKOFF_CAP_SECS:-21600}
+case $BACKOFF_BASE in
+  ''|*[!0-9]*) BACKOFF_BASE=3600 ;;
+esac
+case $BACKOFF_CAP in
+  ''|*[!0-9]*) BACKOFF_CAP=21600 ;;
+esac
+if [ "$BACKOFF_BASE" -lt 1 ]; then
+  BACKOFF_BASE=3600
+fi
+if [ "$BACKOFF_CAP" -lt 1 ]; then
+  BACKOFF_CAP=21600
+fi
+if [ "$BACKOFF_CAP" -lt "$BACKOFF_BASE" ]; then
+  BACKOFF_CAP=$BACKOFF_BASE
+fi
+
+acp_fail_stamp() {
+  echo "$HB/ensure-acp-$1.fail"
+}
+
+# 0 = skip this agent's download; other plan rows still run.
+acp_download_blocked() {
+  local agent=$1 stamp last next now until
+  stamp=$(acp_fail_stamp "$agent")
+  [ -f "$stamp" ] || return 1
+  read -r last next <"$stamp" || return 1
+  case "$last" in
+    ''|*[!0-9]*) return 1 ;;
+  esac
+  case "$next" in
+    ''|*[!0-9]*) return 1 ;;
+  esac
+  now=$(date +%s)
+  until=$((last + next))
+  if [ "$now" -lt "$until" ]; then
+    log "skip $agent download: backoff ${next}s until $(date -d "@$until" '+%Y-%m-%d %H:%M:%S %Z' 2>/dev/null || echo "$until")"
+    return 0
+  fi
+  return 1
+}
+
+acp_backoff_fail() {
+  local agent=$1 stamp now prev next
+  stamp=$(acp_fail_stamp "$agent")
+  now=$(date +%s)
+  next=$BACKOFF_BASE
+  if [ -f "$stamp" ]; then
+    read -r _ prev <"$stamp" || prev=$BACKOFF_BASE
+    case "$prev" in
+      ''|*[!0-9]*) prev=$BACKOFF_BASE ;;
+    esac
+    next=$((prev * 2))
+    if [ "$next" -lt "$BACKOFF_BASE" ]; then
+      next=$BACKOFF_BASE
+    fi
+  fi
+  if [ "$next" -gt "$BACKOFF_CAP" ]; then
+    next=$BACKOFF_CAP
+  fi
+  printf '%s %s\n' "$now" "$next" >"$stamp"
+  log "backoff $agent: next_backoff_secs=$next"
+}
+
+acp_backoff_clear() {
+  local agent=$1 stamp
+  stamp=$(acp_fail_stamp "$agent")
+  if [ -f "$stamp" ]; then
+    rm -f "$stamp"
+    log "cleared download backoff for $agent"
+  fi
+}
+
+api_installed_version() {
+  local agent=$1
+  python3 - "$agent" <<'PY' 2>>"$LOG"
+import json, os, sys, urllib.request
+agent = sys.argv[1]
+token = open(os.environ["CODEG_TOKEN_FILE"]).read().strip()
+req = urllib.request.Request(
+  "http://127.0.0.1:3080/api/acp_list_agents",
+  data=b"{}",
+  headers={"Authorization": "Bearer " + token, "Content-Type": "application/json"},
+  method="POST",
+)
+agents = json.load(urllib.request.urlopen(req, timeout=30))
+for a in agents:
+  if (a.get("agent_type") or "") == agent:
+    inst = (a.get("installed_version") or "").strip()
+    sys.stdout.write(inst if inst else "-")
+    raise SystemExit(0)
+sys.stdout.write("-")
+PY
+}
+
+api_download_binary() {
+  local agent=$1 want=$2 inst=${3:--}
+  local tid code
+  tid="ensure-$(date +%s)-$agent"
+  log "downloading $agent version=$want taskId=$tid (was $inst)"
+  code=$(curl -sS -m 900 -o "/tmp/ensure-acp-$agent.body" -w '%{http_code}' \
+    -X POST "$API/api/acp_download_agent_binary" \
+    -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+    -d "{\"agentType\":\"$agent\",\"version\":\"$want\",\"taskId\":\"$tid\"}" \
+    2>/tmp/ensure-acp-$agent.err || echo "000")
+  if [ "$code" = "200" ]; then
+    log "download $agent@$want ok"
+    return 0
+  fi
+  log "download $agent@$want failed http=$code body=$(head -c 200 /tmp/ensure-acp-$agent.body 2>/dev/null) err=$(head -c 120 /tmp/ensure-acp-$agent.err 2>/dev/null)"
+  return 1
+}
+
+# Grok is npx: acp_download_agent_binary refuses it. This probe writes
+# installed_version from npm list / the system CLI.
+api_detect_version() {
+  local agent=$1 code
+  code=$(curl -sS -m 120 -o "/tmp/ensure-acp-$agent.detect" -w '%{http_code}' \
+    -X POST "$API/api/acp_detect_agent_local_version" \
+    -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+    -d "{\"agentType\":\"$agent\"}" 2>>"$LOG" || echo "000")
+  if [ "$code" != "200" ]; then
+    log "detect $agent failed http=$code body=$(head -c 200 /tmp/ensure-acp-$agent.detect 2>/dev/null)"
+    return 1
+  fi
+  python3 -c 'import json,sys
+try:
+    v=json.load(open(sys.argv[1]))
+except Exception:
+    v=None
+sys.stdout.write(v if isinstance(v, str) else "")' "/tmp/ensure-acp-$agent.detect"
+}
+
+api_prepare_npx() {
+  local agent=$1 want=$2 inst=${3:--}
+  local tid code
+  tid="ensure-$(date +%s)-$agent"
+  log "preparing npx $agent version=$want taskId=$tid (was $inst)"
+  code=$(curl -sS -m 900 -o "/tmp/ensure-acp-$agent.body" -w '%{http_code}' \
+    -X POST "$API/api/acp_prepare_npx_agent" \
+    -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+    -d "{\"agentType\":\"$agent\",\"registryVersion\":\"$want\",\"version\":\"$want\",\"cleanFirst\":false,\"taskId\":\"$tid\"}" \
+    2>/tmp/ensure-acp-$agent.err || echo "000")
+  if [ "$code" = "200" ]; then
+    log "prepare $agent@$want ok body=$(head -c 80 /tmp/ensure-acp-$agent.body 2>/dev/null)"
+    return 0
+  fi
+  log "prepare $agent@$want failed http=$code body=$(head -c 200 /tmp/ensure-acp-$agent.body 2>/dev/null) err=$(head -c 120 /tmp/ensure-acp-$agent.err 2>/dev/null)"
+  return 1
+}
 
 # True when antigravity version dir has entry + required sibling.
 antigravity_installed() {
@@ -281,28 +441,66 @@ while IFS= read -r line; do
     antigravity)
       ANTIGRAVITY_VER=$want
       ANTIGRAVITY_ZIP_URL="https://dl.google.com/agy-extensions/releases/linux/agy-acp-server-${ANTIGRAVITY_VER}-linux-x86_64.zip"
+      if acp_download_blocked "$agent"; then
+        continue
+      fi
       if antigravity_installed "$ANTIGRAVITY_VER"; then
-        log "antigravity $ANTIGRAVITY_VER already on disk (api said installed=$inst)"
+        log "antigravity $ANTIGRAVITY_VER already on disk but api installed=$inst != $want; refreshing via POST /api/acp_download_agent_binary"
+        if api_download_binary "$agent" "$want" "$inst"; then
+          acp_backoff_clear "$agent"
+        else
+          acp_backoff_fail "$agent"
+        fi
         continue
       fi
       if install_antigravity_direct; then
-        continue
+        fresh=$(api_installed_version antigravity | tr -d '[:space:]' || true)
+        [ -n "${fresh:-}" ] || fresh="?"
+        if [ "$fresh" = "$want" ]; then
+          log "antigravity $want direct install matches api installed=$fresh"
+          acp_backoff_clear "$agent"
+          continue
+        fi
+        log "antigravity $want on disk after direct install but api installed=$fresh != $want; falling through to API download"
+      else
+        acp_backoff_fail "$agent"
+        log "antigravity direct install failed; falling back to API download version=$want"
       fi
-      log "antigravity direct install failed; falling back to API download version=$want"
+      if api_download_binary "$agent" "$want" "$inst"; then
+        acp_backoff_clear "$agent"
+      else
+        acp_backoff_fail "$agent"
+      fi
       ;;
     cursor)
-      if [ -d "$CACHE/cursor/$want" ] && [ -n "$(ls -A "$CACHE/cursor/$want" 2>/dev/null)" ]; then
-        log "cursor $want already on disk (api said installed=$inst)"
+      if acp_download_blocked "$agent"; then
         continue
+      fi
+      if [ -d "$CACHE/cursor/$want" ] && [ -n "$(ls -A "$CACHE/cursor/$want" 2>/dev/null)" ]; then
+        log "cursor $want already on disk but api installed=$inst != $want; refreshing via POST /api/acp_download_agent_binary"
+      fi
+      if api_download_binary "$agent" "$want" "$inst"; then
+        acp_backoff_clear "$agent"
+      else
+        acp_backoff_fail "$agent"
       fi
       ;;
     grok)
+      if acp_download_blocked "$agent"; then
+        continue
+      fi
       GROK_VER=$want
       GROK_PKG="${GROK_PKG_BASE}@${GROK_VER}"
-      if command -v npm >/dev/null 2>&1; then
-        if ! "$GROK_BIN_DIR/grok" --version 2>/dev/null | grep -q "$GROK_VER"; then
-          log "installing $GROK_PKG via npm (installed=$inst registry=$want)"
-          npm install -g "$GROK_PKG" >>"$LOG" 2>&1 || log "npm install grok failed"
+      grok_on_disk=0
+      if [ -x "$GROK_BIN_DIR/grok-$GROK_VER" ] \
+        || "$GROK_BIN_DIR/grok" --version 2>/dev/null | grep -q "$GROK_VER"; then
+        grok_on_disk=1
+      fi
+      if [ "$grok_on_disk" != "1" ] && command -v npm >/dev/null 2>&1; then
+        log "installing $GROK_PKG via npm (installed=$inst registry=$want)"
+        if ! npm install -g "$GROK_PKG" >>"$LOG" 2>&1; then
+          log "npm install grok failed"
+          acp_backoff_fail "$agent"
         fi
       fi
       if [ -x "$GROK_BIN_DIR/grok-$GROK_VER" ]; then
@@ -310,27 +508,34 @@ while IFS= read -r line; do
         mkdir -p "$GROK_MIRROR"
         sync_dir "$GROK_BIN_DIR" "$GROK_MIRROR"
         log "mirrored grok bins -> $GROK_MIRROR"
+        grok_on_disk=1
       elif command -v grok >/dev/null 2>&1; then
         grok --version >>"$LOG" 2>&1 || true
         if [ -x "$GROK_BIN_DIR/grok-$GROK_VER" ]; then
           ln -sfn "grok-$GROK_VER" "$GROK_BIN_DIR/grok"
           sync_dir "$GROK_BIN_DIR" "$GROK_MIRROR"
+          grok_on_disk=1
         fi
       fi
-      continue
+      # Download endpoint is binary-only. Probe first; prepare if the DB
+      # installed_version is still not the wanted build.
+      if [ "$grok_on_disk" = "1" ]; then
+        log "grok $want already on disk but api installed=$inst != $want; refreshing via POST /api/acp_detect_agent_local_version"
+        detected=$(api_detect_version grok | tr -d '[:space:]' || true)
+        if [ "${detected:-}" = "$want" ]; then
+          log "grok installed_version refreshed to $want"
+          acp_backoff_clear "$agent"
+          continue
+        fi
+        log "grok detect returned ${detected:-none} != $want; falling through to POST /api/acp_prepare_npx_agent"
+      fi
+      if api_prepare_npx "$agent" "$want" "$inst"; then
+        acp_backoff_clear "$agent"
+      else
+        acp_backoff_fail "$agent"
+      fi
       ;;
   esac
-
-  tid="ensure-$(date +%s)-$agent"
-  log "downloading $agent version=$want taskId=$tid (was $inst)"
-  code=$(curl -sS -m 900 -o /tmp/ensure-acp-$agent.body -w '%{http_code}' -X POST "$API/api/acp_download_agent_binary" \
-    -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
-    -d "{\"agentType\":\"$agent\",\"version\":\"$want\",\"taskId\":\"$tid\"}" 2>/tmp/ensure-acp-$agent.err || echo "000")
-  if [ "$code" = "200" ]; then
-    log "download $agent@$want ok"
-  else
-    log "download $agent@$want failed http=$code body=$(head -c 200 /tmp/ensure-acp-$agent.body 2>/dev/null) err=$(head -c 120 /tmp/ensure-acp-$agent.err 2>/dev/null)"
-  fi
 done <<EOF
 $PLAN
 EOF
