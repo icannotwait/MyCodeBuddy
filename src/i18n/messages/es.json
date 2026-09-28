@@ -4153,6 +4153,11 @@
         "planning": "Planificando…"
       },
       "workflowGraph": {
+        "completedTaskProgress": "{completed} / {total} tareas completadas",
+        "waitingForTasks": "Esperando {tasks}",
+        "moreTaskActions": "Más acciones de tareas",
+        "completedTaskCount": "{count} tareas completadas",
+        "currentTaskProgress": "Tarea actual {current} / {total}",
         "title": "Flujo de trabajo",
         "segmentWorkflow": "Flujo",
         "segmentSessions": "Sesiones",
@@ -4165,11 +4170,11 @@
         "collapsedSummary": "Flujo {state}",
         "archivedTitle": "Flujo archivado",
         "archivedReadOnly": "Solo lectura",
-        "simpleOpenPlan": "Abrir Plan",
-        "simpleOpenProgress": "Abrir progreso",
-        "simplePartialProjection": "Proyección Simple parcial",
-        "simpleProjectionWarning": "No se pudieron proyectar algunos datos del Plan o del progreso.",
-        "simpleTasks": "Tareas Simple",
+        "simpleOpenPlan": "Ver plan",
+        "simpleOpenProgress": "Ver registro de progreso",
+        "simplePartialProjection": "Parte de la información de las tareas no está disponible",
+        "simpleProjectionWarning": "No se pudo leer por completo el plan o el registro de progreso.",
+        "simpleTasks": "Tareas",
         "simpleTaskCount": "{count} tareas",
         "simpleNoTasks": "No hay tareas en el Plan",
         "simpleLiveRun": "Ejecución activa: {status}",
@@ -4239,6 +4244,11 @@
         "completionLegacySource": "Flujo de origen heredado #{conversation}",
         "completionLegacySuccessor": "Flujo sucesor #{conversation}",
         "completionAutomaticWake": "La orquestación raíz se reanudó automáticamente",
+        "nodeRole": {
+          "implementer": "Implementación",
+          "reviewer": "Revisión",
+          "author": "Redacción"
+        },
         "completionOutcome": {
           "approve": "Aprobar",
           "approve_with_minors": "Aprobar con cambios menores",

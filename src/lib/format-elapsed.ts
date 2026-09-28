@@ -36,3 +36,20 @@ export function formatElapsedLabel(
   }
   return t("elapsedSeconds", { value: seconds })
 }
+
+/** Compact duration for the workflow floating card. */
+export function formatCompactElapsed(ms: number): string {
+  if (!Number.isFinite(ms) || ms <= 0) return "0s"
+
+  if (ms >= 3_600_000) {
+    const totalMinutes = Math.ceil(ms / 60_000)
+    const hours = Math.floor(totalMinutes / 60)
+    const minutes = totalMinutes % 60
+    return `${hours}h${minutes ? `${minutes}m` : ""}`
+  }
+
+  const totalSeconds = Math.floor(ms / 1_000)
+  const minutes = Math.floor(totalSeconds / 60)
+  const seconds = totalSeconds % 60
+  return minutes ? `${minutes}m${seconds ? `${seconds}s` : ""}` : `${seconds}s`
+}

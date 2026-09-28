@@ -5,15 +5,13 @@
 
 export const SUB_AGENT_OVERLAY_SIZE_KEY = "workspace:sub-agent-overlay-size"
 
-/** Matches former Tailwind `w-72`. */
-export const DEFAULT_OVERLAY_WIDTH = 288
 export const MIN_OVERLAY_WIDTH = 224
-export const MAX_OVERLAY_WIDTH = 448
+export const MAX_OVERLAY_WIDTH = 450
+export const DEFAULT_OVERLAY_WIDTH = MAX_OVERLAY_WIDTH
 
-/** Matches former Tailwind `max-h-96` on the list body. */
-export const DEFAULT_OVERLAY_MAX_HEIGHT = 384
 export const MIN_OVERLAY_MAX_HEIGHT = 120
 export const MAX_OVERLAY_MAX_HEIGHT = 560
+export const DEFAULT_OVERLAY_MAX_HEIGHT = MAX_OVERLAY_MAX_HEIGHT
 
 export interface OverlaySize {
   width: number

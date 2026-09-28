@@ -4153,6 +4153,11 @@
         "planning": "Wird geplant…"
       },
       "workflowGraph": {
+        "completedTaskProgress": "{completed} / {total} Aufgaben abgeschlossen",
+        "waitingForTasks": "Wartet auf {tasks}",
+        "moreTaskActions": "Weitere Aufgabenaktionen",
+        "completedTaskCount": "{count} Aufgaben abgeschlossen",
+        "currentTaskProgress": "Aktuelle Aufgabe {current} / {total}",
         "title": "Workflow",
         "segmentWorkflow": "Workflow",
         "segmentSessions": "Sitzungen",
@@ -4165,11 +4170,11 @@
         "collapsedSummary": "Workflow {state}",
         "archivedTitle": "Archivierter Workflow",
         "archivedReadOnly": "Schreibgeschützt",
-        "simpleOpenPlan": "Plan öffnen",
-        "simpleOpenProgress": "Fortschritt öffnen",
-        "simplePartialProjection": "Unvollständige Simple-Projektion",
-        "simpleProjectionWarning": "Einige Plan- oder Fortschrittsdaten konnten nicht projiziert werden.",
-        "simpleTasks": "Simple-Aufgaben",
+        "simpleOpenPlan": "Plan ansehen",
+        "simpleOpenProgress": "Fortschrittsprotokoll ansehen",
+        "simplePartialProjection": "Einige Aufgabeninformationen sind nicht verfügbar",
+        "simpleProjectionWarning": "Der Plan oder das Fortschrittsprotokoll konnte nicht vollständig gelesen werden.",
+        "simpleTasks": "Aufgaben",
         "simpleTaskCount": "{count} Aufgaben",
         "simpleNoTasks": "Keine Plan-Aufgaben gefunden",
         "simpleLiveRun": "Aktiver Lauf: {status}",
@@ -4239,6 +4244,11 @@
         "completionLegacySource": "Alter Quell-Workflow #{conversation}",
         "completionLegacySuccessor": "Nachfolge-Workflow #{conversation}",
         "completionAutomaticWake": "Die Root-Orchestrierung wurde automatisch fortgesetzt",
+        "nodeRole": {
+          "implementer": "Umsetzung",
+          "reviewer": "Prüfung",
+          "author": "Verfassen"
+        },
         "completionOutcome": {
           "approve": "Genehmigen",
           "approve_with_minors": "Mit kleinen Änderungen genehmigen",

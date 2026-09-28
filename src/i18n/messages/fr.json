@@ -4153,6 +4153,11 @@
         "planning": "Planification…"
       },
       "workflowGraph": {
+        "completedTaskProgress": "{completed} / {total} tâches terminées",
+        "waitingForTasks": "En attente de {tasks}",
+        "moreTaskActions": "Autres actions",
+        "completedTaskCount": "{count} tâches terminées",
+        "currentTaskProgress": "Tâche actuelle {current} / {total}",
         "title": "Flux de travail",
         "segmentWorkflow": "Flux",
         "segmentSessions": "Sessions",
@@ -4165,11 +4170,11 @@
         "collapsedSummary": "Flux {state}",
         "archivedTitle": "Flux archivé",
         "archivedReadOnly": "Lecture seule",
-        "simpleOpenPlan": "Ouvrir le Plan",
-        "simpleOpenProgress": "Ouvrir la progression",
-        "simplePartialProjection": "Projection Simple partielle",
-        "simpleProjectionWarning": "Certaines données du Plan ou de progression n'ont pas pu être projetées.",
-        "simpleTasks": "Tâches Simple",
+        "simpleOpenPlan": "Voir le plan",
+        "simpleOpenProgress": "Voir le suivi",
+        "simplePartialProjection": "Certaines informations sur les tâches sont indisponibles",
+        "simpleProjectionWarning": "Le plan ou le suivi n’a pas pu être lu intégralement.",
+        "simpleTasks": "Tâches",
         "simpleTaskCount": "{count} tâches",
         "simpleNoTasks": "Aucune tâche dans le Plan",
         "simpleLiveRun": "Exécution active : {status}",
@@ -4239,6 +4244,11 @@
         "completionLegacySource": "Flux source hérité nº {conversation}",
         "completionLegacySuccessor": "Flux successeur nº {conversation}",
         "completionAutomaticWake": "L’orchestration racine a repris automatiquement",
+        "nodeRole": {
+          "implementer": "Implémentation",
+          "reviewer": "Revue",
+          "author": "Rédaction"
+        },
         "completionOutcome": {
           "approve": "Approuver",
           "approve_with_minors": "Approuver avec modifications mineures",

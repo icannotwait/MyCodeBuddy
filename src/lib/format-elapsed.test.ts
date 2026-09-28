@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest"
 import {
+  formatCompactElapsed,
   formatElapsedLabel,
   type ElapsedUnitTranslator,
 } from "@/lib/format-elapsed"
@@ -37,5 +38,27 @@ describe("formatElapsedLabel", () => {
 
   it("clamps negative input to zero", () => {
     expect(formatElapsedLabel(-100, t)).toBe("0s")
+  })
+})
+
+describe("formatCompactElapsed", () => {
+  it("floors seconds below one hour and omits zero seconds after minutes", () => {
+    expect(formatCompactElapsed(500)).toBe("0s")
+    expect(formatCompactElapsed(42_999)).toBe("42s")
+    expect(formatCompactElapsed(60_000)).toBe("1m")
+    expect(formatCompactElapsed(162_999)).toBe("2m42s")
+    expect(formatCompactElapsed(3_599_999)).toBe("59m59s")
+  })
+
+  it("rounds total minutes up from one hour, including a carry", () => {
+    expect(formatCompactElapsed(3_600_000)).toBe("1h")
+    expect(formatCompactElapsed(5_641_000)).toBe("1h35m")
+    expect(formatCompactElapsed(7_199_000)).toBe("2h")
+  })
+
+  it("normalizes negative and non-finite durations", () => {
+    for (const duration of [-100, NaN, Infinity, -Infinity]) {
+      expect(formatCompactElapsed(duration)).toBe("0s")
+    }
   })
 })

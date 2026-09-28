@@ -4153,6 +4153,11 @@
         "planning": "جارٍ التخطيط…"
       },
       "workflowGraph": {
+        "completedTaskProgress": "اكتملت {completed} / {total} من المهام",
+        "waitingForTasks": "بانتظار {tasks}",
+        "moreTaskActions": "المزيد من إجراءات المهام",
+        "completedTaskCount": "اكتملت {count} مهام",
+        "currentTaskProgress": "المهمة الحالية {current} / {total}",
         "title": "سير العمل",
         "segmentWorkflow": "سير العمل",
         "segmentSessions": "الجلسات",
@@ -4165,11 +4170,11 @@
         "collapsedSummary": "سير العمل {state}",
         "archivedTitle": "سير عمل مؤرشف",
         "archivedReadOnly": "للقراءة فقط",
-        "simpleOpenPlan": "فتح Plan",
-        "simpleOpenProgress": "فتح التقدم",
-        "simplePartialProjection": "إسقاط Simple جزئي",
-        "simpleProjectionWarning": "تعذر إسقاط بعض بيانات Plan أو التقدم.",
-        "simpleTasks": "مهام Simple",
+        "simpleOpenPlan": "عرض الخطة",
+        "simpleOpenProgress": "عرض سجل التقدم",
+        "simplePartialProjection": "بعض معلومات المهام غير متاحة",
+        "simpleProjectionWarning": "تعذرت قراءة الخطة أو سجل التقدم بالكامل.",
+        "simpleTasks": "المهام",
         "simpleTaskCount": "{count} مهام",
         "simpleNoTasks": "لا توجد مهام في Plan",
         "simpleLiveRun": "تشغيل مباشر: {status}",
@@ -4239,6 +4244,11 @@
         "completionLegacySource": "سير العمل المصدر القديم رقم {conversation}",
         "completionLegacySuccessor": "سير العمل اللاحق رقم {conversation}",
         "completionAutomaticWake": "تم استئناف تنسيق الجذر تلقائيًا",
+        "nodeRole": {
+          "implementer": "تنفيذ",
+          "reviewer": "مراجعة",
+          "author": "تأليف"
+        },
         "completionOutcome": {
           "approve": "موافقة",
           "approve_with_minors": "موافقة مع تعديلات طفيفة",

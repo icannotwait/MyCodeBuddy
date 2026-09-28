@@ -4153,6 +4153,11 @@
         "planning": "Planning…"
       },
       "workflowGraph": {
+        "completedTaskProgress": "{completed} / {total} tasks completed",
+        "waitingForTasks": "Waiting for {tasks}",
+        "moreTaskActions": "More task actions",
+        "completedTaskCount": "{count} tasks completed",
+        "currentTaskProgress": "Current task {current} / {total}",
         "title": "Workflow",
         "segmentWorkflow": "Workflow",
         "segmentSessions": "Sessions",
@@ -4165,11 +4170,11 @@
         "collapsedSummary": "Workflow {state}",
         "archivedTitle": "Archived workflow",
         "archivedReadOnly": "Read-only",
-        "simpleOpenPlan": "Open Plan",
-        "simpleOpenProgress": "Open progress",
-        "simplePartialProjection": "Partial Simple projection",
-        "simpleProjectionWarning": "Some Plan or progress data could not be projected.",
-        "simpleTasks": "Simple tasks",
+        "simpleOpenPlan": "View plan",
+        "simpleOpenProgress": "View progress record",
+        "simplePartialProjection": "Some task information is unavailable",
+        "simpleProjectionWarning": "The plan or progress record could not be fully read.",
+        "simpleTasks": "Tasks",
         "simpleTaskCount": "{count} tasks",
         "simpleNoTasks": "No Plan tasks found",
         "simpleLiveRun": "Live run: {status}",
@@ -4239,6 +4244,11 @@
         "completionLegacySource": "Legacy source workflow #{conversation}",
         "completionLegacySuccessor": "Successor workflow #{conversation}",
         "completionAutomaticWake": "Root orchestration resumed automatically",
+        "nodeRole": {
+          "implementer": "Implementation",
+          "reviewer": "Review",
+          "author": "Authoring"
+        },
         "completionOutcome": {
           "approve": "Approve",
           "approve_with_minors": "Approve with minors",

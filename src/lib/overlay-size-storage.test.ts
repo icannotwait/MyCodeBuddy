@@ -28,6 +28,13 @@ describe("overlay-size-storage", () => {
     expect(clampOverlayMaxHeight(9999)).toBe(MAX_OVERLAY_MAX_HEIGHT)
   })
 
+  it("defaults both dimensions to their maxima", () => {
+    expect(loadOverlaySize(KEY)).toEqual({ width: 450, maxHeight: 560 })
+    expect(clampOverlayWidth(451)).toBe(450)
+    expect(MAX_OVERLAY_WIDTH).toBe(450)
+    expect(MAX_OVERLAY_MAX_HEIGHT).toBe(560)
+  })
+
   it("returns defaults when storage is empty or invalid", () => {
     expect(loadOverlaySize(KEY)).toEqual({
       width: DEFAULT_OVERLAY_WIDTH,

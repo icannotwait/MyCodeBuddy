@@ -736,7 +736,7 @@ export const SubAgentOverlay = memo(function SubAgentOverlay({
         "pointer-events-none flex",
         hasGraph && graphExpanded && activeSegment === "workflow"
           ? "max-w-[min(48rem,calc(100%-2rem))]"
-          : "max-w-[min(28rem,calc(100%-2rem))]"
+          : "max-w-[min(450px,calc(100%-2rem))]"
       )}
       data-testid="sub-agent-overlay"
       data-has-workflow={hasGraph ? "true" : "false"}
@@ -755,7 +755,17 @@ export const SubAgentOverlay = memo(function SubAgentOverlay({
               <BotIcon className="h-4 w-4 shrink-0 text-muted-foreground" />
             )}
             <span className="truncate text-sm font-medium">{headerTitle}</span>
-            {hasGraph && graph ? (
+            {graph?.compatibility === "simple" ? (
+              <span
+                role="img"
+                aria-label={tw(`overallState.${graph.overall_state}`)}
+                title={tw(`overallState.${graph.overall_state}`)}
+                data-testid="workflow-overall-state"
+                className="inline-flex shrink-0"
+              >
+                <WorkflowStatusIcon visualStatus={graph.overall_state} />
+              </span>
+            ) : hasGraph && graph ? (
               <Badge
                 variant="secondary"
                 className="h-5 shrink-0"
@@ -823,7 +833,11 @@ export const SubAgentOverlay = memo(function SubAgentOverlay({
               data-testid="workflow-segment-workflow"
               onClick={() => setSegment("workflow")}
             >
-              {tw("segmentWorkflow")}
+              {tw(
+                graph?.compatibility === "simple"
+                  ? "phase.tasks"
+                  : "segmentWorkflow"
+              )}
             </Button>
             <Button
               type="button"

@@ -208,7 +208,7 @@ describe("SubAgentOverlay", () => {
       )
 
       expect(screen.getByTestId("workflow-archived-banner")).toBeVisible()
-      expect(screen.getByRole("button", { name: "Open Plan" })).toBeVisible()
+      expect(screen.getByRole("button", { name: "View plan" })).toBeVisible()
       expect(
         screen.queryByRole("button", { name: "Continue in Simple" })
       ).toBeNull()
@@ -930,7 +930,7 @@ describe("SubAgentOverlay", () => {
     ).not.toBeInTheDocument()
   })
 
-  it("defaults list max-height to 384 and card width to 288", () => {
+  it("defaults to the maximum 560px list height and 450px card width", () => {
     renderWithIntl(
       <SubAgentOverlay
         delegations={[
@@ -943,9 +943,9 @@ describe("SubAgentOverlay", () => {
       />
     )
     const list = screen.getByTestId("sub-agent-overlay-list")
-    expect(list).toHaveStyle({ maxHeight: "384px" })
+    expect(list).toHaveStyle({ maxHeight: "560px" })
     expect(screen.getByTestId("sub-agent-overlay")).toHaveStyle({
-      width: "288px",
+      width: "450px",
     })
   })
 
@@ -1038,8 +1038,8 @@ describe("SubAgentOverlay", () => {
 
     act(() => {
       firePointer(handle, "pointerdown", 300, 100)
-      firePointer(window, "pointermove", 380, 100)
-      firePointer(window, "pointerup", 380, 100)
+      firePointer(window, "pointermove", 218, 100)
+      firePointer(window, "pointerup", 218, 100)
     })
 
     await vi.waitFor(() => {

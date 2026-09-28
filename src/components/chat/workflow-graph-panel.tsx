@@ -2,17 +2,14 @@
 
 /**
  * Hook-free compatibility dispatcher for workflow projections. Simple renders
- * its task dependency DAG and selected-node detail; manifest and observed-only
+ * grouped tasks with inline execution details; manifest and observed-only
  * snapshots retain the collapsible phase-lane graph.
  */
 
 import {
   memo,
   useCallback,
-  useEffect,
-  useId,
   useMemo,
-  useRef,
   useState,
   useSyncExternalStore,
 } from "react"
@@ -22,6 +19,7 @@ import {
   ChevronDownIcon,
   Eye,
   FileTextIcon,
+  MoreHorizontalIcon,
 } from "lucide-react"
 import { useTranslations } from "next-intl"
 
@@ -29,20 +27,26 @@ import { AgentIcon } from "@/components/agent-icon"
 import { useOpenLinkOrFile } from "@/components/ai-elements/link-safety"
 import { WorkflowStatusIcon } from "@/components/chat/workflow-status-icon"
 import { CompletionDecisionCard } from "@/components/chat/completion-decision-card"
-import { WorkflowDagCanvas } from "@/components/chat/workflow-dag-canvas"
 import { phaseProgressFragments } from "@/components/chat/workflow-phase-rail"
 import { Badge } from "@/components/ui/badge"
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu"
 import { getAgentLabel } from "@/lib/custom-agents"
 import {
   computeDelegationElapsedMs,
   type EditRollupViewModel,
 } from "@/lib/delegation-card"
-import { formatElapsedLabel } from "@/lib/format-elapsed"
+import { formatCompactElapsed, formatElapsedLabel } from "@/lib/format-elapsed"
 import { formatConversationTitle } from "@/lib/conversation-title"
 import { joinRootRel } from "@/lib/file-open-target"
 import { openDelegatedChildSession } from "@/lib/open-delegated-child-session"
 import {
   buildPhaseRail,
+  buildWorkflowNodeRows,
   canOpenWorkflowNode,
   isEstimatedNode,
   type PhaseRailItem,
@@ -56,7 +60,7 @@ import type {
 } from "@/lib/types"
 import { cn } from "@/lib/utils"
 
-/** Line-2 title: session/task text first; never leave blank when summary exists. */
+/** Prefer session/task text; never leave the title blank when summary exists. */
 function nodeDisplayTitle(node: WorkflowNodeSnapshot): string {
   const fromTitle = formatConversationTitle(node.title).trim()
   if (fromTitle) return fromTitle
@@ -332,145 +336,180 @@ function hasUnambiguousNodeIds(
   return true
 }
 
-function SimpleWorkflowDagDetail({
+function SimpleTaskExecution({
   node,
-  detailId,
-  onOpenSession,
+  roleLabel,
+  showTitle,
+  current,
+  allowOpen,
 }: {
   node: WorkflowNodeSnapshot
-  detailId: string
-  onOpenSession: (node: WorkflowNodeSnapshot) => void
+  roleLabel: string
+  showTitle: boolean
+  current: boolean
+  allowOpen: boolean
 }) {
   const t = useTranslations("Folder.chat.workflowGraph")
   const tLive = useTranslations("Folder.chat.liveTurnStats")
   const tDel = useTranslations("Folder.chat.delegation")
   const nowMs = useNowMs(isLiveNodeStatus(node.status))
-  const title = nodeDisplayTitle(node)
-  const agentType = isAgentType(node.agent_type) ? node.agent_type : null
-  const agentLabel = agentType ? getAgentLabel(agentType) : null
-  const model = node.model?.trim() || null
-  const effort = node.effort?.trim() || null
-  const liveRun =
-    node.latest_run_status === "running" ||
-    node.latest_run_status === "reserving"
-      ? node.latest_run_status
-      : isLiveNodeStatus(node.status)
-        ? node.status
-        : null
-  const operationalLine = buildOperationalLine(
-    node,
-    nowMs,
-    tLive as unknown as LiveStatsTranslator,
+  const elapsed = totalElapsedMs(node, nowMs)
+  const model =
+    node.model?.trim().replace(/^(?:codex|claude)[\s/:-]+/i, "") ||
+    (node.agent_type ? getAgentLabel(node.agent_type) : null) ||
+    "—"
+  const summary = formatConversationTitle(
+    node.completion?.card.summary || node.summary
+  ).trim()
+  const editSummary = buildEditSegment(
+    editRollupFromNode(node),
     tDel as unknown as EditSegmentTranslator
   )
-  const metadata = [
-    node.task_index != null ? t("taskIndex", { index: node.task_index }) : null,
-    node.role ? t("roleLabel", { role: node.role }) : null,
-    agentLabel ? t("agentLabel", { agent: agentLabel }) : null,
-    model ? t("modelLabel", { model }) : null,
-    effort ? t("effortLabel", { effort }) : null,
-  ].filter(Boolean) as string[]
   const counters = [
-    node.run_count > 0 ? t("runCount", { count: node.run_count }) : null,
+    node.run_count > 1 ? t("runCount", { count: node.run_count }) : null,
     node.replacement_count > 0
       ? t("replacementCount", { count: node.replacement_count })
       : null,
-    node.round_count != null && node.round_count > 0
+    node.round_count != null && node.round_count > 1
       ? t("roundCount", { count: node.round_count })
       : null,
-  ].filter(Boolean) as string[]
-  const estimated = isEstimatedNode(node)
-  const openable = canOpenWorkflowNode(node)
+  ].filter(Boolean)
+  const outcome = node.completion?.card.outcome ?? node.node_outcome
+  const outcomeLabel =
+    outcome === "approve" ||
+    outcome === "approve_with_minors" ||
+    outcome === "request_changes" ||
+    outcome === "block" ||
+    outcome === "done" ||
+    outcome === "done_with_concerns" ||
+    outcome === "blocked"
+      ? t(`completionOutcome.${outcome}`)
+      : null
+  const status = [t(`nodeStatus.${node.status}`), outcomeLabel]
+    .filter(Boolean)
+    .join(" · ")
+  const concernLabel =
+    outcome === "done" || outcome === "approve" ? null : outcomeLabel
+  const openable = allowOpen && canOpenWorkflowNode(node)
 
   return (
-    <section
-      id={detailId}
-      role="region"
-      aria-label={t("dagSelectedNode")}
-      data-testid="workflow-dag-detail"
+    <div
+      data-testid={`workflow-task-node-${node.node_id}`}
       data-status={node.status}
-      data-sync-state={node.sync_state}
-      className="min-w-0 space-y-2 rounded-xl border bg-card p-3"
-    >
-      <div className="flex min-w-0 flex-wrap items-start gap-2">
-        <WorkflowStatusIcon
-          visualStatus={node.status}
-          className="mt-0.5 size-4 shrink-0"
-        />
-        <div className="min-w-0 flex-1">
-          <h3
-            className="break-words text-sm font-semibold"
-            title={title}
-            dir="auto"
-          >
-            {title}
-          </h3>
-          {liveRun && (
-            <p className="text-xs text-blue-600 dark:text-blue-400">
-              {t("simpleLiveRun", {
-                status: t(`nodeStatus.${liveRun}`),
-              })}
-            </p>
-          )}
-        </div>
-        <Badge variant="secondary" className="shrink-0 text-[10px]">
-          {t(`nodeStatus.${node.status}`)}
-        </Badge>
-      </div>
-
-      {metadata.length > 0 && (
-        <div className="flex min-w-0 flex-wrap gap-x-3 gap-y-1 text-xs text-muted-foreground">
-          {metadata.map((item, index) => (
-            <span key={`${index}:${item}`} className="min-w-0 break-words">
-              {item}
-            </span>
-          ))}
-        </div>
+      data-current={current ? "true" : "false"}
+      data-estimated={isEstimatedNode(node) ? "true" : "false"}
+      className={cn(
+        "min-w-0 space-y-0.5 px-3 py-1.5",
+        current && "bg-blue-500/5"
       )}
-      {operationalLine && (
-        <p
-          className="break-words text-xs text-muted-foreground"
-          title={operationalLine}
+    >
+      <div className="grid min-w-0 grid-cols-[minmax(0,1.3fr)_minmax(0,1fr)_3rem_1.5rem] items-center gap-2 text-left text-xs">
+        <span className="flex min-w-0 items-center gap-1.5">
+          <span
+            role="img"
+            aria-label={status}
+            title={status}
+            className="inline-flex shrink-0"
+          >
+            <WorkflowStatusIcon
+              visualStatus={node.status}
+              className="size-3.5"
+            />
+          </span>
+          <span className="min-w-0 break-words font-medium">{roleLabel}</span>
+        </span>
+        <span
+          className="flex min-w-0 items-center gap-1.5 text-left text-[11px] text-muted-foreground"
+          title={[node.model, node.effort].filter(Boolean).join(" · ")}
         >
-          {operationalLine}
+          <span className="inline-flex size-3.5 shrink-0">
+            {isAgentType(node.agent_type) && (
+              <span
+                role="img"
+                aria-label={getAgentLabel(node.agent_type)}
+                title={getAgentLabel(node.agent_type)}
+                className="inline-flex"
+              >
+                <AgentIcon agentType={node.agent_type} className="size-3.5" />
+              </span>
+            )}
+          </span>
+          <span className="min-w-0 break-all" dir="auto">
+            {model}
+          </span>
+        </span>
+        <span
+          className="translate-x-2 whitespace-nowrap text-left text-[11px] tabular-nums text-muted-foreground"
+          dir="ltr"
+        >
+          {elapsed != null ? formatCompactElapsed(elapsed) : "—"}
+        </span>
+        {openable ? (
+          <button
+            type="button"
+            data-testid={`simple-task-open-${node.node_id}`}
+            aria-label={t("openSession")}
+            title={t("openSession")}
+            className="inline-flex size-6 items-center justify-center rounded text-muted-foreground hover:bg-muted hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+            onClick={() => {
+              void openDelegatedChildSession({
+                childConversationId: node.latest_child_conversation_id,
+                agentType: (node.agent_type as AgentType | null) ?? null,
+                title: node.title,
+              })
+            }}
+          >
+            <Eye className="size-3.5" aria-hidden />
+          </button>
+        ) : (
+          <span />
+        )}
+      </div>
+      {showTitle && (
+        <p
+          className="ps-5 text-[11px] text-muted-foreground [overflow-wrap:anywhere]"
+          dir="auto"
+        >
+          {nodeDisplayTitle(node)}
+        </p>
+      )}
+      {(editSummary || node.tool_call_count != null) && (
+        <p className="flex flex-wrap gap-x-3 ps-5 text-[11px] text-muted-foreground">
+          {editSummary && <span>{editSummary}</span>}
+          {node.tool_call_count != null && (
+            <span>
+              {tLive("toolUseCount", { count: node.tool_call_count })}
+            </span>
+          )}
+        </p>
+      )}
+      {(concernLabel || summary) && (
+        <p
+          className="ps-5 text-xs leading-relaxed [overflow-wrap:anywhere]"
+          dir="auto"
+        >
+          {concernLabel && (
+            <span className="me-1.5 font-medium">{concernLabel}</span>
+          )}
+          {summary}
         </p>
       )}
       {counters.length > 0 && (
-        <p className="break-words text-xs text-muted-foreground">
+        <p className="ps-5 text-[11px] text-muted-foreground">
           {counters.join(" · ")}
         </p>
       )}
       {isSimpleNodeOutOfSync(node) && (
-        <p className="flex items-center gap-1.5 text-xs text-amber-700 dark:text-amber-300">
-          <AlertTriangleIcon className="size-3.5 shrink-0" aria-hidden />
-          <span>{t("simpleOutOfSync")}</span>
+        <p className="flex items-center gap-1.5 ps-5 text-[11px] text-amber-700 dark:text-amber-300">
+          <AlertTriangleIcon className="size-3 shrink-0" aria-hidden />
+          {t("simpleOutOfSync")}
         </p>
       )}
-
-      {openable ? (
-        <div className="flex justify-end">
-          <button
-            type="button"
-            data-testid={`simple-task-open-${node.node_id}`}
-            className="inline-flex h-8 items-center gap-1.5 rounded-md border px-2 text-xs font-medium hover:bg-muted/60"
-            onClick={() => onOpenSession(node)}
-            aria-label={t("openSession")}
-            title={t("openSession")}
-          >
-            <Eye className="size-3.5" aria-hidden />
-            <span>{t("openSession")}</span>
-          </button>
-        </div>
-      ) : (
-        <p className="text-xs text-muted-foreground">
-          {t(estimated ? "estimatedNonActionable" : "noSessions")}
-        </p>
-      )}
-    </section>
+    </div>
   )
 }
 
-function SimpleWorkflowDagPanel({
+function SimpleWorkflowTaskPanel({
   snapshot,
   workspaceRootPath,
   className,
@@ -482,99 +521,40 @@ function SimpleWorkflowDagPanel({
   const t = useTranslations("Folder.chat.workflowGraph")
   const openLinkOrFile = useOpenLinkOrFile()
   const locator = snapshot.simple ?? null
+  const idsAreUnambiguous = hasUnambiguousNodeIds(snapshot.nodes)
   const partial =
+    !idsAreUnambiguous ||
     locator == null ||
     hasBlockingSimpleWarning(snapshot.projection_warning_codes) ||
     snapshot.nodes.some((node) =>
       hasBlockingSimpleWarning(node.projection_warning_codes)
     )
-  const dagNodes = useMemo(
-    () =>
-      snapshot.nodes.map<WorkflowNodeSnapshot>((node) =>
-        node.sync_state === "out_of_sync" && !isSimpleNodeOutOfSync(node)
-          ? { ...node, sync_state: "in_sync" }
-          : node
-      ),
+  const rows = useMemo(
+    () => buildWorkflowNodeRows(snapshot.nodes, "tasks"),
     [snapshot.nodes]
   )
-  const idsAreUnambiguous = useMemo(
-    () => hasUnambiguousNodeIds(snapshot.nodes),
-    [snapshot.nodes]
-  )
-  const nodeIds = useMemo(
-    () => new Set(snapshot.nodes.map((node) => node.node_id)),
-    [snapshot.nodes]
-  )
-  const preferredCurrentId = idsAreUnambiguous
-    ? (snapshot.current_node_ids.find((nodeId) => nodeIds.has(nodeId)) ?? null)
-    : null
-  const [selectedNodeId, setSelectedNodeId] = useState<string | null>(
-    preferredCurrentId
-  )
-  const userSelectionDirty = useRef(false)
-  const reactDetailId = useId()
-  const detailId = `workflow-dag-detail-${reactDetailId.replace(
-    /[^A-Za-z0-9_-]/g,
-    ""
-  )}`
-
-  useEffect(() => {
-    setSelectedNodeId((previous) => {
-      if (!idsAreUnambiguous) {
-        userSelectionDirty.current = false
-        return null
-      }
-      if (
-        userSelectionDirty.current &&
-        previous != null &&
-        nodeIds.has(previous)
-      ) {
-        return previous
-      }
-      if (userSelectionDirty.current) userSelectionDirty.current = false
-      return preferredCurrentId
-    })
-  }, [idsAreUnambiguous, nodeIds, preferredCurrentId])
-
-  const selectNode = useCallback(
-    (nodeId: string) => {
-      if (!idsAreUnambiguous || !nodeIds.has(nodeId)) return
-      userSelectionDirty.current = true
-      setSelectedNodeId(nodeId)
-    },
-    [idsAreUnambiguous, nodeIds]
-  )
-  const selectedNode =
-    idsAreUnambiguous && selectedNodeId != null
-      ? (snapshot.nodes.find((node) => node.node_id === selectedNodeId) ?? null)
-      : null
-  const tasksPhase = useMemo(
-    () =>
-      buildPhaseRail({ ...snapshot, gates: [] }).find(
-        (phase) => phase.kind === "tasks"
-      )!,
-    [snapshot]
-  )
-  const progressParts = phaseProgressFragments(tasksPhase, t)
-
-  const openFile = useCallback(
-    (relPath: string) => {
-      const target = workspaceRootPath
-        ? joinRootRel(workspaceRootPath, relPath)
-        : relPath
-      void openLinkOrFile(target)
-    },
-    [openLinkOrFile, workspaceRootPath]
-  )
-
-  const openSession = useCallback((node: WorkflowNodeSnapshot) => {
-    if (!canOpenWorkflowNode(node)) return
-    void openDelegatedChildSession({
-      childConversationId: node.latest_child_conversation_id,
-      agentType: (node.agent_type as AgentType | null) ?? null,
-      title: node.title,
-    })
-  }, [])
+  const completed = rows.filter((row) =>
+    row.nodes.every((node) => node.status === "completed")
+  ).length
+  const dependencies = useMemo(() => {
+    const byNode = new Map(
+      rows.flatMap((row) =>
+        row.nodes.map((node) => [node.node_id, row] as const)
+      )
+    )
+    const result = new Map(rows.map((row) => [row, new Set<typeof row>()]))
+    for (const edge of snapshot.edges) {
+      const from = byNode.get(edge.from)
+      const to = byNode.get(edge.to)
+      if (from && to && from !== to) result.get(to)!.add(from)
+    }
+    return result
+  }, [rows, snapshot.edges])
+  const openFile = (relPath: string) => {
+    void openLinkOrFile(
+      workspaceRootPath ? joinRootRel(workspaceRootPath, relPath) : relPath
+    )
+  }
 
   return (
     <div
@@ -584,95 +564,190 @@ function SimpleWorkflowDagPanel({
       role="region"
       aria-label={t("simpleTasks")}
     >
-      {locator && (
-        <div className="flex min-w-0 gap-1.5" data-testid="simple-file-links">
-          <button
-            type="button"
-            className="inline-flex h-8 min-w-0 flex-1 items-center justify-center gap-1.5 rounded-md border px-2 text-xs font-medium hover:bg-muted/60"
-            onClick={() => openFile(locator.plan_rel_path)}
-            title={locator.plan_rel_path}
-            aria-label={t("simpleOpenPlan")}
+      <div className="sticky top-0 z-10 space-y-1.5 rounded-lg bg-card px-1 py-1.5">
+        <div className="flex min-w-0 flex-wrap items-center gap-1">
+          <span
+            className="me-auto flex items-center gap-1.5 px-1 text-xs tabular-nums"
+            title={t("completedTaskProgress", {
+              completed,
+              total: rows.length,
+            })}
           >
-            <FileTextIcon className="size-3.5 shrink-0" aria-hidden />
-            <span className="min-w-0 truncate">{t("simpleOpenPlan")}</span>
-          </button>
-          <button
-            type="button"
-            className="inline-flex h-8 min-w-0 flex-1 items-center justify-center gap-1.5 rounded-md border px-2 text-xs font-medium hover:bg-muted/60"
-            data-testid="simple-progress-link"
-            onClick={() => openFile(locator.progress_rel_path)}
-            title={locator.progress_rel_path}
-            aria-label={t("simpleOpenProgress")}
-          >
-            <FileTextIcon className="size-3.5 shrink-0" aria-hidden />
-            <span className="min-w-0 truncate">{t("simpleOpenProgress")}</span>
-          </button>
+            <WorkflowStatusIcon visualStatus="completed" className="size-3.5" />
+            <span>
+              {completed} / {rows.length}
+            </span>
+          </span>
+          {locator && (
+            <>
+              <button
+                type="button"
+                className="inline-flex h-7 min-w-0 items-center gap-1 rounded-md px-1.5 text-xs text-muted-foreground hover:bg-muted hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                onClick={() => openFile(locator.plan_rel_path)}
+                title={locator.plan_rel_path}
+              >
+                <FileTextIcon className="size-3.5 shrink-0" aria-hidden />
+                <span>{t("simpleOpenPlan")}</span>
+              </button>
+              {!partial && (
+                <DropdownMenu>
+                  <DropdownMenuTrigger asChild>
+                    <button
+                      type="button"
+                      aria-label={t("moreTaskActions")}
+                      className="inline-flex size-7 shrink-0 items-center justify-center rounded-md text-muted-foreground hover:bg-muted hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                    >
+                      <MoreHorizontalIcon className="size-4" aria-hidden />
+                    </button>
+                  </DropdownMenuTrigger>
+                  <DropdownMenuContent align="end" className="w-auto max-w-72">
+                    <DropdownMenuItem
+                      onSelect={() => openFile(locator.progress_rel_path)}
+                    >
+                      <FileTextIcon aria-hidden />
+                      {t("simpleOpenProgress")}
+                    </DropdownMenuItem>
+                  </DropdownMenuContent>
+                </DropdownMenu>
+              )}
+            </>
+          )}
         </div>
-      )}
-
+        <div
+          role="progressbar"
+          aria-label={t("completedTaskProgress", {
+            completed,
+            total: rows.length,
+          })}
+          aria-valuemin={0}
+          aria-valuemax={rows.length || 1}
+          aria-valuenow={completed}
+          className="mx-1 h-1 overflow-hidden rounded-full bg-muted"
+        >
+          <div
+            className="h-full rounded-full bg-emerald-500 transition-[width]"
+            style={{
+              width: rows.length ? `${(completed / rows.length) * 100}%` : "0%",
+            }}
+          />
+        </div>
+      </div>
       {partial && (
         <div
-          className="min-w-0 border-s-2 border-amber-500 px-2 py-1 text-xs"
+          className="min-w-0 rounded-lg border border-amber-500/20 bg-amber-500/5 px-2 py-1.5 text-xs"
           data-testid="simple-projection-warning"
         >
-          <div className="flex min-w-0 items-center gap-1.5 font-medium">
+          <p className="flex items-center gap-1.5 font-medium">
             <AlertTriangleIcon
               className="size-3.5 shrink-0 text-amber-600 dark:text-amber-400"
               aria-hidden
             />
-            <span className="min-w-0 break-words">
-              {t("simplePartialProjection")}
-            </span>
-          </div>
-          <p className="mt-0.5 break-words text-[11px] text-muted-foreground">
+            {t("simplePartialProjection")}
+          </p>
+          <p className="mt-0.5 text-[11px] text-muted-foreground">
             {t("simpleProjectionWarning")}
           </p>
+          {locator && (
+            <button
+              type="button"
+              data-testid="simple-progress-link"
+              className="mt-1 min-w-0 break-words text-start text-xs underline underline-offset-4 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+              onClick={() => openFile(locator.progress_rel_path)}
+            >
+              {t("simpleOpenProgress")}
+            </button>
+          )}
         </div>
       )}
-
       <section
         className="min-w-0 space-y-2"
         data-testid="workflow-graph-lane-tasks"
         aria-label={t("phase.tasks")}
       >
-        <div className="flex min-w-0 flex-wrap items-center gap-1.5 px-1">
-          <WorkflowStatusIcon visualStatus={tasksPhase.status} />
-          <span className="min-w-0 flex-1 truncate text-xs font-semibold">
-            {t("phase.tasks")}
-          </span>
-          <span className="ms-auto flex max-w-full flex-wrap items-center justify-end gap-1.5 text-[10px] text-muted-foreground">
-            <span>{t(`phaseStatus.${tasksPhase.status}`)}</span>
-            <span className="tabular-nums">
-              {progressParts.length > 0
-                ? progressParts.join(" · ")
-                : t("simpleTaskCount", { count: snapshot.nodes.length })}
-            </span>
-          </span>
-        </div>
-
-        {snapshot.nodes.length === 0 ? (
+        {rows.length === 0 && (
           <p className="px-1 py-2 text-xs text-muted-foreground">
             {t("simpleNoTasks")}
           </p>
-        ) : (
-          <WorkflowDagCanvas
-            nodes={dagNodes}
-            edges={snapshot.edges}
-            currentNodeIds={snapshot.current_node_ids}
-            selectedNodeId={selectedNodeId}
-            detailId={detailId}
-            nodeDisplayTitle={nodeDisplayTitle}
-            onSelect={selectNode}
-          />
         )}
-
-        {selectedNode && (
-          <SimpleWorkflowDagDetail
-            node={selectedNode}
-            detailId={detailId}
-            onOpenSession={openSession}
-          />
-        )}
+        {rows.map((row, rowIndex) => {
+          const primary =
+            row.nodes.find((node) => node.role === "implementer") ??
+            row.nodes[0]
+          const reviewerCount = row.nodes.filter(
+            (node) => node.role === "reviewer"
+          ).length
+          let reviewerIndex = 0
+          const waitingFor = Array.from(dependencies.get(row) ?? []).filter(
+            (dependency) =>
+              !dependency.nodes.every((node) => node.status === "completed")
+          )
+          const current = row.nodes.some((node) =>
+            snapshot.current_node_ids.includes(node.node_id)
+          )
+          return (
+            <section
+              key={`${row.id}-${rowIndex}`}
+              data-testid={`workflow-task-group-${row.id}`}
+              className={cn(
+                "min-w-0 overflow-hidden rounded-xl border bg-card",
+                current && "border-blue-500/40"
+              )}
+              aria-label={nodeDisplayTitle(primary)}
+            >
+              <div className="flex items-start gap-1.5 border-b border-border/60 px-3 py-2">
+                <span className="mt-0.5 inline-flex size-3.5 shrink-0 items-center justify-start rounded bg-muted text-[10px] font-medium tabular-nums text-muted-foreground">
+                  {row.taskIndex ?? rowIndex + 1}
+                </span>
+                <h3
+                  className="min-w-0 text-[13px] font-semibold leading-5 [overflow-wrap:anywhere]"
+                  dir="auto"
+                >
+                  {nodeDisplayTitle(primary)}
+                </h3>
+              </div>
+              {waitingFor.length > 0 && (
+                <p className="px-3 pt-2 text-[11px] text-muted-foreground [overflow-wrap:anywhere]">
+                  {t("waitingForTasks", {
+                    tasks: waitingFor
+                      .map((dependency) =>
+                        dependency.taskIndex != null
+                          ? t("taskIndex", { index: dependency.taskIndex })
+                          : nodeDisplayTitle(dependency.nodes[0])
+                      )
+                      .join(" · "),
+                  })}
+                </p>
+              )}
+              <div className="divide-y divide-border/50">
+                {row.nodes.map((node, nodeIndex) => {
+                  const role =
+                    node.role === "implementer" ||
+                    node.role === "reviewer" ||
+                    node.role === "author"
+                      ? t(`nodeRole.${node.role}`)
+                      : node.role || t("phase.tasks")
+                  if (node.role === "reviewer") reviewerIndex += 1
+                  return (
+                    <SimpleTaskExecution
+                      key={`${node.node_id}-${nodeIndex}`}
+                      node={node}
+                      roleLabel={
+                        node.role === "reviewer" && reviewerCount > 1
+                          ? `${role} ${reviewerIndex}`
+                          : role
+                      }
+                      showTitle={
+                        nodeDisplayTitle(node) !== nodeDisplayTitle(primary)
+                      }
+                      current={snapshot.current_node_ids.includes(node.node_id)}
+                      allowOpen={idsAreUnambiguous}
+                    />
+                  )
+                })}
+              </div>
+            </section>
+          )
+        })}
       </section>
     </div>
   )
@@ -1151,17 +1226,8 @@ export const WorkflowGraphPanel = memo(function WorkflowGraphPanel(
   props: WorkflowGraphPanelProps
 ) {
   if (props.snapshot.compatibility === "simple") {
-    const locator = props.snapshot.simple
-    const selectionScope =
-      props.conversationId != null
-        ? `conversation:${props.conversationId}`
-        : `locator:${JSON.stringify([
-            locator?.plan_rel_path ?? "",
-            locator?.progress_rel_path ?? "",
-          ])}`
     return (
-      <SimpleWorkflowDagPanel
-        key={selectionScope}
+      <SimpleWorkflowTaskPanel
         snapshot={props.snapshot}
         workspaceRootPath={props.workspaceRootPath}
         className={props.className}

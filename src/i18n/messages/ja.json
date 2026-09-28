@@ -4153,6 +4153,11 @@
         "planning": "計画中…"
       },
       "workflowGraph": {
+        "completedTaskProgress": "{total} 件中 {completed} 件のタスクが完了",
+        "waitingForTasks": "{tasks} を待機中",
+        "moreTaskActions": "その他のタスク操作",
+        "completedTaskCount": "{count} 件のタスクが完了",
+        "currentTaskProgress": "現在のタスク {current} / {total}",
         "title": "ワークフロー",
         "segmentWorkflow": "ワークフロー",
         "segmentSessions": "セッション",
@@ -4165,11 +4170,11 @@
         "collapsedSummary": "ワークフロー {state}",
         "archivedTitle": "アーカイブ済みワークフロー",
         "archivedReadOnly": "読み取り専用",
-        "simpleOpenPlan": "Plan を開く",
-        "simpleOpenProgress": "進捗を開く",
-        "simplePartialProjection": "Simple の部分投影",
-        "simpleProjectionWarning": "Plan または進捗の一部を投影できませんでした。",
-        "simpleTasks": "Simple タスク",
+        "simpleOpenPlan": "計画を表示",
+        "simpleOpenProgress": "進捗記録を表示",
+        "simplePartialProjection": "一部のタスク情報を表示できません",
+        "simpleProjectionWarning": "計画または進捗記録を完全に読み取れませんでした。",
+        "simpleTasks": "タスク",
         "simpleTaskCount": "{count} 件のタスク",
         "simpleNoTasks": "Plan タスクがありません",
         "simpleLiveRun": "実行中：{status}",
@@ -4239,6 +4244,11 @@
         "completionLegacySource": "旧形式の元ワークフロー #{conversation}",
         "completionLegacySuccessor": "後続ワークフロー #{conversation}",
         "completionAutomaticWake": "ルートオーケストレーションは自動的に再開されました",
+        "nodeRole": {
+          "implementer": "実装",
+          "reviewer": "レビュー",
+          "author": "執筆"
+        },
         "completionOutcome": {
           "approve": "承認",
           "approve_with_minors": "軽微な修正付きで承認",

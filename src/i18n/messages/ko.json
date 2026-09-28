@@ -4153,6 +4153,11 @@
         "planning": "계획 중…"
       },
       "workflowGraph": {
+        "completedTaskProgress": "작업 {total}개 중 {completed}개 완료",
+        "waitingForTasks": "{tasks} 대기 중",
+        "moreTaskActions": "추가 작업 메뉴",
+        "completedTaskCount": "작업 {count}개 완료",
+        "currentTaskProgress": "현재 작업 {current} / {total}",
         "title": "워크플로",
         "segmentWorkflow": "워크플로",
         "segmentSessions": "세션",
@@ -4165,11 +4170,11 @@
         "collapsedSummary": "워크플로 {state}",
         "archivedTitle": "보관된 워크플로",
         "archivedReadOnly": "읽기 전용",
-        "simpleOpenPlan": "Plan 열기",
-        "simpleOpenProgress": "진행 상황 열기",
-        "simplePartialProjection": "부분 Simple 프로젝션",
-        "simpleProjectionWarning": "일부 Plan 또는 진행 데이터를 표시할 수 없습니다.",
-        "simpleTasks": "Simple 작업",
+        "simpleOpenPlan": "계획 보기",
+        "simpleOpenProgress": "진행 기록 보기",
+        "simplePartialProjection": "일부 작업 정보를 표시할 수 없습니다",
+        "simpleProjectionWarning": "계획 또는 진행 기록을 완전히 읽지 못했습니다.",
+        "simpleTasks": "작업",
         "simpleTaskCount": "작업 {count}개",
         "simpleNoTasks": "Plan 작업이 없습니다",
         "simpleLiveRun": "실시간 실행: {status}",
@@ -4239,6 +4244,11 @@
         "completionLegacySource": "레거시 원본 워크플로 #{conversation}",
         "completionLegacySuccessor": "후속 워크플로 #{conversation}",
         "completionAutomaticWake": "루트 오케스트레이션이 자동으로 재개되었습니다",
+        "nodeRole": {
+          "implementer": "구현",
+          "reviewer": "검토",
+          "author": "작성"
+        },
         "completionOutcome": {
           "approve": "승인",
           "approve_with_minors": "경미한 수정 조건부 승인",
