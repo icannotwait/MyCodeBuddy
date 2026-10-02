@@ -8,6 +8,16 @@ PIDFILE=$HB/watchdog.pid
 # v2: old watchdog.lock may still be held by a codeg-server that inherited fd 9
 LOCK=$HB/watchdog.lock.v2
 LOG=$HB/watchdog.log
+TUNNEL_RESTART_STAMP=$HB/tunnel-restart.stamp
+
+# Public URL probe: unset → live-box default; empty string → skip probe.
+if [ ! -v CODEG_PUBLIC_URL ]; then
+  CODEG_PUBLIC_URL="https://drawcode.20241021.best/"
+fi
+# Consecutive public failures before treating tunnel as broken (anti-flap).
+PUBLIC_FAIL_THRESHOLD=${PUBLIC_FAIL_THRESHOLD:-2}
+# Seconds between tunnel-only restarts (anti-flap). Default 3 minutes.
+TUNNEL_RESTART_COOLDOWN=${TUNNEL_RESTART_COOLDOWN:-180}
 
 mkdir -p "$HB"
 
@@ -19,6 +29,7 @@ fi
 
 echo $$ > "$PIDFILE"
 loop=0
+pub_fail_streak=0
 
 port_up() {
   local port=$1
@@ -43,6 +54,75 @@ webdav_ok() {
   local code
   code=$(curl -sS -o /dev/null -w '%{http_code}' --connect-timeout 2 --max-time 5 http://127.0.0.1:6065/ 2>/dev/null || echo 000)
   [ "$code" = "401" ] || [ "$code" = "200" ]
+}
+
+# Public edge probe. Sets globals: pub_status (skip|ok|bad|fail), pub_code, pub_detail.
+# Returns 0 if healthy/skipped, 1 if tunnel looks broken.
+probe_public() {
+  pub_status=skip
+  pub_code=000
+  pub_detail=
+  if [ -z "${CODEG_PUBLIC_URL}" ]; then
+    return 0
+  fi
+  local body=/tmp/codeg-watchdog-public.$$
+  pub_code=$(curl -sS -o "$body" -w '%{http_code}' --connect-timeout 5 --max-time 12 \
+    -L --max-redirs 2 "$CODEG_PUBLIC_URL" 2>/dev/null || echo 000)
+  local mention=
+  if [ -f "$body" ] && grep -qiE '1033|error.?code.?1033|Cloudflare Tunnel error' "$body" 2>/dev/null; then
+    mention=1033
+  fi
+  rm -f "$body"
+
+  # 530 / 1033: classic zombie tunnel (process up, edge broken).
+  if [ "$pub_code" = "530" ] || [ -n "$mention" ]; then
+    pub_status=bad
+    pub_detail="code=$pub_code mention=${mention:-none}"
+    return 1
+  fi
+  # Connect/timeout failure only counts when local UI is healthy (isolates tunnel).
+  if [ "$pub_code" = "000" ]; then
+    if [ "${http:-down}" = "ok" ]; then
+      pub_status=fail
+      pub_detail="connect_fail local=ok"
+      return 1
+    fi
+    pub_status=fail
+    pub_detail="connect_fail local=$http"
+    return 0
+  fi
+  if [ "$pub_code" = "200" ]; then
+    pub_status=ok
+    return 0
+  fi
+  # Other non-200: log but do not treat as tunnel-zombie (avoid false restarts).
+  pub_status=other
+  pub_detail="code=$pub_code"
+  return 0
+}
+
+tunnel_cooldown_ok() {
+  local now last
+  now=$(date +%s)
+  if [ -f "$TUNNEL_RESTART_STAMP" ]; then
+    last=$(cat "$TUNNEL_RESTART_STAMP" 2>/dev/null || echo 0)
+    if [ -n "${last:-}" ] && [ "$last" -gt 0 ] 2>/dev/null; then
+      if [ $((now - last)) -lt "$TUNNEL_RESTART_COOLDOWN" ]; then
+        return 1
+      fi
+    fi
+  fi
+  return 0
+}
+
+# Restart ONLY cloudflared (never codeg-server). Uses force mode so start script
+# does not exit early when a zombie process is still present.
+restart_tunnel() {
+  local reason=$1
+  echo "$(TZ=Asia/Shanghai date '+%Y-%m-%d %H:%M:%S CST') restart cloudflared ONLY: $reason" >>"$LOG"
+  date +%s >"$TUNNEL_RESTART_STAMP"
+  FORCE_RESTART=1 "$BOOT/start-codeg-tunnel.sh" --force 9>&- || true
+  sleep 2
 }
 
 restart_server() {
@@ -79,6 +159,7 @@ while true; do
   swebdav=down
   broken=0
   http=down
+  pub=skip
 
   if port_up 3080; then
     s3080=up
@@ -118,6 +199,38 @@ while true; do
     if cf_up; then scf=up; fi
   fi
 
+  # Public edge probe: detect zombie tunnels (process up, edge 530/1033).
+  if probe_public; then
+    pub="$pub_status"
+    if [ "$pub_status" = "ok" ] || [ "$pub_status" = "skip" ]; then
+      pub_fail_streak=0
+    fi
+  else
+    pub="$pub_status"
+    pub_fail_streak=$((pub_fail_streak + 1))
+    broken=$((broken + 1))
+    echo "$(TZ=Asia/Shanghai date '+%Y-%m-%d %H:%M:%S CST') public probe FAIL streak=$pub_fail_streak/$PUBLIC_FAIL_THRESHOLD url=$CODEG_PUBLIC_URL $pub_detail cloudflared=$scf http=$http" >>"$LOG"
+    if [ "$pub_fail_streak" -ge "$PUBLIC_FAIL_THRESHOLD" ]; then
+      if tunnel_cooldown_ok; then
+        restart_tunnel "public $pub_detail after ${pub_fail_streak} consecutive fails (local http=$http)"
+        pub_fail_streak=0
+        # Re-check process after force restart
+        if cf_up; then scf=up; else scf=down; broken=$((broken + 1)); fi
+        # Optional immediate re-probe for log clarity (does not count toward streak).
+        if probe_public; then
+          pub="$pub_status"
+        else
+          pub="$pub_status"
+        fi
+      else
+        last=$(cat "$TUNNEL_RESTART_STAMP" 2>/dev/null || echo 0)
+        now=$(date +%s)
+        left=$((TUNNEL_RESTART_COOLDOWN - (now - last)))
+        echo "$(TZ=Asia/Shanghai date '+%Y-%m-%d %H:%M:%S CST') tunnel restart skipped: cooldown ${left}s remaining" >>"$LOG"
+      fi
+    fi
+  fi
+
   # WebDAV (WsgiDAV on :6065) — was missing from watchdog; dies after reboot/update.
   if [ -x "$BOOT/start-webdav.sh" ]; then
     "$BOOT/start-webdav.sh" 9>&- || true
@@ -134,7 +247,7 @@ while true; do
   fi
 
   ts=$(TZ=Asia/Shanghai date '+%Y-%m-%d %H:%M:%S CST')
-  echo "$ts 3080=$s3080 http=$http cloudflared=$scf webdav=$swebdav broken=$broken" >>"$LOG"
+  echo "$ts 3080=$s3080 http=$http cloudflared=$scf public=$pub pubcode=${pub_code:-na} webdav=$swebdav broken=$broken" >>"$LOG"
 
   loop=$((loop + 1))
   # Every ~10 min: restore/mirror ACP binaries if Update wiped ~/.cache
