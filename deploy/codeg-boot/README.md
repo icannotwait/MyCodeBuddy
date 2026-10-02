@@ -92,3 +92,15 @@ re-reads `acp_list_agents` and uses the same API download when the server
 still disagrees. Grok is an npx agent, so the binary download endpoint
 rejects it; the script calls `POST /api/acp_detect_agent_local_version` and,
 if the probed version is still wrong, `POST /api/acp_prepare_npx_agent`.
+## Public tunnel probe
+
+`codeg-watchdog.sh` optionally probes `CODEG_PUBLIC_URL` (default on this live
+host: `https://drawcode.20241021.best/`). If unset, the default applies; if set
+to empty, the probe is skipped.
+
+When the public edge returns **530**, the body mentions Cloudflare error
+**1033**, or the request fails to connect while local `:3080` is healthy, the
+watchdog treats the tunnel as a zombie: after **2 consecutive** failures and a
+**~3 minute** cooldown, it force-restarts **only** `cloudflared` via
+`FORCE_RESTART=1` / `start-codeg-tunnel.sh --force`. It never restarts
+`codeg-server` for this path.
