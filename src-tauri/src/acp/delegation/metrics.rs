@@ -1310,7 +1310,7 @@ impl DelegationMetrics {
     /// Terminal only for the CAS winner (loser/replay must not call this).
     pub fn record_terminal(&self, status: TaskStatus, duration: Duration) {
         let ms = Self::duration_ms_saturating(duration);
-        let _ = self.terminal_duration_ms_total.fetch_update(
+        let _ = self.terminal_duration_ms_total.try_update(
             Ordering::Relaxed,
             Ordering::Relaxed,
             |v| Some(v.saturating_add(ms)),
@@ -1359,7 +1359,7 @@ impl DelegationMetrics {
         let ms = Self::duration_ms_saturating(wall);
         let _ =
             self.wait_duration_ms_total
-                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+                .try_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
                     Some(v.saturating_add(ms))
                 });
         Self::inc_labeled(
@@ -1413,7 +1413,7 @@ impl DelegationMetrics {
         self.continuation_suspend_duration_ms_count
             .fetch_add(1, Ordering::Relaxed);
         let ms = Self::duration_ms_saturating(duration);
-        let _ = self.continuation_suspend_duration_ms_total.fetch_update(
+        let _ = self.continuation_suspend_duration_ms_total.try_update(
             Ordering::Relaxed,
             Ordering::Relaxed,
             |value| Some(value.saturating_add(ms)),

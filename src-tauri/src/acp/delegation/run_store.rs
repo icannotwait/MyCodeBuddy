@@ -2479,7 +2479,7 @@ impl RunStore {
         #[cfg(any(test, feature = "test-utils"))]
         if self
             .terminal_completion_protocol_load_failures_remaining
-            .fetch_update(
+            .try_update(
                 std::sync::atomic::Ordering::SeqCst,
                 std::sync::atomic::Ordering::SeqCst,
                 |remaining| remaining.checked_sub(1),
