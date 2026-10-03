@@ -111,6 +111,12 @@ mod tests {
                     notnull: 1,
                     pk: 0,
                 },
+                ColumnInfo {
+                    name: "design_rel_path".into(),
+                    col_type: "TEXT".into(),
+                    notnull: 0,
+                    pk: 0,
+                },
             ]
         );
         assert!(!columns

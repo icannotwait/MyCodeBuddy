@@ -333,6 +333,22 @@ pub struct BrokerRegisterSimpleWorkflowRequest {
     pub plan_rel_path: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub progress_rel_path: Option<String>,
+    /// Omitted = preserve for the same Plan; null = clear; string = bind.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_optional_design_path"
+    )]
+    pub design_rel_path: Option<Option<String>>,
+}
+
+pub(super) fn deserialize_optional_design_path<'de, D>(
+    deserializer: D,
+) -> Result<Option<Option<String>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Option::<String>::deserialize(deserializer).map(Some)
 }
 
 /// Settle a Design/Plan document gate for one cycle. Backs
@@ -402,6 +418,7 @@ mod workflow_v2_tests {
         let request = BrokerRegisterSimpleWorkflowRequest {
             token: "secret".into(),
             plan_rel_path: "docs/plan.md".into(),
+            design_rel_path: None,
             progress_rel_path: None,
         };
         let encoded = serde_json::to_value(request).expect("encode Simple registration");

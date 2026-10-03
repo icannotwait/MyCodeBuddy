@@ -127,8 +127,9 @@ pub use recovery_policy::{
     WorkflowRecoveryRiskClass, WorkflowRecoverySnapshot, WorkflowRecoveryStopCode,
 };
 pub use simple::{
-    load_simple_workflow, register_simple_workflow, resolve_conversation_workflow_mode,
-    ConversationWorkflowMode, SimpleWorkflowError, SimpleWorkflowRegistration,
+    load_simple_workflow, register_simple_workflow, register_simple_workflow_with_design,
+    resolve_conversation_workflow_mode, ConversationWorkflowMode, SimpleWorkflowError,
+    SimpleWorkflowRegistration,
 };
 pub use simple_parse::{
     parse_simple_plan, parse_simple_progress, read_simple_plan, read_simple_progress,

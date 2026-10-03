@@ -7,6 +7,7 @@ import {
 } from "@testing-library/react"
 import userEvent from "@testing-library/user-event"
 import { NextIntlClientProvider } from "next-intl"
+import { useSyncExternalStore } from "react"
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 
 import { SubAgentOverlay } from "./sub-agent-overlay"
@@ -43,6 +44,15 @@ const {
     workspaceSubscribeEnvelopes: vi.fn(() => unsubscribe),
     workspaceToken: { mode: "paths" as const },
     workspaceUnsubscribe: unsubscribe,
+  }
+})
+
+// Observe subscription identity while still running React's real store hook.
+vi.mock("react", async () => {
+  const actual = await vi.importActual<typeof import("react")>("react")
+  return {
+    ...actual,
+    useSyncExternalStore: vi.fn(actual.useSyncExternalStore),
   }
 })
 
@@ -572,7 +582,7 @@ function simpleGraph(): WorkflowGraphSnapshot {
   }
 }
 
-function simpleDagGraph(): WorkflowGraphSnapshot {
+function simpleTaskOverviewGraph(): WorkflowGraphSnapshot {
   return {
     schema_version: 1,
     workflow_kind: "brainstorm_to_delivery",
@@ -710,6 +720,7 @@ function simpleDagGraph(): WorkflowGraphSnapshot {
 
 beforeEach(() => {
   __resetWorkflowGraphStoreForTests()
+  vi.mocked(useSyncExternalStore).mockClear()
   vi.mocked(openDelegatedChildSession).mockClear()
   openWorkflowFile.mockClear()
   getWorkspaceStateStore.mockReset()
@@ -814,8 +825,40 @@ it("keeps design review and plan authoring/review visible without counting them 
 })
 
 describe("Simple workflow task overview", () => {
+  it("keeps the inactive clock subscription stable across task updates", () => {
+    const clockHook = vi.mocked(useSyncExternalStore)
+    const graph = simpleTaskOverviewGraph()
+    graph.nodes = [
+      { ...graph.nodes[0], summary: "Initial result", status: "completed" },
+    ]
+    graph.current_node_ids = []
+    const view = render(simplePanelView(graph, 88))
+    const initialSubscriptions = clockHook.mock.calls
+      .filter(([, getSnapshot]) => getSnapshot() === 0)
+      .map(([subscribe]) => subscribe)
+    expect(initialSubscriptions).toHaveLength(1)
+    clockHook.mockClear()
+
+    view.rerender(
+      simplePanelView(
+        {
+          ...graph,
+          nodes: [{ ...graph.nodes[0], summary: "Updated result" }],
+        },
+        88
+      )
+    )
+
+    expect(screen.getByText("Updated result")).toBeVisible()
+    const updatedSubscriptions = clockHook.mock.calls
+      .filter(([, getSnapshot]) => getSnapshot() === 0)
+      .map(([subscribe]) => subscribe)
+    expect(updatedSubscriptions).toHaveLength(1)
+    expect(updatedSubscriptions[0]).toBe(initialSubscriptions[0])
+  })
+
   it("uses the plan task title and hides child session titles", () => {
-    const graph = simpleDagGraph()
+    const graph = simpleTaskOverviewGraph()
     graph.nodes = graph.nodes
       .filter((item) => item.task_index === 1)
       .map((item) => ({
@@ -850,7 +893,7 @@ describe("Simple workflow task overview", () => {
   })
 
   it("shows every task, parallel review, result and compact metric without selection", () => {
-    const graph = simpleDagGraph()
+    const graph = simpleTaskOverviewGraph()
     graph.nodes = graph.nodes.map((item) => ({
       ...item,
       summary: `Result of ${item.node_id}`,
@@ -884,7 +927,7 @@ describe("Simple workflow task overview", () => {
 
   it("updates inline results without moving scroll or requiring a selection", () => {
     const scroll = vi.spyOn(HTMLElement.prototype, "scrollIntoView")
-    const graph = simpleDagGraph()
+    const graph = simpleTaskOverviewGraph()
     const view = render(simplePanelView(graph, 88))
     const next = {
       ...graph,
@@ -906,7 +949,7 @@ describe("Simple workflow task overview", () => {
   it.each(["pending", "estimated", "canceled", "superseded"] as const)(
     "does not count %s tasks as completed",
     (status) => {
-      const graph = simpleDagGraph()
+      const graph = simpleTaskOverviewGraph()
       graph.nodes = graph.nodes.map((item) => ({ ...item, status }))
       render(simplePanelView(graph, 88))
       expect(
@@ -916,7 +959,7 @@ describe("Simple workflow task overview", () => {
   )
 
   it("keeps records in the menu and opens each observed session directly", async () => {
-    const graph = simpleDagGraph()
+    const graph = simpleTaskOverviewGraph()
     graph.projection_warning_codes = []
     graph.nodes = graph.nodes.map((item) => ({
       ...item,
@@ -948,7 +991,7 @@ describe("Simple workflow task overview", () => {
   })
 
   it("renders localized roles, summaries and language-independent durations", () => {
-    const graph = simpleDagGraph()
+    const graph = simpleTaskOverviewGraph()
     graph.nodes = graph.nodes.map((item) => ({
       ...item,
       elapsed_completed_ms: 162_000,
@@ -966,7 +1009,7 @@ describe("Simple workflow task overview", () => {
   })
 
   it("keeps missing-locator and ambiguous-node data visible without unsafe session actions", () => {
-    const graph = simpleDagGraph()
+    const graph = simpleTaskOverviewGraph()
     graph.simple = null
     graph.nodes = [graph.nodes[0], { ...graph.nodes[0] }]
     render(simplePanelView(graph, 88))
@@ -978,7 +1021,7 @@ describe("Simple workflow task overview", () => {
   })
 
   it("retains unindexed tasks and supports an empty workflow", () => {
-    const graph = simpleDagGraph()
+    const graph = simpleTaskOverviewGraph()
     graph.nodes = [
       node({ node_id: "unindexed", title: "Unindexed task", task_index: null }),
     ]

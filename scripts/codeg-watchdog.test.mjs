@@ -1,0 +1,439 @@
+import assert from "node:assert/strict"
+import { spawnSync } from "node:child_process"
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs"
+import { tmpdir } from "node:os"
+import { join } from "node:path"
+import test from "node:test"
+
+const watchdogPath = new URL(
+  "../deploy/codeg-boot/scripts/codeg-watchdog.sh",
+  import.meta.url
+)
+
+// Source the real top-level shell functions without running the daemon's
+// filesystem setup or infinite loop. Only external I/O (curl/start/date) is fake.
+function runWatchdog(commands, env = {}, runLoop = false) {
+  const root = mkdtempSync(join(tmpdir(), "codeg-watchdog-test-"))
+  const source = readFileSync(watchdogPath, "utf8")
+  const functions = [...source.matchAll(/^\w+\(\) \{\n[\s\S]*?^\}/gm)]
+    .map(([body]) => body)
+    .join("\n")
+  writeFileSync(join(root, "functions.sh"), functions)
+  writeFileSync(join(root, "now"), "2000000000\n")
+  writeFileSync(
+    join(root, "start-codeg-tunnel.sh"),
+    '#!/bin/bash\nprintf "%s %s\\n" "$FORCE_RESTART" "$*" >>"$TEST_ROOT/starts"\nexit "${START_EXIT:-0}"\n',
+    { mode: 0o755 }
+  )
+  const daemonLoop = source.slice(source.indexOf("\nwhile true; do"))
+  const harness = `
+set -uo pipefail
+source "$TEST_ROOT/functions.sh"
+BOOT=$TEST_ROOT
+HB=$TEST_ROOT
+LOG=$TEST_ROOT/watchdog.log
+TUNNEL_RESTART_STAMP=$TEST_ROOT/tunnel-restart.stamp
+CODEG_PUBLIC_URL=https://example.invalid/
+PUBLIC_FAIL_THRESHOLD=2
+TUNNEL_RESTART_COOLDOWN=180
+TUNNEL_RESTART_BACKOFF_CAP=1800
+TUNNEL_RESTART_DAILY_CAP=0
+TUNNEL_RESTART_GRACE=60
+pub_fail_streak=0
+http=ok
+scf=up
+broken=0
+curl() {
+  local output=
+  printf '%s\\n' "$*" >>"$TEST_ROOT/curls"
+  while [ "$#" -gt 0 ]; do
+    if [ "$1" = -o ]; then output=$2; shift; fi
+    shift
+  done
+  [ -z "$output" ] || printf '%s' "\${CURL_BODY:-}" >"$output"
+  printf '%s' "\${CURL_CODE:-000}"
+  return "\${CURL_EXIT:-0}"
+}
+date() {
+  if [ "$*" = +%s ]; then cat "$TEST_ROOT/now"; else command date "$@"; fi
+}
+sleep() { :; }
+ps() { return 0; }
+${commands}
+${runLoop ? daemonLoop : ""}
+`
+  try {
+    const result = spawnSync("bash", ["-c", harness], {
+      env: { ...process.env, ...env, TEST_ROOT: root },
+      encoding: "utf8",
+      timeout: 5000,
+    })
+    assert.ifError(result.error)
+    return {
+      ...result,
+      log: readOptional(join(root, "watchdog.log")),
+      starts: readOptional(join(root, "starts")),
+      stamp: readOptional(join(root, "tunnel-restart.stamp")),
+      curls: readOptional(join(root, "curls")),
+    }
+  } finally {
+    rmSync(root, { recursive: true, force: true })
+  }
+}
+
+function readOptional(path) {
+  try {
+    return readFileSync(path, "utf8")
+  } catch (error) {
+    if (error.code !== "ENOENT") throw error
+    return ""
+  }
+}
+
+const probe = `probe_public; result=$?; printf '%s|%s|%s|%s\\n' "$result" "$pub_status" "$pub_code" "$pub_detail"`
+
+test("transport errors count once with a normalized 000 when local UI is healthy", () => {
+  for (const code of ["000", "200"]) {
+    const result = runWatchdog(probe, { CURL_CODE: code, CURL_EXIT: "28" })
+    assert.equal(result.status, 0, result.stderr)
+    assert.match(result.stdout, /^1\|fail\|000\|connect_fail local=ok/)
+  }
+})
+
+test("transport failure with a down local UI does not blame the tunnel", () => {
+  const result = runWatchdog(`http=down\n${probe}`, { CURL_EXIT: "7" })
+  assert.equal(result.status, 0, result.stderr)
+  assert.match(result.stdout, /^0\|fail\|000\|connect_fail local=down/)
+})
+
+test("successful pages containing 1033 or Cloudflare text do not trigger recovery", () => {
+  const result = runWatchdog(probe, {
+    CURL_CODE: "200",
+    CURL_BODY: "Build 1033: docs about Cloudflare Tunnel error",
+  })
+  assert.equal(result.stdout, "0|ok|200|\n")
+})
+
+test("530 and explicit 1033 error pages are tunnel failures", () => {
+  for (const [code, body] of [
+    ["530", "unavailable"],
+    ["503", "<h1>Cloudflare Tunnel error</h1>"],
+    ["502", "Error code: 1033"],
+  ]) {
+    const result = runWatchdog(probe, { CURL_CODE: code, CURL_BODY: body })
+    assert.equal(result.status, 0, result.stderr)
+    assert.match(result.stdout, /^1\|bad\|/)
+  }
+})
+
+test("an unrelated error body containing the number 1033 is not a tunnel error", () => {
+  const result = runWatchdog(probe, {
+    CURL_CODE: "404",
+    CURL_BODY: "Record 1033 does not exist",
+  })
+  assert.equal(result.stdout, "0|other|404|code=404\n")
+})
+
+test("empty or unset public URL skips curl", () => {
+  for (const setup of ["CODEG_PUBLIC_URL=", "unset CODEG_PUBLIC_URL"]) {
+    const result = runWatchdog(`${setup}\n${probe}`)
+    assert.equal(result.status, 0, result.stderr)
+    assert.equal(result.stdout, "0|skip|000|\n")
+    assert.equal(result.curls, "")
+  }
+})
+
+test("local probes reject incomplete transfers even after successful HTTP headers", () => {
+  const result = runWatchdog(
+    `http_ok; printf 'ui=%s\\n' "$?"\nwebdav_ok; printf 'webdav=%s\\n' "$?"`,
+    { CURL_CODE: "200", CURL_BODY: "x".repeat(1200), CURL_EXIT: "18" }
+  )
+  assert.equal(result.status, 0, result.stderr)
+  assert.equal(result.stdout, "ui=1\nwebdav=1\n")
+})
+
+test("complete local UI and authenticated WebDAV responses remain healthy", () => {
+  const result = runWatchdog(
+    `http_ok; printf 'ui=%s\\n' "$?"\nCURL_CODE=401\nwebdav_ok; printf 'webdav=%s\\n' "$?"`,
+    { CURL_CODE: "200", CURL_BODY: "x".repeat(1200) }
+  )
+  assert.equal(result.stdout, "ui=0\nwebdav=0\n")
+})
+
+test("failed tunnel launch propagates its status and retains an attempt cooldown", () => {
+  const result = runWatchdog(
+    `restart_tunnel test; printf 'restart=%s\\n' "$?"\ntunnel_cooldown_ok; printf 'allowed=%s\\n' "$?"`,
+    { START_EXIT: "9" }
+  )
+  assert.equal(result.stdout, "restart=9\nallowed=1\n")
+  assert.match(result.log, /restart.*failed.*9/)
+  assert.match(result.stamp, /^2000000000(?: |\n)/)
+})
+
+test("repeated attempts back off to a bounded maximum, including failed launches", () => {
+  const result = runWatchdog(
+    `
+for now in 2000000000 2000000180 2000000540 2000001260 2000002700; do
+  echo "$now" >"$TEST_ROOT/now"
+  restart_tunnel test
+done
+echo 2000004499 >"$TEST_ROOT/now"
+tunnel_cooldown_ok; printf 'before=%s\\n' "$?"
+echo 2000004500 >"$TEST_ROOT/now"
+tunnel_cooldown_ok; printf 'at=%s\\n' "$?"
+restart_tunnel test
+echo 2000006299 >"$TEST_ROOT/now"
+tunnel_cooldown_ok; printf 'capped_before=%s\\n' "$?"
+echo 2000006300 >"$TEST_ROOT/now"
+tunnel_cooldown_ok; printf 'capped_at=%s\\n' "$?"
+`,
+    { START_EXIT: "9" }
+  )
+  assert.equal(result.status, 0, result.stderr)
+  assert.equal(result.stdout, "before=1\nat=0\ncapped_before=1\ncapped_at=0\n")
+  assert.equal(result.starts.trim().split("\n").length, 6)
+})
+
+test("optional daily cap counts failed attempts and unlocks on the next UTC day", () => {
+  const result = runWatchdog(
+    `
+TUNNEL_RESTART_DAILY_CAP=2
+restart_tunnel first
+echo 2000000180 >"$TEST_ROOT/now"
+restart_tunnel second
+echo 2000000540 >"$TEST_ROOT/now"
+restart_tunnel third; printf 'capped=%s\\n' "$?"
+echo 2000073600 >"$TEST_ROOT/now"
+restart_tunnel next_day; printf 'next_day=%s\\n' "$?"
+`,
+    { START_EXIT: "9" }
+  )
+  assert.equal(result.status, 0, result.stderr)
+  assert.equal(result.stdout, "capped=2\nnext_day=9\n")
+  assert.equal(result.starts.trim().split("\n").length, 3)
+  assert.match(result.log, /daily cap/)
+})
+
+test("disabled daily cap does not stop recovery at an arbitrary attempt count", () => {
+  const result = runWatchdog(`
+TUNNEL_RESTART_GRACE=0
+for now in 2000000000 2000001800 2000003600 2000005400 2000007200 2000009000 2000010800; do
+  echo "$now" >"$TEST_ROOT/now"
+  restart_tunnel test || exit 1
+done
+`)
+  assert.equal(result.status, 0, result.stderr)
+  assert.equal(result.starts.trim().split("\n").length, 7)
+})
+
+test("legacy timestamp-only state still enforces cooldown after an upgrade", () => {
+  const result = runWatchdog(`
+echo 1999999999 >"$TUNNEL_RESTART_STAMP"
+tunnel_cooldown_ok; printf 'allowed=%s\\n' "$?"
+echo 2000000179 >"$TEST_ROOT/now"
+tunnel_cooldown_ok; printf 'expired=%s\\n' "$?"
+`)
+  assert.equal(result.status, 0, result.stderr)
+  assert.equal(result.stdout, "allowed=1\nexpired=0\n")
+})
+
+test("invalid numeric config falls back safely before arithmetic", () => {
+  const result = runWatchdog(`
+PUBLIC_FAIL_THRESHOLD='-2'
+TUNNEL_RESTART_COOLDOWN='1+1'
+TUNNEL_RESTART_BACKOFF_CAP=999999999999999999999999999999999
+TUNNEL_RESTART_DAILY_CAP=hello
+TUNNEL_RESTART_GRACE=-1
+configure_watchdog
+printf '%s %s %s %s %s\\n' "$PUBLIC_FAIL_THRESHOLD" "$TUNNEL_RESTART_COOLDOWN" "$TUNNEL_RESTART_BACKOFF_CAP" "$TUNNEL_RESTART_DAILY_CAP" "$TUNNEL_RESTART_GRACE"
+`)
+  assert.equal(result.status, 0, result.stderr)
+  assert.equal(result.stdout, "2 180 1800 0 60\n")
+  assert.match(result.stderr, /invalid PUBLIC_FAIL_THRESHOLD/)
+  assert.match(result.stderr, /invalid TUNNEL_RESTART_COOLDOWN/)
+  assert.match(result.log, /invalid TUNNEL_RESTART_COOLDOWN/)
+})
+
+test("decimal config accepts leading zeroes and explicit disabled cap/grace", () => {
+  const result = runWatchdog(`
+PUBLIC_FAIL_THRESHOLD=08
+TUNNEL_RESTART_COOLDOWN=0008
+TUNNEL_RESTART_BACKOFF_CAP=0001
+TUNNEL_RESTART_DAILY_CAP=0
+TUNNEL_RESTART_GRACE=0
+configure_watchdog
+printf '%s %s %s %s %s\\n' "$PUBLIC_FAIL_THRESHOLD" "$TUNNEL_RESTART_COOLDOWN" "$TUNNEL_RESTART_BACKOFF_CAP" "$TUNNEL_RESTART_DAILY_CAP" "$TUNNEL_RESTART_GRACE"
+`)
+  assert.equal(result.status, 0, result.stderr)
+  assert.equal(result.stdout, "8 8 8 0 0\n")
+})
+
+test("public failures must be consecutive before a force restart", () => {
+  const result = runWatchdog(`
+CURL_CODE=530
+check_public_tunnel
+CURL_CODE=404
+check_public_tunnel
+CURL_CODE=530
+check_public_tunnel
+printf 'streak=%s\\n' "$pub_fail_streak"
+`)
+  assert.equal(result.status, 0, result.stderr)
+  assert.equal(result.stdout, "streak=1\n")
+  assert.equal(result.starts, "")
+})
+
+test("failed force restart keeps the public failure streak", () => {
+  const result = runWatchdog(
+    `
+CURL_CODE=530
+check_public_tunnel
+check_public_tunnel; printf 'result=%s\\n' "$?"
+printf 'streak=%s\\n' "$pub_fail_streak"
+`,
+    { START_EXIT: "9" }
+  )
+  assert.equal(result.status, 0, result.stderr)
+  assert.equal(result.stdout, "result=9\nstreak=2\n")
+  assert.equal(result.starts, "1 --force\n")
+  assert.match(result.log, /restart failed: exit=9/)
+})
+
+test("successful force launch preserves failures during a fixed readiness grace", () => {
+  const result = runWatchdog(`
+CURL_CODE=530
+check_public_tunnel
+check_public_tunnel
+printf 'launched=%s\\n' "$pub_fail_streak"
+echo 2000000059 >"$TEST_ROOT/now"
+source "$TEST_ROOT/functions.sh"
+check_public_tunnel
+printf 'grace=%s\\n' "$pub_fail_streak"
+echo 2000000060 >"$TEST_ROOT/now"
+check_public_tunnel
+printf 'expired=%s\\n' "$pub_fail_streak"
+`)
+  assert.equal(result.status, 0, result.stderr)
+  assert.equal(result.stdout, "launched=2\ngrace=2\nexpired=3\n")
+  assert.equal(result.starts, "1 --force\n")
+  assert.match(result.log, /readiness grace/)
+})
+
+test("healthy probe resets escalation while preserving cooldown and daily usage", () => {
+  const result = runWatchdog(`
+TUNNEL_RESTART_DAILY_CAP=2
+restart_tunnel first
+echo 2000000180 >"$TEST_ROOT/now"
+restart_tunnel second
+CURL_CODE=200
+check_public_tunnel
+printf 'streak=%s\\n' "$pub_fail_streak"
+tunnel_cooldown_ok; printf 'daily=%s\\n' "$?"
+TUNNEL_RESTART_DAILY_CAP=0
+tunnel_cooldown_ok; printf 'cooldown=%s\\n' "$?"
+echo 2000000360 >"$TEST_ROOT/now"
+tunnel_cooldown_ok; printf 'recovered=%s\\n' "$?"
+`)
+  assert.equal(result.status, 0, result.stderr)
+  assert.equal(result.stdout, "streak=0\ndaily=1\ncooldown=1\nrecovered=0\n")
+  assert.equal(result.starts.trim().split("\n").length, 2)
+})
+
+test("unset URL remains opt-in after configuration is initialized", () => {
+  const result = runWatchdog(
+    `unset CODEG_PUBLIC_URL\nconfigure_watchdog\n${probe}`
+  )
+  assert.equal(result.status, 0, result.stderr)
+  assert.equal(result.stdout, "0|skip|000|\n")
+  assert.equal(result.curls, "")
+})
+
+test("unrelated error responses do not reset restart backoff", () => {
+  const result = runWatchdog(`
+TUNNEL_RESTART_GRACE=0
+restart_tunnel first
+echo 2000000180 >"$TEST_ROOT/now"
+restart_tunnel second
+CURL_CODE=404
+check_public_tunnel
+echo 2000000360 >"$TEST_ROOT/now"
+tunnel_cooldown_ok; printf 'allowed=%s\\n' "$?"
+`)
+  assert.equal(result.status, 0, result.stderr)
+  assert.equal(result.stdout, "allowed=1\n")
+  assert.equal(result.stderr, "")
+})
+
+test("corrupt persisted numbers never reach Bash arithmetic", () => {
+  const result = runWatchdog(`
+printf '%s\\n' '999999999999999999999999 1 2 3 4' >"$TUNNEL_RESTART_STAMP"
+tunnel_cooldown_ok; printf 'corrupt_timestamp=%s\\n' "$?"
+printf '%s\\n' '1999999999 1+2 2 3 4' >"$TUNNEL_RESTART_STAMP"
+tunnel_cooldown_ok; printf 'corrupt_counters=%s\\n' "$?"
+`)
+  assert.equal(result.status, 0, result.stderr)
+  assert.equal(result.stdout, "corrupt_timestamp=0\ncorrupt_counters=1\n")
+  assert.match(result.stderr, /invalid tunnel restart/)
+})
+
+test("daemon loop logs failed recovery without clearing consecutive failures", () => {
+  const result = runWatchdog(
+    `
+loop=0
+# Guard every service boundary: this test can never inspect or kill host services.
+port_up() { return 0; }
+http_ok() { return 0; }
+webdav_ok() { return 0; }
+cf_up() { return 0; }
+restart_server() { echo 'unexpected server restart' >&2; exit 90; }
+ps() { printf '123\\n'; }
+cat >"$BOOT/start-webdav.sh" <<'MOCK'
+#!/bin/bash
+exit 0
+MOCK
+chmod +x "$BOOT/start-webdav.sh"
+sleep() {
+  if [ "$1" = 60 ]; then
+    if [ "$loop" -ge 3 ]; then exit 0; fi
+    echo "$((2000000000 + loop * 60))" >"$TEST_ROOT/now"
+  fi
+}
+CURL_CODE=530
+`,
+    { START_EXIT: "9" },
+    true
+  )
+  assert.equal(result.status, 0, result.stderr)
+  assert.equal(result.stderr, "")
+  assert.match(result.log, /streak=3\/2/)
+  assert.match(result.log, /restart failed: exit=9/)
+  assert.match(result.log, /tunnel restart skipped: cooldown\/backoff/)
+  assert.match(result.log, /3080=up http=ok cloudflared=up public=bad/)
+  assert.equal(result.starts.match(/1 --force/g)?.length, 1)
+})
+
+test("a failed state write prevents an unbudgeted force restart", () => {
+  const result = runWatchdog(`
+TUNNEL_RESTART_STAMP=$TEST_ROOT/missing/stamp
+restart_tunnel test; printf 'result=%s\\n' "$?"
+`)
+  assert.equal(result.status, 0, result.stderr)
+  assert.equal(result.stdout, "result=1\n")
+  assert.equal(result.starts, "")
+  assert.match(result.log, /cannot persist tunnel restart state/)
+})
+
+test("readiness grace reports pending without marking the public edge broken", () => {
+  const result = runWatchdog(`
+restart_tunnel test
+CURL_CODE=530
+check_public_tunnel
+printf 'grace=%s|%s|%s|%s\\n' "$pub" "$pub_status" "$broken" "$pub_fail_streak"
+echo 2000000060 >"$TEST_ROOT/now"
+check_public_tunnel
+printf 'expired=%s|%s|%s|%s\\n' "$pub" "$pub_status" "$broken" "$pub_fail_streak"
+`)
+  assert.equal(result.status, 0, result.stderr)
+  assert.equal(result.stdout, "grace=pending|bad|0|0\nexpired=bad|bad|1|1\n")
+  assert.match(result.log, /public probe bad code=530.*readiness grace/)
+})

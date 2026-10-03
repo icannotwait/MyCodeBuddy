@@ -128,6 +128,7 @@ pub(crate) async fn register_simple_workflow_txn<C: ConnectionTrait>(
     parent_conversation_id: i32,
     plan_rel_path: &str,
     progress_rel_path: Option<&str>,
+    design_rel_path: Option<Option<&str>>,
 ) -> Result<SimpleWorkflowRegistration, SimpleWorkflowError> {
     let parent = conversation::Entity::find_by_id(parent_conversation_id)
         .filter(conversation::Column::DeletedAt.is_null())
@@ -165,6 +166,13 @@ pub(crate) async fn register_simple_workflow_txn<C: ConnectionTrait>(
     }
 
     let plan_rel_path = normalize_rel_path(plan_rel_path)?;
+    let design_rel_path = match design_rel_path {
+        Some(path) => path.map(normalize_rel_path).transpose()?,
+        None => existing
+            .as_ref()
+            .filter(|current| current.plan_rel_path == plan_rel_path)
+            .and_then(|current| current.design_rel_path.clone()),
+    };
     let progress_rel_path = normalize_rel_path(
         progress_rel_path
             .map(str::to_owned)
@@ -176,7 +184,8 @@ pub(crate) async fn register_simple_workflow_txn<C: ConnectionTrait>(
     match existing {
         Some(current) => {
             let unchanged = current.plan_rel_path == plan_rel_path
-                && current.progress_rel_path == progress_rel_path;
+                && current.progress_rel_path == progress_rel_path
+                && current.design_rel_path == design_rel_path;
             if unchanged {
                 return Ok(SimpleWorkflowRegistration {
                     descriptor: current,
@@ -187,6 +196,7 @@ pub(crate) async fn register_simple_workflow_txn<C: ConnectionTrait>(
             let mut active: simple_workflow::ActiveModel = current.into();
             active.plan_rel_path = Set(plan_rel_path);
             active.progress_rel_path = Set(progress_rel_path);
+            active.design_rel_path = Set(design_rel_path);
             active.updated_at = Set(now);
             let descriptor = active.update(conn).await.map_err(db_error)?;
             Ok(SimpleWorkflowRegistration {
@@ -200,6 +210,7 @@ pub(crate) async fn register_simple_workflow_txn<C: ConnectionTrait>(
                 parent_conversation_id: Set(parent_conversation_id),
                 plan_rel_path: Set(plan_rel_path),
                 progress_rel_path: Set(progress_rel_path),
+                design_rel_path: Set(design_rel_path),
                 created_at: Set(now),
                 updated_at: Set(now),
             }
@@ -221,12 +232,33 @@ pub async fn register_simple_workflow(
     plan_rel_path: &str,
     progress_rel_path: Option<&str>,
 ) -> Result<SimpleWorkflowRegistration, SimpleWorkflowError> {
+    register_simple_workflow_with_design(
+        conn,
+        parent_conversation_id,
+        plan_rel_path,
+        progress_rel_path,
+        None,
+    )
+    .await
+}
+
+/// Register locators and optionally bind the Design that may affect current activity.
+/// Omission preserves a same-Plan binding, but clears it when the Plan changes.
+/// `Some(None)` explicitly clears the binding; `Some(Some(path))` binds/replaces it.
+pub async fn register_simple_workflow_with_design(
+    conn: &DatabaseConnection,
+    parent_conversation_id: i32,
+    plan_rel_path: &str,
+    progress_rel_path: Option<&str>,
+    design_rel_path: Option<Option<&str>>,
+) -> Result<SimpleWorkflowRegistration, SimpleWorkflowError> {
     let txn = conn.begin().await.map_err(db_error)?;
     let registration = register_simple_workflow_txn(
         &txn,
         parent_conversation_id,
         plan_rel_path,
         progress_rel_path,
+        design_rel_path,
     )
     .await?;
     txn.commit().await.map_err(db_error)?;

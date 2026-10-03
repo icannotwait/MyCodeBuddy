@@ -101,12 +101,17 @@
   },
   {
     "name": "register_simple_workflow",
+    "description": "Register the current Plan/progress locators. Optionally bind its Design so only that Design affects current workflow activity; other Design runs remain visible as history.",
     "inputSchema": {
       "type": "object",
       "required": ["plan_rel_path"],
       "properties": {
         "plan_rel_path": {},
-        "progress_rel_path": {}
+        "progress_rel_path": {},
+        "design_rel_path": {
+          "type": ["string", "null"],
+          "description": "Workspace-relative Design path. A string binds/replaces it; null clears it. Omission preserves the binding for the same normalized Plan path, but clears it if the Plan path changes."
+        }
       }
     }
   },

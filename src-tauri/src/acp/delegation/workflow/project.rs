@@ -2938,6 +2938,20 @@ async fn project_simple_mode(
     let mut projection_warning_codes = Vec::new();
     let safe_plan_rel_path = normalize_rel_path(&descriptor.plan_rel_path).ok();
     let safe_progress_rel_path = normalize_rel_path(&descriptor.progress_rel_path).ok();
+    let safe_design_rel_path =
+        descriptor
+            .design_rel_path
+            .as_deref()
+            .and_then(|path| match normalize_rel_path(path) {
+                Ok(path) => Some(path),
+                Err(_) => {
+                    push_projection_warning(
+                        &mut projection_warning_codes,
+                        "simple_design_invalid_path",
+                    );
+                    None
+                }
+            });
     let plan = match read_simple_plan(Path::new(&workspace.path), &descriptor.plan_rel_path).await {
         Ok(plan) => plan,
         Err(error) => {
@@ -3517,30 +3531,45 @@ async fn project_simple_mode(
     } else {
         current
     };
-    // Registration changes the task source, not the observed document history.
+    // Design history remains visible, but only the explicitly bound Design can
+    // affect current activity. Plan history follows the normalized current Plan
+    // locator, including after re-registration; invalid locators admit no runs.
+    let mut current_document_node_ids = HashSet::new();
     let document_runs = parent_runs
         .iter()
-        .filter(|run| {
-            match run
-                .work_unit_key
-                .as_deref()
-                .and_then(parse_recognized_work_unit_key)
-            {
-                Some(ParsedWorkUnitKey::Design { .. } | ParsedWorkUnitKey::DesignFixer { .. }) => {
+        .filter_map(|run| {
+            let key = run.work_unit_key.as_deref()?;
+            let parsed = parse_recognized_work_unit_key(key)?;
+            let affects_current = match &parsed {
+                ParsedWorkUnitKey::Design { rel_doc_path, .. }
+                | ParsedWorkUnitKey::DesignFixer { rel_doc_path, .. } => {
+                    safe_design_rel_path.as_deref() == Some(rel_doc_path.as_str())
+                }
+                ParsedWorkUnitKey::PlanAuthor { rel_plan_path, .. }
+                | ParsedWorkUnitKey::PlanReviewer { rel_plan_path, .. } => {
+                    if safe_plan_rel_path.as_deref() != Some(rel_plan_path.as_str()) {
+                        return None;
+                    }
                     true
                 }
-                Some(
-                    ParsedWorkUnitKey::PlanAuthor { rel_plan_path, .. }
-                    | ParsedWorkUnitKey::PlanReviewer { rel_plan_path, .. },
-                ) => safe_plan_rel_path.as_deref() == Some(rel_plan_path.as_str()),
-                _ => false,
+                _ => return None,
+            };
+            if affects_current {
+                // Document synthetic ids are safe ASCII and pass through the
+                // public allocator unchanged, independent of run ordering.
+                current_document_node_ids.insert(synthetic_node_id(&parsed, key));
             }
+            Some(run.clone())
         })
-        .cloned()
         .collect();
     let (document_nodes, mut phases) = project_observed_runs(document_runs);
+    let current_document_nodes = document_nodes
+        .iter()
+        .filter(|node| current_document_node_ids.contains(&node.node_id))
+        .cloned()
+        .collect::<Vec<_>>();
     let (active_document_ids, active_document_phase) =
-        select_current_nodes(&document_nodes, &[], &[]);
+        select_current_nodes(&current_document_nodes, &[], &[]);
     let current_phase_id = if active_document_ids.is_empty() {
         (!current_node_ids.is_empty()).then(|| "tasks".into())
     } else {
@@ -8703,6 +8732,7 @@ mod tests {
         simple_workflow::ActiveModel {
             parent_conversation_id: Set(parent),
             plan_rel_path: Set("C:/private/plan.md".into()),
+            design_rel_path: Set(None),
             progress_rel_path: Set(format!(".superpowers/sdd/{parent}/progress.md")),
             created_at: Set(now),
             updated_at: Set(now),
@@ -8744,6 +8774,7 @@ mod tests {
         simple_workflow::ActiveModel {
             parent_conversation_id: Set(successor),
             plan_rel_path: Set("docs/superpowers/plans/p.md".into()),
+            design_rel_path: Set(None),
             progress_rel_path: Set(format!(".superpowers/sdd/{successor}/progress.md")),
             created_at: Set(now),
             updated_at: Set(now),
@@ -8754,6 +8785,7 @@ mod tests {
         simple_workflow::ActiveModel {
             parent_conversation_id: Set(archived_parent),
             plan_rel_path: Set("docs/conflicting.md".into()),
+            design_rel_path: Set(None),
             progress_rel_path: Set(format!(".superpowers/sdd/{archived_parent}/progress.md")),
             created_at: Set(now),
             updated_at: Set(now),
@@ -8864,6 +8896,7 @@ mod tests {
         simple_workflow::ActiveModel {
             parent_conversation_id: Set(parent),
             plan_rel_path: Set("docs/conflicting.md".into()),
+            design_rel_path: Set(None),
             progress_rel_path: Set(format!(".superpowers/sdd/{parent}/progress.md")),
             created_at: Set(now),
             updated_at: Set(now),

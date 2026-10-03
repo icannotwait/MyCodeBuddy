@@ -7,6 +7,7 @@ pub struct Model {
     pub parent_conversation_id: i32,
     pub plan_rel_path: String,
     pub progress_rel_path: String,
+    pub design_rel_path: Option<String>,
     pub created_at: DateTimeUtc,
     pub updated_at: DateTimeUtc,
 }

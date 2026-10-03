@@ -147,9 +147,11 @@ function subscribeLiveClock(onStoreChange: () => void): () => void {
   }
 }
 
+const noopSubscribe = () => () => {}
+
 function useNowMs(active: boolean): number {
   return useSyncExternalStore(
-    active ? subscribeLiveClock : () => () => {},
+    active ? subscribeLiveClock : noopSubscribe,
     // Terminal-only views never need a wall clock (finished − started).
     // Live views read the interval-backed snapshot (updated once per second).
     () => (active ? liveClockMs : 0),

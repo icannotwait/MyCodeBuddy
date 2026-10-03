@@ -784,6 +784,11 @@ struct RegisterSimpleWorkflowArguments {
     plan_rel_path: String,
     #[serde(default)]
     progress_rel_path: Option<String>,
+    #[serde(
+        default,
+        deserialize_with = "super::transport::deserialize_optional_design_path"
+    )]
+    design_rel_path: Option<Option<String>>,
 }
 
 pub fn serialize_jsonrpc_line(response: &JsonRpcResponse) -> Result<Vec<u8>, serde_json::Error> {
@@ -2479,6 +2484,11 @@ async fn build_tools_call_spawn(
                     .progress_rel_path
                     .as_deref()
                     .is_some_and(|path| path.trim().is_empty())
+                || arguments
+                    .design_rel_path
+                    .as_ref()
+                    .and_then(|path| path.as_deref())
+                    .is_some_and(|path| path.trim().is_empty())
             {
                 return LineAction::Respond(err(
                     id,
@@ -2490,6 +2500,7 @@ async fn build_tools_call_spawn(
                 token: ctx.token.clone(),
                 plan_rel_path: arguments.plan_rel_path,
                 progress_rel_path: arguments.progress_rel_path,
+                design_rel_path: arguments.design_rel_path,
             };
             let round_trip =
                 Box::pin(
@@ -7505,7 +7516,7 @@ mod tests {
             .expect("registration properties");
         assert_eq!(
             properties.keys().cloned().collect::<Vec<_>>(),
-            vec!["plan_rel_path", "progress_rel_path"]
+            vec!["design_rel_path", "plan_rel_path", "progress_rel_path"]
         );
 
         let response = unwrap_respond(
@@ -7523,6 +7534,24 @@ mod tests {
             .await,
         );
         assert_eq!(response.error.expect("unknown field error").code, -32602);
+    }
+
+    #[test]
+    fn simple_registration_arguments_distinguish_omitted_and_cleared_design() {
+        for (json, expected) in [
+            (json!({"plan_rel_path": "docs/plan.md"}), None),
+            (
+                json!({"plan_rel_path": "docs/plan.md", "design_rel_path": null}),
+                Some(None),
+            ),
+            (
+                json!({"plan_rel_path": "docs/plan.md", "design_rel_path": "docs/design.md"}),
+                Some(Some("docs/design.md".to_string())),
+            ),
+        ] {
+            let arguments: RegisterSimpleWorkflowArguments = serde_json::from_value(json).unwrap();
+            assert_eq!(arguments.design_rel_path, expected);
+        }
     }
 
     #[test]
@@ -9474,6 +9503,16 @@ mod tests {
                 "registration progress empty",
                 "register_simple_workflow",
                 json!({"plan_rel_path": "docs/plan.md", "progress_rel_path": ""}),
+            ),
+            (
+                "registration design type",
+                "register_simple_workflow",
+                json!({"plan_rel_path": "docs/plan.md", "design_rel_path": 7}),
+            ),
+            (
+                "registration design empty",
+                "register_simple_workflow",
+                json!({"plan_rel_path": "docs/plan.md", "design_rel_path": " "}),
             ),
             (
                 "status wait type",

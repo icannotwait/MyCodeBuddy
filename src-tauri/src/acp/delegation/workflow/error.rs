@@ -715,6 +715,7 @@ mod tests {
         simple_workflow::ActiveModel {
             parent_conversation_id: Set(successor),
             plan_rel_path: Set("docs/plan.md".into()),
+            design_rel_path: Set(None),
             progress_rel_path: Set(".superpowers/sdd/successor/progress.md".into()),
             created_at: Set(now),
             updated_at: Set(now),
@@ -872,6 +873,7 @@ mod tests {
         simple_workflow::ActiveModel {
             parent_conversation_id: Set(simple),
             plan_rel_path: Set("docs/simple-plan.md".into()),
+            design_rel_path: Set(None),
             progress_rel_path: Set(".superpowers/sdd/simple/progress.md".into()),
             created_at: Set(now),
             updated_at: Set(now),
@@ -943,6 +945,7 @@ mod tests {
         simple_workflow::ActiveModel {
             parent_conversation_id: Set(archived),
             plan_rel_path: Set("docs/conflicting-plan.md".into()),
+            design_rel_path: Set(None),
             progress_rel_path: Set(".superpowers/sdd/conflict/progress.md".into()),
             created_at: Set(now),
             updated_at: Set(now),

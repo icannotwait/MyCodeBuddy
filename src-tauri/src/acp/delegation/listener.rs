@@ -60,7 +60,7 @@ use crate::acp::delegation::workflow::{
 use crate::acp::delegation::workflow::{
     decide_workflow_recovery, emit_workflow_compatibility_nudge, get_workflow_state_core,
     guard_current_final_delivery_core, guard_task_final_delivery_core,
-    load_completion_protocol_header, recover_workflow_core, register_simple_workflow,
+    load_completion_protocol_header, recover_workflow_core, register_simple_workflow_with_design,
     require_v2_mutation, settle_workflow_gate_v2_core,
     workflow_v2_publication_retired_for_conversation, workflow_v2_retired_for_conversation,
     FinalDeliveryGuardResult, PlanReviewError, RecoverWorkflowRequest, SettleWorkflowV2Request,
@@ -2092,11 +2092,12 @@ impl DelegationListener {
         let Some(runs) = self.broker.run_store() else {
             return WorkflowWireError::StoreUnavailable.to_value();
         };
-        match register_simple_workflow(
+        match register_simple_workflow_with_design(
             &runs.db().conn,
             parent_conversation_id,
             &req.plan_rel_path,
             req.progress_rel_path.as_deref(),
+            req.design_rel_path.as_ref().map(|path| path.as_deref()),
         )
         .await
         {
@@ -2117,6 +2118,7 @@ impl DelegationListener {
                 serde_json::json!({
                     "plan_rel_path": registration.descriptor.plan_rel_path,
                     "progress_rel_path": registration.descriptor.progress_rel_path,
+                    "design_rel_path": registration.descriptor.design_rel_path,
                     "registration_mode": registration_mode,
                     "idempotent_replay": !registration.created && !registration.updated,
                 })
@@ -10909,11 +10911,13 @@ mod tests {
             .process_register_simple_workflow(BrokerRegisterSimpleWorkflowRequest {
                 token: "simple-root".into(),
                 plan_rel_path: "./docs//plan.md".into(),
+                design_rel_path: Some(Some("./docs//design.md".into())),
                 progress_rel_path: None,
             })
             .await;
         assert_eq!(created["registration_mode"], "created");
         assert_eq!(created["plan_rel_path"], "docs/plan.md");
+        assert_eq!(created["design_rel_path"], "docs/design.md");
         assert_eq!(
             created["progress_rel_path"],
             format!(".superpowers/sdd/{parent}/progress.md")
@@ -10927,22 +10931,26 @@ mod tests {
             .process_register_simple_workflow(BrokerRegisterSimpleWorkflowRequest {
                 token: "simple-root".into(),
                 plan_rel_path: "docs/plan.md".into(),
+                design_rel_path: None,
                 progress_rel_path: None,
             })
             .await;
         assert_eq!(replay["registration_mode"], "unchanged");
         assert_eq!(replay["idempotent_replay"], true);
+        assert_eq!(replay["design_rel_path"], "docs/design.md");
         assert!(events.try_recv().is_err(), "replay must not emit a refresh");
 
         let updated = listener
             .process_register_simple_workflow(BrokerRegisterSimpleWorkflowRequest {
                 token: "simple-root".into(),
                 plan_rel_path: "docs/plan.md".into(),
+                design_rel_path: Some(None),
                 progress_rel_path: Some("state/progress.md".into()),
             })
             .await;
         assert_eq!(updated["registration_mode"], "updated");
         assert_eq!(updated["progress_rel_path"], "state/progress.md");
+        assert!(updated["design_rel_path"].is_null());
         events.try_recv().expect("refresh after committed update");
 
         for (token, code) in [("missing", "invalid_token"), ("simple-child", "root_only")] {
@@ -10950,6 +10958,7 @@ mod tests {
                 .process_register_simple_workflow(BrokerRegisterSimpleWorkflowRequest {
                     token: token.into(),
                     plan_rel_path: "docs/other.md".into(),
+                    design_rel_path: None,
                     progress_rel_path: None,
                 })
                 .await;
@@ -10959,6 +10968,7 @@ mod tests {
             .process_register_simple_workflow(BrokerRegisterSimpleWorkflowRequest {
                 token: "simple-root".into(),
                 plan_rel_path: "../outside.md".into(),
+                design_rel_path: None,
                 progress_rel_path: None,
             })
             .await;
@@ -11163,6 +11173,7 @@ mod tests {
         simple_workflow::ActiveModel {
             parent_conversation_id: Set(parent),
             plan_rel_path: Set("docs/conflicting-simple-plan.md".into()),
+            design_rel_path: Set(None),
             progress_rel_path: Set(".superpowers/sdd/conflict/progress.md".into()),
             created_at: Set(now),
             updated_at: Set(now),

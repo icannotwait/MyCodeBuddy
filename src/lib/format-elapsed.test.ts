@@ -36,6 +36,15 @@ describe("formatElapsedLabel", () => {
     expect(formatElapsedLabel(7_323_000, t)).toBe("2h 2m 3s")
   })
 
+  it.each([NaN, Infinity, -Infinity])(
+    "normalizes non-finite input %s to localized zero seconds",
+    (duration) => {
+      const localized: ElapsedUnitTranslator = (_key, { value }) =>
+        `${value} 秒`
+      expect(formatElapsedLabel(duration, localized)).toBe("0 秒")
+    }
+  )
+
   it("clamps negative input to zero", () => {
     expect(formatElapsedLabel(-100, t)).toBe("0s")
   })

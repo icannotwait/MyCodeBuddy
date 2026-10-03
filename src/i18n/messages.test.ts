@@ -136,8 +136,12 @@ describe("i18n locale key parity vs en.json", () => {
     }
   })
 
-  it("defines Simple DAG copy and relationship placeholders", () => {
-    const dagKeys = [
+  it("keeps task overview copy without retired DAG and summary labels", () => {
+    const retiredKeys = [
+      "completedTaskCount",
+      "currentTaskProgress",
+      "simpleTaskCount",
+      "simpleLiveRun",
       "dagAria",
       "dagSelectedNode",
       "dagCurrentNode",
@@ -148,27 +152,15 @@ describe("i18n locale key parity vs en.json", () => {
     ] as const
 
     for (const messages of locales) {
-      const workflow = (
-        messages as unknown as {
-          Folder: { chat: { workflowGraph: Record<string, string> } }
-        }
-      ).Folder.chat.workflowGraph
+      const workflow = messages.Folder.chat.workflowGraph
 
-      for (const key of dagKeys) {
-        expect(workflow[key], `missing workflow DAG key ${key}`).toEqual(
-          expect.any(String)
-        )
-        expect(workflow[key].trim(), `empty workflow DAG key ${key}`).not.toBe(
-          ""
-        )
+      for (const key of retiredKeys) {
+        expect(workflow, `retired workflow key ${key}`).not.toHaveProperty(key)
       }
-      expect(
-        Object.keys(workflow)
-          .filter((key) => key.startsWith("dag"))
-          .sort()
-      ).toEqual([...dagKeys].sort())
-      expect(workflow.dagDependsOn).toContain("{nodes}")
-      expect(workflow.dagRequiredBy).toContain("{nodes}")
+      expect(workflow.completedTaskProgress).toContain("{completed}")
+      expect(workflow.completedTaskProgress).toContain("{total}")
+      expect(workflow.waitingForTasks).toContain("{tasks}")
+      expect(workflow.moreTaskActions.trim()).not.toBe("")
     }
   })
 
