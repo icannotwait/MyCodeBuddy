@@ -121,7 +121,7 @@ impl SharedSessionMetrics {
     pub(super) fn remove_live_session(&self) {
         let _ = self
             .live_sessions
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
                 Some(current.saturating_sub(1))
             });
     }
@@ -135,7 +135,7 @@ impl SharedSessionMetrics {
         let count = count as u64;
         let _ = self
             .active_leases
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
                 Some(current.saturating_sub(count))
             });
     }
@@ -249,7 +249,7 @@ impl SharedSessionMetrics {
 }
 
 fn saturating_sub(counter: &AtomicU64, amount: u64) {
-    let _ = counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+    let _ = counter.try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
         Some(current.saturating_sub(amount))
     });
 }

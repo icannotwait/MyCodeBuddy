@@ -263,13 +263,18 @@ pub fn scratch_root() -> PathBuf {
 /// this module's own docs warn about.
 fn sweep_roots() -> Vec<PathBuf> {
     let mut roots = vec![scratch_root()];
-    for candidate in [
-        std::env::temp_dir().join(SCRATCH_NAMESPACE),
-        #[cfg(unix)]
-        short_root(),
-    ] {
-        if !roots.contains(&candidate) {
-            roots.push(candidate);
+    // Windows only has the ambient temp root here. A one-element `for` is
+    // `clippy::single_element_loop` under `-D warnings`, so push each
+    // candidate directly. Unix still adds the short socket root after it.
+    let ambient = std::env::temp_dir().join(SCRATCH_NAMESPACE);
+    if !roots.contains(&ambient) {
+        roots.push(ambient);
+    }
+    #[cfg(unix)]
+    {
+        let short = short_root();
+        if !roots.contains(&short) {
+            roots.push(short);
         }
     }
     roots

@@ -4798,7 +4798,7 @@ async fn load_workflow_recovery_snapshot_detailed_conn<C: sea_orm::ConnectionTra
             lineage_reset_consumed: settlement.lineage_reset_authorization_id.is_some(),
         }
     };
-    let latest_plan_gate = latest_plan_settlement.map(&project_plan_gate);
+    let latest_plan_gate = latest_plan_settlement.map(project_plan_gate);
     let current_plan_gate = current_plan_settlement.map(project_plan_gate);
 
     if header.structural_revision <= 0

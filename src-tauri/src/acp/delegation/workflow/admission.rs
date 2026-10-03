@@ -298,7 +298,7 @@ impl CompleteWorkTestControl {
 
     fn consume(counter: &std::sync::atomic::AtomicUsize) -> bool {
         counter
-            .fetch_update(
+            .try_update(
                 std::sync::atomic::Ordering::SeqCst,
                 std::sync::atomic::Ordering::SeqCst,
                 |remaining| (remaining > 0).then(|| remaining - 1),
