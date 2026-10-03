@@ -7514,8 +7514,10 @@ mod tests {
         let properties = registration["inputSchema"]["properties"]
             .as_object()
             .expect("registration properties");
+        let mut property_names = properties.keys().map(String::as_str).collect::<Vec<_>>();
+        property_names.sort_unstable();
         assert_eq!(
-            properties.keys().cloned().collect::<Vec<_>>(),
+            property_names,
             vec!["design_rel_path", "plan_rel_path", "progress_rel_path"]
         );
 

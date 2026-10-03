@@ -110,7 +110,7 @@
         "progress_rel_path": {},
         "design_rel_path": {
           "type": ["string", "null"],
-          "description": "Workspace-relative Design path. A string binds/replaces it; null clears it. Omission preserves the binding for the same normalized Plan path, but clears it if the Plan path changes."
+          "description": "Workspace-relative Design path: string binds/replaces; null clears. Omitted: keep binding for the same normalized Plan path; clear if Plan changes."
         }
       }
     }
