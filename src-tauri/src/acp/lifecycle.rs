@@ -1802,6 +1802,7 @@ async fn register_delegation_tool_call_from_event(
     }
 }
 
+#[cfg(any(not(codeg_test_shard), codeg_test_shard = "3"))]
 #[cfg(test)]
 mod delegation_title_tests {
     use super::{
@@ -2305,6 +2306,7 @@ mod delegation_title_tests {
     }
 }
 
+#[cfg(any(not(codeg_test_shard), codeg_test_shard = "3"))]
 #[cfg(test)]
 mod delegation_registration_tests {
     //! Covers `register_delegation_tool_call_from_event` — the dispatcher-side
@@ -3655,6 +3657,7 @@ pub fn lifecycle_subscriber_task(
     }
 }
 
+#[cfg(any(not(codeg_test_shard), codeg_test_shard = "3"))]
 #[cfg(test)]
 mod tests {
     use super::*;

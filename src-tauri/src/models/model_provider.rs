@@ -55,6 +55,7 @@ impl From<crate::db::entities::model_provider::Model> for ModelProviderInfo {
     }
 }
 
+#[cfg(any(not(codeg_test_shard), codeg_test_shard = "9"))]
 #[cfg(test)]
 mod tests {
     use super::mask_api_key;

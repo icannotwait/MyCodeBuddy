@@ -705,6 +705,7 @@ pub async fn canvas_delete_nodes(
     canvas_delete_nodes_core(&EventEmitter::Tauri(app), &db, &terminals, node_ids).await
 }
 
+#[cfg(any(not(codeg_test_shard), codeg_test_shard = "0"))]
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1649,6 +1650,7 @@ mod tests {
     }
 }
 
+#[cfg(any(not(codeg_test_shard), codeg_test_shard = "0"))]
 /// Event-shape coverage: the funnel prune emits ONE `Pruned` event carrying the
 /// scrubbed state, over the same broadcaster the web/tauri bridges consume.
 #[cfg(test)]

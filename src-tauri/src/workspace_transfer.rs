@@ -222,6 +222,7 @@ pub fn env_duration_secs(name: &str, default_secs: u64) -> Duration {
     )
 }
 
+#[cfg(any(not(codeg_test_shard), codeg_test_shard = "5"))]
 #[cfg(test)]
 mod tests {
     use super::*;

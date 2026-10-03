@@ -199,6 +199,7 @@ pub(crate) fn normalize_goal_status(status: &str) -> String {
     out
 }
 
+#[cfg(any(not(codeg_test_shard), codeg_test_shard = "7"))]
 #[cfg(test)]
 mod tests {
     use super::*;

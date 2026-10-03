@@ -539,6 +539,7 @@ fn invalid_request(message: impl Into<String>) -> AppCommandError {
     AppCommandError::new(AppErrorCode::InvalidRequest, message)
 }
 
+#[cfg(any(not(codeg_test_shard), codeg_test_shard = "0"))]
 #[cfg(test)]
 mod tests {
     use super::*;

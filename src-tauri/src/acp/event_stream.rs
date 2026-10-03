@@ -685,6 +685,7 @@ fn agent_stats_size(stats: &crate::models::message::AgentExecutionStats) -> usiz
             .sum::<usize>()
 }
 
+#[cfg(any(not(codeg_test_shard), codeg_test_shard = "3"))]
 #[cfg(test)]
 mod tests {
     use super::*;

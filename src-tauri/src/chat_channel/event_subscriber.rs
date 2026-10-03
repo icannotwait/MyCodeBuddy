@@ -453,6 +453,7 @@ fn parse_acp_event(payload: &AcpEvent, lang: Lang) -> Option<(String, RichMessag
     }
 }
 
+#[cfg(any(not(codeg_test_shard), codeg_test_shard = "10"))]
 #[cfg(test)]
 mod permission_push_tests {
     //! Coverage for the global permission-request push: it fires for desktop /

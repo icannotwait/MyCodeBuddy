@@ -2383,6 +2383,7 @@ fn hex_value(chars: &[char], at: usize, len: usize) -> Option<u32> {
     u32::from_str_radix(&text, 16).ok()
 }
 
+#[cfg(any(not(codeg_test_shard), codeg_test_shard = "4"))]
 #[cfg(test)]
 mod tests {
     use super::*;

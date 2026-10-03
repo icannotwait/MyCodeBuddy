@@ -269,6 +269,7 @@ fn strip_prefix_ignore_ascii_case<'a>(text: &'a str, prefix: &str) -> Option<&'a
 // set `CODEG_HOME` inside a serialized test mutex; we deliberately don't
 // duplicate that here. `simplify_verbatim_path` reads no env, so it is
 // tested directly.
+#[cfg(any(not(codeg_test_shard), codeg_test_shard = "7"))]
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -1825,6 +1825,7 @@ unsafe extern "system" fn resize_hook_proc(
     DefSubclassProc(hwnd, msg, wparam, lparam)
 }
 
+#[cfg(any(not(codeg_test_shard), codeg_test_shard = "0"))]
 #[cfg(test)]
 mod tests {
     use std::sync::{Arc, Mutex};

@@ -548,6 +548,7 @@ pub async fn open_system_notification_settings(app: AppHandle) -> Result<(), App
     .with_detail(last_error.unwrap_or_else(|| "no candidate command available".to_string())))
 }
 
+#[cfg(any(not(codeg_test_shard), codeg_test_shard = "7"))]
 #[cfg(all(test, feature = "tauri-runtime"))]
 mod tests {
     use super::*;

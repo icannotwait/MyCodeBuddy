@@ -567,6 +567,7 @@ pub fn card_summary_to_json(summary: &CardSummary) -> Result<String, serde_json:
     serde_json::to_string(summary)
 }
 
+#[cfg(any(not(codeg_test_shard), codeg_test_shard = "1"))]
 #[cfg(test)]
 mod tests {
     use super::*;

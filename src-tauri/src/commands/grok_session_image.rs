@@ -639,6 +639,7 @@ pub async fn resolve_grok_session_image(
     .await
 }
 
+#[cfg(any(not(codeg_test_shard), codeg_test_shard = "7"))]
 #[cfg(test)]
 mod href_parser_tests {
     use super::*;
@@ -740,6 +741,7 @@ mod href_parser_tests {
     }
 }
 
+#[cfg(any(not(codeg_test_shard), codeg_test_shard = "7"))]
 #[cfg(test)]
 mod candidate_tests {
     use super::*;
@@ -1071,6 +1073,7 @@ mod candidate_tests {
     }
 }
 
+#[cfg(any(not(codeg_test_shard), codeg_test_shard = "7"))]
 #[cfg(test)]
 mod resolver_tests {
     use super::candidate_tests::png_header;

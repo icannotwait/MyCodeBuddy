@@ -21,6 +21,7 @@ use crate::web::handlers::conversations::{
 
 use super::{hook_test_lock, reset_schedule_calls, schedule_call_count};
 
+#[cfg(any(not(codeg_test_shard), codeg_test_shard = "9"))]
 #[tokio::test]
 async fn hook_emit_conversation_state_schedules() {
     let _guard = hook_test_lock().await;
@@ -40,6 +41,7 @@ async fn hook_emit_conversation_state_schedules() {
     );
 }
 
+#[cfg(any(not(codeg_test_shard), codeg_test_shard = "9"))]
 #[tokio::test]
 async fn hook_soft_delete_schedules() {
     let _guard = hook_test_lock().await;
@@ -62,6 +64,7 @@ async fn hook_soft_delete_schedules() {
     );
 }
 
+#[cfg(any(not(codeg_test_shard), codeg_test_shard = "9"))]
 #[tokio::test]
 async fn hook_http_status_schedules() {
     let _guard = hook_test_lock().await;
@@ -91,6 +94,7 @@ async fn hook_http_status_schedules() {
     );
 }
 
+#[cfg(any(not(codeg_test_shard), codeg_test_shard = "9"))]
 #[tokio::test]
 async fn hook_shared_status_notify_schedules() {
     let _guard = hook_test_lock().await;

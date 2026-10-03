@@ -813,6 +813,7 @@ fn parse_env_var(s: &str) -> Option<(String, String)> {
     Some((name.to_string(), value.to_string()))
 }
 
+#[cfg(any(not(codeg_test_shard), codeg_test_shard = "3"))]
 #[cfg(test)]
 mod tests {
     use super::*;

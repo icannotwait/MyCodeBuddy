@@ -882,6 +882,7 @@ pub async fn science_open_central_dir() -> Result<String, ScienceError> {
     Ok(dir.to_string_lossy().to_string())
 }
 
+#[cfg(any(not(codeg_test_shard), codeg_test_shard = "1"))]
 #[cfg(test)]
 mod tests {
     use super::*;

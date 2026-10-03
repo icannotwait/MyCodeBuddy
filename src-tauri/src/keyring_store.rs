@@ -674,6 +674,7 @@ pub fn delete_secret(name: &str) -> Result<(), String> {
     write_tokens_map(&tokens)
 }
 
+#[cfg(any(not(codeg_test_shard), codeg_test_shard = "10"))]
 #[cfg(all(test, not(feature = "tauri-runtime")))]
 mod tests {
     use super::*;

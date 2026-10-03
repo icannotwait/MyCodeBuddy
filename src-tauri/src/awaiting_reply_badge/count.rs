@@ -19,6 +19,7 @@ pub async fn count_awaiting_reply(conn: &DatabaseConnection) -> Result<u32, DbEr
     Ok(n as u32)
 }
 
+#[cfg(any(not(codeg_test_shard), codeg_test_shard = "5"))]
 #[cfg(test)]
 mod tests {
     use super::*;

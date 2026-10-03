@@ -436,6 +436,7 @@ pub async fn open_logs_dir() -> Result<String, AppCommandError> {
     open_logs_dir_core()
 }
 
+#[cfg(any(not(codeg_test_shard), codeg_test_shard = "10"))]
 #[cfg(test)]
 mod tests {
     use super::*;

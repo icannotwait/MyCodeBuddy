@@ -1210,6 +1210,7 @@ fn count_unified_diff_lines(diff: &str) -> (u64, u64) {
     (add, del)
 }
 
+#[cfg(any(not(codeg_test_shard), codeg_test_shard = "7"))]
 #[cfg(test)]
 mod tests {
     use super::*;

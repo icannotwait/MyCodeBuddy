@@ -831,6 +831,7 @@ pub fn is_transient_sqlite(msg: &str) -> bool {
         || lower.contains("code: 6")
 }
 
+#[cfg(any(not(codeg_test_shard), codeg_test_shard = "7"))]
 #[cfg(test)]
 mod promote_sqlite_classify_tests {
     use super::*;
@@ -1737,6 +1738,7 @@ pub mod mock {
         }
     }
 
+    #[cfg(any(not(codeg_test_shard), codeg_test_shard = "7"))]
     #[cfg(test)]
     mod settle_gate_tests {
         use super::TEST_SETTLE_GATE_TIMEOUT;
@@ -1890,6 +1892,7 @@ pub mod mock {
 // Tests
 // ---------------------------------------------------------------------------
 
+#[cfg(any(not(codeg_test_shard), codeg_test_shard = "7"))]
 #[cfg(test)]
 mod tests {
     use super::*;

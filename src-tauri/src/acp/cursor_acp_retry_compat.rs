@@ -681,6 +681,7 @@ fn log_status(status: CompatPatchStatus, version: &str, bundle: Option<&Path>) {
     }
 }
 
+#[cfg(any(not(codeg_test_shard), codeg_test_shard = "0"))]
 #[cfg(test)]
 mod tests {
     use super::*;

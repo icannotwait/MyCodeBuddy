@@ -132,6 +132,7 @@ async fn windows_wait_for_parent_exit(pid: u32) {
     }
 }
 
+#[cfg(any(not(codeg_test_shard), codeg_test_shard = "4"))]
 #[cfg(test)]
 mod tests {
     use super::*;

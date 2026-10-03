@@ -339,6 +339,7 @@ pub async fn remove_staging_best_effort(tmp_dir: &Path, staging_name: &str) {
     }
 }
 
+#[cfg(any(not(codeg_test_shard), codeg_test_shard = "6"))]
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;

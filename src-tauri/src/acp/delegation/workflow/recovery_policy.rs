@@ -767,6 +767,7 @@ fn hex_lower(bytes: &[u8]) -> String {
     out
 }
 
+#[cfg(any(not(codeg_test_shard), codeg_test_shard = "7"))]
 #[cfg(test)]
 mod workflow_recovery_policy {
     use super::*;

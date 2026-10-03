@@ -1596,6 +1596,7 @@ impl Drop for ConnectionCleanupGuard {
     }
 }
 
+#[cfg(any(not(codeg_test_shard), codeg_test_shard = "0"))]
 #[cfg(test)]
 mod cleanup_guard_tests {
     use super::{
@@ -21212,6 +21213,7 @@ async fn emit_conversation_update(
     }
 }
 
+#[cfg(any(not(codeg_test_shard), codeg_test_shard = "0"))]
 #[cfg(test)]
 mod disconnect_origin {
     use super::*;
@@ -21362,6 +21364,7 @@ mod disconnect_origin {
     }
 }
 
+#[cfg(any(not(codeg_test_shard), codeg_test_shard = "0"))]
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -328,6 +328,7 @@ pub struct MessageTurn {
     pub generation_tokens: Option<u64>,
 }
 
+#[cfg(any(not(codeg_test_shard), codeg_test_shard = "5"))]
 #[cfg(test)]
 mod autonomous_origin_tests {
     use super::{AutonomousTurnOrigin, MessageTurn};

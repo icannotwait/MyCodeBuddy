@@ -151,6 +151,7 @@ pub fn estimated_plan_publication_material_decision(
     plan_publication_material_decision(prior_manifest, prior, current_manifest, current)
 }
 
+#[cfg(any(not(codeg_test_shard), codeg_test_shard = "4"))]
 #[cfg(test)]
 mod plan_material_publication_tests {
     use super::super::plan_material::parse_plan_material;
@@ -7810,6 +7811,7 @@ fn settle_result_from_row(
     })
 }
 
+#[cfg(any(not(codeg_test_shard), codeg_test_shard = "4"))]
 #[cfg(test)]
 mod completion_v2_shared_validator_replay_tests {
     use super::super::plan_review::{FindingSeverity, FindingStatus};
@@ -8752,6 +8754,7 @@ fn review_verdict_str(verdict: ReviewVerdict) -> &'static str {
 // Tests (B10 owned by Task 3)
 // ---------------------------------------------------------------------------
 
+#[cfg(any(not(codeg_test_shard), codeg_test_shard = "4"))]
 #[cfg(test)]
 mod tests {
     use super::settle_workflow_gate_v2_from_fixture as settle_workflow_gate_core;

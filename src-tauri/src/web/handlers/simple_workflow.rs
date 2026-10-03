@@ -5,6 +5,7 @@ pub async fn continue_archived_workflow_in_simple() -> Result<(), AppCommandErro
     continue_archived_workflow_in_simple_core()
 }
 
+#[cfg(any(not(codeg_test_shard), codeg_test_shard = "9"))]
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;

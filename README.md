@@ -325,6 +325,7 @@ Run these opt-in commands from the repository root:
 | ----------------------------------------------------- | ------------------------------------------------------------------------------------------------- |
 | `pnpm rust:check:low-memory`                          | Shared Rust library without Tauri; the recommended 4 GiB daily check                              |
 | `pnpm rust:test:low-memory -- <test-path> -- --exact` | One exact shared-core test at runtime; compilation still builds the complete library test harness |
+| `pnpm rust:test:sharded:low-memory` | Native Linux only: sequential compile-time shards of the shared-core library tests; Python 3.11+ required |
 | `pnpm rust:check:desktop:low-memory`                  | Desktop library, including Tauri                                                                  |
 | `pnpm rust:check:server:low-memory`                   | Server library and binary                                                                         |
 | `pnpm rust:check:mcp:low-memory`                      | MCP companion binary                                                                              |
@@ -334,8 +335,9 @@ one job/thread and disables incremental state and debug information. It is
 opt-in, so normal Cargo commands and CI are unchanged. The first invocation
 can still be slow because it may need a cold build.
 
-On the current Windows codebase, even one filtered unit test first compiles a
-single harness containing all 4,028 library tests. The low-memory profile
+In the earlier Windows measurement, even one filtered unit test first compiled a
+single harness containing all 4,028 library tests (a historical count, not the
+current cross-platform inventory). The low-memory profile
 reduced its observed `rustc` peak from roughly 12.2 GiB to 7.55 GiB, but the
 test-name filter only changes execution after compilation. A 4 GiB machine
 should therefore use `rust:check:low-memory` for daily Rust feedback and leave
@@ -348,6 +350,36 @@ When enough memory is available, an exact test can be run with:
 ```bash
 pnpm rust:test:low-memory -- acp::codex_goal::tests::clear_with_no_open_goal_is_a_noop -- --exact
 ```
+
+The dedicated **native-Linux** sharded workflow is experimental. In the recorded
+attempt, 6,615 of 7,278 active tests compiled across nine of eleven partitions;
+663 still could not compile, and runtime failures/one blocked fixture remained.
+It is **not yet a reliable full-suite solution for this VM**. See the
+[measured evidence](docs/testing/rust-test-shard-evidence/results.json).
+To attempt the complete workflow on a suitable host, use the wrapper:
+
+```bash
+python3 scripts/rust-test-shards.py --audit-only
+pnpm rust:test:sharded:low-memory
+# Use --offline only after the locked dependencies are cached:
+python3 scripts/rust-test-shards.py --offline --output /tmp/codeg-shards-run-1
+```
+
+This opt-in workflow reduces the tests compiled into each harness, rather than
+merely filtering execution. It retains the original private test access and
+assertions. It covers only `--no-default-features --features test-utils --lib`;
+it does not replace desktop/server, integration, binary, or other-platform jobs.
+Leave `CODEG_TEST_SHARD` unset for normal Cargo commands and when invoking the
+wrapper. The wrapper runs every manifest shard; `--shard N` and `--list-only`
+are incomplete diagnostics, never full-suite success. Compilation still needs
+substantial memory: observed successful shards have exceeded 6 GiB, so this is
+**not a 4 GiB guarantee**. Do not run parallel Cargo builds alongside it.
+
+See [the low-memory test workflow](docs/testing/rust-test-shards.md) for exact
+prerequisites, coverage checks, deterministic inventory maintenance, retained
+logs, and how to distinguish environment failures from regressions. Any build,
+OOM termination, name-list mismatch, or test failure must remain a nonzero job
+result; do not hide it with filters, new ignored tests, or `|| true`.
 
 > Tip: when you have a fresh `codeg-mcp` build under `src-tauri/target/release/` and want to point a manually-launched `codeg-server` at it without reinstalling, export `CODEG_MCP_BIN=$(pwd)/src-tauri/target/release/codeg-mcp`.
 

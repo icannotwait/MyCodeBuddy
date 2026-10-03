@@ -135,6 +135,7 @@ pub fn extract_session_id_from_raw_response(raw: &serde_json::Value) -> Option<S
         .map(str::to_string)
 }
 
+#[cfg(any(not(codeg_test_shard), codeg_test_shard = "3"))]
 #[cfg(test)]
 mod tests {
     use super::*;

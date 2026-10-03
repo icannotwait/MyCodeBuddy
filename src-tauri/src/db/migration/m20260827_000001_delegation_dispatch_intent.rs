@@ -96,6 +96,7 @@ pub(crate) async fn install_for_historical_completion_fixture(
     Ok(())
 }
 
+#[cfg(any(not(codeg_test_shard), codeg_test_shard = "9"))]
 #[cfg(test)]
 mod tests {
     use sea_orm::{ConnectionTrait, Database, DbBackend, Statement};

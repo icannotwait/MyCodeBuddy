@@ -376,6 +376,7 @@ fn fail_for_reviewer(reason: ExecutionGateReason, node_id: &str) -> ExecutionGat
 // Tests (B10 owned by Task 4 — A7 / B3 / B13)
 // ---------------------------------------------------------------------------
 
+#[cfg(any(not(codeg_test_shard), codeg_test_shard = "3"))]
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1181,6 +1182,7 @@ mod tests {
     }
 }
 
+#[cfg(any(not(codeg_test_shard), codeg_test_shard = "3"))]
 #[cfg(test)]
 mod completion_outcome_gates {
     use super::*;

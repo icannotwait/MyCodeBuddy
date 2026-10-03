@@ -374,6 +374,7 @@ fn current_env_vars(keys: &[&str]) -> Vec<(String, String)> {
         .collect()
 }
 
+#[cfg(any(not(codeg_test_shard), codeg_test_shard = "9"))]
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;

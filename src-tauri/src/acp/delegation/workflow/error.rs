@@ -546,6 +546,7 @@ pub async fn require_writable_conversation_workflow<C: ConnectionTrait>(
     Ok(())
 }
 
+#[cfg(any(not(codeg_test_shard), codeg_test_shard = "8"))]
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -282,6 +282,7 @@ fn truncate_utf8(text: &str, max: usize) -> &str {
     &text[..end]
 }
 
+#[cfg(any(not(codeg_test_shard), codeg_test_shard = "5"))]
 #[cfg(test)]
 mod tests {
     use super::*;

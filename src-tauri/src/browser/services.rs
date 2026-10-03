@@ -326,6 +326,7 @@ fn announce(emitter: &EventEmitter, service: DetectedService) {
     emit_event(emitter, SERVICE_DETECTED_EVENT, service);
 }
 
+#[cfg(any(not(codeg_test_shard), codeg_test_shard = "0"))]
 #[cfg(test)]
 mod tests {
     use super::*;

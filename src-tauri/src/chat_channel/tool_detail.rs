@@ -133,6 +133,7 @@ pub(crate) fn truncate_str(s: &str, max: usize) -> String {
     }
 }
 
+#[cfg(any(not(codeg_test_shard), codeg_test_shard = "10"))]
 #[cfg(test)]
 mod tests {
     use super::*;

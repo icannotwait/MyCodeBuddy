@@ -373,6 +373,7 @@ impl From<DbError> for AppCommandError {
     }
 }
 
+#[cfg(any(not(codeg_test_shard), codeg_test_shard = "6"))]
 #[cfg(test)]
 mod tests {
     use super::*;

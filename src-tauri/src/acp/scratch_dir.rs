@@ -805,6 +805,7 @@ fn clear_readonly_recursive(path: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
+#[cfg(any(not(codeg_test_shard), codeg_test_shard = "1"))]
 #[cfg(test)]
 mod tests {
     use super::*;

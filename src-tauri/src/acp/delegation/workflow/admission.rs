@@ -2992,6 +2992,7 @@ pub fn emit_workflow_side_effect(emitter: &EventEmitter, effect: &WorkflowTxnSid
 // Tests (B10)
 // ---------------------------------------------------------------------------
 
+#[cfg(any(not(codeg_test_shard), codeg_test_shard = "6"))]
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -3574,6 +3574,7 @@ fn db_error(error: sea_orm::DbErr) -> CompletionEvidenceError {
     CompletionEvidenceError::Persistence(error.to_string())
 }
 
+#[cfg(any(not(codeg_test_shard), codeg_test_shard = "8"))]
 #[cfg(test)]
 mod tests {
     use std::collections::HashSet;

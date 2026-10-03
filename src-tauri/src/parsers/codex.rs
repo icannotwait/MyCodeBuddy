@@ -6928,6 +6928,7 @@ fn group_into_turns(messages: Vec<UnifiedMessage>) -> Vec<MessageTurn> {
     turns
 }
 
+#[cfg(any(not(codeg_test_shard), codeg_test_shard = "4"))]
 #[cfg(test)]
 mod tests {
 

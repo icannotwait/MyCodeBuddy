@@ -1220,6 +1220,7 @@ pub async fn acp_update_deepseek_model_catalog(
     update_deepseek_model_catalog_core(models, &emitter)
 }
 
+#[cfg(any(not(codeg_test_shard), codeg_test_shard = "8"))]
 #[cfg(test)]
 mod tests {
     use super::*;

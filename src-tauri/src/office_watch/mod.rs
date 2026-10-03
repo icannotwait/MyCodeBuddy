@@ -903,6 +903,7 @@ pub async fn office_watch_idle_sweep_task(idle_timeout: Duration, interval: Dura
     }
 }
 
+#[cfg(any(not(codeg_test_shard), codeg_test_shard = "8"))]
 #[cfg(test)]
 mod tests {
     use super::*;

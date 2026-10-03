@@ -402,6 +402,7 @@ fn parse_task_index_str(value: &str) -> Option<u32> {
     value.parse().ok().filter(|&n| n > 0)
 }
 
+#[cfg(any(not(codeg_test_shard), codeg_test_shard = "4"))]
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -6,6 +6,7 @@ pub use service::*;
 pub use store::*;
 pub use types::*;
 
+#[cfg(any(not(codeg_test_shard), codeg_test_shard = "5"))]
 #[cfg(test)]
 #[allow(clippy::module_inception)] // Keeps recovery authorization integration tests beside the module exports.
 mod recovery_authorization {

@@ -3799,6 +3799,7 @@ fn extract_tool_call_id(tool_call: &serde_json::Value) -> String {
         .to_string()
 }
 
+#[cfg(any(not(codeg_test_shard), codeg_test_shard = "7"))]
 #[cfg(test)]
 mod tests {
     use super::*;

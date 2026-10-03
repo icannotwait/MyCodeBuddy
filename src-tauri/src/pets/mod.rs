@@ -454,6 +454,7 @@ pub fn delete_pet(id: &str) -> Result<(), AppCommandError> {
     fs::remove_dir_all(&dir).map_err(AppCommandError::io)
 }
 
+#[cfg(any(not(codeg_test_shard), codeg_test_shard = "10"))]
 #[cfg(test)]
 mod tests {
     use super::*;

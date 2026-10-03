@@ -70,6 +70,7 @@ async fn append_state_only_revision_txn(
     .await
 }
 
+#[cfg(any(not(codeg_test_shard), codeg_test_shard = "1"))]
 #[tokio::test]
 async fn session_2566_blocked_workflow_recovers_in_place_to_task_one_admission() {
     // workflow_id = afd89cd7-5df0-49d9-8a40-1d2c95791cbd
@@ -334,6 +335,7 @@ async fn session_2566_blocked_workflow_recovers_in_place_to_task_one_admission()
     txn.commit().await.expect("commit Task 1 admission");
 }
 
+#[cfg(any(not(codeg_test_shard), codeg_test_shard = "1"))]
 #[tokio::test]
 async fn legacy_parent_disconnect_authorize_continue_then_unresumable_replace() {
     let (db, runs, parent, child, source_task_id) = seed_legacy_parent_disconnect().await;

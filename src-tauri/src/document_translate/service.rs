@@ -221,6 +221,7 @@ pub fn build_production_document_translation_service(
     DocumentTranslationService::new(db, runner)
 }
 
+#[cfg(any(not(codeg_test_shard), codeg_test_shard = "3"))]
 #[cfg(test)]
 mod tests {
     use super::*;

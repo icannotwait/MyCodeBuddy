@@ -621,6 +621,7 @@ pub fn title_changed(app: &AppHandle, tab_id: &str, title: String) {
     }
 }
 
+#[cfg(any(not(codeg_test_shard), codeg_test_shard = "1"))]
 #[cfg(test)]
 mod tests {
     use super::*;

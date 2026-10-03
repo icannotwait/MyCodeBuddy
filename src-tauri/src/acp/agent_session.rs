@@ -139,6 +139,7 @@ fn dispatch_session_id(dispatch: &Dispatch) -> Option<&str> {
     message.params().get("sessionId")?.as_str()
 }
 
+#[cfg(any(not(codeg_test_shard), codeg_test_shard = "9"))]
 #[cfg(test)]
 mod tests {
     use super::*;

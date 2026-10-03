@@ -101,6 +101,7 @@ pub(crate) async fn publish_native_title(
     }
 }
 
+#[cfg(any(not(codeg_test_shard), codeg_test_shard = "5"))]
 #[cfg(test)]
 mod tests {
     use super::{native_title_from_session_info, publish_native_title};

@@ -6536,6 +6536,7 @@ async fn get_unpushed_hashes(
     Ok((Some(hashes), has_upstream))
 }
 
+#[cfg(any(not(codeg_test_shard), codeg_test_shard = "9"))]
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -9252,6 +9253,7 @@ branch refs/heads/main";
 
 // Symlink confinement that `read_workspace_file_base64` relies on. Unix-only
 // because it uses real filesystem symlinks.
+#[cfg(any(not(codeg_test_shard), codeg_test_shard = "9"))]
 #[cfg(all(test, unix))]
 mod workspace_confinement_tests {
     use super::*;

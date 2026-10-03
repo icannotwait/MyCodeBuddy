@@ -517,6 +517,7 @@ pub(crate) fn strip_route_separator_from_prompt(blocks: &mut [PromptInputBlock])
     stripped
 }
 
+#[cfg(any(not(codeg_test_shard), codeg_test_shard = "8"))]
 #[cfg(test)]
 mod tests {
     use super::*;

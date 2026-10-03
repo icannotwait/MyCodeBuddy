@@ -114,6 +114,7 @@ pub fn trips_threshold(percent: f64, threshold: i32) -> bool {
     threshold > 0 && percent >= threshold as f64
 }
 
+#[cfg(any(not(codeg_test_shard), codeg_test_shard = "1"))]
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -125,6 +125,7 @@ pub fn tab_label(tab_id: &str) -> String {
     format!("{TAB_LABEL_PREFIX}{tab_id}")
 }
 
+#[cfg(any(not(codeg_test_shard), codeg_test_shard = "7"))]
 #[cfg(test)]
 mod tests {
     use super::TAB_LABEL_PREFIX;

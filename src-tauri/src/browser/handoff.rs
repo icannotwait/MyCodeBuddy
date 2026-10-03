@@ -743,6 +743,7 @@ fn trim_float(value: f64) -> String {
     text.trim_end_matches('0').trim_end_matches('.').to_string()
 }
 
+#[cfg(any(not(codeg_test_shard), codeg_test_shard = "5"))]
 #[cfg(test)]
 mod tests {
     use super::*;

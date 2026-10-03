@@ -1138,6 +1138,7 @@ fn log_if_slow(operation: &str, path: &Path, started_at: Instant) {
     }
 }
 
+#[cfg(any(not(codeg_test_shard), codeg_test_shard = "7"))]
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -163,6 +163,7 @@ pub fn set_ready_lease_timeout_for_test(d: Option<Duration>) {
     *TEST_READY_LEASE_TIMEOUT.lock().unwrap() = d;
 }
 
+#[cfg(any(not(codeg_test_shard), codeg_test_shard = "1"))]
 #[cfg(test)]
 mod tests {
     use super::*;

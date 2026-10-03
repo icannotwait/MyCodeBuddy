@@ -1906,6 +1906,7 @@ fn read_subdirs(dir: &Path) -> Vec<PathBuf> {
         .collect()
 }
 
+#[cfg(any(not(codeg_test_shard), codeg_test_shard = "7"))]
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -1221,6 +1221,7 @@ pub(crate) fn is_binary_file_compatible(path: &Path) -> bool {
     }
 }
 
+#[cfg(any(not(codeg_test_shard), codeg_test_shard = "8"))]
 #[cfg(test)]
 mod tests {
     use super::*;

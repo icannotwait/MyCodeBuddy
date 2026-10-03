@@ -343,6 +343,7 @@ pub fn now_epoch_ms() -> u64 {
         .unwrap_or(0)
 }
 
+#[cfg(any(not(codeg_test_shard), codeg_test_shard = "9"))]
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -705,6 +705,7 @@ fn thread_name_prefix(terminal_id: &str) -> String {
         .collect()
 }
 
+#[cfg(any(not(codeg_test_shard), codeg_test_shard = "1"))]
 #[cfg(test)]
 mod tests {
     use super::thread_name_prefix;

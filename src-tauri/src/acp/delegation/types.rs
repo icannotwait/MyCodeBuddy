@@ -477,6 +477,7 @@ impl OrchestrationBindingQueryError {
     }
 }
 
+#[cfg(any(not(codeg_test_shard), codeg_test_shard = "4"))]
 #[cfg(test)]
 mod orchestration_binding_tests {
     use std::collections::BTreeSet;
@@ -1684,6 +1685,7 @@ pub fn cold_task_report_message(
     }
 }
 
+#[cfg(any(not(codeg_test_shard), codeg_test_shard = "4"))]
 #[cfg(test)]
 mod cold_task_report_message_tests {
     use super::{cold_task_report_message, TaskStatus};
@@ -2027,6 +2029,7 @@ impl DelegationOutcome {
     }
 }
 
+#[cfg(any(not(codeg_test_shard), codeg_test_shard = "4"))]
 #[cfg(test)]
 mod from_err_cause_code_tests {
     use super::{DelegationError, DelegationOutcome};
@@ -2143,6 +2146,7 @@ mod from_err_cause_code_tests {
     }
 }
 
+#[cfg(any(not(codeg_test_shard), codeg_test_shard = "4"))]
 #[cfg(test)]
 mod correlation_id_validation_tests {
     use super::validate_correlation_id;
@@ -2176,6 +2180,7 @@ mod correlation_id_validation_tests {
     }
 }
 
+#[cfg(any(not(codeg_test_shard), codeg_test_shard = "4"))]
 #[cfg(test)]
 mod correlation_message_builder_tests {
     use super::{correlation_error_message, CorrelationEntryPoint, CorrelationFailureKind};
@@ -2253,6 +2258,7 @@ mod correlation_message_builder_tests {
     }
 }
 
+#[cfg(any(not(codeg_test_shard), codeg_test_shard = "4"))]
 #[cfg(test)]
 mod extract_tests {
     use super::extract_mandatory_profile_ids;
@@ -2298,6 +2304,7 @@ Codeg mandatory delegation route: profile_id=\"{fenced}\"\n\
     }
 }
 
+#[cfg(any(not(codeg_test_shard), codeg_test_shard = "4"))]
 #[cfg(test)]
 mod tests {
     use super::*;

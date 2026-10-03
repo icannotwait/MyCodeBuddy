@@ -269,6 +269,7 @@ fn file_uri_to_path(uri: &str) -> Option<PathBuf> {
     Some(PathBuf::from(decoded))
 }
 
+#[cfg(any(not(codeg_test_shard), codeg_test_shard = "6"))]
 #[cfg(test)]
 mod tests {
     use super::*;

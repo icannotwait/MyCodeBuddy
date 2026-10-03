@@ -504,6 +504,7 @@ pub fn redirect_to_alias(app: &AppHandle, tab_id: &str, alias: Url) {
     });
 }
 
+#[cfg(any(not(codeg_test_shard), codeg_test_shard = "3"))]
 #[cfg(test)]
 mod tests {
     use super::*;

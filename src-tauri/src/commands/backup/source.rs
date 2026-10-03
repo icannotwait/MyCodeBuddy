@@ -274,6 +274,7 @@ fn spawn_err(e: tokio::task::JoinError) -> AppCommandError {
     AppCommandError::task_execution_failed("Backup source task failed").with_detail(e.to_string())
 }
 
+#[cfg(any(not(codeg_test_shard), codeg_test_shard = "8"))]
 #[cfg(test)]
 mod tests {
     use super::*;

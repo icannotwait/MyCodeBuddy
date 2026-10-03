@@ -106,6 +106,7 @@ async fn send_broker_cancel(socket_path: &str, req: &BrokerCancelRequest) {
     let _ = tokio::time::timeout(BROKER_CANCEL_BUDGET, client_cancel(socket_path, req)).await;
 }
 
+#[cfg(any(not(codeg_test_shard), codeg_test_shard = "5"))]
 #[cfg(test)]
 mod orchestration_binding_artifact_storage_tests {
     use std::collections::BTreeSet;
@@ -4854,6 +4855,7 @@ pub fn render_task_report(report: &Value) -> Value {
     })
 }
 
+#[cfg(any(not(codeg_test_shard), codeg_test_shard = "5"))]
 #[cfg(test)]
 mod tests {
     use std::collections::{BTreeMap, HashSet};

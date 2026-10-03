@@ -849,6 +849,7 @@ fn run_on_main<R: Send + 'static>(
     rx.recv().map_err(|e| e.to_string())
 }
 
+#[cfg(any(not(codeg_test_shard), codeg_test_shard = "7"))]
 #[cfg(test)]
 mod tests {
     use super::*;

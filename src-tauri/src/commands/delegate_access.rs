@@ -371,6 +371,7 @@ pub async fn get_delegate_access(
     Ok(get_delegate_access_core(&db, &manager, conversation_id).await)
 }
 
+#[cfg(any(not(codeg_test_shard), codeg_test_shard = "5"))]
 #[cfg(test)]
 mod tests {
     use sea_orm::{ActiveModelTrait, EntityTrait, IntoActiveModel, Set};

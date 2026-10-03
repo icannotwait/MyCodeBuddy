@@ -234,6 +234,7 @@ pub fn eval_call(code: &str) -> String {
 /// a test.
 const RENDER_JS: &str = include_str!("../../../src/browser-injected/eval-render.js");
 
+#[cfg(any(not(codeg_test_shard), codeg_test_shard = "7"))]
 #[cfg(test)]
 mod tests {
     use super::*;

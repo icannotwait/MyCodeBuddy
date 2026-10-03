@@ -131,6 +131,7 @@ pub fn leak<T>(value: T) -> &'static T {
     Box::leak(Box::new(value))
 }
 
+#[cfg(any(not(codeg_test_shard), codeg_test_shard = "4"))]
 #[cfg(test)]
 mod tests {
     use super::*;

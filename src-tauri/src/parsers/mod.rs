@@ -1753,6 +1753,7 @@ pub fn path_eq_for_matching(left: &str, right: &str) -> bool {
     normalize_path_for_matching(left) == normalize_path_for_matching(right)
 }
 
+#[cfg(any(not(codeg_test_shard), codeg_test_shard = "5"))]
 #[cfg(test)]
 mod route_sanitizer_tests {
 
@@ -2169,6 +2170,7 @@ mod route_sanitizer_tests {
     }
 }
 
+#[cfg(any(not(codeg_test_shard), codeg_test_shard = "5"))]
 #[cfg(test)]
 mod tests {
     use chrono::Utc;

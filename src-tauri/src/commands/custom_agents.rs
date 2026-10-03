@@ -634,6 +634,7 @@ pub async fn acp_add_registry_agent(
     acp_add_registry_agent_core(registry_id, distribution_kind, &db, &emitter).await
 }
 
+#[cfg(any(not(codeg_test_shard), codeg_test_shard = "0"))]
 #[cfg(test)]
 mod tests {
     use super::*;

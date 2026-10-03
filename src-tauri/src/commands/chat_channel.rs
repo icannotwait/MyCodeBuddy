@@ -677,6 +677,7 @@ pub async fn weixin_check_qrcode(
     weixin_check_qrcode_core(&db, channel_id, &qrcode).await
 }
 
+#[cfg(any(not(codeg_test_shard), codeg_test_shard = "0"))]
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -300,6 +300,7 @@ fn walk_joined(root: &Path, target: &Path) -> Result<(), AppCommandError> {
     Err(path_rejected("Target path is not under workspace root"))
 }
 
+#[cfg(any(not(codeg_test_shard), codeg_test_shard = "3"))]
 #[cfg(test)]
 mod tests {
     use super::*;

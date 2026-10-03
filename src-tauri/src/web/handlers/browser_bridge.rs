@@ -96,6 +96,7 @@ pub fn bridgeable_target(url: &str) -> Result<(u16, String), AppCommandError> {
     Ok((port, path))
 }
 
+#[cfg(any(not(codeg_test_shard), codeg_test_shard = "8"))]
 #[cfg(test)]
 mod tests {
     use super::*;

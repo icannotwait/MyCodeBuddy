@@ -371,6 +371,7 @@ pub struct BrokerSettleWorkflowRequest {
     pub summary: String,
 }
 
+#[cfg(any(not(codeg_test_shard), codeg_test_shard = "1"))]
 #[cfg(test)]
 mod workflow_v2_tests {
     use super::{BrokerCompleteWorkRequest, BrokerRegisterSimpleWorkflowRequest};
@@ -1088,6 +1089,7 @@ pub async fn client_cancel(socket_path: &str, req: &BrokerCancelRequest) -> io::
     Ok(())
 }
 
+#[cfg(any(not(codeg_test_shard), codeg_test_shard = "1"))]
 #[cfg(test)]
 mod tests {
     use super::*;

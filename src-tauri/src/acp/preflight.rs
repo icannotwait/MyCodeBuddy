@@ -877,6 +877,7 @@ async fn check_binary_environment(
     checks
 }
 
+#[cfg(any(not(codeg_test_shard), codeg_test_shard = "3"))]
 #[cfg(test)]
 mod adapter_tests {
     use super::*;

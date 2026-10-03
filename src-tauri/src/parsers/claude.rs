@@ -3352,6 +3352,7 @@ pub(crate) fn group_into_turns_with_origins(
     turns
 }
 
+#[cfg(any(not(codeg_test_shard), codeg_test_shard = "7"))]
 #[cfg(test)]
 mod tests {
     use std::io::Write;

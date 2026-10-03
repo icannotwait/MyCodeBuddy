@@ -264,6 +264,7 @@ pub fn handle_message(app: &AppHandle, tab_id: &str, raw: String, main_frame: bo
     }
 }
 
+#[cfg(any(not(codeg_test_shard), codeg_test_shard = "9"))]
 #[cfg(test)]
 mod tests {
     use super::*;

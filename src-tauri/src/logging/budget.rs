@@ -416,6 +416,7 @@ impl<W: Write, C: DayClock, S: NoticeSink> Write for BudgetedWriter<W, C, S> {
     }
 }
 
+#[cfg(any(not(codeg_test_shard), codeg_test_shard = "0"))]
 #[cfg(test)]
 mod tests {
     use super::*;

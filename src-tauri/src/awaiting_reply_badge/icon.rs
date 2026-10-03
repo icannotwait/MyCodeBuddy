@@ -122,6 +122,7 @@ fn blit_glyph(buf: &mut [u8], ox: i32, oy: i32, rows: &[u8; 7]) {
     }
 }
 
+#[cfg(any(not(codeg_test_shard), codeg_test_shard = "5"))]
 #[cfg(test)]
 mod tests {
     use super::*;

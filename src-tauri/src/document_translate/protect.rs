@@ -513,6 +513,7 @@ fn find_next_token_start(s: &str, code_prefix: &str, inline_prefix: &str) -> Opt
     }
 }
 
+#[cfg(any(not(codeg_test_shard), codeg_test_shard = "7"))]
 #[cfg(test)]
 mod tests {
     use super::*;

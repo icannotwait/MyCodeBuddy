@@ -1153,6 +1153,7 @@ fn clamp_reference_search_limit_for_registry(limit: u16) -> u16 {
 
 // ─── Test support and unit tests ────────────────────────────────────────────
 
+#[cfg(any(not(codeg_test_shard), codeg_test_shard = "1"))]
 #[cfg(test)]
 mod tests {
     use super::*;

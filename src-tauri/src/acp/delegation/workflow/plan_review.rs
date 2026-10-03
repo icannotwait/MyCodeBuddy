@@ -1121,6 +1121,7 @@ fn blocking_finding_owners(findings: &[PlanFindingUpdate]) -> Vec<String> {
         .collect()
 }
 
+#[cfg(any(not(codeg_test_shard), codeg_test_shard = "5"))]
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1745,6 +1746,7 @@ mod tests {
     }
 }
 
+#[cfg(any(not(codeg_test_shard), codeg_test_shard = "5"))]
 #[cfg(test)]
 mod v2_tests {
     use super::*;

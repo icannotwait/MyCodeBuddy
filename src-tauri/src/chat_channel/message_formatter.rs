@@ -153,6 +153,7 @@ pub fn format_daily_report(report: &DailyReportData, lang: Lang) -> RichMessage 
     RichMessage::info(body).with_title(i18n::daily_report_title(lang))
 }
 
+#[cfg(any(not(codeg_test_shard), codeg_test_shard = "8"))]
 #[cfg(test)]
 mod permission_request_tests {
     use super::*;
@@ -188,6 +189,7 @@ mod permission_request_tests {
     }
 }
 
+#[cfg(any(not(codeg_test_shard), codeg_test_shard = "8"))]
 #[cfg(test)]
 mod user_prompt_sent_tests {
     use super::*;
@@ -208,6 +210,7 @@ mod user_prompt_sent_tests {
     }
 }
 
+#[cfg(any(not(codeg_test_shard), codeg_test_shard = "8"))]
 #[cfg(test)]
 mod question_request_tests {
     use super::*;

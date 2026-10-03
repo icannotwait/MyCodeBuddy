@@ -341,6 +341,7 @@ pub async fn replay_perf_fixture(
     })
 }
 
+#[cfg(any(not(codeg_test_shard), codeg_test_shard = "4"))]
 #[cfg(test)]
 mod tests {
     use super::*;

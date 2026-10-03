@@ -295,6 +295,7 @@ async fn rollback_impl(state: Arc<AppState>) -> Result<UpdateActionResult, AppCo
     })
 }
 
+#[cfg(any(not(codeg_test_shard), codeg_test_shard = "1"))]
 #[cfg(test)]
 mod release_policy_tests {
     use super::*;
@@ -331,6 +332,7 @@ mod release_policy_tests {
 // `ensure_supported` rejects Windows, and the desktop build's `perform_impl` is
 // the not-supported stub, so these low-level implementation tests only apply to
 // a server build on a supported platform.
+#[cfg(any(not(codeg_test_shard), codeg_test_shard = "1"))]
 #[cfg(all(test, not(feature = "tauri-runtime"), not(target_os = "windows")))]
 mod tests {
     use super::*;

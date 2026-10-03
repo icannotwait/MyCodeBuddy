@@ -47,6 +47,7 @@ pub fn gate_continue_session_reuse(agent_type: AgentType) -> ContinueCapabilityD
     }
 }
 
+#[cfg(any(not(codeg_test_shard), codeg_test_shard = "4"))]
 #[cfg(test)]
 mod tests {
     use super::*;

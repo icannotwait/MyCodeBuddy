@@ -4136,6 +4136,7 @@ fn _manifest_state_wire(s: ManifestWorkflowState) -> &'static str {
 // Tests (B10 owned by Task 4 — projection)
 // ---------------------------------------------------------------------------
 
+#[cfg(any(not(codeg_test_shard), codeg_test_shard = "5"))]
 #[cfg(test)]
 mod tests {
     use super::super::simple_parse::SimpleProgressTask;

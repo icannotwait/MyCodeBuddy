@@ -1813,6 +1813,7 @@ fn truncate_title(s: &str) -> String {
     }
 }
 
+#[cfg(any(not(codeg_test_shard), codeg_test_shard = "7"))]
 #[cfg(test)]
 mod tests {
     use super::*;

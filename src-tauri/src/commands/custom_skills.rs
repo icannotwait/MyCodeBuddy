@@ -775,6 +775,7 @@ fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<(), CustomSkillsError> {
 
 // ─── Tests ──────────────────────────────────────────────────────────────
 
+#[cfg(any(not(codeg_test_shard), codeg_test_shard = "4"))]
 #[cfg(test)]
 mod tests {
     use super::*;

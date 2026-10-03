@@ -2094,6 +2094,7 @@ pub struct ForkResultInfo {
     pub sibling_conversation_id: i32,
 }
 
+#[cfg(any(not(codeg_test_shard), codeg_test_shard = "4"))]
 #[cfg(test)]
 mod envelope_tests {
     use super::*;

@@ -11173,6 +11173,7 @@ impl SessionPlanApprovalAccess for ConnectionManagerPlanApprovalLookup {
     }
 }
 
+#[cfg(any(not(codeg_test_shard), codeg_test_shard = "2"))]
 #[cfg(test)]
 mod disconnect_origin {
     use super::*;
@@ -12026,6 +12027,7 @@ mod disconnect_origin {
     }
 }
 
+#[cfg(any(not(codeg_test_shard), codeg_test_shard = "2"))]
 #[cfg(test)]
 mod tests {
     use super::*;

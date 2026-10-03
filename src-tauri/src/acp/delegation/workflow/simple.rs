@@ -392,6 +392,7 @@ pub async fn resolve_conversation_workflow_mode<C: ConnectionTrait>(
     })
 }
 
+#[cfg(any(not(codeg_test_shard), codeg_test_shard = "8"))]
 #[cfg(test)]
 mod tests {
     use chrono::Utc;

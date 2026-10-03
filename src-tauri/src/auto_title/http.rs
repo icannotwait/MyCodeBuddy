@@ -328,6 +328,7 @@ impl crate::auto_title::runner::TitleAgentRunner for DirectCompletionTitleRunner
 
 // ── Tests ───────────────────────────────────────────────────────────────────
 
+#[cfg(any(not(codeg_test_shard), codeg_test_shard = "0"))]
 #[cfg(test)]
 mod tests {
     use super::*;

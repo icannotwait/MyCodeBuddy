@@ -296,6 +296,7 @@ pub mod test_hooks {
     }
 }
 
+#[cfg(any(not(codeg_test_shard), codeg_test_shard = "8"))]
 #[cfg(test)]
 mod tests {
     use super::*;

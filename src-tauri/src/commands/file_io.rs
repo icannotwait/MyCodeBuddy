@@ -43,6 +43,7 @@ pub async fn save_text_file(path: String, contents: String) -> Result<(), AppCom
     Ok(())
 }
 
+#[cfg(any(not(codeg_test_shard), codeg_test_shard = "9"))]
 #[cfg(all(test, feature = "tauri-runtime"))]
 mod tests {
     use super::*;

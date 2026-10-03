@@ -651,6 +651,7 @@ where
     collected
 }
 
+#[cfg(any(not(codeg_test_shard), codeg_test_shard = "5"))]
 #[cfg(test)]
 mod tests {
     use super::{collect_lines_lossy, spawn_retrying_exec_busy, spawn_retrying_exec_busy_within};

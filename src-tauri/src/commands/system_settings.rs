@@ -905,6 +905,7 @@ pub async fn update_system_autostart_settings(
     apply_autostart_setting(&*autolaunch_manager(&app)?, settings.enabled)
 }
 
+#[cfg(any(not(codeg_test_shard), codeg_test_shard = "8"))]
 #[cfg(all(test, feature = "tauri-runtime"))]
 mod autostart_tests {
     use std::cell::RefCell;
@@ -1032,6 +1033,7 @@ mod autostart_tests {
     }
 }
 
+#[cfg(any(not(codeg_test_shard), codeg_test_shard = "8"))]
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1674,6 +1676,7 @@ mod tests {
     }
 }
 
+#[cfg(any(not(codeg_test_shard), codeg_test_shard = "8"))]
 #[cfg(all(test, feature = "tauri-runtime"))]
 mod close_behavior_tests {
     use super::*;

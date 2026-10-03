@@ -2083,6 +2083,7 @@ pub(crate) fn http_url_to_ws_url(base_url: &str, path: &str) -> String {
     }
 }
 
+#[cfg(any(not(codeg_test_shard), codeg_test_shard = "4"))]
 #[cfg(test)]
 mod tests {
     use super::*;

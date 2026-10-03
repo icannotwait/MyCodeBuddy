@@ -1827,6 +1827,7 @@ async fn upgrade_connection_gone_before_emit(
 
 // ---- stubs used when rebind APIs not yet fully wired in non-test builds ----
 
+#[cfg(any(not(codeg_test_shard), codeg_test_shard = "8"))]
 #[cfg(test)]
 mod tests {
     use super::*;

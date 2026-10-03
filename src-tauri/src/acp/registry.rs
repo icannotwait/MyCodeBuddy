@@ -3038,6 +3038,7 @@ pub fn get_agent_meta(agent_type: AgentType) -> AcpAgentMeta {
     }
 }
 
+#[cfg(any(not(codeg_test_shard), codeg_test_shard = "1"))]
 #[cfg(test)]
 mod tests {
     use super::*;

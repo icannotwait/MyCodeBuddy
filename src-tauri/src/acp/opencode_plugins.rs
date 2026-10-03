@@ -1079,6 +1079,7 @@ pub fn parse_plugin_spec(spec: &str) -> Option<(String, String)> {
     }
 }
 
+#[cfg(any(not(codeg_test_shard), codeg_test_shard = "9"))]
 #[cfg(test)]
 mod layout_tests {
     use super::*;

@@ -1083,6 +1083,7 @@ pub async fn probe_web_service_port(
     do_probe_web_service_port(&db.conn, port).await
 }
 
+#[cfg(any(not(codeg_test_shard), codeg_test_shard = "3"))]
 #[cfg(test)]
 mod local_address_tests {
     use super::{addresses_for_bind, advertise_host, get_local_addresses, is_advertisable_ipv4};

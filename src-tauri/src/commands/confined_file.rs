@@ -319,6 +319,7 @@ fn open_no_follow(path: &Path) -> std::io::Result<std::fs::File> {
     std::fs::File::open(path)
 }
 
+#[cfg(any(not(codeg_test_shard), codeg_test_shard = "5"))]
 #[cfg(test)]
 mod tests {
     use super::*;

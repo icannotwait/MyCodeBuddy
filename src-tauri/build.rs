@@ -1,4 +1,5 @@
 fn main() {
+    configure_test_shard();
     configure_common_controls_v6_manifest();
 
     #[cfg(feature = "tauri-runtime")]
@@ -99,5 +100,35 @@ fn ensure_sidecar_placeholder() {
              Run `pnpm tauri:prepare-sidecars` before `tauri build` to ship a working binary.",
             path.display()
         );
+    }
+}
+
+/// Opt-in unit-test compilation shards. Unset means the original full suite.
+/// The wrapper audits all shard listings against the source inventory.
+fn configure_test_shard() {
+    println!("cargo:rerun-if-env-changed=CODEG_TEST_SHARD");
+    println!("cargo:rerun-if-changed=test-shard-count.txt");
+    let count: usize = include_str!("test-shard-count.txt")
+        .trim()
+        .parse()
+        .expect("test-shard-count.txt must contain a shard count");
+    assert!((1..=16).contains(&count), "test shard count must be 1..16");
+    let values = (0..count)
+        .map(|shard| format!("\"{shard}\""))
+        .collect::<Vec<_>>()
+        .join(", ");
+    println!("cargo:rustc-check-cfg=cfg(codeg_test_shard, values(none(), {values}))");
+    if let Some(value) = std::env::var_os("CODEG_TEST_SHARD") {
+        let value = value.to_str().expect("CODEG_TEST_SHARD must be UTF-8");
+        let shard: usize = value
+            .parse()
+            .expect("CODEG_TEST_SHARD must be a shard number");
+        assert!(
+            shard < count && value == shard.to_string(),
+            "CODEG_TEST_SHARD must identify a configured shard; use scripts/rust-test-shards.py for the complete suite"
+        );
+        println!("cargo:warning=Compiling ONLY library test shard {shard} of {count}; this is not the complete suite");
+        println!("cargo:rustc-cfg=codeg_test_shard");
+        println!("cargo:rustc-cfg=codeg_test_shard=\"{shard}\"");
     }
 }

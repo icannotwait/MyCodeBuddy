@@ -77,15 +77,40 @@ pnpm rust:check:low-memory
 pnpm rust:check:desktop:low-memory
 pnpm rust:check:server:low-memory
 pnpm rust:check:mcp:low-memory
-# 有更高可用内存或足够页文件时，才运行精确单测
+# Linux 实验性编译期分片：尝试串行运行全部清单，目前此 VM 尚未全编译成功
+# 需要 Python 3.11+，实测仍需超过 6 GiB；不保证 4 GiB 可运行
+pnpm rust:test:sharded:low-memory
+# 有更高可用内存或足够页文件时，才运行整库精确单测
 pnpm rust:test:low-memory -- acp::codex_goal::tests::clear_with_no_open_goal_is_a_noop -- --exact
 ```
 
 低内存配置将 Cargo 编译任务和测试线程限制为 1，并关闭增量编译和调试信息，
-但首次冷编译仍可能较慢。`--exact` 只过滤测试运行，不会缩小编译目标；当前
-Windows 整库测试程序包含 4,028 个测试，单个 `rustc` 在低内存配置下实测峰值
+但首次冷编译仍可能较慢。`--exact` 只过滤测试运行，不会缩小编译目标；此前
+Windows 整库测试程序包含 4,028 个测试（历史测量，非当前测试总数），单个 `rustc` 在低内存配置下实测峰值
 仍约 7.55 GiB。因此 4 GiB 机器默认只运行共享核心 check，Rust 单测与完整回归
 交由 CI 或更高内存机器执行；足够大的系统页文件可能有帮助，但不作成功保证。
+
+Linux 编译期分片是独立、实验性 opt-in 工作流。本次 11 组中仅 9 组完成编译，
+7,278 个当前作用域测试中已列出 6,615 个，仍有 663 个受 OOM 阻塞；执行结果为
+6,588 通过、25 失败、1 个原有 ignore、1 个网络测试受环境策略阻塞。它尚不是此
+VM 上可靠的完整低内存测试方案，不能宣称全部通过。详见
+[测量记录](docs/testing/rust-test-shard-evidence/results.json)。工作流只覆盖
+`--no-default-features --features test-utils --lib`。它保留原测试断言和私有访问，
+不替代默认桌面、server、二进制、集成测试或其他平台检查。普通 Cargo 命令在
+未设置 `CODEG_TEST_SHARD` 时保留全部原测试；调用完整 wrapper 时也必须取消该
+环境变量。不要同时运行其他 Cargo 构建。
+
+```bash
+# 源码清单、条件编译与插入 gate 的完整性检查（不编译测试）
+python3 scripts/rust-test-shards.py --audit-only
+# 已缓存锁定依赖时，离线编译、列名、校验并执行全部分片
+python3 scripts/rust-test-shards.py --offline --output /tmp/codeg-shards-run-1
+```
+
+完整 wrapper 的退出码必须透传：OOM / 编译失败、测试名漏项或重复、断言失败均
+不能标记成功。`--shard N` 只是局部诊断，`--list-only` 不执行测试；两者都不能
+代替完整回归。新增或修改 Rust 源码后需重建并审核确定性清单，具体命令、覆盖
+边界与环境错误诊断见 [低内存测试工作流](docs/testing/rust-test-shards.md)。
 
 ## 架构
 

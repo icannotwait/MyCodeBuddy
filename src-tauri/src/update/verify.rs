@@ -83,6 +83,7 @@ pub fn verify_release_signature(data: &[u8], tauri_sig_b64: &str) -> Result<(), 
     verify_minisign(&public_key, data, &minisig_text)
 }
 
+#[cfg(any(not(codeg_test_shard), codeg_test_shard = "4"))]
 #[cfg(test)]
 mod tests {
     use super::*;

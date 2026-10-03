@@ -268,6 +268,7 @@ pub async fn reorder(conn: &DatabaseConnection, ids: Vec<i32>) -> Result<(), App
     Ok(())
 }
 
+#[cfg(any(not(codeg_test_shard), codeg_test_shard = "4"))]
 #[cfg(test)]
 mod tests {
     use super::*;

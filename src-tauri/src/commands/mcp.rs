@@ -6047,6 +6047,7 @@ fn resolve_smithery_install_spec_with_selection(
     canonicalize_spec(&selected.spec, "smithery selected option")
 }
 
+#[cfg(any(not(codeg_test_shard), codeg_test_shard = "5"))]
 #[cfg(test)]
 mod tests {
     use super::*;

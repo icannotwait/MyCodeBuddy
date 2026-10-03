@@ -282,6 +282,7 @@ fn encode(image: &DynamicImage, format: CaptureFormat) -> Result<Vec<u8>, String
     Ok(out.into_inner())
 }
 
+#[cfg(any(not(codeg_test_shard), codeg_test_shard = "5"))]
 #[cfg(test)]
 mod tests {
     use super::*;

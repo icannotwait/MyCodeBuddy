@@ -1735,6 +1735,7 @@ async fn resume_and_finish(
     fail_after_suspension(context, &failed_record, failure_code).await;
 }
 
+#[cfg(any(not(codeg_test_shard), codeg_test_shard = "4"))]
 #[cfg(test)]
 mod cleanup_tests {
     use super::*;

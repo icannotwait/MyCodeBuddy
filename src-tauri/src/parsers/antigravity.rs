@@ -1369,6 +1369,7 @@ fn non_empty_capped(body: String) -> Option<String> {
     (!trimmed.trim().is_empty()).then(|| truncate_str(trimmed, TOOL_OUTPUT_CAP))
 }
 
+#[cfg(any(not(codeg_test_shard), codeg_test_shard = "3"))]
 #[cfg(test)]
 mod tests {
     use super::*;

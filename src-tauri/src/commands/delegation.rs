@@ -1111,6 +1111,7 @@ pub fn get_delegation_metrics_core(
     metrics.snapshot()
 }
 
+#[cfg(any(not(codeg_test_shard), codeg_test_shard = "0"))]
 #[cfg(test)]
 mod tests {
     use super::*;

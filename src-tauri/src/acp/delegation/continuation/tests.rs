@@ -86,6 +86,7 @@ async fn complete_seeded_task(broker: &DelegationBroker, task_id: &str) {
         .await;
 }
 
+#[cfg(any(not(codeg_test_shard), codeg_test_shard = "3"))]
 #[tokio::test]
 async fn continuation_broker_immediate_all_terminal_snapshot_is_ready() {
     let broker = Arc::new(test_broker());
@@ -118,6 +119,7 @@ async fn continuation_broker_immediate_all_terminal_snapshot_is_ready() {
     assert_eq!(coordinator.worker_count(), 0);
 }
 
+#[cfg(any(not(codeg_test_shard), codeg_test_shard = "3"))]
 #[tokio::test]
 async fn continuation_broker_immediate_attention_snapshot_is_ready() {
     let attention = Arc::new(MemoryDelegationAttentionStore::new());
@@ -169,6 +171,7 @@ async fn continuation_broker_immediate_attention_snapshot_is_ready() {
     assert_eq!(coordinator.worker_count(), 0);
 }
 
+#[cfg(any(not(codeg_test_shard), codeg_test_shard = "3"))]
 #[tokio::test]
 async fn continuation_broker_immediate_unavailable_snapshot_is_ready() {
     let broker = Arc::new(test_broker());
@@ -199,6 +202,7 @@ async fn continuation_broker_immediate_unavailable_snapshot_is_ready() {
     assert_eq!(coordinator.worker_count(), 0);
 }
 
+#[cfg(any(not(codeg_test_shard), codeg_test_shard = "3"))]
 #[tokio::test]
 async fn continuation_broker_attention_has_priority_over_unavailable() {
     let attention = Arc::new(MemoryDelegationAttentionStore::new());
@@ -1240,6 +1244,7 @@ impl ParentContinuationPort for PostAdmissionReloadFailurePort {
     }
 }
 
+#[cfg(any(not(codeg_test_shard), codeg_test_shard = "3"))]
 #[tokio::test]
 async fn continuation_coordinator_waiter_close_before_insert_creates_no_row() {
     let broker = Arc::new(test_broker());
@@ -1298,6 +1303,7 @@ async fn continuation_coordinator_waiter_close_before_insert_creates_no_row() {
     assert_eq!(coordinator.worker_count(), 0);
 }
 
+#[cfg(any(not(codeg_test_shard), codeg_test_shard = "3"))]
 #[tokio::test]
 async fn continuation_coordinator_waiter_close_after_insert_entry_keeps_owned_worker() {
     let broker = Arc::new(test_broker());
@@ -1365,6 +1371,7 @@ async fn continuation_coordinator_waiter_close_after_insert_entry_keeps_owned_wo
     );
 }
 
+#[cfg(any(not(codeg_test_shard), codeg_test_shard = "3"))]
 #[tokio::test]
 async fn continuation_coordinator_post_registration_completion_claims_before_suspend_ack() {
     let broker = Arc::new(test_broker());
@@ -1410,6 +1417,7 @@ async fn continuation_coordinator_post_registration_completion_claims_before_sus
     assert_eq!(ack.continuation_id, claimed.continuation_id);
 }
 
+#[cfg(any(not(codeg_test_shard), codeg_test_shard = "3"))]
 #[tokio::test(start_paused = true)]
 async fn continuation_coordinator_checkpoint_uses_exact_logical_600_seconds() {
     let broker = Arc::new(test_broker());
@@ -1505,6 +1513,7 @@ async fn continuation_coordinator_checkpoint_uses_exact_logical_600_seconds() {
     assert_eq!(persisted.wake_at, waiting.wake_at);
 }
 
+#[cfg(any(not(codeg_test_shard), codeg_test_shard = "3"))]
 #[tokio::test(start_paused = true)]
 async fn continuation_coordinator_event_deadline_race_claims_once_and_clears_registry() {
     let broker = Arc::new(test_broker());
@@ -1615,11 +1624,13 @@ async fn assert_post_ack_transition_failure_is_terminalized(target: Continuation
     assert_eq!(coordinator.worker_count(), 0);
 }
 
+#[cfg(any(not(codeg_test_shard), codeg_test_shard = "3"))]
 #[tokio::test]
 async fn continuation_coordinator_post_ack_suspended_cas_failure_is_not_ownerless() {
     assert_post_ack_transition_failure_is_terminalized(ContinuationState::Waiting).await;
 }
 
+#[cfg(any(not(codeg_test_shard), codeg_test_shard = "3"))]
 /// After suspend_parent ack, completion-drop (wait-cancel aborting arm_task)
 /// must not use the pre-suspension failure path. Parent turn is already
 /// cleared; the worker must still commit durable Waiting so the suspended
@@ -1756,6 +1767,7 @@ async fn continuation_coordinator_post_ack_cancel_preserves_resumable_waiting() 
     .expect("worker must drain after cancel");
 }
 
+#[cfg(any(not(codeg_test_shard), codeg_test_shard = "3"))]
 /// Closed can win alone while suspend is still Pending (ACK not ready yet).
 /// Once suspend control was sent, that must not pre-suspension-fail — await
 /// ACK and commit durable Waiting so the parent stays resumable.
@@ -1870,6 +1882,7 @@ async fn continuation_coordinator_closed_before_ack_after_suspend_requested_pres
     .expect("worker must drain after cancel");
 }
 
+#[cfg(any(not(codeg_test_shard), codeg_test_shard = "3"))]
 /// When suspend ACK and `completion.closed` are both ready on the same select
 /// poll, prefer ACK. Biased ranking of closed first would pre-suspension-fail
 /// after the parent turn was already cleared, leaving no resumable Waiting.
@@ -1972,16 +1985,19 @@ async fn continuation_coordinator_ack_ready_beats_completion_closed() {
     .expect("worker must drain after cancel");
 }
 
+#[cfg(any(not(codeg_test_shard), codeg_test_shard = "3"))]
 #[tokio::test]
 async fn continuation_coordinator_post_ack_resuming_cas_failure_is_not_ownerless() {
     assert_post_ack_transition_failure_is_terminalized(ContinuationState::Resuming).await;
 }
 
+#[cfg(any(not(codeg_test_shard), codeg_test_shard = "3"))]
 #[tokio::test]
 async fn continuation_coordinator_post_admission_completion_cas_failure_is_not_ownerless() {
     assert_post_ack_transition_failure_is_terminalized(ContinuationState::Completed).await;
 }
 
+#[cfg(any(not(codeg_test_shard), codeg_test_shard = "3"))]
 #[tokio::test]
 async fn continuation_coordinator_post_admission_reload_failure_retains_owner_until_cleanup() {
     let broker = Arc::new(test_broker());
@@ -2031,6 +2047,7 @@ async fn continuation_coordinator_post_admission_reload_failure_retains_owner_un
     assert_eq!(coordinator.worker_count(), 0);
 }
 
+#[cfg(any(not(codeg_test_shard), codeg_test_shard = "3"))]
 #[tokio::test]
 async fn continuation_coordinator_waiting_publication_failure_is_not_ownerless() {
     let broker = Arc::new(test_broker());
@@ -2083,6 +2100,7 @@ async fn continuation_coordinator_waiting_publication_failure_is_not_ownerless()
     assert_eq!(coordinator.worker_count(), 0);
 }
 
+#[cfg(any(not(codeg_test_shard), codeg_test_shard = "3"))]
 #[tokio::test]
 async fn continuation_coordinator_post_ack_parent_identity_drift_is_not_ownerless() {
     let broker = Arc::new(test_broker());
@@ -2189,21 +2207,25 @@ async fn assert_suspension_cleanup_cause_stays_owned(cause: SuspensionFailureCau
     assert_eq!(coordinator.worker_count(), 0);
 }
 
+#[cfg(any(not(codeg_test_shard), codeg_test_shard = "3"))]
 #[tokio::test]
 async fn continuation_coordinator_suspend_drain_timeout_stays_owned_for_task8_cleanup() {
     assert_suspension_cleanup_cause_stays_owned(SuspensionFailureCause::DrainTimeout).await;
 }
 
+#[cfg(any(not(codeg_test_shard), codeg_test_shard = "3"))]
 #[tokio::test]
 async fn continuation_coordinator_parent_connection_loss_stays_owned_for_task8_cleanup() {
     assert_suspension_cleanup_cause_stays_owned(SuspensionFailureCause::ParentConnectionLost).await;
 }
 
+#[cfg(any(not(codeg_test_shard), codeg_test_shard = "3"))]
 #[tokio::test]
 async fn continuation_coordinator_parent_stop_rejection_stays_owned_for_task8_cleanup() {
     assert_suspension_cleanup_cause_stays_owned(SuspensionFailureCause::ParentStopRequested).await;
 }
 
+#[cfg(any(not(codeg_test_shard), codeg_test_shard = "3"))]
 #[tokio::test]
 async fn continuation_coordinator_local_suspend_rejection_uses_pre_suspension_owner() {
     struct LocalRejectionPort;
@@ -2302,6 +2324,7 @@ async fn continuation_coordinator_local_suspend_rejection_uses_pre_suspension_ow
     assert_eq!(coordinator.worker_count(), 0);
 }
 
+#[cfg(any(not(codeg_test_shard), codeg_test_shard = "3"))]
 /// Transfer failure (oneshot closed without delivery) must terminalize the
 /// durable Arming row so a later arm is not blocked by an orphan continuation.
 #[tokio::test]
@@ -2398,6 +2421,7 @@ async fn transfer_oneshot_closed_without_delivery_terminalizes_arming_continuati
     assert_eq!(coordinator.cancel_workers_for_parent("parent"), 1);
 }
 
+#[cfg(any(not(codeg_test_shard), codeg_test_shard = "3"))]
 /// Cancel during the transfer oneshot await must terminalize durable Arming
 /// (same orphan-slot failure mode as oneshot closed without delivery).
 #[tokio::test]
@@ -2546,16 +2570,19 @@ async fn assert_pre_suspension_failure_persistence_retains_owner(store_error: bo
     assert_eq!(coordinator.worker_count(), 0);
 }
 
+#[cfg(any(not(codeg_test_shard), codeg_test_shard = "3"))]
 #[tokio::test]
 async fn continuation_coordinator_pre_suspension_active_cas_loser_retains_owner() {
     assert_pre_suspension_failure_persistence_retains_owner(false).await;
 }
 
+#[cfg(any(not(codeg_test_shard), codeg_test_shard = "3"))]
 #[tokio::test]
 async fn continuation_coordinator_pre_suspension_store_error_retains_owner() {
     assert_pre_suspension_failure_persistence_retains_owner(true).await;
 }
 
+#[cfg(any(not(codeg_test_shard), codeg_test_shard = "3"))]
 #[tokio::test]
 async fn continuation_coordinator_stale_generation_and_version_cannot_wake_newer_row() {
     let broker = Arc::new(test_broker());
@@ -2625,6 +2652,7 @@ async fn continuation_coordinator_stale_generation_and_version_cannot_wake_newer
     assert_eq!(coordinator.worker_count(), 0);
 }
 
+#[cfg(any(not(codeg_test_shard), codeg_test_shard = "3"))]
 #[tokio::test]
 async fn continuation_coordinator_stale_generation_worker_cannot_drain_newer_row() {
     let broker = Arc::new(test_broker());
@@ -2721,6 +2749,7 @@ async fn continuation_coordinator_stale_generation_worker_cannot_drain_newer_row
     assert_eq!(coordinator.worker_count(), 0);
 }
 
+#[cfg(any(not(codeg_test_shard), codeg_test_shard = "3"))]
 #[tokio::test(start_paused = true)]
 async fn continuation_coordinator_prompt_delivery_retries_exact_schedule() {
     let broker = Arc::new(test_broker());
@@ -2874,6 +2903,7 @@ fn admission_request(record: &ContinuationRecord) -> ContinuationPromptRequest {
     }
 }
 
+#[cfg(any(not(codeg_test_shard), codeg_test_shard = "3"))]
 #[tokio::test]
 async fn continuation_coordinator_manager_ack_loss_marker_is_crash_safe() {
     let manager = Arc::new(crate::acp::manager::ConnectionManager::new());
@@ -2959,6 +2989,7 @@ async fn continuation_coordinator_manager_ack_loss_marker_is_crash_safe() {
     assert!(turns.is_empty());
 }
 
+#[cfg(any(not(codeg_test_shard), codeg_test_shard = "3"))]
 #[tokio::test]
 async fn continuation_coordinator_manager_admission_replay_is_idempotent() {
     let manager = crate::acp::manager::ConnectionManager::new();
@@ -2995,6 +3026,7 @@ async fn continuation_coordinator_manager_admission_replay_is_idempotent() {
     ));
 }
 
+#[cfg(any(not(codeg_test_shard), codeg_test_shard = "3"))]
 #[tokio::test]
 async fn continuation_coordinator_manager_admission_rejects_identity_drift_without_side_effects() {
     let manager = crate::acp::manager::ConnectionManager::new();
@@ -3140,6 +3172,7 @@ async fn continuation_coordinator_manager_admission_rejects_identity_drift_witho
     ));
 }
 
+#[cfg(any(not(codeg_test_shard), codeg_test_shard = "3"))]
 #[tokio::test(start_paused = true)]
 async fn continuation_coordinator_stop_cancels_worker_during_retry() {
     let broker = Arc::new(test_broker());
@@ -3182,6 +3215,7 @@ async fn continuation_coordinator_stop_cancels_worker_during_retry() {
     );
 }
 
+#[cfg(any(not(codeg_test_shard), codeg_test_shard = "3"))]
 #[tokio::test(start_paused = true)]
 async fn continuation_coordinator_permanent_failure_drains_children_before_terminal_row() {
     let task_store = Arc::new(MockTaskStore::with_running("task-running", 99));
@@ -3264,6 +3298,7 @@ async fn continuation_coordinator_permanent_failure_drains_children_before_termi
     assert_eq!(coordinator.worker_count(), 0);
 }
 
+#[cfg(any(not(codeg_test_shard), codeg_test_shard = "3"))]
 #[tokio::test(start_paused = true)]
 async fn continuation_coordinator_stale_failure_worker_keeps_exact_resuming_fence() {
     let task_store = Arc::new(MockTaskStore::with_running("task-running", 99));
@@ -3370,6 +3405,7 @@ async fn continuation_coordinator_stale_failure_worker_keeps_exact_resuming_fenc
     assert_eq!(coordinator.worker_count(), 0);
 }
 
+#[cfg(any(not(codeg_test_shard), codeg_test_shard = "3"))]
 #[tokio::test(start_paused = true)]
 async fn continuation_coordinator_state_conflict_drains_children_with_distinct_failure_code() {
     let task_store = Arc::new(MockTaskStore::with_running("task-running", 99));
@@ -3447,6 +3483,7 @@ fn session_for_conversation(conversation_id: i32) -> SessionState {
     state
 }
 
+#[cfg(any(not(codeg_test_shard), codeg_test_shard = "3"))]
 #[tokio::test]
 async fn continuation_waiting_manager_port_updates_matching_session_and_rejects_mismatch() {
     let manager = Arc::new(crate::acp::manager::ConnectionManager::new());
@@ -3538,6 +3575,7 @@ async fn continuation_waiting_manager_port_updates_matching_session_and_rejects_
     ));
 }
 
+#[cfg(any(not(codeg_test_shard), codeg_test_shard = "3"))]
 #[tokio::test]
 async fn continuation_coordinator_manager_port_failure_is_redacted_and_terminal_by_code() {
     let manager = Arc::new(crate::acp::manager::ConnectionManager::new());
@@ -3586,6 +3624,7 @@ async fn continuation_coordinator_manager_port_failure_is_redacted_and_terminal_
     }
 }
 
+#[cfg(any(not(codeg_test_shard), codeg_test_shard = "3"))]
 #[tokio::test]
 async fn continuation_coordinator_manager_port_suspend_rechecks_parent_identity() {
     let manager = Arc::new(crate::acp::manager::ConnectionManager::new());
@@ -3633,6 +3672,7 @@ async fn continuation_coordinator_manager_port_suspend_rechecks_parent_identity(
     }
 }
 
+#[cfg(any(not(codeg_test_shard), codeg_test_shard = "3"))]
 #[tokio::test]
 async fn continuation_coordinator_suspension_dispatch_preserves_installation_stage_causes() {
     let (closed_tx, closed_rx, _closed_liveness) = crate::acp::connection::connection_channel(1);
@@ -3716,6 +3756,7 @@ async fn continuation_coordinator_suspension_dispatch_preserves_installation_sta
     }
 }
 
+#[cfg(any(not(codeg_test_shard), codeg_test_shard = "3"))]
 #[test]
 fn continuation_waiting_event_round_trips_snapshot() {
     let mut state = session_for_conversation(7);
@@ -3729,6 +3770,7 @@ fn continuation_waiting_event_round_trips_snapshot() {
     assert_eq!(state.to_snapshot().waiting_for_subagents, Some(waiting));
 }
 
+#[cfg(any(not(codeg_test_shard), codeg_test_shard = "3"))]
 #[test]
 fn continuation_waiting_event_ignores_other_conversation() {
     let mut state = session_for_conversation(7);
@@ -3741,6 +3783,7 @@ fn continuation_waiting_event_ignores_other_conversation() {
     assert_eq!(state.to_snapshot().waiting_for_subagents, None);
 }
 
+#[cfg(any(not(codeg_test_shard), codeg_test_shard = "3"))]
 #[test]
 fn continuation_waiting_terminal_event_clears_snapshot() {
     let mut state = session_for_conversation(7);
@@ -4053,6 +4096,7 @@ impl E2eMatrix {
     }
 }
 
+#[cfg(any(not(codeg_test_shard), codeg_test_shard = "3"))]
 /// 2. capability-on running Join inserts one row and sends SuspendForDelegation.
 #[tokio::test(start_paused = true)]
 async fn delegation_continuation_e2e_capability_on_running_join_inserts_and_suspends() {
@@ -4087,6 +4131,7 @@ async fn delegation_continuation_e2e_capability_on_running_join_inserts_and_susp
     fx.await_worker_gone().await;
 }
 
+#[cfg(any(not(codeg_test_shard), codeg_test_shard = "3"))]
 /// 3. peer-close is waiter-only at the coordinator boundary: cancelling the
 /// Join waiter after durable insert keeps the arm worker and children alive.
 #[tokio::test(start_paused = true)]
@@ -4165,6 +4210,7 @@ async fn delegation_continuation_e2e_peer_close_does_not_abort_arming() {
     assert_eq!(port.admit_count.load(Ordering::Relaxed), 1);
 }
 
+#[cfg(any(not(codeg_test_shard), codeg_test_shard = "3"))]
 /// 4. No parent prompt while children merely run before the checkpoint.
 #[tokio::test(start_paused = true)]
 async fn delegation_continuation_e2e_no_prompt_while_children_merely_running() {
@@ -4208,6 +4254,7 @@ async fn delegation_continuation_e2e_no_prompt_while_children_merely_running() {
     fx.await_worker_gone().await;
 }
 
+#[cfg(any(not(codeg_test_shard), codeg_test_shard = "3"))]
 /// 5a. All-terminal admits exactly one hidden prompt.
 #[tokio::test(start_paused = true)]
 async fn delegation_continuation_e2e_wake_all_terminal_admits_once() {
@@ -4229,6 +4276,7 @@ async fn delegation_continuation_e2e_wake_all_terminal_admits_once() {
     assert_eq!(fx.broker.pending_count().await, 0);
 }
 
+#[cfg(any(not(codeg_test_shard), codeg_test_shard = "3"))]
 /// 5b. Attention admits exactly one hidden prompt.
 #[tokio::test(start_paused = true)]
 async fn delegation_continuation_e2e_wake_attention_admits_once() {
@@ -4268,6 +4316,7 @@ async fn delegation_continuation_e2e_wake_attention_admits_once() {
     complete_seeded_task(&fx.broker, "e2e-attention").await;
 }
 
+#[cfg(any(not(codeg_test_shard), codeg_test_shard = "3"))]
 /// 5c. Unavailable admits exactly one hidden prompt after mid-wait loss of the live task.
 #[tokio::test(start_paused = true)]
 async fn delegation_continuation_e2e_wake_unavailable_admits_once() {
@@ -4290,6 +4339,7 @@ async fn delegation_continuation_e2e_wake_unavailable_admits_once() {
     assert_eq!(fx.coordinator.worker_count(), 0);
 }
 
+#[cfg(any(not(codeg_test_shard), codeg_test_shard = "3"))]
 /// 5d. Checkpoint admits exactly one hidden prompt at the logical 600s deadline.
 #[tokio::test(start_paused = true)]
 async fn delegation_continuation_e2e_wake_checkpoint_admits_once() {
@@ -4349,6 +4399,7 @@ async fn delegation_continuation_e2e_wake_checkpoint_admits_once() {
     assert_eq!(second_terminal.state, ContinuationState::Completed);
 }
 
+#[cfg(any(not(codeg_test_shard), codeg_test_shard = "3"))]
 /// 6 + 7. Prompt contains latest typed snapshot and durable marker; no public
 /// UserMessage / cold user turn exposes the hidden prompt.
 #[tokio::test(start_paused = true)]
@@ -4562,6 +4613,7 @@ async fn delegation_continuation_e2e_prompt_snapshot_marker_and_hidden_from_publ
     assert_eq!(port.admits.load(Ordering::Relaxed), 1);
 }
 
+#[cfg(any(not(codeg_test_shard), codeg_test_shard = "3"))]
 /// 8. Re-Join from the continuation turn creates a larger generation and new wake_at.
 #[tokio::test(start_paused = true)]
 async fn delegation_continuation_e2e_rejoin_creates_larger_generation_and_new_wake_at() {
@@ -4614,6 +4666,7 @@ async fn delegation_continuation_e2e_rejoin_creates_larger_generation_and_new_wa
     fx.await_worker_gone().await;
 }
 
+#[cfg(any(not(codeg_test_shard), codeg_test_shard = "3"))]
 /// 9. User Stop at Arming / Waiting / WakePending / Resuming yields no duplicate
 /// prompt and no orphan child.
 #[tokio::test(start_paused = true)]
@@ -4760,6 +4813,7 @@ async fn delegation_continuation_e2e_stop_at_each_phase_no_duplicate_or_orphan()
     }
 }
 
+#[cfg(any(not(codeg_test_shard), codeg_test_shard = "3"))]
 /// 10. Parent disconnect and startup reconciliation release the lock only after cleanup.
 #[tokio::test(start_paused = true)]
 async fn delegation_continuation_e2e_disconnect_and_startup_release_lock_after_cleanup() {

@@ -1439,6 +1439,7 @@ fn short_suffix(run_id: i32) -> String {
     format!("r{run_id}b")
 }
 
+#[cfg(any(not(codeg_test_shard), codeg_test_shard = "10"))]
 #[cfg(test)]
 mod tests {
     use super::*;

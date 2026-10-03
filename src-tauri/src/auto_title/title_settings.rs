@@ -310,6 +310,7 @@ pub fn next_config_gen(current: u64) -> Option<u64> {
         .filter(|&next| next <= CONFIG_GEN_I64_MAX)
 }
 
+#[cfg(any(not(codeg_test_shard), codeg_test_shard = "5"))]
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -34,6 +34,7 @@ impl MigrationTrait for Migration {
     }
 }
 
+#[cfg(any(not(codeg_test_shard), codeg_test_shard = "4"))]
 #[cfg(test)]
 mod tests {
     use sea_orm::{ConnectionTrait, DbBackend, EntityTrait, Statement};

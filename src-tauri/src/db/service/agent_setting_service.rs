@@ -237,6 +237,7 @@ fn is_sqlite_full_error(err: &DbError) -> bool {
     message.contains("database or disk is full") || message.contains("(code: 13)")
 }
 
+#[cfg(any(not(codeg_test_shard), codeg_test_shard = "7"))]
 #[cfg(test)]
 mod tests {
     use super::*;

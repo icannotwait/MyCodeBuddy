@@ -540,6 +540,7 @@ pub async fn set_chat_authoring_settings(
     }
 }
 
+#[cfg(any(not(codeg_test_shard), codeg_test_shard = "7"))]
 #[cfg(test)]
 mod tests {
     use super::*;

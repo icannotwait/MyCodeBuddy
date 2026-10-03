@@ -1134,6 +1134,7 @@ fn decode_available_utf8(pending: &mut Vec<u8>) -> String {
     output
 }
 
+#[cfg(any(not(codeg_test_shard), codeg_test_shard = "4"))]
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
@@ -2126,6 +2127,7 @@ mod tests {
     }
 }
 
+#[cfg(any(not(codeg_test_shard), codeg_test_shard = "4"))]
 #[cfg(test)]
 mod fork_contract_tests {
     use super::*;

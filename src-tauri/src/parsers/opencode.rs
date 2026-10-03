@@ -1783,6 +1783,7 @@ async fn batch_load_subagent_tool_calls(
     result
 }
 
+#[cfg(any(not(codeg_test_shard), codeg_test_shard = "3"))]
 #[cfg(test)]
 mod tests {
     use super::{extract_opencode_file_image, resolve_xdg_data_home, OpenCodeParser};

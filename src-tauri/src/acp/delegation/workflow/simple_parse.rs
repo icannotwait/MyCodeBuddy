@@ -911,6 +911,7 @@ pub async fn read_simple_progress(
     parse_simple_progress(&bytes, plan_rel_path)
 }
 
+#[cfg(any(not(codeg_test_shard), codeg_test_shard = "4"))]
 #[cfg(test)]
 mod tests {
     use super::super::types::ReviewerSlot;

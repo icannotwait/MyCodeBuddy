@@ -3756,6 +3756,7 @@ pub fn default_socket_path(_temp_dir: &Path) -> PathBuf {
     PathBuf::from(format!(r"\\.\pipe\codeg-delegation-{}", std::process::id()))
 }
 
+#[cfg(any(not(codeg_test_shard), codeg_test_shard = "5"))]
 #[cfg(test)]
 mod tests {
     use super::*;

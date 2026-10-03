@@ -1819,6 +1819,7 @@ fn hash_turn(turn: &MessageTurn) -> u64 {
     hasher.finish()
 }
 
+#[cfg(any(not(codeg_test_shard), codeg_test_shard = "6"))]
 #[cfg(test)]
 mod tests {
     use super::*;

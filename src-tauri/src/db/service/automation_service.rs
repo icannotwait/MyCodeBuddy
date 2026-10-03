@@ -680,6 +680,7 @@ pub async fn prune_old_runs(conn: &DatabaseConnection, keep_days: i64) -> Result
     Ok(res.rows_affected)
 }
 
+#[cfg(any(not(codeg_test_shard), codeg_test_shard = "3"))]
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -2863,6 +2863,7 @@ pub async fn template_delete(conn: &DatabaseConnection, id: i32) -> Result<(), D
     Ok(())
 }
 
+#[cfg(any(not(codeg_test_shard), codeg_test_shard = "7"))]
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -915,6 +915,7 @@ fn keepalive_std() -> Duration {
         .unwrap_or_else(|_| Duration::from_secs(3600))
 }
 
+#[cfg(any(not(codeg_test_shard), codeg_test_shard = "4"))]
 #[cfg(test)]
 mod tests {
     use super::*;

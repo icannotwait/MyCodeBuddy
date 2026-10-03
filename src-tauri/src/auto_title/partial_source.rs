@@ -106,6 +106,7 @@ pub(crate) fn fold_partial_candidates(
         .collect()
 }
 
+#[cfg(any(not(codeg_test_shard), codeg_test_shard = "1"))]
 #[cfg(test)]
 mod tests {
     use super::*;

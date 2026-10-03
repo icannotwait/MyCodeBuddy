@@ -63,6 +63,7 @@ pub fn compression_layer() -> CompressionLayer<impl Predicate> {
         .compress_when(SizeAbove::new(MIN_COMPRESS_BYTES).and(CompressibleContentType))
 }
 
+#[cfg(any(not(codeg_test_shard), codeg_test_shard = "10"))]
 #[cfg(test)]
 mod tests {
     use super::*;

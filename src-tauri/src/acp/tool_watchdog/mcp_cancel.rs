@@ -115,6 +115,7 @@ impl McpCancelRegistry {
 // types.rs has: Cancelled, AlreadySettled, Unsupported, Stale, TimedOut
 // Add NotFound if missing — check types.
 
+#[cfg(any(not(codeg_test_shard), codeg_test_shard = "1"))]
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -1,3 +1,4 @@
+#[cfg(any(not(codeg_test_shard), codeg_test_shard = "8"))]
 mod tests {
     use super::*;
 

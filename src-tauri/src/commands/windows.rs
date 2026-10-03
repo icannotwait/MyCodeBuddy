@@ -2576,6 +2576,7 @@ pub async fn set_tray_locale(
         .map_err(|e| AppCommandError::window("Failed to refresh tray menu", e.to_string()))
 }
 
+#[cfg(any(not(codeg_test_shard), codeg_test_shard = "9"))]
 #[cfg(test)]
 mod owner_window_tests {
     use super::{AuxWindowState, SettingsWindowState};
@@ -2667,6 +2668,7 @@ mod owner_window_tests {
     }
 }
 
+#[cfg(any(not(codeg_test_shard), codeg_test_shard = "9"))]
 #[cfg(test)]
 mod pet_panel_geometry_tests {
     use super::{compute_pet_panel_origin, PET_PANEL_GAP, PET_PANEL_WIDTH};
@@ -2758,6 +2760,7 @@ mod pet_panel_geometry_tests {
     }
 }
 
+#[cfg(any(not(codeg_test_shard), codeg_test_shard = "9"))]
 #[cfg(test)]
 mod settings_route_tests {
     use super::resolve_settings_route;
@@ -2796,6 +2799,7 @@ mod settings_route_tests {
     }
 }
 
+#[cfg(any(not(codeg_test_shard), codeg_test_shard = "9"))]
 #[cfg(test)]
 mod macos_fullscreen_close_tests {
     use super::should_drain_macos_fullscreen_before_close;

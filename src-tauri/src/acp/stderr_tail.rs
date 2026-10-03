@@ -613,6 +613,7 @@ fn summarize_body(first: &str) -> String {
     "unrecognized parse error (redacted)".to_string()
 }
 
+#[cfg(any(not(codeg_test_shard), codeg_test_shard = "1"))]
 #[cfg(test)]
 mod tests {
     use super::*;

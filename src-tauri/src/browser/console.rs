@@ -829,6 +829,7 @@ pub fn cdp_context_origin(raw: Option<&str>) -> Option<String> {
     Some(piece(raw, CONSOLE_MAX_ORIGIN_CHARS))
 }
 
+#[cfg(any(not(codeg_test_shard), codeg_test_shard = "0"))]
 #[cfg(test)]
 mod tests {
     use super::*;

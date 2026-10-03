@@ -202,6 +202,7 @@ fn map_completion_mutation_error(error: CompletionMutationError) -> AppCommandEr
     }
 }
 
+#[cfg(any(not(codeg_test_shard), codeg_test_shard = "3"))]
 #[cfg(test)]
 mod protocol_error_tests {
     use super::*;
@@ -406,6 +407,7 @@ fn desktop_completion_context_for_label(
     }
 }
 
+#[cfg(any(not(codeg_test_shard), codeg_test_shard = "3"))]
 #[cfg(all(test, feature = "tauri-runtime"))]
 mod tests {
     use super::*;

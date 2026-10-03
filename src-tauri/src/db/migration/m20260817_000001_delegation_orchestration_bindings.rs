@@ -107,6 +107,7 @@ pub(crate) async fn install_for_historical_completion_fixture(
     Ok(())
 }
 
+#[cfg(any(not(codeg_test_shard), codeg_test_shard = "7"))]
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;

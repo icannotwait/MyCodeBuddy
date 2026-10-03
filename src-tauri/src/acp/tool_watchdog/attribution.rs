@@ -500,6 +500,7 @@ impl LeaseAttribution {
     }
 }
 
+#[cfg(any(not(codeg_test_shard), codeg_test_shard = "1"))]
 #[cfg(test)]
 mod tool_watchdog_attribution_tests {
     use super::*;

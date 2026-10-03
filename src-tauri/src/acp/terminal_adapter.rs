@@ -57,6 +57,7 @@ pub fn adapter_for(_agent_type: AgentType) -> &'static dyn AcpTerminalAdapter {
     &GENERIC_TERMINAL_ADAPTER
 }
 
+#[cfg(any(not(codeg_test_shard), codeg_test_shard = "4"))]
 #[cfg(test)]
 mod tests {
     use super::*;

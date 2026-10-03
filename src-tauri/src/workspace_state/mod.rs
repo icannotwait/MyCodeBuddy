@@ -2232,6 +2232,7 @@ pub async fn get_workspace_snapshot_core(
     Ok(guard_snapshot)
 }
 
+#[cfg(any(not(codeg_test_shard), codeg_test_shard = "0"))]
 #[cfg(test)]
 mod tests {
     use super::*;

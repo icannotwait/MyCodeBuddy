@@ -78,6 +78,7 @@ pub(crate) fn classify_shell_family(shell: &str) -> ShellFamily {
     }
 }
 
+#[cfg(any(not(codeg_test_shard), codeg_test_shard = "0"))]
 #[cfg(test)]
 mod tests {
     use super::*;

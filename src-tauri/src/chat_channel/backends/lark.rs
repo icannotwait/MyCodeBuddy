@@ -706,6 +706,7 @@ fn build_lark_card(msg: &RichMessage) -> serde_json::Value {
     })
 }
 
+#[cfg(any(not(codeg_test_shard), codeg_test_shard = "1"))]
 #[cfg(test)]
 mod tests {
     use super::*;

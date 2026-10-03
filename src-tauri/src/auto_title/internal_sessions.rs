@@ -258,6 +258,7 @@ pub fn is_lexically_below(path: &str, reserved_root: &Path) -> bool {
     norm_path.starts_with(&prefix)
 }
 
+#[cfg(any(not(codeg_test_shard), codeg_test_shard = "0"))]
 #[cfg(test)]
 mod tests {
     use super::*;

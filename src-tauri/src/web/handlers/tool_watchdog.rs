@@ -76,6 +76,7 @@ pub async fn acp_tool_watchdog_cancel(
     Ok(Json(projection))
 }
 
+#[cfg(any(not(codeg_test_shard), codeg_test_shard = "3"))]
 #[cfg(test)]
 mod tests {
     use super::*;

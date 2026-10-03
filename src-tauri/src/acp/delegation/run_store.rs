@@ -6363,6 +6363,7 @@ async fn project_conversation_in_txn(
 // Tests
 // ---------------------------------------------------------------------------
 
+#[cfg(any(not(codeg_test_shard), codeg_test_shard = "6"))]
 #[cfg(test)]
 mod tests {
     use std::time::Duration;
@@ -15489,6 +15490,7 @@ fn apply_encoded_runtime_stats_to_conversation_update(
         )
 }
 
+#[cfg(any(not(codeg_test_shard), codeg_test_shard = "6"))]
 #[cfg(test)]
 mod termination_audit {
     use super::*;

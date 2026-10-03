@@ -255,6 +255,7 @@ pub fn parse_envelope(value: Value) -> Result<EncryptedPayload, AppCommandError>
         .map_err(|e| invalid("Malformed encrypted snapshot").with_detail(e.to_string()))
 }
 
+#[cfg(any(not(codeg_test_shard), codeg_test_shard = "7"))]
 #[cfg(test)]
 mod tests {
     use super::*;

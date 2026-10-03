@@ -151,6 +151,7 @@ pub fn prepare_codex_launch_env(
     Ok(env)
 }
 
+#[cfg(any(not(codeg_test_shard), codeg_test_shard = "8"))]
 #[cfg(test)]
 mod tests {
     use super::*;

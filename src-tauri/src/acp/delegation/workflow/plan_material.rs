@@ -1378,6 +1378,7 @@ fn sha256_prefixed(bytes: &[u8]) -> String {
     output
 }
 
+#[cfg(any(not(codeg_test_shard), codeg_test_shard = "9"))]
 #[cfg(test)]
 mod tests {
     use std::collections::{BTreeMap, BTreeSet};

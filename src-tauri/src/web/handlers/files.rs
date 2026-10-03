@@ -1033,6 +1033,7 @@ async fn stream_and_finalize(
     })
 }
 
+#[cfg(any(not(codeg_test_shard), codeg_test_shard = "10"))]
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -175,6 +175,7 @@ pub fn cached_or_bundled_snapshot() -> Vec<Value> {
     read_cache(false).unwrap_or_else(crate::acp::codex_model_catalog::bundled_snapshot_models)
 }
 
+#[cfg(any(not(codeg_test_shard), codeg_test_shard = "7"))]
 #[cfg(test)]
 mod tests {
     use super::*;

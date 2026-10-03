@@ -144,6 +144,7 @@ fn is_internal_prompt_marker(marker: &str) -> bool {
         && !body.chars().any(char::is_whitespace)
 }
 
+#[cfg(any(not(codeg_test_shard), codeg_test_shard = "3"))]
 #[cfg(test)]
 mod tests {
     use chrono::Utc;

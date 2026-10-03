@@ -1161,6 +1161,7 @@ pub async fn work_task_template_delete(
     work_task_template_delete_core(&db, id).await
 }
 
+#[cfg(any(not(codeg_test_shard), codeg_test_shard = "3"))]
 #[cfg(test)]
 mod tests {
     use super::*;

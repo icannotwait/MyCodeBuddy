@@ -21,6 +21,7 @@
     "test:release": "node --test scripts/*.test.mjs src-tauri/scripts/*.test.mjs",
     "rust:check:low-memory": "cd src-tauri && cargo --config ../.cargo/low-memory.toml check --locked --no-default-features --lib",
     "rust:test:low-memory": "cd src-tauri && cargo --config ../.cargo/low-memory.toml test --locked --no-default-features --features test-utils --lib",
+    "rust:test:sharded:low-memory": "python3 scripts/rust-test-shards.py",
     "rust:check:desktop:low-memory": "cd src-tauri && cargo --config ../.cargo/low-memory.toml check --locked --lib",
     "rust:check:server:low-memory": "cd src-tauri && cargo --config ../.cargo/low-memory.toml check --locked --no-default-features --features server --lib --bin codeg-server",
     "rust:check:mcp:low-memory": "cd src-tauri && cargo --config ../.cargo/low-memory.toml check --locked --no-default-features --bin codeg-mcp",

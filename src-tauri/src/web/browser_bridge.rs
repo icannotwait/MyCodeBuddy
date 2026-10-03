@@ -1655,6 +1655,7 @@ fn json_for_script(text: &str) -> String {
         .replace('&', "\\u0026")
 }
 
+#[cfg(any(not(codeg_test_shard), codeg_test_shard = "10"))]
 #[cfg(test)]
 mod tests {
     use super::*;

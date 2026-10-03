@@ -357,6 +357,7 @@ fn zip_err(e: zip::result::ZipError) -> AppCommandError {
     AppCommandError::io_error("ZIP archive operation failed").with_detail(e.to_string())
 }
 
+#[cfg(any(not(codeg_test_shard), codeg_test_shard = "0"))]
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -414,6 +414,7 @@ pub(crate) fn path_is_under_root(target: &Path, root: &Path) -> bool {
     target_key.starts_with(&root_prefix)
 }
 
+#[cfg(any(not(codeg_test_shard), codeg_test_shard = "1"))]
 #[cfg(test)]
 mod tests {
     use super::*;

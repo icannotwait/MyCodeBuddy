@@ -338,6 +338,7 @@ fn corrupt_header_error() -> AppCommandError {
         .with_i18n(BACKUP_I18N_KEY_BAD_PASSPHRASE, Default::default())
 }
 
+#[cfg(any(not(codeg_test_shard), codeg_test_shard = "10"))]
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -1170,6 +1170,7 @@ fn format_delegation_result(agent: &str, result: &DelegationResultSummary) -> St
     }
 }
 
+#[cfg(any(not(codeg_test_shard), codeg_test_shard = "1"))]
 #[cfg(test)]
 mod delegation_relay_tests {
     use super::*;
@@ -1312,6 +1313,7 @@ mod delegation_relay_tests {
     }
 }
 
+#[cfg(any(not(codeg_test_shard), codeg_test_shard = "1"))]
 /// End-to-end dedup coverage through the real `handle_acp_envelope`, driving a
 /// recording channel backend so the exact channel messages are observable. The
 /// terminal delegation line must render EXACTLY ONCE across the terminal
@@ -2255,6 +2257,7 @@ mod async_relay_dedup_tests {
     }
 }
 
+#[cfg(any(not(codeg_test_shard), codeg_test_shard = "1"))]
 #[cfg(test)]
 mod error_terminal_gate_tests {
     //! Regression coverage for the F2-aligned `AcpEvent::Error` gating —

@@ -187,6 +187,7 @@ fn parse_event_sequence(event_id: &str) -> Option<u64> {
     event_id.rsplit_once('-')?.1.parse().ok()
 }
 
+#[cfg(any(not(codeg_test_shard), codeg_test_shard = "4"))]
 #[cfg(test)]
 mod tests {
     use super::*;

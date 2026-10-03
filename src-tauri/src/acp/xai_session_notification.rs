@@ -151,6 +151,7 @@ pub fn resolve_context_window_size_from_parts(
     crate::parsers::infer_context_window_max_tokens(model_id.or(Some("grok"))).unwrap_or(256_000)
 }
 
+#[cfg(any(not(codeg_test_shard), codeg_test_shard = "3"))]
 #[cfg(test)]
 mod tests {
     use super::*;

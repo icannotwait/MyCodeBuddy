@@ -330,6 +330,7 @@ pub fn is_synthetic_parent_tool_use_id(id: &str) -> bool {
     id.starts_with("delegation-")
 }
 
+#[cfg(any(not(codeg_test_shard), codeg_test_shard = "7"))]
 #[cfg(test)]
 mod tests {
     use super::*;

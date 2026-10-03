@@ -521,6 +521,7 @@ fn is_executable_format_error(message: &str) -> bool {
         || lowered.contains("is not a valid application for this os platform")
 }
 
+#[cfg(any(not(codeg_test_shard), codeg_test_shard = "4"))]
 #[cfg(test)]
 mod tests {
     use super::*;

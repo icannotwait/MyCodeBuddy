@@ -7361,6 +7361,7 @@ impl WorkTaskToolAccess for EngineWorkTaskTools {
     }
 }
 
+#[cfg(any(not(codeg_test_shard), codeg_test_shard = "9"))]
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -1140,6 +1140,7 @@ fn spawn_err(e: tokio::task::JoinError) -> AppCommandError {
     AppCommandError::task_execution_failed("Restore task failed").with_detail(e.to_string())
 }
 
+#[cfg(any(not(codeg_test_shard), codeg_test_shard = "9"))]
 #[cfg(test)]
 mod tests {
     use super::*;

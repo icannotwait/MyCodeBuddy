@@ -6,6 +6,7 @@ use crate::acp::delegation::route::PINNED_CODEBUDDY_VERSION;
 use crate::acp::registry::get_agent_meta;
 use crate::models::agent::{AgentType, BUILTIN_AGENT_TYPES};
 
+#[cfg(any(not(codeg_test_shard), codeg_test_shard = "8"))]
 #[test]
 fn openclaw_is_not_a_builtin_agent() {
     for agent in BUILTIN_AGENT_TYPES {
@@ -22,6 +23,7 @@ fn openclaw_is_not_a_builtin_agent() {
     );
 }
 
+#[cfg(any(not(codeg_test_shard), codeg_test_shard = "8"))]
 /// `route.rs` is fork-only and never conflicts, so a registry bump (Task 5
 /// takes upstream's 2.149.0) leaves it stale unless someone edits it by hand.
 /// No version literal here on purpose: the invariant is agreement, not a number.

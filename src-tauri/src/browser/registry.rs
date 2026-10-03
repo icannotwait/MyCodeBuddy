@@ -598,6 +598,7 @@ fn gesture_is_modifier_click(payload: &Value, wanted: &str) -> bool {
         .unwrap_or(false)
 }
 
+#[cfg(any(not(codeg_test_shard), codeg_test_shard = "0"))]
 #[cfg(test)]
 mod tests {
     use super::*;

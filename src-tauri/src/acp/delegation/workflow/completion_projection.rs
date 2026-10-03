@@ -822,6 +822,7 @@ fn parse_role(role: &str) -> Option<CompletionRole> {
     }
 }
 
+#[cfg(any(not(codeg_test_shard), codeg_test_shard = "0"))]
 #[cfg(test)]
 mod tests {
     use crate::acp::delegation::workflow::{
@@ -915,6 +916,7 @@ mod tests {
     }
 }
 
+#[cfg(any(not(codeg_test_shard), codeg_test_shard = "0"))]
 #[cfg(test)]
 mod design_self_review_decision {
     use chrono::Utc;

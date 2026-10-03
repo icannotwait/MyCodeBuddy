@@ -235,6 +235,7 @@ pub fn re_resolve_spawn_config(
     out
 }
 
+#[cfg(any(not(codeg_test_shard), codeg_test_shard = "8"))]
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -345,6 +345,7 @@ pub async fn startup_workspace_path(db: &AppDatabase, urls: &[String]) -> String
     "workspace".into()
 }
 
+#[cfg(any(not(codeg_test_shard), codeg_test_shard = "3"))]
 #[cfg(test)]
 mod tests {
     use super::*;

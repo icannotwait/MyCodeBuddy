@@ -467,6 +467,7 @@ pub fn build_commit_uri(canonical_repo: &str, full_hash: &str) -> String {
     )
 }
 
+#[cfg(any(not(codeg_test_shard), codeg_test_shard = "1"))]
 #[cfg(test)]
 mod tests {
     use super::*;

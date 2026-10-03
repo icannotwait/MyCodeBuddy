@@ -1431,6 +1431,7 @@ pub async fn stop_office_watch(root_path: String, path: String) -> Result<(), Ap
         .map_err(Into::into)
 }
 
+#[cfg(any(not(codeg_test_shard), codeg_test_shard = "5"))]
 #[cfg(test)]
 mod tests {
     use super::*;

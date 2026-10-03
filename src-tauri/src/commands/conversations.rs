@@ -3882,6 +3882,7 @@ fn parse_error_to_app_error(error: ParseError) -> AppCommandError {
     }
 }
 
+#[cfg(any(not(codeg_test_shard), codeg_test_shard = "7"))]
 #[cfg(test)]
 mod tests {
     fn inert_title_coordinator(

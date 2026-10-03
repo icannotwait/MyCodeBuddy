@@ -168,6 +168,7 @@ pub fn is_shell_like_tool(kind: Option<&str>, title: Option<&str>) -> bool {
         || title.contains("command")
 }
 
+#[cfg(any(not(codeg_test_shard), codeg_test_shard = "7"))]
 #[cfg(test)]
 mod tests {
     use super::*;

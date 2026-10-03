@@ -213,6 +213,7 @@ pub fn grok_exit_plan_disconnect_response() -> Value {
     serde_json::json!({ "outcome": "keep_planning", "feedback": "" })
 }
 
+#[cfg(any(not(codeg_test_shard), codeg_test_shard = "4"))]
 #[cfg(test)]
 mod tests {
     use super::*;
