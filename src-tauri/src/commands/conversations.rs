@@ -219,6 +219,20 @@ pub async fn save_opened_tabs(
     .await
 }
 
+fn ordinary_session_hidden(
+    filter: &InternalSessionFilter,
+    agent_type: AgentType,
+    external_id: Option<&str>,
+    working_dir: Option<&str>,
+) -> bool {
+    filter.contains(agent_type, external_id, working_dir)
+        || crate::roundtable::hidden_from_ordinary_discovery(
+            agent_type,
+            external_id,
+            working_dir,
+        )
+}
+
 /// Drop internal agent sessions before search / aggregation / import.
 pub fn filter_internal_summaries(
     rows: Vec<(AgentType, ConversationSummary)>,
@@ -226,7 +240,8 @@ pub fn filter_internal_summaries(
 ) -> Vec<(AgentType, ConversationSummary)> {
     rows.into_iter()
         .filter(|(agent_type, summary)| {
-            !filter.contains(
+            !ordinary_session_hidden(
+                filter,
                 *agent_type,
                 Some(summary.id.as_str()),
                 summary.folder_path.as_deref(),
@@ -243,8 +258,9 @@ pub fn reject_internal_detail(
     filter: &InternalSessionFilter,
 ) -> Result<ConversationDetail, AppCommandError> {
     let working_dir = detail.summary.folder_path.as_deref();
-    if filter.contains(agent_type, Some(conversation_id), working_dir)
-        || filter.contains(
+    if ordinary_session_hidden(filter, agent_type, Some(conversation_id), working_dir)
+        || ordinary_session_hidden(
+            filter,
             detail.summary.agent_type,
             Some(detail.summary.id.as_str()),
             working_dir,
@@ -1838,7 +1854,8 @@ fn try_recover_stale_session(
     };
     parser
         .recover_conversation(&query, &|summary| {
-            !filter.contains(
+            !ordinary_session_hidden(
+                filter,
                 agent_type,
                 Some(summary.id.as_str()),
                 summary.folder_path.as_deref(),
@@ -1846,6 +1863,18 @@ fn try_recover_stale_session(
         })
         .ok()
         .flatten()
+}
+
+/// Recovery entry used by the roundtable registry tests.
+#[cfg(any(test, feature = "test-utils"))]
+pub fn recover_stale_session_for_test(
+    parser: &dyn AgentParser,
+    agent_type: AgentType,
+    cwd: Option<&str>,
+    approx: chrono::DateTime<chrono::Utc>,
+    filter: &InternalSessionFilter,
+) -> Option<crate::models::ConversationDetail> {
+    try_recover_stale_session(parser, agent_type, cwd, approx, filter)
 }
 
 /// How a detail load resolved an external id.

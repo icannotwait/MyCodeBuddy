@@ -3,6 +3,7 @@
 //! The encoder and validator are the production P02 and P04 functions.
 //! [`InMemoryToolStore`] is only this path. A fake broker is not a certificate.
 
+use std::path::Path;
 use std::str::FromStr;
 use std::sync::Mutex;
 
@@ -33,6 +34,10 @@ pub struct QualificationHarness {
     store: InMemoryToolStore,
     delivered: Mutex<Option<CandidateReceipt>>,
     transport: FakeBrokerTransport,
+    /// Qualification registry. Not the production `rt_internal_bindings` table.
+    session_registry: super::RoundtableSessionRegistry,
+    /// Kept so the temporary registry directory outlives the store.
+    registry_dir: tempfile::TempDir,
 }
 
 impl QualificationHarness {
@@ -132,6 +137,9 @@ impl QualificationHarness {
             .expect("qualification token admits its own attempt");
         let transport =
             FakeBrokerTransport::open("roundtable-qualification", fence.incarnation.to_string());
+        let registry_dir = tempfile::tempdir().expect("qualification registry directory");
+        let session_registry = super::RoundtableSessionRegistry::temporary(registry_dir.path())
+            .expect("qualification registry store");
         Self {
             phase,
             role,
@@ -143,7 +151,17 @@ impl QualificationHarness {
             store: InMemoryToolStore::new(),
             delivered: Mutex::new(None),
             transport,
+            session_registry,
+            registry_dir,
         }
+    }
+
+    pub fn session_registry(&self) -> &super::RoundtableSessionRegistry {
+        &self.session_registry
+    }
+
+    pub fn registry_directory(&self) -> &Path {
+        self.registry_dir.path()
     }
 
     pub fn phase(&self) -> &PhaseSnapshotV1 {

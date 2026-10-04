@@ -4,8 +4,11 @@
 //! external ID, discovery lease, and reserved working-directory root.
 
 use std::collections::HashSet;
+use std::future::Future;
 use std::path::{Component, Path, PathBuf};
-use std::sync::Arc;
+use std::pin::Pin;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex as StdMutex};
 
 use sea_orm::{ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter, Set};
 use serde_json::Value;
@@ -50,6 +53,7 @@ impl InternalSessionFilter {
     ) -> bool {
         external_id.is_some_and(|id| self.ids.contains(&(agent_type, id.to_owned())))
             || working_dir.is_some_and(|path| is_lexically_below(path, &self.reserved_root))
+            || extra_session_hidden(agent_type, external_id, working_dir)
     }
 
     /// Test/debug accessor for the reserved title-run root.
@@ -69,6 +73,8 @@ pub struct InternalAgentSessionRegistry {
     discovery: Arc<RwLock<()>>,
     ids: LiveInternalSessionIds,
     reserved_root: PathBuf,
+    /// Roundtable discovery leases attached to this process registry.
+    gates: StdMutex<Vec<Arc<dyn DiscoveryGate>>>,
 }
 
 impl InternalAgentSessionRegistry {
@@ -90,6 +96,7 @@ impl InternalAgentSessionRegistry {
             discovery: Arc::new(RwLock::new(())),
             ids: Arc::new(Mutex::new(Arc::new(set))),
             reserved_root,
+            gates: StdMutex::new(Vec::new()),
         }))
     }
 
@@ -101,6 +108,7 @@ impl InternalAgentSessionRegistry {
             discovery: Arc::new(RwLock::new(())),
             ids: Arc::new(Mutex::new(Arc::new(HashSet::new()))),
             reserved_root,
+            gates: StdMutex::new(Vec::new()),
         }))
     }
 
@@ -124,10 +132,22 @@ impl InternalAgentSessionRegistry {
     }
 
     /// Shared discovery lease + immutable filter snapshot for list/detail/import.
+    ///
+    /// Roundtable discovery leases attached to this registry are acquired
+    /// first, so a handshake in progress cannot be scanned until register ack.
     pub async fn shared_filter(
         &self,
-    ) -> Result<(OwnedRwLockReadGuard<()>, InternalSessionFilter), DbError> {
-        let guard = self.discovery.clone().read_owned().await;
+    ) -> Result<(SharedDiscoveryGuard, InternalSessionFilter), DbError> {
+        let gates = self
+            .gates
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .clone();
+        let mut roundtable = Vec::with_capacity(gates.len());
+        for gate in &gates {
+            roundtable.push(gate.wait_shared().await);
+        }
+        let internal = self.discovery.clone().read_owned().await;
         let ids = {
             let locked = self.ids.lock().await;
             Arc::clone(&*locked)
@@ -136,7 +156,20 @@ impl InternalAgentSessionRegistry {
             ids,
             reserved_root: self.reserved_root.clone(),
         };
-        Ok((guard, filter))
+        Ok((
+            SharedDiscoveryGuard {
+                _internal: internal,
+                _roundtable: roundtable,
+            },
+            filter,
+        ))
+    }
+
+    pub(crate) fn retain_discovery_gate(&self, gate: Arc<dyn DiscoveryGate>) {
+        self.gates
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .push(gate);
     }
 
     /// Register under an already-held exclusive discovery lease.
@@ -208,6 +241,80 @@ impl InternalAgentSessionRegistry {
         model.insert(&self.conn).await?;
         Ok(())
     }
+}
+
+/// Held for the whole ordinary scan. Drops the roundtable discovery read
+/// first, then the internal-session read.
+pub struct SharedDiscoveryGuard {
+    _roundtable: Vec<SharedDiscoveryPermit>,
+    _internal: OwnedRwLockReadGuard<()>,
+}
+
+/// Read permit for one roundtable discovery lease.
+pub struct SharedDiscoveryPermit {
+    _guard: tokio::sync::OwnedRwLockReadGuard<()>,
+}
+
+impl SharedDiscoveryPermit {
+    pub(crate) fn hold(guard: tokio::sync::OwnedRwLockReadGuard<()>) -> Self {
+        Self { _guard: guard }
+    }
+}
+
+/// Blocks [`InternalAgentSessionRegistry::shared_filter`] while a roundtable
+/// handshake holds the matching write lease.
+pub(crate) trait DiscoveryGate: Send + Sync {
+    fn wait_shared(&self) -> Pin<Box<dyn Future<Output = SharedDiscoveryPermit> + Send + '_>>;
+}
+
+struct ExtraHide {
+    id: u64,
+    hide: Arc<dyn Fn(AgentType, Option<&str>, Option<&str>) -> bool + Send + Sync>,
+}
+
+fn extra_hides() -> &'static StdMutex<Vec<ExtraHide>> {
+    static HIDES: StdMutex<Vec<ExtraHide>> = StdMutex::new(Vec::new());
+    &HIDES
+}
+
+fn next_hide_id() -> &'static AtomicU64 {
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    &NEXT
+}
+
+pub(crate) fn install_extra_discovery_hide(
+    hide: Arc<dyn Fn(AgentType, Option<&str>, Option<&str>) -> bool + Send + Sync>,
+) -> u64 {
+    let id = next_hide_id().fetch_add(1, Ordering::Relaxed);
+    extra_hides()
+        .lock()
+        .unwrap_or_else(|err| err.into_inner())
+        .push(ExtraHide { id, hide });
+    id
+}
+
+pub(crate) fn remove_extra_discovery_hide(id: u64) {
+    extra_hides()
+        .lock()
+        .unwrap_or_else(|err| err.into_inner())
+        .retain(|item| item.id != id);
+}
+
+/// Live roundtable registries. Empty when none have been constructed.
+pub(crate) fn extra_session_hidden(
+    agent_type: AgentType,
+    external_id: Option<&str>,
+    working_dir: Option<&str>,
+) -> bool {
+    let callbacks: Vec<_> = extra_hides()
+        .lock()
+        .unwrap_or_else(|err| err.into_inner())
+        .iter()
+        .map(|item| Arc::clone(&item.hide))
+        .collect();
+    callbacks
+        .iter()
+        .any(|hide| hide(agent_type, external_id, working_dir))
 }
 
 fn ensure_reserved_root(data_dir: &Path) -> Result<PathBuf, DbError> {

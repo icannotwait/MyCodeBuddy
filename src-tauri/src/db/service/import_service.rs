@@ -134,6 +134,16 @@ where
     .map_err(|error| DbError::Database(sea_orm::DbErr::Custom(error.to_string())))?;
     let (guard, filter) = registry.shared_filter().await?;
     let summaries = collect_local_summaries(deepseek_env, on_agent_done).await;
+    let summaries = summaries
+        .into_iter()
+        .filter(|(agent_type, summary)| {
+            !crate::roundtable::hidden_from_ordinary_discovery(
+                *agent_type,
+                Some(summary.id.as_str()),
+                summary.folder_path.as_deref(),
+            )
+        })
+        .collect();
     let visible = filter_internal_summaries(summaries, &filter);
     drop(guard);
     Ok(visible)
@@ -434,6 +444,20 @@ pub(crate) async fn sync_imported_sessions(
     refreshed
 }
 
+/// `true` when a new conversation row was inserted. Roundtable sessions are skipped.
+#[cfg(any(test, feature = "test-utils"))]
+pub async fn import_one_accepted_for_test(
+    conn: &DatabaseConnection,
+    folder_id: i32,
+    agent_type: &AgentType,
+    summary: &ConversationSummary,
+) -> Result<bool, DbError> {
+    Ok(matches!(
+        import_one(conn, folder_id, agent_type, summary, DeletedPolicy::Skip).await?,
+        ImportOutcome::Imported
+    ))
+}
+
 #[cfg(test)]
 pub(crate) async fn import_one_for_test(
     conn: &DatabaseConnection,
@@ -455,6 +479,13 @@ async fn import_one(
     summary: &ConversationSummary,
     deleted: DeletedPolicy,
 ) -> Result<ImportOutcome, DbError> {
+    if crate::roundtable::hidden_from_ordinary_discovery(
+        *agent_type,
+        Some(summary.id.as_str()),
+        summary.folder_path.as_deref(),
+    ) {
+        return Ok(ImportOutcome::Skipped);
+    }
     let at_str = agent_type_db_str(agent_type);
 
     let exists = conversation::Entity::find()

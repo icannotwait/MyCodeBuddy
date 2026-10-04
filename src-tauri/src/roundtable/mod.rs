@@ -10,6 +10,7 @@ mod gateway;
 pub(crate) mod ingress;
 mod qualification;
 mod qualification_harness;
+mod registry;
 mod relay;
 mod request_accounting;
 mod runtime;
@@ -37,6 +38,10 @@ pub use qualification::{
     evaluate_certificate, CertifiedBinary, OsIdentity, QualificationKey, QualificationReport,
 };
 pub use qualification_harness::QualificationHarness;
+pub use registry::{
+    downgrade_is_silent_compatible, hidden_from_ordinary_discovery, DiscoveryLease, ExternalId,
+    InternalBindingRecord, ObserverWindow, RegisteredBinding, RootLease, RoundtableSessionRegistry,
+};
 pub use relay::{
     forward_to_caller_target, probe_instance_socket, relay_from_helper, InstanceSocket,
     LoopbackRelay, SocketProbe, SANDBOX_ENDPOINT,

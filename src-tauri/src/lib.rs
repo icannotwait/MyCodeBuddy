@@ -1498,6 +1498,9 @@ mod tauri_app {
                     )
                     .map_err(|e| e.to_string())?
                 };
+                crate::roundtable::RoundtableSessionRegistry::install_process_discovery(
+                    &internal_sessions,
+                );
                 app.manage(internal_sessions.clone());
 
                 // Restore and apply saved system proxy settings before any network

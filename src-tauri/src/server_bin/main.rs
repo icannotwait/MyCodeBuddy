@@ -322,6 +322,7 @@ async fn async_main() -> ExitCode {
                 return ExitCode::FAILURE;
             }
         };
+    codeg_lib::roundtable::RoundtableSessionRegistry::install_process_discovery(&internal_sessions);
     let title_db = Arc::new(codeg_lib::db::AppDatabase {
         conn: db.conn.clone(),
     });
