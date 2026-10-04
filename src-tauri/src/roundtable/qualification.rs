@@ -102,3 +102,37 @@ fn image_digest_complete(digest: &str) -> bool {
 fn is_zero(hash: Hash256) -> bool {
     hash == Hash256::from_bytes([0; 32])
 }
+
+/// Service qualification. The policy hash must be the sealed manifest join.
+/// A report labeled passed, including a fake success, is not a certificate.
+pub fn qualify_service(
+    key: &QualificationKey,
+    manifest: &super::capabilities::LaunchCapabilityManifestV1,
+    report: Option<&QualificationReport>,
+) -> QualificationStatus {
+    if super::capabilities::verify_service_manifest(
+        manifest,
+        &super::capabilities::ManifestExtras::default(),
+    )
+    .is_err()
+    {
+        return QualificationStatus::Failed;
+    }
+    let Ok(expected) = super::capabilities::policy_hash_for(manifest) else {
+        return QualificationStatus::Failed;
+    };
+    if key.policy_hash != expected {
+        return QualificationStatus::Expired;
+    }
+    let Some(report) = report else {
+        return QualificationStatus::NotTested;
+    };
+    if report.status != QualificationStatus::Passed {
+        return report.status;
+    }
+    if &report.key != key {
+        return QualificationStatus::Expired;
+    }
+    let _evidence = report.evidence_ref.as_str();
+    QualificationStatus::NotTested
+}

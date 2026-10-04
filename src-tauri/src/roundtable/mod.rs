@@ -4,6 +4,7 @@
 //! ordinary session rows and does not claim a live OS sandbox on hosts that
 //! cannot prove one.
 
+mod capabilities;
 mod companion;
 mod feature_gate;
 mod gateway;
@@ -34,8 +35,16 @@ pub use ingress::{
     bind_private_ingress, BarrierFact, CompletionCoordinator, CompletionMarker, IngressKind,
     RuntimeIngress,
 };
+pub use capabilities::{
+    classify_service_failure, drain_recorded_failures, host_broker_call,
+    host_tools_agent_manifest, policy_hash_for, record_service_response, record_service_update,
+    sealed_service_manifest, service_client_capabilities_value, service_manifest_for_session,
+    verify_service_manifest, FailureObservation, FailureSource, LaunchCapabilityManifestV1,
+    ManifestExtras, OrdinarySessionFlags, ServiceTurnDecision,
+};
 pub use qualification::{
-    evaluate_certificate, CertifiedBinary, OsIdentity, QualificationKey, QualificationReport,
+    evaluate_certificate, qualify_service, CertifiedBinary, OsIdentity, QualificationKey,
+    QualificationReport,
 };
 pub use qualification_harness::QualificationHarness;
 pub use registry::{

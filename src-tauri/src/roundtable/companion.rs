@@ -14,8 +14,9 @@ use tokio::sync::Notify;
 use crate::acp::delegation::companion::{CompanionContext, CompanionFeatures};
 use crate::acp::delegation::transport::CompanionRole;
 
+use super::capabilities::{self, LaunchCapabilityManifestV1};
 use super::rt_error;
-use super::tool_core::{service_tool_names, AttemptToken};
+use super::tool_core::AttemptToken;
 
 pub const ATTEMPT_TOKEN_ENV: &str = "CODEG_ROUNDTABLE_ATTEMPT_TOKEN";
 
@@ -148,14 +149,22 @@ pub fn callable_tools(mode: &CompanionMode) -> Vec<String> {
 
 pub fn tool_callable(mode: &CompanionMode, name: &str) -> bool {
     match mode {
-        CompanionMode::ServiceRoundtable { .. } => service_tool_names().contains(&name),
+        CompanionMode::ServiceRoundtable { .. } => {
+            service_names().iter().any(|tool| tool == name)
+        }
         CompanionMode::LegacyParent(args) => legacy_companion_context(args).allows_tool(name),
     }
 }
 
 pub fn service_tools_ignoring_host_flags(flags: &[&str]) -> Vec<String> {
-    let _ignored = flags.len();
-    service_names()
+    let ordinary = capabilities::OrdinarySessionFlags::from_names(flags);
+    let manifest = capabilities::service_manifest_for_session(&ordinary);
+    if capabilities::verify_service_manifest(&manifest, &capabilities::ManifestExtras::default())
+        .is_err()
+    {
+        return Vec::new();
+    }
+    manifest.tool_names
 }
 
 pub struct ServiceLaunchInput<'a> {
@@ -171,6 +180,7 @@ pub struct ServiceLaunchPlan {
     pub prompt: String,
     pub log: String,
     pub request_url: String,
+    pub manifest: LaunchCapabilityManifestV1,
 }
 
 impl std::fmt::Debug for ServiceLaunchPlan {
@@ -183,6 +193,7 @@ impl std::fmt::Debug for ServiceLaunchPlan {
             .field("prompt", &self.prompt)
             .field("log", &self.log)
             .field("request_url", &self.request_url)
+            .field("manifest", &self.manifest)
             .finish()
     }
 }
@@ -193,19 +204,30 @@ pub fn plan_service_launch(input: &ServiceLaunchInput<'_>) -> ServiceLaunchPlan 
     if token != input.billing_credential {
         sandbox_env.insert(ATTEMPT_TOKEN_ENV.to_string(), token.to_string());
     }
+    let manifest = capabilities::sealed_service_manifest();
+    let verified = capabilities::verify_service_manifest(
+        &manifest,
+        &capabilities::ManifestExtras::default(),
+    )
+    .is_ok();
     ServiceLaunchPlan {
-        argv: vec![
-            "codeg-mcp".to_string(),
-            "--service-roundtable".to_string(),
-            "--socket-path".to_string(),
-            input.socket_path.to_string(),
-            "--incarnation".to_string(),
-            input.incarnation.to_string(),
-        ],
+        argv: if verified {
+            vec![
+                "codeg-mcp".to_string(),
+                "--service-roundtable".to_string(),
+                "--socket-path".to_string(),
+                input.socket_path.to_string(),
+                "--incarnation".to_string(),
+                input.incarnation.to_string(),
+            ]
+        } else {
+            Vec::new()
+        },
         sandbox_env,
         prompt: "roundtable service prompt".to_string(),
         log: "service companion broker watch".to_string(),
         request_url: String::new(),
+        manifest,
     }
 }
 
@@ -352,6 +374,8 @@ pub fn bind_service_process(
         .filter(|value| !value.is_empty())
         .cloned()
         .ok_or_else(|| rt_error(ErrorCode::Unauthenticated, "missing_attempt_token"))?;
+    let manifest = capabilities::sealed_service_manifest();
+    capabilities::verify_service_manifest(&manifest, &capabilities::ManifestExtras::default())?;
     let transport = FakeBrokerTransport::open(socket_path, incarnation);
     let watch = transport.watch();
     Ok(ServiceProcess {
@@ -362,10 +386,13 @@ pub fn bind_service_process(
 }
 
 fn service_names() -> Vec<String> {
-    service_tool_names()
-        .iter()
-        .map(|name| (*name).to_string())
-        .collect()
+    let manifest = capabilities::sealed_service_manifest();
+    if capabilities::verify_service_manifest(&manifest, &capabilities::ManifestExtras::default())
+        .is_err()
+    {
+        return Vec::new();
+    }
+    manifest.tool_names
 }
 
 fn legacy_names(args: &LegacyParentArgs) -> Vec<String> {

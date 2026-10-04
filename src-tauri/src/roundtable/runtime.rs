@@ -14,10 +14,7 @@ use tokio::sync::{mpsc, RwLock};
 
 use crate::acp::agent_process::{plan_roundtable_process, spawn_roundtable_process};
 use crate::acp::connection::{ConnectionCommand, LaneOwnedPermit, LaneSender};
-use crate::acp::host_tools_policy::{
-    roundtable_companion_groups, roundtable_hosts_fs, roundtable_hosts_terminal,
-    roundtable_interactive_permission,
-};
+use crate::acp::host_tools_policy::roundtable_interactive_permission;
 use crate::acp::manager::ConnectionManager;
 use crate::acp::types::PromptInputBlock;
 use crate::acp::SessionState;
@@ -76,6 +73,7 @@ pub struct PreparedRoundtableConnection {
     pub compatibility_label: String,
     pub policy: RoundtableLaunchPolicy,
     pub launch: crate::acp::agent_process::RoundtableProcessPlan,
+    pub manifest: super::capabilities::LaunchCapabilityManifestV1,
     pub state: Arc<RwLock<SessionState>>,
     cmd_tx: LaneSender<ConnectionCommand>,
     /// Kept so the command lane stays open. Tests read it through
@@ -115,16 +113,15 @@ pub enum QueueReject {
     Overflow,
 }
 
-fn launch_policy() -> RoundtableLaunchPolicy {
+fn launch_policy(
+    manifest: &super::capabilities::LaunchCapabilityManifestV1,
+) -> RoundtableLaunchPolicy {
     RoundtableLaunchPolicy {
         service_owned: true,
         interactive_permissions: roundtable_interactive_permission(),
-        host_fs: roundtable_hosts_fs(),
-        host_terminal: roundtable_hosts_terminal(),
-        companion_groups: roundtable_companion_groups()
-            .iter()
-            .map(|group| (*group).to_string())
-            .collect(),
+        host_fs: manifest.native_fs,
+        host_terminal: manifest.native_shell,
+        companion_groups: manifest.mcp_servers.clone(),
         ordinary_conversation_import: false,
         automatic_title: false,
         hidden_generation: ConnectionPurpose::Roundtable.is_hidden_generation(),
@@ -141,8 +138,13 @@ pub async fn prepare_roundtable_connection(
     launch: RoundtableLaunch,
     sink: Arc<dyn PrivateRuntimeSink>,
 ) -> RtResult<PreparedRoundtableConnection> {
+    let manifest = super::capabilities::sealed_service_manifest();
+    super::capabilities::verify_service_manifest(
+        &manifest,
+        &super::capabilities::ManifestExtras::default(),
+    )?;
     let process = plan_roundtable_process(&launch.sandbox)?;
-    let policy = launch_policy();
+    let policy = launch_policy(&manifest);
     #[cfg(any(test, feature = "test-utils"))]
     let install_without_exec = launch.spawn_failpoint;
     #[cfg(not(any(test, feature = "test-utils")))]
@@ -170,6 +172,7 @@ pub async fn prepare_roundtable_connection(
         compatibility_label: ROUNDTABLE_SERVICE_LABEL.to_string(),
         policy,
         launch: process,
+        manifest,
         state: lane.state,
         cmd_tx: lane.cmd_tx,
         cmd_rx: Arc::new(Mutex::new(lane.cmd_rx)),

@@ -114,6 +114,13 @@ pub(crate) fn is_roundtable_purpose(purpose: ConnectionPurpose) -> bool {
     purpose == ConnectionPurpose::Roundtable
 }
 
+pub(crate) fn route_attribution(connection_id: &str) -> Option<(Fence, u64)> {
+    let routes = routes().lock().unwrap_or_else(|err| err.into_inner());
+    routes
+        .get(connection_id)
+        .map(|route| (route.fence.clone(), route.turn_generation))
+}
+
 /// Bind one incarnation's ordered ACP ingress. Replacing a connection keeps
 /// the incarnation's existing sequence.
 pub fn bind_private_ingress(
@@ -219,6 +226,8 @@ pub struct CompletionCoordinator {
     buffered: BTreeSet<u64>,
     /// `CompletionWait::start` closes MCP admission before it releases the gate.
     closed_inside_gate: bool,
+    service_turn: Option<u64>,
+    service_failures: Vec<super::capabilities::FailureObservation>,
 }
 
 impl CompletionCoordinator {
@@ -240,6 +249,8 @@ impl CompletionCoordinator {
             applied: 0,
             buffered: BTreeSet::new(),
             closed_inside_gate: false,
+            service_turn: None,
+            service_failures: Vec::new(),
         }
     }
 
@@ -285,7 +296,6 @@ impl CompletionCoordinator {
     /// Close MCP admission and capture the admitted handlers while the gate
     /// is held, then release it. Does not wait and does not accept.
     pub fn begin(&mut self, marker: CompletionMarker) -> CompletionBarrier {
-        let _turn_generation = marker.turn_generation;
         if marker.fence != *self.state.fence() {
             return CompletionBarrier {
                 pending_tools: BTreeSet::new(),
@@ -294,6 +304,7 @@ impl CompletionCoordinator {
                 mcp_closed: false,
             };
         }
+        self.service_turn = Some(marker.turn_generation);
         self.state.note_prompt_response(marker.prompt_response_seq);
         self.state.set_finish(marker.finish);
         let wait = CompletionWait::start(&mut self.gate, &mut self.state, marker.ingress_watermark);
@@ -366,6 +377,11 @@ impl CompletionCoordinator {
     /// Decide the turn only after the captured handlers and ACP watermark
     /// have drained. The fact is checked, not treated as acceptance.
     pub fn on_barrier_drained(&mut self, fact: BarrierFact) -> RtResult<RuntimeTurnCompleted> {
+        let manifest = super::capabilities::sealed_service_manifest();
+        super::capabilities::verify_service_manifest(
+            &manifest,
+            &super::capabilities::ManifestExtras::default(),
+        )?;
         let Some(captured) = self.captured.clone() else {
             return Err(rt_error(ErrorCode::InvalidState, "barrier_missing"));
         };
@@ -391,6 +407,71 @@ impl CompletionCoordinator {
         let completed = complete_turn(&self.state, &barrier)?;
         debug_assert_ne!(completed.finish_reason, "accepted");
         Ok(completed)
+    }
+
+    pub fn observe_service_failure(
+        &mut self,
+        observation: super::capabilities::FailureObservation,
+    ) {
+        self.service_failures.push(observation);
+    }
+
+    /// Decide only after ingress and admitted handlers drain. Acceptance is
+    /// never implied by `end_turn` or by a staged candidate.
+    pub fn adjudicate_service_turn(
+        &mut self,
+        fact: BarrierFact,
+    ) -> RtResult<super::capabilities::ServiceTurnDecision> {
+        let manifest = super::capabilities::sealed_service_manifest();
+        super::capabilities::verify_service_manifest(
+            &manifest,
+            &super::capabilities::ManifestExtras::default(),
+        )?;
+        let Some(captured) = self.captured.clone() else {
+            return Err(rt_error(ErrorCode::InvalidState, "barrier_missing"));
+        };
+        let Some(watermark) = self
+            .wait
+            .as_ref()
+            .map(|wait| wait.barrier().ingress_watermark)
+        else {
+            return Err(rt_error(ErrorCode::InvalidState, "barrier_missing"));
+        };
+        if fact.fence != *self.state.fence()
+            || fact.admitted_handlers != captured
+            || fact.acp_watermark != watermark
+        {
+            return Err(rt_error(ErrorCode::InvalidState, "barrier_fact_mismatch"));
+        }
+        let state = self.state.clone();
+        let waiting = self.wait.as_mut().expect("barrier").poll(&state);
+        if waiting {
+            return Err(rt_error(ErrorCode::InvalidState, "barrier_pending"));
+        }
+        let barrier = self.wait.as_ref().expect("barrier").barrier().clone();
+        let completed = complete_turn(&self.state, &barrier);
+        let staged = self
+            .staged_candidate()
+            .map(|receipt| receipt.candidate_id.clone());
+        let turn = self.service_turn.unwrap_or(0);
+        Ok(match &completed {
+            Ok(done) => super::capabilities::decide_service_turn(
+                &fact.fence,
+                turn,
+                &self.service_failures,
+                Some(done),
+                None,
+                staged,
+            ),
+            Err(error) => super::capabilities::decide_service_turn(
+                &fact.fence,
+                turn,
+                &self.service_failures,
+                None,
+                error.details.reason.as_deref(),
+                staged,
+            ),
+        })
     }
 
     fn observe(&mut self, seq: u64) {

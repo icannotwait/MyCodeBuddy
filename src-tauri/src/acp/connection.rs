@@ -6037,6 +6037,29 @@ fn build_initialize_request(
         .meta(meta))
 }
 
+/// Service initialize starts empty. It does not take ordinary client
+/// capabilities and then delete filesystem, terminal, or elicitation.
+fn service_client_capabilities() -> ClientCapabilities {
+    let mut meta = serde_json::Map::new();
+    meta.insert(
+        "jetbrains".to_string(),
+        serde_json::json!({
+            "air": { "version": 1, "capabilities": ["sessionFailure"] }
+        }),
+    );
+    ClientCapabilities::new().meta(meta)
+}
+
+fn build_service_initialize_request() -> InitializeRequest {
+    InitializeRequest::new(ProtocolVersion::V1)
+        .client_capabilities(service_client_capabilities())
+        .meta(Meta::default())
+}
+
+pub(crate) fn service_client_capabilities_value() -> serde_json::Value {
+    serde_json::to_value(service_client_capabilities()).unwrap_or(serde_json::Value::Null)
+}
+
 /// The client capabilities codeg advertises on Initialize, with per-agent
 /// gates. Extracted for testability — each gate is a documented product
 /// decision:
@@ -8537,13 +8560,20 @@ async fn run_connection(
 
             // Advertise filesystem, terminal and Codex elicitation capabilities
             // while preserving the connection's terminal snapshot metadata.
-            let init_request = build_initialize_request(
-                agent_type,
-                &terminal_shell.spec,
-                adapter_for(agent_type),
-                host_tools,
-            )
-            .map_err(|e| agent_client_protocol::util::internal_error(e.to_string()))?;
+            // Roundtable service sessions do not inherit that advertisement.
+            let service_session =
+                crate::roundtable::ingress::is_roundtable_purpose(state.read().await.purpose);
+            let init_request = if service_session {
+                build_service_initialize_request()
+            } else {
+                build_initialize_request(
+                    agent_type,
+                    &terminal_shell.spec,
+                    adapter_for(agent_type),
+                    host_tools,
+                )
+                .map_err(|e| agent_client_protocol::util::internal_error(e.to_string()))?
+            };
             // Bound the Initialize handshake so an outdated / incompatible
             // cached binary that never responds can't leave the frontend
             // stuck on "Connecting...". A healthy agent answers in <1s; we
@@ -8693,7 +8723,9 @@ async fn run_connection(
             // Load MCP servers configured for this agent and filter by the
             // capabilities the agent just declared. Stdio is mandatory per
             // ACP spec; HTTP/SSE are gated on `mcp_capabilities.{http,sse}`.
-            let mut mcp_servers: Vec<McpServer> = if agent_supports_mcp {
+            let mut mcp_servers: Vec<McpServer> = if service_session {
+                Vec::new()
+            } else if agent_supports_mcp {
                 let mcp_caps = &init_resp.agent_capabilities.mcp_capabilities;
                 load_mcp_servers_for_agent(agent_type)
                     .into_iter()
@@ -8745,7 +8777,9 @@ async fn run_connection(
             // exempts when the ready lease is missing. User MCP via
             // ~/.gemini/config/mcp_config.json is separate; a file-based
             // Antigravity companion write was considered and deferred.
-            let mut delegate_injection = if skips_wire_companion(agent_type) {
+            let mut delegate_injection = if service_session {
+                None
+            } else if skips_wire_companion(agent_type) {
                 if agent_type == AgentType::Antigravity {
                     tracing::info!(
                         "[ACP] skipping codeg-mcp inject for Antigravity (agy does not spawn wire mcpServers; companion unsupported)"
@@ -14121,6 +14155,16 @@ async fn finalize_bound_prompt_response(
         .await;
     }
     let raw_reason_str = stop_reason_to_str(reason);
+    if crate::roundtable::ingress::is_roundtable_session(state).await {
+        let connection_id = state.read().await.connection_id.clone();
+        let turn = state.read().await.active_turn_generation;
+        crate::roundtable::capabilities::record_service_response(
+            &connection_id,
+            turn,
+            response.meta.as_ref(),
+            raw_reason_str,
+        );
+    }
     // A severity-error sessionFailure already explains a blank end_turn.
     // Do not rewrite that into "empty".
     let (reason_str, empty_report) = if terminal_failure
@@ -19264,6 +19308,35 @@ fn response_session_failure(
     record
 }
 
+/// Roundtable classification reuses the typed AIR parser. An unreadable
+/// versioned record fails closed; it is not treated as success.
+pub(crate) fn classify_service_failure(
+    meta: Option<&serde_json::Map<String, serde_json::Value>>,
+    source: crate::roundtable::capabilities::FailureSource,
+    stop_reason: Option<&str>,
+    http_status: Option<u16>,
+) -> crate::roundtable::capabilities::FailureClassification {
+    let mut records = Vec::new();
+    let mut incompatible = false;
+    if let Some(raw) = air_session_failure(meta) {
+        match parse_session_failure_record(raw) {
+            Some(record) => records.push(crate::roundtable::capabilities::ParsedFailure {
+                id: record.id,
+                revision: record.revision,
+                severity: record.severity,
+                source,
+            }),
+            None => incompatible = true,
+        }
+    }
+    crate::roundtable::capabilities::FailureClassification {
+        records,
+        incompatible,
+        http_status,
+        stop_reason: stop_reason.map(str::to_string),
+    }
+}
+
 /// Strict SemVer floor check: true when `version >= min` by SemVer
 /// PRECEDENCE. Prerelease ordering matters here — `0.64.0-rc1` precedes
 /// `0.64.0` and may predate the very commit that shipped the
@@ -23408,6 +23481,15 @@ async fn emit_conversation_update(
                         "[ACP] dropped AIR sessionFailure without usable id/revision: {raw:?}"
                     ),
                 }
+            }
+            if crate::roundtable::ingress::is_roundtable_session(state).await {
+                let connection_id = state.read().await.connection_id.clone();
+                let turn = state.read().await.active_turn_generation;
+                crate::roundtable::capabilities::record_service_update(
+                    &connection_id,
+                    turn,
+                    info.meta.as_ref(),
+                );
             }
             // codex-acp #289 (v1.1.3+): a retryable turn error rides under
             // `_meta.codex.error` (only when `willRetry == true`) and the turn

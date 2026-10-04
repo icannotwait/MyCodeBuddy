@@ -13,5 +13,8 @@ mod private_ingress;
 #[path = "roundtable_cases/companion.rs"]
 mod companion;
 
+#[path = "roundtable_cases/capability_boundary.rs"]
+mod capability_boundary;
+
 #[path = "roundtable_cases/registry.rs"]
 mod registry;
