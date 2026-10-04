@@ -9,7 +9,7 @@ mod tests {
     use crate::acp::types::{AcpEvent, EventEnvelope};
     use crate::models::AgentType;
     use std::collections::VecDeque;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::Arc;
 
     struct RootDepth;
@@ -599,12 +599,11 @@ mod tests {
     // Real on-disk `store.db` coordinator tests.
     //
     // Everything above exercises `CursorStoreEnricher` against scripted
-    // `CursorStoreLookup` fakes. These two instead wire the real
+    // `CursorStoreLookup` fakes. These tests instead wire the real
     // `CursorStoreReader` at a throwaway temp `cursor_dir`, proving the full
-    // coordinator + reader integration handles a store file that doesn't
-    // exist yet and only appears mid-flight from a concurrent writer —
-    // exactly the ACP-vs-Cursor's-own-writer race the coordinator exists
-    // to bridge.
+    // coordinator + reader integration handles a store file that appears
+    // before or after the lookup deadline. Prepare and close SQLite outside
+    // the timed section so fixture creation cannot race reads of its schema.
 
     fn temp_cursor_store_root() -> std::path::PathBuf {
         std::env::temp_dir().join(format!(
@@ -617,7 +616,7 @@ mod tests {
         ))
     }
 
-    /// Writes a fresh `store.db` at `store_path` containing exactly one
+    /// Writes a fresh SQLite store at `store_path` containing exactly one
     /// `delegate_to_agent` blob for `tool_call_id`, matching the schema
     /// `CursorStoreReader::lookup` scans (see `cursor_store.rs`'s own
     /// `write_store` test helper, which this mirrors).
@@ -648,6 +647,43 @@ mod tests {
             rusqlite::params!["row-0", serde_json::to_vec(&blob).unwrap()],
         )
         .unwrap();
+    }
+
+    /// Publish a fully written fixture only after the coordinator's first
+    /// real lookup misses. Return that miss unchanged: only a later retry
+    /// can read the newly visible store and backfill the broker.
+    struct PublishStoreAfterFirstLookup {
+        reader: CursorStoreReader,
+        staged_path: std::path::PathBuf,
+        store_path: std::path::PathBuf,
+        attempts: AtomicUsize,
+        published: Mutex<Option<tokio::sync::oneshot::Sender<Result<(), String>>>>,
+    }
+
+    impl CursorStoreLookup for PublishStoreAfterFirstLookup {
+        fn lookup(
+            &self,
+            session_id: &str,
+            tool_call_id: &str,
+        ) -> Result<CursorStoredToolCall, CursorStoreError> {
+            let result = self.reader.lookup(session_id, tool_call_id);
+            if self.attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+                let publication = if result == Err(CursorStoreError::StoreNotFound) {
+                    std::fs::rename(&self.staged_path, &self.store_path)
+                        .map_err(|err| format!("publish prepared Cursor store: {err}"))
+                } else {
+                    Err(format!(
+                        "expected first real lookup to miss, got {result:?}"
+                    ))
+                };
+                if let Some(published) = self.published.lock().unwrap().take() {
+                    // Surface filesystem errors to the test instead of losing
+                    // a writer panic behind a generic blocking-task failure.
+                    let _ = published.send(publication);
+                }
+            }
+            result
+        }
     }
 
     fn push_proto_varint(out: &mut Vec<u8>, mut value: u64) {
@@ -709,11 +745,9 @@ mod tests {
         }
     }
 
-    /// The store file doesn't exist at the first (and several subsequent)
-    /// lookup attempts — `resolve_store_path` reports `StoreNotFound`, which
-    /// is retryable — and only appears ~80 ms in from a concurrent writer
-    /// thread, well inside `CURSOR_STORE_LOOKUP_DEADLINE`. The retry loop
-    /// must pick it up and backfill.
+    /// The first real lookup reports `StoreNotFound`. Publish the closed
+    /// fixture at that boundary and require the coordinator to retry, read
+    /// the real SQLite blob, and backfill within its unchanged deadline.
     #[tokio::test]
     async fn real_store_backfill_succeeds_when_write_lands_before_deadline() {
         let metrics = Arc::new(DelegationMetrics::default());
@@ -730,11 +764,19 @@ mod tests {
             .join("acp-sessions")
             .join(session_id)
             .join("store.db");
-        std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(80));
-            write_real_delegate_blob(&store_path, "tc-real");
+        // A sibling filename is invisible to the reader, and rename stays
+        // on the same filesystem. All schema/data writes finish before the
+        // one-second production budget starts; no detached writer survives.
+        let staged_path = store_path.with_file_name("prepared.db");
+        write_real_delegate_blob(&staged_path, "tc-real");
+        let (published_tx, published_rx) = tokio::sync::oneshot::channel();
+        let store = Arc::new(PublishStoreAfterFirstLookup {
+            reader: CursorStoreReader::with_cursor_dir(cursor_dir.clone()),
+            staged_path,
+            store_path,
+            attempts: AtomicUsize::new(0),
+            published: Mutex::new(Some(published_tx)),
         });
-        let store = Arc::new(CursorStoreReader::with_cursor_dir(cursor_dir.clone()));
         let sessions = Arc::new(MapSessions(std::sync::Mutex::new(
             [(
                 "cursor-conn".into(),
@@ -745,11 +787,19 @@ mod tests {
             )]
             .into(),
         )));
-        let enricher = CursorStoreEnricher::new(store, sessions, broker.clone(), metrics.clone());
+        let enricher =
+            CursorStoreEnricher::new(store.clone(), sessions, broker.clone(), metrics.clone());
+        let observation_timeout = CURSOR_STORE_LOOKUP_DEADLINE + Duration::from_millis(500);
+        let started = Instant::now();
         enricher.maybe_schedule(&mcp_tool_envelope("cursor-conn", "tc-real", Some("{}")));
+        tokio::time::timeout(observation_timeout, published_rx)
+            .await
+            .expect("first real lookup did not publish the prepared store")
+            .expect("publication result sender dropped")
+            .expect("prepared Cursor store publication failed");
         wait_for_enrichment_resolved(
             metrics.as_ref(),
-            CURSOR_STORE_LOOKUP_DEADLINE + Duration::from_millis(500),
+            observation_timeout.saturating_sub(started.elapsed()),
         )
         .await;
         assert_eq!(
@@ -759,7 +809,9 @@ mod tests {
                 .as_deref(),
             Some("tc-real")
         );
+        assert!(store.attempts.load(Ordering::SeqCst) >= 2);
         assert_eq!(metrics.snapshot().cursor_enrichment_resolved, 1);
+        assert!(metrics.snapshot().cursor_enrichment_failed.is_empty());
         std::fs::remove_dir_all(&cursor_dir).ok();
     }
 
@@ -815,11 +867,9 @@ mod tests {
         std::fs::remove_dir_all(&cursor_dir).ok();
     }
 
-    /// Sibling of the above: the writer thread doesn't land the blob until
-    /// 1200 ms in — past `CURSOR_STORE_LOOKUP_DEADLINE` (1000 ms) — so the
-    /// coordinator must give up and record the last retryable class
-    /// (`not_found`) instead of backfilling once the (now-existing) file
-    /// would finally match.
+    /// Keep the store absent until the real deadline has expired and the
+    /// lookup task has exited. Publishing a readable fixture afterward must
+    /// not revive that completed lookup or backfill the broker.
     #[tokio::test]
     async fn real_store_write_after_deadline_fails_closed() {
         let metrics = Arc::new(DelegationMetrics::default());
@@ -836,10 +886,8 @@ mod tests {
             .join("acp-sessions")
             .join(session_id)
             .join("store.db");
-        std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(1200));
-            write_real_delegate_blob(&store_path, "tc-late-real");
-        });
+        let staged_path = store_path.with_file_name("prepared.db");
+        write_real_delegate_blob(&staged_path, "tc-late-real");
         let store = Arc::new(CursorStoreReader::with_cursor_dir(cursor_dir.clone()));
         let sessions = Arc::new(MapSessions(std::sync::Mutex::new(
             [(
@@ -851,13 +899,26 @@ mod tests {
             )]
             .into(),
         )));
-        let enricher = CursorStoreEnricher::new(store, sessions, broker.clone(), metrics.clone());
+        let enricher =
+            CursorStoreEnricher::new(store.clone(), sessions, broker.clone(), metrics.clone());
+        let started = Instant::now();
         enricher.maybe_schedule(&mcp_tool_envelope(
             "cursor-conn",
             "tc-late-real",
             Some("{}"),
         ));
-        tokio::time::sleep(CURSOR_STORE_LOOKUP_DEADLINE + Duration::from_millis(300)).await;
+        tokio::time::timeout(
+            CURSOR_STORE_LOOKUP_DEADLINE + Duration::from_millis(300),
+            async {
+                while enricher.in_flight_len_for_test() != 0 {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            },
+        )
+        .await
+        .expect("missing-store lookup did not finish at its deadline");
+        assert!(started.elapsed() >= CURSOR_STORE_LOOKUP_DEADLINE);
+        assert_eq!(enricher.in_flight_len_for_test(), 0);
         assert_eq!(
             metrics
                 .snapshot()
@@ -866,7 +927,15 @@ mod tests {
                 .copied(),
             Some(1)
         );
+        std::fs::rename(&staged_path, &store_path).expect("publish late Cursor store");
+        let stored = store.lookup(session_id, "tc-late-real").unwrap();
+        assert_eq!(stored.tool_name, "delegate_to_agent");
+        assert_eq!(
+            extract_delegation_match_key_from_value(&stored.args),
+            Some(real_delegate_key())
+        );
         assert_eq!(metrics.snapshot().cursor_enrichment_resolved, 0);
+        assert!(metrics.snapshot().cursor_enrichment_backfill.is_empty());
         assert!(broker
             .take_matching_tool_call("cursor-conn", &real_delegate_key())
             .await
