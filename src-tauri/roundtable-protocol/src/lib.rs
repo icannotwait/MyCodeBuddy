@@ -8,12 +8,14 @@ pub mod canonical;
 pub mod context;
 pub mod dto;
 pub mod model;
+pub mod strategy;
 
 pub use budget::*;
 pub use canonical::{canonical_bytes, parse_strict_json, to_hex};
 pub use context::*;
 pub use dto::*;
 pub use model::*;
+pub use strategy::*;
 
 pub fn decode_config(bytes: &[u8], limits: &ParseLimits) -> RtResult<RoundtableConfigV1> {
     decode_json(bytes, limits)
