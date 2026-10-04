@@ -33,7 +33,7 @@
 
 <table>
   <tr>
-    <td width="50%" valign="top">🧩 <strong>Una interfaz para todos los agentes</strong><br/>Quince agentes integrados, y cualquier agente compatible con ACP puede sumarse: todos se presentan como la misma conversación estructurada, no como una terminal.</td>
+    <td width="50%" valign="top">🧩 <strong>Una interfaz para todos los agentes</strong><br/>Catorce agentes integrados, y cualquier agente compatible con ACP puede sumarse: todos se presentan como la misma conversación estructurada, no como una terminal.</td>
     <td width="50%" valign="top">🔎 <strong>Sesiones que viajan</strong><br/>Importa, busca y retoma el historial que cada agente guarda en disco, y luego pásaselo a otro agente.</td>
   </tr>
   <tr>
@@ -110,7 +110,7 @@
 
 ### Una interfaz para todos los agentes
 
-Quince agentes vienen integrados, y cualquier otro agente compatible con ACP puede sumarse desde el registro público o con su JSON de distribución. Codeg se comunica con cada uno de ellos mediante el Agent Client Protocol, así que todos reciben la misma conversación enriquecida —tarjetas de herramientas, diffs en vivo, planes y solicitudes de permiso— en lugar de una terminal en la que dejarse la vista.
+Catorce agentes vienen integrados, y cualquier otro agente compatible con ACP puede sumarse desde el registro público o con su JSON de distribución. Codeg se comunica con cada uno de ellos mediante el Agent Client Protocol, así que todos reciben la misma conversación enriquecida —tarjetas de herramientas, diffs en vivo, planes y solicitudes de permiso— en lugar de una terminal en la que dejarse la vista.
 
 [Documentación →](https://docs.codeg.app/guide/supported-agents) · [Agentes personalizados →](https://docs.codeg.app/guide/custom-agents)
 
@@ -275,13 +275,12 @@ Un editor, diffs en vivo y lado a lado, un cliente de git completo con un editor
 
 ## 🤖 Agentes compatibles
 
-Codeg se comunica con cada agente mediante el [Agent Client Protocol](https://agentclientprotocol.com), así que todos reciben la misma interfaz estructurada. Quince vienen integrados, y Codeg instala, fija la versión y actualiza la mayoría de ellos por ti:
+Codeg se comunica con cada agente mediante el [Agent Client Protocol](https://agentclientprotocol.com), así que todos reciben la misma interfaz estructurada. Catorce vienen integrados, y Codeg instala, fija la versión y actualiza la mayoría de ellos por ti:
 
 <p>
   <a href="https://www.anthropic.com/claude-code"><kbd><img src="../images/agents/claude-code.svg" alt="" width="16" valign="middle" /> Claude Code</kbd></a> &nbsp;
   <a href="https://github.com/openai/codex"><kbd><img src="../images/agents/codex.svg" alt="" width="16" valign="middle" /> Codex</kbd></a> &nbsp;
   <a href="https://github.com/google-gemini/gemini-cli"><kbd><img src="../images/agents/gemini-cli.svg" alt="" width="16" valign="middle" /> Gemini CLI</kbd></a> &nbsp;
-  <a href="https://openclaw.ai"><kbd><img src="../images/agents/openclaw.svg" alt="" width="16" valign="middle" /> OpenClaw</kbd></a> &nbsp;
   <a href="https://opencode.ai"><kbd><picture><source media="(prefers-color-scheme: dark)" srcset="../images/agents/opencode-dark.svg" /><img src="../images/agents/opencode.svg" alt="" width="16" valign="middle" /></picture> OpenCode</kbd></a> &nbsp;
   <a href="https://cline.bot"><kbd><picture><source media="(prefers-color-scheme: dark)" srcset="../images/agents/cline-dark.svg" /><img src="../images/agents/cline.svg" alt="" width="16" valign="middle" /></picture> Cline</kbd></a> &nbsp;
   <a href="https://hermes-agent.nousresearch.com"><kbd><picture><source media="(prefers-color-scheme: dark)" srcset="../images/agents/hermes-agent-dark.svg" /><img src="../images/agents/hermes-agent.svg" alt="" width="16" valign="middle" /></picture> Hermes Agent</kbd></a> &nbsp;
@@ -326,6 +325,8 @@ $env:CODEG_STATIC_DIR="$env:LOCALAPPDATA\codeg-server\web"; codeg-server
 
 El instalador usa por defecto `%LOCALAPPDATA%\codeg-server`, así que no sobrescribe una instalación de escritorio de DrawCode. Si una versión anterior compartía la carpeta del escritorio, el script saca el servidor de ahí.
 
+[GitHub Releases](https://github.com/icannotwait/MyCodeBuddy/releases) también ofrece archivos de servidor firmados para autoalojamiento: `codeg-server-linux-x64.tar.gz`, `codeg-server-linux-arm64.tar.gz`, `codeg-server-darwin-x64.tar.gz`, `codeg-server-darwin-arm64.tar.gz` y `codeg-server-windows-x64.zip`. Cada uno incluye el servidor, el complemento MCP, el auxiliar de control del equipo, los recursos `web/` y los archivos de licencia.
+
 **Docker** — construye el servidor opcional desde este repositorio:
 
 ```bash
@@ -341,9 +342,25 @@ pnpm install && pnpm build
 cd src-tauri
 cargo build --release --bin codeg-server --no-default-features --features server
 cargo build --release --bin codeg-mcp --no-default-features --features mcp-bin
+# Solo si el control del equipo está habilitado:
 cargo build --release --bin codeg-computer-helper --no-default-features --features computer-helper
 CODEG_STATIC_DIR=../out ./target/release/codeg-server
 ```
+
+**Actualizaciones de compilaciones fuente en Linux/macOS** — Ejecuta desde la raíz del repositorio para obtener el código y recompilar:
+
+```bash
+git pull
+pnpm install && pnpm build
+cd src-tauri
+cargo build --release --bin codeg-server --no-default-features --features server
+cargo build --release --bin codeg-mcp --no-default-features --features mcp-bin
+# Solo si el control del equipo está habilitado:
+cargo build --release --bin codeg-computer-helper --no-default-features --features computer-helper
+# Detén el servicio, vuelve a desplegar el servidor, el complemento MCP, el auxiliar opcional y los recursos web, y reinícialo.
+```
+
+Para actualizar Docker, ejecuta `git pull && docker compose up --build -d --force-recreate` desde la raíz del repositorio.
 
 **Móvil** — instala la [app de iOS](https://apps.apple.com/app/codeg-client/id6785199071) o el [APK de Android](https://github.com/xintaofei/codeg-android/releases/latest) y apúntala al **Servicio Web** de tu app de escritorio o a tu propio `codeg-server`: URL, token y listo. Los pasos de vinculación están en [Apps móviles](https://docs.codeg.app/getting-started/installation#mobile-apps).
 

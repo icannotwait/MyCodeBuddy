@@ -966,7 +966,11 @@ mod tests {
             Err(NotGrantable::Unidentified)
         );
         assert_eq!(
-            grantable(&app(1, None, Some("/Applications/TextEdit.app")), &me, &list),
+            grantable(
+                &app(1, None, Some("/Applications/TextEdit.app")),
+                &me,
+                &list
+            ),
             Ok(())
         );
     }

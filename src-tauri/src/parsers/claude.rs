@@ -4106,7 +4106,10 @@ mod tests {
     /// one of them mid-body keeps it.
     #[test]
     fn continuation_summary_text_strips_only_the_framing() {
-        assert_eq!(continuation_summary_text(CONTINUATION), CONTINUATION_SUMMARY);
+        assert_eq!(
+            continuation_summary_text(CONTINUATION),
+            CONTINUATION_SUMMARY
+        );
 
         let quoting = CONTINUATION.replace(
             "   - None.",

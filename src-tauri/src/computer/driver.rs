@@ -257,7 +257,9 @@ mod tests {
         assert!(DRIVER_DESIGNATED_REQUIREMENT
             .starts_with(&format!("identifier \"{DRIVER_SIGNING_ID}\" and ")));
         assert!(DRIVER_DESIGNATED_REQUIREMENT.ends_with(&format!("= {DRIVER_TEAM_ID}")));
-        assert!(!crate::models::agent::is_valid_custom_agent_id(DRIVER_CACHE_ID));
+        assert!(!crate::models::agent::is_valid_custom_agent_id(
+            DRIVER_CACHE_ID
+        ));
     }
 
     /// The entitlement check is an exact match: a denied one, a missing one

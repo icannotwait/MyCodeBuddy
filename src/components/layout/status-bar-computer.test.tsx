@@ -114,6 +114,18 @@ const controlled = {
 }
 
 describe("StatusBarComputer", () => {
+  it("hides controls when the server stops offering computer use", async () => {
+    const { rerender, container } = mount()
+    await screen.findByRole("button", { name: "Computer use" })
+    api.computerAvailable.mockReturnValue(false)
+    rerender(
+      <NextIntlClientProvider locale="en" messages={enMessages}>
+        <StatusBarComputer />
+      </NextIntlClientProvider>
+    )
+    expect(container).toBeEmptyDOMElement()
+  })
+
   it("is not there while computer use is off", async () => {
     api.getComputerToolsSettings.mockResolvedValue({
       enabled: false,

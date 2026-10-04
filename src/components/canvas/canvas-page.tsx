@@ -151,6 +151,14 @@ function BoardTitleMenu({ summary }: { summary: CanvasBoardSummary | null }) {
   const { updateBoard, deleteBoard } = useCanvasBoardActions()
   const [editOpen, setEditOpen] = useState(false)
   const [deleteOpen, setDeleteOpen] = useState(false)
+  // List summaries stop refreshing while a board is open. Its live node
+  // snapshot is what the delete confirmation must count, especially shells
+  // added since entering the board. Never use another board's cached nodes.
+  const liveNodes = useCanvasStore((s) =>
+    s.boardId === summary?.board.id && s.hydrated && !s.boardMissing
+      ? s.nodes
+      : null
+  )
 
   if (!summary) {
     return (
@@ -160,6 +168,15 @@ function BoardTitleMenu({ summary }: { summary: CanvasBoardSummary | null }) {
     )
   }
   const { board } = summary
+  const deleteSummary = liveNodes
+    ? {
+        ...summary,
+        node_count: liveNodes.size,
+        terminal_count: [...liveNodes.values()].filter(
+          (node) => node.kind === "terminal"
+        ).length,
+      }
+    : summary
   return (
     <>
       <DropdownMenu>
@@ -204,7 +221,7 @@ function BoardTitleMenu({ summary }: { summary: CanvasBoardSummary | null }) {
         onSubmit={(values) => updateBoard(board.id, values)}
       />
       <CanvasBoardDeleteDialog
-        summary={summary}
+        summary={deleteSummary}
         open={deleteOpen}
         onOpenChange={setDeleteOpen}
         onConfirm={(boardId) => {

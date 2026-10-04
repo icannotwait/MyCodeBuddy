@@ -33,7 +33,7 @@
 
 <table>
   <tr>
-    <td width="50%" valign="top">🧩 <strong>واجهة واحدة لكل الوكلاء</strong><br/>خمسة عشر وكيلاً مدمجًا، ويمكن لأي وكيل متوافق مع ACP الانضمام — ويُعرض عملهم جميعًا كمحادثة منظَّمة موحّدة، لا كطرفية.</td>
+    <td width="50%" valign="top">🧩 <strong>واجهة واحدة لكل الوكلاء</strong><br/>أربعة عشر وكيلاً مدمجًا، ويمكن لأي وكيل متوافق مع ACP الانضمام — ويُعرض عملهم جميعًا كمحادثة منظَّمة موحّدة، لا كطرفية.</td>
     <td width="50%" valign="top">🔎 <strong>جلسات تنتقل معك</strong><br/>استورد السجل الذي يحفظه كل وكيل على القرص، وابحث فيه، واستأنفه، ثم سلّمه إلى وكيل آخر.</td>
   </tr>
   <tr>
@@ -110,7 +110,7 @@
 
 ### واجهة واحدة لكل الوكلاء
 
-يضم Codeg خمسة عشر وكيلاً مدمجًا، ويمكن لأي وكيل آخر متوافق مع ACP الانضمام من السجل العام أو عبر ملف distribution JSON الخاص به. ويتواصل Codeg مع كلٍّ منهم عبر Agent Client Protocol، فيحصلون جميعًا على المحادثة الغنية نفسها — بطاقات الأدوات، والفروقات الحيّة، والخطط، وطلبات الأذونات — بدلاً من طرفية تُضطر إلى التحديق فيها.
+يضم Codeg أربعة عشر وكيلاً مدمجًا، ويمكن لأي وكيل آخر متوافق مع ACP الانضمام من السجل العام أو عبر ملف distribution JSON الخاص به. ويتواصل Codeg مع كلٍّ منهم عبر Agent Client Protocol، فيحصلون جميعًا على المحادثة الغنية نفسها — بطاقات الأدوات، والفروقات الحيّة، والخطط، وطلبات الأذونات — بدلاً من طرفية تُضطر إلى التحديق فيها.
 
 [التوثيق ←](https://docs.codeg.app/guide/supported-agents) · [الوكلاء المخصّصون ←](https://docs.codeg.app/guide/custom-agents)
 
@@ -275,13 +275,12 @@
 
 ## 🤖 الوكلاء المدعومون
 
-يتواصل Codeg مع كل وكيل عبر [Agent Client Protocol](https://agentclientprotocol.com)، فيحصل كلٌّ منهم على الواجهة المنظَّمة نفسها. ويأتي بخمسة عشر وكيلاً مدمجًا، يتولّى تثبيت معظمهم وتثبيت إصداراتهم وتحديثهم نيابةً عنك:
+يتواصل Codeg مع كل وكيل عبر [Agent Client Protocol](https://agentclientprotocol.com)، فيحصل كلٌّ منهم على الواجهة المنظَّمة نفسها. ويأتي بأربعة عشر وكيلاً مدمجًا، يتولّى تثبيت معظمهم وتثبيت إصداراتهم وتحديثهم نيابةً عنك:
 
 <p>
   <a href="https://www.anthropic.com/claude-code"><kbd><img src="../images/agents/claude-code.svg" alt="" width="16" valign="middle" /> Claude Code</kbd></a> &nbsp;
   <a href="https://github.com/openai/codex"><kbd><img src="../images/agents/codex.svg" alt="" width="16" valign="middle" /> Codex</kbd></a> &nbsp;
   <a href="https://github.com/google-gemini/gemini-cli"><kbd><img src="../images/agents/gemini-cli.svg" alt="" width="16" valign="middle" /> Gemini CLI</kbd></a> &nbsp;
-  <a href="https://openclaw.ai"><kbd><img src="../images/agents/openclaw.svg" alt="" width="16" valign="middle" /> OpenClaw</kbd></a> &nbsp;
   <a href="https://opencode.ai"><kbd><picture><source media="(prefers-color-scheme: dark)" srcset="../images/agents/opencode-dark.svg" /><img src="../images/agents/opencode.svg" alt="" width="16" valign="middle" /></picture> OpenCode</kbd></a> &nbsp;
   <a href="https://cline.bot"><kbd><picture><source media="(prefers-color-scheme: dark)" srcset="../images/agents/cline-dark.svg" /><img src="../images/agents/cline.svg" alt="" width="16" valign="middle" /></picture> Cline</kbd></a> &nbsp;
   <a href="https://hermes-agent.nousresearch.com"><kbd><picture><source media="(prefers-color-scheme: dark)" srcset="../images/agents/hermes-agent-dark.svg" /><img src="../images/agents/hermes-agent.svg" alt="" width="16" valign="middle" /></picture> Hermes Agent</kbd></a> &nbsp;
@@ -326,6 +325,8 @@ $env:CODEG_STATIC_DIR="$env:LOCALAPPDATA\codeg-server\web"; codeg-server
 
 المجلد الافتراضي للمثبّت هو `%LOCALAPPDATA%\codeg-server`، لذلك لا يستبدل تثبيت DrawCode لسطح المكتب. إذا كان تثبيت أقدم في مجلد سطح المكتب، ينقل السكربت الخادم إلى خارجه.
 
+توفّر [GitHub Releases](https://github.com/icannotwait/MyCodeBuddy/releases) أيضًا أرشيفات خادم موقّعة للاستضافة الذاتية: `codeg-server-linux-x64.tar.gz` و`codeg-server-linux-arm64.tar.gz` و`codeg-server-darwin-x64.tar.gz` و`codeg-server-darwin-arm64.tar.gz` و`codeg-server-windows-x64.zip`. يتضمن كل منها الخادم ورفيق MCP ومساعد التحكم بالكمبيوتر وموارد `web/` وملفات الترخيص.
+
 **Docker** — ابنِ الخادم الاختياري من هذا المستودع:
 
 ```bash
@@ -341,9 +342,25 @@ pnpm install && pnpm build
 cd src-tauri
 cargo build --release --bin codeg-server --no-default-features --features server
 cargo build --release --bin codeg-mcp --no-default-features --features mcp-bin
+# فقط إذا كانت ميزة استخدام الكمبيوتر مفعّلة:
 cargo build --release --bin codeg-computer-helper --no-default-features --features computer-helper
 CODEG_STATIC_DIR=../out ./target/release/codeg-server
 ```
+
+**ترقية بناء Linux/macOS من المصدر** — نفّذ من جذر المستودع لسحب المصدر وإعادة البناء:
+
+```bash
+git pull
+pnpm install && pnpm build
+cd src-tauri
+cargo build --release --bin codeg-server --no-default-features --features server
+cargo build --release --bin codeg-mcp --no-default-features --features mcp-bin
+# فقط إذا كانت ميزة استخدام الكمبيوتر مفعّلة:
+cargo build --release --bin codeg-computer-helper --no-default-features --features computer-helper
+# أوقف الخدمة، وأعد نشر الخادم ورفيق MCP ومساعد الكمبيوتر الاختياري وموارد الويب، ثم أعد التشغيل.
+```
+
+لترقية Docker، نفّذ `git pull && docker compose up --build -d --force-recreate` من جذر المستودع.
 
 **الهاتف واللوحي** — ثبّت [تطبيق iOS](https://apps.apple.com/app/codeg-client/id6785199071) أو [حزمة Android APK](https://github.com/xintaofei/codeg-android/releases/latest)، ثم وجّهه إلى **خدمة الويب** في تطبيق سطح المكتب أو إلى خادم `codeg-server` الخاص بك: العنوان والرمز، وانتهى الأمر. خطوات الاقتران في [التطبيقات المحمولة](https://docs.codeg.app/getting-started/installation#mobile-apps).
 

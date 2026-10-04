@@ -5469,6 +5469,7 @@
     "tooltipShared": "Utilisation de l'ordinateur · {count, plural, one {# fenêtre partagée} other {# fenêtres partagées}}",
     "stop": "Arrêter le partage",
     "stopHint": "Arrête immédiatement le partage de toutes les fenêtres et interrompt ce que font les agents. Partagez à nouveau une fenêtre quand vous voulez qu'ils reprennent.",
+    "clipboardBoundary": "Le contrôle de l’ordinateur n’isole pas le presse-papiers. Même si les outils du presse-papiers sont désactivés, un agent peut cliquer sur Coller dans une application partagée et voir ce que vous avez copié auparavant. Effacez le contenu sensible du presse-papiers avant d’autoriser le contrôle.",
     "indicator": {
       "actOne": "Les agents peuvent agir sur {app}",
       "actMany": "Les agents peuvent agir sur {count, plural, one {# fenêtre} other {# fenêtres}}",
@@ -5690,8 +5691,8 @@
         "hint": "Avec cette option, un agent peut lancer en arrière-plan une application installée — jamais codeg ni une des applications jamais partagées — et déplacer ou redimensionner une fenêtre sur laquelle vous le laissez agir. Lancer une application ne partage aucune de ses fenêtres : cela reste votre décision."
       },
       "clipboard": {
-        "label": "Autoriser les agents à utiliser le presse-papiers",
-        "hint": "Avec cette option, un agent peut placer du texte dans le presse-papiers pour le coller, et relire ce qu'il a copié depuis une fenêtre que vous lui avez partagée. Ce que vous copiez vous-même n'est jamais lu pour un agent, et un agent ne peut coller que ce qu'il y a placé lui-même."
+        "label": "Autoriser les agents à utiliser les outils du presse-papiers",
+        "hint": "Une fois activés, les outils du presse-papiers permettent à un agent d’écrire du texte à coller et de lire le contenu qu’il a copié depuis une fenêtre partagée."
       },
       "screen": {
         "label": "Proposer l'écran entier",

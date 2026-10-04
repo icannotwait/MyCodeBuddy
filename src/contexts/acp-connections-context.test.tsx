@@ -4431,7 +4431,7 @@ describe("AcpConnectionsProvider preview-tab release (disconnectIfIdle)", () => 
         expect.objectContaining({
           title: "Fix the flaky upload test",
           redactedTitle: "api - Codeg",
-          body: "api · notificationTurnComplete",
+          body: "api · notificationTurnComplete(agent=Claude Code)",
         })
       )
 
@@ -9121,9 +9121,9 @@ describe("AcpConnectionsProvider Grok cross-agent-type model switch", () => {
         action?: { label: string; onClick: () => void }
       },
     ]
-    expect(title).toBe("backendErrors.agentRuntimeOutdated")
+    expect(title).toBe("backendErrors.agentRuntimeOutdated(agent=Pi)")
     expect(options.description).toBe(instructions)
-    expect(options.action?.label).toBe("actions.openAgentsSettings")
+    expect(options.action?.label).toBe("§actions.openAgentsSettings")
     act(() => options.action!.onClick())
     expect(h.openSettingsWindow).toHaveBeenCalledWith("agents", {
       agentType: "pi",
@@ -22861,7 +22861,7 @@ describe("AIR session failures are told as notifications", () => {
 
     expect(h.toastError).toHaveBeenCalledTimes(1)
     const options = toastOptions(h.toastError.mock.calls[0])
-    expect(options.action?.label).toBe("action.login")
+    expect(options.action?.label).toBe("§action.login")
     act(() => options.action!.onClick())
     expect(h.openSettingsWindow).toHaveBeenCalledWith("agents", {
       agentType: "claude_code",
@@ -22870,7 +22870,7 @@ describe("AIR session failures are told as notifications", () => {
     const alert = h.recordAlert.mock.calls[0][0]
     expect(
       alert.actions.map((action: { label: string }) => action.label)
-    ).toEqual(["action.login"])
+    ).toEqual(["§action.login"])
   })
 
   it("gives no Sign in button to a verdict that is not about credentials", async () => {

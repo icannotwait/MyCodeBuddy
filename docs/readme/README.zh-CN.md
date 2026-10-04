@@ -33,7 +33,7 @@
 
 <table>
   <tr>
-    <td width="50%" valign="top">🧩 <strong>一个界面，容纳所有智能体</strong><br/>内置十五个智能体，任何兼容 ACP 的智能体都能加入——全部呈现为同一套结构化对话，而不是一个终端。</td>
+    <td width="50%" valign="top">🧩 <strong>一个界面，容纳所有智能体</strong><br/>内置十四个智能体，任何兼容 ACP 的智能体都能加入——全部呈现为同一套结构化对话，而不是一个终端。</td>
     <td width="50%" valign="top">🔎 <strong>会话随你流转</strong><br/>导入、搜索、续接每个智能体留在磁盘上的历史，还能把它交给另一个智能体接着做。</td>
   </tr>
   <tr>
@@ -110,7 +110,7 @@
 
 ### 一个界面，容纳所有智能体
 
-内置十五个智能体，其它兼容 ACP 的智能体也能从公开注册表或它的 distribution JSON 加入。Codeg 与每一个智能体都用 Agent Client Protocol 对话，所以它们拿到的是同一套丰富的对话界面——工具卡片、实时 diff、计划与权限确认——而不是一个得眯着眼看的终端。
+内置十四个智能体，其它兼容 ACP 的智能体也能从公开注册表或它的 distribution JSON 加入。Codeg 与每一个智能体都用 Agent Client Protocol 对话，所以它们拿到的是同一套丰富的对话界面——工具卡片、实时 diff、计划与权限确认——而不是一个得眯着眼看的终端。
 
 [文档 →](https://docs.codeg.app/zh/guide/supported-agents) · [自定义智能体 →](https://docs.codeg.app/zh/guide/custom-agents)
 
@@ -275,13 +275,12 @@ Codeg 可以作为桌面应用运行，也可以作为用任意浏览器访问�
 
 ## 🤖 支持的智能体
 
-Codeg 通过 [Agent Client Protocol](https://agentclientprotocol.com) 与每个智能体对话，所以它们拿到的都是同一套结构化界面。内置十五个，其中大部分 Codeg 都能替你安装、锁定版本并更新：
+Codeg 通过 [Agent Client Protocol](https://agentclientprotocol.com) 与每个智能体对话，所以它们拿到的都是同一套结构化界面。内置十四个，其中大部分 Codeg 都能替你安装、锁定版本并更新：
 
 <p>
   <a href="https://www.anthropic.com/claude-code"><kbd><img src="../images/agents/claude-code.svg" alt="" width="16" valign="middle" /> Claude Code</kbd></a> &nbsp;
   <a href="https://github.com/openai/codex"><kbd><img src="../images/agents/codex.svg" alt="" width="16" valign="middle" /> Codex</kbd></a> &nbsp;
   <a href="https://github.com/google-gemini/gemini-cli"><kbd><img src="../images/agents/gemini-cli.svg" alt="" width="16" valign="middle" /> Gemini CLI</kbd></a> &nbsp;
-  <a href="https://openclaw.ai"><kbd><img src="../images/agents/openclaw.svg" alt="" width="16" valign="middle" /> OpenClaw</kbd></a> &nbsp;
   <a href="https://opencode.ai"><kbd><picture><source media="(prefers-color-scheme: dark)" srcset="../images/agents/opencode-dark.svg" /><img src="../images/agents/opencode.svg" alt="" width="16" valign="middle" /></picture> OpenCode</kbd></a> &nbsp;
   <a href="https://cline.bot"><kbd><picture><source media="(prefers-color-scheme: dark)" srcset="../images/agents/cline-dark.svg" /><img src="../images/agents/cline.svg" alt="" width="16" valign="middle" /></picture> Cline</kbd></a> &nbsp;
   <a href="https://hermes-agent.nousresearch.com"><kbd><picture><source media="(prefers-color-scheme: dark)" srcset="../images/agents/hermes-agent-dark.svg" /><img src="../images/agents/hermes-agent.svg" alt="" width="16" valign="middle" /></picture> Hermes Agent</kbd></a> &nbsp;
@@ -326,6 +325,8 @@ $env:CODEG_STATIC_DIR="$env:LOCALAPPDATA\codeg-server\web"; codeg-server
 
 安装程序默认目录是 `%LOCALAPPDATA%\codeg-server`，因此不会覆盖 DrawCode 桌面安装。若旧版装在桌面目录里，脚本会把服务器挪出来。
 
+[GitHub Releases](https://github.com/icannotwait/MyCodeBuddy/releases) 也提供带签名的自托管服务器归档：`codeg-server-linux-x64.tar.gz`、`codeg-server-linux-arm64.tar.gz`、`codeg-server-darwin-x64.tar.gz`、`codeg-server-darwin-arm64.tar.gz` 和 `codeg-server-windows-x64.zip`。每份归档包含服务器、MCP 伴生进程、电脑操作辅助进程、`web/` 资源和许可证文件。
+
 **Docker** — 从本仓库构建可选服务器：
 
 ```bash
@@ -341,9 +342,25 @@ pnpm install && pnpm build
 cd src-tauri
 cargo build --release --bin codeg-server --no-default-features --features server
 cargo build --release --bin codeg-mcp --no-default-features --features mcp-bin
+# 仅在启用电脑操作时构建：
 cargo build --release --bin codeg-computer-helper --no-default-features --features computer-helper
 CODEG_STATIC_DIR=../out ./target/release/codeg-server
 ```
+
+**Linux/macOS 源码构建升级** — 在仓库根目录执行，拉取源码并重新构建：
+
+```bash
+git pull
+pnpm install && pnpm build
+cd src-tauri
+cargo build --release --bin codeg-server --no-default-features --features server
+cargo build --release --bin codeg-mcp --no-default-features --features mcp-bin
+# 仅在启用电脑操作时构建：
+cargo build --release --bin codeg-computer-helper --no-default-features --features computer-helper
+# 停止服务，重新部署服务器、MCP 伴生进程、可选的电脑操作辅助进程和 Web 资源，然后重启。
+```
+
+Docker 升级时，在仓库根目录执行 `git pull && docker compose up --build -d --force-recreate`。
 
 **移动端** — 安装 [iOS 应用](https://apps.apple.com/app/codeg-client/id6785199071) 或 [Android APK](https://github.com/xintaofei/codeg-android/releases/latest)，再把它指向桌面应用的 **Web 服务**或你自己的 `codeg-server`：填地址、填令牌，完成。配对步骤见 [移动应用](https://docs.codeg.app/zh/getting-started/installation#mobile-apps)。
 

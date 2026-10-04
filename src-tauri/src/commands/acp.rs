@@ -254,7 +254,6 @@ fn npm_install_attempts(
     Ok((pinned, None))
 }
 
-
 /// Check whether an NPX agent command is spawnable.
 /// Uses PATH first, then falls back to the current npm global prefix to handle
 /// GUI environments that don't inherit the user's shell PATH.
@@ -7212,7 +7211,9 @@ pub(crate) fn load_pi_config_core() -> PiConfigProjection {
     load_pi_config_at(&pi_agent_dir())
 }
 
-pub(crate) async fn load_pi_config_for_db(db: &AppDatabase) -> Result<PiConfigProjection, AcpError> {
+pub(crate) async fn load_pi_config_for_db(
+    db: &AppDatabase,
+) -> Result<PiConfigProjection, AcpError> {
     Ok(load_pi_config_at(&pi_settings_dir_from_db(db).await?))
 }
 
@@ -10860,7 +10861,7 @@ pub(crate) async fn build_session_runtime_env(
 async fn build_runtime_env_for_agent(
     db: &AppDatabase,
     agent_type: AgentType,
-    session_id: Option<&str>,
+    _session_id: Option<&str>,
     data_dir: &Path,
     allow_disabled: bool,
 ) -> Result<BTreeMap<String, String>, AcpError> {
@@ -12936,7 +12937,9 @@ pub async fn acp_update_pi_config(
 /// directory resolution.
 #[cfg(feature = "tauri-runtime")]
 #[cfg_attr(feature = "tauri-runtime", tauri::command)]
-pub async fn acp_load_pi_config(db: State<'_, AppDatabase>) -> Result<PiConfigProjection, AcpError> {
+pub async fn acp_load_pi_config(
+    db: State<'_, AppDatabase>,
+) -> Result<PiConfigProjection, AcpError> {
     load_pi_config_for_db(&db).await
 }
 
@@ -14836,9 +14839,7 @@ mod tests {
         // No approvals wanted: no preset says exactly that without widening the
         // sandbox, and the model-screened default is the nearest.
         assert_eq!(
-            initial_mode_for(
-                "approval_policy = \"never\"\nsandbox_mode = \"workspace-write\"\n"
-            ),
+            initial_mode_for("approval_policy = \"never\"\nsandbox_mode = \"workspace-write\"\n"),
             Some("agent")
         );
     }
@@ -16019,10 +16020,7 @@ base_url = \"https://example.test/v1\"
     // composer sends is clamped straight back and the picker looks broken. These
     // pin the shape pi actually reads.
 
-    fn pi_reasoning_spec(
-        reasoning: bool,
-        map: &[(&str, Option<&str>)],
-    ) -> PiModelReasoningSpec {
+    fn pi_reasoning_spec(reasoning: bool, map: &[(&str, Option<&str>)]) -> PiModelReasoningSpec {
         PiModelReasoningSpec {
             reasoning,
             thinking_level_map: map
@@ -16049,7 +16047,11 @@ base_url = \"https://example.test/v1\"
             "gpt-5.6-sol",
             Some(&pi_reasoning_spec(
                 true,
-                &[("off", Some("none")), ("minimal", None), ("xhigh", Some("xhigh"))],
+                &[
+                    ("off", Some("none")),
+                    ("minimal", None),
+                    ("xhigh", Some("xhigh")),
+                ],
             )),
         );
 
@@ -16073,7 +16075,11 @@ base_url = \"https://example.test/v1\"
             "reasoning-model",
             Some(&pi_reasoning_spec(
                 true,
-                &[("minimal", Some("minimal")), ("max", Some("max")), ("ultra", Some("ultra"))],
+                &[
+                    ("minimal", Some("minimal")),
+                    ("max", Some("max")),
+                    ("ultra", Some("ultra")),
+                ],
             )),
         );
 
@@ -16328,8 +16334,16 @@ base_url = \"https://example.test/v1\"
     fn pi_config_projection_reads_selected_agent_directory() {
         let default = tempfile::tempdir().unwrap();
         let custom = tempfile::tempdir().unwrap();
-        fs::write(default.path().join("settings.json"), r#"{"defaultModel":"wrong"}"#).unwrap();
-        fs::write(custom.path().join("settings.json"), r#"{"defaultModel":"right","defaultThinkingLevel":"max"}"#).unwrap();
+        fs::write(
+            default.path().join("settings.json"),
+            r#"{"defaultModel":"wrong"}"#,
+        )
+        .unwrap();
+        fs::write(
+            custom.path().join("settings.json"),
+            r#"{"defaultModel":"right","defaultThinkingLevel":"max"}"#,
+        )
+        .unwrap();
         let loaded = load_pi_config_at(custom.path());
         assert_eq!(loaded.default_model.as_deref(), Some("right"));
         assert_eq!(loaded.default_thinking_level.as_deref(), Some("max"));
@@ -16371,8 +16385,14 @@ esac
 "#,
         );
         let mut env = BTreeMap::new();
-        env.insert("PI_ACP_PI_COMMAND".into(), script.to_string_lossy().into_owned());
-        env.insert("PI_CODING_AGENT_DIR".into(), temp.path().to_string_lossy().into_owned());
+        env.insert(
+            "PI_ACP_PI_COMMAND".into(),
+            script.to_string_lossy().into_owned(),
+        );
+        env.insert(
+            "PI_CODING_AGENT_DIR".into(),
+            temp.path().to_string_lossy().into_owned(),
+        );
         let catalog = query_pi_model_catalog(&env, PI_ANSWER_DEADLINE).await;
         assert_eq!(catalog.status, PiCatalogStatus::Ok);
         assert_eq!(catalog.models.len(), 1);
@@ -16480,7 +16500,10 @@ echo {"id":"codeg-models","type":"response","command":"get_available_models","su
 "#.replace('\n', "\r\n"),
         ).unwrap();
         let mut env = BTreeMap::new();
-        env.insert("PI_ACP_PI_COMMAND".into(), script.to_string_lossy().into_owned());
+        env.insert(
+            "PI_ACP_PI_COMMAND".into(),
+            script.to_string_lossy().into_owned(),
+        );
         let catalog = query_pi_model_catalog(&env, PI_ANSWER_DEADLINE).await;
         assert_eq!(catalog.status, PiCatalogStatus::Ok);
         assert_eq!(catalog.models.len(), 1);
@@ -16617,7 +16640,11 @@ echo {"id":"codeg-models","type":"response","command":"get_available_models","su
             "gpt-5.6-sol",
             Some(&pi_reasoning_spec(
                 true,
-                &[("off", Some("none")), ("minimal", None), ("low", Some("LOW"))],
+                &[
+                    ("off", Some("none")),
+                    ("minimal", None),
+                    ("low", Some("LOW")),
+                ],
             )),
         );
 
@@ -16626,7 +16653,10 @@ echo {"id":"codeg-models","type":"response","command":"get_available_models","su
         assert_eq!(models.len(), 1);
         assert_eq!(models[0].id, "gpt-5.6-sol");
         assert_eq!(models[0].reasoning, Some(true));
-        assert_eq!(models[0].thinking_level_map["off"], Some("none".to_string()));
+        assert_eq!(
+            models[0].thinking_level_map["off"],
+            Some("none".to_string())
+        );
         assert_eq!(models[0].thinking_level_map["minimal"], None);
         assert_eq!(models[0].thinking_level_map["low"], Some("LOW".to_string()));
     }
@@ -17860,7 +17890,6 @@ wire_api = "chat"
     fn build_npm_install_spec_rejects_invalid_override() {
         assert!(build_npm_install_spec("cline@3.0.9", Some("latest")).is_err());
     }
-
 
     // The pinned default is byte-identical to what `build_npm_install_spec`
     // produced before the channel existed, with no fallback attempt.

@@ -9,7 +9,10 @@
 // The unoptimized lib test binary trips the same harmless macOS
 // "__eh_frame section too large" linker warning as the `codeg` binary; see the
 // note at the top of `main.rs`.
-#![cfg_attr(debug_assertions, allow(linker_messages))]
+#![cfg_attr(
+    all(debug_assertions, test, target_os = "macos"),
+    allow(linker_messages)
+)]
 
 pub mod acp;
 pub mod acp_transcript;
@@ -821,16 +824,16 @@ mod tauri_app {
         if let Some(cm) = app.try_state::<ConnectionManager>() {
             // Disconnect first so terminal ACP events enter the desktop
             // queue before we drain the batcher.
-            tauri::async_runtime::block_on(cm.disconnect_all(
-                crate::acp::termination::AcpDisconnectOrigin::ApplicationShutdown,
-            ));
+            tauri::async_runtime::block_on(
+                cm.disconnect_all(
+                    crate::acp::termination::AcpDisconnectOrigin::ApplicationShutdown,
+                ),
+            );
         }
         tauri::async_runtime::block_on(
             crate::acp::terminal_runtime::kill_all_registered_acp_terminals(),
         );
-        if let Some(delivery) =
-            app.try_state::<std::sync::Arc<crate::acp::DesktopAcpDelivery>>()
-        {
+        if let Some(delivery) = app.try_state::<std::sync::Arc<crate::acp::DesktopAcpDelivery>>() {
             if let Err(error) = tauri::async_runtime::block_on(delivery.shutdown()) {
                 tracing::error!("[ACP] desktop delivery shutdown failed: {error}");
             }

@@ -610,9 +610,9 @@ async fn async_main() -> ExitCode {
                 // The screen this server runs on, where it is let share it
                 // (`CODEG_COMPUTER_USE`); none otherwise.
                 match state.computer_service.get() {
-                    Some(service) => Arc::new(
-                        codeg_lib::commands::computer::McpComputerTools::new(service.clone()),
-                    )
+                    Some(service) => Arc::new(codeg_lib::commands::computer::McpComputerTools::new(
+                        service.clone(),
+                    ))
                         as Arc<dyn codeg_lib::acp::computer_tools::ComputerToolAccess>,
                     None => Arc::new(codeg_lib::acp::computer_tools::NoComputerDesktop),
                 },

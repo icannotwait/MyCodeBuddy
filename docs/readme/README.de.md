@@ -33,7 +33,7 @@
 
 <table>
   <tr>
-    <td width="50%" valign="top">🧩 <strong>Eine Oberfläche für alle Agenten</strong><br/>Fünfzehn Agenten sind eingebaut, und jeder ACP-Agent kann dazukommen — alle dargestellt als dieselbe strukturierte Unterhaltung, nicht als Terminal.</td>
+    <td width="50%" valign="top">🧩 <strong>Eine Oberfläche für alle Agenten</strong><br/>Vierzehn Agenten sind eingebaut, und jeder ACP-Agent kann dazukommen — alle dargestellt als dieselbe strukturierte Unterhaltung, nicht als Terminal.</td>
     <td width="50%" valign="top">🔎 <strong>Sitzungen zum Mitnehmen</strong><br/>Importiere, durchsuche und setze die Historie fort, die jeder Agent auf der Festplatte ablegt, und übergib sie dann an einen anderen Agenten.</td>
   </tr>
   <tr>
@@ -110,7 +110,7 @@
 
 ### Eine Oberfläche für alle Agenten
 
-Fünfzehn Agenten sind eingebaut, und jeder weitere ACP-Agent kann aus der öffentlichen Registry oder über sein Distribution-JSON dazukommen. Codeg spricht mit jedem von ihnen über das Agent Client Protocol, sodass alle dieselbe reichhaltige Unterhaltung bekommen — Tool-Karten, Live-Diffs, Pläne und Berechtigungsanfragen — statt eines Terminals, vor dem du die Augen zusammenkneifst.
+Vierzehn Agenten sind eingebaut, und jeder weitere ACP-Agent kann aus der öffentlichen Registry oder über sein Distribution-JSON dazukommen. Codeg spricht mit jedem von ihnen über das Agent Client Protocol, sodass alle dieselbe reichhaltige Unterhaltung bekommen — Tool-Karten, Live-Diffs, Pläne und Berechtigungsanfragen — statt eines Terminals, vor dem du die Augen zusammenkneifst.
 
 [Doku →](https://docs.codeg.app/guide/supported-agents) · [Eigene Agenten →](https://docs.codeg.app/guide/custom-agents)
 
@@ -275,13 +275,12 @@ Ein Editor, Live- und Zwei-Spalten-Diffs, ein vollwertiger Git-Client mit dreisp
 
 ## 🤖 Unterstützte Agenten
 
-Codeg spricht mit jedem Agenten über das [Agent Client Protocol](https://agentclientprotocol.com), sodass jeder dieselbe strukturierte Oberfläche bekommt. Fünfzehn sind eingebaut, und die meisten davon installiert, fixiert und aktualisiert Codeg für dich:
+Codeg spricht mit jedem Agenten über das [Agent Client Protocol](https://agentclientprotocol.com), sodass jeder dieselbe strukturierte Oberfläche bekommt. Vierzehn sind eingebaut, und die meisten davon installiert, fixiert und aktualisiert Codeg für dich:
 
 <p>
   <a href="https://www.anthropic.com/claude-code"><kbd><img src="../images/agents/claude-code.svg" alt="" width="16" valign="middle" /> Claude Code</kbd></a> &nbsp;
   <a href="https://github.com/openai/codex"><kbd><img src="../images/agents/codex.svg" alt="" width="16" valign="middle" /> Codex</kbd></a> &nbsp;
   <a href="https://github.com/google-gemini/gemini-cli"><kbd><img src="../images/agents/gemini-cli.svg" alt="" width="16" valign="middle" /> Gemini CLI</kbd></a> &nbsp;
-  <a href="https://openclaw.ai"><kbd><img src="../images/agents/openclaw.svg" alt="" width="16" valign="middle" /> OpenClaw</kbd></a> &nbsp;
   <a href="https://opencode.ai"><kbd><picture><source media="(prefers-color-scheme: dark)" srcset="../images/agents/opencode-dark.svg" /><img src="../images/agents/opencode.svg" alt="" width="16" valign="middle" /></picture> OpenCode</kbd></a> &nbsp;
   <a href="https://cline.bot"><kbd><picture><source media="(prefers-color-scheme: dark)" srcset="../images/agents/cline-dark.svg" /><img src="../images/agents/cline.svg" alt="" width="16" valign="middle" /></picture> Cline</kbd></a> &nbsp;
   <a href="https://hermes-agent.nousresearch.com"><kbd><picture><source media="(prefers-color-scheme: dark)" srcset="../images/agents/hermes-agent-dark.svg" /><img src="../images/agents/hermes-agent.svg" alt="" width="16" valign="middle" /></picture> Hermes Agent</kbd></a> &nbsp;
@@ -326,6 +325,8 @@ $env:CODEG_STATIC_DIR="$env:LOCALAPPDATA\codeg-server\web"; codeg-server
 
 Der Installer verwendet standardmäßig `%LOCALAPPDATA%\codeg-server` und überschreibt damit keine DrawCode-Desktop-Installation. Liegt eine ältere Installation im Desktop-Ordner, verschiebt das Skript den Server dort heraus.
 
+[GitHub Releases](https://github.com/icannotwait/MyCodeBuddy/releases) bieten auch signierte Server-Archive für Self-Hosting: `codeg-server-linux-x64.tar.gz`, `codeg-server-linux-arm64.tar.gz`, `codeg-server-darwin-x64.tar.gz`, `codeg-server-darwin-arm64.tar.gz` und `codeg-server-windows-x64.zip`. Jedes enthält den Server, den MCP-Begleitprozess, den Computer-Helper, `web/`-Assets und Lizenzdateien.
+
 **Docker** — den optionalen Server aus diesem Repository bauen:
 
 ```bash
@@ -341,9 +342,25 @@ pnpm install && pnpm build
 cd src-tauri
 cargo build --release --bin codeg-server --no-default-features --features server
 cargo build --release --bin codeg-mcp --no-default-features --features mcp-bin
+# Nur wenn die Computersteuerung aktiviert ist:
 cargo build --release --bin codeg-computer-helper --no-default-features --features computer-helper
 CODEG_STATIC_DIR=../out ./target/release/codeg-server
 ```
+
+**Upgrades quellcodebasierter Linux/macOS-Installationen** — Im Repository-Stamm ausführen, um den Quellcode abzurufen und neu zu bauen:
+
+```bash
+git pull
+pnpm install && pnpm build
+cd src-tauri
+cargo build --release --bin codeg-server --no-default-features --features server
+cargo build --release --bin codeg-mcp --no-default-features --features mcp-bin
+# Nur wenn die Computersteuerung aktiviert ist:
+cargo build --release --bin codeg-computer-helper --no-default-features --features computer-helper
+# Dienst stoppen, Server, MCP-Begleitprozess, optionalen Computer-Helper und Web-Assets neu bereitstellen, dann neu starten.
+```
+
+Für Docker-Upgrades im Repository-Stamm `git pull && docker compose up --build -d --force-recreate` ausführen.
 
 **Mobil** — installiere die [iOS-App](https://apps.apple.com/app/codeg-client/id6785199071) oder das [Android-APK](https://github.com/xintaofei/codeg-android/releases/latest) und richte sie auf den **Webdienst** deiner Desktop-App oder auf deinen eigenen `codeg-server`: URL, Token, fertig. Die Kopplungsschritte stehen in [Mobile Apps](https://docs.codeg.app/getting-started/installation#mobile-apps).
 

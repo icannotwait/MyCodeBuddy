@@ -1,7 +1,7 @@
 pub mod agent_mentions;
-pub mod air_contract;
 pub mod agent_process;
 pub mod agent_session;
+pub mod air_contract;
 pub mod antigravity_login;
 pub mod autonomous_activity;
 pub mod background_watch;
@@ -55,8 +55,8 @@ pub mod registry;
 pub mod remote_registry;
 pub mod request_usage;
 pub mod scratch_dir;
-pub mod session_attach;
 pub mod service_error;
+pub mod session_attach;
 pub mod session_info;
 pub mod session_state;
 pub mod session_title;

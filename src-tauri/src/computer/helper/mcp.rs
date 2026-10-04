@@ -444,7 +444,10 @@ mod tests {
             client.call_tool("list_windows", json!({}), Duration::from_secs(5)),
         );
         assert_eq!(apps.unwrap().text(), "list_apps");
-        assert_eq!(windows.unwrap().structured.unwrap()["which"], "list_windows");
+        assert_eq!(
+            windows.unwrap().structured.unwrap()["which"],
+            "list_windows"
+        );
         server.await.unwrap();
     }
 
@@ -539,7 +542,11 @@ mod tests {
         let client = McpClient::start(client_read, client_write);
         let big = "x".repeat(4096);
         let err = client
-            .call_tool("get_window_state", json!({ "query": big }), Duration::from_secs(60))
+            .call_tool(
+                "get_window_state",
+                json!({ "query": big }),
+                Duration::from_secs(60),
+            )
             .await
             .unwrap_err();
         assert_eq!(err, McpError::Timeout);

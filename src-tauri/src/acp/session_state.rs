@@ -4560,7 +4560,10 @@ mod tests {
             parent_tool_use_id: None,
         });
         assert!(s.begin_agent_initiated_turn());
-        assert!(s.live_message.is_none(), "the turn starts from a clean slate");
+        assert!(
+            s.live_message.is_none(),
+            "the turn starts from a clean slate"
+        );
         s.apply_event(&AcpEvent::StatusChanged {
             status: ConnectionStatus::Prompting,
         });
@@ -4574,6 +4577,9 @@ mod tests {
             session_id: "ext".into(),
             stop_reason: "cancelled".into(),
             agent_type: "grok".into(),
+            mark_awaiting_reply: false,
+            termination_source: None,
+            provider_turn_id: None,
         });
         assert!(s.turn_in_flight, "the admitted prompt still owns the gate");
         assert!(!s.agent_initiated_turn);
@@ -4587,6 +4593,9 @@ mod tests {
             session_id: "ext".into(),
             stop_reason: "end_turn".into(),
             agent_type: "grok".into(),
+            mark_awaiting_reply: false,
+            termination_source: None,
+            provider_turn_id: None,
         });
         assert!(!s.turn_in_flight);
     }

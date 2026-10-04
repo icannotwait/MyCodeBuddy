@@ -1614,7 +1614,10 @@ mod tests {
         )
         .await;
 
-        assert!(result.is_err(), "a deleted conversation cannot be collected");
+        assert!(
+            result.is_err(),
+            "a deleted conversation cannot be collected"
+        );
         let snapshot = canvas_list_nodes_core(&db, board).await.expect("snapshot");
         assert_eq!(snapshot.revision, 0);
         assert!(

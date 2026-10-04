@@ -20,6 +20,16 @@ use tokio::sync::oneshot;
 use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
 
+use crate::acp::browser_tools::{
+    BrowserActOutcome, BrowserCaptureOutcome, BrowserConsoleOutcome, BrowserEvalOutcome,
+    BrowserSnapshotOutcome, BrowserTabOutcome, BrowserTabsOutcome, BrowserToolAccess,
+    ERROR_NO_SUCH_TAB,
+};
+use crate::acp::chat_authoring::{AuthoringContext, AuthoringOutcome, ChatAuthoringAccess};
+use crate::acp::computer_tools::{
+    ComputerActOutcome, ComputerAppsOutcome, ComputerCaptureOutcome, ComputerSnapshotOutcome,
+    ComputerToolAccess, ComputerVerifyOutcome, ComputerWindowsOutcome, ERROR_NO_SUCH_TARGET,
+};
 use crate::acp::delegation::broker::{
     DelegationBroker, StatusWait, StatusWaitPreflight, StatusWaitPreflightKind,
 };
@@ -36,33 +46,23 @@ use crate::acp::delegation::recovery_policy::{
 use crate::acp::delegation::run_store::{
     recovery_action_payload, recovery_source_from_continue_eligibility,
 };
-use crate::acp::browser_tools::{
-    BrowserActOutcome, BrowserCaptureOutcome, BrowserConsoleOutcome, BrowserEvalOutcome,
-    BrowserSnapshotOutcome, BrowserTabOutcome, BrowserTabsOutcome, BrowserToolAccess,
-    ERROR_NO_SUCH_TAB,
-};
-use crate::acp::chat_authoring::{AuthoringContext, AuthoringOutcome, ChatAuthoringAccess};
-use crate::acp::computer_tools::{
-    ComputerActOutcome, ComputerAppsOutcome, ComputerCaptureOutcome, ComputerSnapshotOutcome,
-    ComputerToolAccess, ComputerVerifyOutcome, ComputerWindowsOutcome, ERROR_NO_SUCH_TARGET,
-};
 use crate::acp::delegation::transport::{
-    read_frame, write_frame, BrokerAskRequest, BrokerCancelRequest, BrokerCancelTaskRequest,
-    BrokerCommitFeedbackRequest, BrokerCompleteWorkRequest, BrokerFeedbackRequest,
+    read_frame, write_frame, BrokerAskRequest, BrokerBrowserActRequest,
+    BrokerBrowserCaptureRequest, BrokerBrowserConsoleRequest, BrokerBrowserEvalRequest,
+    BrokerBrowserSnapshotRequest, BrokerBrowserTabOpRequest, BrokerBrowserTabsRequest,
+    BrokerCancelRequest, BrokerCancelTaskRequest, BrokerCommitFeedbackRequest,
+    BrokerCompleteWorkRequest, BrokerComputerActRequest, BrokerComputerAppsRequest,
+    BrokerComputerCaptureRequest, BrokerComputerClipboardRequest, BrokerComputerLaunchRequest,
+    BrokerComputerSnapshotRequest, BrokerComputerVerifyRequest, BrokerComputerWindowsRequest,
+    BrokerCreateAutomationRequest, BrokerCreateWorkTaskRequest, BrokerFeedbackRequest,
     BrokerGetWorkflowStateRequest, BrokerMessage, BrokerOrchestrationBindingsRequest,
     BrokerParentDecisionRequest, BrokerPublishWorkflowRequest, BrokerRecoverWorkflowRequest,
     BrokerRecoveryAuthorizationRequest, BrokerRegisterSimpleWorkflowRequest,
     BrokerReplyDelegationRequest, BrokerRequest, BrokerResponse, BrokerResumeTaskRequest,
-    BrokerSessionRequest, BrokerSettleWorkflowRequest, BrokerStatusRequest, CancelDelegationReason,
-    CompanionReadyAck, CompanionRole, BrokerBrowserActRequest, BrokerBrowserCaptureRequest,
-    BrokerBrowserConsoleRequest, BrokerBrowserEvalRequest, BrokerBrowserSnapshotRequest,
-    BrokerBrowserTabOpRequest, BrokerBrowserTabsRequest, BrokerComputerActRequest,
-    BrokerComputerAppsRequest, BrokerComputerCaptureRequest, BrokerComputerLaunchRequest,
-    BrokerComputerSnapshotRequest, BrokerComputerVerifyRequest, BrokerComputerWindowsRequest,
-    BrokerCreateAutomationRequest, BrokerCreateWorkTaskRequest, BrokerTaskCompleteRequest,
-    BrokerTaskProgressRequest, BrokerComputerClipboardRequest,
+    BrokerSessionRequest, BrokerSettleWorkflowRequest, BrokerStatusRequest,
+    BrokerTaskCompleteRequest, BrokerTaskProgressRequest, CancelDelegationReason,
+    CompanionReadyAck, CompanionRole,
 };
-use crate::acp::work_task_tools::{TaskReportAck, WorkTaskToolAccess};
 use crate::acp::delegation::types::{
     correlation_error_message, parse_admission_ticket_v1_request, validate_correlation_id,
     AdmissionPreparation, CorrelationEntryPoint, CorrelationFailureKind, DelegationReplyResult,
@@ -101,6 +101,7 @@ use crate::acp::recovery_authorization::{
 #[cfg(unix)]
 use crate::acp::scratch_dir::SUN_PATH_CAP;
 use crate::acp::session_info::{SessionInfo, SessionInfoAccess};
+use crate::acp::work_task_tools::{TaskReportAck, WorkTaskToolAccess};
 use crate::db::entities::delegation_workflow_gate_settlement::GateSettlementOutcome;
 use crate::db::entities::{
     delegation_workflow, delegation_workflow_run_binding, recovery_authorization,
@@ -2054,7 +2055,6 @@ impl DelegationListener {
             .ok_or(OrchestrationBindingQueryAuthError::NoActiveConversation)
     }
 
-
     async fn process_browser_tabs(&self, req: BrokerBrowserTabsRequest) -> BrowserTabsOutcome {
         if self.tokens.lookup(&req.token).await.is_none() {
             return BrowserTabsOutcome::default();
@@ -2205,7 +2205,9 @@ impl DelegationListener {
                 crate::acp::computer_tools::no_such_target_note(&req.target_id),
             );
         }
-        self.computer.capture(&req.target_id, req.max_dimension).await
+        self.computer
+            .capture(&req.target_id, req.max_dimension)
+            .await
     }
 
     async fn process_computer_snapshot(
@@ -2270,7 +2272,7 @@ impl DelegationListener {
     /// hears what a runtime with no desktop hears, and nothing is done.
     async fn process_computer_clipboard(
         &self,
-        req: crate::acp::delegation::transport::BrokerComputerClipboardRequest,
+        req: BrokerComputerClipboardRequest,
     ) -> crate::acp::computer_tools::ComputerClipboardOutcome {
         if self.tokens.lookup(&req.token).await.is_none() {
             return crate::acp::computer_tools::ComputerClipboardOutcome::refused(
@@ -2342,7 +2344,6 @@ impl DelegationListener {
         };
         self.authoring.create_work_task(ctx, req.spec).await
     }
-
 
     async fn process_orchestration_bindings(
         &self,
@@ -4004,9 +4005,7 @@ fn browser_tabs_response(outcome: BrowserTabsOutcome) -> std::io::Result<BrokerR
 /// Serialize a [`BrowserSnapshotOutcome`] into a [`BrokerResponse`] for the
 /// `BrowserSnapshot` arm — the companion renders it into the `browser_snapshot`
 /// tool result.
-fn browser_snapshot_response(
-    outcome: BrowserSnapshotOutcome,
-) -> std::io::Result<BrokerResponse> {
+fn browser_snapshot_response(outcome: BrowserSnapshotOutcome) -> std::io::Result<BrokerResponse> {
     Ok(BrokerResponse {
         outcome: serde_json::to_value(&outcome).map_err(|e| {
             std::io::Error::new(std::io::ErrorKind::InvalidData, format!("encode: {e}"))
@@ -4355,6 +4354,8 @@ pub fn default_socket_path(_temp_dir: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::acp::browser_tools::{NoBrowserTabs, ERROR_GRANT_REQUIRED, ERROR_NO_SUCH_TAB};
+    use crate::acp::computer_tools::NoComputerDesktop;
     use crate::acp::connection::SuspensionAck;
     use crate::acp::delegation::attention::{
         mock::MemoryDelegationAttentionStore, AttentionOpenResult, AttentionRecord,
@@ -4380,8 +4381,6 @@ mod tests {
     use crate::acp::delegation::spawner::{
         accepted, mock::MockSpawner, ConnectionSpawner, ResumedSpawn, SpawnerError,
     };
-    use crate::acp::browser_tools::{NoBrowserTabs, ERROR_GRANT_REQUIRED, ERROR_NO_SUCH_TAB};
-    use crate::acp::computer_tools::NoComputerDesktop;
     use crate::acp::delegation::types::{DelegationError, DelegationOutcome, DelegationSuccess};
     use crate::acp::delegation::workflow::publish_workflow_manifest_fixture;
     use crate::acp::tool_watchdog::{CancelCause, WaitCancelResult, WaitStamp};
@@ -4611,11 +4610,7 @@ mod tests {
                 note: None,
             }
         }
-        async fn snapshot(
-            &self,
-            tab_id: &str,
-            max_chars: Option<usize>,
-        ) -> BrowserSnapshotOutcome {
+        async fn snapshot(&self, tab_id: &str, max_chars: Option<usize>) -> BrowserSnapshotOutcome {
             self.calls
                 .lock()
                 .await
@@ -4669,10 +4664,7 @@ mod tests {
             ));
             BrowserActOutcome::control_required(tab_id)
         }
-        async fn tab_op(
-            &self,
-            op: crate::acp::browser_tools::BrowserTabOp,
-        ) -> BrowserTabOutcome {
+        async fn tab_op(&self, op: crate::acp::browser_tools::BrowserTabOp) -> BrowserTabOutcome {
             self.calls
                 .lock()
                 .await
@@ -5899,7 +5891,6 @@ mod tests {
             Arc::new(StubFeedback::default()),
             Arc::new(StubQuestion::default()),
             Arc::new(StubSessionInfo::default()),
-        
             Arc::new(StubTaskTools),
             Arc::new(StubAuthoring::default()),
             Arc::new(NoBrowserTabs),
@@ -6324,7 +6315,6 @@ mod tests {
             Arc::new(StubQuestion::default()),
             Arc::new(StubSessionInfo::default()),
             wait_cancel,
-        
             Arc::new(StubTaskTools),
             Arc::new(StubAuthoring::default()),
             Arc::new(NoBrowserTabs),
@@ -10363,7 +10353,6 @@ mod tests {
             Arc::new(StubFeedback::default()),
             Arc::new(StubQuestion::default()),
             Arc::new(StubSessionInfo::default()),
-        
             Arc::new(StubTaskTools),
             Arc::new(StubAuthoring::default()),
             Arc::new(NoBrowserTabs),
@@ -11743,7 +11732,6 @@ mod tests {
             Arc::new(StubSessionInfo::default()),
             crate::acp::delegation::wait_cancel::WaitCancelRegistry::new_shared(),
             EventEmitter::test_web_only(broadcaster),
-        
             Arc::new(StubTaskTools),
             Arc::new(StubAuthoring::default()),
             Arc::new(NoBrowserTabs),
@@ -11922,7 +11910,6 @@ mod tests {
             Arc::new(StubSessionInfo::default()),
             crate::acp::delegation::wait_cancel::WaitCancelRegistry::new_shared(),
             EventEmitter::Noop,
-        
             Arc::new(StubTaskTools),
             Arc::new(StubAuthoring::default()),
             Arc::new(NoBrowserTabs),
@@ -12106,7 +12093,6 @@ mod tests {
             Arc::new(StubSessionInfo::default()),
             crate::acp::delegation::wait_cancel::WaitCancelRegistry::new_shared(),
             EventEmitter::Noop,
-        
             Arc::new(StubTaskTools),
             Arc::new(StubAuthoring::default()),
             Arc::new(NoBrowserTabs),
@@ -12248,6 +12234,14 @@ mod tests {
                 compact_catalog: false,
                 workflow_v2: true,
                 completion_v2: false,
+                tasks: false,
+                automations: false,
+                taskboard: false,
+                browser: false,
+                browser_eval: false,
+                computer: false,
+                computer_launch: false,
+                computer_clipboard: false,
             },
             role: CompanionRole::Root,
             can_spawn_child: true,
@@ -12639,7 +12633,6 @@ mod tests {
             Arc::new(StubFeedback::default()),
             Arc::new(StubQuestion::default()),
             Arc::new(StubSessionInfo::default()),
-        
             Arc::new(StubTaskTools),
             Arc::new(StubAuthoring::default()),
             Arc::new(NoBrowserTabs),
@@ -13082,7 +13075,6 @@ mod tests {
             Arc::new(StubFeedback::default()),
             Arc::new(StubQuestion::default()),
             Arc::new(StubSessionInfo::default()),
-        
             Arc::new(StubTaskTools),
             Arc::new(StubAuthoring::default()),
             Arc::new(NoBrowserTabs),
@@ -13304,12 +13296,11 @@ mod tests {
                 Arc::new(StubFeedback::default()),
                 Arc::clone(&questions) as Arc<dyn SessionQuestionAccess>,
                 Arc::new(StubSessionInfo::default()),
-            
                 Arc::new(StubTaskTools),
                 Arc::new(StubAuthoring::default()),
                 Arc::new(NoBrowserTabs),
-            Arc::new(NoComputerDesktop),
-        );
+                Arc::new(NoComputerDesktop),
+            );
             RecoveryFixture {
                 db,
                 folder_id,
@@ -14412,7 +14403,9 @@ mod tests {
 
         let listed = browser_round_trip(
             listener.clone(),
-            BrokerMessage::BrowserTabs(BrokerBrowserTabsRequest { token: "tok".into() }),
+            BrokerMessage::BrowserTabs(BrokerBrowserTabsRequest {
+                token: "tok".into(),
+            }),
         )
         .await;
         assert_eq!(listed.outcome["tabs"][0]["tabId"], "t1");
@@ -14567,7 +14560,10 @@ mod tests {
             },
         );
         let response = browser_capture_response(huge).unwrap();
-        assert_eq!(response.outcome["error"], crate::acp::browser_tools::ERROR_READ_FAILED);
+        assert_eq!(
+            response.outcome["error"],
+            crate::acp::browser_tools::ERROR_READ_FAILED
+        );
         assert_eq!(response.outcome["tabId"], "t1");
         assert!(response.outcome.get("capture").is_none());
         assert!(serde_json::to_vec(&response.outcome).unwrap().len() < 4096);
@@ -14589,7 +14585,10 @@ mod tests {
                 clipped: false,
             },
         );
-        assert_eq!(browser_capture_response(small).unwrap().outcome["capture"]["data"], "AAAA");
+        assert_eq!(
+            browser_capture_response(small).unwrap().outcome["capture"]["data"],
+            "AAAA"
+        );
     }
 
     /// A caller who cannot prove it is a companion is told the same thing a

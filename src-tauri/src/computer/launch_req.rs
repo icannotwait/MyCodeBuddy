@@ -204,10 +204,7 @@ pub(crate) fn held_here() -> bool {
 /// # Safety
 ///
 /// `attr` must be an initialised `posix_spawnattr_t`.
-pub unsafe fn apply(
-    attr: &mut libc::posix_spawnattr_t,
-    requirement: &[u8],
-) -> std::io::Result<()> {
+pub unsafe fn apply(attr: &mut libc::posix_spawnattr_t, requirement: &[u8]) -> std::io::Result<()> {
     let set = set_fn().ok_or_else(|| {
         std::io::Error::other(
             "computer use needs macOS 14.4 or later, the first to let a launch be held to a \

@@ -77,5 +77,9 @@ export function useComputerEnabled({
     []
   )
 
-  return { enabled, mark, applySince }
+  return {
+    enabled: desktopOnly && !available ? null : enabled,
+    mark,
+    applySince,
+  }
 }

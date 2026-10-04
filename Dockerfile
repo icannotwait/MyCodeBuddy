@@ -9,7 +9,7 @@ COPY public/ ./public/
 COPY next.config.ts tsconfig.json postcss.config.mjs components.json ./
 RUN pnpm build
 
-# Stage 2: Build Rust server binary + codeg-mcp companion
+# Stage 2: Build Rust server and its runtime companions
 FROM rust:slim-bookworm AS backend
 RUN apt-get update && apt-get install -y pkg-config libssl-dev && rm -rf /var/lib/apt/lists/*
 WORKDIR /app/src-tauri
@@ -22,7 +22,8 @@ COPY src-tauri/ ./
 # `mcp-bin` is required for the delegation companion; it is not a default
 # feature, so `tauri build` does not replace the sidecar with a desktop copy.
 RUN cargo build --release --bin codeg-server --no-default-features --features server \
- && cargo build --release --bin codeg-mcp --no-default-features --features mcp-bin
+ && cargo build --release --bin codeg-mcp --no-default-features --features mcp-bin \
+ && cargo build --release --bin codeg-computer-helper --no-default-features --features computer-helper
 
 # Stage 3: Runtime
 FROM node:24-bookworm-slim
@@ -48,6 +49,7 @@ RUN apt-get update && apt-get install -y \
 
 COPY --from=backend /app/src-tauri/target/release/codeg-server /usr/local/bin/codeg-server
 COPY --from=backend /app/src-tauri/target/release/codeg-mcp /usr/local/bin/codeg-mcp
+COPY --from=backend /app/src-tauri/target/release/codeg-computer-helper /usr/local/bin/codeg-computer-helper
 COPY --from=frontend /app/out /app/web
 
 ENV CODEG_STATIC_DIR=/app/web

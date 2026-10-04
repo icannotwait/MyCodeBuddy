@@ -560,12 +560,31 @@ describe("ComputerSettingsSection", () => {
     expect(mockSet.mock.calls[0][0]).toEqual({ launchEnabled: true })
   })
 
+  it("explains that clipboard tools do not isolate app Paste while off or on", async () => {
+    mount()
+    const clipboard = await screen.findByRole("switch", {
+      name: "Let agents use clipboard tools",
+    })
+    await waitFor(() => expect(clipboard).not.toBeDisabled())
+    expect(clipboard).not.toBeChecked()
+    const notice = screen.getByText(
+      "Computer control does not isolate your clipboard. Even with clipboard tools off, an agent can click Paste in a shared app and expose what you copied earlier. Clear sensitive clipboard content before granting control."
+    )
+    expect(notice).toBeVisible()
+    expect(
+      screen.queryByText(/What you copied yourself is never read/)
+    ).toBeNull()
+    fireEvent.click(clipboard)
+    expect(clipboard).toBeChecked()
+    expect(notice).toBeVisible()
+  })
+
   /** The clipboard tools are off until the person turns them on; turning
    *  them on saves only that. */
   it("lets agents use the clipboard, saving only that", async () => {
     mount()
     const clipboard = await screen.findByRole("switch", {
-      name: "Let agents use the clipboard",
+      name: "Let agents use clipboard tools",
     })
     await waitFor(() => expect(clipboard).not.toBeDisabled())
     expect(clipboard).not.toBeChecked()
@@ -598,7 +617,9 @@ describe("ComputerSettingsSection", () => {
     where.serverPlatform = "windows"
     platform.isLinux = true
     mount()
-    await screen.findByRole("switch", { name: "Let agents use the clipboard" })
+    await screen.findByRole("switch", {
+      name: "Let agents use clipboard tools",
+    })
     expect(
       screen.getByRole("switch", { name: "Offer the entire screen" })
     ).toBeInTheDocument()
@@ -614,7 +635,9 @@ describe("ComputerSettingsSection", () => {
     where.local = false
     where.serverPlatform = "linux"
     mount()
-    await screen.findByRole("switch", { name: "Let agents use the clipboard" })
+    await screen.findByRole("switch", {
+      name: "Let agents use clipboard tools",
+    })
     expect(
       screen.queryByRole("switch", { name: "Offer the entire screen" })
     ).toBeNull()
@@ -625,7 +648,9 @@ describe("ComputerSettingsSection", () => {
   it("has no entire screen to offer on Linux", async () => {
     platform.isLinux = true
     mount()
-    await screen.findByRole("switch", { name: "Let agents use the clipboard" })
+    await screen.findByRole("switch", {
+      name: "Let agents use clipboard tools",
+    })
     expect(
       screen.queryByRole("switch", { name: "Offer the entire screen" })
     ).toBeNull()

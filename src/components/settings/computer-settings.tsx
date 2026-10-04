@@ -602,7 +602,14 @@ export function ComputerSettingsSection() {
           <SettingRow
             icon={ClipboardList}
             title={t("clipboard.label")}
-            description={t("clipboard.hint")}
+            description={
+              <>
+                <span className="block">{t("clipboard.hint")}</span>
+                <span className="mt-1 block">
+                  {tComputer("clipboardBoundary")}
+                </span>
+              </>
+            }
             htmlFor="computer-clipboard-enabled"
             control={
               <Switch

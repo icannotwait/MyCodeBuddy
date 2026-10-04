@@ -1543,7 +1543,11 @@ mod tests {
     #[test]
     fn a_safari_pop_up_is_not_set_by_value() {
         let mut book = SnapshotBook::default();
-        book.record(1, 10, Some(facts("s00000001", &[(5, "AXPopUpButton", false)])));
+        book.record(
+            1,
+            10,
+            Some(facts("s00000001", &[(5, "AXPopUpButton", false)])),
+        );
         let set = WindowAction::SetValue {
             element: element("s00000001", 5),
             value: "Large".into(),
@@ -1745,7 +1749,10 @@ mod tests {
         let other = act_error(
             "set_value",
             back,
-            &refused(json!({"code": "tool_invocation_failed"}), "element is disabled"),
+            &refused(
+                json!({"code": "tool_invocation_failed"}),
+                "element is disabled",
+            ),
         );
         assert_eq!(other.code, HelperErrorCode::ActionFailed);
         assert!(other.message.contains("element is disabled"));

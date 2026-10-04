@@ -5469,6 +5469,7 @@
     "tooltipShared": "Computer use · {count, plural, one {# window shared} other {# windows shared}}",
     "stop": "Stop sharing",
     "stopHint": "Stop sharing every window now, and cut off whatever agents are doing. Share a window again whenever you want them back.",
+    "clipboardBoundary": "Computer control does not isolate your clipboard. Even with clipboard tools off, an agent can click Paste in a shared app and expose what you copied earlier. Clear sensitive clipboard content before granting control.",
     "indicator": {
       "actOne": "Agents can act on {app}",
       "actMany": "Agents can act on {count, plural, one {# window} other {# windows}}",
@@ -5690,8 +5691,8 @@
         "hint": "With this on, an agent may start an installed application in the background — never codeg or one of the apps that are never shared — and move or resize a window you let it act on. Starting an application shares none of its windows: that is still yours to decide."
       },
       "clipboard": {
-        "label": "Let agents use the clipboard",
-        "hint": "With this on, an agent may put text on the clipboard to paste it, and read back what it copied out of a window you shared with it. What you copied yourself is never read for an agent, and an agent can paste only what it put there itself."
+        "label": "Let agents use clipboard tools",
+        "hint": "When enabled, clipboard tools let an agent write text for pasting and read back content it copied from a shared window."
       },
       "screen": {
         "label": "Offer the entire screen",

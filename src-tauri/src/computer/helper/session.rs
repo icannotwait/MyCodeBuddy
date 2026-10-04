@@ -43,7 +43,8 @@ pub fn state() -> SessionState {
         return SessionState::Unknown;
     }
     // SAFETY: the +1 dictionary from above, released by the wrapper.
-    let session: CFDictionary<CFString, CFType> = unsafe { CFDictionary::wrap_under_create_rule(raw) };
+    let session: CFDictionary<CFString, CFType> =
+        unsafe { CFDictionary::wrap_under_create_rule(raw) };
     let flag = |key: &'static str| {
         session
             .find(CFString::from_static_string(key))

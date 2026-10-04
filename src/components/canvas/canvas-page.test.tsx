@@ -5,7 +5,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest"
 import { toast } from "sonner"
 import enMessages from "@/i18n/messages/en.json"
 import { canvasListBoards } from "@/lib/api"
-import type { CanvasBoard, CanvasBoardSummary } from "@/lib/types"
+import type { CanvasBoard, CanvasBoardSummary, CanvasNode } from "@/lib/types"
 import { useCanvasBoardsStore } from "@/stores/canvas-boards-store"
 import { useCanvasStore } from "@/stores/canvas-store"
 import { CanvasPage, CanvasPageTitle } from "./canvas-page"
@@ -61,6 +61,32 @@ function summary(b: CanvasBoard): CanvasBoardSummary {
   return { board: b, node_count: 0, terminal_count: 0, preview: [] }
 }
 
+function node(id: number, kind: CanvasNode["kind"]): CanvasNode {
+  return {
+    id,
+    board_id: 2,
+    kind,
+    folder_id: null,
+    folder_group_id: null,
+    agent_type: null,
+    conversation_id: null,
+    member_ids: [],
+    title: null,
+    content: null,
+    path: kind === "terminal" ? "/tmp" : null,
+    color: null,
+    collapsed: false,
+    grid_columns: 0,
+    grid_rows: 0,
+    x: 0,
+    y: 0,
+    width: 200,
+    height: 140,
+    created_at: "2026-09-01T00:00:00Z",
+    updated_at: "2026-09-01T00:00:00Z",
+  }
+}
+
 function renderPage() {
   return render(
     <NextIntlClientProvider locale="en" messages={enMessages}>
@@ -88,7 +114,7 @@ describe("CanvasPage", () => {
     expect(screen.queryByTestId("board-view")).toBeNull()
     // The breadcrumb is just the route title here — nothing to go back to.
     expect(
-      screen.getByRole("heading", { name: "Infinite Canvas" })
+      screen.getByRole("heading", { name: enMessages.Canvas.title })
     ).toBeTruthy()
   })
 
@@ -138,6 +164,85 @@ describe("CanvasPage", () => {
     ).toBeTruthy()
     expect(screen.queryByRole("button", { name: "Research" })).toBeNull()
   })
+
+  it("warns about nodes added after opening the board when deleting from its title", async () => {
+    useCanvasBoardsStore.getState().openBoard(2)
+    renderPage()
+    await screen.findByRole("button", { name: "Canvas options" })
+
+    act(() => {
+      const store = useCanvasStore.getState()
+      store.openBoard(2)
+      store.acceptSnapshot({ board_id: 2, revision: 0, nodes: [] })
+      store.handleCanvasChanged({
+        kind: "upsert",
+        node: node(10, "note"),
+        revision: 1,
+      })
+      store.handleCanvasChanged({
+        kind: "upsert",
+        node: node(11, "terminal"),
+        revision: 2,
+      })
+    })
+    // The board-list cache is still the empty-board snapshot.
+    expect(
+      useCanvasBoardsStore.getState().boards.find((s) => s.board.id === 2)
+        ?.node_count
+    ).toBe(0)
+    await userEvent.click(
+      screen.getByRole("button", { name: "Canvas options" })
+    )
+    await userEvent.click(
+      await screen.findByRole("menuitem", { name: "Delete canvas…" })
+    )
+    expect(screen.getByText("It holds 2 items.")).toBeTruthy()
+    expect(
+      screen.getByText(
+        "1 terminal on it will be closed and its process stopped."
+      )
+    ).toBeTruthy()
+
+    // A live deletion while the confirmation is open updates it too.
+    act(() => {
+      useCanvasStore
+        .getState()
+        .handleCanvasChanged({ kind: "deleted", id: 11, revision: 3 })
+    })
+    expect(screen.getByText("It holds 1 item.")).toBeTruthy()
+    expect(
+      screen.queryByText(
+        "1 terminal on it will be closed and its process stopped."
+      )
+    ).toBeNull()
+  })
+
+  it.each([
+    { boardId: 1, hydrated: true },
+    { boardId: 2, hydrated: false },
+  ])(
+    "keeps the list counts until this board is hydrated ($boardId, $hydrated)",
+    async ({ boardId, hydrated }) => {
+      mockList.mockResolvedValue([
+        { ...summary(board(2)), node_count: 3, terminal_count: 1 },
+      ])
+      useCanvasBoardsStore.getState().openBoard(2)
+      useCanvasStore.setState({ boardId, hydrated, nodes: new Map() })
+      renderPage()
+      await userEvent.click(
+        await screen.findByRole("button", { name: "Canvas options" })
+      )
+      await userEvent.click(
+        await screen.findByRole("menuitem", { name: "Delete canvas…" })
+      )
+      expect(screen.getByText("It holds 3 items.")).toBeTruthy()
+      expect(
+        screen.getByText(
+          "1 terminal on it will be closed and its process stopped."
+        )
+      ).toBeTruthy()
+    }
+  )
 
   it("leaves a canvas whose nodes can no longer be read", async () => {
     // Deleted while this client wasn't listening: no board event ever comes,

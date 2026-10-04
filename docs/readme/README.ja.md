@@ -33,7 +33,7 @@
 
 <table>
   <tr>
-    <td width="50%" valign="top">🧩 <strong>すべてのエージェントを、ひとつのインターフェースで</strong><br/>15 種のエージェントを内蔵し、ACP エージェントならどれでも加えられます — いずれもターミナルではなく、同じ構造化された会話として表示されます。</td>
+    <td width="50%" valign="top">🧩 <strong>すべてのエージェントを、ひとつのインターフェースで</strong><br/>14 種のエージェントを内蔵し、ACP エージェントならどれでも加えられます — いずれもターミナルではなく、同じ構造化された会話として表示されます。</td>
     <td width="50%" valign="top">🔎 <strong>引き継げるセッション</strong><br/>各エージェントがディスクに残す履歴をインポート・検索・再開でき、さらに別のエージェントへ引き継げます。</td>
   </tr>
   <tr>
@@ -110,7 +110,7 @@
 
 ### すべてのエージェントを、ひとつのインターフェースで
 
-15 種のエージェントを内蔵し、ほかの ACP エージェントも公開レジストリまたはその distribution JSON から加えられます。Codeg はそのすべてと Agent Client Protocol で通信するので、どれも目を凝らして読むターミナルではなく、同じリッチな会話 — ツールカード、ライブ diff、計画、権限の確認 — として表示されます。
+14 種のエージェントを内蔵し、ほかの ACP エージェントも公開レジストリまたはその distribution JSON から加えられます。Codeg はそのすべてと Agent Client Protocol で通信するので、どれも目を凝らして読むターミナルではなく、同じリッチな会話 — ツールカード、ライブ diff、計画、権限の確認 — として表示されます。
 
 [ドキュメント →](https://docs.codeg.app/guide/supported-agents) · [カスタムエージェント →](https://docs.codeg.app/guide/custom-agents)
 
@@ -275,13 +275,12 @@ Codeg はデスクトップアプリとしても、任意のブラウザで開�
 
 ## 🤖 対応エージェント
 
-Codeg はすべてのエージェントと [Agent Client Protocol](https://agentclientprotocol.com) で通信するため、どのエージェントにも同じ構造化されたインターフェースが用意されます。15 種を内蔵し、その多くは Codeg がインストール・バージョン固定・更新まで面倒を見ます：
+Codeg はすべてのエージェントと [Agent Client Protocol](https://agentclientprotocol.com) で通信するため、どのエージェントにも同じ構造化されたインターフェースが用意されます。14 種を内蔵し、その多くは Codeg がインストール・バージョン固定・更新まで面倒を見ます：
 
 <p>
   <a href="https://www.anthropic.com/claude-code"><kbd><img src="../images/agents/claude-code.svg" alt="" width="16" valign="middle" /> Claude Code</kbd></a> &nbsp;
   <a href="https://github.com/openai/codex"><kbd><img src="../images/agents/codex.svg" alt="" width="16" valign="middle" /> Codex</kbd></a> &nbsp;
   <a href="https://github.com/google-gemini/gemini-cli"><kbd><img src="../images/agents/gemini-cli.svg" alt="" width="16" valign="middle" /> Gemini CLI</kbd></a> &nbsp;
-  <a href="https://openclaw.ai"><kbd><img src="../images/agents/openclaw.svg" alt="" width="16" valign="middle" /> OpenClaw</kbd></a> &nbsp;
   <a href="https://opencode.ai"><kbd><picture><source media="(prefers-color-scheme: dark)" srcset="../images/agents/opencode-dark.svg" /><img src="../images/agents/opencode.svg" alt="" width="16" valign="middle" /></picture> OpenCode</kbd></a> &nbsp;
   <a href="https://cline.bot"><kbd><picture><source media="(prefers-color-scheme: dark)" srcset="../images/agents/cline-dark.svg" /><img src="../images/agents/cline.svg" alt="" width="16" valign="middle" /></picture> Cline</kbd></a> &nbsp;
   <a href="https://hermes-agent.nousresearch.com"><kbd><picture><source media="(prefers-color-scheme: dark)" srcset="../images/agents/hermes-agent-dark.svg" /><img src="../images/agents/hermes-agent.svg" alt="" width="16" valign="middle" /></picture> Hermes Agent</kbd></a> &nbsp;
@@ -326,6 +325,8 @@ $env:CODEG_STATIC_DIR="$env:LOCALAPPDATA\codeg-server\web"; codeg-server
 
 インストーラーの既定ディレクトリは `%LOCALAPPDATA%\codeg-server` なので、DrawCode のデスクトップ版を上書きしません。古いインストールがデスクトップのフォルダーにある場合、スクリプトはサーバーをそこから移します。
 
+[GitHub Releases](https://github.com/icannotwait/MyCodeBuddy/releases) では、セルフホスト用の署名付きサーバーアーカイブも配布しています：`codeg-server-linux-x64.tar.gz`、`codeg-server-linux-arm64.tar.gz`、`codeg-server-darwin-x64.tar.gz`、`codeg-server-darwin-arm64.tar.gz`、`codeg-server-windows-x64.zip`。各アーカイブにはサーバー、MCP コンパニオン、コンピューター操作ヘルパー、`web/` アセット、ライセンスファイルが含まれます。
+
 **Docker** — 任意のサーバーをこのリポジトリからビルドします：
 
 ```bash
@@ -341,9 +342,25 @@ pnpm install && pnpm build
 cd src-tauri
 cargo build --release --bin codeg-server --no-default-features --features server
 cargo build --release --bin codeg-mcp --no-default-features --features mcp-bin
+# コンピューター操作を有効にする場合のみ：
 cargo build --release --bin codeg-computer-helper --no-default-features --features computer-helper
 CODEG_STATIC_DIR=../out ./target/release/codeg-server
 ```
+
+**Linux/macOS のソースビルド更新** — リポジトリのルートで実行し、ソースを取得して再ビルドします：
+
+```bash
+git pull
+pnpm install && pnpm build
+cd src-tauri
+cargo build --release --bin codeg-server --no-default-features --features server
+cargo build --release --bin codeg-mcp --no-default-features --features mcp-bin
+# コンピューター操作を有効にする場合のみ：
+cargo build --release --bin codeg-computer-helper --no-default-features --features computer-helper
+# サービスを停止し、サーバー、MCP コンパニオン、任意の操作ヘルパー、Web アセットを再配置して再起動します。
+```
+
+Docker の更新は、リポジトリのルートで `git pull && docker compose up --build -d --force-recreate` を実行します。
 
 **モバイル** — [iOS アプリ](https://apps.apple.com/app/codeg-client/id6785199071) または [Android APK](https://github.com/xintaofei/codeg-android/releases/latest) をインストールし、デスクトップアプリの **Webサービス**か自分の `codeg-server` を指定するだけ：アドレスとトークンを入れれば完了です。接続手順は [モバイルアプリ](https://docs.codeg.app/getting-started/installation#mobile-apps)。
 

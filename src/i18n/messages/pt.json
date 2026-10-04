@@ -5469,6 +5469,7 @@
     "tooltipShared": "Uso do computador · {count, plural, one {# janela compartilhada} other {# janelas compartilhadas}}",
     "stop": "Parar de compartilhar",
     "stopHint": "Para de compartilhar todas as janelas agora e interrompe o que os agentes estiverem fazendo. Compartilhe uma janela de novo quando quiser que continuem.",
+    "clipboardBoundary": "O controle do computador não isola a área de transferência. Mesmo com as ferramentas da área de transferência desativadas, um agente pode clicar em Colar em um aplicativo compartilhado e ver o que você copiou antes. Limpe o conteúdo sensível da área de transferência antes de conceder o controle.",
     "indicator": {
       "actOne": "Os agentes podem agir em {app}",
       "actMany": "Os agentes podem agir em {count, plural, one {# janela} other {# janelas}}",
@@ -5690,8 +5691,8 @@
         "hint": "Com isto ativado, um agente pode iniciar em segundo plano um aplicativo instalado — nunca o codeg nem um dos aplicativos nunca compartilhados — e mover ou redimensionar uma janela em que você o deixa agir. Iniciar um aplicativo não compartilha nenhuma das janelas dele: isso continua sendo decisão sua."
       },
       "clipboard": {
-        "label": "Permitir que os agentes usem a área de transferência",
-        "hint": "Com isto ativado, um agente pode colocar texto na área de transferência para colá-lo e reler o que copiou de uma janela que você compartilhou com ele. O que você mesmo copia nunca é lido para um agente, e um agente só pode colar o que ele mesmo colocou lá."
+        "label": "Permitir que agentes usem as ferramentas da área de transferência",
+        "hint": "Quando ativadas, as ferramentas da área de transferência permitem que um agente escreva texto para colar e leia o conteúdo que copiou de uma janela compartilhada."
       },
       "screen": {
         "label": "Oferecer a tela inteira",

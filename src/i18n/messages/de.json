@@ -5469,6 +5469,7 @@
     "tooltipShared": "Computernutzung · {count, plural, one {# Fenster freigegeben} other {# Fenster freigegeben}}",
     "stop": "Freigabe beenden",
     "stopHint": "Beendet sofort die Freigabe aller Fenster und bricht ab, was Agenten gerade tun. Gib ein Fenster erneut frei, wenn sie weitermachen sollen.",
+    "clipboardBoundary": "Die Computersteuerung isoliert die Zwischenablage nicht. Auch bei deaktivierten Zwischenablage-Werkzeugen kann ein Agent in einer freigegebenen App auf „Einfügen“ klicken und zuvor von dir kopierte Inhalte sehen. Entferne vertrauliche Inhalte aus der Zwischenablage, bevor du die Steuerung erlaubst.",
     "indicator": {
       "actOne": "Agenten können in {app} handeln",
       "actMany": "Agenten können in {count, plural, one {# Fenster} other {# Fenstern}} handeln",
@@ -5690,8 +5691,8 @@
         "hint": "Ist dies aktiv, darf ein Agent eine installierte Anwendung im Hintergrund starten – nie codeg oder eine der nie freigegebenen – und ein Fenster, in dem er handeln darf, verschieben oder in der Größe ändern. Das Starten einer Anwendung gibt keines ihrer Fenster frei: Das entscheidest weiterhin du."
       },
       "clipboard": {
-        "label": "Agenten die Zwischenablage nutzen lassen",
-        "hint": "Ist dies aktiv, darf ein Agent Text in die Zwischenablage legen, um ihn einzusetzen, und zurücklesen, was er selbst aus einem für ihn freigegebenen Fenster kopiert hat. Was du selbst kopierst, wird nie für einen Agenten gelesen, und ein Agent kann nur einsetzen, was er selbst dort abgelegt hat."
+        "label": "Agenten die Zwischenablage-Werkzeuge erlauben",
+        "hint": "Wenn aktiviert, kann ein Agent mit den Zwischenablage-Werkzeugen Text zum Einfügen schreiben und Inhalte lesen, die er aus einem freigegebenen Fenster kopiert hat."
       },
       "screen": {
         "label": "Ganzen Bildschirm anbieten",

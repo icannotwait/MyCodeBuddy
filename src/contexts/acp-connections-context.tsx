@@ -9496,10 +9496,10 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
       const replaceShadow = (table: SessionFailureRecord[]) => {
         shadows.set(shadowKey, table)
       }
-      const desktopTitle = () => {
-        const fn = folderNameRef.current
-        return fn ? `${fn} - Codeg` : "Codeg"
-      }
+      const notifySession = (
+        kind: Parameters<typeof notifyDesktop>[0],
+        content: { body: string; redactedBody?: string }
+      ) => notifyDesktop(kind, sessionNotification(shadowKey, content))
 
       // One owner: live streaming deltas that bypass the ingestor play in
       // `pushMappedEvents`. Everything accepted into this frame plays here.
@@ -9512,6 +9512,16 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
       }
 
       switch (event.type) {
+        case "session_started":
+          rememberResolvedIdentity(shadowKey, { sessionId: event.session_id })
+          break
+        case "conversation_linked":
+          if (event.conversation_id > 0) {
+            rememberResolvedIdentity(shadowKey, {
+              conversationId: event.conversation_id,
+            })
+          }
+          break
         case "status_changed":
           if (event.status === "prompting") {
             replaceShadow(settleSessionFailures(shadow(), "all"))
@@ -9530,11 +9540,9 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
           }
           if (!mayNotify || event.stop_reason !== "end_turn" || !conn) break
           const agentLabel = getAgentLabel(conn.agentType)
-          const title = desktopTitle()
           const failure = latestActiveTerminalFailure(shadow())
           if (failure) {
-            void notifyDesktop("error", {
-              title,
+            void notifySession("error", {
               body: translate("notificationError", {
                 agent: agentLabel,
                 message: failure.title.trim() || tFailure("category.unknown"),
@@ -9544,8 +9552,7 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
               }),
             })
           } else {
-            void notifyDesktop("turn_complete", {
-              title,
+            void notifySession("turn_complete", {
               body: translate("notificationTurnComplete", {
                 agent: agentLabel,
               }),
@@ -9555,8 +9562,7 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
         }
         case "question_request":
           if (mayNotify && conn) {
-            void notifyDesktop("question_request", {
-              title: desktopTitle(),
+            void notifySession("question_request", {
               body: translate("notificationQuestion", {
                 agent: getAgentLabel(conn.agentType),
               }),
@@ -9566,8 +9572,7 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
         case "permission_request":
           if (mayNotify && conn) {
             const agentLabel = getAgentLabel(conn.agentType)
-            void notifyDesktop("permission_request", {
-              title: desktopTitle(),
+            void notifySession("permission_request", {
               body: `${agentLabel}: ${tChat("permissionDialog.subtitle")}`,
             })
           }
@@ -9581,7 +9586,7 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
               count,
             })
             const single = event.settled[0]!
-            void notifyDesktop("background_task", {
+            void notifySession("background_task", {
               body:
                 count === 1
                   ? `${agentLabel}: ${
@@ -9597,7 +9602,6 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
                       agent: agentLabel,
                     })
                   : many,
-              title: desktopTitle(),
             })
           }
           break
@@ -9725,8 +9729,7 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
           )
           if (presented.route.kind === "transcript") break
           if (mayNotify && conn && acpErrorNotifiesDesktop(presented.route)) {
-            void notifyDesktop("error", {
-              title: desktopTitle(),
+            void notifySession("error", {
               body: translate("notificationError", {
                 agent: agentLabel,
                 message: presented.text,
@@ -9818,8 +9821,10 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
     },
     [
       notifyTurnFailure,
+      rememberResolvedIdentity,
       retireTurnFailures,
       sessionFailureNotifyActions,
+      sessionNotification,
       t,
       tChat,
       tFailure,

@@ -234,7 +234,7 @@ impl Dialect {
                 (rest.starts_with("AX")
                     && end > 2
                     && follows(&rest[end..], &[" \"", " = \"", " (", " ["]))
-                    .then(|| &rest[..end])
+                .then(|| &rest[..end])
             }
             Dialect::Windows => {
                 let end = rest
@@ -243,7 +243,7 @@ impl Dialect {
                     .unwrap_or(rest.len());
                 (UIA_CONTROL_TYPES.contains(&&rest[..end])
                     && follows(&rest[end..], &[" \"", " = \"", " ["]))
-                    .then(|| &rest[..end])
+                .then(|| &rest[..end])
             }
             Dialect::Linux => {
                 // `- [3] push button "name" …` and `- label = "name"`: an
@@ -266,12 +266,48 @@ impl Dialect {
 /// UI Automation's control types, as cua-driver names them in its Windows
 /// tree.
 const UIA_CONTROL_TYPES: &[&str] = &[
-    "AppBar", "Button", "Calendar", "CheckBox", "ComboBox", "Custom", "DataGrid", "DataItem",
-    "Document", "Edit", "Group", "Header", "HeaderItem", "Hyperlink", "Image", "List",
-    "ListItem", "Menu", "MenuBar", "MenuItem", "Pane", "ProgressBar", "RadioButton",
-    "ScrollBar", "SemanticZoom", "Separator", "Slider", "Spinner", "SplitButton", "StatusBar",
-    "Tab", "TabItem", "Table", "Text", "Thumb", "TitleBar", "ToolBar", "ToolTip", "Tree",
-    "TreeItem", "Unknown", "Window",
+    "AppBar",
+    "Button",
+    "Calendar",
+    "CheckBox",
+    "ComboBox",
+    "Custom",
+    "DataGrid",
+    "DataItem",
+    "Document",
+    "Edit",
+    "Group",
+    "Header",
+    "HeaderItem",
+    "Hyperlink",
+    "Image",
+    "List",
+    "ListItem",
+    "Menu",
+    "MenuBar",
+    "MenuItem",
+    "Pane",
+    "ProgressBar",
+    "RadioButton",
+    "ScrollBar",
+    "SemanticZoom",
+    "Separator",
+    "Slider",
+    "Spinner",
+    "SplitButton",
+    "StatusBar",
+    "Tab",
+    "TabItem",
+    "Table",
+    "Text",
+    "Thumb",
+    "TitleBar",
+    "ToolBar",
+    "ToolTip",
+    "Tree",
+    "TreeItem",
+    "Unknown",
+    "Window",
 ];
 
 pub fn redact_tree(tree: &str, dialect: Dialect) -> Redacted {
@@ -473,7 +509,10 @@ mod tests {
             "{out}"
         );
         // A label after the value counts too.
-        assert!(out.contains("- [3] AXTextField = \"[redacted]\"\n"), "{out}");
+        assert!(
+            out.contains("- [3] AXTextField = \"[redacted]\"\n"),
+            "{out}"
+        );
         // A value with a quote in it is cut at its start, not guessed at.
         assert!(
             out.contains("- [4] AXSecureTextField = \"[redacted]\"\n"),
@@ -515,12 +554,18 @@ mod tests {
 
         let tree = "- [0] AXTextArea = \"notes\nremember: the password is in the vault\"\n- [1] AXTextField \"Enter your\npassword\nhere\" = \"hunter2\" [id=pw]\n- [2] AXTextField = \"s3cr3t\" (Account password) [help=\"x\" actions=[confirm]]\n";
         let out = redacted(tree, Dialect::Mac);
-        assert!(out.contains("remember: the password is in the vault\"\n"), "{out}");
+        assert!(
+            out.contains("remember: the password is in the vault\"\n"),
+            "{out}"
+        );
         assert!(
             out.contains("- [1] AXTextField \"Enter your\npassword\nhere\" = \"[redacted]\"\n"),
             "{out}"
         );
-        assert!(out.ends_with("- [2] AXTextField = \"[redacted]\"\n"), "{out}");
+        assert!(
+            out.ends_with("- [2] AXTextField = \"[redacted]\"\n"),
+            "{out}"
+        );
         assert!(!out.contains("hunter2") && !out.contains("s3cr3t"), "{out}");
 
         // Another platform's markers are just text here: `value="` in a
@@ -529,7 +574,10 @@ mod tests {
         let tree = "- [0] AXTextField \"HTML input value=\"Password\"\" = \"hunter2\"\n- [1] AXTextArea = \"<form>\n<input type=\"text\" id=\"password\">\"\n";
         let out = redacted(tree, Dialect::Mac);
         assert!(!out.contains("hunter2"), "{out}");
-        assert!(out.contains("<input type=\"text\" id=\"password\">\"\n"), "{out}");
+        assert!(
+            out.contains("<input type=\"text\" id=\"password\">\"\n"),
+            "{out}"
+        );
     }
 
     /// Windows and Linux trees put an addressable element's value in
@@ -538,11 +586,23 @@ mod tests {
     fn values_are_found_in_every_platforms_tree() {
         let windows = "- [0] Window \"Sign in\"\n  - [1] Edit \"Password\" [value=\"hunter2\" id=pw actions=[invoke]]\n  - [2] Edit \"User\" [value=\"me\"]\n  - Text \"PIN code\" = \"1234\"\n  - [3] Edit [value=\"one\n- Recovery code: 5678\n  - Button two\" help=\"Enter the password\"]\n  - [4] Button \"OK\"\n";
         let out = redacted(windows, Dialect::Windows);
-        assert!(out.contains("  - [1] Edit \"Password\" = \"[redacted]\"\n"), "{out}");
-        assert!(out.contains("  - [2] Edit \"User\" [value=\"me\"]\n"), "{out}");
-        assert!(out.contains("  - Text \"PIN code\" = \"[redacted]\"\n"), "{out}");
+        assert!(
+            out.contains("  - [1] Edit \"Password\" = \"[redacted]\"\n"),
+            "{out}"
+        );
+        assert!(
+            out.contains("  - [2] Edit \"User\" [value=\"me\"]\n"),
+            "{out}"
+        );
+        assert!(
+            out.contains("  - Text \"PIN code\" = \"[redacted]\"\n"),
+            "{out}"
+        );
         // A line of the value that looks like a list item is not a node.
-        assert!(out.contains("  - [3] Edit = \"[redacted]\"\n  - [4] Button"), "{out}");
+        assert!(
+            out.contains("  - [3] Edit = \"[redacted]\"\n  - [4] Button"),
+            "{out}"
+        );
         for leaked in ["hunter2", "1234", "5678", "Button two"] {
             assert!(!out.contains(leaked), "{leaked}: {out}");
         }
@@ -607,7 +667,8 @@ mod tests {
         for node in &out.nodes {
             let line = &out.tree[node.offset as usize..];
             assert!(
-                line.trim_start().starts_with(&format!("- [{}] ", node.index)),
+                line.trim_start()
+                    .starts_with(&format!("- [{}] ", node.index)),
                 "{line}"
             );
         }

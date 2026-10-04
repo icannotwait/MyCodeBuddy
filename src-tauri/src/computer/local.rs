@@ -790,6 +790,7 @@ impl ComputerBackend for LocalBackend {
         delivery: ActDelivery,
         clipboard: ClipboardUse,
         stop: u64,
+        still: &(dyn Fn() -> bool + Send + Sync),
     ) -> Result<RawAct, BackendError> {
         let stopped = || {
             BackendError::Refused(
@@ -805,8 +806,20 @@ impl ComputerBackend for LocalBackend {
             return Err(stopped());
         }
         let connection = self.connection().await?;
+        // Starting either process can take seconds. The grant may have
+        // been revoked or lowered meanwhile without a global Stop.
+        let ready = connection.request(HelperOp::DriverReady, stop).await?;
+        self.decode::<()>(ready).await?;
         if self.stopped.load(Ordering::Acquire) > stop {
             return Err(stopped());
+        }
+        if !still() {
+            return Err(BackendError::Refused(
+                ActRefusal::Revoked,
+                "The window's sharing or input policy changed before the action went out, so \
+                 nothing was sent. Read the shared windows and their input policy again."
+                    .into(),
+            ));
         }
         let reply = connection
             .request(
@@ -1401,6 +1414,92 @@ mod tests {
             .is_some_and(|why| why.contains("pnpm tauri:prepare-sidecars")));
     }
 
+    /// Revoking access while the driver is starting must prevent the first
+    /// action, not merely the next one. The in-memory helper changes policy
+    /// before acknowledging DriverReady and records every action it receives.
+    #[cfg(not(target_os = "macos"))]
+    #[tokio::test]
+    async fn a_window_action_rechecks_access_after_driver_startup() {
+        use tokio::sync::oneshot;
+
+        let backend = LocalBackend::new(|_: &BackendStatus| {});
+        let (writer, mut wire) = tokio::io::duplex(4096);
+        let pending: Pending = Arc::new(StdMutex::new(HashMap::new()));
+        let (_closed_tx, closed) = watch::channel(false);
+        // Connection owns a child for shutdown only. This short-lived child
+        // does no test work; the helper protocol itself stays in memory.
+        let mut child = tokio::process::Command::new(std::env::current_exe().unwrap())
+            .arg("--list")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        child.wait().await.unwrap();
+        let connection = Arc::new(Connection {
+            writer: Mutex::new(Box::new(writer)),
+            pending: pending.clone(),
+            next_id: AtomicU64::new(1),
+            closed,
+            broken: AtomicBool::new(false),
+            peer: PeerCheck::NotApplicable,
+            child: HelperChild::Tokio(Mutex::new(child)),
+        });
+        *backend.slot.lock().await = Slot {
+            connection: Some(connection),
+            open: true,
+        };
+        let allowed = Arc::new(AtomicBool::new(true));
+        let helper_allowed = allowed.clone();
+        let (sent_tx, sent_rx) = oneshot::channel();
+        let helper = tokio::spawn(async move {
+            let request: HelperRequest = read_frame(&mut wire).await.unwrap();
+            let was_ready = matches!(request.op, HelperOp::DriverReady);
+            helper_allowed.store(false, Ordering::Release);
+            let tx = pending.lock().unwrap().remove(&request.id).unwrap();
+            tx.send(HelperReply::ok(request.id, ())).unwrap();
+            sent_tx.send(was_ready).unwrap();
+            // Answer an unexpected Act too, so a regression fails promptly
+            // instead of waiting for the production request timeout.
+            let next = read_frame::<_, HelperRequest>(&mut wire).await;
+            if let Ok(request) = &next {
+                if let Some(tx) = pending.lock().unwrap().remove(&request.id) {
+                    tx.send(HelperReply::ok(request.id, ())).unwrap();
+                }
+            }
+            next
+        });
+        let still = || allowed.load(Ordering::Acquire);
+        let result = backend
+            .act(
+                1,
+                1,
+                1,
+                None,
+                None,
+                WindowAction::Restore,
+                ActDelivery::Background,
+                ClipboardUse::default(),
+                0,
+                &still,
+            )
+            .await;
+        assert!(
+            sent_rx.await.unwrap(),
+            "the driver must start before admission is rechecked"
+        );
+        assert!(matches!(
+            result,
+            Err(BackendError::Refused(ActRefusal::Revoked, _))
+        ));
+        // Closing the connection gives the fake helper EOF; an Act would
+        // instead have been parsed and returned successfully.
+        drop(backend.slot.lock().await.connection.take());
+        assert!(
+            helper.await.unwrap().is_err(),
+            "a revoked action reached the helper"
+        );
+    }
+
     /// A Stop holds in the backend itself, with no helper running to hear it:
     /// an action let through before it does not go out — and no helper is
     /// started for one — while one let through after it is not held back.
@@ -1428,7 +1527,8 @@ mod tests {
                     act(),
                     ActDelivery::Background,
                     Default::default(),
-                    0
+                    0,
+                    &|| true,
                 )
                 .await
                 .unwrap_err(),
@@ -1453,7 +1553,8 @@ mod tests {
                     act(),
                     ActDelivery::Background,
                     Default::default(),
-                    1
+                    1,
+                    &|| true,
                 )
                 .await
                 .unwrap_err(),

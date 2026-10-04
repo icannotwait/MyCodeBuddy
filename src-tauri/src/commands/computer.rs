@@ -344,6 +344,13 @@ fn denied(target_id: &str, why: ActDenied) -> Refusal {
         // The source of what is on the clipboard is what a paste would need
         // a grant for; codeg does not know it.
         ActDenied::Paste => Refusal::refused(ERROR_GRANT_REQUIRED, PASTE_NOTE.into()),
+        ActDenied::PrimaryPaste => Refusal::refused(
+            ERROR_GRANT_REQUIRED,
+            "On Linux the middle mouse button can paste the user's PRIMARY selection, which \
+             is separate from the clipboard and is not shared with agents. Use the left or \
+             right button instead; writing the clipboard does not permit a middle click."
+                .into(),
+        ),
         ActDenied::NeedsElement => Refusal::failed(ERROR_ACTION_FAILED, NEEDS_ELEMENT_NOTE.into()),
         ActDenied::NoPointing => Refusal::failed(ERROR_ACTION_FAILED, no_pointing_note(target_id)),
         ActDenied::DragModifiers => {
@@ -411,6 +418,8 @@ fn blocklist_of(config: &ComputerToolsConfig) -> Blocklist {
 /// What a share is decided by: see `ComputerService::policy`.
 struct SharingPolicy {
     enabled: bool,
+    allow_foreground: bool,
+    launch_enabled: bool,
     /// The entire screen may be shared.
     screen_enabled: bool,
     blocklist: Blocklist,
@@ -420,9 +429,56 @@ impl SharingPolicy {
     fn of(config: &ComputerToolsConfig) -> Self {
         Self {
             enabled: config.enabled,
+            allow_foreground: config.allow_foreground,
+            launch_enabled: config.launch_enabled,
             screen_enabled: config.screen_enabled,
             blocklist: blocklist_of(config),
         }
+    }
+
+    /// Screen input is always foreground input. Recheck that permission
+    /// alongside the grant and masking policy once the driver is ready.
+    fn allows_screen_action(
+        &self,
+        targets: &TargetTable,
+        epoch: u64,
+        judged_by: &[String],
+    ) -> bool {
+        self.enabled
+            && self.screen_enabled
+            && self.allow_foreground
+            && self
+                .blocklist
+                .entries()
+                .iter()
+                .all(|entry| judged_by.contains(entry))
+            && targets.screen_controlled(epoch)
+    }
+
+    /// The synchronous check made after the driver is ready. The caller
+    /// holds grant_gate, just as a share or policy change does.
+    #[allow(clippy::too_many_arguments)]
+    fn allows_window_action(
+        &self,
+        targets: &TargetTable,
+        target_id: &str,
+        epoch: u64,
+        me: &SelfIdentity,
+        delivery: ActDelivery,
+        needs_launch: bool,
+    ) -> bool {
+        self.enabled
+            && (delivery != ActDelivery::Foreground || self.allow_foreground)
+            && (!needs_launch || self.launch_enabled)
+            && targets.get(target_id).is_some_and(|entry| {
+                !entry.gone
+                    && entry.epoch == epoch
+                    && entry
+                        .grant
+                        .as_ref()
+                        .is_some_and(|grant| grant.level.allows(GrantLevel::Control))
+                    && grantable(&entry.app, me, &self.blocklist).is_ok()
+            })
     }
 }
 
@@ -1281,10 +1337,9 @@ impl ComputerService {
             Err((why, ended)) => {
                 self.announce(&ended.into_iter().collect::<Vec<_>>());
                 Err(match why {
-                    ReadRefusal::NotGrantable(why) => Refusal::refused(
-                        ERROR_BLOCKED,
-                        blocked_note(&ticket.target_id, why.note()),
-                    ),
+                    ReadRefusal::NotGrantable(why) => {
+                        Refusal::refused(ERROR_BLOCKED, blocked_note(&ticket.target_id, why.note()))
+                    }
                     ReadRefusal::NoSuchTarget | ReadRefusal::GrantRequired => refused(),
                 })
             }
@@ -1722,6 +1777,20 @@ impl ComputerService {
             // stamp for it, which an ordinary action has no need of.
             paste: owned.filter(|_| may_paste(request)),
         };
+        let still = || {
+            let _gate = self.grant_gate.lock().unwrap_or_else(|p| p.into_inner());
+            self.policy
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .allows_window_action(
+                    &self.targets,
+                    target_id,
+                    epoch,
+                    &self.me,
+                    delivery,
+                    request.needs_launch_switch(),
+                )
+        };
         let sent_at = tokio::time::Instant::now();
         let press = self
             .backend
@@ -1735,6 +1804,7 @@ impl ComputerService {
                 delivery,
                 clipboard,
                 stop,
+                &still,
             )
             .await
             .map(|raw| Press {
@@ -1822,14 +1892,7 @@ impl ComputerService {
         let still = move || {
             let _gate = self.grant_gate.lock().unwrap_or_else(|p| p.into_inner());
             let policy = self.policy.lock().unwrap_or_else(|p| p.into_inner());
-            policy.enabled
-                && policy.screen_enabled
-                && policy
-                    .blocklist
-                    .entries()
-                    .iter()
-                    .all(|entry| judged_by.contains(entry))
-                && self.targets.screen_controlled(epoch)
+            policy.allows_screen_action(&self.targets, epoch, &judged_by)
         };
         let raw = self
             .backend
@@ -2850,6 +2913,144 @@ pub async fn computer_indicator_fit(app: AppHandle, width: f64, height: f64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn screen_dispatch_rechecks_foreground_permission_after_startup() {
+        let table = TargetTable::new();
+        let me = SelfIdentity {
+            pid: 1,
+            exe: None,
+            bundle: None,
+        };
+        let mut config = ComputerToolsConfig {
+            enabled: true,
+            screen_enabled: true,
+            allow_foreground: true,
+            ..Default::default()
+        };
+        let initial = SharingPolicy::of(&config);
+        table.share_screen(GrantLevel::Control, 1_000, &me, &initial.blocklist);
+        let epoch = table.begin_screen_read(2_000, None).unwrap().epoch;
+        let judged_by = initial.blocklist.entries().to_vec();
+        assert!(initial.allows_screen_action(&table, epoch, &judged_by));
+
+        // Only the foreground preference changes while DriverReady waits;
+        // the existing control grant is still present at dispatch.
+        config.allow_foreground = false;
+        assert!(table.screen_controlled(epoch));
+        assert!(!SharingPolicy::of(&config).allows_screen_action(&table, epoch, &judged_by));
+
+        config.allow_foreground = true;
+        assert!(SharingPolicy::of(&config).allows_screen_action(&table, epoch, &judged_by));
+    }
+
+    #[test]
+    fn window_dispatch_holds_to_the_live_grant_and_policy() {
+        use crate::computer::protocol::{RawApp, RawWindow};
+
+        let me = SelfIdentity {
+            pid: 1,
+            exe: None,
+            bundle: None,
+        };
+        let table = TargetTable::new();
+        let app = RawApp {
+            pid: 42,
+            name: "Editor".into(),
+            bundle_id: Some("org.example.Editor".into()),
+            path: Some("/opt/editor".into()),
+            started_at: Some(1),
+            active: false,
+        };
+        let (windows, _) = table.observe(
+            &[RawWindow {
+                pid: 42,
+                window_id: 1,
+                app,
+                title: "Document".into(),
+                bounds: Rect {
+                    x: 0.0,
+                    y: 0.0,
+                    width: 100.0,
+                    height: 100.0,
+                },
+                on_screen: true,
+                minimized: None,
+                hidden: None,
+                on_current_space: None,
+                z_index: None,
+                content: None,
+            }],
+            None,
+        );
+        let id = &windows[0].target_id;
+        let mut config = ComputerToolsConfig {
+            enabled: true,
+            ..Default::default()
+        };
+        let mut policy = SharingPolicy::of(&config);
+        table
+            .share(id, GrantLevel::Control, 1, &me, &policy.blocklist)
+            .unwrap();
+        let epoch = table.get(id).unwrap().epoch;
+        let allowed = |policy: &SharingPolicy| {
+            policy.allows_window_action(&table, id, epoch, &me, ActDelivery::Background, false)
+        };
+        assert!(allowed(&policy));
+        table
+            .share(id, GrantLevel::Read, 2, &me, &policy.blocklist)
+            .unwrap();
+        assert!(
+            !allowed(&policy),
+            "a downgrade must stop an admitted action"
+        );
+        table
+            .share(id, GrantLevel::Control, 3, &me, &policy.blocklist)
+            .unwrap();
+        assert!(allowed(&policy));
+        config.allow_foreground = false;
+        policy = SharingPolicy::of(&config);
+        assert!(allowed(&policy), "background input remains allowed");
+        assert!(!policy.allows_window_action(
+            &table,
+            id,
+            epoch,
+            &me,
+            ActDelivery::Foreground,
+            false,
+        ));
+        assert!(!policy.allows_window_action(
+            &table,
+            id,
+            epoch,
+            &me,
+            ActDelivery::Background,
+            true,
+        ));
+        config.launch_enabled = true;
+        policy = SharingPolicy::of(&config);
+        assert!(policy.allows_window_action(&table, id, epoch, &me, ActDelivery::Background, true,));
+        config.blocklist = vec!["org.example.Editor".into()];
+        policy = SharingPolicy::of(&config);
+        assert!(!allowed(&policy), "the latest blocklist must be applied");
+        config.blocklist.clear();
+        config.enabled = false;
+        policy = SharingPolicy::of(&config);
+        assert!(!allowed(&policy));
+        config.enabled = true;
+        policy = SharingPolicy::of(&config);
+        table
+            .share(id, GrantLevel::None, 4, &me, &policy.blocklist)
+            .unwrap();
+        assert!(!allowed(&policy));
+        table
+            .share(id, GrantLevel::Control, 5, &me, &policy.blocklist)
+            .unwrap();
+        assert!(
+            !allowed(&policy),
+            "a new sharing must not revive an old action"
+        );
+    }
 
     /// A tree is cut on a line boundary, never mid-line, and a cap of 0 or
     /// one the tree fits under leaves it whole.

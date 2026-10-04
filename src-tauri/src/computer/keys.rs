@@ -323,8 +323,8 @@ pub fn classify(chord: &Chord, platform: Platform) -> ChordClass {
         // Option on a Mac moves and deletes by word; Alt elsewhere opens the
         // application's menus.
         (false, true) => {
-            let by_word = key.is_arrow()
-                || (matches!(key, Key::Backspace | Key::Delete) && !m.shift);
+            let by_word =
+                key.is_arrow() || (matches!(key, Key::Backspace | Key::Delete) && !m.shift);
             if platform == Platform::Mac && by_word {
                 ChordClass::Window
             } else {
@@ -431,9 +431,7 @@ fn never_chord(chord: &Chord, platform: Platform) -> bool {
         // View (Win+Tab) and the switcher that stays up (Ctrl+Alt+Tab).
         Platform::Windows => {
             (m.meta && matches!(key, Key::Char('l') | Key::Tab))
-                || (m.control
-                    && m.alt
-                    && matches!(key, Key::Delete | Key::Backspace | Key::Tab))
+                || (m.control && m.alt && matches!(key, Key::Delete | Key::Backspace | Key::Tab))
         }
         // Lock (Super+L, Ctrl+Alt+L), log out (Ctrl+Alt+Delete), ending the
         // X server (Ctrl+Alt+Backspace).
@@ -730,9 +728,15 @@ mod tests {
         assert_eq!(screen("down", &["ctrl"], Platform::Mac), ChordClass::Beyond);
         assert_eq!(screen("left", &["ctrl"], Platform::Mac), ChordClass::Window);
         assert_eq!(screen("d", &["win"], Platform::Windows), ChordClass::Window);
-        assert_eq!(screen("tab", &["alt"], Platform::Windows), ChordClass::Window);
+        assert_eq!(
+            screen("tab", &["alt"], Platform::Windows),
+            ChordClass::Window
+        );
         assert_eq!(screen("l", &["win"], Platform::Windows), ChordClass::Beyond);
-        assert_eq!(screen("tab", &["win"], Platform::Windows), ChordClass::Beyond);
+        assert_eq!(
+            screen("tab", &["win"], Platform::Windows),
+            ChordClass::Beyond
+        );
         assert_eq!(
             screen("tab", &["ctrl", "alt"], Platform::Windows),
             ChordClass::Beyond

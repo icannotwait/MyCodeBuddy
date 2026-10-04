@@ -396,6 +396,9 @@ pub enum ActDenied {
     ChordBeyond,
     /// A paste: the clipboard is the user's, and its source is not tracked.
     Paste,
+    /// X11's middle button pastes PRIMARY, a selection separate from the
+    /// clipboard whose ownership the service tracks.
+    PrimaryPaste,
     /// A character key with no element named to type it into.
     NeedsElement,
     /// The screenshot the point came from cannot be mapped back to the
@@ -1702,6 +1705,7 @@ fn resolve(
             count,
             modifiers,
         } => {
+            check_pointer_button(*button, Platform::current())?;
             check_pointer_modifiers(*modifiers, scope)?;
             if *count == 2 && !modifiers.is_empty() {
                 return Err(ActDenied::DoubleClickModifiers);
@@ -1720,6 +1724,7 @@ fn resolve(
             modifiers,
             duration_ms,
         } => {
+            check_pointer_button(*button, Platform::current())?;
             check_pointer_modifiers(*modifiers, scope)?;
             if !super::keys::drag_carries_modifiers(*modifiers, Platform::current()) {
                 return Err(ActDenied::DragModifiers);
@@ -1862,6 +1867,7 @@ fn resolve_on_screen(
             count,
             modifiers,
         } => {
+            check_pointer_button(*button, Platform::current())?;
             check_pointer_modifiers(*modifiers, GrantScope::Screen)?;
             WindowAction::Click {
                 at: DriverTarget::Point(point_in(mark, point)?),
@@ -1877,6 +1883,7 @@ fn resolve_on_screen(
             modifiers,
             duration_ms,
         } => {
+            check_pointer_button(*button, Platform::current())?;
             check_pointer_modifiers(*modifiers, GrantScope::Screen)?;
             if !super::keys::drag_carries_modifiers(*modifiers, Platform::current()) {
                 return Err(ActDenied::DragModifiers);
@@ -1904,6 +1911,20 @@ fn resolve_on_screen(
         },
         _ => return Err(ActDenied::ScreenPointerOnly),
     })
+}
+
+/// Linux's PRIMARY selection is not CLIPBOARD. A middle-button release can
+/// paste it even when the agent owns the tracked clipboard, so neither a
+/// click nor a drag may send that button. Left and right keep their routes.
+fn check_pointer_button(
+    button: super::types::PointerButton,
+    platform: Platform,
+) -> Result<(), ActDenied> {
+    if platform == Platform::Linux && button == super::types::PointerButton::Middle {
+        Err(ActDenied::PrimaryPaste)
+    } else {
+        Ok(())
+    }
 }
 
 /// Whether the grant reaches `modifiers` held over a click or a drag: a
@@ -2998,7 +3019,11 @@ mod tests {
                 repeat: 1,
             },
         ] {
-            assert_eq!(act(&table, &id, &writes), Err(ActDenied::Secret), "{writes:?}");
+            assert_eq!(
+                act(&table, &id, &writes),
+                Err(ActDenied::Secret),
+                "{writes:?}"
+            );
         }
     }
 
@@ -3203,6 +3228,75 @@ mod tests {
         );
     }
 
+    #[test]
+    fn linux_middle_button_never_reads_the_primary_selection() {
+        for platform in [Platform::Mac, Platform::Windows, Platform::Linux] {
+            for button in [
+                PointerButton::Left,
+                PointerButton::Right,
+                PointerButton::Middle,
+            ] {
+                let result = check_pointer_button(button, platform);
+                if platform == Platform::Linux && button == PointerButton::Middle {
+                    assert_eq!(result, Err(ActDenied::PrimaryPaste));
+                } else {
+                    assert_eq!(result, Ok(()));
+                }
+            }
+        }
+    }
+
+    /// Owning CLIPBOARD is not owning PRIMARY: both kinds of target and a
+    /// middle-button drag remain refused even after clipboard_write.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_middle_pointer_actions_are_refused_even_with_owned_clipboard() {
+        let table = TargetTable::new();
+        let (id, snapshot, capture) = shared_and_read(&table, GrantLevel::Control);
+        let point = PointTarget {
+            generation: capture,
+            x: 20.0,
+            y: 20.0,
+        };
+        let targets = [
+            AgentTarget::Point(point.clone()),
+            AgentTarget::Element(ElementTarget {
+                generation: snapshot,
+                index: 1,
+            }),
+        ];
+        let mut requests: Vec<_> = targets
+            .into_iter()
+            .map(|target| ComputerActRequest::Click {
+                target,
+                button: PointerButton::Middle,
+                count: 1,
+                modifiers: Modifiers::default(),
+            })
+            .collect();
+        requests.push(ComputerActRequest::Drag {
+            from: point.clone(),
+            to: point,
+            button: PointerButton::Middle,
+            modifiers: Modifiers::default(),
+            duration_ms: None,
+        });
+        for request in requests {
+            for paste_ok in [false, true] {
+                let result = table.begin_act(
+                    &id,
+                    3_000,
+                    None,
+                    &me(),
+                    &Blocklist::new(&[]),
+                    &request,
+                    paste_ok,
+                );
+                assert!(matches!(result, Err((ActDenied::PrimaryPaste, _))));
+            }
+        }
+    }
+
     /// An action is placed on the screen from where the helper says it
     /// aimed: an element at the middle of its frame, a point at its offset in
     /// the window's units from where the window was measured to be — and an
@@ -3330,7 +3424,11 @@ mod tests {
             Err(ActDenied::ChordBeyond)
         );
         assert_eq!(
-            act(&table, &id, &key(Key::Char('x'), Modifiers::default(), None)),
+            act(
+                &table,
+                &id,
+                &key(Key::Char('x'), Modifiers::default(), None)
+            ),
             Err(ActDenied::NeedsElement)
         );
         let field = ElementTarget {
@@ -3424,6 +3522,51 @@ mod tests {
         table
             .begin_screen_act(3_000, None, request)
             .map_err(|(why, _)| why)
+    }
+
+    /// The screen does not grant the untracked PRIMARY selection either.
+    /// Linux does not currently offer screen sharing, but its resolver must
+    /// keep the same boundary as window actions if that changes.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_screen_middle_actions_cannot_paste_primary() {
+        let table = TargetTable::new();
+        share_screen(&table, GrantLevel::Control, 1_000);
+        let generation = screen_read(&table, 2_000).unwrap();
+        let point = PointTarget {
+            generation,
+            x: 20.0,
+            y: 20.0,
+        };
+        for button in [
+            PointerButton::Left,
+            PointerButton::Right,
+            PointerButton::Middle,
+        ] {
+            let requests = [
+                ComputerActRequest::Click {
+                    target: AgentTarget::Point(point.clone()),
+                    button,
+                    count: 1,
+                    modifiers: Modifiers::default(),
+                },
+                ComputerActRequest::Drag {
+                    from: point.clone(),
+                    to: point.clone(),
+                    button,
+                    modifiers: Modifiers::default(),
+                    duration_ms: None,
+                },
+            ];
+            for request in requests {
+                let result = screen_act(&table, &request);
+                if button == PointerButton::Middle {
+                    assert_eq!(result, Err(ActDenied::PrimaryPaste));
+                } else {
+                    assert!(result.is_ok(), "left/right pointer actions remain allowed");
+                }
+            }
+        }
     }
 
     /// Sharing the entire screen shares every window the rules allow — one

@@ -295,7 +295,6 @@ pub struct BrokerSessionRequest {
     pub max_messages: Option<u32>,
 }
 
-
 /// Report a progress milestone for the work task driving the parent session.
 /// Backs the `task_progress` MCP tool. Authenticated by the per-launch `token`;
 /// the listener resolves the parent connection from it and the task engine maps
@@ -999,7 +998,6 @@ pub async fn client_session_round_trip(
 ) -> io::Result<BrokerResponse> {
     message_round_trip(socket_path, &BrokerMessage::SessionInfo(req.clone())).await
 }
-
 
 /// Dispatch a `task_progress` report and read back the `{ recorded }` ack.
 pub async fn client_task_progress_round_trip(

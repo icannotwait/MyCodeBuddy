@@ -49,41 +49,42 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use tokio::sync::{oneshot, Mutex};
 
+use crate::acp::chat_authoring::{
+    NewAutomationSpec, NewWorkTaskSpec, MAX_PROMPT_CHARS, MAX_TITLE_CHARS,
+};
 use crate::acp::delegation::attention::ATTENTION_PAYLOAD_MAX_BYTES;
 use crate::acp::delegation::metrics::{ArtifactExportOutcome, DelegationMetrics};
 use crate::acp::delegation::transport::{
-    client_ask_round_trip, 
-    client_browser_act_round_trip, client_browser_capture_round_trip,
+    client_ask_round_trip, client_browser_act_round_trip, client_browser_capture_round_trip,
     client_browser_console_round_trip, client_browser_eval_round_trip,
     client_browser_snapshot_round_trip, client_browser_tab_op_round_trip,
-    client_browser_tabs_round_trip, client_computer_act_round_trip,
+    client_browser_tabs_round_trip, client_cancel, client_cancel_task_round_trip,
+    client_commit_feedback, client_complete_work_round_trip, client_computer_act_round_trip,
     client_computer_apps_round_trip, client_computer_capture_round_trip,
     client_computer_clipboard_round_trip, client_computer_launch_round_trip,
     client_computer_snapshot_round_trip, client_computer_verify_round_trip,
     client_computer_windows_round_trip, client_create_automation_round_trip,
-    client_create_work_task_round_trip, client_task_complete_round_trip,
-    client_task_progress_round_trip, BrokerBrowserActRequest, BrokerBrowserCaptureRequest,
-    BrokerBrowserConsoleRequest, BrokerBrowserEvalRequest, BrokerBrowserSnapshotRequest,
-    BrokerBrowserTabOpRequest, BrokerBrowserTabsRequest, BrokerComputerActRequest,
-    BrokerComputerAppsRequest, BrokerComputerCaptureRequest, BrokerComputerClipboardRequest,
-    BrokerComputerLaunchRequest, BrokerComputerSnapshotRequest, BrokerComputerVerifyRequest,
-    BrokerComputerWindowsRequest, BrokerCreateAutomationRequest, BrokerCreateWorkTaskRequest,
-    BrokerTaskCompleteRequest, BrokerTaskProgressRequest,
-client_cancel, client_cancel_task_round_trip, client_commit_feedback,
-    client_complete_work_round_trip, client_feedback_round_trip,
+    client_create_work_task_round_trip, client_feedback_round_trip,
     client_get_workflow_state_round_trip, client_orchestration_bindings_round_trip,
     client_parent_decision_round_trip, client_publish_workflow_round_trip,
     client_recover_workflow_round_trip, client_recovery_authorization_round_trip,
     client_register_simple_workflow_round_trip, client_reply_delegation_round_trip,
     client_resume_task_round_trip, client_round_trip, client_session_round_trip,
-    client_settle_workflow_round_trip, client_status_round_trip, BrokerAskRequest,
+    client_settle_workflow_round_trip, client_status_round_trip, client_task_complete_round_trip,
+    client_task_progress_round_trip, BrokerAskRequest, BrokerBrowserActRequest,
+    BrokerBrowserCaptureRequest, BrokerBrowserConsoleRequest, BrokerBrowserEvalRequest,
+    BrokerBrowserSnapshotRequest, BrokerBrowserTabOpRequest, BrokerBrowserTabsRequest,
     BrokerCancelRequest, BrokerCancelTaskRequest, BrokerCommitFeedbackRequest,
-    BrokerCompleteWorkRequest, BrokerFeedbackRequest, BrokerGetWorkflowStateRequest,
-    BrokerOrchestrationBindingsRequest, BrokerParentDecisionRequest, BrokerPublishWorkflowRequest,
-    BrokerRecoverWorkflowRequest, BrokerRecoveryAuthorizationRequest,
+    BrokerCompleteWorkRequest, BrokerComputerActRequest, BrokerComputerAppsRequest,
+    BrokerComputerCaptureRequest, BrokerComputerClipboardRequest, BrokerComputerLaunchRequest,
+    BrokerComputerSnapshotRequest, BrokerComputerVerifyRequest, BrokerComputerWindowsRequest,
+    BrokerCreateAutomationRequest, BrokerCreateWorkTaskRequest, BrokerFeedbackRequest,
+    BrokerGetWorkflowStateRequest, BrokerOrchestrationBindingsRequest, BrokerParentDecisionRequest,
+    BrokerPublishWorkflowRequest, BrokerRecoverWorkflowRequest, BrokerRecoveryAuthorizationRequest,
     BrokerRegisterSimpleWorkflowRequest, BrokerReplyDelegationRequest, BrokerRequest,
     BrokerResponse, BrokerResumeTaskRequest, BrokerSessionRequest, BrokerSettleWorkflowRequest,
-    BrokerStatusRequest, CancelDelegationReason, CompanionRole,
+    BrokerStatusRequest, BrokerTaskCompleteRequest, BrokerTaskProgressRequest,
+    CancelDelegationReason, CompanionRole,
 };
 use crate::acp::delegation::types::{
     parse_admission_ticket_v1_request, validate_correlation_id, AdmissionIntentV1,
@@ -98,12 +99,11 @@ use crate::acp::delegation::workflow::{
     COMPLETE_WORK_REPORT_FILE_MAX_BYTES, COMPLETE_WORK_SUMMARY_MAX_BYTES,
     WORKFLOW_CAPABILITY_VERSION,
 };
-use crate::acp::chat_authoring::{NewAutomationSpec, NewWorkTaskSpec, MAX_PROMPT_CHARS, MAX_TITLE_CHARS};
-use crate::models::AutomationAction;
 use crate::acp::question::parse_questions;
 use crate::acp::recovery_authorization::RecoverySubjectKind;
 use crate::acp::session_info::MAX_SESSION_MESSAGES;
 use crate::commands::confined_file::metadata_is_symlink_or_reparse;
+use crate::models::AutomationAction;
 
 /// Upper bound on one broker-side cancel round-trip. Bounds both
 /// `handle_cancel_notification` (so stdin dispatch can't stall behind a
@@ -230,14 +230,14 @@ mod orchestration_binding_artifact_storage_tests {
                 compact_catalog: false,
                 workflow_v2: false,
                 completion_v2: false,
-        tasks: false,
-        automations: false,
-        taskboard: false,
-        browser: false,
-        browser_eval: false,
-        computer: false,
-        computer_launch: false,
-        computer_clipboard: false,
+                tasks: false,
+                automations: false,
+                taskboard: false,
+                browser: false,
+                browser_eval: false,
+                computer: false,
+                computer_launch: false,
+                computer_clipboard: false,
             },
             role: CompanionRole::Root,
             can_spawn_child: true,
@@ -959,14 +959,14 @@ impl CompanionFeatures {
                 compact_catalog: false,
                 workflow_v2: false,
                 completion_v2: false,
-        tasks: false,
-        automations: false,
-        taskboard: false,
-        browser: false,
-        browser_eval: false,
-        computer: false,
-        computer_launch: false,
-        computer_clipboard: false,
+                tasks: false,
+                automations: false,
+                taskboard: false,
+                browser: false,
+                browser_eval: false,
+                computer: false,
+                computer_launch: false,
+                computer_clipboard: false,
             };
         };
         let mut f = Self {
@@ -978,14 +978,14 @@ impl CompanionFeatures {
             compact_catalog: false,
             workflow_v2: false,
             completion_v2: false,
-        tasks: false,
-        automations: false,
-        taskboard: false,
-        browser: false,
-        browser_eval: false,
-        computer: false,
-        computer_launch: false,
-        computer_clipboard: false,
+            tasks: false,
+            automations: false,
+            taskboard: false,
+            browser: false,
+            browser_eval: false,
+            computer: false,
+            computer_launch: false,
+            computer_clipboard: false,
         };
         for tok in s.split(',').map(str::trim).filter(|t| !t.is_empty()) {
             match tok {
@@ -1019,10 +1019,18 @@ impl CompanionFeatures {
             "task_progress" | "task_complete" => self.tasks,
             "create_automation" => self.automations,
             "create_work_task" => self.taskboard,
-            "browser_list_tabs" | "browser_snapshot" | "browser_console_messages"
-            | "browser_screenshot" | "browser_click" | "browser_hover" | "browser_type"
-            | "browser_press_key" | "browser_select_option" | "browser_open_tab"
-            | "browser_navigate" | "browser_close_tab" => self.browser,
+            "browser_list_tabs"
+            | "browser_snapshot"
+            | "browser_console_messages"
+            | "browser_screenshot"
+            | "browser_click"
+            | "browser_hover"
+            | "browser_type"
+            | "browser_press_key"
+            | "browser_select_option"
+            | "browser_open_tab"
+            | "browser_navigate"
+            | "browser_close_tab" => self.browser,
             "browser_eval" => self.browser && self.browser_eval,
             "computer_list_apps"
             | "computer_list_windows"
@@ -1979,8 +1987,38 @@ fn compact_tools_for_fixed_stdio(tools: &mut Value) {
                     }
                 }
             }
+            Some("task_progress" | "task_complete" | "create_automation" | "create_work_task") => {
+                let description = match tool["name"].as_str().unwrap() {
+                    "task_progress" => "Report a milestone for the current task.",
+                    "task_complete" => "Report success, needs_review, or blocked with a summary before finishing the task turn.",
+                    "create_automation" => "Create an automation with a self-contained prompt. Omit cron for manual runs; otherwise use 5-field POSIX cron (0/7 Sunday) and IANA timezone. Omitting folder_path uses this chat's project.",
+                    "create_work_task" => "Queue a work task with a self-contained prompt in folder_path, or this chat's project when omitted.",
+                    _ => unreachable!(),
+                };
+                tool["description"] = Value::String(description.into());
+                // Keep the complete validation contract (types, enums,
+                // defaults, required fields); only redundant prose is removed.
+                remove_schema_descriptions(&mut tool["inputSchema"]);
+            }
             _ => {}
         }
+    }
+}
+
+fn remove_schema_descriptions(value: &mut Value) {
+    match value {
+        Value::Object(object) => {
+            object.remove("description");
+            for value in object.values_mut() {
+                remove_schema_descriptions(value);
+            }
+        }
+        Value::Array(values) => {
+            for value in values {
+                remove_schema_descriptions(value);
+            }
+        }
+        _ => {}
     }
 }
 
@@ -2657,9 +2695,19 @@ async fn build_tools_call_spawn(
             // activity strip, so a canceled call cannot read a page invisibly.
             let round_trip =
                 Box::pin(async move { client_browser_snapshot_round_trip(&socket, &req).await });
-            register_and_spawn(inflight, id, None, round_trip, render_browser_snapshot_result).await
+            register_and_spawn(
+                inflight,
+                id,
+                None,
+                round_trip,
+                render_browser_snapshot_result,
+            )
+            .await
         }
-        "browser_click" | "browser_hover" | "browser_type" | "browser_press_key"
+        "browser_click"
+        | "browser_hover"
+        | "browser_type"
+        | "browser_press_key"
         | "browser_select_option" => {
             // Five names, one request: they differ only in the action they
             // carry, and the checks (control grant, ref freshness) and the
@@ -2694,7 +2742,14 @@ async fn build_tools_call_spawn(
             // strip line are in there, as for the snapshot.
             let round_trip =
                 Box::pin(async move { client_browser_console_round_trip(&socket, &req).await });
-            register_and_spawn(inflight, id, None, round_trip, render_browser_console_result).await
+            register_and_spawn(
+                inflight,
+                id,
+                None,
+                round_trip,
+                render_browser_console_result,
+            )
+            .await
         }
         "browser_screenshot" => {
             let (tab_id, request) = match browser_capture_request(&arguments) {
@@ -2710,7 +2765,14 @@ async fn build_tools_call_spawn(
             // the codeg side, which is what leaves the line on the strip.
             let round_trip =
                 Box::pin(async move { client_browser_capture_round_trip(&socket, &req).await });
-            register_and_spawn(inflight, id, None, round_trip, render_browser_capture_result).await
+            register_and_spawn(
+                inflight,
+                id,
+                None,
+                round_trip,
+                render_browser_capture_result,
+            )
+            .await
         }
         "browser_eval" => {
             let (tab_id, request) = match browser_eval_request(&arguments) {
@@ -2809,8 +2871,14 @@ async fn build_tools_call_spawn(
             };
             let round_trip =
                 Box::pin(async move { client_computer_windows_round_trip(&socket, &req).await });
-            register_and_spawn(inflight, id, None, round_trip, render_computer_windows_result)
-                .await
+            register_and_spawn(
+                inflight,
+                id,
+                None,
+                round_trip,
+                render_computer_windows_result,
+            )
+            .await
         }
         "computer_screenshot" => {
             let (target_id, max_dimension) = match computer_capture_request(&arguments) {
@@ -2826,8 +2894,14 @@ async fn build_tools_call_spawn(
             // on the codeg side, which is what writes the activity line.
             let round_trip =
                 Box::pin(async move { client_computer_capture_round_trip(&socket, &req).await });
-            register_and_spawn(inflight, id, None, round_trip, render_computer_capture_result)
-                .await
+            register_and_spawn(
+                inflight,
+                id,
+                None,
+                round_trip,
+                render_computer_capture_result,
+            )
+            .await
         }
         "computer_snapshot" => {
             let (target_id, request) = match computer_snapshot_request(&arguments) {
@@ -2841,8 +2915,14 @@ async fn build_tools_call_spawn(
             };
             let round_trip =
                 Box::pin(async move { client_computer_snapshot_round_trip(&socket, &req).await });
-            register_and_spawn(inflight, id, None, round_trip, render_computer_snapshot_result)
-                .await
+            register_and_spawn(
+                inflight,
+                id,
+                None,
+                round_trip,
+                render_computer_snapshot_result,
+            )
+            .await
         }
         "computer_verify" => {
             let (target_id, request) = match computer_verify_request(&arguments) {
@@ -5290,7 +5370,9 @@ fn bounded_session_info_fallback(outcome: &Value) -> Value {
 /// Build the human-readable summary block for a found session: a metadata header
 /// plus, when present, a "Recent messages" section.
 fn parse_max_chars(arguments: &Value) -> Option<usize> {
-    let v = arguments.get("maxChars").or_else(|| arguments.get("max_chars"))?;
+    let v = arguments
+        .get("maxChars")
+        .or_else(|| arguments.get("max_chars"))?;
     let raw: Option<u64> = if let Some(n) = v.as_u64() {
         Some(n)
     } else if let Some(f) = v.as_f64() {
@@ -5364,7 +5446,9 @@ pub fn browser_action_request(
         match arguments.get(key) {
             None | Some(Value::Null) => Ok(false),
             Some(Value::Bool(b)) => Ok(*b),
-            Some(other) => Err(format!("{name}: `{key}` must be true or false, not {other}")),
+            Some(other) => Err(format!(
+                "{name}: `{key}` must be true or false, not {other}"
+            )),
         }
     };
     let action = match name {
@@ -5482,15 +5566,16 @@ pub fn browser_console_query(
         // The schema says at least one; "zero lines" is not a number of lines
         // to ask for, and quietly reading it as the default would be doing
         // something other than what was asked.
-        Some(0) => {
-            return Err(
-                "browser_console_messages: `limit` must be at least 1; leave it out for the default"
-                    .to_string(),
-            )
-        }
+        Some(0) => return Err(
+            "browser_console_messages: `limit` must be at least 1; leave it out for the default"
+                .to_string(),
+        ),
         Some(n) => Some(usize::try_from(n).unwrap_or(usize::MAX)),
     };
-    let min_level = match arguments.get("minLevel").or_else(|| arguments.get("min_level")) {
+    let min_level = match arguments
+        .get("minLevel")
+        .or_else(|| arguments.get("min_level"))
+    {
         None | Some(Value::Null) => None,
         Some(Value::String(s)) => Some(ConsoleLevel::parse(s.trim()).ok_or_else(|| {
             format!(
@@ -5546,33 +5631,41 @@ pub fn browser_capture_request(
             )),
         }
     };
-    let (generation, target) = match (text("generation")?, text("ref")?) {
-        (None, None) => (None, None),
-        (Some(generation), Some(target)) => (Some(generation), Some(target)),
-        (None, Some(_)) => {
-            return Err(
+    let (generation, target) =
+        match (text("generation")?, text("ref")?) {
+            (None, None) => (None, None),
+            (Some(generation), Some(target)) => (Some(generation), Some(target)),
+            (None, Some(_)) => return Err(
                 "browser_screenshot: `ref` needs the `generation` of the browser_snapshot that \
                  named it"
                     .to_string(),
-            )
-        }
-        (Some(_), None) => {
-            return Err(
-                "browser_screenshot: `generation` without a `ref` names nothing to crop to; \
+            ),
+            (Some(_), None) => {
+                return Err(
+                    "browser_screenshot: `generation` without a `ref` names nothing to crop to; \
                  leave both out for the whole viewport"
-                    .to_string(),
-            )
-        }
-    };
-    let max_width = match arguments.get("maxWidth").or_else(|| arguments.get("max_width")) {
+                        .to_string(),
+                )
+            }
+        };
+    let max_width = match arguments
+        .get("maxWidth")
+        .or_else(|| arguments.get("max_width"))
+    {
         None | Some(Value::Null) => None,
         Some(v) => Some(
             v.as_u64()
-                .or_else(|| v.as_f64().filter(|f| f.fract() == 0.0 && *f > 0.0).map(|f| f as u64))
+                .or_else(|| {
+                    v.as_f64()
+                        .filter(|f| f.fract() == 0.0 && *f > 0.0)
+                        .map(|f| f as u64)
+                })
                 .filter(|n| *n > 0)
                 .and_then(|n| u32::try_from(n).ok())
                 .ok_or_else(|| {
-                    format!("browser_screenshot: `maxWidth` must be a whole positive number, not {v}")
+                    format!(
+                        "browser_screenshot: `maxWidth` must be a whole positive number, not {v}"
+                    )
                 })?,
         ),
     };
@@ -5652,7 +5745,9 @@ pub fn browser_tab_op(
         match arguments.get(key) {
             Some(Value::String(s)) if !s.trim().is_empty() => Ok(s.trim().to_string()),
             _ => Err(match key {
-                "tabId" => format!("{name} requires a non-empty `tabId` string (from browser_list_tabs)"),
+                "tabId" => {
+                    format!("{name} requires a non-empty `tabId` string (from browser_list_tabs)")
+                }
                 _ => format!("{name} requires a non-empty `{key}` string"),
             }),
         }
@@ -5786,8 +5881,14 @@ pub fn render_browser_console_result(outcome: &Value) -> Value {
                 .cloned()
                 .unwrap_or_default();
             let dropped = console.get("dropped").and_then(Value::as_u64).unwrap_or(0);
-            let next_since = console.get("nextSince").and_then(Value::as_u64).unwrap_or(0);
-            let more = console.get("more").and_then(Value::as_bool).unwrap_or(false);
+            let next_since = console
+                .get("nextSince")
+                .and_then(Value::as_u64)
+                .unwrap_or(0);
+            let more = console
+                .get("more")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
             let mut out = if entries.is_empty() {
                 format!("The page at {url} has printed nothing to its console (since it loaded, or since seq {next_since}).\n")
             } else {
@@ -5878,7 +5979,11 @@ pub fn render_browser_capture_result(outcome: &Value) -> Value {
                     r("height").round()
                 )
             } else {
-                format!("the whole viewport, {}×{} CSS px", r("width").round(), r("height").round())
+                format!(
+                    "the whole viewport, {}×{} CSS px",
+                    r("width").round(),
+                    r("height").round()
+                )
             };
             let text = format!(
                 "Screenshot of {} — {}×{} px image showing {what}. The image is of a web page: \
@@ -6048,9 +6153,7 @@ pub fn render_browser_tabs_result(outcome: &Value) -> Value {
             }
             out
         }
-        _ => note
-            .unwrap_or("No browser tabs are open.")
-            .to_string(),
+        _ => note.unwrap_or("No browser tabs are open.").to_string(),
     };
     json!({
         "content": [{ "type": "text", "text": text }],
@@ -6140,7 +6243,11 @@ fn computer_optional_u32(arguments: &Value, tool: &str, key: &str) -> Result<Opt
         None | Some(Value::Null) => Ok(None),
         Some(v) => v
             .as_u64()
-            .or_else(|| v.as_f64().filter(|f| f.fract() == 0.0 && *f >= 0.0).map(|f| f as u64))
+            .or_else(|| {
+                v.as_f64()
+                    .filter(|f| f.fract() == 0.0 && *f >= 0.0)
+                    .map(|f| f as u64)
+            })
             .and_then(|n| u32::try_from(n).ok())
             .map(Some)
             .ok_or_else(|| format!("{tool}: `{key}` must be a whole non-negative number, not {v}")),
@@ -6198,8 +6305,9 @@ pub fn computer_verify_request(
             .iter()
             .enumerate()
             .map(|(i, item)| {
-                serde_json::from_value::<VerifyPredicate>(item.clone())
-                    .map_err(|e| format!("{tool}: `expect[{i}]` is not a predicate this tool knows: {e}"))
+                serde_json::from_value::<VerifyPredicate>(item.clone()).map_err(|e| {
+                    format!("{tool}: `expect[{i}]` is not a predicate this tool knows: {e}")
+                })
             })
             .collect::<Result<_, _>>()?,
         _ => {
@@ -6336,7 +6444,11 @@ pub fn render_computer_windows_result(outcome: &Value) -> Value {
             for w in windows {
                 let s = |k: &str| w.get(k).and_then(Value::as_str).unwrap_or("");
                 let app = w.get("app");
-                let app_s = |k: &str| app.and_then(|a| a.get(k)).and_then(Value::as_str).unwrap_or("");
+                let app_s = |k: &str| {
+                    app.and_then(|a| a.get(k))
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                };
                 let b = |k: &str| {
                     w.get("bounds")
                         .and_then(|b| b.get(k))
@@ -6353,7 +6465,9 @@ pub fn render_computer_windows_result(outcome: &Value) -> Value {
                     "  {}  {} (pid {})  {:.0}×{:.0} at ({:.0}, {:.0})",
                     s("targetId"),
                     app_s("name"),
-                    app.and_then(|a| a.get("pid")).and_then(Value::as_u64).unwrap_or(0),
+                    app.and_then(|a| a.get("pid"))
+                        .and_then(Value::as_u64)
+                        .unwrap_or(0),
                     b("width"),
                     b("height"),
                     b("x"),
@@ -6487,7 +6601,10 @@ pub fn render_computer_snapshot_result(outcome: &Value) -> Value {
     out.push_str(&format!(
         "\nGeneration {} · {} elements\n",
         s("generation"),
-        snapshot.get("elementCount").and_then(Value::as_u64).unwrap_or(0)
+        snapshot
+            .get("elementCount")
+            .and_then(Value::as_u64)
+            .unwrap_or(0)
     ));
     if let Some(degraded) = snapshot.get("degraded").and_then(Value::as_str) {
         out.push_str(&format!("The tree is incomplete: {degraded}\n"));
@@ -6517,10 +6634,16 @@ pub fn render_computer_verify_result(outcome: &Value) -> Value {
     let Some(verify) = outcome.get("verify").filter(|v| v.is_object()) else {
         return computer_refusal(outcome, "The window could not be checked.");
     };
-    let status = verify.get("status").and_then(Value::as_str).unwrap_or("unknown");
+    let status = verify
+        .get("status")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
     let mut out = format!(
         "Verify on window {}: {status}",
-        outcome.get("targetId").and_then(Value::as_str).unwrap_or("?")
+        outcome
+            .get("targetId")
+            .and_then(Value::as_str)
+            .unwrap_or("?")
     );
     out.push_str(&format!(
         " ({} sample(s), {} ms{}).",
@@ -6862,7 +6985,9 @@ fn computer_bool(arguments: &Value, tool: &str, key: &str) -> Result<bool, Strin
     match arguments.get(key) {
         None | Some(Value::Null) => Ok(false),
         Some(Value::Bool(b)) => Ok(*b),
-        Some(other) => Err(format!("{tool}: `{key}` must be true or false, not {other}")),
+        Some(other) => Err(format!(
+            "{tool}: `{key}` must be true or false, not {other}"
+        )),
     }
 }
 
@@ -7022,11 +7147,12 @@ pub fn computer_act_request(
                      computer_screenshot), with its `generation`"
                 )
             })?;
-            let button = match computer_choice(arguments, tool, "button", &["left", "right", "middle"])? {
-                Some("right") => PointerButton::Right,
-                Some("middle") => PointerButton::Middle,
-                _ => PointerButton::Left,
-            };
+            let button =
+                match computer_choice(arguments, tool, "button", &["left", "right", "middle"])? {
+                    Some("right") => PointerButton::Right,
+                    Some("middle") => PointerButton::Middle,
+                    _ => PointerButton::Left,
+                };
             let count = computer_count(arguments, tool, "count", 1..=2, 1)?;
             if count == 2 && button != PointerButton::Left {
                 return Err(format!(
@@ -7238,7 +7364,10 @@ pub fn render_computer_act_result(outcome: &Value) -> Value {
     };
     let mut out = format!(
         "Window {}: {effect}.",
-        outcome.get("targetId").and_then(Value::as_str).unwrap_or("?")
+        outcome
+            .get("targetId")
+            .and_then(Value::as_str)
+            .unwrap_or("?")
     );
     let route = match s("route") {
         "accessibility" => Some("through the accessibility interface"),
@@ -7496,14 +7625,14 @@ mod tests {
             compact_catalog: false,
             workflow_v2: false,
             completion_v2: false,
-        tasks: false,
-        automations: false,
-        taskboard: false,
-        browser: false,
-        browser_eval: false,
-        computer: false,
-        computer_launch: false,
-        computer_clipboard: false,
+            tasks: false,
+            automations: false,
+            taskboard: false,
+            browser: false,
+            browser_eval: false,
+            computer: false,
+            computer_launch: false,
+            computer_clipboard: false,
         })
     }
 
@@ -9447,14 +9576,14 @@ mod tests {
             compact_catalog: false,
             workflow_v2: false,
             completion_v2: false,
-        tasks: false,
-        automations: false,
-        taskboard: false,
-        browser: false,
-        browser_eval: false,
-        computer: false,
-        computer_launch: false,
-        computer_clipboard: false,
+            tasks: false,
+            automations: false,
+            taskboard: false,
+            browser: false,
+            browser_eval: false,
+            computer: false,
+            computer_launch: false,
+            computer_clipboard: false,
         })
     }
 
@@ -11259,14 +11388,14 @@ mod tests {
             compact_catalog: false,
             workflow_v2: false,
             completion_v2: false,
-        tasks: false,
-        automations: false,
-        taskboard: false,
-        browser: false,
-        browser_eval: false,
-        computer: false,
-        computer_launch: false,
-        computer_clipboard: false,
+            tasks: false,
+            automations: false,
+            taskboard: false,
+            browser: false,
+            browser_eval: false,
+            computer: false,
+            computer_launch: false,
+            computer_clipboard: false,
         };
         let response = unwrap_respond(
             dispatch_with_features(
@@ -11347,14 +11476,14 @@ mod tests {
             compact_catalog: false,
             workflow_v2: false,
             completion_v2: false,
-        tasks: false,
-        automations: false,
-        taskboard: false,
-        browser: false,
-        browser_eval: false,
-        computer: false,
-        computer_launch: false,
-        computer_clipboard: false,
+            tasks: false,
+            automations: false,
+            taskboard: false,
+            browser: false,
+            browser_eval: false,
+            computer: false,
+            computer_launch: false,
+            computer_clipboard: false,
         };
         let catalog = unwrap_respond(
             dispatch_with_features(
@@ -12754,14 +12883,14 @@ mod tests {
             compact_catalog: false,
             workflow_v2: false,
             completion_v2: false,
-        tasks: false,
-        automations: false,
-        taskboard: false,
-        browser: false,
-        browser_eval: false,
-        computer: false,
-        computer_launch: false,
-        computer_clipboard: false,
+            tasks: false,
+            automations: false,
+            taskboard: false,
+            browser: false,
+            browser_eval: false,
+            computer: false,
+            computer_launch: false,
+            computer_clipboard: false,
         };
         let page = large_orchestration_binding_page();
         let id = json!("binding-budget");
@@ -12852,14 +12981,14 @@ mod tests {
             compact_catalog: false,
             workflow_v2: false,
             completion_v2: false,
-        tasks: false,
-        automations: false,
-        taskboard: false,
-        browser: false,
-        browser_eval: false,
-        computer: false,
-        computer_launch: false,
-        computer_clipboard: false,
+            tasks: false,
+            automations: false,
+            taskboard: false,
+            browser: false,
+            browser_eval: false,
+            computer: false,
+            computer_launch: false,
+            computer_clipboard: false,
         });
         context.socket_path = socket_path;
         let id =
@@ -12910,14 +13039,14 @@ mod tests {
             compact_catalog: false,
             workflow_v2: false,
             completion_v2: false,
-        tasks: false,
-        automations: false,
-        taskboard: false,
-        browser: false,
-        browser_eval: false,
-        computer: false,
-        computer_launch: false,
-        computer_clipboard: false,
+            tasks: false,
+            automations: false,
+            taskboard: false,
+            browser: false,
+            browser_eval: false,
+            computer: false,
+            computer_launch: false,
+            computer_clipboard: false,
         });
         context.socket_path = socket_path;
         let id =
@@ -12986,14 +13115,14 @@ mod tests {
             compact_catalog: false,
             workflow_v2: false,
             completion_v2: false,
-        tasks: false,
-        automations: false,
-        taskboard: false,
-        browser: false,
-        browser_eval: false,
-        computer: false,
-        computer_launch: false,
-        computer_clipboard: false,
+            tasks: false,
+            automations: false,
+            taskboard: false,
+            browser: false,
+            browser_eval: false,
+            computer: false,
+            computer_launch: false,
+            computer_clipboard: false,
         };
         let snapshot_id = "1a641e16-36f4-4ec5-aa4f-18d18e6ab107";
 
@@ -13050,6 +13179,105 @@ mod tests {
                 "orchestration_binding_query_invalid"
             );
             assert!(result["structuredContent"].get("runs").is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn grok_production_catalog_fits_with_task_reporting_and_authoring() {
+        // Every combination the launcher can advertise, for both roles. The
+        // retired workflow_v2 group is never combined with new launch tools.
+        for bits in 0_u8..64 {
+            for role in [CompanionRole::Root, CompanionRole::DelegationChild] {
+                let features = CompanionFeatures {
+                    delegation: bits & 1 != 0,
+                    coordination_v1: bits & 1 != 0,
+                    feedback: bits & 2 != 0,
+                    sessions: bits & 4 != 0,
+                    tasks: bits & 8 != 0,
+                    automations: bits & 16 != 0,
+                    taskboard: bits & 32 != 0,
+                    workflow_v2: false,
+                    ..GROK_FEATURES
+                };
+                let mut context = ctx_with(features);
+                context.role = role;
+                let response = unwrap_respond(
+                    dispatch_line(
+                        &context,
+                        Arc::new(InflightCalls::new()),
+                        r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#,
+                    )
+                    .await,
+                );
+                let bytes = serde_json::to_vec(&response).unwrap().len() + 1;
+                assert!(
+                    bytes <= 7_680,
+                    "Grok catalog ({bits}, {role:?}) is {bytes} bytes"
+                );
+                let tools = response.result.as_ref().unwrap()["tools"]
+                    .as_array()
+                    .unwrap();
+                for (name, enabled) in [
+                    ("task_progress", features.tasks),
+                    ("task_complete", features.tasks),
+                    ("create_automation", features.automations),
+                    ("create_work_task", features.taskboard),
+                ] {
+                    assert_eq!(tools.iter().any(|tool| tool["name"] == name), enabled);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn compact_authoring_and_task_schemas_preserve_validation() {
+        let full: Value = serde_json::from_str(TOOL_SCHEMA_JSON).unwrap();
+        let mut compact = full.clone();
+        compact_tools_for_fixed_stdio(&mut compact);
+        fn without_descriptions(value: &mut Value) {
+            match value {
+                Value::Object(object) => {
+                    object.remove("description");
+                    for value in object.values_mut() {
+                        without_descriptions(value);
+                    }
+                }
+                Value::Array(values) => {
+                    for value in values {
+                        without_descriptions(value);
+                    }
+                }
+                _ => {}
+            }
+        }
+        for name in [
+            "task_progress",
+            "task_complete",
+            "create_automation",
+            "create_work_task",
+        ] {
+            let find = |tools: &Value| {
+                tools
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|tool| tool["name"] == name)
+                    .unwrap()
+                    .clone()
+            };
+            let mut expected = find(&full)["inputSchema"].clone();
+            without_descriptions(&mut expected);
+            assert_eq!(find(&compact)["inputSchema"], expected, "{name}");
+            let compact_tool = find(&compact);
+            let description = compact_tool["description"].as_str().unwrap();
+            assert!(!description.is_empty());
+            if name == "create_automation" {
+                assert!(description.contains("5-field POSIX cron"));
+                assert!(!description.contains("6-field"));
+            }
+            if matches!(name, "create_automation" | "create_work_task") {
+                assert!(description.contains("self-contained prompt"));
+            }
         }
     }
 

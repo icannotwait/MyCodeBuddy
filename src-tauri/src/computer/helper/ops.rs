@@ -383,25 +383,25 @@ fn required_array<'a>(tool: &str, value: &'a Value, key: &str) -> Result<&'a [Va
 #[cfg(any(test, not(any(target_os = "macos", windows))))]
 fn parse_apps(value: &Value) -> Result<Vec<RawApp>, HelperError> {
     required_array("list_apps", value, "apps").map(|apps| {
-            apps.iter()
-                // The driver also lists installed applications that are not
-                // running (pid 0); only running ones have windows.
-                .filter(|a| a.get("running").and_then(Value::as_bool) == Some(true))
-                .filter_map(|a| {
-                    let pid = u32::try_from(a.get("pid")?.as_u64()?)
-                        .ok()
-                        .filter(|p| *p > 0)?;
-                    Some(RawApp {
-                        pid,
-                        name: string(a, "name").unwrap_or_default(),
-                        bundle_id: string(a, "bundle_id"),
-                        path: string(a, "launch_path"),
-                        active: a.get("active").and_then(Value::as_bool).unwrap_or(false),
-                        started_at: process_start(pid),
-                    })
+        apps.iter()
+            // The driver also lists installed applications that are not
+            // running (pid 0); only running ones have windows.
+            .filter(|a| a.get("running").and_then(Value::as_bool) == Some(true))
+            .filter_map(|a| {
+                let pid = u32::try_from(a.get("pid")?.as_u64()?)
+                    .ok()
+                    .filter(|p| *p > 0)?;
+                Some(RawApp {
+                    pid,
+                    name: string(a, "name").unwrap_or_default(),
+                    bundle_id: string(a, "bundle_id"),
+                    path: string(a, "launch_path"),
+                    active: a.get("active").and_then(Value::as_bool).unwrap_or(false),
+                    started_at: process_start(pid),
                 })
-                .collect()
-        })
+            })
+            .collect()
+    })
 }
 
 /// Remembers which application each running process is, so listing windows
@@ -637,38 +637,38 @@ pub(super) fn join_identified(windows: Vec<RawWindow>, stamps: Vec<Option<u64>>)
 pub(super) fn parse_windows(value: &Value) -> Result<Vec<RawWindow>, HelperError> {
     let flag = |w: &Value, key: &str| w.get(key).and_then(Value::as_bool);
     required_array("list_windows", value, "windows").map(|windows| {
-            windows
-                .iter()
-                .filter(|w| w.get("layer").and_then(Value::as_i64).unwrap_or(0) == 0)
-                .filter_map(|w| {
-                    let bounds = rect(w.get("bounds")?)?;
-                    if bounds.is_empty() {
-                        return None;
-                    }
-                    let pid = u32::try_from(w.get("pid")?.as_u64()?).ok()?;
-                    Some(RawWindow {
-                        window_id: w.get("window_id")?.as_u64()?,
+        windows
+            .iter()
+            .filter(|w| w.get("layer").and_then(Value::as_i64).unwrap_or(0) == 0)
+            .filter_map(|w| {
+                let bounds = rect(w.get("bounds")?)?;
+                if bounds.is_empty() {
+                    return None;
+                }
+                let pid = u32::try_from(w.get("pid")?.as_u64()?).ok()?;
+                Some(RawWindow {
+                    window_id: w.get("window_id")?.as_u64()?,
+                    pid,
+                    title: string(w, "title").unwrap_or_default(),
+                    bounds,
+                    on_screen: flag(w, "is_on_screen").unwrap_or(false),
+                    minimized: flag(w, "minimized"),
+                    hidden: None,
+                    on_current_space: flag(w, "on_current_space"),
+                    z_index: w.get("z_index").and_then(Value::as_i64),
+                    content: None,
+                    app: RawApp {
                         pid,
-                        title: string(w, "title").unwrap_or_default(),
-                        bounds,
-                        on_screen: flag(w, "is_on_screen").unwrap_or(false),
-                        minimized: flag(w, "minimized"),
-                        hidden: None,
-                        on_current_space: flag(w, "on_current_space"),
-                        z_index: w.get("z_index").and_then(Value::as_i64),
-                        content: None,
-                        app: RawApp {
-                            pid,
-                            name: string(w, "app_name").unwrap_or_default(),
-                            bundle_id: None,
-                            path: None,
-                            active: false,
-                            started_at: None,
-                        },
-                    })
+                        name: string(w, "app_name").unwrap_or_default(),
+                        bundle_id: None,
+                        path: None,
+                        active: false,
+                        started_at: None,
+                    },
                 })
-                .collect()
-        })
+            })
+            .collect()
+    })
 }
 
 /// macOS: mark which of `windows` are minimized, and which belong to a

@@ -1462,7 +1462,9 @@ mod tests {
         for agent_like in ["cua-driver", "opencode", "@", "@.hidden", "@a/b", "@..", ""] {
             assert!(!is_tool_cache_id(agent_like), "{agent_like:?}");
         }
-        assert!(!crate::models::agent::is_valid_custom_agent_id("@cua-driver"));
+        assert!(!crate::models::agent::is_valid_custom_agent_id(
+            "@cua-driver"
+        ));
         assert!(clear_tool_cache("cua-driver").is_err());
     }
 

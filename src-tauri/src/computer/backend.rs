@@ -224,7 +224,8 @@ pub trait ComputerBackend: Send + Sync {
     /// still the process that started at `started_at` and, where another
     /// process draws inside the window, that `content` is still its run;
     /// that the session is not locked; that no later Stop has been
-    /// [`halt`](Self::halt)ed.
+    /// [`halt`](Self::halt)ed. After starting the helper and driver, ask
+    /// `still` whether the same control grant and policy remain in force.
     #[allow(clippy::too_many_arguments)]
     async fn act(
         &self,
@@ -237,6 +238,7 @@ pub trait ComputerBackend: Send + Sync {
         delivery: ActDelivery,
         clipboard: ClipboardUse,
         stop: u64,
+        still: &(dyn Fn() -> bool + Send + Sync),
     ) -> Result<RawAct, BackendError>;
 
     /// The entire screen, every window `rules` do not allow painted over.

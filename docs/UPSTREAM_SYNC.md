@@ -58,3 +58,14 @@ After conflict resolution, review all branding/updater files, deleted OpenClaw
 paths, the release workflow, and functional fork diffs explicitly in the pull
 request. Complete the frontend and Rust checks required by `AGENTS.md`, in
 addition to `pnpm test:release`, before merge.
+
+## 0.33.0 compatibility notes
+
+Grok's current MCP client reads individual JSONL responses through an 8,192-byte
+buffer without reassembling split records. The fork keeps its compact delegation,
+task-reporting, and enabled automation/taskboard tools below a 7,680-byte catalog
+budget. Browser and computer tools are temporarily unavailable for Grok: their
+schemas cannot all fit even with descriptions removed, and image results need
+separate transport support. A session notice explains this limitation. Other
+agents keep these tool groups. Restore them for Grok only after validating its
+catalog and result transport, not just shortening tool descriptions.

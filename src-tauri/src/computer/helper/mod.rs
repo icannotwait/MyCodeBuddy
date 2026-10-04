@@ -213,8 +213,12 @@ fn open_channel() -> Result<Channel, (i32, String)> {
     if requirement.is_none() {
         // A helper that cannot tell whether it is a release build is treated
         // as one.
-        let me = self_info()
-            .map_err(|e| (EXIT_UNANCHORED, format!("cannot read my own signature: {e}")))?;
+        let me = self_info().map_err(|e| {
+            (
+                EXIT_UNANCHORED,
+                format!("cannot read my own signature: {e}"),
+            )
+        })?;
         if me.team_id.is_some() {
             return Err((
                 EXIT_UNANCHORED,
@@ -938,7 +942,9 @@ async fn handle_op(
             for permission in act::permissions_for(&action) {
                 state.require(*permission).await?;
             }
-            let driver = state.driver(stop).await?;
+            // codeg readies the driver before rechecking the live control
+            // grant. Never restart it here after that final admission check.
+            let driver = state.running_driver(stop).await?;
             // Whatever pastes goes only while the clipboard is still what the
             // agent put there: asked as late as the helper can before it goes.
             let paste_ok = match use_of.paste {

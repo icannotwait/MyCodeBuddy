@@ -124,7 +124,9 @@ mod tests {
         assert!(is_web_search_input(Some(&search)));
         // codex-acp's other `kind: "search"` calls carry no such type: a fuzzy
         // file search sends `{query}`, an `rg` it ran sends no `rawInput`.
-        assert!(!is_web_search_input(Some(&serde_json::json!({"query": "q"}))));
+        assert!(!is_web_search_input(Some(
+            &serde_json::json!({"query": "q"})
+        )));
         assert!(!is_web_search_input(None));
     }
 }

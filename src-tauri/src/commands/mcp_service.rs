@@ -31,8 +31,8 @@ use sea_orm::DatabaseConnection;
 use serde::{Deserialize, Serialize};
 
 use crate::acp::browser_tools::BrowserToolsRuntimeConfig;
-use crate::acp::computer_tools::ComputerToolsRuntimeConfig;
 use crate::acp::chat_authoring::ChatAuthoringRuntimeConfig;
+use crate::acp::computer_tools::ComputerToolsRuntimeConfig;
 use crate::acp::delegation::broker::DelegationBroker;
 use crate::acp::delegation::listener::TokenRegistry;
 use crate::acp::delegation::service;
@@ -271,8 +271,7 @@ pub async fn set_codeg_mcp_tool_group_core(
 ) -> Result<(), AppCommandError> {
     use crate::commands::chat_authoring::ChatAuthoringFlag;
     use crate::commands::{
-        browser_tools, chat_authoring, computer_tools, delegation, feedback, question,
-        session_info,
+        browser_tools, chat_authoring, computer_tools, delegation, feedback, question, session_info,
     };
 
     match key {

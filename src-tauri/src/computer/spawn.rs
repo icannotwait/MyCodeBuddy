@@ -265,7 +265,14 @@ impl ExitWatch {
         unsafe {
             let mut event: libc::kevent = std::mem::zeroed();
             loop {
-                let n = libc::kevent(self.kq, std::ptr::null(), 0, &mut event, 1, std::ptr::null());
+                let n = libc::kevent(
+                    self.kq,
+                    std::ptr::null(),
+                    0,
+                    &mut event,
+                    1,
+                    std::ptr::null(),
+                );
                 if n > 0 {
                     return;
                 }

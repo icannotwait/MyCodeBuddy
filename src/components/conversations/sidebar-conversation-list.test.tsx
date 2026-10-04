@@ -1729,9 +1729,12 @@ describe("SidebarConversationList — Recent section", () => {
       enMessages.Folder.sidebar
 
     // Cards rendered for one conversation: its canonical row (Folders or
-    // Chat), plus a second one while Recent lists it too.
+    // Chat), plus a second one while Recent lists it too. Count the row
+    // wrappers, not their buttons, which carry the same conversation id.
     const cardsFor = (id: number) =>
-      document.querySelectorAll(`[data-conversation-id="${id}"]`).length
+      document.querySelectorAll(
+        `[data-sidebar-row-key][data-conversation-id="${id}"]`
+      ).length
 
     // Radix arms its outside-pointer listener in a `setTimeout(0)` and jsdom has
     // no `PointerEvent`, so drive the header menu with real `MouseEvent`s under

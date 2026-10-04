@@ -5469,6 +5469,7 @@
     "tooltipShared": "Uso del ordenador · {count, plural, one {# ventana compartida} other {# ventanas compartidas}}",
     "stop": "Dejar de compartir",
     "stopHint": "Deja de compartir todas las ventanas ahora e interrumpe lo que estén haciendo los agentes. Vuelve a compartir una ventana cuando quieras que sigan.",
+    "clipboardBoundary": "El control del ordenador no aísla el portapapeles. Aunque las herramientas del portapapeles estén desactivadas, un agente puede hacer clic en Pegar en una aplicación compartida y ver lo que copiaste antes. Borra el contenido sensible del portapapeles antes de conceder el control.",
     "indicator": {
       "actOne": "Los agentes pueden actuar en {app}",
       "actMany": "Los agentes pueden actuar en {count, plural, one {# ventana} other {# ventanas}}",
@@ -5690,8 +5691,8 @@
         "hint": "Con esto activado, un agente puede iniciar en segundo plano una aplicación instalada —nunca codeg ni una de las que nunca se comparten— y mover o cambiar el tamaño de una ventana en la que le permites actuar. Iniciar una aplicación no comparte ninguna de sus ventanas: eso lo sigues decidiendo tú."
       },
       "clipboard": {
-        "label": "Permitir que los agentes usen el portapapeles",
-        "hint": "Con esto activado, un agente puede poner texto en el portapapeles para pegarlo y volver a leer lo que copió de una ventana que compartiste con él. Lo que copias tú nunca se lee para un agente, y un agente solo puede pegar lo que puso él mismo."
+        "label": "Permitir a los agentes usar las herramientas del portapapeles",
+        "hint": "Al activarlas, las herramientas del portapapeles permiten a un agente escribir texto para pegarlo y leer el contenido que haya copiado de una ventana compartida."
       },
       "screen": {
         "label": "Ofrecer toda la pantalla",

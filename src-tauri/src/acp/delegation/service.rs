@@ -315,6 +315,45 @@ mod tests {
         }
     }
 
+    #[async_trait]
+    impl crate::acp::work_task_tools::WorkTaskToolAccess for Stub {
+        async fn report_progress(
+            &self,
+            _parent_connection_id: &str,
+            _message: &str,
+        ) -> crate::acp::work_task_tools::TaskReportAck {
+            unreachable!("a service liveness probe must not report task progress")
+        }
+
+        async fn complete(
+            &self,
+            _parent_connection_id: &str,
+            _verdict: &str,
+            _summary: Option<&str>,
+        ) -> crate::acp::work_task_tools::TaskReportAck {
+            unreachable!("a service liveness probe must not complete a task")
+        }
+    }
+
+    #[async_trait]
+    impl crate::acp::chat_authoring::ChatAuthoringAccess for Stub {
+        async fn create_automation(
+            &self,
+            _ctx: crate::acp::chat_authoring::AuthoringContext,
+            _spec: crate::acp::chat_authoring::NewAutomationSpec,
+        ) -> crate::acp::chat_authoring::AuthoringOutcome {
+            unreachable!("a service liveness probe must not create an automation")
+        }
+
+        async fn create_work_task(
+            &self,
+            _ctx: crate::acp::chat_authoring::AuthoringContext,
+            _spec: crate::acp::chat_authoring::NewWorkTaskSpec,
+        ) -> crate::acp::chat_authoring::AuthoringOutcome {
+            unreachable!("a service liveness probe must not create a work task")
+        }
+    }
+
     /// A temp directory short enough to bind a socket inside, whatever the
     /// ambient `$TMPDIR` happens to be.
     ///
@@ -376,6 +415,9 @@ mod tests {
             Arc::new(Stub),
             Arc::new(Stub),
             Arc::new(Stub),
+            Arc::new(Stub),
+            Arc::new(Stub),
+            Arc::new(crate::acp::browser_tools::NoBrowserTabs),
             Arc::new(crate::acp::computer_tools::NoComputerDesktop),
         );
         DelegationService::new(listener, socket_path)

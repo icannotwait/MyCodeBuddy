@@ -5691,14 +5691,11 @@ fn reconcile_turn_usage(turns: &mut [MessageTurn], recorded: &TurnUsage) {
     // Prefer a turn that already reports usage — it is one the transcript
     // itself tied to a model call, so the recovered tokens land beside spend
     // that really happened rather than on an unrelated bubble.
-    let target = turns
-        .iter()
-        .rposition(|t| t.usage.is_some())
-        .or_else(|| {
-            turns.iter().rposition(|t| {
-                matches!(t.role, TurnRole::Assistant) && !is_codex_compaction_divider(&t.blocks)
-            })
-        });
+    let target = turns.iter().rposition(|t| t.usage.is_some()).or_else(|| {
+        turns.iter().rposition(|t| {
+            matches!(t.role, TurnRole::Assistant) && !is_codex_compaction_divider(&t.blocks)
+        })
+    });
     if let Some(turn) = target.and_then(|i| turns.get_mut(i)) {
         turn.usage = Some(match turn.usage {
             Some(ref existing) => codex_usage_add(existing, &missing),
@@ -8266,6 +8263,7 @@ mod tests {
 
     use std::collections::HashMap;
 
+    use super::codex_compacted_summary;
     use super::codex_line_ordinal;
     use super::codex_parent_thread_id;
     use super::completed_mcp_call;
@@ -8291,7 +8289,6 @@ mod tests {
     use super::BudgetedSink;
     use super::CodexParser;
     use super::RolloutFileName;
-    use super::codex_compacted_summary;
     use super::CODEX_COMPACTION_SUMMARY_PREFIX;
     use super::CODEX_COMPACTION_TOOL_NAME;
     use super::CODEX_PLAN_APPROVAL_PROMPT;
@@ -9501,7 +9498,12 @@ earlier terminal context records.\n\
             )
         };
         let searched_report = |ts: &str| {
-            usage_count_line(ts, [522_480, 450_432, 7_798], [579_422, 501_952, 8_158], WINDOW)
+            usage_count_line(
+                ts,
+                [522_480, 450_432, 7_798],
+                [579_422, 501_952, 8_158],
+                WINDOW,
+            )
         };
         let first_turn = vec![
             rollout_line(
@@ -9537,14 +9539,22 @@ earlier terminal context records.\n\
             ),
         ];
         let reading = |lines: &[String], tag: &str| {
-            let stats = parse_lines(lines, tag).session_stats.expect("session stats");
-            (stats.context_window_used_tokens, stats.context_window_usage_percent)
+            let stats = parse_lines(lines, tag)
+                .session_stats
+                .expect("session stats");
+            (
+                stats.context_window_used_tokens,
+                stats.context_window_usage_percent,
+            )
         };
 
         let (used, percent) = reading(&first_turn, "ws-846-searched");
         assert_eq!(used, Some(57_302), "the reading before the search stands");
         let percent = percent.expect("percent");
-        assert!((percent - 57_302.0 / WINDOW as f64 * 100.0).abs() < 1e-9, "{percent}");
+        assert!(
+            (percent - 57_302.0 / WINDOW as f64 * 100.0).abs() < 1e-9,
+            "{percent}"
+        );
 
         // Older codex restates the latest report as the next request opens; a
         // restatement of the report set aside is set aside with it.
@@ -12196,7 +12206,10 @@ earlier terminal context records.\n\
         lines.extend(announced_reasoning(
             "2026-09-24T07:21:02Z",
             "rs_1",
-            &["**Checking directory usage**", "**Checking repository changes**"],
+            &[
+                "**Checking directory usage**",
+                "**Checking repository changes**",
+            ],
         ));
         lines.extend(announced_reasoning(
             "2026-09-24T07:21:12Z",
@@ -12208,7 +12221,10 @@ earlier terminal context records.\n\
         lines.extend(announced_reasoning(
             "2026-09-24T07:21:20Z",
             "rs_4",
-            &["**Reviewing disk usage snapshot**", "**Measuring temporary storage usage**"],
+            &[
+                "**Reviewing disk usage snapshot**",
+                "**Measuring temporary storage usage**",
+            ],
         ));
         // A tool call is visible and ends the run; its own announcement follows.
         lines.extend([
@@ -12365,7 +12381,9 @@ earlier terminal context records.\n\
 
         assert_eq!(
             thinking_texts(&detail),
-            vec!["**Assessing execution capabilities**\n\n**Determining the next step**".to_string()]
+            vec![
+                "**Assessing execution capabilities**\n\n**Determining the next step**".to_string()
+            ]
         );
 
         let _ = fs::remove_file(path);
@@ -16635,22 +16653,58 @@ earlier terminal context records.\n\
     #[test]
     fn a_compaction_draws_the_live_divider_and_opens_onto_its_handoff() {
         let content = jsonl(&[
-            record("2026-09-29T00:00:00Z", "session_meta", serde_json::json!({"id": "cmp-2", "cwd": "/tmp/demo", "cli_version": "0.156.1"})),
-            record("2026-09-29T00:00:01Z", "event_msg", serde_json::json!({"type": "task_started", "turn_id": "t1"})),
-            record("2026-09-29T00:00:02Z", "response_item", serde_json::json!({"type": "message", "role": "user", "content": [{"type": "input_text", "text": "look at /private/tmp"}]})),
+            record(
+                "2026-09-29T00:00:00Z",
+                "session_meta",
+                serde_json::json!({"id": "cmp-2", "cwd": "/tmp/demo", "cli_version": "0.156.1"}),
+            ),
+            record(
+                "2026-09-29T00:00:01Z",
+                "event_msg",
+                serde_json::json!({"type": "task_started", "turn_id": "t1"}),
+            ),
+            record(
+                "2026-09-29T00:00:02Z",
+                "response_item",
+                serde_json::json!({"type": "message", "role": "user", "content": [{"type": "input_text", "text": "look at /private/tmp"}]}),
+            ),
             assistant_item("2026-09-29T00:00:03Z", "It holds 40 stale folders."),
             token_count("2026-09-29T00:00:04Z", 1000, 100),
-            record("2026-09-29T00:00:05Z", "event_msg", serde_json::json!({"type": "task_complete", "turn_id": "t1"})),
-            record("2026-09-29T00:01:00Z", "event_msg", serde_json::json!({"type": "task_started", "turn_id": "t2"})),
+            record(
+                "2026-09-29T00:00:05Z",
+                "event_msg",
+                serde_json::json!({"type": "task_complete", "turn_id": "t1"}),
+            ),
+            record(
+                "2026-09-29T00:01:00Z",
+                "event_msg",
+                serde_json::json!({"type": "task_started", "turn_id": "t2"}),
+            ),
             token_count("2026-09-29T00:01:01Z", 1000, 100),
             assistant_item("2026-09-29T00:01:40Z", HANDOFF),
-            record("2026-09-29T00:01:40.100Z", "token_usage_record", serde_json::json!({"thread_id": "cmp-2", "turn_id": "t2"})),
+            record(
+                "2026-09-29T00:01:40.100Z",
+                "token_usage_record",
+                serde_json::json!({"thread_id": "cmp-2", "turn_id": "t2"}),
+            ),
             token_count("2026-09-29T00:01:40.200Z", 2400, 180),
             compacted("2026-09-29T00:01:40.300Z", HANDOFF),
-            record("2026-09-29T00:01:40.400Z", "event_msg", serde_json::json!({"type": "thread_settings_applied"})),
+            record(
+                "2026-09-29T00:01:40.400Z",
+                "event_msg",
+                serde_json::json!({"type": "thread_settings_applied"}),
+            ),
             token_count("2026-09-29T00:01:40.500Z", 2400, 180),
-            record("2026-09-29T00:01:40.600Z", "event_msg", serde_json::json!({"type": "item_completed", "turn_id": "t2", "item": {"type": "ContextCompaction", "id": "01a0eaed-d00a-7480"}})),
-            record("2026-09-29T00:01:41Z", "event_msg", serde_json::json!({"type": "task_complete", "turn_id": "t2"})),
+            record(
+                "2026-09-29T00:01:40.600Z",
+                "event_msg",
+                serde_json::json!({"type": "item_completed", "turn_id": "t2", "item": {"type": "ContextCompaction", "id": "01a0eaed-d00a-7480"}}),
+            ),
+            record(
+                "2026-09-29T00:01:41Z",
+                "event_msg",
+                serde_json::json!({"type": "task_complete", "turn_id": "t2"}),
+            ),
         ]);
         let detail = parse_rollout("compaction-handoff", &content, "cmp-2");
 
@@ -16673,7 +16727,10 @@ earlier terminal context records.\n\
         assert_eq!(turn_usage_total(&detail), 2580);
         // The sidebar entry counts what the conversation renders: the prompt
         // and the reply, not the handoff.
-        assert_eq!(summary_of("compaction-handoff-sum", &content).message_count, 2);
+        assert_eq!(
+            summary_of("compaction-handoff-sum", &content).message_count,
+            2
+        );
     }
 
     /// An automatic compaction mid-turn. The compaction's own model call thinks
@@ -16684,29 +16741,93 @@ earlier terminal context records.\n\
     #[test]
     fn a_mid_turn_compaction_keeps_its_own_thinking_out_of_the_reply() {
         let content = jsonl(&[
-            record("2026-09-29T00:00:00Z", "session_meta", serde_json::json!({"id": "cmp-3", "cwd": "/tmp/demo", "cli_version": "0.153.4"})),
-            record("2026-09-29T00:00:01Z", "event_msg", serde_json::json!({"type": "task_started", "turn_id": "t1"})),
-            record("2026-09-29T00:00:02Z", "response_item", serde_json::json!({"type": "message", "role": "user", "content": [{"type": "input_text", "text": "fix the race"}]})),
-            record("2026-09-29T00:00:03Z", "event_msg", serde_json::json!({"type": "item_completed", "item": {"type": "Reasoning", "id": "rs_1", "summary_text": ["**Looking at the lock**"]}})),
-            record("2026-09-29T00:00:03.100Z", "response_item", serde_json::json!({"type": "reasoning", "id": "rs_1", "summary": [{"type": "summary_text", "text": "**Looking at the lock**"}]})),
-            record("2026-09-29T00:00:04Z", "response_item", serde_json::json!({"type": "function_call", "name": "shell", "call_id": "c1", "arguments": "{\"command\":[\"rg\",\"lock\"]}"})),
-            record("2026-09-29T00:00:05Z", "response_item", serde_json::json!({"type": "function_call_output", "call_id": "c1", "output": "src/lock.rs:1"})),
-            record("2026-09-29T00:00:05.100Z", "token_usage_record", serde_json::json!({"turn_id": "t1"})),
+            record(
+                "2026-09-29T00:00:00Z",
+                "session_meta",
+                serde_json::json!({"id": "cmp-3", "cwd": "/tmp/demo", "cli_version": "0.153.4"}),
+            ),
+            record(
+                "2026-09-29T00:00:01Z",
+                "event_msg",
+                serde_json::json!({"type": "task_started", "turn_id": "t1"}),
+            ),
+            record(
+                "2026-09-29T00:00:02Z",
+                "response_item",
+                serde_json::json!({"type": "message", "role": "user", "content": [{"type": "input_text", "text": "fix the race"}]}),
+            ),
+            record(
+                "2026-09-29T00:00:03Z",
+                "event_msg",
+                serde_json::json!({"type": "item_completed", "item": {"type": "Reasoning", "id": "rs_1", "summary_text": ["**Looking at the lock**"]}}),
+            ),
+            record(
+                "2026-09-29T00:00:03.100Z",
+                "response_item",
+                serde_json::json!({"type": "reasoning", "id": "rs_1", "summary": [{"type": "summary_text", "text": "**Looking at the lock**"}]}),
+            ),
+            record(
+                "2026-09-29T00:00:04Z",
+                "response_item",
+                serde_json::json!({"type": "function_call", "name": "shell", "call_id": "c1", "arguments": "{\"command\":[\"rg\",\"lock\"]}"}),
+            ),
+            record(
+                "2026-09-29T00:00:05Z",
+                "response_item",
+                serde_json::json!({"type": "function_call_output", "call_id": "c1", "output": "src/lock.rs:1"}),
+            ),
+            record(
+                "2026-09-29T00:00:05.100Z",
+                "token_usage_record",
+                serde_json::json!({"turn_id": "t1"}),
+            ),
             token_count("2026-09-29T00:00:05.200Z", 1000, 100),
             // The compaction's model call: its thinking, then its handoff.
-            record("2026-09-29T00:00:30Z", "response_item", serde_json::json!({"type": "reasoning", "id": "rs_c", "summary": [{"type": "summary_text", "text": "**Preparing concise handoff summary**"}]})),
+            record(
+                "2026-09-29T00:00:30Z",
+                "response_item",
+                serde_json::json!({"type": "reasoning", "id": "rs_c", "summary": [{"type": "summary_text", "text": "**Preparing concise handoff summary**"}]}),
+            ),
             assistant_item("2026-09-29T00:00:40Z", HANDOFF),
-            record("2026-09-29T00:00:40.100Z", "token_usage_record", serde_json::json!({"turn_id": "t1"})),
+            record(
+                "2026-09-29T00:00:40.100Z",
+                "token_usage_record",
+                serde_json::json!({"turn_id": "t1"}),
+            ),
             token_count("2026-09-29T00:00:40.200Z", 2400, 180),
             compacted("2026-09-29T00:00:40.300Z", HANDOFF),
-            record("2026-09-29T00:00:40.400Z", "world_state", serde_json::json!({"full": true})),
-            record("2026-09-29T00:00:40.500Z", "turn_context", serde_json::json!({"turn_id": "t1", "model": "gpt-6"})),
-            record("2026-09-29T00:00:40.700Z", "event_msg", serde_json::json!({"type": "item_completed", "item": {"type": "ContextCompaction", "id": "cmp-item"}})),
-            record("2026-09-29T00:00:50Z", "event_msg", serde_json::json!({"type": "item_completed", "item": {"type": "Reasoning", "id": "rs_2", "summary_text": ["**Resuming the fix**"]}})),
-            record("2026-09-29T00:00:50.100Z", "response_item", serde_json::json!({"type": "reasoning", "id": "rs_2", "summary": [{"type": "summary_text", "text": "**Resuming the fix**"}]})),
+            record(
+                "2026-09-29T00:00:40.400Z",
+                "world_state",
+                serde_json::json!({"full": true}),
+            ),
+            record(
+                "2026-09-29T00:00:40.500Z",
+                "turn_context",
+                serde_json::json!({"turn_id": "t1", "model": "gpt-6"}),
+            ),
+            record(
+                "2026-09-29T00:00:40.700Z",
+                "event_msg",
+                serde_json::json!({"type": "item_completed", "item": {"type": "ContextCompaction", "id": "cmp-item"}}),
+            ),
+            record(
+                "2026-09-29T00:00:50Z",
+                "event_msg",
+                serde_json::json!({"type": "item_completed", "item": {"type": "Reasoning", "id": "rs_2", "summary_text": ["**Resuming the fix**"]}}),
+            ),
+            record(
+                "2026-09-29T00:00:50.100Z",
+                "response_item",
+                serde_json::json!({"type": "reasoning", "id": "rs_2", "summary": [{"type": "summary_text", "text": "**Resuming the fix**"}]}),
+            ),
             assistant_item("2026-09-29T00:01:00Z", "Fixed the race."),
             token_count("2026-09-29T00:01:00.100Z", 3500, 260),
-            record("2026-09-29T00:01:01Z", "event_msg", serde_json::json!({"type": "task_complete", "turn_id": "t1"})),
+            record(
+                "2026-09-29T00:01:01Z",
+                "event_msg",
+                serde_json::json!({"type": "task_complete", "turn_id": "t1"}),
+            ),
         ]);
         let detail = parse_rollout("compaction-midturn", &content, "cmp-3");
 
@@ -16742,8 +16863,13 @@ earlier terminal context records.\n\
             .blocks
             .iter()
             .any(|block| matches!(block, ContentBlock::ToolUse { tool_use_id: Some(id), .. } if id == "c1"))));
-        assert_eq!(texts.last(), Some(&("assistant", Some("Fixed the race.".into()))));
-        assert!(!texts.iter().any(|(_, text)| text.as_deref() == Some(HANDOFF)));
+        assert_eq!(
+            texts.last(),
+            Some(&("assistant", Some("Fixed the race.".into())))
+        );
+        assert!(!texts
+            .iter()
+            .any(|(_, text)| text.as_deref() == Some(HANDOFF)));
         // The thinking card that went away had the compaction's round billed
         // to it; that spend stays in the conversation, on the reply before.
         assert_eq!(turn_usage_total(&detail), 3760);
@@ -16752,7 +16878,10 @@ earlier terminal context records.\n\
             .filter_map(|turn| turn.usage.as_ref())
             .map(|usage| usage.input_tokens + usage.output_tokens)
             .sum();
-        assert_eq!(before_divider, 2580, "both rounds before the divider stay there");
+        assert_eq!(
+            before_divider, 2580,
+            "both rounds before the divider stay there"
+        );
     }
 
     /// Codex before ~0.137 wrote no handoff record at all: the summary exists
@@ -16761,14 +16890,42 @@ earlier terminal context records.\n\
     #[test]
     fn an_older_compaction_opens_onto_the_summary_its_record_restates() {
         let content = jsonl(&[
-            record("2026-05-31T10:00:00Z", "session_meta", serde_json::json!({"id": "cmp-4", "cwd": "/tmp/demo", "cli_version": "0.133.0"})),
-            record("2026-05-31T10:00:01Z", "event_msg", serde_json::json!({"type": "user_message", "message": "run the tests"})),
-            record("2026-05-31T10:00:02Z", "event_msg", serde_json::json!({"type": "agent_message", "message": "Running them."})),
-            record("2026-05-31T10:00:03Z", "response_item", serde_json::json!({"type": "function_call", "name": "shell", "call_id": "c1", "arguments": "{\"command\":[\"make\",\"test\"]}"})),
-            record("2026-05-31T10:00:04Z", "response_item", serde_json::json!({"type": "function_call_output", "call_id": "c1", "output": "ok"})),
+            record(
+                "2026-05-31T10:00:00Z",
+                "session_meta",
+                serde_json::json!({"id": "cmp-4", "cwd": "/tmp/demo", "cli_version": "0.133.0"}),
+            ),
+            record(
+                "2026-05-31T10:00:01Z",
+                "event_msg",
+                serde_json::json!({"type": "user_message", "message": "run the tests"}),
+            ),
+            record(
+                "2026-05-31T10:00:02Z",
+                "event_msg",
+                serde_json::json!({"type": "agent_message", "message": "Running them."}),
+            ),
+            record(
+                "2026-05-31T10:00:03Z",
+                "response_item",
+                serde_json::json!({"type": "function_call", "name": "shell", "call_id": "c1", "arguments": "{\"command\":[\"make\",\"test\"]}"}),
+            ),
+            record(
+                "2026-05-31T10:00:04Z",
+                "response_item",
+                serde_json::json!({"type": "function_call_output", "call_id": "c1", "output": "ok"}),
+            ),
             compacted("2026-05-31T10:00:05Z", HANDOFF),
-            record("2026-05-31T10:00:06Z", "event_msg", serde_json::json!({"type": "context_compacted"})),
-            record("2026-05-31T10:00:07Z", "event_msg", serde_json::json!({"type": "agent_message", "message": "All green."})),
+            record(
+                "2026-05-31T10:00:06Z",
+                "event_msg",
+                serde_json::json!({"type": "context_compacted"}),
+            ),
+            record(
+                "2026-05-31T10:00:07Z",
+                "event_msg",
+                serde_json::json!({"type": "agent_message", "message": "All green."}),
+            ),
         ]);
         let detail = parse_rollout("compaction-legacy", &content, "cmp-4");
 
@@ -16778,7 +16935,10 @@ earlier terminal context records.\n\
         );
         let texts = turn_texts(&detail);
         assert_eq!(texts.first(), Some(&("user", Some("run the tests".into()))));
-        assert_eq!(texts.last(), Some(&("assistant", Some("All green.".into()))));
+        assert_eq!(
+            texts.last(),
+            Some(&("assistant", Some("All green.".into())))
+        );
     }
 
     /// The text fallback only looks at what was written since the previous
@@ -16788,14 +16948,34 @@ earlier terminal context records.\n\
     fn the_text_fallback_never_reaches_past_the_previous_compaction() {
         let call = |ts: &str, id: &str| {
             [
-                record(ts, "response_item", serde_json::json!({"type": "function_call", "name": "shell", "call_id": id, "arguments": "{\"command\":[\"ls\"]}"})),
-                record(ts, "response_item", serde_json::json!({"type": "function_call_output", "call_id": id, "output": "ok"})),
+                record(
+                    ts,
+                    "response_item",
+                    serde_json::json!({"type": "function_call", "name": "shell", "call_id": id, "arguments": "{\"command\":[\"ls\"]}"}),
+                ),
+                record(
+                    ts,
+                    "response_item",
+                    serde_json::json!({"type": "function_call_output", "call_id": id, "output": "ok"}),
+                ),
             ]
         };
         let mut records = vec![
-            record("2026-09-29T00:00:00Z", "session_meta", serde_json::json!({"id": "cmp-6", "cwd": "/tmp/demo"})),
-            record("2026-09-29T00:00:01Z", "event_msg", serde_json::json!({"type": "task_started", "turn_id": "t1"})),
-            record("2026-09-29T00:00:02Z", "response_item", serde_json::json!({"type": "message", "role": "user", "content": [{"type": "input_text", "text": "q1"}]})),
+            record(
+                "2026-09-29T00:00:00Z",
+                "session_meta",
+                serde_json::json!({"id": "cmp-6", "cwd": "/tmp/demo"}),
+            ),
+            record(
+                "2026-09-29T00:00:01Z",
+                "event_msg",
+                serde_json::json!({"type": "task_started", "turn_id": "t1"}),
+            ),
+            record(
+                "2026-09-29T00:00:02Z",
+                "response_item",
+                serde_json::json!({"type": "message", "role": "user", "content": [{"type": "input_text", "text": "q1"}]}),
+            ),
             // A real reply that happens to read exactly like a later summary.
             assistant_item("2026-09-29T00:00:03Z", HANDOFF),
         ];
@@ -16839,14 +17019,38 @@ earlier terminal context records.\n\
     #[test]
     fn the_handoff_is_recognized_by_its_text_when_adjacency_breaks() {
         let content = jsonl(&[
-            record("2026-09-29T00:00:00Z", "session_meta", serde_json::json!({"id": "cmp-5", "cwd": "/tmp/demo"})),
-            record("2026-09-29T00:00:01Z", "event_msg", serde_json::json!({"type": "task_started", "turn_id": "t1"})),
-            record("2026-09-29T00:00:02Z", "response_item", serde_json::json!({"type": "message", "role": "user", "content": [{"type": "input_text", "text": "hi"}]})),
+            record(
+                "2026-09-29T00:00:00Z",
+                "session_meta",
+                serde_json::json!({"id": "cmp-5", "cwd": "/tmp/demo"}),
+            ),
+            record(
+                "2026-09-29T00:00:01Z",
+                "event_msg",
+                serde_json::json!({"type": "task_started", "turn_id": "t1"}),
+            ),
+            record(
+                "2026-09-29T00:00:02Z",
+                "response_item",
+                serde_json::json!({"type": "message", "role": "user", "content": [{"type": "input_text", "text": "hi"}]}),
+            ),
             assistant_item("2026-09-29T00:00:03Z", "Hello."),
-            record("2026-09-29T00:00:04Z", "event_msg", serde_json::json!({"type": "task_complete", "turn_id": "t1"})),
-            record("2026-09-29T00:01:00Z", "event_msg", serde_json::json!({"type": "task_started", "turn_id": "t2"})),
+            record(
+                "2026-09-29T00:00:04Z",
+                "event_msg",
+                serde_json::json!({"type": "task_complete", "turn_id": "t1"}),
+            ),
+            record(
+                "2026-09-29T00:01:00Z",
+                "event_msg",
+                serde_json::json!({"type": "task_started", "turn_id": "t2"}),
+            ),
             assistant_item("2026-09-29T00:01:40Z", HANDOFF),
-            record("2026-09-29T00:01:40.100Z", "some_future_accounting", serde_json::json!({"turn_id": "t2"})),
+            record(
+                "2026-09-29T00:01:40.100Z",
+                "some_future_accounting",
+                serde_json::json!({"turn_id": "t2"}),
+            ),
             compacted("2026-09-29T00:01:40.300Z", HANDOFF),
         ]);
         let detail = parse_rollout("compaction-text", &content, "cmp-5");

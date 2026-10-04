@@ -33,7 +33,7 @@
 
 <table>
   <tr>
-    <td width="50%" valign="top">🧩 <strong>One interface for every agent</strong><br/>Fifteen agents built in, and any ACP agent can join — all rendered as the same structured conversation, not a terminal.</td>
+    <td width="50%" valign="top">🧩 <strong>One interface for every agent</strong><br/>Fourteen agents built in, and any ACP agent can join — all rendered as the same structured conversation, not a terminal.</td>
     <td width="50%" valign="top">🔎 <strong>Sessions that travel</strong><br/>Import, search, and resume the history every agent keeps on disk, then hand it to a different agent.</td>
   </tr>
   <tr>
@@ -110,7 +110,7 @@
 
 ### One Interface for Every Agent
 
-Fifteen agents come built in, and any other ACP agent can join from the public registry or its distribution JSON. Codeg speaks the Agent Client Protocol to every one of them, so they all get the same rich conversation — tool cards, live diffs, plans, and permission prompts — instead of a terminal to squint at.
+Fourteen agents come built in, and any other ACP agent can join from the public registry or its distribution JSON. Codeg speaks the Agent Client Protocol to every one of them, so they all get the same rich conversation — tool cards, live diffs, plans, and permission prompts — instead of a terminal to squint at.
 
 [Docs →](https://docs.codeg.app/guide/supported-agents) · [Custom agents →](https://docs.codeg.app/guide/custom-agents)
 
@@ -275,13 +275,12 @@ An editor, live and side-by-side diffs, a full git client with a three-pane merg
 
 ## 🤖 Supported Agents
 
-Codeg talks to every agent over the [Agent Client Protocol](https://agentclientprotocol.com), so each one gets the same structured interface. Fifteen come built in, and Codeg installs, pins, and updates most of them for you:
+Codeg talks to every agent over the [Agent Client Protocol](https://agentclientprotocol.com), so each one gets the same structured interface. Fourteen come built in, and Codeg installs, pins, and updates most of them for you:
 
 <p>
   <a href="https://www.anthropic.com/claude-code"><kbd><img src="./docs/images/agents/claude-code.svg" alt="" width="16" valign="middle" /> Claude Code</kbd></a> &nbsp;
   <a href="https://github.com/openai/codex"><kbd><img src="./docs/images/agents/codex.svg" alt="" width="16" valign="middle" /> Codex</kbd></a> &nbsp;
   <a href="https://github.com/google-gemini/gemini-cli"><kbd><img src="./docs/images/agents/gemini-cli.svg" alt="" width="16" valign="middle" /> Gemini CLI</kbd></a> &nbsp;
-  <a href="https://openclaw.ai"><kbd><img src="./docs/images/agents/openclaw.svg" alt="" width="16" valign="middle" /> OpenClaw</kbd></a> &nbsp;
   <a href="https://opencode.ai"><kbd><picture><source media="(prefers-color-scheme: dark)" srcset="./docs/images/agents/opencode-dark.svg" /><img src="./docs/images/agents/opencode.svg" alt="" width="16" valign="middle" /></picture> OpenCode</kbd></a> &nbsp;
   <a href="https://cline.bot"><kbd><picture><source media="(prefers-color-scheme: dark)" srcset="./docs/images/agents/cline-dark.svg" /><img src="./docs/images/agents/cline.svg" alt="" width="16" valign="middle" /></picture> Cline</kbd></a> &nbsp;
   <a href="https://hermes-agent.nousresearch.com"><kbd><picture><source media="(prefers-color-scheme: dark)" srcset="./docs/images/agents/hermes-agent-dark.svg" /><img src="./docs/images/agents/hermes-agent.svg" alt="" width="16" valign="middle" /></picture> Hermes Agent</kbd></a> &nbsp;
@@ -326,6 +325,8 @@ $env:CODEG_STATIC_DIR="$env:LOCALAPPDATA\codeg-server\web"; codeg-server
 
 The installer defaults to `%LOCALAPPDATA%\codeg-server`, so it does not overwrite a DrawCode desktop install. If an older install shared the desktop folder, the script moves the server out of it.
 
+[GitHub Releases](https://github.com/icannotwait/MyCodeBuddy/releases) also provide signed self-hosted server archives: `codeg-server-linux-x64.tar.gz`, `codeg-server-linux-arm64.tar.gz`, `codeg-server-darwin-x64.tar.gz`, `codeg-server-darwin-arm64.tar.gz`, and `codeg-server-windows-x64.zip`. Each includes the server, MCP companion, computer helper, `web/` assets, and license files.
+
 **Docker** — build the optional server from this repository:
 
 ```bash
@@ -341,9 +342,25 @@ pnpm install && pnpm build
 cd src-tauri
 cargo build --release --bin codeg-server --no-default-features --features server
 cargo build --release --bin codeg-mcp --no-default-features --features mcp-bin
+# Only if computer use is enabled:
 cargo build --release --bin codeg-computer-helper --no-default-features --features computer-helper
 CODEG_STATIC_DIR=../out ./target/release/codeg-server
 ```
+
+**Source-built Linux/macOS upgrades** — Run from the repository root to pull source and rebuild:
+
+```bash
+git pull
+pnpm install && pnpm build
+cd src-tauri
+cargo build --release --bin codeg-server --no-default-features --features server
+cargo build --release --bin codeg-mcp --no-default-features --features mcp-bin
+# Only if computer use is enabled:
+cargo build --release --bin codeg-computer-helper --no-default-features --features computer-helper
+# Stop the service, redeploy the server, MCP companion, optional computer helper, and web assets, then restart.
+```
+
+For Docker upgrades, run `git pull && docker compose up --build -d --force-recreate` from the repository root.
 
 **Mobile** — install the [iOS app](https://apps.apple.com/app/codeg-client/id6785199071) or the [Android APK](https://github.com/xintaofei/codeg-android/releases/latest), then point it at the **Web Service** of your desktop app or at your own `codeg-server`: URL, token, done. Pairing steps in [Mobile apps](https://docs.codeg.app/getting-started/installation#mobile-apps).
 

@@ -33,7 +33,7 @@
 
 <table>
   <tr>
-    <td width="50%" valign="top">🧩 <strong>모든 에이전트를 하나의 인터페이스로</strong><br/>열다섯 개의 에이전트가 기본 내장되어 있고, ACP 에이전트라면 무엇이든 합류할 수 있습니다 — 모두 터미널이 아닌, 같은 구조화된 대화로 표시됩니다.</td>
+    <td width="50%" valign="top">🧩 <strong>모든 에이전트를 하나의 인터페이스로</strong><br/>열네 개의 에이전트가 기본 내장되어 있고, ACP 에이전트라면 무엇이든 합류할 수 있습니다 — 모두 터미널이 아닌, 같은 구조화된 대화로 표시됩니다.</td>
     <td width="50%" valign="top">🔎 <strong>에이전트를 넘나드는 세션</strong><br/>에이전트마다 디스크에 남겨 두는 기록을 가져와 검색하고 이어서 진행한 다음, 다른 에이전트에게 넘겨주세요.</td>
   </tr>
   <tr>
@@ -110,7 +110,7 @@
 
 ### 모든 에이전트를 하나의 인터페이스로
 
-열다섯 개의 에이전트가 기본 내장되어 있고, 그 밖의 ACP 에이전트도 공개 레지스트리나 자체 distribution JSON으로 합류할 수 있습니다. Codeg는 이들 모두와 Agent Client Protocol로 통신하므로, 눈을 가늘게 뜨고 들여다봐야 하는 터미널 대신 모두 같은 풍부한 대화 화면을 갖게 됩니다 — 도구 카드, 실시간 diff, 계획, 권한 요청까지.
+열네 개의 에이전트가 기본 내장되어 있고, 그 밖의 ACP 에이전트도 공개 레지스트리나 자체 distribution JSON으로 합류할 수 있습니다. Codeg는 이들 모두와 Agent Client Protocol로 통신하므로, 눈을 가늘게 뜨고 들여다봐야 하는 터미널 대신 모두 같은 풍부한 대화 화면을 갖게 됩니다 — 도구 카드, 실시간 diff, 계획, 권한 요청까지.
 
 [문서 →](https://docs.codeg.app/guide/supported-agents) · [커스텀 에이전트 →](https://docs.codeg.app/guide/custom-agents)
 
@@ -275,13 +275,12 @@ Codeg를 데스크톱 앱으로, 어떤 브라우저에서든 여는 자체 호�
 
 ## 🤖 지원 에이전트
 
-Codeg는 모든 에이전트와 [Agent Client Protocol](https://agentclientprotocol.com)로 통신하므로, 에이전트마다 같은 구조화된 인터페이스를 갖습니다. 열다섯 개가 기본 내장되어 있으며, 그중 대부분은 Codeg가 대신 설치하고, 버전을 고정하고, 업데이트합니다:
+Codeg는 모든 에이전트와 [Agent Client Protocol](https://agentclientprotocol.com)로 통신하므로, 에이전트마다 같은 구조화된 인터페이스를 갖습니다. 열네 개가 기본 내장되어 있으며, 그중 대부분은 Codeg가 대신 설치하고, 버전을 고정하고, 업데이트합니다:
 
 <p>
   <a href="https://www.anthropic.com/claude-code"><kbd><img src="../images/agents/claude-code.svg" alt="" width="16" valign="middle" /> Claude Code</kbd></a> &nbsp;
   <a href="https://github.com/openai/codex"><kbd><img src="../images/agents/codex.svg" alt="" width="16" valign="middle" /> Codex</kbd></a> &nbsp;
   <a href="https://github.com/google-gemini/gemini-cli"><kbd><img src="../images/agents/gemini-cli.svg" alt="" width="16" valign="middle" /> Gemini CLI</kbd></a> &nbsp;
-  <a href="https://openclaw.ai"><kbd><img src="../images/agents/openclaw.svg" alt="" width="16" valign="middle" /> OpenClaw</kbd></a> &nbsp;
   <a href="https://opencode.ai"><kbd><picture><source media="(prefers-color-scheme: dark)" srcset="../images/agents/opencode-dark.svg" /><img src="../images/agents/opencode.svg" alt="" width="16" valign="middle" /></picture> OpenCode</kbd></a> &nbsp;
   <a href="https://cline.bot"><kbd><picture><source media="(prefers-color-scheme: dark)" srcset="../images/agents/cline-dark.svg" /><img src="../images/agents/cline.svg" alt="" width="16" valign="middle" /></picture> Cline</kbd></a> &nbsp;
   <a href="https://hermes-agent.nousresearch.com"><kbd><picture><source media="(prefers-color-scheme: dark)" srcset="../images/agents/hermes-agent-dark.svg" /><img src="../images/agents/hermes-agent.svg" alt="" width="16" valign="middle" /></picture> Hermes Agent</kbd></a> &nbsp;
@@ -326,6 +325,8 @@ $env:CODEG_STATIC_DIR="$env:LOCALAPPDATA\codeg-server\web"; codeg-server
 
 설치 프로그램의 기본 디렉터리는 `%LOCALAPPDATA%\codeg-server`라서 DrawCode 데스크톱 설치를 덮어쓰지 않습니다. 이전 설치가 데스크톱 폴더에 있으면 스크립트가 서버를 그 밖으로 옮깁니다.
 
+[GitHub Releases](https://github.com/icannotwait/MyCodeBuddy/releases)는 셀프 호스팅용 서명된 서버 압축 파일도 제공합니다: `codeg-server-linux-x64.tar.gz`, `codeg-server-linux-arm64.tar.gz`, `codeg-server-darwin-x64.tar.gz`, `codeg-server-darwin-arm64.tar.gz`, `codeg-server-windows-x64.zip`. 각 파일에는 서버, MCP 동반 프로세스, 컴퓨터 제어 헬퍼, `web/` 자산과 라이선스 파일이 포함됩니다.
+
 **Docker** — 선택적 서버를 이 저장소에서 빌드합니다:
 
 ```bash
@@ -341,9 +342,25 @@ pnpm install && pnpm build
 cd src-tauri
 cargo build --release --bin codeg-server --no-default-features --features server
 cargo build --release --bin codeg-mcp --no-default-features --features mcp-bin
+# 컴퓨터 제어를 활성화한 경우에만:
 cargo build --release --bin codeg-computer-helper --no-default-features --features computer-helper
 CODEG_STATIC_DIR=../out ./target/release/codeg-server
 ```
+
+**Linux/macOS 소스 빌드 업그레이드** — 저장소 루트에서 실행하여 소스를 가져오고 다시 빌드하세요:
+
+```bash
+git pull
+pnpm install && pnpm build
+cd src-tauri
+cargo build --release --bin codeg-server --no-default-features --features server
+cargo build --release --bin codeg-mcp --no-default-features --features mcp-bin
+# 컴퓨터 제어를 활성화한 경우에만:
+cargo build --release --bin codeg-computer-helper --no-default-features --features computer-helper
+# 서비스를 중지하고 서버, MCP 동반 프로세스, 선택적 컴퓨터 헬퍼와 웹 자산을 다시 배포한 뒤 재시작하세요.
+```
+
+Docker 업그레이드는 저장소 루트에서 `git pull && docker compose up --build -d --force-recreate`를 실행하세요.
 
 **모바일** — [iOS 앱](https://apps.apple.com/app/codeg-client/id6785199071) 또는 [Android APK](https://github.com/xintaofei/codeg-android/releases/latest)를 설치한 뒤 데스크톱 앱의 **웹 서비스**나 직접 운영하는 `codeg-server`를 가리키게 하세요: 주소와 토큰만 넣으면 끝입니다. 연결 절차는 [모바일 앱](https://docs.codeg.app/getting-started/installation#mobile-apps) 참고.
 

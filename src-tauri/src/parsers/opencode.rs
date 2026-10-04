@@ -2248,7 +2248,9 @@ fn v2_agent_call(part: &serde_json::Value) -> Option<V2AgentCall<'_>> {
 /// `mention` is a span of the prompt text.
 fn v2_user_blocks(message: &serde_json::Value) -> Vec<ContentBlock> {
     let mut blocks = Vec::new();
-    if let Some(text) = pick_str(Some(message), &["text"]) {
+    if let Some(text) =
+        pick_str_verbatim(Some(message), &["text"]).filter(|text| !text.trim().is_empty())
+    {
         blocks.push(ContentBlock::Text {
             text: text.to_string(),
         });
@@ -2281,14 +2283,18 @@ fn v2_assistant_blocks(
     for part in v2_content(message) {
         match part.get("type").and_then(|t| t.as_str()).unwrap_or("") {
             "text" => {
-                if let Some(text) = pick_str(Some(part), &["text"]) {
+                if let Some(text) =
+                    pick_str_verbatim(Some(part), &["text"]).filter(|text| !text.trim().is_empty())
+                {
                     blocks.push(ContentBlock::Text {
                         text: text.to_string(),
                     });
                 }
             }
             "reasoning" => {
-                if let Some(text) = pick_str(Some(part), &["text"]) {
+                if let Some(text) =
+                    pick_str_verbatim(Some(part), &["text"]).filter(|text| !text.trim().is_empty())
+                {
                     blocks.push(ContentBlock::Thinking {
                         text: text.to_string(),
                     });
@@ -3270,6 +3276,43 @@ mod tests {
             .as_deref(),
             Some("look at notes.md")
         );
+    }
+
+    #[test]
+    fn v2_message_text_preserves_markdown_whitespace() {
+        let source = "    first()\n    second()\n\n";
+        let user = super::v2_user_blocks(&serde_json::json!({ "text": source }));
+        assert!(matches!(user.as_slice(), [ContentBlock::Text { text }] if text == source));
+
+        let assistant = super::v2_assistant_blocks(
+            &serde_json::json!({
+                "content": [
+                    { "type": "reasoning", "text": source },
+                    { "type": "text", "text": source }
+                ]
+            }),
+            &std::collections::HashMap::new(),
+        );
+        assert!(matches!(
+            assistant.as_slice(),
+            [ContentBlock::Thinking { text: thinking }, ContentBlock::Text { text }]
+                if thinking == source && text == source
+        ));
+    }
+
+    #[test]
+    fn v2_blank_message_text_is_still_omitted() {
+        assert!(super::v2_user_blocks(&serde_json::json!({ "text": " \n\t " })).is_empty());
+        assert!(super::v2_assistant_blocks(
+            &serde_json::json!({
+                "content": [
+                    { "type": "reasoning", "text": " \n\t " },
+                    { "type": "text", "text": " \n\t " }
+                ]
+            }),
+            &std::collections::HashMap::new(),
+        )
+        .is_empty());
     }
 
     /// OpenCode 2 returns a tool's result as `state.content` items and its

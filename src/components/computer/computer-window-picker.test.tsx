@@ -92,6 +92,72 @@ beforeEach(() => {
 })
 
 describe("ComputerWindowPicker", () => {
+  it.each(["window", "application", "screen", "all windows"])(
+    "explains clipboard exposure before granting control of %s",
+    async (scope) => {
+      api.computerAvailable.mockReturnValue(true)
+      api.computerStatus.mockResolvedValue({
+        ...status(true),
+        screenOffered: true,
+      })
+      api.computerListShareableWindows.mockResolvedValue([window("none")])
+      api.computerShareWindow.mockResolvedValue([])
+      api.computerShareApp.mockResolvedValue({ shared: [], apps: [] })
+      api.computerShareScreen.mockResolvedValue({ shared: [], apps: [] })
+      api.computerShareWindows.mockResolvedValue({ shared: [], skipped: 0 })
+      mount()
+
+      // The disclosure must be visible before any control is granted, even
+      // before the list finishes loading, and must not depend on a setting.
+      const notice = screen.getByText(
+        "Computer control does not isolate your clipboard. Even with clipboard tools off, an agent can click Paste in a shared app and expose what you copied earlier. Clear sensitive clipboard content before granting control."
+      )
+      expect(notice).toBeVisible()
+      expect(api.computerShareWindow).not.toHaveBeenCalled()
+      expect(api.computerShareApp).not.toHaveBeenCalled()
+      expect(api.computerShareScreen).not.toHaveBeenCalled()
+      expect(api.computerShareWindows).not.toHaveBeenCalled()
+
+      let control: HTMLElement
+      if (scope === "all windows") {
+        control = await screen.findByRole("button", { name: /Share all/ })
+      } else {
+        const group = await screen.findByRole("group", {
+          name:
+            scope === "screen"
+              ? "What agents may do with the entire screen"
+              : scope === "application"
+                ? "What agents may do with all of TextEdit"
+                : "What agents may do with TextEdit",
+        })
+        control = within(group).getByRole("button", { name: "Act" })
+      }
+      expect(control).toBeEnabled()
+      expect(
+        notice.compareDocumentPosition(control) &
+          Node.DOCUMENT_POSITION_FOLLOWING
+      ).not.toBe(0)
+
+      if (scope === "all windows") {
+        await openMenu(control)
+        control = screen.getByRole("menuitem", {
+          name: "Let agents read and act on all of them",
+        })
+      }
+      await act(async () => fireEvent.click(control))
+      const grant =
+        scope === "window"
+          ? api.computerShareWindow
+          : scope === "application"
+            ? api.computerShareApp
+            : scope === "screen"
+              ? api.computerShareScreen
+              : api.computerShareWindows
+      expect(grant).toHaveBeenCalledTimes(1)
+      expect(notice).toBeVisible()
+    }
+  )
+
   /** A window shared before this window of codeg loaded is shown as shared —
    * the list says so, and the store has not been told anything yet. */
   it("shows a grant the store has not heard of yet", async () => {

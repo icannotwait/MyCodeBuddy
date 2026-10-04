@@ -317,8 +317,12 @@ impl WorkspaceWindowSession {
         !std::mem::replace(&mut state.frozen, true)
     }
 
-    fn is_frozen(&self) -> bool {
-        self.lock().frozen
+    /// A health-check result still belongs to this launch's restore. A
+    /// manual open consumes the pending entry, even if the user closes that
+    /// window again before the older result is processed.
+    fn should_restore(&self, window: WorkspaceWindow) -> bool {
+        let state = self.lock();
+        !state.frozen && state.pending.contains(&window)
     }
 
     /// Store the list as it is now, unless that is what is stored already.
@@ -545,11 +549,20 @@ async fn reopen_remote_windows(
                     .with_detail(err.to_string()),
             ),
         };
+        let window = WorkspaceWindow::Remote {
+            connection_id: connection.id,
+        };
+        // A later manual open/close supersedes both outcomes of this check:
+        // do not reopen a window the user closed, or report an obsolete
+        // failure and bring the local workspace forward because of it.
+        if app
+            .try_state::<WorkspaceWindowSession>()
+            .is_some_and(|session| !session.should_restore(window))
+        {
+            continue;
+        }
         let opened = checked.and_then(|()| reopen_remote_window(app, &connection));
         if let Err(error) = opened {
-            let window = WorkspaceWindow::Remote {
-                connection_id: connection.id,
-            };
             // The checks all started together, so this result can be older than
             // a manual open that has since succeeded. That window stands, and
             // there is nothing to report.
@@ -581,8 +594,9 @@ fn reopen_remote_window(
         connection_id: connection.id,
     };
     if let Some(session) = app.try_state::<WorkspaceWindowSession>() {
-        // Quitting: a window built now would only be torn down again.
-        if session.is_frozen() {
+        // Recheck at the build boundary: a manual open or quit can settle
+        // this entry while the health result is being processed.
+        if !session.should_restore(window) {
             return Ok(());
         }
     }
@@ -830,6 +844,35 @@ mod tests {
         // A failure with no window behind it does leave the list.
         assert_eq!(state.forget_pending(remote(1)), Change::Membership);
         assert_eq!(state.snapshot(), vec![remote(2)]);
+    }
+
+    #[test]
+    fn a_manual_open_then_close_cancels_the_pending_restore_result() {
+        let session = WorkspaceWindowSession::new();
+        {
+            let mut state = session.lock();
+            state.pending = vec![remote(1), remote(2)];
+            state.restoring = true;
+        }
+        assert!(session.should_restore(remote(2)));
+        // A's slow check holds B's result back. Opening B manually consumes
+        // its restore, and closing it must not make the old result current
+        // again, whether that result would build a window or show a failure.
+        session.apply(|state| state.mark_open(remote(2)));
+        assert!(!session.should_restore(remote(2)));
+        session.apply(|state| state.mark_closed(remote(2)));
+        assert!(!session.should_restore(remote(2)));
+        assert!(session.should_restore(remote(1)));
+        assert_eq!(session.lock().snapshot(), vec![remote(1)]);
+    }
+
+    #[test]
+    fn quitting_cancels_even_a_still_pending_restore_result() {
+        let session = WorkspaceWindowSession::new();
+        session.lock().pending = vec![remote(1)];
+        assert!(session.should_restore(remote(1)));
+        session.freeze();
+        assert!(!session.should_restore(remote(1)));
     }
 
     #[test]

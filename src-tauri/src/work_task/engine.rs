@@ -10852,8 +10852,14 @@ mod tests {
         assert_eq!(comments.len(), 1, "one settle, one comment");
         let (kind, number, body) = &comments[0];
         assert_eq!((*kind, *number), (ForgeItemKind::Change, 7));
-        assert!(body.contains("nothing was pushed to this pull request"), "{body}");
-        assert!(!body.to_lowercase().contains("accept"), "reads as an approval: {body}");
+        assert!(
+            body.contains("nothing was pushed to this pull request"),
+            "{body}"
+        );
+        assert!(
+            !body.to_lowercase().contains("accept"),
+            "reads as an approval: {body}"
+        );
     }
 
     /// The comment is a fact sheet: the link and the counters. Nothing the

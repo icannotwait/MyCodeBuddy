@@ -1484,7 +1484,9 @@ mod tests {
             let noun = provider.change_noun();
             let text = forge_instruction(ForgeScenario::ReviewFix, provider, 7, URL);
             assert!(
-                text.starts_with(&format!("Review {noun} #7 ({URL}): judge its approach first")),
+                text.starts_with(&format!(
+                    "Review {noun} #7 ({URL}): judge its approach first"
+                )),
                 "{provider:?}: the anchor does not put the judgement first"
             );
             assert!(
@@ -1496,14 +1498,22 @@ mod tests {
             let branch = text
                 .find("If the approach does not hold")
                 .unwrap_or_else(|| panic!("{provider:?} has no failure branch"));
-            let work = text.find("Once the approach holds up").expect("the fixing paragraph");
+            let work = text
+                .find("Once the approach holds up")
+                .expect("the fixing paragraph");
             // Before the work, not after it: an instruction that arrives once
             // the fixes are written is a retraction, not a gate.
-            assert!(gate < branch && branch < work, "{provider:?} judges after fixing");
+            assert!(
+                gate < branch && branch < work,
+                "{provider:?} judges after fixing"
+            );
             let first_fix = text
                 .find("fix the problems that are worth fixing")
                 .expect("the licence to fix");
-            assert!(work < first_fix, "{provider:?} licenses fixes before the judgement");
+            assert!(
+                work < first_fix,
+                "{provider:?} licenses fixes before the judgement"
+            );
             // Doubt is the user's call, not a reason to go ahead.
             assert!(
                 text[gate..branch].contains("treat it as not holding"),
@@ -1520,8 +1530,14 @@ mod tests {
                 outcome.contains("not even the small fixes"),
                 "{provider:?} still lets the reviewer polish the wrong design"
             );
-            assert!(outcome.contains("worktree clean"), "{provider:?} leaves a dirty tree");
-            assert!(outcome.contains("stop there"), "{provider:?} never ends the task");
+            assert!(
+                outcome.contains("worktree clean"),
+                "{provider:?} leaves a dirty tree"
+            );
+            assert!(
+                outcome.contains("stop there"),
+                "{provider:?} never ends the task"
+            );
             // The user gets the decision, and the ways forward from it.
             assert!(
                 outcome.contains("send this task back to have you fix it in place anyway"),
