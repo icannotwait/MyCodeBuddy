@@ -1,6 +1,7 @@
 //! Per-attempt request ledger. Counts and bytes go through [`bound_request`].
 //! A failed or duplicate exchange still consumes its budget. Idempotent
-//! candidate reuse does not waive the transmission.
+//! candidate reuse does not waive the transmission. The generation reserve is
+//! checked against model capacity before a request is committed.
 
 use std::collections::BTreeMap;
 
@@ -102,6 +103,9 @@ impl RequestAccounting {
         profile: &QualifiedContextProfile,
     ) -> RtResult<RequestPermit> {
         enforce_profile_caps(profile)?;
+        if profile.model_capacity_tokens == 0 {
+            return Err(rt_error(ErrorCode::CapacityUnknown, "capacity_unknown"));
+        }
         if request.prior_output != self.required_prior {
             return Err(rt_error(ErrorCode::InvalidArgument, "prior_output_missing"));
         }
@@ -109,8 +113,9 @@ impl RequestAccounting {
         for exchange in &request.tool_exchanges {
             let mut exchange = exchange.clone();
             // The HTTP request is one model request. Each envelope still counts
-            // as a tool call and its reply bytes still count.
+            // as a tool call even when the caller declares zero.
             exchange.model_requests = 0;
+            exchange.tool_calls = exchange.tool_calls.max(1);
             projected.record_exchange(&exchange, profile)?;
         }
         projected.model_requests = projected
@@ -121,6 +126,7 @@ impl RequestAccounting {
         projected.prior_output_bytes = u64::try_from(request.prior_output.len())
             .map_err(|_| rt_error(ErrorCode::InvalidArgument, "overflow"))?;
         let body_bytes = bound_request(&projected, profile)?;
+        admit_generation_reserve(body_bytes, profile)?;
         let candidate_id = assign_candidate(
             &mut self.candidates,
             &mut self.next_candidate,
@@ -194,6 +200,23 @@ pub(crate) fn enforce_profile_caps(profile: &QualifiedContextProfile) -> RtResul
             ErrorCode::CapabilityUnqualified,
             "reserve_too_small",
         ));
+    }
+    Ok(())
+}
+
+/// `adapter_hidden + verified input bytes + generation reserve` must fit.
+/// A missing capacity is not treated as zero room.
+fn admit_generation_reserve(body_bytes: u64, profile: &QualifiedContextProfile) -> RtResult<()> {
+    if profile.model_capacity_tokens == 0 {
+        return Err(rt_error(ErrorCode::CapacityUnknown, "capacity_unknown"));
+    }
+    let admission = profile
+        .adapter_hidden_bound_tokens
+        .checked_add(body_bytes)
+        .and_then(|value| value.checked_add(profile.generation_reserve_tokens))
+        .ok_or_else(|| rt_error(ErrorCode::CapacityUnknown, "capacity_unknown"))?;
+    if admission > profile.model_capacity_tokens {
+        return Err(rt_error(ErrorCode::ContextTooLarge, "context_too_large"));
     }
     Ok(())
 }

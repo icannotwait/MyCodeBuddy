@@ -45,6 +45,7 @@ pub(crate) fn rt_error(code: ErrorCode, reason: &'static str) -> RtError {
         ErrorCode::Forbidden => "The request is forbidden.",
         ErrorCode::CommandInProgress => "The command is already in progress.",
         ErrorCode::ContextTooLarge => "The context is too large.",
+        ErrorCode::CapacityUnknown => "The context capacity is unknown.",
         ErrorCode::StorageUnavailable => "Storage is unavailable.",
         ErrorCode::InvalidState => "The room cannot accept this command.",
         ErrorCode::RuntimeUnavailable => "The runtime is unavailable.",

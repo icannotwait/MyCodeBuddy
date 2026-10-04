@@ -348,6 +348,16 @@ impl RequestTranscriptBound {
         exchange: &ToolExchange,
         _profile: &QualifiedContextProfile,
     ) -> RtResult<()> {
+        let arguments = u64::try_from(exchange.arguments.len()).map_err(|_| invalid("overflow"))?;
+        let reply = u64::try_from(exchange.reply.len()).map_err(|_| invalid("overflow"))?;
+        let admitted = arguments
+            .checked_add(reply)
+            .ok_or_else(|| invalid("overflow"))?;
+        // A declared evidence total must cover the bytes this exchange admits.
+        // Zero is a non-evidence tool reply and stays on the tool-reply cap.
+        if exchange.evidence_bytes > 0 && exchange.evidence_bytes < admitted {
+            return Err(invalid("evidence_bytes"));
+        }
         if exchange.evidence_bytes > EVIDENCE_REPLY_BYTES {
             return Err(too_large("evidence_reply_limit"));
         }
@@ -358,8 +368,6 @@ impl RequestTranscriptBound {
         if evidence > EVIDENCE_ATTEMPT_BYTES {
             return Err(too_large("evidence_attempt_limit"));
         }
-        let arguments = u64::try_from(exchange.arguments.len()).map_err(|_| invalid("overflow"))?;
-        let reply = u64::try_from(exchange.reply.len()).map_err(|_| invalid("overflow"))?;
         self.tool_argument_bytes = self
             .tool_argument_bytes
             .checked_add(arguments)

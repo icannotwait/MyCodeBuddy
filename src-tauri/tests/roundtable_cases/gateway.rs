@@ -116,9 +116,12 @@ fn reason(err: &roundtable_protocol::RtError) -> &str {
 }
 
 fn fits(snapshot_body: u64, profile: &QualifiedContextProfile) -> bool {
-    snapshot_body
-        .checked_add(profile.generation_reserve_tokens)
-        .is_some_and(|total| total <= profile.model_capacity_tokens)
+    profile.model_capacity_tokens > 0
+        && profile
+            .adapter_hidden_bound_tokens
+            .checked_add(snapshot_body)
+            .and_then(|total| total.checked_add(profile.generation_reserve_tokens))
+            .is_some_and(|total| total <= profile.model_capacity_tokens)
 }
 
 fn secret_leaked(text: &str) -> bool {
@@ -840,4 +843,115 @@ fn revoked_or_expired_lease_never_forwards() {
         *lock.lock().expect("release") = true;
         cv.notify_all();
     }
+}
+
+#[test]
+fn generation_reserve_is_checked_against_model_capacity() {
+    let scope = ExecutionScope::Fake;
+    let body_bytes = encoded(RECIPIENT).adapter_bytes;
+
+    let missing = open_gateway();
+    let mut missing_lease = lease(20, scope.clone(), EXPIRES);
+    missing_lease.context_profile.model_capacity_tokens = 0;
+    let missing_handle = missing.register(missing_lease).expect("register");
+    missing.set_upstream_body(Vec::new());
+    let err = missing
+        .handle(
+            &missing_handle,
+            model_request(20, scope.clone(), encoded(RECIPIENT)),
+        )
+        .expect_err("missing capacity");
+    assert_eq!(err.code, ErrorCode::CapacityUnknown);
+    assert_eq!(reason(&err), "capacity_unknown");
+    assert_eq!(missing.forward_count(), 0);
+
+    let tight = open_gateway();
+    let mut tight_lease = lease(21, scope.clone(), EXPIRES);
+    tight_lease.context_profile.model_capacity_tokens = body_bytes + 8_192 - 1;
+    let tight_handle = tight.register(tight_lease).expect("register");
+    tight.set_upstream_body(Vec::new());
+    let err = tight
+        .handle(
+            &tight_handle,
+            model_request(21, scope.clone(), encoded(RECIPIENT)),
+        )
+        .expect_err("bound plus reserve");
+    assert_eq!(err.code, ErrorCode::ContextTooLarge);
+    assert_eq!(reason(&err), "context_too_large");
+    assert_eq!(tight.forward_count(), 0);
+
+    let hidden = open_gateway();
+    let mut hidden_lease = lease(22, scope.clone(), EXPIRES);
+    hidden_lease.context_profile.adapter_hidden_bound_tokens = 1;
+    hidden_lease.context_profile.model_capacity_tokens = body_bytes + 8_192;
+    let hidden_handle = hidden.register(hidden_lease).expect("register");
+    hidden.set_upstream_body(Vec::new());
+    let err = hidden
+        .handle(
+            &hidden_handle,
+            model_request(22, scope.clone(), encoded(RECIPIENT)),
+        )
+        .expect_err("hidden adapter plus reserve");
+    assert_eq!(err.code, ErrorCode::ContextTooLarge);
+    assert_eq!(reason(&err), "context_too_large");
+    assert_eq!(hidden.forward_count(), 0);
+}
+
+#[test]
+fn zero_tool_call_envelope_consumes_one_call() {
+    let gateway = open_gateway();
+    let scope = ExecutionScope::Fake;
+    let handle = gateway
+        .register(lease(23, scope.clone(), EXPIRES))
+        .expect("register");
+    gateway.set_upstream_body(Vec::new());
+
+    let mut zero = ToolExchange::search_empty();
+    assert!(!zero.reply.is_empty());
+    zero.tool_calls = 0;
+    let first = send_exchange(&gateway, &handle, &scope, 23, zero.clone(), None);
+    assert_eq!(first.permit.tool_calls(), 1);
+    assert_eq!(gateway.forward_count(), 1);
+
+    let mut batch = encoded(RECIPIENT);
+    batch.tool_exchanges = (0..127).map(|_| zero.clone()).collect();
+    let filled = gateway
+        .handle(&handle, model_request(23, scope.clone(), batch))
+        .expect("fill to 128");
+    assert_eq!(filled.permit.tool_calls(), 128);
+    let forwarded = gateway.forward_count();
+
+    let mut one_more = encoded(RECIPIENT);
+    one_more.tool_exchanges = vec![zero];
+    let err = gateway
+        .handle(&handle, model_request(23, scope.clone(), one_more))
+        .expect_err("request 129");
+    assert_eq!(err.code, ErrorCode::ContextTooLarge);
+    assert_eq!(reason(&err), "context_too_large");
+    assert_eq!(gateway.forward_count(), forwarded);
+    assert_eq!(
+        gateway
+            .accounting(handle.attempt_id())
+            .expect("snap")
+            .tool_calls,
+        128
+    );
+
+    let evidence_gateway = open_gateway();
+    let evidence_handle = evidence_gateway
+        .register(lease(24, scope.clone(), EXPIRES))
+        .expect("evidence");
+    evidence_gateway.set_upstream_body(Vec::new());
+    let mut under_reported = ToolExchange::evidence(8_192);
+    under_reported.evidence_bytes = 1;
+    under_reported.arguments = b"extra".to_vec();
+    let err = evidence_gateway
+        .handle(
+            &evidence_handle,
+            exchange_request(24, &scope, under_reported, None),
+        )
+        .expect_err("under-reported evidence");
+    assert_eq!(err.code, ErrorCode::InvalidArgument);
+    assert_eq!(reason(&err), "evidence_bytes");
+    assert_eq!(evidence_gateway.forward_count(), 0);
 }
