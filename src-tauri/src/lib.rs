@@ -57,6 +57,7 @@ pub mod pets;
 pub mod preferences;
 pub mod process;
 pub mod reference_search;
+pub mod roundtable;
 pub mod supervise;
 mod terminal;
 pub mod turn_timings;
