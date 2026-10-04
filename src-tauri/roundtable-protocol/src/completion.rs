@@ -363,6 +363,8 @@ pub struct CompletionWait {
     waiting: bool,
     waited_inside_gate: bool,
     trace: Vec<GateTraceEvent>,
+    /// `gate.held()` immediately after MCP close, before the gate is released.
+    sample: bool,
 }
 
 impl CompletionWait {
@@ -371,8 +373,12 @@ impl CompletionWait {
         gate.enter();
         trace.push(GateTraceEvent::Acquired);
         let barrier = close_mcp_admission(state, watermark);
-        trace.push(GateTraceEvent::ClosedMcp);
-        trace.push(GateTraceEvent::CapturedHandlers);
+        let sample = gate.held();
+        if sample {
+            trace.push(GateTraceEvent::ClosedMcp);
+            trace.push(GateTraceEvent::CapturedHandlers);
+        }
+        // Waited is recorded only after leave, once the flag is false.
         gate.leave();
         trace.push(GateTraceEvent::Released);
         let waiting = !converged(&barrier);
@@ -382,6 +388,7 @@ impl CompletionWait {
             waiting,
             waited_inside_gate: false,
             trace,
+            sample,
         }
     }
 
@@ -395,6 +402,11 @@ impl CompletionWait {
 
     pub fn gate_held(&self) -> bool {
         self.flag.held()
+    }
+
+    /// Whether the gate was held at MCP close, before release.
+    pub fn sample(&self) -> bool {
+        self.sample
     }
 
     pub fn waited_inside_gate(&self) -> bool {
@@ -433,20 +445,22 @@ pub struct Actor {
     inbox: VecDeque<ActorMessage>,
     replies: usize,
     stops: u64,
+    flag: GateFlag,
 }
 
 impl Actor {
-    pub fn new() -> Self {
+    pub fn new(gate: &CompletionGate) -> Self {
         Self {
             inbox: VecDeque::new(),
             replies: 0,
             stops: 0,
+            flag: gate.flag.clone(),
         }
     }
 
-    /// The actor never holds the admission gate. Barrier waits stay outside it.
+    /// Reads the completion gate flag shared with close and wait.
     pub fn gate_held(&self) -> bool {
-        false
+        self.flag.held()
     }
 
     pub fn request_reply(&mut self, handler: HandlerId) {
@@ -477,11 +491,5 @@ impl Actor {
 
     pub fn reply_count(&self) -> usize {
         self.replies
-    }
-}
-
-impl Default for Actor {
-    fn default() -> Self {
-        Self::new()
     }
 }

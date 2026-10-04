@@ -124,8 +124,10 @@ fn actor_remains_responsive_while_completion_barrier_waits() {
     let mut gate = CompletionGate::new();
     let mut wait = CompletionWait::start(&mut gate, &mut state, 1);
     assert!(wait.is_waiting());
+    assert!(wait.sample());
     assert!(!wait.gate_held());
     assert!(!gate.held());
+    assert!(!wait.trace().contains(&GateTraceEvent::Waited));
     assert!(!wait.waited_inside_gate());
     assert!(wait.barrier().pending_tools.contains(&handler_id));
     assert_eq!(
@@ -139,9 +141,10 @@ fn actor_remains_responsive_while_completion_barrier_waits() {
     );
     assert!(wait.poll(&state));
     assert_eq!(wait.trace().last(), Some(&GateTraceEvent::Waited));
+    assert!(!wait.gate_held());
     assert!(!wait.waited_inside_gate());
 
-    let mut actor = Actor::new();
+    let mut actor = Actor::new(&gate);
     assert!(!actor.gate_held());
     actor.request_reply(handler_id.clone());
     assert_eq!(
