@@ -1,0 +1,160 @@
+{
+  "verdict": "blocked_platform",
+  "g1_passed": false,
+  "qualification_issued": false,
+  "experiment_id": null,
+  "execution_tree_hash": null,
+  "shared_core_hashes": {
+    "canonical": null,
+    "delivery_encoder": null,
+    "validator": null,
+    "tool_core": null,
+    "request_accounting": null,
+    "ingress": null
+  },
+  "profile": {
+    "exact_id": "linux-codex-2.1.1",
+    "os_name": "linux",
+    "os_version": "debian-12",
+    "adapter_version": "codex-acp@2.1.1",
+    "isolator_version": "linux-oci",
+    "host_os_name": "windows",
+    "host_os_version": "Windows 11 Pro 10.0.26200.9457",
+    "platform_blocked": true,
+    "binaries": [
+      {
+        "role": "crun",
+        "absolute_path": null,
+        "version": null,
+        "sha256": null
+      },
+      {
+        "role": "codex",
+        "absolute_path": null,
+        "version": null,
+        "sha256": null
+      },
+      {
+        "role": "node",
+        "absolute_path": null,
+        "version": null,
+        "sha256": null
+      },
+      {
+        "role": "adapter",
+        "absolute_path": null,
+        "version": null,
+        "sha256": null
+      },
+      {
+        "role": "mcp",
+        "absolute_path": null,
+        "version": null,
+        "sha256": null
+      }
+    ],
+    "image_digest": null,
+    "policy_hash": null,
+    "tool_contract_hash": null,
+    "core_hash": null,
+    "plan_hash": null,
+    "execution_tree_hash": null,
+    "shared_core_hashes": {
+      "canonical": null,
+      "delivery_encoder": null,
+      "validator": null,
+      "tool_core": null,
+      "request_accounting": null,
+      "ingress": null
+    },
+    "observed_at": null
+  },
+  "probe_hashes": [],
+  "observed_at": null,
+  "missing": [
+    "image_digest",
+    "policy_hash",
+    "tool_contract_hash",
+    "core_hash",
+    "plan_hash",
+    "execution_tree_hash",
+    "shared_core:canonical",
+    "shared_core:delivery_encoder",
+    "shared_core:validator",
+    "shared_core:tool_core",
+    "shared_core:request_accounting",
+    "shared_core:ingress",
+    "binary:crun",
+    "binary:codex",
+    "binary:node",
+    "binary:adapter",
+    "binary:mcp",
+    "observed_at",
+    "approval",
+    "new_session",
+    "roundtable_mcp",
+    "ordered_turn_completion",
+    "cancel_and_reap",
+    "strict_isolation",
+    "bounded_context_delivery",
+    "private_events",
+    "sidebar_discovery",
+    "global_body_events",
+    "model_credential_material_in_sandbox",
+    "model_credentials_visible_to_agent",
+    "actual_binary_match",
+    "endpoint_compatibility",
+    "native_read_boundary",
+    "api_credential_scope"
+  ],
+  "anomalies": [
+    "approval_absent",
+    "binary_hashes_not_measured",
+    "platform_blocked"
+  ],
+  "required_capabilities": [
+    {
+      "name": "new_session",
+      "status": "not_tested"
+    },
+    {
+      "name": "roundtable_mcp",
+      "status": "not_tested"
+    },
+    {
+      "name": "ordered_turn_completion",
+      "status": "not_tested"
+    },
+    {
+      "name": "cancel_and_reap",
+      "status": "not_tested"
+    },
+    {
+      "name": "strict_isolation",
+      "status": "not_tested"
+    },
+    {
+      "name": "bounded_context_delivery",
+      "status": "not_tested"
+    }
+  ],
+  "private_events": "not_tested",
+  "ordinary_sidebar_imports": null,
+  "sidebar_discovery": "not_tested",
+  "global_body_events": null,
+  "model_credential_material_in_sandbox": null,
+  "model_credentials_visible_to_agent": null,
+  "credentials_unreachable": "not_tested",
+  "api_credential_scope": "not_tested",
+  "chatgpt_account_scope": "not_tested",
+  "actual_resolved_binary_matches_certificate": null,
+  "binary_match": "not_tested",
+  "idle_processes_after_reap": null,
+  "normal_completion_after_submit_receipt": null,
+  "endpoint_compatibility": "not_tested",
+  "native_read_boundary": "not_tested",
+  "companion_lifecycle": "not_tested",
+  "fake_broker_is_certificate": false,
+  "fake_fd_is_certificate": false,
+  "traces": []
+}

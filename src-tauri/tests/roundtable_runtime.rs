@@ -18,3 +18,6 @@ mod capability_boundary;
 
 #[path = "roundtable_cases/registry.rs"]
 mod registry;
+
+#[path = "roundtable_cases/roundtable_qualification.rs"]
+mod roundtable_qualification;
