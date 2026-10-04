@@ -9,6 +9,7 @@ pub mod context;
 pub mod dto;
 pub mod model;
 pub mod strategy;
+pub mod validation;
 
 pub use budget::*;
 pub use canonical::{canonical_bytes, parse_strict_json, to_hex};
@@ -16,6 +17,11 @@ pub use context::*;
 pub use dto::*;
 pub use model::*;
 pub use strategy::*;
+pub use validation::{
+    submit_candidate, validate_consensus, validate_result, AliasVisibility, ClaimRef, DecisionKind,
+    EvidenceRef, FieldCode, RequiredTarget, ResponseRef, ResultScope, SubmissionDecision,
+    SubmissionState, ValidatedResult, VisibleAliases, MAX_REPAIRABLE_INVALID_SUBMISSIONS,
+};
 
 pub fn decode_config(bytes: &[u8], limits: &ParseLimits) -> RtResult<RoundtableConfigV1> {
     decode_json(bytes, limits)

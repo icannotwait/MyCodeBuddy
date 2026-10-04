@@ -1,0 +1,290 @@
+{
+  "contract_profile": "roundtable_plan_1_2",
+  "schema_version": 1,
+  "limits": {
+    "default_quota_bytes": 8192,
+    "hard_cap_bytes": 65536,
+    "min_claims": 1,
+    "max_claims": 20,
+    "abstain_claims": 0,
+    "max_responses": 30,
+    "max_open_questions": 20,
+    "max_position_changes": 20,
+    "max_repairable_invalid_submissions": 3
+  },
+  "cases": [
+    {
+      "name": "empty_proposal",
+      "phase_kind": "proposal",
+      "payload": {
+        "kind": "proposal",
+        "summary": "ready",
+        "claims": []
+      },
+      "code": "claim_count",
+      "path": "$.claims"
+    },
+    {
+      "name": "blank_summary",
+      "phase_kind": "proposal",
+      "payload": {
+        "kind": "proposal",
+        "summary": " ",
+        "claims": [
+          {
+            "local_key": "c0",
+            "text": "claim",
+            "evidence_aliases": [],
+            "confidence": "low"
+          }
+        ]
+      },
+      "code": "empty_summary",
+      "path": "$.summary"
+    },
+    {
+      "name": "abstain_without_reason",
+      "phase_kind": "proposal",
+      "payload": {
+        "kind": "abstain",
+        "summary": "坐出",
+        "claims": []
+      },
+      "code": "abstain_reason",
+      "path": "$.reason"
+    },
+    {
+      "name": "abstain_with_claim",
+      "phase_kind": "critique",
+      "payload": {
+        "kind": "abstain",
+        "summary": "坐出",
+        "reason": "范围外",
+        "claims": [
+          {
+            "local_key": "c0",
+            "text": "claim",
+            "evidence_aliases": [],
+            "confidence": "low"
+          }
+        ]
+      },
+      "code": "abstain_claims",
+      "path": "$.claims"
+    },
+    {
+      "name": "duplicate_local_key",
+      "phase_kind": "proposal",
+      "payload": {
+        "kind": "proposal",
+        "summary": "重复",
+        "claims": [
+          {
+            "local_key": "c0",
+            "text": "one",
+            "evidence_aliases": [],
+            "confidence": "low"
+          },
+          {
+            "local_key": "c0",
+            "text": "two",
+            "evidence_aliases": [],
+            "confidence": "low"
+          }
+        ]
+      },
+      "code": "duplicate_local_key",
+      "path": "$.claims[1].local_key"
+    },
+    {
+      "name": "both_targets",
+      "phase_kind": "critique",
+      "payload": {
+        "kind": "critique",
+        "summary": "两个目标",
+        "claims": [
+          {
+            "local_key": "c0",
+            "text": "claim",
+            "evidence_aliases": [],
+            "confidence": "low"
+          }
+        ],
+        "responses": [
+          {
+            "target_claim_alias": "c-pub",
+            "target_response_alias": "r-pub",
+            "stance": "challenge",
+            "priority": "normal",
+            "text": "both",
+            "evidence_aliases": []
+          }
+        ]
+      },
+      "code": "ambiguous_target",
+      "path": "$.responses[0]"
+    },
+    {
+      "name": "missing_target",
+      "phase_kind": "critique",
+      "payload": {
+        "kind": "critique",
+        "summary": "没有目标",
+        "claims": [
+          {
+            "local_key": "c0",
+            "text": "claim",
+            "evidence_aliases": [],
+            "confidence": "low"
+          }
+        ],
+        "responses": [
+          {
+            "stance": "clarify",
+            "priority": "normal",
+            "text": "none",
+            "evidence_aliases": []
+          }
+        ]
+      },
+      "code": "missing_target",
+      "path": "$.responses[0]"
+    },
+    {
+      "name": "forged_speaker",
+      "phase_kind": "proposal",
+      "payload": {
+        "kind": "proposal",
+        "speaker_id": "11111111-1111-4111-8111-111111111111",
+        "summary": "伪造",
+        "claims": [
+          {
+            "local_key": "c0",
+            "text": "claim",
+            "evidence_aliases": [],
+            "confidence": "low"
+          }
+        ]
+      },
+      "code": "identity_not_selectable",
+      "path": "$.speaker_id"
+    },
+    {
+      "name": "coverage_field",
+      "phase_kind": "synthesis",
+      "payload": {
+        "kind": "synthesis",
+        "coverage": null,
+        "recommendation": {
+          "text": "建议",
+          "aliases": [],
+          "inference": true
+        },
+        "alternatives": [],
+        "consensus_items": [],
+        "disagreements": [],
+        "risks": [],
+        "decision_requests": []
+      },
+      "code": "coverage_rejected",
+      "path": "$.coverage"
+    },
+    {
+      "name": "wrong_phase_kind",
+      "phase_kind": "proposal",
+      "payload": {
+        "kind": "critique",
+        "summary": "错阶段",
+        "claims": [
+          {
+            "local_key": "c0",
+            "text": "claim",
+            "evidence_aliases": [],
+            "confidence": "low"
+          }
+        ]
+      },
+      "code": "wrong_phase_kind",
+      "path": "$.kind"
+    },
+    {
+      "name": "unknown_alias",
+      "phase_kind": "proposal",
+      "payload": {
+        "kind": "proposal",
+        "summary": "坏别名",
+        "claims": [
+          {
+            "local_key": "c0",
+            "text": "claim",
+            "evidence_aliases": ["missing-alias"],
+            "confidence": "low"
+          }
+        ]
+      },
+      "code": "unknown_alias",
+      "path": "$.claims[0].evidence_aliases[0]"
+    },
+    {
+      "name": "prose_is_not_a_parser",
+      "phase_kind": "proposal",
+      "raw": "Final answer {\"kind\":\"proposal\",\"summary\":\"ok\",\"claims\":[]}",
+      "code": "invalid_json",
+      "path": "$"
+    },
+    {
+      "name": "unlabeled_inference",
+      "phase_kind": "synthesis",
+      "payload": {
+        "kind": "synthesis",
+        "recommendation": {
+          "text": "没有依据",
+          "aliases": [],
+          "inference": false
+        },
+        "alternatives": [],
+        "consensus_items": [],
+        "disagreements": [],
+        "risks": [],
+        "decision_requests": []
+      },
+      "code": "inference_required",
+      "path": "$.recommendation"
+    },
+    {
+      "name": "labeled_inference",
+      "phase_kind": "synthesis",
+      "ok": true,
+      "payload": {
+        "kind": "synthesis",
+        "recommendation": {
+          "text": "无证据推断",
+          "aliases": [],
+          "inference": true
+        },
+        "alternatives": [],
+        "consensus_items": [],
+        "disagreements": [],
+        "risks": [],
+        "decision_requests": []
+      }
+    },
+    {
+      "name": "minimal_proposal",
+      "phase_kind": "proposal",
+      "ok": true,
+      "payload": {
+        "kind": "proposal",
+        "summary": "成员摘要",
+        "claims": [
+          {
+            "local_key": "c0",
+            "text": "claim",
+            "evidence_aliases": [],
+            "confidence": "low"
+          }
+        ]
+      }
+    }
+  ]
+}
