@@ -4,15 +4,24 @@
 //! ordinary session rows and does not claim a live OS sandbox on hosts that
 //! cannot prove one.
 
+mod companion;
 mod feature_gate;
 mod gateway;
 pub(crate) mod ingress;
 mod qualification;
+mod qualification_harness;
 mod relay;
 mod request_accounting;
 mod runtime;
 mod sandbox;
+mod tool_core;
 
+pub use companion::{
+    advertised_tools, bind_service_process, callable_tools, legacy_companion_context,
+    parse_companion_args, plan_service_launch, service_tools_ignoring_host_flags, tool_callable,
+    CompanionMode, CompanionParse, FakeBrokerTransport, LegacyParentArgs, ServiceLaunchInput,
+    ServiceLaunchPlan, ServiceProcess, ServiceWatchState, ServiceWatchdog, ATTEMPT_TOKEN_ENV,
+};
 pub use feature_gate::{
     scopes_convert, AdmissionFacts, ExecutionGate, ExecutionPolicy, ExecutionScope, GatePermit,
 };
@@ -27,6 +36,7 @@ pub use ingress::{
 pub use qualification::{
     evaluate_certificate, CertifiedBinary, OsIdentity, QualificationKey, QualificationReport,
 };
+pub use qualification_harness::QualificationHarness;
 pub use relay::{
     forward_to_caller_target, probe_instance_socket, relay_from_helper, InstanceSocket,
     LoopbackRelay, SocketProbe, SANDBOX_ENDPOINT,
@@ -44,6 +54,11 @@ pub use sandbox::{
     attempt_live_escapes, build_sandbox_plan, DbIdentity, EscapeReport, IsolationProvider,
     JournalLaunchIntentStore, LaunchIntent, LaunchIntentStore, LinuxOciIsolator, PreparedSandbox,
     SandboxInput, SandboxInstance, SandboxPlan,
+};
+pub use tool_core::{
+    dispatch_tool, service_result_schema, service_tool_names, service_tool_schema,
+    AdmittedToolScope, AttemptToken, InMemoryToolStore, RoundtableToolCall, RoundtableToolResponse,
+    TokenBinding, TokenRegistry, ToolStore, SERVICE_RESULT_SCHEMA_ID, SERVICE_TOOL_VERSION,
 };
 
 use roundtable_protocol::{ErrorCode, ErrorDetails, RtError};

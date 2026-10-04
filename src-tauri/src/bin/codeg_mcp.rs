@@ -8,6 +8,11 @@
 //! `--features` groups (`delegation` / `coordination_v1` / `feedback` /
 //! `ask` / `sessions` / `workflow_v2`) and `--role` (`root` | `delegation_child`).
 //!
+//! Service roundtable mode is a separate entry:
+//! `codeg-mcp --service-roundtable --socket-path <path> --incarnation <id>`.
+//! Its attempt token arrives only in the child environment. That mode does
+//! not read a host parent PID and watches broker EOF instead.
+//!
 //! The agent's MCP config (injected by codeg via `load_mcp_servers_for_agent`)
 //! spawns this binary with three required flags:
 //!
@@ -37,165 +42,17 @@ use std::process::ExitCode;
 use std::sync::Arc;
 
 use codeg_lib::acp::delegation::companion::{
-    dispatch_line, drain_and_cancel_all, serialize_jsonrpc_line, CompanionContext,
-    CompanionFeatures, InflightCalls, JsonRpcResponse, LineAction,
+    dispatch_line, drain_and_cancel_all, serialize_jsonrpc_line, InflightCalls, JsonRpcResponse,
+    LineAction,
 };
 use codeg_lib::acp::delegation::parent_watcher::{wait_for_parent_exit, DEFAULT_POLL_INTERVAL};
-use codeg_lib::acp::delegation::transport::{client_establish_ready_lease, CompanionRole};
+use codeg_lib::acp::delegation::transport::client_establish_ready_lease;
+use codeg_lib::roundtable::{
+    bind_service_process, legacy_companion_context, parse_companion_args, CompanionMode,
+    CompanionParse,
+};
 use tokio::io::{AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::sync::Mutex;
-
-struct Args {
-    parent_connection_id: String,
-    socket_path: String,
-    token: String,
-    /// Optional PID of the codeg / codeg-server process that owns this
-    /// session. When set, codeg-mcp exits as soon as the parent is gone so
-    /// orphaned companions don't keep the binary file locked (Windows
-    /// upgrade failure) or hold open a UDS / pipe nobody will ever read
-    /// from. Omitted by older parents — backward compatible.
-    parent_pid: Option<u32>,
-    /// Comma-joined tool groups to expose (e.g.
-    /// `delegation,coordination_v1,feedback,ask,sessions,workflow_v2`).
-    /// Omitted by parents that predate feature gating; see
-    /// `CompanionFeatures::parse` (defaults to delegation-only without Join).
-    features: Option<String>,
-    /// Launch role. Omitted by older launchers → Root.
-    role: CompanionRole,
-    /// Launch-time depth snapshot. Omitted by older launchers to preserve their
-    /// prior behavior; the main-process broker still enforces the hard limit.
-    can_spawn_child: bool,
-    /// Immutable ACP connection incarnation used in fallback tool-call ids.
-    connection_incarnation_id: String,
-    /// Built-in slugs removed from the closed delegate target enum.
-    disabled_agents: Option<String>,
-}
-
-fn parse_role(raw: &str) -> Result<CompanionRole, String> {
-    match raw {
-        "root" => Ok(CompanionRole::Root),
-        "delegation_child" => Ok(CompanionRole::DelegationChild),
-        other => Err(format!(
-            "--role must be root or delegation_child, got {other}"
-        )),
-    }
-}
-
-fn parse_args() -> Result<Args, String> {
-    let mut parent_connection_id = None;
-    let mut socket_path = None;
-    let mut token = None;
-    let mut parent_pid = None;
-    let mut features = None;
-    let mut role = None;
-    let mut can_spawn_child = None;
-    let mut connection_incarnation_id = None;
-    let mut disabled_agents = None;
-
-    let mut iter = std::env::args().skip(1);
-    while let Some(arg) = iter.next() {
-        match arg.as_str() {
-            "--parent-connection-id" => {
-                parent_connection_id = Some(
-                    iter.next()
-                        .ok_or_else(|| "--parent-connection-id requires a value".to_string())?,
-                );
-            }
-            "--socket-path" => {
-                socket_path = Some(
-                    iter.next()
-                        .ok_or_else(|| "--socket-path requires a value".to_string())?,
-                );
-            }
-            "--token" => {
-                token = Some(
-                    iter.next()
-                        .ok_or_else(|| "--token requires a value".to_string())?,
-                );
-            }
-            "--parent-pid" => {
-                let raw = iter
-                    .next()
-                    .ok_or_else(|| "--parent-pid requires a value".to_string())?;
-                parent_pid = Some(
-                    raw.parse::<u32>()
-                        .map_err(|e| format!("--parent-pid must be a u32: {e}"))?,
-                );
-            }
-            "--features" => {
-                features = Some(
-                    iter.next()
-                        .ok_or_else(|| "--features requires a value".to_string())?,
-                );
-            }
-            "--role" => {
-                let raw = iter
-                    .next()
-                    .ok_or_else(|| "--role requires a value".to_string())?;
-                role = Some(parse_role(&raw)?);
-            }
-            "--can-spawn-child" => {
-                let raw = iter
-                    .next()
-                    .ok_or_else(|| "--can-spawn-child requires a value".to_string())?;
-                can_spawn_child = Some(
-                    raw.parse::<bool>()
-                        .map_err(|e| format!("--can-spawn-child must be true or false: {e}"))?,
-                );
-            }
-            "--connection-incarnation-id" => {
-                connection_incarnation_id =
-                    Some(iter.next().ok_or_else(|| {
-                        "--connection-incarnation-id requires a value".to_string()
-                    })?);
-            }
-            "--disabled-agents" => {
-                disabled_agents = Some(
-                    iter.next()
-                        .ok_or_else(|| "--disabled-agents requires a value".to_string())?,
-                );
-            }
-            "--custom-agents" => {
-                let _ = iter
-                    .next()
-                    .ok_or_else(|| "--custom-agents requires a value".to_string())?;
-            }
-            "--help" | "-h" => {
-                println!(
-                    "codeg-mcp --parent-connection-id <uuid> --socket-path <path> --token <secret> [--parent-pid <pid>] [--features delegation,coordination_v1,feedback,ask,sessions,workflow_v2] [--role root|delegation_child] [--can-spawn-child true|false] [--disabled-agents <agent>,...] [--custom-agents <ignored>]"
-                );
-                std::process::exit(0);
-            }
-            other => return Err(format!("unknown arg: {other}")),
-        }
-    }
-    let parent_connection_id =
-        parent_connection_id.ok_or_else(|| "missing --parent-connection-id".to_string())?;
-    Ok(Args {
-        connection_incarnation_id: connection_incarnation_id
-            .unwrap_or_else(|| parent_connection_id.clone()),
-        parent_connection_id,
-        socket_path: socket_path.ok_or_else(|| "missing --socket-path".to_string())?,
-        token: token.ok_or_else(|| "missing --token".to_string())?,
-        parent_pid,
-        features,
-        // Older launchers omit --role; default Root for backward compatibility.
-        role: role.unwrap_or(CompanionRole::Root),
-        can_spawn_child: can_spawn_child.unwrap_or(true),
-        disabled_agents,
-    })
-}
-
-fn parse_csv(raw: Option<&str>) -> Vec<String> {
-    raw.map(|csv| {
-        csv.split(',')
-            .map(str::trim)
-            .filter(|entry| !entry.is_empty())
-            .map(str::to_string)
-            .collect()
-    })
-    .unwrap_or_default()
-}
 
 /// Serialize a `JsonRpcResponse` and append a newline; small enough to keep
 /// inline so the write-mutex critical section stays tight.
@@ -219,35 +76,71 @@ async fn write_response_locked<W: AsyncWrite + Unpin>(
     Ok(())
 }
 
+async fn run_service(socket_path: &str, incarnation: &str) -> ExitCode {
+    let env = std::env::vars().collect::<std::collections::HashMap<_, _>>();
+    let process = match bind_service_process(socket_path, incarnation, &env) {
+        Ok(process) => process,
+        Err(err) => {
+            let _ = writeln!(std::io::stderr(), "codeg-mcp: {}", err.message);
+            return ExitCode::from(2);
+        }
+    };
+    if process.reads_host_parent_pid()
+        || process.parent_pid().is_some()
+        || !process.token_is_present()
+    {
+        return ExitCode::from(2);
+    }
+    let stdin = tokio::io::stdin();
+    let mut lines = BufReader::new(stdin).lines();
+    loop {
+        tokio::select! {
+            biased;
+            _ = process.watch_closed() => {
+                return ExitCode::SUCCESS;
+            }
+            line_result = lines.next_line() => {
+                match line_result {
+                    Ok(None) | Err(_) => return ExitCode::SUCCESS,
+                    Ok(Some(_)) => {}
+                }
+            }
+        }
+    }
+}
+
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> ExitCode {
     // Stderr-only subscriber: stdout is the JSON-RPC protocol channel, and
     // concurrent mcp processes share no log file. No hub/buffer/emitter.
     let _log_guard = codeg_lib::logging::init::init_mcp();
 
-    let args = match parse_args() {
-        Ok(a) => a,
+    let parsed = match parse_companion_args(std::env::args().skip(1)) {
+        Ok(parsed) => parsed,
         Err(e) => {
             let _ = writeln!(std::io::stderr(), "codeg-mcp: {e}");
             return ExitCode::from(2);
         }
     };
-    let features = CompanionFeatures::parse(args.features.as_deref());
-    let ctx = CompanionContext {
-        parent_connection_id: args.parent_connection_id,
-        socket_path: args.socket_path.clone(),
-        token: args.token.clone(),
-        features,
-        role: args.role,
-        can_spawn_child: args.can_spawn_child,
-        connection_incarnation_id: args.connection_incarnation_id,
-        disabled_agents: parse_csv(args.disabled_agents.as_deref()),
+    let args = match parsed {
+        CompanionParse::Help(text) => {
+            println!("{text}");
+            return ExitCode::SUCCESS;
+        }
+        CompanionParse::Launch(CompanionMode::ServiceRoundtable {
+            socket_path,
+            incarnation,
+        }) => {
+            return run_service(&socket_path, &incarnation).await;
+        }
+        CompanionParse::Launch(CompanionMode::LegacyParent(args)) => args,
     };
+    let ctx = legacy_companion_context(&args);
 
     // When delegation is enabled, establish the authenticated ready lease
     // BEFORE serving stdio tools. Failure exits non-zero so the agent never
     // sees a half-ready companion.
-    let mut ready_hold = if features.delegation {
+    let mut ready_hold = if ctx.features.delegation {
         match client_establish_ready_lease(&args.socket_path, &args.token).await {
             Ok(hold) => Some(hold),
             Err(e) => {
@@ -394,6 +287,8 @@ mod tests {
     use std::pin::Pin;
     use std::task::{Context, Poll};
 
+    use codeg_lib::acp::delegation::companion::{CompanionContext, CompanionFeatures};
+    use codeg_lib::acp::delegation::transport::CompanionRole;
     use serde_json::{json, Value};
     use tokio::io::AsyncWrite;
 
