@@ -1,7 +1,7 @@
 //! Short roundtable transactions.
 //!
 //! Methods commit or roll back before returning. They do not wait on a model
-//! or a process, and they do not issue `BEGIN IMMEDIATE`. Same-room consistency
+//! or a process, and they use ordinary short transactions. Same-room consistency
 //! is a composite foreign key or a conditional update. The product execution
 //! gate is not enabled here. Pool pragmas come from the P09a connection profile;
 //! `synchronous` stays whatever that profile already set, which is `NORMAL`.
@@ -563,7 +563,7 @@ impl RoundtableStore {
     }
 
     /// Point the room at a phase only when that phase row is in the same room
-    /// and the revision still matches. Not `BEGIN IMMEDIATE`.
+    /// and the revision still matches. Uses an ordinary short transaction.
     pub async fn assign_current_phase(
         &self,
         room_id: &str,

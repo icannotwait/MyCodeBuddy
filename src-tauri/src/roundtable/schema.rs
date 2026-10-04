@@ -14,8 +14,8 @@ use sea_orm::{ConnectionTrait, DbErr};
 pub enum DurabilityProfile {
     /// `synchronous=NORMAL`. A process crash can recover committed transactions.
     ProcessCrashRecovery,
-    /// `synchronous=FULL` or `EXTRA`, plus a filesystem fault test this task
-    /// does not perform and does not claim.
+    /// `FULL` or `EXTRA` synchronous mode, plus a filesystem fault test this
+    /// task does not perform and does not claim.
     PowerLoss,
 }
 
@@ -492,8 +492,8 @@ pub fn roundtable_table_names() -> &'static [&'static str] {
 }
 
 /// Idempotent schema body shared by the registered migration and
-/// [`super::migrate_roundtable`]. Callers that need atomicity wrap this in a
-/// transaction. Statements do not use `BEGIN IMMEDIATE`.
+/// [`super::migrate_roundtable`]. Callers that need atomicity wrap this in an
+/// ordinary short transaction.
 pub async fn apply_roundtable_schema(conn: &impl ConnectionTrait) -> Result<(), DbErr> {
     for statement in STATEMENTS {
         conn.execute_unprepared(statement).await?;
