@@ -81,6 +81,14 @@ function collectDuplicateKeys(filename: string): string[] {
 // `en.json` is the source of truth. Any missing key in another locale fails
 // the test with the exact dotted path, making translation gaps grep-able.
 describe("i18n locale key parity vs en.json", () => {
+  it("defines the shared clipboard boundary disclosure in all ten locales", () => {
+    for (const messages of locales) {
+      const computer = messages.ComputerUse as Record<string, unknown>
+      expect(computer.clipboardBoundary).toEqual(expect.any(String))
+      expect((computer.clipboardBoundary as string).trim()).not.toBe("")
+    }
+  })
+
   it.each(localeFiles)("%s has no duplicate message keys", (filename) => {
     expect(collectDuplicateKeys(filename)).toEqual([])
   })

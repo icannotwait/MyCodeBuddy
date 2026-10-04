@@ -400,6 +400,48 @@ impl codeg_lib::acp::session_info::SessionInfoAccess for NoSessionInfo {
     }
 }
 
+/// Task-tool stub: the historical protocol tests never exercise the task arms.
+struct NoTaskTools;
+#[async_trait]
+impl codeg_lib::acp::work_task_tools::WorkTaskToolAccess for NoTaskTools {
+    async fn report_progress(
+        &self,
+        _parent: &str,
+        _message: &str,
+    ) -> codeg_lib::acp::work_task_tools::TaskReportAck {
+        codeg_lib::acp::work_task_tools::TaskReportAck::rejected("no engine")
+    }
+    async fn complete(
+        &self,
+        _parent: &str,
+        _verdict: &str,
+        _summary: Option<&str>,
+    ) -> codeg_lib::acp::work_task_tools::TaskReportAck {
+        codeg_lib::acp::work_task_tools::TaskReportAck::rejected("no engine")
+    }
+}
+
+/// Chat-authoring stub: the historical protocol tests never exercise the authoring
+/// arms.
+struct NoAuthoring;
+#[async_trait]
+impl codeg_lib::acp::chat_authoring::ChatAuthoringAccess for NoAuthoring {
+    async fn create_automation(
+        &self,
+        _ctx: codeg_lib::acp::chat_authoring::AuthoringContext,
+        _spec: codeg_lib::acp::chat_authoring::NewAutomationSpec,
+    ) -> codeg_lib::acp::chat_authoring::AuthoringOutcome {
+        codeg_lib::acp::chat_authoring::AuthoringOutcome::rejected("automation", "no authoring")
+    }
+    async fn create_work_task(
+        &self,
+        _ctx: codeg_lib::acp::chat_authoring::AuthoringContext,
+        _spec: codeg_lib::acp::chat_authoring::NewWorkTaskSpec,
+    ) -> codeg_lib::acp::chat_authoring::AuthoringOutcome {
+        codeg_lib::acp::chat_authoring::AuthoringOutcome::rejected("work_task", "no authoring")
+    }
+}
+
 #[cfg(windows)]
 fn workflow_socket_path() -> std::path::PathBuf {
     std::path::PathBuf::from(format!(
@@ -2484,6 +2526,14 @@ const HISTORICAL_WORKFLOW_ROOT_FEATURES: CompanionFeatures = CompanionFeatures {
     compact_catalog: false,
     workflow_v2: true,
     completion_v2: false,
+    tasks: false,
+    automations: false,
+    taskboard: false,
+    browser: false,
+    browser_eval: false,
+    computer: false,
+    computer_launch: false,
+    computer_clipboard: false,
 };
 
 const HISTORICAL_COMPLETION_CHILD_FEATURES: CompanionFeatures = CompanionFeatures {
@@ -2495,6 +2545,14 @@ const HISTORICAL_COMPLETION_CHILD_FEATURES: CompanionFeatures = CompanionFeature
     compact_catalog: false,
     workflow_v2: false,
     completion_v2: true,
+    tasks: false,
+    automations: false,
+    taskboard: false,
+    browser: false,
+    browser_eval: false,
+    computer: false,
+    computer_launch: false,
+    computer_clipboard: false,
 };
 
 struct CapabilityResult {
@@ -2728,6 +2786,10 @@ async fn run_capability_case(case: CapabilityCase) -> CapabilityResult {
         Arc::new(NoSessionInfo),
         codeg_lib::acp::delegation::wait_cancel::WaitCancelRegistry::new_shared(),
         EventEmitter::Noop,
+        Arc::new(NoTaskTools),
+        Arc::new(NoAuthoring),
+        Arc::new(codeg_lib::acp::browser_tools::NoBrowserTabs),
+        Arc::new(codeg_lib::acp::computer_tools::NoComputerDesktop),
     );
     let socket_path = workflow_socket_path();
     let listener_task = tokio::spawn(listener.run(socket_path.clone()));
@@ -3606,6 +3668,10 @@ async fn run_final_delivery_fixture(
         Arc::new(NoSessionInfo),
         codeg_lib::acp::delegation::wait_cancel::WaitCancelRegistry::new_shared(),
         EventEmitter::Noop,
+        Arc::new(NoTaskTools),
+        Arc::new(NoAuthoring),
+        Arc::new(codeg_lib::acp::browser_tools::NoBrowserTabs),
+        Arc::new(codeg_lib::acp::computer_tools::NoComputerDesktop),
     );
     let socket_path = workflow_socket_path();
     let listener_task = tokio::spawn(with_historical_workflow_fixture_mutations(

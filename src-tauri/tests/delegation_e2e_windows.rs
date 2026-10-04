@@ -90,6 +90,48 @@ impl codeg_lib::acp::session_info::SessionInfoAccess for NoSessionInfo {
     }
 }
 
+/// Task-tool stub: the e2e delegation tests never exercise the task arms.
+struct NoTaskTools;
+#[async_trait]
+impl codeg_lib::acp::work_task_tools::WorkTaskToolAccess for NoTaskTools {
+    async fn report_progress(
+        &self,
+        _parent: &str,
+        _message: &str,
+    ) -> codeg_lib::acp::work_task_tools::TaskReportAck {
+        codeg_lib::acp::work_task_tools::TaskReportAck::rejected("no engine")
+    }
+    async fn complete(
+        &self,
+        _parent: &str,
+        _verdict: &str,
+        _summary: Option<&str>,
+    ) -> codeg_lib::acp::work_task_tools::TaskReportAck {
+        codeg_lib::acp::work_task_tools::TaskReportAck::rejected("no engine")
+    }
+}
+
+/// Chat-authoring stub: the e2e delegation tests never exercise the authoring
+/// arms.
+struct NoAuthoring;
+#[async_trait]
+impl codeg_lib::acp::chat_authoring::ChatAuthoringAccess for NoAuthoring {
+    async fn create_automation(
+        &self,
+        _ctx: codeg_lib::acp::chat_authoring::AuthoringContext,
+        _spec: codeg_lib::acp::chat_authoring::NewAutomationSpec,
+    ) -> codeg_lib::acp::chat_authoring::AuthoringOutcome {
+        codeg_lib::acp::chat_authoring::AuthoringOutcome::rejected("automation", "no authoring")
+    }
+    async fn create_work_task(
+        &self,
+        _ctx: codeg_lib::acp::chat_authoring::AuthoringContext,
+        _spec: codeg_lib::acp::chat_authoring::NewWorkTaskSpec,
+    ) -> codeg_lib::acp::chat_authoring::AuthoringOutcome {
+        codeg_lib::acp::chat_authoring::AuthoringOutcome::rejected("work_task", "no authoring")
+    }
+}
+
 fn unique_pipe(tag: &str) -> String {
     format!(
         r"\\.\pipe\codeg-e2e-{}-{}-{}",
@@ -177,6 +219,12 @@ async fn end_to_end_named_pipe_happy_path() {
         Arc::new(NoFeedback) as Arc<dyn codeg_lib::acp::feedback::SessionFeedbackAccess>,
         Arc::new(NoQuestions) as Arc<dyn SessionQuestionAccess>,
         Arc::new(NoSessionInfo) as Arc<dyn codeg_lib::acp::session_info::SessionInfoAccess>,
+        Arc::new(NoTaskTools) as Arc<dyn codeg_lib::acp::work_task_tools::WorkTaskToolAccess>,
+        Arc::new(NoAuthoring) as Arc<dyn codeg_lib::acp::chat_authoring::ChatAuthoringAccess>,
+        Arc::new(codeg_lib::acp::browser_tools::NoBrowserTabs)
+            as Arc<dyn codeg_lib::acp::browser_tools::BrowserToolAccess>,
+        Arc::new(codeg_lib::acp::computer_tools::NoComputerDesktop)
+            as Arc<dyn codeg_lib::acp::computer_tools::ComputerToolAccess>,
     );
 
     let pipe = unique_pipe("happy");
@@ -278,6 +326,12 @@ async fn end_to_end_named_pipe_back_to_back_requests() {
         Arc::new(NoFeedback) as Arc<dyn codeg_lib::acp::feedback::SessionFeedbackAccess>,
         Arc::new(NoQuestions) as Arc<dyn SessionQuestionAccess>,
         Arc::new(NoSessionInfo) as Arc<dyn codeg_lib::acp::session_info::SessionInfoAccess>,
+        Arc::new(NoTaskTools) as Arc<dyn codeg_lib::acp::work_task_tools::WorkTaskToolAccess>,
+        Arc::new(NoAuthoring) as Arc<dyn codeg_lib::acp::chat_authoring::ChatAuthoringAccess>,
+        Arc::new(codeg_lib::acp::browser_tools::NoBrowserTabs)
+            as Arc<dyn codeg_lib::acp::browser_tools::BrowserToolAccess>,
+        Arc::new(codeg_lib::acp::computer_tools::NoComputerDesktop)
+            as Arc<dyn codeg_lib::acp::computer_tools::ComputerToolAccess>,
     );
 
     let pipe = unique_pipe("repeat");
