@@ -87,6 +87,26 @@ jobs:
         working-directory: src-tauri
         run: cargo fmt --check
 
+  roundtable-protocol:
+    name: Roundtable protocol contracts
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: cargo fmt --check
+        run: cargo fmt --check --manifest-path src-tauri/roundtable-protocol/Cargo.toml
+
+      - name: cargo test --locked
+        run: cargo --config .cargo/low-memory.toml test --locked --manifest-path src-tauri/roundtable-protocol/Cargo.toml
+
+      - name: cargo clippy
+        run: cargo --config .cargo/low-memory.toml clippy --locked --manifest-path src-tauri/roundtable-protocol/Cargo.toml --all-targets -- -D warnings
+
   rust:
     name: Rust ${{ matrix.mode }} on ${{ matrix.os }}
     runs-on: ${{ matrix.os }}

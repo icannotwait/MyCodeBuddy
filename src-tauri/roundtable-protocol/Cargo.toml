@@ -1,0 +1,17 @@
+[package]
+name = "roundtable-protocol"
+version = "0.1.0"
+edition = "2021"
+publish = false
+license = "Apache-2.0"
+description = "Roundtable protocol types, canonical bytes, and golden contracts"
+
+# Own workspace root so this crate is not a member of src-tauri/codeg.
+[workspace]
+
+[dependencies]
+serde = { version = "=1.0.228", features = ["derive"] }
+serde_json = "=1.0.151"
+sha2 = "=0.10.9"
+thiserror = "=2.0.18"
+uuid = { version = "=1.20.0", features = ["serde"] }

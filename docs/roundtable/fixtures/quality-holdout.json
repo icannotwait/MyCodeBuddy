@@ -1,0 +1,270 @@
+{
+  "contract_profile": "roundtable_plan_1_2",
+  "schema_version": 1,
+  "tasks": [
+    {
+      "id": "fact-01",
+      "family": "fact_check",
+      "topic": "核对一份发布说明中的版本号、破坏性变更和回滚步骤是否与给定变更记录一致。",
+      "checks": [
+        {
+          "check_id": "fact-01-error",
+          "check_type": "seeded_error",
+          "opportunity": "把 1.2.0 写成 1.20，并省略迁移步骤"
+        },
+        {
+          "check_id": "fact-01-response",
+          "check_type": "substantive_response",
+          "opportunity": "指出遗漏的迁移步骤并引用变更记录"
+        },
+        {
+          "check_id": "fact-01-risk",
+          "check_type": "minority_risk",
+          "opportunity": "仅有一名成员指出回滚窗口与数据迁移不可逆"
+        }
+      ]
+    },
+    {
+      "id": "fact-02",
+      "family": "fact_check",
+      "topic": "核对事故时间线里的告警时间、影响范围和修复提交是否互相矛盾。",
+      "checks": [
+        {
+          "check_id": "fact-02-error",
+          "check_type": "seeded_error",
+          "opportunity": "修复提交时间早于告警，但被写成事故原因"
+        },
+        {
+          "check_id": "fact-02-response",
+          "check_type": "substantive_response",
+          "opportunity": "要求用原始日志区分触发时间和提交时间"
+        },
+        {
+          "check_id": "fact-02-risk",
+          "check_type": "minority_risk",
+          "opportunity": "少数意见认为第三方依赖时钟偏移未被排除"
+        }
+      ]
+    },
+    {
+      "id": "fact-03",
+      "family": "fact_check",
+      "topic": "核对容量表中的并发、超时和字节上限是否与所附配置原文一致。",
+      "checks": [
+        {
+          "check_id": "fact-03-error",
+          "check_type": "seeded_error",
+          "opportunity": "把单次输出上限 8 KiB 写成房间总上限"
+        },
+        {
+          "check_id": "fact-03-response",
+          "check_type": "substantive_response",
+          "opportunity": "区分单次输出、插话和房间预算三个量"
+        },
+        {
+          "check_id": "fact-03-risk",
+          "check_type": "minority_risk",
+          "opportunity": "少数意见指出未知用量不能被当成零"
+        }
+      ]
+    },
+    {
+      "id": "fact-04",
+      "family": "fact_check",
+      "topic": "核对引用文献中的样本数、失败数和结论句是否被调换。",
+      "checks": [
+        {
+          "check_id": "fact-04-error",
+          "check_type": "seeded_error",
+          "opportunity": "把 12 次失败写成 12 次成功"
+        },
+        {
+          "check_id": "fact-04-response",
+          "check_type": "substantive_response",
+          "opportunity": "按原文表格逐项核对分子和分母"
+        },
+        {
+          "check_id": "fact-04-risk",
+          "check_type": "minority_risk",
+          "opportunity": "少数意见要求保留未回报的样本而不是删除"
+        }
+      ]
+    },
+    {
+      "id": "tradeoff-01",
+      "family": "plan_tradeoff",
+      "topic": "在固定房间预算下比较串行深评与有限并行复核。",
+      "checks": [
+        {
+          "check_id": "tradeoff-01-error",
+          "check_type": "seeded_error",
+          "opportunity": "声称并行不会增加不确定收尾时间"
+        },
+        {
+          "check_id": "tradeoff-01-response",
+          "check_type": "substantive_response",
+          "opportunity": "回应并行清理超时会占用后续阶段预算"
+        },
+        {
+          "check_id": "tradeoff-01-risk",
+          "check_type": "minority_risk",
+          "opportunity": "少数意见认为串行会错过时间窗口内的反例"
+        }
+      ]
+    },
+    {
+      "id": "tradeoff-02",
+      "family": "plan_tradeoff",
+      "topic": "比较短输出配额与允许一次较长主持综合的方案。",
+      "checks": [
+        {
+          "check_id": "tradeoff-02-error",
+          "check_type": "seeded_error",
+          "opportunity": "把截断输出当成完整结论"
+        },
+        {
+          "check_id": "tradeoff-02-response",
+          "check_type": "substantive_response",
+          "opportunity": "说明截断时哪些主张不能被当作已覆盖"
+        },
+        {
+          "check_id": "tradeoff-02-risk",
+          "check_type": "minority_risk",
+          "opportunity": "少数意见指出短配额会系统性丢掉低置信风险"
+        }
+      ]
+    },
+    {
+      "id": "tradeoff-03",
+      "family": "plan_tradeoff",
+      "topic": "比较冻结快照与允许讨论中更新资料的方案。",
+      "checks": [
+        {
+          "check_id": "tradeoff-03-error",
+          "check_type": "seeded_error",
+          "opportunity": "把更新后的文件说成所有成员都已读到"
+        },
+        {
+          "check_id": "tradeoff-03-response",
+          "check_type": "substantive_response",
+          "opportunity": "解释未重发的成员仍基于旧快照"
+        },
+        {
+          "check_id": "tradeoff-03-risk",
+          "check_type": "minority_risk",
+          "opportunity": "少数意见要求显式标记资料版本分裂"
+        }
+      ]
+    },
+    {
+      "id": "tradeoff-04",
+      "family": "plan_tradeoff",
+      "topic": "比较失败即停与在剩余预算内换一名成员继续的方案。",
+      "checks": [
+        {
+          "check_id": "tradeoff-04-error",
+          "check_type": "seeded_error",
+          "opportunity": "把缺席成员计为同意"
+        },
+        {
+          "check_id": "tradeoff-04-response",
+          "check_type": "substantive_response",
+          "opportunity": "说明缺席不能转化为支持票"
+        },
+        {
+          "check_id": "tradeoff-04-risk",
+          "check_type": "minority_risk",
+          "opportunity": "少数意见认为替换成员会改变原问题的责任边界"
+        }
+      ]
+    },
+    {
+      "id": "counter-01",
+      "family": "counterexample_tracking",
+      "topic": "跟踪一个声称所有输入都有界的证明，并保留已给出的反例。",
+      "checks": [
+        {
+          "check_id": "counter-01-error",
+          "check_type": "seeded_error",
+          "opportunity": "反例被综合结论改写成已修复"
+        },
+        {
+          "check_id": "counter-01-response",
+          "check_type": "substantive_response",
+          "opportunity": "回应反例仍能复现的步骤"
+        },
+        {
+          "check_id": "counter-01-risk",
+          "check_type": "minority_risk",
+          "opportunity": "少数意见保留空输入与超大输入两个反例"
+        }
+      ]
+    },
+    {
+      "id": "counter-02",
+      "family": "counterexample_tracking",
+      "topic": "跟踪幂等键重放，区分相同请求与冲突请求。",
+      "checks": [
+        {
+          "check_id": "counter-02-error",
+          "check_type": "seeded_error",
+          "opportunity": "不同请求体复用同一键仍返回第一次的成功"
+        },
+        {
+          "check_id": "counter-02-response",
+          "check_type": "substantive_response",
+          "opportunity": "指出必须拒绝冲突而不是静默覆盖"
+        },
+        {
+          "check_id": "counter-02-risk",
+          "check_type": "minority_risk",
+          "opportunity": "少数意见要求同时保留两次请求的摘要"
+        }
+      ]
+    },
+    {
+      "id": "counter-03",
+      "family": "counterexample_tracking",
+      "topic": "跟踪暂停后的恢复，检查旧尝试是否仍能写入。",
+      "checks": [
+        {
+          "check_id": "counter-03-error",
+          "check_type": "seeded_error",
+          "opportunity": "恢复后接受旧 fence 的结果"
+        },
+        {
+          "check_id": "counter-03-response",
+          "check_type": "substantive_response",
+          "opportunity": "说明旧 fence 必须失效"
+        },
+        {
+          "check_id": "counter-03-risk",
+          "check_type": "minority_risk",
+          "opportunity": "少数意见指出清理未完成时不能开始下一阶段"
+        }
+      ]
+    },
+    {
+      "id": "counter-04",
+      "family": "counterexample_tracking",
+      "topic": "跟踪主持综合是否丢弃仅一人提出的高影响风险。",
+      "checks": [
+        {
+          "check_id": "counter-04-error",
+          "check_type": "seeded_error",
+          "opportunity": "综合稿删除了未被反驳的数据丢失风险"
+        },
+        {
+          "check_id": "counter-04-response",
+          "check_type": "substantive_response",
+          "opportunity": "要求给出删除该风险的依据或将其保留"
+        },
+        {
+          "check_id": "counter-04-risk",
+          "check_type": "minority_risk",
+          "opportunity": "少数意见本身就是该数据丢失风险，必须出现在结果中"
+        }
+      ]
+    }
+  ]
+}

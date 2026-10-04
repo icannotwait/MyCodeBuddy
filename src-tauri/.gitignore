@@ -14,3 +14,6 @@
 /vendor/sacp-tokio/target/
 # Generated when running standalone cargo against the path crate
 /vendor/kill_tree/Cargo.lock
+
+# Independent protocol crate. Its lockfile is committed; build output is not.
+/roundtable-protocol/target/
