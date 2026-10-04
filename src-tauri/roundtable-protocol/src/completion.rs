@@ -213,19 +213,7 @@ pub fn close_mcp_admission(
     state: &mut CompletionState,
     ingress_watermark: u64,
 ) -> CompletionBarrier {
-    state.mcp_open = false;
-    let pending_tools = state
-        .handlers
-        .iter()
-        .filter(|(_, progress)| !progress.finished)
-        .map(|(id, _)| id.clone())
-        .collect();
-    CompletionBarrier {
-        pending_tools,
-        ingress_watermark,
-        ingress_applied: state.applied_through,
-        mcp_closed: true,
-    }
+    close_and_capture(state, ingress_watermark, None, None).0
 }
 
 pub fn refresh_barrier(state: &CompletionState, barrier: &mut CompletionBarrier) {
@@ -363,8 +351,47 @@ pub struct CompletionWait {
     waiting: bool,
     waited_inside_gate: bool,
     trace: Vec<GateTraceEvent>,
-    /// `gate.held()` immediately after MCP close, before the gate is released.
+    /// `gate.held()` read inside close and handler capture, before release.
     sample: bool,
+}
+
+/// Closes MCP admission and captures unfinished handlers.
+///
+/// `gate.held()` is read in this function. That bool is the sample. `ClosedMcp`
+/// and `CapturedHandlers` are emitted here only when the read is true, so moving
+/// this call before `enter` or after `leave` makes the sample false.
+fn close_and_capture(
+    state: &mut CompletionState,
+    ingress_watermark: u64,
+    gate: Option<&CompletionGate>,
+    trace: Option<&mut Vec<GateTraceEvent>>,
+) -> (CompletionBarrier, bool) {
+    state.mcp_open = false;
+    let pending_tools = state
+        .handlers
+        .iter()
+        .filter(|(_, progress)| !progress.finished)
+        .map(|(id, _)| id.clone())
+        .collect();
+    let sample = match gate {
+        Some(gate) => gate.held(),
+        None => false,
+    };
+    if sample {
+        if let Some(trace) = trace {
+            trace.push(GateTraceEvent::ClosedMcp);
+            trace.push(GateTraceEvent::CapturedHandlers);
+        }
+    }
+    (
+        CompletionBarrier {
+            pending_tools,
+            ingress_watermark,
+            ingress_applied: state.applied_through,
+            mcp_closed: true,
+        },
+        sample,
+    )
 }
 
 impl CompletionWait {
@@ -372,12 +399,7 @@ impl CompletionWait {
         let mut trace = Vec::new();
         gate.enter();
         trace.push(GateTraceEvent::Acquired);
-        let barrier = close_mcp_admission(state, watermark);
-        let sample = gate.held();
-        if sample {
-            trace.push(GateTraceEvent::ClosedMcp);
-            trace.push(GateTraceEvent::CapturedHandlers);
-        }
+        let (barrier, sample) = close_and_capture(state, watermark, Some(&*gate), Some(&mut trace));
         // Waited is recorded only after leave, once the flag is false.
         gate.leave();
         trace.push(GateTraceEvent::Released);
@@ -404,7 +426,7 @@ impl CompletionWait {
         self.flag.held()
     }
 
-    /// Whether the gate was held at MCP close, before release.
+    /// Whether close read the gate as held, before release.
     pub fn sample(&self) -> bool {
         self.sample
     }
