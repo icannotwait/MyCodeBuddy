@@ -50,6 +50,7 @@ pub fn parse_strict_json(bytes: &[u8], limits: &ParseLimits) -> RtResult<Value> 
         index: 0,
         depth: 0,
         max_depth: limits.max_depth,
+        path: Vec::new(),
     };
     let value = parser.parse_value()?;
     parser.skip_ws();
@@ -71,6 +72,7 @@ struct Parser<'a> {
     index: usize,
     depth: u32,
     max_depth: u32,
+    path: Vec<String>,
 }
 
 impl<'a> Parser<'a> {
@@ -112,10 +114,12 @@ impl<'a> Parser<'a> {
             if !self.consume(b':') {
                 return Err(RtError::from_reason(InternalReason::InvalidJson));
             }
-            let value = self.parse_value()?;
             if map.contains_key(&key) {
-                return Err(RtError::from_reason(InternalReason::DuplicateKey));
+                return Err(RtError::duplicate_key(self.object_path(&key)));
             }
+            self.path.push(key.clone());
+            let value = self.parse_value()?;
+            self.path.pop();
             map.insert(key, value);
             self.skip_ws();
             if self.consume(b',') {
@@ -355,6 +359,17 @@ impl<'a> Parser<'a> {
 
     fn starts_with(&self, text: &[u8]) -> bool {
         self.input[self.index..].starts_with(text)
+    }
+
+    fn object_path(&self, key: &str) -> String {
+        let mut path = String::from("$");
+        for segment in &self.path {
+            path.push('.');
+            path.push_str(segment);
+        }
+        path.push('.');
+        path.push_str(key);
+        path
     }
 }
 

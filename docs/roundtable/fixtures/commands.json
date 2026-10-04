@@ -10,9 +10,17 @@
   ],
   "contract_profile": "roundtable_plan_1_2",
   "json_schema": {
+    "description": "Nullable properties are required and allow null. Optional properties are omitted when absent and do not allow null.",
+    "type": "object",
+    "additionalProperties": false,
+    "required": [
+      "commands"
+    ],
     "properties": {
       "commands": {
+        "type": "array",
         "items": {
+          "type": "string",
           "enum": [
             "roundtable_preflight",
             "roundtable_create",
@@ -33,11 +41,9 @@
             "roundtable_attach",
             "roundtable_detach"
           ]
-        },
-        "type": "array"
+        }
       }
-    },
-    "type": "object"
+    }
   },
   "schema_version": 1
 }

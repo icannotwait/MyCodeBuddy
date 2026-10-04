@@ -67,7 +67,12 @@ fn config_ranges_and_closed_commands() {
     let duplicate = decode_config(br#"{"n":2,"n":3}"#, &parse).unwrap_err();
     assert_eq!(duplicate.code, ErrorCode::InvalidArgument);
     assert_eq!(duplicate.details.reason.as_deref(), Some("duplicate_key"));
+    assert_eq!(duplicate.details.field_errors.len(), 1);
+    assert_eq!(duplicate.details.field_errors[0].path, "$.n");
+    assert_eq!(duplicate.details.field_errors[0].reason, "duplicate_key");
     assert_ne!(duplicate.details.reason.as_deref(), Some("missing_field"));
+    let nested = decode_config(br#"{"a":{"n":1,"n":2}}"#, &parse).unwrap_err();
+    assert_eq!(nested.details.field_errors[0].path, "$.a.n");
 
     let deep = decode_config(&nested_object(33), &parse).unwrap_err();
     assert_eq!(deep.code, ErrorCode::InvalidArgument);
@@ -188,6 +193,8 @@ fn strict_json_and_canonical_hash() {
     assert_golden_fixtures();
     assert_get_read_is_exclusive();
     assert_command_body_has_no_principal();
+    assert_null_and_absent_stay_distinct();
+    assert_time_ledger_mono_stays_off_the_wire();
 }
 
 fn assert_commands_partition() {
@@ -415,10 +422,9 @@ fn assert_golden_fixtures() {
                 case["sha256"].as_str().unwrap(),
                 "{name} sha256"
             );
-            assert_eq!(
-                hex(&canonical),
-                case["canonical_utf8_hex"].as_str().unwrap()
-            );
+            let value: serde_json::Value = serde_json::from_slice(&canonical).unwrap();
+            assert_closed_schema(&fixture["json_schema"], name);
+            assert_schema(&fixture["json_schema"], &value, name);
         }
     }
 
@@ -446,13 +452,51 @@ fn assert_golden_fixtures() {
         .collect();
     assert_eq!(listed, CommandNameV1::ALL);
 
+    let member = read_fixture("member.json");
+    let member_case = &member["cases"][0];
+    let member_original = decode_hex(member_case["original_hex"].as_str().unwrap());
+    let member_decoded: roundtable_protocol::MemberResultV1 =
+        decode_json(&member_original, &parse()).unwrap();
+    assert_eq!(
+        hex(&roundtable_protocol::canonical_bytes(&member_decoded).unwrap()),
+        member_case["canonical_utf8_hex"].as_str().unwrap()
+    );
+
     let projection = read_fixture("projection.json");
-    let body_hex = projection["cases"][0]["canonical_utf8_hex"]
-        .as_str()
-        .unwrap();
-    let body: serde_json::Value = serde_json::from_slice(&decode_hex(body_hex)).unwrap();
+    let projection_case = &projection["cases"][0];
+    let projection_original = decode_hex(projection_case["original_hex"].as_str().unwrap());
+    let projection_decoded: roundtable_protocol::ProjectionBodyV1 =
+        decode_json(&projection_original, &parse()).unwrap();
+    let projection_bytes = roundtable_protocol::canonical_bytes(&projection_decoded).unwrap();
+    assert_eq!(
+        hex(&projection_bytes),
+        projection_case["canonical_utf8_hex"].as_str().unwrap()
+    );
+    let body: serde_json::Value = serde_json::from_slice(&projection_bytes).unwrap();
     assert!(body.get("hash").is_none());
     assert!(body.get("moderator_speaker_id").is_some());
+    assert_eq!(body["ledger_seq"], "4");
+    assert_eq!(body["sampled_active_ms"], "1500");
+    assert_eq!(body["sampled_at_utc"], "2026-10-03T12:00:00Z");
+    assert!(body.get("prepaid_until").is_none());
+    assert!(body.get("last_sample_mono").is_none());
+
+    let errors = read_fixture("errors.json");
+    let error_case = &errors["cases"][0];
+    let emitted = decode_config(br#"{"n":2,"n":3}"#, &parse()).unwrap_err();
+    let emitted_bytes = roundtable_protocol::canonical_bytes(&emitted).unwrap();
+    assert_eq!(
+        hex(&emitted_bytes),
+        error_case["canonical_utf8_hex"].as_str().unwrap()
+    );
+    let error_original = decode_hex(error_case["original_hex"].as_str().unwrap());
+    let error_decoded: RtError = decode_json(&error_original, &parse()).unwrap();
+    assert_eq!(
+        roundtable_protocol::canonical_bytes(&error_decoded).unwrap(),
+        emitted_bytes
+    );
+    assert_eq!(error_decoded.details.field_errors[0].path, "$.n");
+    assert_schema_null_rules();
 }
 
 fn assert_get_read_is_exclusive() {
@@ -615,4 +659,448 @@ fn decode_hex(text: &str) -> Vec<u8> {
 
 fn hex(bytes: &[u8]) -> String {
     roundtable_protocol::to_hex(bytes)
+}
+
+fn assert_null_and_absent_stay_distinct() {
+    let id = "11111111-1111-4111-8111-111111111111";
+    let hash = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
+    assert_nullable::<RtError>(
+        r#"{"code":"invalid_argument","message":"The request is invalid.","retryable":false,"current_revision":null,"details":{"reason":"duplicate_key","field_errors":[]}}"#,
+        r#"{"code":"invalid_argument","message":"The request is invalid.","retryable":false,"details":{"reason":"duplicate_key","field_errors":[]}}"#,
+        "current_revision",
+    );
+    assert_nullable::<RtError>(
+        r#"{"code":"invalid_argument","message":"The request is invalid.","retryable":false,"current_revision":null,"details":{"reason":null,"field_errors":[]}}"#,
+        r#"{"code":"invalid_argument","message":"The request is invalid.","retryable":false,"current_revision":null,"details":{"field_errors":[]}}"#,
+        "reason",
+    );
+    assert_nullable::<roundtable_protocol::QualificationCertificateV1>(
+        r#"{"status":"not_tested","keys":[],"report_ref":null}"#,
+        r#"{"status":"not_tested","keys":[]}"#,
+        "report_ref",
+    );
+
+    let fence = format!(
+        r#"{{"attempt_id":"{id}","binding_id":"{id}","boot_epoch":"1","context_hash":"{hash}","incarnation":"{id}","phase_id":"{id}","phase_revision":"1","policy_hash":"{hash}","run_epoch":"1"}}"#
+    );
+    assert_optional::<roundtable_protocol::RuntimeTurnCompleted>(
+        &format!(
+            r#"{{"fence":{fence},"finish_reason":"end","ingress_watermark":"0","tool_barrier":{{"drained":true}}}}"#
+        ),
+        &format!(
+            r#"{{"candidate_id":null,"fence":{fence},"finish_reason":"end","ingress_watermark":"0","tool_barrier":{{"drained":true}}}}"#
+        ),
+        "candidate_id",
+    );
+    assert_nullable::<roundtable_protocol::MutationAck>(
+        &format!(
+            r#"{{"accepted":true,"last_seq":"0","operation_id":null,"request_id":"{id}","revision":"1","room_id":"{id}","run_epoch":"1","status":"draft"}}"#
+        ),
+        &format!(
+            r#"{{"accepted":true,"last_seq":"0","request_id":"{id}","revision":"1","room_id":"{id}","run_epoch":"1","status":"draft"}}"#
+        ),
+        "operation_id",
+    );
+    assert_nullable::<roundtable_protocol::ControlOperationV1>(
+        &format!(
+            r#"{{"kind":"pause","operation_id":"{id}","room_id":"{id}","run_epoch":"1","step":"requested","successor_phase_id":null,"target_phase_id":"{id}","target_revision":"1"}}"#
+        ),
+        &format!(
+            r#"{{"kind":"pause","operation_id":"{id}","room_id":"{id}","run_epoch":"1","step":"requested","target_phase_id":"{id}","target_revision":"1"}}"#
+        ),
+        "successor_phase_id",
+    );
+    assert_optional::<roundtable_protocol::ResponseV1>(
+        r#"{"evidence_aliases":[],"priority":"normal","stance":"support","text":"t"}"#,
+        r#"{"evidence_aliases":[],"priority":"normal","stance":"support","target_claim_alias":null,"text":"t"}"#,
+        "target_claim_alias",
+    );
+    assert_optional::<roundtable_protocol::ResponseV1>(
+        r#"{"evidence_aliases":[],"priority":"normal","stance":"support","text":"t"}"#,
+        r#"{"evidence_aliases":[],"priority":"normal","stance":"support","target_response_alias":null,"text":"t"}"#,
+        "target_response_alias",
+    );
+    assert_nullable::<roundtable_protocol::MandatoryTargetV1>(
+        &format!(r#"{{"claim_id":"{id}","response_id":null,"speaker_id":"{id}"}}"#),
+        &format!(r#"{{"claim_id":"{id}","speaker_id":"{id}"}}"#),
+        "response_id",
+    );
+
+    let phase = format!(
+        r#"{{"config_version":"1","interjection_version":"1","kind":"proposal","mandatory_targets":[],"members":[],"output_byte_limit":1,"phase_id":"{id}","phase_index":0,"policy_hash":"{hash}","published_messages":[],"question_version":"1","revision":"1","schema_version":1,"source_manifest_hash":"{hash}","source_manifest_id":"{id}","tool_quota":{{"per_attempt_bytes":1,"per_call_bytes":1}}}}"#
+    );
+    let phase_null = format!(
+        r#"{{"config_version":"1","critique_round":null,"interjection_version":"1","kind":"proposal","mandatory_targets":[],"members":[],"output_byte_limit":1,"phase_id":"{id}","phase_index":0,"policy_hash":"{hash}","published_messages":[],"question_version":"1","revision":"1","schema_version":1,"source_manifest_hash":"{hash}","source_manifest_id":"{id}","tool_quota":{{"per_attempt_bytes":1,"per_call_bytes":1}}}}"#
+    );
+    assert_optional::<roundtable_protocol::PhaseSnapshotV1>(&phase, &phase_null, "critique_round");
+
+    let manifest = format!(
+        r#"{{"binding_id":"{id}","effort":"low","model":"m","output_byte_limit":1,"prior_cursor":null,"prompt_bytes":1,"prompt_hash":"{hash}","prompt_version":"p","provider_ref":"provider:test","public_view_hash":"{hash}","role_hash":"{hash}","schema_id":"s","schema_version":1,"template_version":"t","tool_version":"v"}}"#
+    );
+    let manifest_absent = manifest.replace(r#","prior_cursor":null"#, "");
+    assert_nullable::<roundtable_protocol::DeliveryManifestV1>(
+        &manifest,
+        &manifest_absent,
+        "prior_cursor",
+    );
+    assert_nullable::<roundtable_protocol::ContextStateV1>(
+        r#"{"cli_hidden_context_limit":null,"compression_signal":false,"delivered_prompt_bytes":1,"freshness":"unknown","tool_return_bytes":0}"#,
+        r#"{"compression_signal":false,"delivered_prompt_bytes":1,"freshness":"unknown","tool_return_bytes":0}"#,
+        "cli_hidden_context_limit",
+    );
+
+    let frame = format!(
+        r#"{{"attempt_id":"{id}","incarnation":"{id}","phase_revision":"1","room_id":"{id}","run_epoch":"1","speaker_id":"{id}","subscription_id":"{id}","text":"hi"}}"#
+    );
+    for key in [
+        "chunk_seq",
+        "first_chunk_seq",
+        "last_chunk_seq",
+        "reset_baseline_seq",
+    ] {
+        let with_null = frame.replacen('{', &format!(r#"{{"{key}":null,"#), 1);
+        assert_optional::<roundtable_protocol::PreviewFrameV1>(&frame, &with_null, key);
+    }
+
+    let record = format!(
+        r#"{{"config_hash":"{hash}","confirmable":false,"created_at":"2026-10-03T00:00:00Z","expires_at":"2026-10-03T00:30:00Z","limits_hash":"{hash}","policy_hash":"{hash}","preflight_id":"pf","principal_id":"{id}","qualification_keys":[],"recipients":[],"revision":null,"room_id":null,"source_manifest_hash":"{hash}","source_manifest_id":"{id}"}}"#
+    );
+    assert_nullable::<roundtable_protocol::PreflightRecordV1>(
+        &record,
+        &record.replace(r#""room_id":null,"#, ""),
+        "room_id",
+    );
+    assert_nullable::<roundtable_protocol::PreflightRecordV1>(
+        &record,
+        &record.replace(r#""revision":null,"#, ""),
+        "revision",
+    );
+
+    let config = String::from_utf8(config_json(true, false)).unwrap();
+    let request = format!(r#"{{"config":{config}}}"#);
+    let decoded =
+        decode_json::<roundtable_protocol::PreflightRequest>(request.as_bytes(), &parse()).unwrap();
+    let request_text =
+        String::from_utf8(roundtable_protocol::canonical_bytes(&decoded).unwrap()).unwrap();
+    assert!(!request_text.contains("\"room_id\""));
+    assert!(!request_text.contains("\"revision\""));
+    let request_null = format!(r#"{{"config":{config},"room_id":null}}"#);
+    let err =
+        decode_json::<roundtable_protocol::PreflightRequest>(request_null.as_bytes(), &parse())
+            .unwrap_err();
+    assert_eq!(err.details.reason.as_deref(), Some("null_not_allowed"));
+
+    let record_decoded =
+        decode_json::<roundtable_protocol::PreflightRecordV1>(record.as_bytes(), &parse()).unwrap();
+    let record_text =
+        String::from_utf8(roundtable_protocol::canonical_bytes(&record_decoded).unwrap()).unwrap();
+    assert!(record_text.contains("\"room_id\":null"));
+    assert!(record_text.contains("\"revision\":null"));
+    assert_ne!(request_text, record_text);
+}
+
+fn assert_time_ledger_mono_stays_off_the_wire() {
+    let ledger = roundtable_protocol::TimeLedger {
+        ledger_seq: roundtable_protocol::Seq(4),
+        remaining_room_ms: roundtable_protocol::DurationMs(900_000),
+        remaining_phase_ms: roundtable_protocol::DurationMs(450_000),
+        prepaid_until: roundtable_protocol::MonoMs(7),
+        last_sample_mono: roundtable_protocol::MonoMs(11),
+    };
+    assert_eq!(ledger.prepaid_until, roundtable_protocol::MonoMs(7));
+    assert_eq!(ledger.last_sample_mono, roundtable_protocol::MonoMs(11));
+    let canonical = roundtable_protocol::canonical_bytes(&ledger).unwrap();
+    let text = String::from_utf8(canonical.clone()).unwrap();
+    assert_eq!(
+        text,
+        r#"{"ledger_seq":"4","remaining_phase_ms":"450000","remaining_room_ms":"900000"}"#
+    );
+    let round_trip: roundtable_protocol::TimeLedger = decode_json(&canonical, &parse()).unwrap();
+    assert_eq!(round_trip.ledger_seq, ledger.ledger_seq);
+    assert_eq!(round_trip.remaining_room_ms, ledger.remaining_room_ms);
+    assert_eq!(round_trip.remaining_phase_ms, ledger.remaining_phase_ms);
+    assert_eq!(round_trip.prepaid_until, roundtable_protocol::MonoMs(0));
+    assert_eq!(round_trip.last_sample_mono, roundtable_protocol::MonoMs(0));
+    let rejected = decode_json::<roundtable_protocol::TimeLedger>(
+        br#"{"last_sample_mono":"11","ledger_seq":"4","prepaid_until":"7","remaining_phase_ms":"450000","remaining_room_ms":"900000"}"#,
+        &parse(),
+    )
+    .unwrap_err();
+    assert_eq!(rejected.details.reason.as_deref(), Some("unknown_field"));
+}
+
+fn assert_nullable<T>(with_null: &str, absent: &str, key: &str)
+where
+    T: for<'de> serde::Deserialize<'de> + serde::Serialize + std::fmt::Debug,
+{
+    let decoded: T = decode_json(with_null.as_bytes(), &parse())
+        .unwrap_or_else(|err| panic!("{key} null decode failed: {err:?}\n{with_null}"));
+    let canonical = roundtable_protocol::canonical_bytes(&decoded).unwrap();
+    let text = String::from_utf8(canonical.clone()).unwrap();
+    assert!(
+        text.contains(&format!("\"{key}\":null")),
+        "{key} canonical dropped null: {text}"
+    );
+    let again: T = decode_json(&canonical, &parse()).unwrap();
+    assert_eq!(
+        roundtable_protocol::canonical_bytes(&again).unwrap(),
+        canonical
+    );
+    let err = decode_json::<T>(absent.as_bytes(), &parse()).unwrap_err();
+    assert_eq!(
+        err.details.reason.as_deref(),
+        Some("missing_field"),
+        "{key} absent: {err:?}"
+    );
+}
+
+fn assert_optional<T>(absent: &str, with_null: &str, key: &str)
+where
+    T: for<'de> serde::Deserialize<'de> + serde::Serialize + std::fmt::Debug,
+{
+    let decoded: T = decode_json(absent.as_bytes(), &parse())
+        .unwrap_or_else(|err| panic!("{key} absent decode failed: {err:?}\n{absent}"));
+    let canonical = roundtable_protocol::canonical_bytes(&decoded).unwrap();
+    let text = String::from_utf8(canonical).unwrap();
+    assert!(
+        !text.contains(&format!("\"{key}\"")),
+        "{key} canonical kept an absent optional: {text}"
+    );
+    let again: T = decode_json(text.as_bytes(), &parse()).unwrap();
+    assert_eq!(
+        String::from_utf8(roundtable_protocol::canonical_bytes(&again).unwrap()).unwrap(),
+        text
+    );
+    let err = decode_json::<T>(with_null.as_bytes(), &parse()).unwrap_err();
+    assert_eq!(
+        err.details.reason.as_deref(),
+        Some("null_not_allowed"),
+        "{key} null: {err:?}"
+    );
+}
+
+fn assert_closed_schema(schema: &serde_json::Value, name: &str) {
+    assert_ne!(
+        schema,
+        &serde_json::json!({"type": "object"}),
+        "{name} still has a stub schema"
+    );
+    assert_eq!(schema["type"], "object", "{name}");
+    assert_eq!(schema["additionalProperties"], false, "{name}");
+    assert!(
+        !schema["properties"].as_object().unwrap().is_empty(),
+        "{name}"
+    );
+    assert!(!schema["required"].as_array().unwrap().is_empty(), "{name}");
+    let description = schema["description"].as_str().unwrap_or("");
+    assert!(
+        description.contains("Nullable") && description.contains("Optional"),
+        "{name} missing null-versus-absent rule"
+    );
+}
+
+fn assert_schema(schema: &serde_json::Value, value: &serde_json::Value, path: &str) {
+    if let Some(enum_values) = schema.get("enum").and_then(|item| item.as_array()) {
+        assert!(
+            enum_values.iter().any(|item| item == value),
+            "{path} not in enum: {value}"
+        );
+    }
+    if let Some(type_value) = schema.get("type") {
+        assert!(
+            type_matches(type_value, value),
+            "{path} type mismatch {value} against {type_value}"
+        );
+    }
+    if value.is_null() {
+        return;
+    }
+    if let Some(pattern) = schema.get("pattern").and_then(|item| item.as_str()) {
+        if let Some(text) = value.as_str() {
+            assert!(
+                pattern_matches(pattern, text),
+                "{path} pattern {pattern} rejected {text}"
+            );
+        }
+    }
+    if let Some(min) = schema.get("minimum").and_then(|item| item.as_i64()) {
+        let number = value
+            .as_i64()
+            .or_else(|| value.as_u64().and_then(|item| i64::try_from(item).ok()))
+            .unwrap();
+        assert!(number >= min, "{path}");
+    }
+    if let Some(max) = schema.get("maximum").and_then(|item| item.as_u64()) {
+        assert!(value.as_u64().unwrap() <= max, "{path}");
+    }
+    if let Some(items) = value.as_array() {
+        let item_schema = schema
+            .get("items")
+            .unwrap_or_else(|| panic!("{path} missing items"));
+        for (index, item) in items.iter().enumerate() {
+            assert_schema(item_schema, item, &format!("{path}[{index}]"));
+        }
+        return;
+    }
+    if let Some(object) = value.as_object() {
+        assert_eq!(
+            schema["additionalProperties"], false,
+            "{path} additionalProperties"
+        );
+        let properties = schema["properties"]
+            .as_object()
+            .unwrap_or_else(|| panic!("{path} properties"));
+        if let Some(required) = schema.get("required").and_then(|item| item.as_array()) {
+            for key in required {
+                let key = key.as_str().unwrap();
+                assert!(object.contains_key(key), "{path} missing required {key}");
+            }
+        }
+        for key in object.keys() {
+            let property = properties
+                .get(key)
+                .unwrap_or_else(|| panic!("{path} unknown {key}"));
+            assert_schema(property, &object[key], &format!("{path}.{key}"));
+        }
+    }
+}
+
+fn type_matches(type_value: &serde_json::Value, value: &serde_json::Value) -> bool {
+    if let Some(name) = type_value.as_str() {
+        return type_name_matches(name, value);
+    }
+    type_value
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|item| type_name_matches(item.as_str().unwrap(), value))
+}
+
+fn type_name_matches(name: &str, value: &serde_json::Value) -> bool {
+    match name {
+        "object" => value.is_object(),
+        "array" => value.is_array(),
+        "string" => value.is_string(),
+        "boolean" => value.is_boolean(),
+        "null" => value.is_null(),
+        "integer" => value.as_i64().is_some() || value.as_u64().is_some(),
+        other => panic!("unknown schema type {other}"),
+    }
+}
+
+fn pattern_matches(pattern: &str, text: &str) -> bool {
+    match pattern {
+        "^(0|[1-9][0-9]*)$" => is_wire_digits(text),
+        "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$" => is_uuid_text(text),
+        "^[0-9a-f]{64}$" => {
+            text.len() == 64
+                && text
+                    .bytes()
+                    .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+        }
+        other => panic!("unsupported schema pattern {other}"),
+    }
+}
+
+fn is_wire_digits(text: &str) -> bool {
+    let bytes = text.as_bytes();
+    !bytes.is_empty()
+        && bytes.iter().all(|byte| byte.is_ascii_digit())
+        && (bytes.len() == 1 || bytes[0] != b'0')
+}
+
+fn is_uuid_text(text: &str) -> bool {
+    let bytes = text.as_bytes();
+    bytes.len() == 36
+        && bytes[8] == b'-'
+        && bytes[13] == b'-'
+        && bytes[18] == b'-'
+        && bytes[23] == b'-'
+        && bytes.iter().enumerate().all(|(index, byte)| {
+            matches!(index, 8 | 13 | 18 | 23)
+                || (byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+        })
+}
+
+fn assert_schema_null_rules() {
+    let config = read_fixture("config.json");
+    let source = &config["json_schema"]["properties"]["source_refs"]["items"];
+    assert!(required_contains(source, "base_commit"));
+    assert!(allows_null(&source["properties"]["base_commit"]));
+    let participant = &config["json_schema"]["properties"]["participants"]["items"];
+    assert!(!required_contains(participant, "model"));
+    assert!(!allows_null(&participant["properties"]["model"]));
+    assert!(!required_contains(&config["json_schema"], "display_name"));
+    assert!(!allows_null(
+        &config["json_schema"]["properties"]["display_name"]
+    ));
+
+    let member = read_fixture("member.json");
+    let response = &member["json_schema"]["properties"]["responses"]["items"];
+    assert!(!required_contains(response, "target_claim_alias"));
+    assert!(!allows_null(&response["properties"]["target_claim_alias"]));
+    assert!(!required_contains(&member["json_schema"], "reason"));
+    assert!(!allows_null(&member["json_schema"]["properties"]["reason"]));
+
+    let moderator = read_fixture("moderator.json");
+    assert!(required_contains(&moderator["json_schema"], "coverage"));
+    assert!(allows_null(
+        &moderator["json_schema"]["properties"]["coverage"]
+    ));
+
+    let projection = read_fixture("projection.json");
+    for key in [
+        "blocked_reason",
+        "moderator_speaker_id",
+        "ledger_seq",
+        "sampled_active_ms",
+        "sampled_at_utc",
+    ] {
+        assert!(required_contains(&projection["json_schema"], key), "{key}");
+    }
+    assert!(allows_null(
+        &projection["json_schema"]["properties"]["blocked_reason"]
+    ));
+    assert!(allows_null(
+        &projection["json_schema"]["properties"]["moderator_speaker_id"]
+    ));
+    assert!(!allows_null(
+        &projection["json_schema"]["properties"]["ledger_seq"]
+    ));
+
+    let errors = read_fixture("errors.json");
+    assert!(required_contains(
+        &errors["json_schema"],
+        "current_revision"
+    ));
+    assert!(allows_null(
+        &errors["json_schema"]["properties"]["current_revision"]
+    ));
+    let details = &errors["json_schema"]["properties"]["details"];
+    assert!(required_contains(details, "reason"));
+    assert!(allows_null(&details["properties"]["reason"]));
+    assert!(required_contains(details, "field_errors"));
+}
+
+fn allows_null(schema: &serde_json::Value) -> bool {
+    let type_has_null = schema.get("type").is_some_and(|type_value| {
+        type_value == "null"
+            || type_value
+                .as_array()
+                .is_some_and(|items| items.iter().any(|item| item == "null"))
+    });
+    let enum_has_null = schema
+        .get("enum")
+        .and_then(|item| item.as_array())
+        .is_some_and(|items| items.iter().any(|item| item.is_null()));
+    type_has_null || enum_has_null
+}
+
+fn required_contains(schema: &serde_json::Value, key: &str) -> bool {
+    schema["required"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|item| item == key)
 }

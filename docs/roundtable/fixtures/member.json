@@ -10,7 +10,147 @@
   ],
   "contract_profile": "roundtable_plan_1_2",
   "json_schema": {
-    "type": "object"
+    "description": "Nullable properties are required and allow null. Optional properties are omitted when absent and do not allow null.",
+    "type": "object",
+    "additionalProperties": false,
+    "required": [
+      "kind",
+      "summary",
+      "claims"
+    ],
+    "properties": {
+      "kind": {
+        "type": "string",
+        "enum": [
+          "proposal",
+          "critique",
+          "abstain"
+        ]
+      },
+      "summary": {
+        "type": "string"
+      },
+      "claims": {
+        "type": "array",
+        "items": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "local_key",
+            "text",
+            "evidence_aliases",
+            "confidence"
+          ],
+          "properties": {
+            "local_key": {
+              "type": "string"
+            },
+            "text": {
+              "type": "string"
+            },
+            "evidence_aliases": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "confidence": {
+              "type": "string",
+              "enum": [
+                "low",
+                "medium",
+                "high"
+              ]
+            }
+          }
+        }
+      },
+      "responses": {
+        "type": "array",
+        "items": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "stance",
+            "priority",
+            "text",
+            "evidence_aliases"
+          ],
+          "properties": {
+            "target_claim_alias": {
+              "type": "string"
+            },
+            "target_response_alias": {
+              "type": "string"
+            },
+            "stance": {
+              "type": "string",
+              "enum": [
+                "support",
+                "challenge",
+                "clarify",
+                "revise"
+              ]
+            },
+            "priority": {
+              "type": "string",
+              "enum": [
+                "normal",
+                "critical"
+              ]
+            },
+            "text": {
+              "type": "string"
+            },
+            "evidence_aliases": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            }
+          }
+        }
+      },
+      "open_questions": {
+        "type": "array",
+        "items": {
+          "type": "string"
+        }
+      },
+      "position_changes": {
+        "type": "array",
+        "items": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "own_prior_claim_alias",
+            "new_local_claim_key",
+            "reason",
+            "trigger_response_aliases"
+          ],
+          "properties": {
+            "own_prior_claim_alias": {
+              "type": "string"
+            },
+            "new_local_claim_key": {
+              "type": "string"
+            },
+            "reason": {
+              "type": "string"
+            },
+            "trigger_response_aliases": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            }
+          }
+        }
+      },
+      "reason": {
+        "type": "string"
+      }
+    }
   },
   "schema_version": 1
 }

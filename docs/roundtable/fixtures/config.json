@@ -10,7 +10,179 @@
   ],
   "contract_profile": "roundtable_plan_1_2",
   "json_schema": {
-    "type": "object"
+    "description": "Nullable properties are required and allow null. Optional properties are omitted when absent and do not allow null.",
+    "type": "object",
+    "additionalProperties": false,
+    "required": [
+      "topic",
+      "workspace_id",
+      "source_refs",
+      "participants",
+      "moderator_ordinal",
+      "strategy",
+      "concurrency",
+      "budgets",
+      "timeouts",
+      "quotas"
+    ],
+    "properties": {
+      "schema_version": {
+        "type": "integer",
+        "minimum": 0
+      },
+      "topic": {
+        "type": "string"
+      },
+      "display_name": {
+        "type": "string"
+      },
+      "workspace_id": {
+        "type": "string"
+      },
+      "source_refs": {
+        "type": "array",
+        "items": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "snapshot_id",
+            "base_commit"
+          ],
+          "properties": {
+            "snapshot_id": {
+              "type": "string",
+              "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+            },
+            "base_commit": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          }
+        }
+      },
+      "participants": {
+        "type": "array",
+        "items": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "ordinal",
+            "role",
+            "provider_ref"
+          ],
+          "properties": {
+            "ordinal": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "role": {
+              "type": "string"
+            },
+            "provider_ref": {
+              "type": "string"
+            },
+            "model": {
+              "type": "string"
+            },
+            "effort": {
+              "type": "string"
+            }
+          }
+        }
+      },
+      "moderator_ordinal": {
+        "type": "integer",
+        "minimum": 0
+      },
+      "strategy": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "type",
+          "critique_rounds"
+        ],
+        "properties": {
+          "type": {
+            "type": "string",
+            "enum": [
+              "phased_rounds"
+            ]
+          },
+          "version": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "critique_rounds": {
+            "type": "integer",
+            "minimum": 0
+          }
+        }
+      },
+      "concurrency": {
+        "type": "integer",
+        "minimum": 0
+      },
+      "strict_snapshot_v1": {
+        "type": "boolean"
+      },
+      "budgets": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "room_budget",
+          "phase_budget"
+        ],
+        "properties": {
+          "room_budget": {
+            "type": "string",
+            "pattern": "^(0|[1-9][0-9]*)$"
+          },
+          "phase_budget": {
+            "type": "string",
+            "pattern": "^(0|[1-9][0-9]*)$"
+          }
+        }
+      },
+      "timeouts": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "attempt_timeout"
+        ],
+        "properties": {
+          "attempt_timeout": {
+            "type": "string",
+            "pattern": "^(0|[1-9][0-9]*)$"
+          }
+        }
+      },
+      "quotas": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "input_byte_limit"
+        ],
+        "properties": {
+          "output_byte_limit": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 9007199254740991
+          },
+          "input_byte_limit": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 9007199254740991
+          },
+          "interjection_byte_limit": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 9007199254740991
+          }
+        }
+      }
+    }
   },
   "schema_version": 1
 }

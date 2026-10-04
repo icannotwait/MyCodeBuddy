@@ -10,7 +10,89 @@
   ],
   "contract_profile": "roundtable_plan_1_2",
   "json_schema": {
-    "type": "object"
+    "description": "Nullable properties are required and allow null. Optional properties are omitted when absent and do not allow null.",
+    "type": "object",
+    "additionalProperties": false,
+    "required": [
+      "code",
+      "message",
+      "retryable",
+      "current_revision",
+      "details"
+    ],
+    "properties": {
+      "code": {
+        "type": "string",
+        "enum": [
+          "invalid_argument",
+          "unauthenticated",
+          "forbidden",
+          "revision_conflict",
+          "idempotency_conflict",
+          "command_in_progress",
+          "control_in_progress",
+          "invalid_state",
+          "policy_unenforceable",
+          "capability_unqualified",
+          "context_too_large",
+          "capacity_unknown",
+          "insufficient_budget",
+          "cannot_reach_quorum",
+          "no_next_phase",
+          "capacity_limited",
+          "storage_unavailable",
+          "runtime_unavailable"
+        ]
+      },
+      "message": {
+        "type": "string"
+      },
+      "retryable": {
+        "type": "boolean"
+      },
+      "current_revision": {
+        "type": [
+          "string",
+          "null"
+        ],
+        "pattern": "^(0|[1-9][0-9]*)$"
+      },
+      "details": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "reason",
+          "field_errors"
+        ],
+        "properties": {
+          "reason": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "field_errors": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "path",
+                "reason"
+              ],
+              "properties": {
+                "path": {
+                  "type": "string"
+                },
+                "reason": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        }
+      }
+    }
   },
   "schema_version": 1
 }

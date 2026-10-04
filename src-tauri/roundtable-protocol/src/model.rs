@@ -328,8 +328,8 @@ macro_rules! wire_u64 {
 
 wire_u64!(Seq, Revision, Epoch, DurationMs);
 
-/// Monotonic sample. Not serialized and not stored across processes.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+/// Monotonic sample. Not a wire type and not stored across processes.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct MonoMs(pub u64);
 
 fn parse_wire_u64(text: &str) -> Option<u64> {
@@ -969,6 +969,8 @@ pub struct FieldError {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ErrorDetails {
+    /// Nullable diagnostic. The key is required; null and absent differ.
+    #[serde(deserialize_with = "de_nullable")]
     pub reason: Option<String>,
     pub field_errors: Vec<FieldError>,
 }
@@ -980,6 +982,8 @@ pub struct RtError {
     pub code: ErrorCode,
     pub message: String,
     pub retryable: bool,
+    /// Nullable. JSON null means no revision; omitting the key is rejected.
+    #[serde(deserialize_with = "de_nullable")]
     pub current_revision: Option<Revision>,
     pub details: ErrorDetails,
 }
@@ -988,6 +992,22 @@ pub type RtResult<T> = Result<T, RtError>;
 
 impl RtError {
     pub fn from_reason(reason: InternalReason) -> Self {
+        Self::with_field_errors(reason, Vec::new())
+    }
+
+    /// Duplicate-key failure. `path` is the JSONPath of the repeated key.
+    pub fn duplicate_key(path: impl Into<String>) -> Self {
+        let path = path.into();
+        Self::with_field_errors(
+            InternalReason::DuplicateKey,
+            vec![FieldError {
+                path,
+                reason: InternalReason::DuplicateKey.as_str().to_string(),
+            }],
+        )
+    }
+
+    fn with_field_errors(reason: InternalReason, field_errors: Vec<FieldError>) -> Self {
         let code = reason.public_code();
         Self {
             code,
@@ -996,7 +1016,7 @@ impl RtError {
             current_revision: None,
             details: ErrorDetails {
                 reason: Some(reason.as_str().to_string()),
-                field_errors: Vec::new(),
+                field_errors,
             },
         }
     }
@@ -1209,6 +1229,8 @@ pub enum QualificationStatus {
 pub struct QualificationCertificateV1 {
     pub status: QualificationStatus,
     pub keys: Vec<String>,
+    /// Nullable. A missing report is explicit null, not an omitted key.
+    #[serde(deserialize_with = "de_nullable")]
     pub report_ref: Option<String>,
 }
 
@@ -1277,7 +1299,12 @@ pub struct RuntimeTurnCompleted {
     pub finish_reason: String,
     pub ingress_watermark: Seq,
     pub tool_barrier: ToolBarrierV1,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// Optional. Omitted when absent; JSON null is rejected.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "de_optional"
+    )]
     pub candidate_id: Option<String>,
 }
 
@@ -1301,6 +1328,8 @@ pub struct CandidateReceipt {
 pub struct MutationAck {
     pub request_id: RequestId,
     pub accepted: bool,
+    /// Nullable. Null means accepted without an operation id.
+    #[serde(deserialize_with = "de_nullable")]
     pub operation_id: Option<OperationId>,
     pub room_id: RoomId,
     pub revision: Revision,
@@ -1319,6 +1348,8 @@ pub struct ControlOperationV1 {
     pub target_phase_id: PhaseId,
     pub target_revision: Revision,
     pub run_epoch: Epoch,
+    /// Nullable. Null means this step has no successor phase.
+    #[serde(deserialize_with = "de_nullable")]
     pub successor_phase_id: Option<PhaseId>,
 }
 
@@ -1377,9 +1408,19 @@ impl ClaimV1 {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ResponseV1 {
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// Optional. Omitted when absent; JSON null is rejected.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "de_optional"
+    )]
     pub target_claim_alias: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// Optional. Omitted when absent; JSON null is rejected.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "de_optional"
+    )]
     pub target_response_alias: Option<String>,
     pub stance: Stance,
     pub priority: Priority,
@@ -1514,6 +1555,20 @@ pub struct PhaseRefV1 {
     pub state: PhaseState,
 }
 
+/// A04 internal timing ledger. Prepaid ticks do not emit a business event.
+/// Monotonic fields are skipped so they cannot cross a process or the wire.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TimeLedger {
+    pub ledger_seq: Seq,
+    pub remaining_room_ms: DurationMs,
+    pub remaining_phase_ms: DurationMs,
+    #[serde(skip)]
+    pub prepaid_until: MonoMs,
+    #[serde(skip)]
+    pub last_sample_mono: MonoMs,
+}
+
 /// Body hashed by [`ProjectionRef`]. The projection hash is not a field here.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -1530,6 +1585,10 @@ pub struct ProjectionBodyV1 {
     #[serde(deserialize_with = "de_nullable")]
     pub moderator_speaker_id: Option<SpeakerId>,
     pub phase_refs: Vec<PhaseRefV1>,
+    /// Persistent budget sample at this business commit. Not a start authorization.
+    pub ledger_seq: Seq,
+    pub sampled_active_ms: DurationMs,
+    pub sampled_at_utc: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1566,6 +1625,8 @@ pub struct OrderedMemberV1 {
 pub struct MandatoryTargetV1 {
     pub speaker_id: SpeakerId,
     pub claim_id: ClaimId,
+    /// Nullable. Null targets the claim without a response id.
+    #[serde(deserialize_with = "de_nullable")]
     pub response_id: Option<ResponseId>,
 }
 
@@ -1584,7 +1645,12 @@ pub struct PhaseSnapshotV1 {
     pub phase_index: u32,
     pub revision: Revision,
     pub kind: PhaseKind,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// Optional. Present only for a critique round; null is rejected.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "de_optional"
+    )]
     pub critique_round: Option<u32>,
     pub config_version: Revision,
     pub question_version: Revision,
@@ -1614,6 +1680,8 @@ pub struct DeliveryManifestV1 {
     pub effort: String,
     pub provider_ref: String,
     pub binding_id: BindingId,
+    /// Nullable. Null means this delivery has no prior cursor.
+    #[serde(deserialize_with = "de_nullable")]
     pub prior_cursor: Option<String>,
     pub prompt_hash: Hash256,
     pub prompt_bytes: SafeInt,
@@ -1633,6 +1701,8 @@ pub struct ContextStateV1 {
     pub freshness: ContextFreshness,
     pub delivered_prompt_bytes: SafeInt,
     pub tool_return_bytes: SafeInt,
+    /// Nullable. Null means the hidden limit is unknown, not omitted.
+    #[serde(deserialize_with = "de_nullable")]
     pub cli_hidden_context_limit: Option<SafeInt>,
     pub compression_signal: bool,
 }
@@ -1680,13 +1750,33 @@ pub struct PreviewFrameV1 {
     pub incarnation: IncarnationId,
     pub run_epoch: Epoch,
     pub phase_revision: Revision,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// Optional preview cursor. Omitted when absent; null is rejected.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "de_optional"
+    )]
     pub chunk_seq: Option<Seq>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// Optional. Omitted when absent; null is rejected.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "de_optional"
+    )]
     pub first_chunk_seq: Option<Seq>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// Optional. Omitted when absent; null is rejected.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "de_optional"
+    )]
     pub last_chunk_seq: Option<Seq>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// Optional. Omitted when absent; null is rejected.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "de_optional"
+    )]
     pub reset_baseline_seq: Option<Seq>,
     pub text: String,
 }
@@ -1706,7 +1796,11 @@ pub struct ResolvedRecipientV1 {
 pub struct PreflightRecordV1 {
     pub preflight_id: String,
     pub principal_id: PrincipalId,
+    /// Nullable. A config estimate with no room keeps explicit null.
+    #[serde(deserialize_with = "de_nullable")]
     pub room_id: Option<RoomId>,
+    /// Nullable. Paired with `room_id`; absent is not null.
+    #[serde(deserialize_with = "de_nullable")]
     pub revision: Option<Revision>,
     pub config_hash: Hash256,
     pub source_manifest_id: ManifestId,

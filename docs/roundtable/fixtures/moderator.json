@@ -10,7 +10,337 @@
   ],
   "contract_profile": "roundtable_plan_1_2",
   "json_schema": {
-    "type": "object"
+    "description": "Nullable properties are required and allow null. Optional properties are omitted when absent and do not allow null.",
+    "type": "object",
+    "additionalProperties": false,
+    "required": [
+      "kind",
+      "speaker_id",
+      "recommendation",
+      "alternatives",
+      "consensus_items",
+      "disagreements",
+      "risks",
+      "decision_requests",
+      "coverage"
+    ],
+    "properties": {
+      "kind": {
+        "type": "string",
+        "enum": [
+          "synthesis"
+        ]
+      },
+      "speaker_id": {
+        "type": "string",
+        "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+      },
+      "recommendation": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "text",
+          "aliases",
+          "inference"
+        ],
+        "properties": {
+          "text": {
+            "type": "string"
+          },
+          "aliases": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "kind",
+                "alias"
+              ],
+              "properties": {
+                "kind": {
+                  "type": "string",
+                  "enum": [
+                    "message",
+                    "claim",
+                    "evidence"
+                  ]
+                },
+                "alias": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "inference": {
+            "type": "boolean"
+          }
+        }
+      },
+      "alternatives": {
+        "type": "array",
+        "items": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "text",
+            "aliases",
+            "inference"
+          ],
+          "properties": {
+            "text": {
+              "type": "string"
+            },
+            "aliases": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "kind",
+                  "alias"
+                ],
+                "properties": {
+                  "kind": {
+                    "type": "string",
+                    "enum": [
+                      "message",
+                      "claim",
+                      "evidence"
+                    ]
+                  },
+                  "alias": {
+                    "type": "string"
+                  }
+                }
+              }
+            },
+            "inference": {
+              "type": "boolean"
+            }
+          }
+        }
+      },
+      "consensus_items": {
+        "type": "array",
+        "items": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "text",
+            "agreement_level",
+            "aliases",
+            "supporter_aliases",
+            "support_response_aliases",
+            "inference"
+          ],
+          "properties": {
+            "text": {
+              "type": "string"
+            },
+            "agreement_level": {
+              "type": "string",
+              "enum": [
+                "explicit_agreement",
+                "compatible_positions",
+                "unresolved"
+              ]
+            },
+            "aliases": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "kind",
+                  "alias"
+                ],
+                "properties": {
+                  "kind": {
+                    "type": "string",
+                    "enum": [
+                      "message",
+                      "claim",
+                      "evidence"
+                    ]
+                  },
+                  "alias": {
+                    "type": "string"
+                  }
+                }
+              }
+            },
+            "supporter_aliases": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "support_response_aliases": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "inference": {
+              "type": "boolean"
+            }
+          }
+        }
+      },
+      "disagreements": {
+        "type": "array",
+        "items": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "text",
+            "aliases",
+            "inference"
+          ],
+          "properties": {
+            "text": {
+              "type": "string"
+            },
+            "aliases": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "kind",
+                  "alias"
+                ],
+                "properties": {
+                  "kind": {
+                    "type": "string",
+                    "enum": [
+                      "message",
+                      "claim",
+                      "evidence"
+                    ]
+                  },
+                  "alias": {
+                    "type": "string"
+                  }
+                }
+              }
+            },
+            "inference": {
+              "type": "boolean"
+            }
+          }
+        }
+      },
+      "risks": {
+        "type": "array",
+        "items": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "text",
+            "aliases",
+            "inference"
+          ],
+          "properties": {
+            "text": {
+              "type": "string"
+            },
+            "aliases": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "kind",
+                  "alias"
+                ],
+                "properties": {
+                  "kind": {
+                    "type": "string",
+                    "enum": [
+                      "message",
+                      "claim",
+                      "evidence"
+                    ]
+                  },
+                  "alias": {
+                    "type": "string"
+                  }
+                }
+              }
+            },
+            "inference": {
+              "type": "boolean"
+            }
+          }
+        }
+      },
+      "decision_requests": {
+        "type": "array",
+        "items": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "text",
+            "aliases",
+            "inference"
+          ],
+          "properties": {
+            "text": {
+              "type": "string"
+            },
+            "aliases": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "kind",
+                  "alias"
+                ],
+                "properties": {
+                  "kind": {
+                    "type": "string",
+                    "enum": [
+                      "message",
+                      "claim",
+                      "evidence"
+                    ]
+                  },
+                  "alias": {
+                    "type": "string"
+                  }
+                }
+              }
+            },
+            "inference": {
+              "type": "boolean"
+            }
+          }
+        }
+      },
+      "coverage": {
+        "type": [
+          "object",
+          "null"
+        ],
+        "additionalProperties": false,
+        "required": [
+          "succeeded",
+          "absent"
+        ],
+        "properties": {
+          "succeeded": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "absent": {
+            "type": "integer",
+            "minimum": 0
+          }
+        }
+      }
+    }
   },
   "schema_version": 1
 }
