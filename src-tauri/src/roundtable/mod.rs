@@ -6,6 +6,7 @@
 
 mod feature_gate;
 mod gateway;
+pub(crate) mod ingress;
 mod qualification;
 mod relay;
 mod request_accounting;
@@ -18,6 +19,10 @@ pub use feature_gate::{
 pub use gateway::{
     ApprovedOrigin, ClientPolicy, GatewayHandle, GatewayLease, HoldRelease, HostCredential,
     HostModelGateway, ModelRequest, ModelResponse, ObservedForward,
+};
+pub use ingress::{
+    bind_private_ingress, BarrierFact, CompletionCoordinator, CompletionMarker, IngressKind,
+    RuntimeIngress,
 };
 pub use qualification::{
     evaluate_certificate, CertifiedBinary, OsIdentity, QualificationKey, QualificationReport,

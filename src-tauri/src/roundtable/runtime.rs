@@ -33,6 +33,13 @@ use super::rt_error;
 /// this sink: admission does not import a conversation row.
 pub trait PrivateRuntimeSink: Send + Sync {
     fn attach(&self, connection_id: &str, owner: &ConnectionOwner);
+
+    /// Accept one ordered raw ACP event. The default drops it so attach-only
+    /// observers keep compiling. Emission overrides this.
+    fn push(&self, ingress: super::ingress::RuntimeIngress) -> RtResult<()> {
+        let _ = ingress;
+        Ok(())
+    }
 }
 
 /// What the service would launch, plus the already-prepared sandbox. The

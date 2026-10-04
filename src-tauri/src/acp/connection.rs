@@ -83,9 +83,64 @@ use crate::models::system::AppLocale;
 use crate::network::proxy;
 use crate::parsers::COMPACTION_SUMMARY_META_KEY;
 use crate::terminal::shell::ResolvedShellSpec;
-use crate::web::event_bridge::{
-    emit_with_state, emit_with_state_built, emit_with_state_gated, EventEmitter,
-};
+use crate::web::event_bridge::EventEmitter;
+
+/// Branch before the public emit. A roundtable raw event is pushed to the
+/// private ingress and never enters `emit_with_state`.
+async fn emit_with_state(
+    state: &Arc<RwLock<SessionState>>,
+    emitter: &EventEmitter,
+    payload: AcpEvent,
+) {
+    if let Some(payload) = crate::roundtable::ingress::divert_if_roundtable(state, payload).await {
+        crate::web::event_bridge::emit_with_state(state, emitter, payload).await;
+    }
+}
+
+async fn emit_with_state_gated<F>(
+    state: &Arc<RwLock<SessionState>>,
+    emitter: &EventEmitter,
+    payload: AcpEvent,
+    gate: F,
+) -> bool
+where
+    F: FnOnce(&SessionState) -> bool,
+{
+    if crate::roundtable::ingress::is_roundtable_session(state).await {
+        let allowed = {
+            let guard = state.read().await;
+            gate(&guard)
+        };
+        if !allowed {
+            return false;
+        }
+        crate::roundtable::ingress::deliver_from_state(state, payload).await;
+        return true;
+    }
+    crate::web::event_bridge::emit_with_state_gated(state, emitter, payload, gate).await
+}
+
+async fn emit_with_state_built<F>(
+    state: &Arc<RwLock<SessionState>>,
+    emitter: &EventEmitter,
+    build: F,
+) -> bool
+where
+    F: FnOnce(&mut SessionState) -> Option<AcpEvent>,
+{
+    if crate::roundtable::ingress::is_roundtable_session(state).await {
+        let event = {
+            let mut guard = state.write().await;
+            build(&mut guard)
+        };
+        let Some(event) = event else {
+            return false;
+        };
+        crate::roundtable::ingress::deliver_from_state(state, event).await;
+        return true;
+    }
+    crate::web::event_bridge::emit_with_state_built(state, emitter, build).await
+}
 
 /// Injected into the agent process only when the user has opted in — see
 /// [`force_command_color_enabled`] for why it is not a default.
