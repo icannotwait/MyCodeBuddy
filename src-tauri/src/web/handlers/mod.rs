@@ -8,6 +8,8 @@ pub mod browser_tools;
 pub mod canvas;
 pub mod chat_authoring;
 pub mod chat_channel;
+pub mod computer;
+pub mod computer_tools;
 pub mod config_sync;
 pub mod conversation_experience;
 pub mod conversations;

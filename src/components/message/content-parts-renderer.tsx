@@ -99,6 +99,13 @@ import { isCodegMcpWorkbenchTool } from "@/lib/codeg-mcp-tool"
 import { fsSeparator } from "@/lib/path-utils"
 import { DelegatedSubThread } from "./delegated-sub-thread"
 import { DelegationStatusCard } from "./delegation-status-card"
+import { CodexVisualizeCard } from "./codex-visualize-card"
+import { HtmlFilePreviews } from "./html-file-previews"
+import {
+  findHtmlFileMentions,
+  hasCodexVisualizeRef,
+  splitCodexVisualizeRefs,
+} from "@/lib/codex-visualize"
 import { DelegationStatusGroupCard } from "./delegation-status-group-card"
 import { BackgroundTaskCard } from "./background-task-card"
 import { GeneratedImagesBlock } from "./generated-images-block"
@@ -2340,8 +2347,101 @@ const TextPart = memo(function TextPart({
       </div>
     )
   }
-  // One-shot live→history handoff: consume a completed incremental partition when
-  // the joined source matches the canonical TextPart text exactly.
+  return (
+    <AssistantText
+      text={text}
+      isStreaming={isStreaming ?? false}
+      autolinkLocalPaths={autolinkLocalPaths}
+    />
+  )
+})
+
+/**
+ * Assistant text, with its inline HTML previews:
+ * - explicit references — Codex's `visualize{…}` marker, Hermes'
+ *   `::preview{file=…}` — are cut out of the Markdown and rendered in place,
+ *   expanded;
+ * - any other local HTML file the reply mentions gets an on-demand "Preview"
+ *   row under it (not while streaming, so rows do not flicker in and out).
+ */
+function AssistantText({
+  text,
+  isStreaming,
+  autolinkLocalPaths,
+}: {
+  text: string
+  isStreaming: boolean
+  autolinkLocalPaths?: boolean
+}) {
+  const segments = useMemo(
+    () => (hasCodexVisualizeRef(text) ? splitCodexVisualizeRefs(text) : null),
+    [text]
+  )
+  const mentions = useMemo(() => {
+    if (isStreaming) return []
+    const shown =
+      segments?.flatMap((s) => (s.kind === "visualize" ? [s.ref.path] : [])) ??
+      []
+    return findHtmlFileMentions(text, { exclude: shown })
+  }, [text, segments, isStreaming])
+
+  const hasInline = segments?.some((s) => s.kind === "visualize") ?? false
+  // Structured previews own this text. Drop a full-text streaming handoff so
+  // it is not applied to a later plain render of the same source.
+  if (hasInline || mentions.length > 0) {
+    takeCompletedStreamingPartition(text)
+  }
+  if (!hasInline && mentions.length === 0) {
+    return (
+      <MarkdownText
+        text={text}
+        isStreaming={isStreaming}
+        autolinkLocalPaths={autolinkLocalPaths}
+      />
+    )
+  }
+  return (
+    <div className="space-y-2">
+      {hasInline && segments ? (
+        segments.map((segment, index) =>
+          segment.kind === "visualize" ? (
+            <CodexVisualizeCard
+              key={`viz-${index}-${segment.ref.path}`}
+              path={segment.ref.path}
+              mode={segment.ref.mode}
+            />
+          ) : (
+            <MarkdownText
+              key={`md-${index}`}
+              text={segment.text}
+              isStreaming={isStreaming}
+              autolinkLocalPaths={autolinkLocalPaths}
+            />
+          )
+        )
+      ) : (
+        <MarkdownText
+          text={text}
+          isStreaming={isStreaming}
+          autolinkLocalPaths={autolinkLocalPaths}
+        />
+      )}
+      {mentions.length > 0 ? <HtmlFilePreviews paths={mentions} /> : null}
+    </div>
+  )
+}
+
+function MarkdownText({
+  text,
+  isStreaming,
+  autolinkLocalPaths,
+}: {
+  text: string
+  isStreaming: boolean
+  autolinkLocalPaths?: boolean
+}) {
+  // One-shot live→history handoff: consume a completed incremental partition
+  // when the joined source matches this markdown text exactly.
   const partition = takeCompletedStreamingPartition(text)
   if (
     partition &&
@@ -2370,7 +2470,7 @@ const TextPart = memo(function TextPart({
       </MessageResponse>
     </div>
   )
-})
+}
 
 /** Max plain terminal chars while a command tool is still running. */
 export const RUNNING_COMMAND_OUTPUT_TAIL_CHARS = 24_000

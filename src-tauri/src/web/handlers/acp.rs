@@ -1961,6 +1961,8 @@ pub struct AcpUpdatePiConfigParams {
     pub custom_base_url: Option<String>,
     #[serde(default)]
     pub custom_api: Option<String>,
+    #[serde(default)]
+    pub model_reasoning: Option<acp_commands::PiModelReasoningSpec>,
 }
 
 pub async fn acp_update_pi_config(
@@ -1976,6 +1978,7 @@ pub async fn acp_update_pi_config(
             api_key: params.api_key,
             custom_base_url: params.custom_base_url,
             custom_api: params.custom_api,
+            model_reasoning: params.model_reasoning,
         },
         &state.db,
         &emitter,
@@ -1985,9 +1988,21 @@ pub async fn acp_update_pi_config(
     Ok(Json(()))
 }
 
-pub async fn acp_load_pi_config() -> Result<Json<acp_commands::PiConfigProjection>, AppCommandError>
-{
-    Ok(Json(acp_commands::load_pi_config_core()))
+pub async fn acp_load_pi_config(
+    Extension(state): Extension<Arc<AppState>>,
+) -> Result<Json<acp_commands::PiConfigProjection>, AppCommandError> {
+    let config = acp_commands::load_pi_config_for_db(&state.db)
+        .await
+        .map_err(|e| AppCommandError::task_execution_failed(e.to_string()))?;
+    Ok(Json(config))
+}
+
+pub async fn acp_list_pi_model_capabilities(
+    Extension(state): Extension<Arc<AppState>>,
+) -> Result<Json<acp_commands::PiModelCatalog>, AppCommandError> {
+    Ok(Json(
+        acp_commands::list_pi_model_catalog_core(&state.db, &state.data_dir).await,
+    ))
 }
 
 pub async fn acp_load_deepseek_model_catalog(
@@ -2205,6 +2220,15 @@ pub async fn acp_detect_agent_local_version(
         acp_commands::acp_detect_agent_local_version_core(params.agent_type, &db.conn, &emitter)
             .await
             .map_err(|e| AppCommandError::task_execution_failed(e.to_string()))?;
+    Ok(Json(result))
+}
+
+pub async fn acp_fetch_agent_latest_release(
+    Json(params): Json<AgentTypeParams>,
+) -> Result<Json<Option<crate::acp::latest_release::AgentLatestRelease>>, AppCommandError> {
+    let result = acp_commands::acp_fetch_agent_latest_release_core(params.agent_type)
+        .await
+        .map_err(|e| AppCommandError::task_execution_failed(e.to_string()))?;
     Ok(Json(result))
 }
 

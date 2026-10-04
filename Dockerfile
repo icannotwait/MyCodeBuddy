@@ -19,8 +19,10 @@ COPY src-tauri/ ./
 # `locate_codeg_mcp_binary()` finds it via the exe-sibling lookup.
 # `server` feature is required to compile the codeg-server bin (desktop
 # default builds intentionally omit it to shrink the antivirus surface).
+# `mcp-bin` is required for the delegation companion; it is not a default
+# feature, so `tauri build` does not replace the sidecar with a desktop copy.
 RUN cargo build --release --bin codeg-server --no-default-features --features server \
- && cargo build --release --bin codeg-mcp --no-default-features
+ && cargo build --release --bin codeg-mcp --no-default-features --features mcp-bin
 
 # Stage 3: Runtime
 FROM node:24-bookworm-slim

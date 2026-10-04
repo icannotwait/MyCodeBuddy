@@ -113,6 +113,18 @@ pub struct AppState {
     /// every group, and a flag that existed in one build only would be a
     /// second shape of `AppState` to keep in step.
     pub browser_tools_config: crate::acp::browser_tools::BrowserToolsRuntimeConfig,
+    /// Hot-swappable computer-use settings (the group switch, the grant
+    /// timeout, the blocklist). Shared with the `DelegationInjection` so MCP
+    /// injection reads it, re-read at call time by the desktop access impl,
+    /// and watched by the desktop's computer service, which ends every grant
+    /// when the group is switched off. Carried in both runtimes for the same
+    /// reason as `browser_tools_config`: one setting, one popover.
+    pub computer_tools_config: crate::acp::computer_tools::ComputerToolsRuntimeConfig,
+    /// codeg-server's computer service, where the person who runs it has let
+    /// it share the screen it runs on (`CODEG_COMPUTER_USE`) — set once,
+    /// after the persisted settings are applied. Never set in the desktop
+    /// app's web service: its screen is shared from the desktop window.
+    pub computer_service: std::sync::OnceLock<Arc<crate::commands::computer::ComputerService>>,
     /// Serializes mutually-exclusive system operations — in-place
     /// self-update, restart, rollback — so a second click can't race a
     /// download/swap already in flight. Handlers `try_lock` and reject when
@@ -161,6 +173,7 @@ pub struct DelegationStack {
     pub continuation_store: Arc<dyn ContinuationStore>,
     pub continuation_coordinator: Arc<DelegationContinuationCoordinator>,
     pub browser: crate::acp::browser_tools::BrowserToolsRuntimeConfig,
+    pub computer: crate::acp::computer_tools::ComputerToolsRuntimeConfig,
 }
 
 /// Build the delegation broker + token registry + per-process UDS socket
@@ -267,6 +280,7 @@ pub fn build_delegation_stack(
     let sessions = crate::acp::session_info::SessionInfoRuntimeConfig::new();
     let authoring = crate::acp::chat_authoring::ChatAuthoringRuntimeConfig::new();
     let browser = crate::acp::browser_tools::BrowserToolsRuntimeConfig::new();
+    let computer = crate::acp::computer_tools::ComputerToolsRuntimeConfig::new();
 
     // Soft-supervisor wake channel: tx side is shared via SupervisorWake on
     // injection + broker; rx is taken once at desktop/server startup after
@@ -291,6 +305,8 @@ pub fn build_delegation_stack(
         ask: ask.clone(),
         sessions: sessions.clone(),
         authoring: authoring.clone(),
+        browser: browser.clone(),
+        computer: computer.clone(),
         // Same backing manager as the listener's question lookup; used only by
         // the run_connection teardown guard to reclaim a parked ask.
         questions: Arc::new(crate::acp::manager::ConnectionManagerQuestionLookup {
@@ -322,6 +338,7 @@ pub fn build_delegation_stack(
         continuation_store,
         continuation_coordinator,
         browser,
+        computer,
     }
 }
 
@@ -571,6 +588,8 @@ impl AppState {
             session_info_config: stack.sessions,
             chat_authoring_config: stack.authoring,
             browser_tools_config: stack.browser,
+            computer_tools_config: stack.computer,
+            computer_service: std::sync::OnceLock::new(),
             system_op_lock: default_system_op_lock(),
             update_state: default_update_state(),
         }

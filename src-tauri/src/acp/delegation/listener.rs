@@ -36,6 +36,16 @@ use crate::acp::delegation::recovery_policy::{
 use crate::acp::delegation::run_store::{
     recovery_action_payload, recovery_source_from_continue_eligibility,
 };
+use crate::acp::browser_tools::{
+    BrowserActOutcome, BrowserCaptureOutcome, BrowserConsoleOutcome, BrowserEvalOutcome,
+    BrowserSnapshotOutcome, BrowserTabOutcome, BrowserTabsOutcome, BrowserToolAccess,
+    ERROR_NO_SUCH_TAB,
+};
+use crate::acp::chat_authoring::{AuthoringContext, AuthoringOutcome, ChatAuthoringAccess};
+use crate::acp::computer_tools::{
+    ComputerActOutcome, ComputerAppsOutcome, ComputerCaptureOutcome, ComputerSnapshotOutcome,
+    ComputerToolAccess, ComputerVerifyOutcome, ComputerWindowsOutcome, ERROR_NO_SUCH_TARGET,
+};
 use crate::acp::delegation::transport::{
     read_frame, write_frame, BrokerAskRequest, BrokerCancelRequest, BrokerCancelTaskRequest,
     BrokerCommitFeedbackRequest, BrokerCompleteWorkRequest, BrokerFeedbackRequest,
@@ -44,8 +54,15 @@ use crate::acp::delegation::transport::{
     BrokerRecoveryAuthorizationRequest, BrokerRegisterSimpleWorkflowRequest,
     BrokerReplyDelegationRequest, BrokerRequest, BrokerResponse, BrokerResumeTaskRequest,
     BrokerSessionRequest, BrokerSettleWorkflowRequest, BrokerStatusRequest, CancelDelegationReason,
-    CompanionReadyAck, CompanionRole,
+    CompanionReadyAck, CompanionRole, BrokerBrowserActRequest, BrokerBrowserCaptureRequest,
+    BrokerBrowserConsoleRequest, BrokerBrowserEvalRequest, BrokerBrowserSnapshotRequest,
+    BrokerBrowserTabOpRequest, BrokerBrowserTabsRequest, BrokerComputerActRequest,
+    BrokerComputerAppsRequest, BrokerComputerCaptureRequest, BrokerComputerLaunchRequest,
+    BrokerComputerSnapshotRequest, BrokerComputerVerifyRequest, BrokerComputerWindowsRequest,
+    BrokerCreateAutomationRequest, BrokerCreateWorkTaskRequest, BrokerTaskCompleteRequest,
+    BrokerTaskProgressRequest, BrokerComputerClipboardRequest,
 };
+use crate::acp::work_task_tools::{TaskReportAck, WorkTaskToolAccess};
 use crate::acp::delegation::types::{
     correlation_error_message, parse_admission_ticket_v1_request, validate_correlation_id,
     AdmissionPreparation, CorrelationEntryPoint, CorrelationFailureKind, DelegationReplyResult,
@@ -444,6 +461,26 @@ pub struct DelegationListener {
     recovery_authorizations: Option<Arc<RecoveryAuthorizationService>>,
     #[cfg(any(test, feature = "test-utils"))]
     status_release_decision_gate: Arc<StatusReleaseDecisionGate>,
+    /// Records work-task reports (`task_progress` / `task_complete`) against the
+    /// task the parent connection is executing. Same token → parent-connection
+    /// scoping as the delegation arms.
+    pub tasks: Arc<dyn WorkTaskToolAccess>,
+    /// Creates automations / board tasks on behalf of the chat that asked
+    /// (`create_automation` / `create_work_task`). The impl re-checks the
+    /// feature flags at call time, so flipping the setting off stops writes
+    /// from sessions that were launched while it was on.
+    pub authoring: Arc<dyn ChatAuthoringAccess>,
+    /// Lists the built-in browser's tabs, reads a shared page and acts on one
+    /// (`browser_list_tabs` / `browser_snapshot` / the action tools). Like the
+    /// authoring impl it
+    /// re-checks its feature flag at call time; unlike every other arm here it
+    /// exists only in the desktop build, because a browser tab is a native
+    /// webview — server mode gets `NoBrowserTabs`.
+    pub browser: Arc<dyn BrowserToolAccess>,
+    /// Lists the desktop's applications and windows and reads a shared window
+    /// (`computer_*`). Desktop-only like the browser — server mode gets
+    /// `NoComputerDesktop` — and like it, re-checks its switch at call time.
+    pub computer: Arc<dyn ComputerToolAccess>,
 }
 
 impl DelegationListener {
@@ -479,6 +516,10 @@ impl DelegationListener {
         feedback: Arc<dyn SessionFeedbackAccess>,
         questions: Arc<dyn SessionQuestionAccess>,
         session_info: Arc<dyn SessionInfoAccess>,
+        tasks: Arc<dyn WorkTaskToolAccess>,
+        authoring: Arc<dyn ChatAuthoringAccess>,
+        browser: Arc<dyn BrowserToolAccess>,
+        computer: Arc<dyn ComputerToolAccess>,
     ) -> Arc<Self> {
         Self::new_with_wait_cancel(
             broker,
@@ -489,6 +530,10 @@ impl DelegationListener {
             questions,
             session_info,
             crate::acp::delegation::wait_cancel::WaitCancelRegistry::new_shared(),
+            tasks,
+            authoring,
+            browser,
+            computer,
         )
     }
 
@@ -502,6 +547,10 @@ impl DelegationListener {
         questions: Arc<dyn SessionQuestionAccess>,
         session_info: Arc<dyn SessionInfoAccess>,
         wait_cancel: Arc<crate::acp::delegation::wait_cancel::WaitCancelRegistry>,
+        tasks: Arc<dyn WorkTaskToolAccess>,
+        authoring: Arc<dyn ChatAuthoringAccess>,
+        browser: Arc<dyn BrowserToolAccess>,
+        computer: Arc<dyn ComputerToolAccess>,
     ) -> Arc<Self> {
         Self::new_with_workflow_emitter(
             broker,
@@ -513,6 +562,10 @@ impl DelegationListener {
             session_info,
             wait_cancel,
             EventEmitter::Noop,
+            tasks,
+            authoring,
+            browser,
+            computer,
         )
     }
 
@@ -529,6 +582,10 @@ impl DelegationListener {
         session_info: Arc<dyn SessionInfoAccess>,
         wait_cancel: Arc<crate::acp::delegation::wait_cancel::WaitCancelRegistry>,
         workflow_emitter: EventEmitter,
+        tasks: Arc<dyn WorkTaskToolAccess>,
+        authoring: Arc<dyn ChatAuthoringAccess>,
+        browser: Arc<dyn BrowserToolAccess>,
+        computer: Arc<dyn ComputerToolAccess>,
     ) -> Arc<Self> {
         let metrics = broker.metrics();
         let recovery_authorizations = broker
@@ -548,6 +605,10 @@ impl DelegationListener {
             recovery_authorizations,
             #[cfg(any(test, feature = "test-utils"))]
             status_release_decision_gate: Arc::new(StatusReleaseDecisionGate::default()),
+            tasks,
+            authoring,
+            browser,
+            computer,
         })
     }
 
@@ -990,6 +1051,105 @@ impl DelegationListener {
             BrokerMessage::RecoverWorkflow(req) => {
                 value_response(&self.process_recover_workflow(req).await)?
             }
+            BrokerMessage::TaskProgress(req) => {
+                task_ack_response(self.process_task_progress(req).await)?
+            }
+            BrokerMessage::TaskComplete(req) => {
+                task_ack_response(self.process_task_complete(req).await)?
+            }
+            BrokerMessage::CreateAutomation(req) => {
+                // A bounded DB write. Like SessionInfo it never long-polls, so
+                // there is no peer-close race to run — and unlike Ask there is
+                // nothing to tear down if the caller cancels: either the row
+                // landed or it didn't, and the response is simply dropped.
+                authoring_response(self.process_create_automation(req).await)?
+            }
+            BrokerMessage::CreateWorkTask(req) => {
+                authoring_response(self.process_create_work_task(req).await)?
+            }
+            BrokerMessage::BrowserTabs(req) => {
+                // A registry read. No peer-close race for the same reason as
+                // SessionInfo: it cannot block on anything.
+                browser_tabs_response(self.process_browser_tabs(req).await)?
+            }
+            BrokerMessage::BrowserSnapshot(req) => {
+                // This one CAN take a moment — it evaluates in the page's
+                // isolated world and waits for the answer — but it is bounded
+                // by the read's own 15 s engine timeout rather than by a human
+                // or a long-poll, and abandoning it early would leave the
+                // activity line unwritten while the page had already been
+                // read. So no peer-close race here either: the read runs to its
+                // own end, and a caller that walked away simply gets no answer.
+                browser_snapshot_response(self.process_browser_snapshot(req).await)?
+            }
+            BrokerMessage::BrowserAct(req) => {
+                // Same shape as the read: bounded by the engine's own
+                // timeouts, and an action that has happened has to leave its
+                // line on the strip whether or not the caller is still there.
+                browser_act_response(self.process_browser_act(req).await)?
+            }
+            BrokerMessage::BrowserConsole(req) => {
+                // A registry read, like the listing; nothing to block on.
+                browser_console_response(self.process_browser_console(req).await)?
+            }
+            BrokerMessage::BrowserCapture(req) => {
+                // Bounded by the capture's own engine timeout, as the read
+                // is; the line it leaves on the strip is written on the
+                // codeg side whether or not the caller waits.
+                browser_capture_response(self.process_browser_capture(req).await)?
+            }
+            BrokerMessage::BrowserEval(req) => {
+                // The one browser message that waits on a human, so it can sit
+                // here for a couple of minutes. Still no peer-close race: the
+                // question is in front of a person, and whipping it away
+                // because the agent's socket went quiet would train them to
+                // dismiss dialogs that vanish. It is bounded by the
+                // confirmation's own timeout either way.
+                browser_eval_response(self.process_browser_eval(req).await)?
+            }
+            BrokerMessage::BrowserTabOp(req) => {
+                // Bounded by the settle timeout on the codeg side. No
+                // peer-close race for the same reason the snapshot arm has
+                // none: dropping the future mid-flight would leave a tab open
+                // (or a page navigated) with nothing on the strip to say so.
+                browser_tab_op_response(self.process_browser_tab_op(req).await)?
+            }
+            BrokerMessage::ComputerApps(req) => {
+                // One driver listing behind the helper, bounded by the
+                // helper's own timeout. No peer-close race, as for the
+                // browser listing: nothing here waits on a person.
+                computer_response(&self.process_computer_apps(req).await)?
+            }
+            BrokerMessage::ComputerWindows(req) => {
+                computer_response(&self.process_computer_windows(req).await)?
+            }
+            BrokerMessage::ComputerCapture(req) => {
+                // Like the browser capture: the read runs to its own end, so
+                // the activity line it writes on the codeg side is never
+                // skipped because the caller walked away.
+                computer_capture_response(self.process_computer_capture(req).await)?
+            }
+            BrokerMessage::ComputerSnapshot(req) => {
+                computer_response(&self.process_computer_snapshot(req).await)?
+            }
+            BrokerMessage::ComputerVerify(req) => {
+                computer_response(&self.process_computer_verify(req).await)?
+            }
+            BrokerMessage::ComputerAct(req) => {
+                // Runs to its end like a read: an action cannot be recalled
+                // halfway, and the line it leaves on the panel's activity
+                // list must not depend on whether the caller is still there.
+                computer_response(&self.process_computer_act(req).await)?
+            }
+            BrokerMessage::ComputerLaunch(req) => {
+                // To its end, as an action: a started application cannot be
+                // recalled either.
+                computer_response(&self.process_computer_launch(req).await)?
+            }
+            BrokerMessage::ComputerClipboard(req) => {
+                // To its end: a write cannot be recalled.
+                computer_response(&self.process_computer_clipboard(req).await)?
+            }
             BrokerMessage::Cancel(cancel) => {
                 self.process_cancel(cancel).await;
                 // Empty ack — the companion only uses this to detect the
@@ -998,21 +1158,6 @@ impl DelegationListener {
                     outcome: Value::Null,
                 }
             }
-            // Browser tools are a 0.31.0 wire capability. This listener does
-            // not inject them onto the default six-tool `tools/list`; the
-            // variants exist so a companion that sends them gets a stable
-            // JSON error instead of a decode/exhaustiveness failure.
-            BrokerMessage::BrowserTabs(_)
-            | BrokerMessage::BrowserSnapshot(_)
-            | BrokerMessage::BrowserAct(_)
-            | BrokerMessage::BrowserConsole(_)
-            | BrokerMessage::BrowserCapture(_)
-            | BrokerMessage::BrowserEval(_)
-            | BrokerMessage::BrowserTabOp(_) => BrokerResponse {
-                outcome: serde_json::json!({
-                    "error": "browser tools are not available"
-                }),
-            },
         };
         write_frame(conn, &resp).await?;
         if let Some(owner) = foreground_release_owner.take() {
@@ -1908,6 +2053,296 @@ impl DelegationListener {
             .await
             .ok_or(OrchestrationBindingQueryAuthError::NoActiveConversation)
     }
+
+
+    async fn process_browser_tabs(&self, req: BrokerBrowserTabsRequest) -> BrowserTabsOutcome {
+        if self.tokens.lookup(&req.token).await.is_none() {
+            return BrowserTabsOutcome::default();
+        }
+        self.browser.list_tabs().await
+    }
+
+    /// Validate the token and read one shared page.
+    ///
+    /// An invalid token is told the tab does not exist — the same answer a
+    /// wrong id gets, so a caller off the street cannot use the refusal codes
+    /// to probe which tabs are open or which of them are shared.
+    async fn process_browser_snapshot(
+        &self,
+        req: BrokerBrowserSnapshotRequest,
+    ) -> BrowserSnapshotOutcome {
+        if self.tokens.lookup(&req.token).await.is_none() {
+            return BrowserSnapshotOutcome::refused(
+                &req.tab_id,
+                ERROR_NO_SUCH_TAB,
+                format!("No browser tab {} is open.", req.tab_id),
+            );
+        }
+        self.browser.snapshot(&req.tab_id, req.max_chars).await
+    }
+
+    /// Validate the token and act on one shared page. An invalid token gets
+    /// the same "no such tab" a wrong id gets, for the reason given on
+    /// [`Self::process_browser_snapshot`].
+    async fn process_browser_act(&self, req: BrokerBrowserActRequest) -> BrowserActOutcome {
+        if self.tokens.lookup(&req.token).await.is_none() {
+            return BrowserActOutcome::refused(
+                &req.tab_id,
+                ERROR_NO_SUCH_TAB,
+                format!("No browser tab {} is open.", req.tab_id),
+            );
+        }
+        self.browser.act(&req.tab_id, req.request).await
+    }
+
+    /// Validate the token and read one shared page's console; an invalid
+    /// token gets "no such tab", as everywhere here.
+    async fn process_browser_console(
+        &self,
+        req: BrokerBrowserConsoleRequest,
+    ) -> BrowserConsoleOutcome {
+        if self.tokens.lookup(&req.token).await.is_none() {
+            return BrowserConsoleOutcome::refused(
+                &req.tab_id,
+                ERROR_NO_SUCH_TAB,
+                format!("No browser tab {} is open.", req.tab_id),
+            );
+        }
+        self.browser.console(&req.tab_id, req.query).await
+    }
+
+    /// Validate the token and capture one shared page; an invalid token gets
+    /// "no such tab", as everywhere here.
+    async fn process_browser_capture(
+        &self,
+        req: BrokerBrowserCaptureRequest,
+    ) -> BrowserCaptureOutcome {
+        if self.tokens.lookup(&req.token).await.is_none() {
+            return BrowserCaptureOutcome::refused(
+                &req.tab_id,
+                ERROR_NO_SUCH_TAB,
+                format!("No browser tab {} is open.", req.tab_id),
+            );
+        }
+        self.browser.capture(&req.tab_id, req.request).await
+    }
+
+    /// Validate the token and run one snippet on one shared page; an invalid
+    /// token gets "no such tab", as everywhere here.
+    ///
+    /// Checking the token BEFORE the access impl matters more here than
+    /// anywhere else on this surface: the impl is what raises the dialog, and
+    /// a caller with no standing must not be able to put a question in front
+    /// of the user at all.
+    async fn process_browser_eval(&self, req: BrokerBrowserEvalRequest) -> BrowserEvalOutcome {
+        if self.tokens.lookup(&req.token).await.is_none() {
+            return BrowserEvalOutcome::refused(
+                &req.tab_id,
+                ERROR_NO_SUCH_TAB,
+                format!("No browser tab {} is open.", req.tab_id),
+            );
+        }
+        self.browser.eval(&req.tab_id, req.request).await
+    }
+
+    /// Validate the token and open / navigate / close one tab.
+    ///
+    /// The token is checked before the access impl, as everywhere here: an
+    /// invalid one must not be able to open a tab on the user's screen, and
+    /// hears the same "no such tab" every other unauthenticated round trip
+    /// gets. An `Open` has no tab to name, so it hears the note instead —
+    /// which reveals nothing either, being what a session with the browser
+    /// switched off also hears.
+    async fn process_browser_tab_op(&self, req: BrokerBrowserTabOpRequest) -> BrowserTabOutcome {
+        if self.tokens.lookup(&req.token).await.is_none() {
+            let tab_id = req.op.tab_id();
+            return BrowserTabOutcome::refused(
+                tab_id,
+                ERROR_NO_SUCH_TAB,
+                match tab_id {
+                    Some(tab_id) => format!("No browser tab {tab_id} is open."),
+                    None => crate::acp::browser_tools::NO_BROWSER_NOTE.to_string(),
+                },
+            );
+        }
+        self.browser.tab_op(req.op).await
+    }
+
+    /// Validate the token and list the running applications. An invalid token
+    /// hears what a runtime with no desktop hears: nothing is listed, so a
+    /// caller that cannot prove it is a companion learns nothing about what
+    /// is running.
+    async fn process_computer_apps(&self, req: BrokerComputerAppsRequest) -> ComputerAppsOutcome {
+        if self.tokens.lookup(&req.token).await.is_none() {
+            return ComputerAppsOutcome::default();
+        }
+        self.computer.list_apps().await
+    }
+
+    /// Validate the token and list the windows. Same unauthenticated answer as
+    /// the application listing.
+    async fn process_computer_windows(
+        &self,
+        req: BrokerComputerWindowsRequest,
+    ) -> ComputerWindowsOutcome {
+        if self.tokens.lookup(&req.token).await.is_none() {
+            return ComputerWindowsOutcome::default();
+        }
+        self.computer.list_windows(req.pid).await
+    }
+
+    /// An invalid token is told the window does not exist — the answer a
+    /// wrong id gets — so the refusal codes cannot be used from outside to
+    /// probe which windows exist or which are shared.
+    async fn process_computer_capture(
+        &self,
+        req: BrokerComputerCaptureRequest,
+    ) -> ComputerCaptureOutcome {
+        if self.tokens.lookup(&req.token).await.is_none() {
+            return ComputerCaptureOutcome::refused(
+                &req.target_id,
+                ERROR_NO_SUCH_TARGET,
+                crate::acp::computer_tools::no_such_target_note(&req.target_id),
+            );
+        }
+        self.computer.capture(&req.target_id, req.max_dimension).await
+    }
+
+    async fn process_computer_snapshot(
+        &self,
+        req: BrokerComputerSnapshotRequest,
+    ) -> ComputerSnapshotOutcome {
+        if self.tokens.lookup(&req.token).await.is_none() {
+            return ComputerSnapshotOutcome::refused(
+                &req.target_id,
+                ERROR_NO_SUCH_TARGET,
+                crate::acp::computer_tools::no_such_target_note(&req.target_id),
+            );
+        }
+        self.computer.snapshot(&req.target_id, req.request).await
+    }
+
+    async fn process_computer_verify(
+        &self,
+        req: BrokerComputerVerifyRequest,
+    ) -> ComputerVerifyOutcome {
+        if self.tokens.lookup(&req.token).await.is_none() {
+            return ComputerVerifyOutcome::refused(
+                &req.target_id,
+                ERROR_NO_SUCH_TARGET,
+                crate::acp::computer_tools::no_such_target_note(&req.target_id),
+            );
+        }
+        self.computer.verify(&req.target_id, req.request).await
+    }
+
+    /// Same unauthenticated answer as a read: an invalid token is told the
+    /// window does not exist, and nothing is done.
+    async fn process_computer_act(&self, req: BrokerComputerActRequest) -> ComputerActOutcome {
+        if self.tokens.lookup(&req.token).await.is_none() {
+            return ComputerActOutcome::refused(
+                &req.target_id,
+                ERROR_NO_SUCH_TARGET,
+                crate::acp::computer_tools::no_such_target_note(&req.target_id),
+            );
+        }
+        self.computer
+            .act(&req.target_id, req.request, req.delivery)
+            .await
+    }
+
+    /// Validate the token and start the application. An invalid token hears
+    /// what a runtime with no desktop hears, and nothing is started.
+    async fn process_computer_launch(
+        &self,
+        req: BrokerComputerLaunchRequest,
+    ) -> crate::acp::computer_tools::ComputerLaunchOutcome {
+        if self.tokens.lookup(&req.token).await.is_none() {
+            return crate::acp::computer_tools::ComputerLaunchOutcome::refused(
+                crate::acp::computer_tools::ERROR_UNAVAILABLE,
+                crate::acp::computer_tools::NO_DESKTOP_NOTE,
+            );
+        }
+        self.computer.launch_app(req.name, req.key).await
+    }
+
+    /// Validate the token and read or write the clipboard. An invalid token
+    /// hears what a runtime with no desktop hears, and nothing is done.
+    async fn process_computer_clipboard(
+        &self,
+        req: crate::acp::delegation::transport::BrokerComputerClipboardRequest,
+    ) -> crate::acp::computer_tools::ComputerClipboardOutcome {
+        if self.tokens.lookup(&req.token).await.is_none() {
+            return crate::acp::computer_tools::ComputerClipboardOutcome::refused(
+                crate::acp::computer_tools::ERROR_UNAVAILABLE,
+                crate::acp::computer_tools::NO_DESKTOP_NOTE,
+            );
+        }
+        self.computer.clipboard(req.op).await
+    }
+
+    /// Validate the token and hand the progress report to the task engine,
+    /// which resolves the parent connection to its owning task + generation.
+    async fn process_task_progress(&self, req: BrokerTaskProgressRequest) -> TaskReportAck {
+        let Some(entry) = self.tokens.lookup(&req.token).await else {
+            return TaskReportAck::rejected("invalid token");
+        };
+        self.tasks
+            .report_progress(&entry.parent_connection_id, &req.message)
+            .await
+    }
+
+    /// Validate the token and hand the final verdict to the task engine.
+    async fn process_task_complete(&self, req: BrokerTaskCompleteRequest) -> TaskReportAck {
+        let Some(entry) = self.tokens.lookup(&req.token).await else {
+            return TaskReportAck::rejected("invalid token");
+        };
+        self.tasks
+            .complete(
+                &entry.parent_connection_id,
+                &req.verdict,
+                req.summary.as_deref(),
+            )
+            .await
+    }
+
+    /// Resolve the caller's [`AuthoringContext`] from its per-launch token: the
+    /// conversation it is currently in (for defaulting the target project) plus
+    /// the working directory recorded at injection. `None` when the token is
+    /// invalid — the caller gets a soft refusal, not a leak of whether the token
+    /// merely expired.
+    async fn authoring_context(&self, token: &str) -> Option<AuthoringContext> {
+        let entry = self.tokens.lookup(token).await?;
+        let conversation_id = self
+            .parent_lookup
+            .current_conversation_id(&entry.parent_connection_id)
+            .await;
+        Some(AuthoringContext {
+            conversation_id,
+            working_dir: entry.working_dir,
+        })
+    }
+
+    /// Validate the token and hand the automation spec to the authoring impl,
+    /// which re-checks the feature flag before writing.
+    async fn process_create_automation(
+        &self,
+        req: BrokerCreateAutomationRequest,
+    ) -> AuthoringOutcome {
+        let Some(ctx) = self.authoring_context(&req.token).await else {
+            return AuthoringOutcome::rejected("automation", "invalid token");
+        };
+        self.authoring.create_automation(ctx, req.spec).await
+    }
+
+    /// Validate the token and hand the task spec to the authoring impl.
+    async fn process_create_work_task(&self, req: BrokerCreateWorkTaskRequest) -> AuthoringOutcome {
+        let Some(ctx) = self.authoring_context(&req.token).await else {
+            return AuthoringOutcome::rejected("work_task", "invalid token");
+        };
+        self.authoring.create_work_task(ctx, req.spec).await
+    }
+
 
     async fn process_orchestration_bindings(
         &self,
@@ -3555,6 +3990,167 @@ fn session_response(info: SessionInfo) -> std::io::Result<BrokerResponse> {
     })
 }
 
+/// Serialize a [`BrowserTabsOutcome`] into a [`BrokerResponse`] for the
+/// `BrowserTabs` arm — the companion renders it into the `browser_list_tabs`
+/// tool result.
+fn browser_tabs_response(outcome: BrowserTabsOutcome) -> std::io::Result<BrokerResponse> {
+    Ok(BrokerResponse {
+        outcome: serde_json::to_value(&outcome).map_err(|e| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, format!("encode: {e}"))
+        })?,
+    })
+}
+
+/// Serialize a [`BrowserSnapshotOutcome`] into a [`BrokerResponse`] for the
+/// `BrowserSnapshot` arm — the companion renders it into the `browser_snapshot`
+/// tool result.
+fn browser_snapshot_response(
+    outcome: BrowserSnapshotOutcome,
+) -> std::io::Result<BrokerResponse> {
+    Ok(BrokerResponse {
+        outcome: serde_json::to_value(&outcome).map_err(|e| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, format!("encode: {e}"))
+        })?,
+    })
+}
+
+/// Serialize a [`BrowserActOutcome`] into a [`BrokerResponse`] for the
+/// `BrowserAct` arm — the companion renders it into the action tool's result.
+fn browser_act_response(outcome: BrowserActOutcome) -> std::io::Result<BrokerResponse> {
+    Ok(BrokerResponse {
+        outcome: serde_json::to_value(&outcome).map_err(|e| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, format!("encode: {e}"))
+        })?,
+    })
+}
+
+/// Serialize a [`BrowserConsoleOutcome`] for the `BrowserConsole` arm.
+fn browser_console_response(outcome: BrowserConsoleOutcome) -> std::io::Result<BrokerResponse> {
+    Ok(BrokerResponse {
+        outcome: serde_json::to_value(&outcome).map_err(|e| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, format!("encode: {e}"))
+        })?,
+    })
+}
+
+/// Serialize a [`BrowserEvalOutcome`] for the `BrowserEval` arm. No size guard
+/// like the capture's: what a snippet can send back is already bounded twice,
+/// in the page's renderer and again in `EvalOutcome::from_answer`.
+fn browser_eval_response(outcome: BrowserEvalOutcome) -> std::io::Result<BrokerResponse> {
+    Ok(BrokerResponse {
+        outcome: serde_json::to_value(&outcome).map_err(|e| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, format!("encode: {e}"))
+        })?,
+    })
+}
+
+/// Serialize a [`BrowserTabOutcome`] for the `BrowserTabOp` arm. Nothing to
+/// guard for size: the answer is a tab summary at most.
+fn browser_tab_op_response(outcome: BrowserTabOutcome) -> std::io::Result<BrokerResponse> {
+    Ok(BrokerResponse {
+        outcome: serde_json::to_value(&outcome).map_err(|e| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, format!("encode: {e}"))
+        })?,
+    })
+}
+
+/// Serialize a [`BrowserCaptureOutcome`] for the `BrowserCapture` arm. The
+/// image rides inside as base64. The capture pipeline keeps it far under the
+/// frame cap, but this is the last place before the frame is written, so it
+/// is measured here too: a capture the companion would refuse to read is
+/// answered with a refusal it can, rather than with a broken round trip.
+fn browser_capture_response(outcome: BrowserCaptureOutcome) -> std::io::Result<BrokerResponse> {
+    let encode = |outcome: &BrowserCaptureOutcome| {
+        serde_json::to_vec(outcome).map_err(|e| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, format!("encode: {e}"))
+        })
+    };
+    let mut bytes = encode(&outcome)?;
+    if bytes.len() > CAPTURE_RESPONSE_MAX_BYTES {
+        let refused = BrowserCaptureOutcome::refused(
+            &outcome.tab_id,
+            crate::acp::browser_tools::ERROR_READ_FAILED,
+            format!(
+                "The screenshot came out too large to deliver ({} bytes). Ask for a smaller \
+                 `maxWidth`, or `format: \"jpeg\"`.",
+                bytes.len()
+            ),
+        );
+        bytes = encode(&refused)?;
+    }
+    Ok(BrokerResponse {
+        outcome: serde_json::from_slice(&bytes).map_err(|e| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, format!("encode: {e}"))
+        })?,
+    })
+}
+
+/// What a serialized capture outcome may weigh: the frame cap less room for
+/// the envelope around it.
+const CAPTURE_RESPONSE_MAX_BYTES: usize = super::transport::MAX_FRAME_BYTES - 64 * 1024;
+
+/// Serialize any computer-use outcome for its arm. Nothing but the capture
+/// can come near the frame cap: a snapshot's tree is cut to `maxChars` on the
+/// codeg side, and the listings and verdicts are small.
+fn computer_response(outcome: &impl serde::Serialize) -> std::io::Result<BrokerResponse> {
+    Ok(BrokerResponse {
+        outcome: serde_json::to_value(outcome).map_err(|e| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, format!("encode: {e}"))
+        })?,
+    })
+}
+
+/// Serialize a [`ComputerCaptureOutcome`], measured against the frame cap for
+/// the same reason as the browser's: a capture the companion could not read
+/// is answered with a refusal it can.
+fn computer_capture_response(outcome: ComputerCaptureOutcome) -> std::io::Result<BrokerResponse> {
+    let encode = |outcome: &ComputerCaptureOutcome| {
+        serde_json::to_vec(outcome).map_err(|e| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, format!("encode: {e}"))
+        })
+    };
+    let mut bytes = encode(&outcome)?;
+    if bytes.len() > CAPTURE_RESPONSE_MAX_BYTES {
+        let refused = ComputerCaptureOutcome::refused(
+            &outcome.target_id,
+            crate::acp::computer_tools::ERROR_READ_FAILED,
+            format!(
+                "The screenshot came out too large to deliver ({} bytes). Ask for a smaller \
+                 `maxDimension`.",
+                bytes.len()
+            ),
+        );
+        bytes = encode(&refused)?;
+    }
+    Ok(BrokerResponse {
+        outcome: serde_json::from_slice(&bytes).map_err(|e| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, format!("encode: {e}"))
+        })?,
+    })
+}
+
+/// Serialize a [`TaskReportAck`] into a [`BrokerResponse`] for the
+/// `TaskProgress` / `TaskComplete` arms — the companion renders it into the
+/// tool result.
+fn task_ack_response(ack: TaskReportAck) -> std::io::Result<BrokerResponse> {
+    Ok(BrokerResponse {
+        outcome: serde_json::to_value(&ack).map_err(|e| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, format!("encode: {e}"))
+        })?,
+    })
+}
+
+/// Serialize an [`AuthoringOutcome`] into a [`BrokerResponse`] for the
+/// `CreateAutomation` / `CreateWorkTask` arms — the companion renders it into
+/// the tool result.
+fn authoring_response(outcome: AuthoringOutcome) -> std::io::Result<BrokerResponse> {
+    Ok(BrokerResponse {
+        outcome: serde_json::to_value(&outcome).map_err(|e| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, format!("encode: {e}"))
+        })?,
+    })
+}
+
 /// The `declined` outcome — used when the token is invalid, the connection is
 /// gone, or the answer one-shot was dropped without a response. The LLM reads it
 /// as "the user didn't answer; proceed with your own judgment".
@@ -3784,6 +4380,8 @@ mod tests {
     use crate::acp::delegation::spawner::{
         accepted, mock::MockSpawner, ConnectionSpawner, ResumedSpawn, SpawnerError,
     };
+    use crate::acp::browser_tools::{NoBrowserTabs, ERROR_GRANT_REQUIRED, ERROR_NO_SUCH_TAB};
+    use crate::acp::computer_tools::NoComputerDesktop;
     use crate::acp::delegation::types::{DelegationError, DelegationOutcome, DelegationSuccess};
     use crate::acp::delegation::workflow::publish_workflow_manifest_fixture;
     use crate::acp::tool_watchdog::{CancelCause, WaitCancelResult, WaitStamp};
@@ -3994,6 +4592,162 @@ mod tests {
     }
 
     use tokio::sync::oneshot;
+
+    #[derive(Default)]
+    struct StubBrowser {
+        calls: tokio::sync::Mutex<Vec<String>>,
+    }
+    #[async_trait]
+    impl BrowserToolAccess for StubBrowser {
+        async fn list_tabs(&self) -> BrowserTabsOutcome {
+            self.calls.lock().await.push("list".into());
+            BrowserTabsOutcome {
+                tabs: vec![crate::browser::agent::AgentTabSummary {
+                    tab_id: "t1".into(),
+                    origin: Some("https://example.com".into()),
+                    level: crate::browser::agent::GrantLevel::Read,
+                    title: Some("Example".into()),
+                }],
+                note: None,
+            }
+        }
+        async fn snapshot(
+            &self,
+            tab_id: &str,
+            max_chars: Option<usize>,
+        ) -> BrowserSnapshotOutcome {
+            self.calls
+                .lock()
+                .await
+                .push(format!("snapshot {tab_id} {max_chars:?}"));
+            BrowserSnapshotOutcome::grant_required(tab_id)
+        }
+        async fn eval(
+            &self,
+            tab_id: &str,
+            request: crate::browser::eval::EvalRequest,
+        ) -> BrowserEvalOutcome {
+            self.calls
+                .lock()
+                .await
+                .push(format!("eval {tab_id} {}", request.code));
+            BrowserEvalOutcome::grant_required(tab_id)
+        }
+        async fn console(
+            &self,
+            tab_id: &str,
+            query: crate::browser::console::ConsoleQuery,
+        ) -> BrowserConsoleOutcome {
+            self.calls.lock().await.push(format!(
+                "console {tab_id} since={} min={:?} limit={:?}",
+                query.since, query.min_level, query.limit
+            ));
+            BrowserConsoleOutcome::grant_required(tab_id)
+        }
+        async fn capture(
+            &self,
+            tab_id: &str,
+            request: crate::browser::capture::CaptureRequest,
+        ) -> BrowserCaptureOutcome {
+            self.calls.lock().await.push(format!(
+                "capture {tab_id} {:?} {:?} {:?}",
+                request.clip_target(),
+                request.max_width,
+                request.format
+            ));
+            BrowserCaptureOutcome::grant_required(tab_id)
+        }
+        async fn act(
+            &self,
+            tab_id: &str,
+            request: crate::browser::agent::ActionRequest,
+        ) -> BrowserActOutcome {
+            self.calls.lock().await.push(format!(
+                "act {tab_id} {} {:?}",
+                request.generation,
+                serde_json::to_value(&request.action).unwrap()
+            ));
+            BrowserActOutcome::control_required(tab_id)
+        }
+        async fn tab_op(
+            &self,
+            op: crate::acp::browser_tools::BrowserTabOp,
+        ) -> BrowserTabOutcome {
+            self.calls
+                .lock()
+                .await
+                .push(format!("tab_op {}", serde_json::to_value(&op).unwrap()));
+            match op.tab_id() {
+                Some(tab_id) => BrowserTabOutcome::control_required(tab_id),
+                None => BrowserTabOutcome::tab(
+                    crate::browser::agent::AgentTabSummary {
+                        tab_id: "t9".into(),
+                        origin: Some("http://localhost:3000".into()),
+                        level: crate::browser::agent::GrantLevel::Control,
+                        title: Some("dev".into()),
+                    },
+                    None,
+                ),
+            }
+        }
+    }
+
+    /// No-engine stub: every report is rejected, mirroring a process without a
+    /// running task engine.
+    struct StubTaskTools;
+    #[async_trait]
+    impl WorkTaskToolAccess for StubTaskTools {
+        async fn report_progress(&self, _parent: &str, _message: &str) -> TaskReportAck {
+            TaskReportAck::rejected("no task engine in this process")
+        }
+        async fn complete(
+            &self,
+            _parent: &str,
+            _verdict: &str,
+            _summary: Option<&str>,
+        ) -> TaskReportAck {
+            TaskReportAck::rejected("no task engine in this process")
+        }
+    }
+
+    use crate::acp::chat_authoring::{NewAutomationSpec, NewWorkTaskSpec};
+
+    /// Records what the listener handed down and returns a canned outcome, so
+    /// authoring tests can assert the token → context resolution without a DB.
+    #[derive(Default)]
+    struct StubAuthoring {
+        automations: tokio::sync::Mutex<Vec<(AuthoringContext, NewAutomationSpec)>>,
+        work_tasks: tokio::sync::Mutex<Vec<(AuthoringContext, NewWorkTaskSpec)>>,
+    }
+    #[async_trait]
+    impl ChatAuthoringAccess for StubAuthoring {
+        async fn create_automation(
+            &self,
+            ctx: AuthoringContext,
+            spec: NewAutomationSpec,
+        ) -> AuthoringOutcome {
+            self.automations.lock().await.push((ctx, spec));
+            AuthoringOutcome {
+                created: true,
+                kind: "automation".into(),
+                id: Some(7),
+                ..Default::default()
+            }
+        }
+        async fn create_work_task(
+            &self,
+            ctx: AuthoringContext,
+            spec: NewWorkTaskSpec,
+        ) -> AuthoringOutcome {
+            self.work_tasks.lock().await.push((ctx, spec));
+            AuthoringOutcome {
+                created: true,
+                kind: "work_task".into(),
+                id: Some(9),
+                ..Default::default()
+            }
+        }
+    }
 
     async fn make_broker(mock: Arc<MockSpawner>) -> Arc<DelegationBroker> {
         let broker = Arc::new(DelegationBroker::new(
@@ -5145,6 +5899,11 @@ mod tests {
             Arc::new(StubFeedback::default()),
             Arc::new(StubQuestion::default()),
             Arc::new(StubSessionInfo::default()),
+        
+            Arc::new(StubTaskTools),
+            Arc::new(StubAuthoring::default()),
+            Arc::new(NoBrowserTabs),
+            Arc::new(NoComputerDesktop),
         )
     }
 
@@ -5565,6 +6324,11 @@ mod tests {
             Arc::new(StubQuestion::default()),
             Arc::new(StubSessionInfo::default()),
             wait_cancel,
+        
+            Arc::new(StubTaskTools),
+            Arc::new(StubAuthoring::default()),
+            Arc::new(NoBrowserTabs),
+            Arc::new(NoComputerDesktop),
         )
     }
 
@@ -5583,6 +6347,10 @@ mod tests {
             Arc::new(StubQuestion::default()),
             Arc::new(StubSessionInfo::default()),
             wait_cancel,
+            Arc::new(StubTaskTools),
+            Arc::new(StubAuthoring::default()),
+            Arc::new(NoBrowserTabs),
+            Arc::new(NoComputerDesktop),
         )
     }
 
@@ -5604,6 +6372,10 @@ mod tests {
             feedback,
             Arc::new(StubQuestion::default()),
             Arc::new(StubSessionInfo::default()),
+            Arc::new(StubTaskTools),
+            Arc::new(StubAuthoring::default()),
+            Arc::new(NoBrowserTabs),
+            Arc::new(NoComputerDesktop),
         )
     }
 
@@ -5626,6 +6398,10 @@ mod tests {
             Arc::new(StubFeedback::default()),
             questions,
             Arc::new(StubSessionInfo::default()),
+            Arc::new(StubTaskTools),
+            Arc::new(StubAuthoring::default()),
+            Arc::new(NoBrowserTabs),
+            Arc::new(NoComputerDesktop),
         )
     }
 
@@ -5647,6 +6423,63 @@ mod tests {
             Arc::new(StubFeedback::default()),
             Arc::new(StubQuestion::default()),
             session_info,
+            Arc::new(StubTaskTools),
+            Arc::new(StubAuthoring::default()),
+            Arc::new(NoBrowserTabs),
+            Arc::new(NoComputerDesktop),
+        )
+    }
+
+    /// Build a listener whose authoring access is the given stub, so
+    /// `create_automation` / `create_work_task` tests can assert what the
+    /// listener resolved and passed down.
+    fn make_authoring_listener(
+        tokens: Arc<TokenRegistry>,
+        authoring: Arc<StubAuthoring>,
+        parent_conversation: Option<i32>,
+    ) -> Arc<DelegationListener> {
+        let broker = Arc::new(DelegationBroker::new(
+            Arc::new(MockSpawner::new()) as Arc<dyn ConnectionSpawner>,
+            Arc::new(AlwaysRootLookup) as Arc<dyn ConversationDepthLookup>,
+        ));
+        DelegationListener::new(
+            broker,
+            tokens,
+            Arc::new(CompanionLeaseRegistry::default()),
+            Arc::new(StaticParentLookup(parent_conversation)),
+            Arc::new(StubFeedback::default()),
+            Arc::new(StubQuestion::default()),
+            Arc::new(StubSessionInfo::default()),
+            Arc::new(StubTaskTools),
+            authoring,
+            Arc::new(NoBrowserTabs),
+            Arc::new(NoComputerDesktop),
+        )
+    }
+
+    /// Build a listener whose browser access is the given stub, so
+    /// `browser_list_tabs` / `browser_snapshot` tests can assert what the token
+    /// gate let through.
+    fn make_browser_listener(
+        tokens: Arc<TokenRegistry>,
+        browser: Arc<dyn BrowserToolAccess>,
+    ) -> Arc<DelegationListener> {
+        let broker = Arc::new(DelegationBroker::new(
+            Arc::new(MockSpawner::new()) as Arc<dyn ConnectionSpawner>,
+            Arc::new(AlwaysRootLookup) as Arc<dyn ConversationDepthLookup>,
+        ));
+        DelegationListener::new(
+            broker,
+            tokens,
+            Arc::new(CompanionLeaseRegistry::default()),
+            Arc::new(StaticParentLookup(Some(1))),
+            Arc::new(StubFeedback::default()),
+            Arc::new(StubQuestion::default()),
+            Arc::new(StubSessionInfo::default()),
+            Arc::new(StubTaskTools),
+            Arc::new(StubAuthoring::default()),
+            browser,
+            Arc::new(NoComputerDesktop),
         )
     }
 
@@ -9530,6 +10363,11 @@ mod tests {
             Arc::new(StubFeedback::default()),
             Arc::new(StubQuestion::default()),
             Arc::new(StubSessionInfo::default()),
+        
+            Arc::new(StubTaskTools),
+            Arc::new(StubAuthoring::default()),
+            Arc::new(NoBrowserTabs),
+            Arc::new(NoComputerDesktop),
         )
     }
 
@@ -10905,6 +11743,11 @@ mod tests {
             Arc::new(StubSessionInfo::default()),
             crate::acp::delegation::wait_cancel::WaitCancelRegistry::new_shared(),
             EventEmitter::test_web_only(broadcaster),
+        
+            Arc::new(StubTaskTools),
+            Arc::new(StubAuthoring::default()),
+            Arc::new(NoBrowserTabs),
+            Arc::new(NoComputerDesktop),
         );
 
         let created = listener
@@ -11079,6 +11922,11 @@ mod tests {
             Arc::new(StubSessionInfo::default()),
             crate::acp::delegation::wait_cancel::WaitCancelRegistry::new_shared(),
             EventEmitter::Noop,
+        
+            Arc::new(StubTaskTools),
+            Arc::new(StubAuthoring::default()),
+            Arc::new(NoBrowserTabs),
+            Arc::new(NoComputerDesktop),
         );
 
         let header_count = delegation_workflow::Entity::find()
@@ -11258,6 +12106,11 @@ mod tests {
             Arc::new(StubSessionInfo::default()),
             crate::acp::delegation::wait_cancel::WaitCancelRegistry::new_shared(),
             EventEmitter::Noop,
+        
+            Arc::new(StubTaskTools),
+            Arc::new(StubAuthoring::default()),
+            Arc::new(NoBrowserTabs),
+            Arc::new(NoComputerDesktop),
         );
 
         for token in ["stale-no-feature", "current-feature"] {
@@ -11786,6 +12639,11 @@ mod tests {
             Arc::new(StubFeedback::default()),
             Arc::new(StubQuestion::default()),
             Arc::new(StubSessionInfo::default()),
+        
+            Arc::new(StubTaskTools),
+            Arc::new(StubAuthoring::default()),
+            Arc::new(NoBrowserTabs),
+            Arc::new(NoComputerDesktop),
         );
         (listener, broker, attention, task_id)
     }
@@ -12224,6 +13082,11 @@ mod tests {
             Arc::new(StubFeedback::default()),
             Arc::new(StubQuestion::default()),
             Arc::new(StubSessionInfo::default()),
+        
+            Arc::new(StubTaskTools),
+            Arc::new(StubAuthoring::default()),
+            Arc::new(NoBrowserTabs),
+            Arc::new(NoComputerDesktop),
         );
 
         // Grandchild requests from middle child.
@@ -12441,7 +13304,12 @@ mod tests {
                 Arc::new(StubFeedback::default()),
                 Arc::clone(&questions) as Arc<dyn SessionQuestionAccess>,
                 Arc::new(StubSessionInfo::default()),
-            );
+            
+                Arc::new(StubTaskTools),
+                Arc::new(StubAuthoring::default()),
+                Arc::new(NoBrowserTabs),
+            Arc::new(NoComputerDesktop),
+        );
             RecoveryFixture {
                 db,
                 folder_id,
@@ -13389,5 +14257,649 @@ mod tests {
             path.as_os_str().len(),
             dialed.err()
         );
+    }
+
+    /// A valid token resolves the caller's conversation + working dir and hands
+    /// both down as the [`AuthoringContext`], so the impl can default the target
+    /// project to the project this chat is in.
+    #[tokio::test]
+    async fn create_automation_resolves_caller_context() {
+        let authoring = Arc::new(StubAuthoring::default());
+        let tokens = Arc::new(TokenRegistry::default());
+        tokens
+            .register(
+                "tok".into(),
+                TokenEntry::legacy("parent-conn", PathBuf::from("/repo/app")),
+            )
+            .await;
+        let listener = make_authoring_listener(tokens, authoring.clone(), Some(42));
+
+        let (mut client, mut server) = duplex(8 * 1024);
+        let server_task = tokio::spawn(async move {
+            listener.serve_one(&mut server).await.unwrap();
+        });
+        let msg = BrokerMessage::CreateAutomation(BrokerCreateAutomationRequest {
+            token: "tok".into(),
+            spec: NewAutomationSpec {
+                name: "Nightly audit".into(),
+                prompt: "audit deps".into(),
+                cron: Some("0 3 * * *".into()),
+                timezone: None,
+                action: Default::default(),
+                agent_type: None,
+                folder_path: None,
+                enabled: true,
+            },
+        });
+        write_frame(&mut client, &msg).await.unwrap();
+        let resp: BrokerResponse = read_frame(&mut client).await.unwrap();
+        server_task.await.unwrap();
+
+        assert_eq!(resp.outcome["created"], true);
+        assert_eq!(resp.outcome["id"], 7);
+        let calls = authoring.automations.lock().await;
+        let (ctx, spec) = calls.first().expect("impl was called");
+        assert_eq!(ctx.conversation_id, Some(42));
+        assert_eq!(ctx.working_dir, PathBuf::from("/repo/app"));
+        assert_eq!(spec.name, "Nightly audit");
+    }
+
+    /// A caller with no conversation yet still reaches the impl — the working
+    /// directory alone can resolve a project — so the arm must not gate on it.
+    #[tokio::test]
+    async fn create_work_task_passes_through_without_a_conversation() {
+        let authoring = Arc::new(StubAuthoring::default());
+        let tokens = Arc::new(TokenRegistry::default());
+        tokens
+            .register(
+                "tok".into(),
+                TokenEntry::legacy("parent-conn", PathBuf::from("/repo/app")),
+            )
+            .await;
+        let listener = make_authoring_listener(tokens, authoring.clone(), None);
+
+        let (mut client, mut server) = duplex(8 * 1024);
+        let server_task = tokio::spawn(async move {
+            listener.serve_one(&mut server).await.unwrap();
+        });
+        let msg = BrokerMessage::CreateWorkTask(BrokerCreateWorkTaskRequest {
+            token: "tok".into(),
+            spec: NewWorkTaskSpec {
+                title: "Fix the flake".into(),
+                prompt: "the retry test is flaky".into(),
+                agent_type: None,
+                folder_path: None,
+            },
+        });
+        write_frame(&mut client, &msg).await.unwrap();
+        let resp: BrokerResponse = read_frame(&mut client).await.unwrap();
+        server_task.await.unwrap();
+
+        assert_eq!(resp.outcome["created"], true);
+        assert_eq!(resp.outcome["id"], 9);
+        let calls = authoring.work_tasks.lock().await;
+        let (ctx, spec) = calls.first().expect("impl was called");
+        assert_eq!(ctx.conversation_id, None);
+        assert_eq!(spec.title, "Fix the flake");
+    }
+
+    /// An invalid token is a soft refusal that NEVER reaches the impl — nothing
+    /// gets written on behalf of an unauthenticated caller.
+    #[tokio::test]
+    async fn create_automation_invalid_token_never_reaches_impl() {
+        let authoring = Arc::new(StubAuthoring::default());
+        // No token registered.
+        let tokens = Arc::new(TokenRegistry::default());
+        let listener = make_authoring_listener(tokens, authoring.clone(), Some(1));
+
+        let (mut client, mut server) = duplex(8 * 1024);
+        let server_task = tokio::spawn(async move {
+            listener.serve_one(&mut server).await.unwrap();
+        });
+        let msg = BrokerMessage::CreateAutomation(BrokerCreateAutomationRequest {
+            token: "bogus".into(),
+            spec: NewAutomationSpec {
+                name: "n".into(),
+                prompt: "p".into(),
+                cron: None,
+                timezone: None,
+                action: Default::default(),
+                agent_type: None,
+                folder_path: None,
+                enabled: true,
+            },
+        });
+        write_frame(&mut client, &msg).await.unwrap();
+        let resp: BrokerResponse = read_frame(&mut client).await.unwrap();
+        server_task.await.unwrap();
+
+        assert_eq!(resp.outcome["created"], false);
+        assert_eq!(resp.outcome["kind"], "automation");
+        assert!(authoring.automations.lock().await.is_empty());
+    }
+
+    // -- browser tools ------------------------------------------------------
+
+    async fn browser_tokens() -> Arc<TokenRegistry> {
+        let tokens = Arc::new(TokenRegistry::default());
+        tokens
+            .register(
+                "tok".into(),
+                TokenEntry::legacy("conn-1", PathBuf::from("/tmp")),
+            )
+            .await;
+        tokens
+    }
+
+    async fn browser_round_trip(
+        listener: Arc<DelegationListener>,
+        msg: BrokerMessage,
+    ) -> BrokerResponse {
+        let (mut client, mut server) = duplex(64 * 1024);
+        let server_task = tokio::spawn(async move {
+            listener.serve_one(&mut server).await.unwrap();
+        });
+        write_frame(&mut client, &msg).await.unwrap();
+        let resp: BrokerResponse = read_frame(&mut client).await.unwrap();
+        server_task.await.unwrap();
+        resp
+    }
+
+    #[tokio::test]
+    async fn browser_tabs_and_snapshot_reach_the_browser_with_their_arguments() {
+        let browser = Arc::new(StubBrowser::default());
+        let listener = make_browser_listener(browser_tokens().await, browser.clone());
+
+        let listed = browser_round_trip(
+            listener.clone(),
+            BrokerMessage::BrowserTabs(BrokerBrowserTabsRequest { token: "tok".into() }),
+        )
+        .await;
+        assert_eq!(listed.outcome["tabs"][0]["tabId"], "t1");
+        assert_eq!(listed.outcome["tabs"][0]["level"], "read");
+
+        let read = browser_round_trip(
+            listener,
+            BrokerMessage::BrowserSnapshot(BrokerBrowserSnapshotRequest {
+                token: "tok".into(),
+                tab_id: "t9".into(),
+                max_chars: Some(1234),
+            }),
+        )
+        .await;
+        // A refusal travels as a value, not as a transport error: the agent
+        // has something to do about it.
+        assert_eq!(read.outcome["error"], ERROR_GRANT_REQUIRED);
+        assert_eq!(read.outcome["tabId"], "t9");
+        assert!(read.outcome["note"].as_str().unwrap().contains("t9"));
+
+        assert_eq!(
+            browser.calls.lock().await.as_slice(),
+            &["list".to_string(), "snapshot t9 Some(1234)".to_string()]
+        );
+    }
+
+    /// An action reaches the browser with the whole request — token checked,
+    /// nothing reinterpreted on the way — and its refusal comes back as a
+    /// value the companion can render.
+    #[tokio::test]
+    async fn an_action_reaches_the_browser_with_its_request() {
+        use crate::browser::agent::{ActionKind, ActionRequest};
+        let browser = Arc::new(StubBrowser::default());
+        let listener = make_browser_listener(browser_tokens().await, browser.clone());
+
+        let acted = browser_round_trip(
+            listener,
+            BrokerMessage::BrowserAct(BrokerBrowserActRequest {
+                token: "tok".into(),
+                tab_id: "t1".into(),
+                request: ActionRequest {
+                    generation: "g.4.2".into(),
+                    target: Some("e5".into()),
+                    action: ActionKind::Type {
+                        text: "Ada".into(),
+                        submit: true,
+                    },
+                },
+            }),
+        )
+        .await;
+        assert_eq!(
+            acted.outcome["error"],
+            crate::acp::browser_tools::ERROR_CONTROL_REQUIRED
+        );
+        assert_eq!(acted.outcome["tabId"], "t1");
+        assert_eq!(
+            browser.calls.lock().await.as_slice(),
+            &[r#"act t1 g.4.2 Object {"kind": String("type"), "text": String("Ada"), "submit": Bool(true)}"#
+                .to_string()]
+        );
+    }
+
+    /// The console and screenshot arms carry their whole request through and
+    /// bring a refusal back as a value; an invalid token is turned away before
+    /// the browser hears of it, like every other browser arm.
+    #[tokio::test]
+    async fn console_and_capture_reach_the_browser_and_refuse_a_bad_token() {
+        use crate::browser::capture::{CaptureFormat, CaptureRequest};
+        use crate::browser::console::{ConsoleLevel, ConsoleQuery};
+        let browser = Arc::new(StubBrowser::default());
+        let listener = make_browser_listener(browser_tokens().await, browser.clone());
+
+        let console = browser_round_trip(
+            listener.clone(),
+            BrokerMessage::BrowserConsole(BrokerBrowserConsoleRequest {
+                token: "tok".into(),
+                tab_id: "t2".into(),
+                query: ConsoleQuery {
+                    since: 7,
+                    min_level: Some(ConsoleLevel::Warn),
+                    limit: Some(20),
+                },
+            }),
+        )
+        .await;
+        assert_eq!(console.outcome["error"], ERROR_GRANT_REQUIRED);
+        assert_eq!(console.outcome["tabId"], "t2");
+
+        let capture = browser_round_trip(
+            listener.clone(),
+            BrokerMessage::BrowserCapture(BrokerBrowserCaptureRequest {
+                token: "tok".into(),
+                tab_id: "t2".into(),
+                request: CaptureRequest {
+                    generation: Some("g.1.1".into()),
+                    target: Some("e4".into()),
+                    max_width: Some(800),
+                    format: CaptureFormat::Jpeg,
+                },
+            }),
+        )
+        .await;
+        assert_eq!(capture.outcome["error"], ERROR_GRANT_REQUIRED);
+        assert_eq!(
+            browser.calls.lock().await.as_slice(),
+            &[
+                "console t2 since=7 min=Some(Warn) limit=Some(20)".to_string(),
+                "capture t2 Some((\"g.1.1\", \"e4\")) Some(800) Jpeg".to_string(),
+            ]
+        );
+
+        browser.calls.lock().await.clear();
+        for message in [
+            BrokerMessage::BrowserConsole(BrokerBrowserConsoleRequest {
+                token: "not-a-token".into(),
+                tab_id: "t1".into(),
+                query: ConsoleQuery::default(),
+            }),
+            BrokerMessage::BrowserCapture(BrokerBrowserCaptureRequest {
+                token: "not-a-token".into(),
+                tab_id: "t1".into(),
+                request: CaptureRequest::default(),
+            }),
+        ] {
+            let out = browser_round_trip(listener.clone(), message).await;
+            assert_eq!(out.outcome["error"], ERROR_NO_SUCH_TAB);
+        }
+        assert!(browser.calls.lock().await.is_empty());
+    }
+
+    /// A capture the companion could not read back — over the frame cap —
+    /// is turned into a refusal it can, at the last step before the frame.
+    #[test]
+    fn a_capture_over_the_frame_cap_becomes_a_refusal() {
+        use crate::browser::capture::{CaptureOutcome, CaptureRegion};
+        let huge = BrowserCaptureOutcome::image(
+            "t1",
+            CaptureOutcome {
+                mime: "image/png".into(),
+                data: "A".repeat(CAPTURE_RESPONSE_MAX_BYTES + 1),
+                width: 1,
+                height: 1,
+                url: "http://x/".into(),
+                region: CaptureRegion {
+                    x: 0.0,
+                    y: 0.0,
+                    width: 1.0,
+                    height: 1.0,
+                },
+                clipped: false,
+            },
+        );
+        let response = browser_capture_response(huge).unwrap();
+        assert_eq!(response.outcome["error"], crate::acp::browser_tools::ERROR_READ_FAILED);
+        assert_eq!(response.outcome["tabId"], "t1");
+        assert!(response.outcome.get("capture").is_none());
+        assert!(serde_json::to_vec(&response.outcome).unwrap().len() < 4096);
+
+        let small = BrowserCaptureOutcome::image(
+            "t1",
+            CaptureOutcome {
+                mime: "image/png".into(),
+                data: "AAAA".into(),
+                width: 1,
+                height: 1,
+                url: "http://x/".into(),
+                region: CaptureRegion {
+                    x: 0.0,
+                    y: 0.0,
+                    width: 1.0,
+                    height: 1.0,
+                },
+                clipped: false,
+            },
+        );
+        assert_eq!(browser_capture_response(small).unwrap().outcome["capture"]["data"], "AAAA");
+    }
+
+    /// A caller who cannot prove it is a companion is told the same thing a
+    /// user with no tabs open would be told, and the browser is never asked.
+    /// Anything else would make the refusal codes a way to enumerate someone's
+    /// open pages from outside the process.
+    #[tokio::test]
+    async fn an_invalid_token_learns_nothing_about_the_tabs() {
+        let browser = Arc::new(StubBrowser::default());
+        let listener = make_browser_listener(browser_tokens().await, browser.clone());
+
+        let listed = browser_round_trip(
+            listener.clone(),
+            BrokerMessage::BrowserTabs(BrokerBrowserTabsRequest {
+                token: "not-a-token".into(),
+            }),
+        )
+        .await;
+        assert_eq!(listed.outcome["tabs"].as_array().unwrap().len(), 0);
+        assert!(listed.outcome.get("note").is_none());
+
+        let read = browser_round_trip(
+            listener,
+            BrokerMessage::BrowserSnapshot(BrokerBrowserSnapshotRequest {
+                token: "not-a-token".into(),
+                tab_id: "t1".into(),
+                max_chars: None,
+            }),
+        )
+        .await;
+        // `t1` really is open and really is shared — and the answer is the one
+        // a nonexistent tab gets.
+        assert_eq!(read.outcome["error"], ERROR_NO_SUCH_TAB);
+        assert!(browser.calls.lock().await.is_empty());
+
+        let acted = browser_round_trip(
+            make_browser_listener(browser_tokens().await, browser.clone()),
+            BrokerMessage::BrowserAct(BrokerBrowserActRequest {
+                token: "not-a-token".into(),
+                tab_id: "t1".into(),
+                request: crate::browser::agent::ActionRequest {
+                    generation: "g".into(),
+                    target: Some("e1".into()),
+                    action: crate::browser::agent::ActionKind::Hover,
+                },
+            }),
+        )
+        .await;
+        assert_eq!(acted.outcome["error"], ERROR_NO_SUCH_TAB);
+        assert!(browser.calls.lock().await.is_empty());
+    }
+
+    // ── computer use ───────────────────────────────────────────────────────
+
+    #[derive(Default)]
+    struct StubComputer {
+        calls: tokio::sync::Mutex<Vec<String>>,
+    }
+
+    #[async_trait]
+    impl ComputerToolAccess for StubComputer {
+        async fn list_apps(&self) -> ComputerAppsOutcome {
+            self.calls.lock().await.push("apps".into());
+            ComputerAppsOutcome::default()
+        }
+        async fn list_windows(&self, pid: Option<u32>) -> ComputerWindowsOutcome {
+            self.calls.lock().await.push(format!("windows {pid:?}"));
+            ComputerWindowsOutcome::default()
+        }
+        async fn capture(&self, target_id: &str, max: Option<u32>) -> ComputerCaptureOutcome {
+            self.calls
+                .lock()
+                .await
+                .push(format!("capture {target_id} {max:?}"));
+            ComputerCaptureOutcome::refused(
+                target_id,
+                crate::acp::computer_tools::ERROR_GRANT_REQUIRED,
+                crate::acp::computer_tools::grant_required_note(target_id),
+            )
+        }
+        async fn snapshot(
+            &self,
+            target_id: &str,
+            request: crate::acp::computer_tools::SnapshotRequest,
+        ) -> ComputerSnapshotOutcome {
+            self.calls
+                .lock()
+                .await
+                .push(format!("snapshot {target_id} {:?}", request.max_chars));
+            ComputerSnapshotOutcome::refused(
+                target_id,
+                crate::acp::computer_tools::ERROR_GRANT_REQUIRED,
+                "stub",
+            )
+        }
+        async fn verify(
+            &self,
+            target_id: &str,
+            request: crate::computer::types::VerifyRequest,
+        ) -> ComputerVerifyOutcome {
+            self.calls
+                .lock()
+                .await
+                .push(format!("verify {target_id} {}", request.expect.len()));
+            ComputerVerifyOutcome::refused(
+                target_id,
+                crate::acp::computer_tools::ERROR_GRANT_REQUIRED,
+                "stub",
+            )
+        }
+        async fn act(
+            &self,
+            target_id: &str,
+            request: crate::computer::types::ComputerActRequest,
+            delivery: Option<crate::computer::types::ActDelivery>,
+        ) -> ComputerActOutcome {
+            let kind = serde_json::to_value(&request).unwrap()["kind"].clone();
+            self.calls.lock().await.push(format!(
+                "act {target_id} {} {delivery:?}",
+                kind.as_str().unwrap_or("?")
+            ));
+            ComputerActOutcome::refused(
+                target_id,
+                crate::acp::computer_tools::ERROR_CONTROL_REQUIRED,
+                "stub",
+            )
+        }
+
+        async fn launch_app(
+            &self,
+            name: Option<String>,
+            key: Option<String>,
+        ) -> crate::acp::computer_tools::ComputerLaunchOutcome {
+            self.calls
+                .lock()
+                .await
+                .push(format!("launch {name:?} {key:?}"));
+            crate::acp::computer_tools::ComputerLaunchOutcome::refused(
+                crate::acp::computer_tools::ERROR_UNAVAILABLE,
+                "stub",
+            )
+        }
+
+        async fn clipboard(
+            &self,
+            op: crate::acp::computer_tools::ClipboardOp,
+        ) -> crate::acp::computer_tools::ComputerClipboardOutcome {
+            self.calls.lock().await.push(format!("clipboard {op:?}"));
+            crate::acp::computer_tools::ComputerClipboardOutcome::refused(
+                crate::acp::computer_tools::ERROR_UNAVAILABLE,
+                "stub",
+            )
+        }
+    }
+
+    fn make_computer_listener(
+        tokens: Arc<TokenRegistry>,
+        computer: Arc<dyn ComputerToolAccess>,
+    ) -> Arc<DelegationListener> {
+        let broker = Arc::new(DelegationBroker::new(
+            Arc::new(MockSpawner::new()) as Arc<dyn ConnectionSpawner>,
+            Arc::new(AlwaysRootLookup) as Arc<dyn ConversationDepthLookup>,
+        ));
+        DelegationListener::new(
+            broker,
+            tokens,
+            Arc::new(CompanionLeaseRegistry::default()),
+            Arc::new(StaticParentLookup(Some(1))),
+            Arc::new(StubFeedback::default()),
+            Arc::new(StubQuestion::default()),
+            Arc::new(StubSessionInfo::default()),
+            Arc::new(StubTaskTools),
+            Arc::new(StubAuthoring::default()),
+            Arc::new(NoBrowserTabs),
+            computer,
+        )
+    }
+
+    /// With a valid token every computer message reaches the access impl with
+    /// its arguments intact, and a refusal comes back as a value.
+    #[tokio::test]
+    async fn computer_messages_reach_the_desktop_with_their_arguments() {
+        let computer = Arc::new(StubComputer::default());
+        let listener = make_computer_listener(browser_tokens().await, computer.clone());
+        let token = || "tok".to_string();
+
+        browser_round_trip(
+            listener.clone(),
+            BrokerMessage::ComputerApps(BrokerComputerAppsRequest { token: token() }),
+        )
+        .await;
+        browser_round_trip(
+            listener.clone(),
+            BrokerMessage::ComputerWindows(BrokerComputerWindowsRequest {
+                token: token(),
+                pid: Some(42),
+            }),
+        )
+        .await;
+        let captured = browser_round_trip(
+            listener.clone(),
+            BrokerMessage::ComputerCapture(BrokerComputerCaptureRequest {
+                token: token(),
+                target_id: "w7".into(),
+                max_dimension: Some(800),
+            }),
+        )
+        .await;
+        assert_eq!(captured.outcome["error"], "computer_grant_required");
+        assert_eq!(captured.outcome["targetId"], "w7");
+        browser_round_trip(
+            listener.clone(),
+            BrokerMessage::ComputerSnapshot(BrokerComputerSnapshotRequest {
+                token: token(),
+                target_id: "w7".into(),
+                request: crate::acp::computer_tools::SnapshotRequest {
+                    max_chars: Some(0),
+                    ..Default::default()
+                },
+            }),
+        )
+        .await;
+        browser_round_trip(
+            listener.clone(),
+            BrokerMessage::ComputerVerify(BrokerComputerVerifyRequest {
+                token: token(),
+                target_id: "w7".into(),
+                request: crate::computer::types::VerifyRequest {
+                    expect: vec![Default::default()],
+                    ..Default::default()
+                },
+            }),
+        )
+        .await;
+        let acted = browser_round_trip(
+            listener,
+            BrokerMessage::ComputerAct(BrokerComputerActRequest {
+                token: token(),
+                target_id: "w7".into(),
+                request: crate::computer::types::ComputerActRequest::SetValue {
+                    target: crate::computer::types::ElementTarget {
+                        generation: "1.2".into(),
+                        index: 4,
+                    },
+                    value: "x".into(),
+                },
+                // Passed on as asked; whether it may be is the service's call.
+                delivery: Some(crate::computer::types::ActDelivery::Foreground),
+            }),
+        )
+        .await;
+        assert_eq!(acted.outcome["error"], "computer_control_required");
+        assert_eq!(
+            computer.calls.lock().await.as_slice(),
+            &[
+                "apps".to_string(),
+                "windows Some(42)".to_string(),
+                "capture w7 Some(800)".to_string(),
+                "snapshot w7 Some(0)".to_string(),
+                "verify w7 1".to_string(),
+                "act w7 setValue Some(Foreground)".to_string(),
+            ]
+        );
+    }
+
+    /// A caller without a valid token learns nothing: the listings are empty,
+    /// every window is "no such window", and the desktop is never asked.
+    #[tokio::test]
+    async fn an_invalid_token_learns_nothing_about_the_desktop() {
+        let computer = Arc::new(StubComputer::default());
+        let listener = make_computer_listener(browser_tokens().await, computer.clone());
+
+        let apps = browser_round_trip(
+            listener.clone(),
+            BrokerMessage::ComputerApps(BrokerComputerAppsRequest {
+                token: "forged".into(),
+            }),
+        )
+        .await;
+        assert_eq!(apps.outcome["apps"], serde_json::json!([]));
+        assert!(apps.outcome.get("error").is_none());
+
+        let read = browser_round_trip(
+            listener.clone(),
+            BrokerMessage::ComputerCapture(BrokerComputerCaptureRequest {
+                token: "forged".into(),
+                target_id: "w1".into(),
+                max_dimension: None,
+            }),
+        )
+        .await;
+        assert_eq!(read.outcome["error"], "computer_no_such_target");
+        let act = browser_round_trip(
+            listener,
+            BrokerMessage::ComputerAct(BrokerComputerActRequest {
+                token: "forged".into(),
+                target_id: "w1".into(),
+                request: crate::computer::types::ComputerActRequest::Key {
+                    target: None,
+                    chord: crate::computer::keys::Chord {
+                        key: crate::computer::keys::Key::Return,
+                        modifiers: Default::default(),
+                    },
+                    repeat: 1,
+                },
+                delivery: None,
+            }),
+        )
+        .await;
+        assert_eq!(act.outcome["error"], "computer_no_such_target");
+        assert!(computer.calls.lock().await.is_empty());
     }
 }

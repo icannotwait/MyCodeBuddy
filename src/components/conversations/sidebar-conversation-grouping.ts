@@ -7,6 +7,7 @@ import type {
 import {
   DEFAULT_SECTION_ORDER,
   normalizeSectionOrder,
+  type SidebarRecentFilter,
   type SidebarSectionKey,
   type SidebarSectionOrder,
   type SidebarSortMode,
@@ -330,6 +331,8 @@ export function selectChatConversationsWithReuse(
  *   by `kind` instead.
  * - Sorted by `sortMode` (not always `updated_at`) so the row order agrees with
  *   the timestamp each card actually shows.
+ * - `filter` optionally narrows the mix to chats only or folder sessions only;
+ *   the default (`"all"`) is the section's whole point.
  *
  * `prev` is the array returned last call (threaded via a ref by the caller).
  */
@@ -338,13 +341,19 @@ export function selectRecentConversationsWithReuse(
   showCompleted: boolean,
   sortMode: SidebarSortMode,
   openFolderIds: ReadonlySet<number>,
-  prev: DbConversationSummary[]
+  prev: DbConversationSummary[],
+  filter: SidebarRecentFilter = "all"
 ): DbConversationSummary[] {
   const next: DbConversationSummary[] = []
   for (const conv of conversations) {
     if (conv.pinned_at != null) continue
     if (!showCompleted && conv.status === "completed") continue
-    if (conv.kind !== "chat" && !openFolderIds.has(conv.folder_id)) continue
+    const isChat = conv.kind === "chat"
+    if (!isChat && !openFolderIds.has(conv.folder_id)) continue
+    // The user's "just chats" / "just folder sessions" narrowing. Same split
+    // the Chat and Folders sections use, so the two views always agree.
+    if (filter === "chats" && !isChat) continue
+    if (filter === "folders" && isChat) continue
     next.push(conv)
   }
   next.sort(
@@ -988,9 +997,12 @@ export interface FoldersEmptyRow {
 
 /**
  * The single empty-state hint shown under an expanded but empty "Recent"
- * section ("No recent conversations"). Folderless like {@link ChatsEmptyRow},
- * and reached only in a workspace with literally nothing in it — Recent spans
- * every section, so any conversation at all fills it.
+ * section ("No recent conversations"). Folderless like {@link ChatsEmptyRow}.
+ * Under the default "all" filter it is reached only when nothing passes
+ * Recent's own gates (see {@link selectRecentConversationsWithReuse}) — Recent
+ * spans every section, so any other conversation fills it. A "chats" /
+ * "folders" filter can also narrow the section to nothing, and the renderer
+ * names that filter in the hint.
  */
 export interface RecentEmptyRow {
   kind: "recent-empty"
@@ -1295,8 +1307,9 @@ export function buildRows(args: {
   chatConversations: readonly DbConversationSummary[]
   chatsExpanded: boolean
   /** The flat "Recent" bucket — every reachable conversation, folder-bound and
-   *  chat alike, newest first (see {@link selectRecentConversationsWithReuse}).
-   *  Only read when `showRecent`. Optional — defaults to empty. */
+   *  chat alike (or just one kind, under the user's filter), newest first (see
+   *  {@link selectRecentConversationsWithReuse}). Only read when `showRecent`.
+   *  Optional — defaults to empty. */
   recentConversations?: readonly DbConversationSummary[]
   /** Whether the Recent section's rows are shown (its own collapse toggle).
    *  Optional — defaults to expanded. */
