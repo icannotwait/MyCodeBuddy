@@ -15,8 +15,10 @@ mod registry;
 mod relay;
 mod request_accounting;
 mod runtime;
+mod objects;
 mod sandbox;
 mod schema;
+mod snapshot;
 mod store;
 mod tool_core;
 
@@ -57,6 +59,17 @@ pub use registry::{
 pub use schema::{
     apply_roundtable_schema, drop_roundtable_schema, roundtable_table_names, DurabilityProfile,
     LOGICAL_MODEL, RECORDED_DURABILITY,
+};
+pub use objects::{
+    ObjectFault, ObjectRef, ObjectStore, ReservationLedger, StorageLease,
+};
+pub use snapshot::{
+    build_delivery, canonical_path_bytes, capture_snapshot, commit_captured_manifest,
+    confirmation_echo, ensure_within_root, freeze_phase, freeze_preflight, fresh_binding_context,
+    lexical_within, line_start_offsets, offer_text_tool, path_within_root, validate_relative_path,
+    ConfirmationEcho, PhaseInput, PreflightLog, ResolvedRecipients, RoomDraft, SelectedFile,
+    SnapshotEncoding, SnapshotLimits, SourceClass, SourceEntryV1, SourceManifestV1,
+    SourceSelection, FRESH_CONTEXT_STATE, MAX_SNAPSHOT_READS,
 };
 pub use store::{
     durability_from_report, migrate_roundtable, open_roundtable_store, promises_power_loss,
