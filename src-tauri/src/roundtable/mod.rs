@@ -9,6 +9,7 @@ mod gateway;
 mod qualification;
 mod relay;
 mod request_accounting;
+mod runtime;
 mod sandbox;
 
 pub use feature_gate::{
@@ -27,6 +28,12 @@ pub use relay::{
 };
 pub use request_accounting::{
     AccountingSnapshot, EncodedModelRequest, RequestAccounting, RequestPermit,
+};
+pub use runtime::{
+    prepare_roundtable_connection, try_enqueue, AdmittedPrompt, ConnectionOwner,
+    InteractivePermission, PreparedPrompt, PreparedRoundtableConnection, PrivateRuntimeSink,
+    QueueReject, RoundtableLaunch, RoundtableLaunchPolicy, TurnGeneration,
+    ROUNDTABLE_SERVICE_LABEL,
 };
 pub use sandbox::{
     attempt_live_escapes, build_sandbox_plan, DbIdentity, EscapeReport, IsolationProvider,

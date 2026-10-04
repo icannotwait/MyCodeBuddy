@@ -3,3 +3,6 @@ mod sandbox;
 
 #[path = "roundtable_cases/gateway.rs"]
 mod gateway;
+
+#[path = "roundtable_cases/runtime_admission.rs"]
+mod runtime_admission;

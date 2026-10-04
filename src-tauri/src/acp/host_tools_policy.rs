@@ -110,6 +110,38 @@ impl HostToolsPolicy {
     }
 }
 
+/// Whether an ACP session may ask the user to approve a tool call.
+/// Roundtable members are not interactive, so the only value this task
+/// admits for them is [`InteractivePermission::Deny`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InteractivePermission {
+    Ask,
+    Deny,
+}
+
+/// Roundtable does not host `fs/*`, whatever `CODEG_ACP_HOST_TOOLS` says.
+/// Ordinary agents still go through [`HostToolsPolicy::hosts_channels`].
+pub fn roundtable_hosts_fs() -> bool {
+    false
+}
+
+/// Roundtable does not host `terminal/*`. Withholding fs without withholding
+/// the shell would not be a boundary, so both stay closed together.
+pub fn roundtable_hosts_terminal() -> bool {
+    false
+}
+
+/// Roundtable turns cannot prompt the user.
+pub fn roundtable_interactive_permission() -> InteractivePermission {
+    InteractivePermission::Deny
+}
+
+/// The only companion group a roundtable member may see. Delegation and the
+/// ordinary host tools are not in this list.
+pub fn roundtable_companion_groups() -> &'static [&'static str] {
+    &["roundtable"]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

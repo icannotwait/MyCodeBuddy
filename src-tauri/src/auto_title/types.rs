@@ -145,6 +145,10 @@ pub enum FailureTransition {
 }
 
 /// Why a connection was launched. Title capture bypasses internal purposes.
+///
+/// `Roundtable` is service-owned and is not hidden generation. Hidden
+/// generation also strips companion tools and multi-turn behavior the room
+/// still needs; roundtable admission uses its own deny-by-default policy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConnectionPurpose {
     User,
@@ -153,6 +157,8 @@ pub enum ConnectionPurpose {
     InternalTitle,
     /// Hidden document-translation run (reserved cwd, no UI / MCP injection).
     InternalTranslate,
+    /// A roundtable member owned by the service, not by an observer window.
+    Roundtable,
 }
 
 impl ConnectionPurpose {
@@ -160,6 +166,9 @@ impl ConnectionPurpose {
     /// injection, no title capture, suppressed terminal prefix / bg watch,
     /// auto-decline permissions). Probe is **not** hidden generation — it
     /// keeps probe-only admission paths.
+    ///
+    /// `Roundtable` is excluded on purpose. It must not capture an ordinary
+    /// conversation, but it is not a hidden-generation session.
     pub fn is_hidden_generation(self) -> bool {
         matches!(self, Self::InternalTitle | Self::InternalTranslate)
     }

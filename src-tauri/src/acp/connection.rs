@@ -1367,9 +1367,67 @@ impl<T> Drop for LaneSender<T> {
     }
 }
 
+/// A reserved command slot that owns a [`LaneSender`] until the command is
+/// sent or the reservation is dropped.
+///
+/// Tokio's [`mpsc::OwnedPermit`] keeps an `mpsc::Sender` alive, but that
+/// sender is not a [`LaneSender`]. Parking an owned permit after every
+/// `LaneSender` was dropped would publish the lane closed while a send was
+/// still possible, and the connection task would exit before `permit.send`.
+/// `permit` is declared first, so it drops before `sender`: sender liveness
+/// stays above zero for the whole reservation.
+pub struct LaneOwnedPermit<T> {
+    permit: mpsc::OwnedPermit<T>,
+    sender: LaneSender<T>,
+}
+
+impl<T> LaneOwnedPermit<T> {
+    /// Send without awaiting. The slot was reserved earlier, so a full queue
+    /// cannot fail this call. A disconnected receiver discards the value.
+    pub fn send(self, value: T) {
+        let LaneOwnedPermit { permit, sender } = self;
+        drop(permit.send(value));
+        drop(sender);
+    }
+}
+
 impl<T> LaneSender<T> {
     pub async fn send(&self, value: T) -> Result<(), mpsc::error::SendError<T>> {
         self.tx.send(value).await
+    }
+
+    /// Reserve one slot and keep this lane alive until the permit is used.
+    ///
+    /// The [`LaneSender`] clone is taken before the channel reserve. A failed
+    /// reserve drops that clone, so a rejected reservation does not leak
+    /// liveness or capacity.
+    pub async fn reserve_owned(&self) -> Result<LaneOwnedPermit<T>, mpsc::error::SendError<()>> {
+        let sender = self.clone();
+        match sender.tx.clone().reserve_owned().await {
+            Ok(permit) => Ok(LaneOwnedPermit { permit, sender }),
+            Err(error) => {
+                drop(sender);
+                Err(error)
+            }
+        }
+    }
+
+    /// Non-blocking form of [`Self::reserve_owned`].
+    ///
+    /// Tokio returns the `mpsc::Sender` inside the error so the caller can
+    /// tell a full queue from a closed one. The [`LaneSender`] clone is still
+    /// dropped here; that returned sender is not a lane owner.
+    pub fn try_reserve_owned(
+        &self,
+    ) -> Result<LaneOwnedPermit<T>, mpsc::error::TrySendError<mpsc::Sender<T>>> {
+        let sender = self.clone();
+        match sender.tx.clone().try_reserve_owned() {
+            Ok(permit) => Ok(LaneOwnedPermit { permit, sender }),
+            Err(error) => {
+                drop(sender);
+                Err(error)
+            }
+        }
     }
 
     pub fn try_send(&self, value: T) -> Result<(), mpsc::error::TrySendError<T>> {
@@ -1399,6 +1457,15 @@ pub(crate) fn connection_channel<T>(
         closed_tx,
     });
     (LaneSender { tx, liveness }, rx, closed_rx)
+}
+
+/// Test-only view of [`connection_channel`]. Production admission uses the
+/// `pub(crate)` constructor directly.
+#[cfg(any(test, feature = "test-utils"))]
+pub fn connection_channel_for_test<T>(
+    capacity: usize,
+) -> (LaneSender<T>, mpsc::Receiver<T>, watch::Receiver<bool>) {
+    connection_channel(capacity)
 }
 
 fn both_connection_lanes_closed(
