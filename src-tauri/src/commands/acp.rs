@@ -6143,10 +6143,12 @@ pub(crate) fn pi_project_trust_launch_block(
     runtime_env: &BTreeMap<String, String>,
 ) -> Option<String> {
     let trust_file = pi_agent_dir_in_workspace(runtime_env, cwd).join("trust.json");
-    let state = pi_project_trust_state_at(&trust_file, &pi_trust_ack_path(), cwd);
-    if state.resources.is_empty() || state.decision != Some(true) || state.acknowledged {
+    if pi_project_trust_resources(cwd).is_empty() {
         return None;
     }
+    // Validate the store before consulting a grant or acknowledgement. The UI
+    // projection treats unreadable/malformed files as no decision, which must
+    // not let a launch bypass this fail-closed check.
     let trust_map = match fs::read_to_string(&trust_file) {
         Ok(text) => match serde_json::from_str::<serde_json::Value>(&text) {
             Ok(serde_json::Value::Object(map)) => map,
@@ -14743,8 +14745,10 @@ mod tests {
         let cases = [
             ("read-only", "on-request", Some("read-only")),
             ("workspace-write", "never", Some("agent")),
+            ("workspace-write", "on-request", Some("workspace-write")),
             ("danger-full-access", "never", Some("agent-full-access")),
-            ("danger-full-access", "on-request", Some("agent")),
+            // codex-acp 2.0 keeps this narrower sandbox user-reviewed.
+            ("danger-full-access", "on-request", Some("workspace-write")),
         ];
         for (sandbox, approval, expected) in cases {
             let settings = parse_codex_sandbox_settings(&format!(
@@ -14761,7 +14765,10 @@ mod tests {
 
         let missing_approval =
             parse_codex_sandbox_settings("sandbox_mode = \"danger-full-access\"\n");
-        assert_eq!(codex_initial_agent_mode(&missing_approval), Some("agent"));
+        assert_eq!(
+            codex_initial_agent_mode(&missing_approval),
+            Some("workspace-write")
+        );
     }
 
     #[test]
@@ -15996,7 +16003,42 @@ base_url = \"https://example.test/v1\"
         let tmp = tempfile::tempdir().expect("tempdir");
         let agent_dir = tmp.path().join("agent");
         fs::create_dir_all(&agent_dir).unwrap();
-        fs::write(agent_dir.join("trust.json"), "not json").unwrap();
+        let workspace = tmp.path().join("repo");
+        fs::create_dir_all(workspace.join(".pi/extensions")).unwrap();
+        let codeg_home = tmp.path().join("codeg-home");
+
+        for acknowledged in [false, true] {
+            pi_set_trust_acknowledged_at(
+                &codeg_home.join("pi-project-trust-ack.json"),
+                &workspace,
+                acknowledged,
+            )
+            .unwrap();
+            for contents in ["not json", "[]", "null", "true", "42", r#""trusted""#] {
+                fs::write(agent_dir.join("trust.json"), contents).unwrap();
+                let blocked = temp_env::with_var(
+                    "CODEG_HOME",
+                    Some(codeg_home.to_string_lossy().to_string()),
+                    || pi_project_trust_launch_block(&workspace, &pi_env_for(&agent_dir)),
+                );
+                assert!(
+                    blocked
+                        .as_deref()
+                        .is_some_and(|message| message.contains("cannot verify")),
+                    "malformed trust must block executable project resources: \
+                     {contents:?}, acknowledged={acknowledged}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn pi_project_trust_launch_fails_closed_for_an_unreadable_store() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let agent_dir = tmp.path().join("agent");
+        // A directory is unreadable as JSON on every platform, even when the
+        // tests run as a user that can bypass file permissions.
+        fs::create_dir_all(agent_dir.join("trust.json")).unwrap();
         let workspace = tmp.path().join("repo");
         fs::create_dir_all(workspace.join(".pi/extensions")).unwrap();
 
@@ -16008,8 +16050,51 @@ base_url = \"https://example.test/v1\"
         assert!(
             blocked
                 .as_deref()
-                .is_some_and(|message| message.contains("cannot verify")),
-            "malformed trust must block executable project resources"
+                .is_some_and(|message| message.contains("cannot be read")),
+            "an unreadable trust store must block executable project resources"
+        );
+    }
+
+    #[test]
+    fn pi_project_trust_launch_allows_missing_and_non_granting_stores() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let agent_dir = tmp.path().join("agent");
+        fs::create_dir_all(&agent_dir).unwrap();
+        let workspace = tmp.path().join("repo");
+        fs::create_dir_all(workspace.join(".pi/extensions")).unwrap();
+
+        temp_env::with_var(
+            "CODEG_HOME",
+            Some(tmp.path().join("codeg-home").to_string_lossy().to_string()),
+            || {
+                let env = pi_env_for(&agent_dir);
+                assert_eq!(pi_project_trust_launch_block(&workspace, &env), None);
+                for trust_map in [
+                    serde_json::Map::new(),
+                    serde_json::Map::from_iter([
+                        (canonical_key(tmp.path()), serde_json::Value::Bool(true)),
+                        (canonical_key(&workspace), serde_json::Value::Bool(false)),
+                    ]),
+                ] {
+                    write_json_object_pretty(&agent_dir.join("trust.json"), &trust_map).unwrap();
+                    assert_eq!(pi_project_trust_launch_block(&workspace, &env), None);
+                }
+            },
+        );
+    }
+
+    #[test]
+    fn pi_project_trust_launch_allows_empty_workspaces_with_a_malformed_store() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let agent_dir = tmp.path().join("agent");
+        fs::create_dir_all(&agent_dir).unwrap();
+        fs::write(agent_dir.join("trust.json"), "not json").unwrap();
+        let workspace = tmp.path().join("repo");
+        fs::create_dir_all(&workspace).unwrap();
+
+        assert_eq!(
+            pi_project_trust_launch_block(&workspace, &pi_env_for(&agent_dir)),
+            None,
         );
     }
 

@@ -15703,6 +15703,15 @@ async fn run_conversation_loop(
                                 stderr_tail,
                             )
                             .await?;
+                            // A finished turn removes its question card. Recent
+                            // Claude versions can background the blocked MCP
+                            // call, so peer-close alone no longer reclaims it.
+                            // A delegation suspension is NOT a turn ending.
+                            if !outcome.status_restored_by_suspension {
+                                if let Some(injection) = delegation_injection {
+                                    injection.questions.cancel_questions_by_parent(conn_id).await;
+                                }
+                            }
                             status_restored_by_suspension =
                                 outcome.status_restored_by_suspension;
                             disconnect_requested = outcome.disconnect_requested;
@@ -16081,6 +16090,13 @@ async fn run_conversation_loop(
                                             }
                                         }
                                         Err(ConnectionCommand::Steer { blocks, reply }) => {
+                                            // Redirecting a turn declines its
+                                            // parked question before the steer
+                                            // can move that MCP call into the
+                                            // background and strand its slot.
+                                            if let Some(injection) = delegation_injection {
+                                                injection.questions.cancel_questions_by_parent(conn_id).await;
+                                            }
                                             let outcome =
                                                 send_steer_request(&cx, &sid, &blocks).await;
                                             if matches!(outcome, Ok(SteerOutcome::Injected)) {
@@ -16376,6 +16392,12 @@ async fn run_conversation_loop(
                                             empty_report.as_ref(),
                                         )
                                         .await;
+                                        // This extension finalized a real
+                                        // turn; suspension-owned terminals
+                                        // were handled as diagnostics above.
+                                        if let Some(injection) = delegation_injection {
+                                            injection.questions.cancel_questions_by_parent(conn_id).await;
+                                        }
                                         tracing::info!(
                                             connection_id = %conn_id,
                                             session_id = %sid.0,
@@ -16703,7 +16725,7 @@ async fn run_conversation_loop(
                 // now, like the mid-turn Cancel does — without waiting on the
                 // agent's own `turn_completed`, which the closed turn then
                 // ignores. That is the one idle turn with a `TurnComplete`.
-                let closed_agent_turn = close_grok_agent_turn(
+                close_grok_agent_turn(
                     state,
                     emitter,
                     perms,
@@ -16746,9 +16768,6 @@ async fn run_conversation_loop(
                     inj.plan_approvals
                         .cancel_plan_approvals_by_parent(conn_id)
                         .await;
-                }
-                if closed_agent_turn {
-                    cancel_grok_agent_turn_asks(delegation_injection, conn_id).await;
                 }
             }
             ConversationInput::Command(ConnectionCommand::Fork { fork_point, reply }) => {
@@ -24834,12 +24853,10 @@ mod tests {
 
     #[tokio::test]
     async fn regression_answered_ordinary_permission_gets_no_plan_review_terminal_update() {
-        let events = run_answered_permission_then_terminal_drain(
-            AgentType::Codex,
-            permission_request_with_meta(None),
-            None,
-        )
-        .await;
+        let mut request = permission_request_with_meta(None);
+        request.tool_call.tool_call_id = "ordinary-tool".into();
+        let events =
+            run_answered_permission_then_terminal_drain(AgentType::Codex, request, None).await;
 
         assert!(events.iter().all(|event| !matches!(
             &event.payload,
