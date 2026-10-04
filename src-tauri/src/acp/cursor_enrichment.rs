@@ -92,6 +92,19 @@ mod tests {
         }
     }
 
+    /// Observe task completion independently of the production lookup budget.
+    /// A blocking scan can finish after that budget on a busy CI worker; its
+    /// deadline metric is only recorded after the async task resumes.
+    async fn wait_for_enrichment_finished(enricher: &CursorStoreEnricher) {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while enricher.in_flight_len_for_test() != 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("cursor enrichment task did not finish");
+    }
+
     #[tokio::test]
     async fn schedules_only_cursor_identityless_mcp_shape() {
         let metrics = Arc::new(DelegationMetrics::default());
@@ -394,18 +407,22 @@ mod tests {
             .is_none());
     }
 
-    struct AfterDeadlineStore;
+    struct AfterDeadlineStore {
+        successful_lookups: AtomicUsize,
+    }
     impl CursorStoreLookup for AfterDeadlineStore {
         fn lookup(&self, _: &str, _: &str) -> Result<CursorStoredToolCall, CursorStoreError> {
             std::thread::sleep(CURSOR_STORE_LOOKUP_DEADLINE + Duration::from_millis(50));
-            Ok(CursorStoredToolCall {
+            let stored = CursorStoredToolCall {
                 tool_name: "delegate_to_agent".into(),
                 args: serde_json::json!({
                     "agent_type": "codex",
                     "task": "late",
                     "correlation_id": "corr-late"
                 }),
-            })
+            };
+            self.successful_lookups.fetch_add(1, Ordering::SeqCst);
+            Ok(stored)
         }
     }
 
@@ -419,16 +436,23 @@ mod tests {
         broker
             .register_identityless_tool_call("cursor-conn", "tc-late".into())
             .await;
+        let store = Arc::new(AfterDeadlineStore {
+            successful_lookups: AtomicUsize::new(0),
+        });
         let enricher = CursorStoreEnricher::new(
-            Arc::new(AfterDeadlineStore),
+            store.clone(),
             Arc::new(MapSessions(std::sync::Mutex::new(
                 [("cursor-conn".into(), cursor_session())].into(),
             ))),
             broker.clone(),
             metrics.clone(),
         );
+        let started = Instant::now();
         enricher.maybe_schedule(&mcp_tool_envelope("cursor-conn", "tc-late", Some("{}")));
-        tokio::time::sleep(CURSOR_STORE_LOOKUP_DEADLINE + Duration::from_millis(200)).await;
+        wait_for_enrichment_finished(&enricher).await;
+        assert!(started.elapsed() >= CURSOR_STORE_LOOKUP_DEADLINE);
+        assert_eq!(enricher.in_flight_len_for_test(), 0);
+        assert_eq!(store.successful_lookups.load(Ordering::SeqCst), 1);
         assert_eq!(
             metrics
                 .snapshot()
@@ -438,6 +462,7 @@ mod tests {
             Some(1)
         );
         assert_eq!(metrics.snapshot().cursor_enrichment_resolved, 0);
+        assert!(metrics.snapshot().cursor_enrichment_backfill.is_empty());
         assert!(broker
             .take_matching_tool_call(
                 "cursor-conn",
@@ -907,16 +932,7 @@ mod tests {
             "tc-late-real",
             Some("{}"),
         ));
-        tokio::time::timeout(
-            CURSOR_STORE_LOOKUP_DEADLINE + Duration::from_millis(300),
-            async {
-                while enricher.in_flight_len_for_test() != 0 {
-                    tokio::time::sleep(Duration::from_millis(10)).await;
-                }
-            },
-        )
-        .await
-        .expect("missing-store lookup did not finish at its deadline");
+        wait_for_enrichment_finished(&enricher).await;
         assert!(started.elapsed() >= CURSOR_STORE_LOOKUP_DEADLINE);
         assert_eq!(enricher.in_flight_len_for_test(), 0);
         assert_eq!(
@@ -963,8 +979,11 @@ mod tests {
             broker,
             metrics.clone(),
         );
+        let started = Instant::now();
         enricher.maybe_schedule(&mcp_tool_envelope("cursor-conn", "tc-miss", Some("{}")));
-        tokio::time::sleep(CURSOR_STORE_LOOKUP_DEADLINE + Duration::from_millis(300)).await;
+        wait_for_enrichment_finished(&enricher).await;
+        assert!(started.elapsed() >= CURSOR_STORE_LOOKUP_DEADLINE);
+        assert_eq!(enricher.in_flight_len_for_test(), 0);
         assert_eq!(
             metrics
                 .snapshot()
