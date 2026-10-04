@@ -53,6 +53,17 @@ pub struct ConnectionProfileReport {
     pub connections: Vec<ConnectionProfile>,
 }
 
+/// `seaql_migrations` name for the roundtable logical model.
+pub const ROUNDTABLE_MIGRATION_NAME: &str = "m20261003_000001_roundtable";
+
+/// The roundtable tables are part of [`migration::Migrator`]. Registering them
+/// does not enable the product gate and does not change `synchronous`.
+pub fn roundtable_migration_registered() -> bool {
+    migration::Migrator::migrations()
+        .iter()
+        .any(|migration| migration.name() == ROUNDTABLE_MIGRATION_NAME)
+}
+
 pub(crate) fn database_file_name() -> &'static str {
     if cfg!(all(debug_assertions, feature = "tauri-runtime")) {
         "codeg-dev.db"

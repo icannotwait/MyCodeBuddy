@@ -16,6 +16,8 @@ mod relay;
 mod request_accounting;
 mod runtime;
 mod sandbox;
+mod schema;
+mod store;
 mod tool_core;
 
 pub use companion::{
@@ -49,7 +51,17 @@ pub use qualification::{
 pub use qualification_harness::QualificationHarness;
 pub use registry::{
     downgrade_is_silent_compatible, hidden_from_ordinary_discovery, DiscoveryLease, ExternalId,
-    InternalBindingRecord, ObserverWindow, RegisteredBinding, RootLease, RoundtableSessionRegistry,
+    InternalBindingRecord, ObserverWindow, RegisteredBinding, RegistryStore, RootLease,
+    RoundtableSessionRegistry, StoredBinding,
+};
+pub use schema::{
+    apply_roundtable_schema, drop_roundtable_schema, roundtable_table_names, DurabilityProfile,
+    LOGICAL_MODEL, RECORDED_DURABILITY,
+};
+pub use store::{
+    durability_from_report, migrate_roundtable, open_roundtable_store, promises_power_loss,
+    verify_connection_profile, NewAttempt, NewBinding, NewClaim, NewCommand, NewEvent, NewEvidence,
+    NewManifest, NewMessage, NewPhase, NewRoom, NewSpeaker, NewSubmission, NewTurn, RoundtableStore,
 };
 pub use relay::{
     forward_to_caller_target, probe_instance_socket, relay_from_helper, InstanceSocket,

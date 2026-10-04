@@ -373,7 +373,15 @@ async fn baseline_database_ordinary_sessions_still_open() {
         ))
         .await
         .expect("master");
-    assert!(roundtable_tables.is_empty());
+    // P09b registers the rt_ tables on the shared migrator. Ordinary session
+    // queries above still do not mention them, and the purpose check below
+    // still rejects a roundtable value.
+    let roundtable_names = roundtable_tables
+        .iter()
+        .map(|row| row.try_get::<String>("", "name").expect("name"))
+        .collect::<Vec<_>>();
+    assert!(roundtable_names.iter().any(|name| name == "rt_internal_bindings"));
+    assert!(roundtable_names.iter().all(|name| name.starts_with("rt_")));
 
     let definition = db
         .conn

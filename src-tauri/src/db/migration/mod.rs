@@ -78,6 +78,7 @@ mod m20260831_000001_canvas_node_group_grid;
 mod m20260907_000001_canvas_node_path;
 mod m20260929_000001_canvas_board;
 mod m20260930_000001_agent_setting_drop_adapter_channel;
+mod m20261003_000001_roundtable;
 mod m20261003_000001_simple_workflow_design_binding;
 
 #[cfg(any(test, feature = "test-utils"))]
@@ -177,6 +178,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20260929_000001_canvas_board::Migration),
             Box::new(m20260930_000001_agent_setting_drop_adapter_channel::Migration),
             Box::new(m20261003_000001_simple_workflow_design_binding::Migration),
+            Box::new(m20261003_000001_roundtable::Migration),
         ]
     }
 }
