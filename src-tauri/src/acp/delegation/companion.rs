@@ -1991,8 +1991,8 @@ fn compact_tools_for_fixed_stdio(tools: &mut Value) {
                 let description = match tool["name"].as_str().unwrap() {
                     "task_progress" => "Report a milestone for the current task.",
                     "task_complete" => "Report success, needs_review, or blocked with a summary before finishing the task turn.",
-                    "create_automation" => "Create an automation with a self-contained prompt. Omit cron for manual runs; otherwise use 5-field POSIX cron (0/7 Sunday) and IANA timezone. Omitting folder_path uses this chat's project.",
-                    "create_work_task" => "Queue a work task with a self-contained prompt in folder_path, or this chat's project when omitted.",
+                    "create_automation" => "Schedule only user-requested timed/repeated work, not current-chat tasks. Use a self-contained prompt. Omit cron for manual runs; otherwise use 5-field POSIX cron (0/7 Sunday) and IANA timezone. Omitting folder_path uses this chat's project.",
+                    "create_work_task" => "Queue only user-requested deferred work, never the current task or trivial steps. Use a self-contained prompt. Omitting folder_path uses this chat's project.",
                     _ => unreachable!(),
                 };
                 tool["description"] = Value::String(description.into());
@@ -7487,7 +7487,6 @@ pub fn render_authoring_result(outcome: &Value) -> Value {
 
 /// Build the human-readable summary block for a found session: a metadata header
 /// plus, when present, a "Recent messages" section.
-
 fn render_session_summary_text(o: &Value) -> String {
     let s = |k: &str| o.get(k).and_then(|v| v.as_str());
     let id = o.get("session_id").and_then(|v| v.as_i64()).unwrap_or(0);
