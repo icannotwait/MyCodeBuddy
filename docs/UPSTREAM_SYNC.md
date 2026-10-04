@@ -24,7 +24,7 @@ history without rebasing:
 git fetch upstream
 git switch main
 git pull --ff-only origin main
-git switch -c sync/codeg-0.32.2
+git switch -c sync/codeg-0.33.0
 git merge --no-ff upstream/main
 ```
 
@@ -32,13 +32,14 @@ Resolve conflicts on the sync branch, then open a pull request into
 MyCodeBuddy `main`. Do not rebase published MyCodeBuddy history. Run the full
 repository verification suite before merging the pull request.
 
-For an upstream Codeg `0.32.2` sync, reset the fork version in `package.json`,
+For an upstream Codeg `0.33.0` sync, reset the fork version in `package.json`,
 `src-tauri/Cargo.toml`, `src-tauri/Cargo.lock`, and
-`src-tauri/tauri.conf.json` to `0.32.2-mycodebuddy.1`. Run
+`src-tauri/tauri.conf.json` to `0.33.0-mycodebuddy.1`. Run
 `pnpm test:release` to verify that the versions and runtime URLs remain
-consistent. The conflict cookbook for this merge is
-`docs/UPSTREAM_0.31.1_CONFLICT_RESOLUTION.md`. The previous
-`0.31.0` cookbook remains at `docs/UPSTREAM_0.31.0_CONFLICT_RESOLUTION.md`.
+consistent. The server entrypoint stays `src-tauri/src/server_bin/main.rs`.
+Feature `server` still builds `codeg-server`; `server-bin` enables `server`.
+`codeg-mcp` requires `mcp-bin`, and computer use adds `computer-helper`.
+The previous cookbook remains at `docs/UPSTREAM_0.31.1_CONFLICT_RESOLUTION.md`.
 
 ## Conflict Priorities
 
@@ -57,3 +58,14 @@ After conflict resolution, review all branding/updater files, deleted OpenClaw
 paths, the release workflow, and functional fork diffs explicitly in the pull
 request. Complete the frontend and Rust checks required by `AGENTS.md`, in
 addition to `pnpm test:release`, before merge.
+
+## 0.33.0 compatibility notes
+
+Grok's current MCP client reads individual JSONL responses through an 8,192-byte
+buffer without reassembling split records. The fork keeps its compact delegation,
+task-reporting, and enabled automation/taskboard tools below a 7,680-byte catalog
+budget. Browser and computer tools are temporarily unavailable for Grok: their
+schemas cannot all fit even with descriptions removed, and image results need
+separate transport support. A session notice explains this limitation. Other
+agents keep these tool groups. Restore them for Grok only after validating its
+catalog and result transport, not just shortening tool descriptions.

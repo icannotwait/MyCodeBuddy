@@ -1,31 +1,48 @@
-# Codeg
+<h1 align="center">
+  <a href="https://docs.codeg.app"><img src="../../public/icon.svg" alt="Codeg logo" width="64" align="absmiddle" /></a> Codeg
+</h1>
 
-[![Release](https://img.shields.io/github/v/release/icannotwait/MyCodeBuddy)](https://github.com/icannotwait/MyCodeBuddy/releases)
-[![License](https://img.shields.io/github/license/icannotwait/MyCodeBuddy)](../../LICENSE)
-[![Tauri](https://img.shields.io/badge/Tauri-2.x-24C8DB)](https://tauri.app/)
-[![Next.js](https://img.shields.io/badge/Next.js-16-black)](https://nextjs.org/)
-[![Docker](https://img.shields.io/badge/Docker-ready-2496ED)](../../Dockerfile)
-
-<p>
-  <a href="../../README.md">English</a> |
-  <a href="./README.zh-CN.md">简体中文</a> |
-  <strong>繁體中文</strong> |
-  <a href="./README.ja.md">日本語</a> |
-  <a href="./README.ko.md">한국어</a> |
-  <a href="./README.es.md">Español</a> |
-  <a href="./README.de.md">Deutsch</a> |
-  <a href="./README.fr.md">Français</a> |
-  <a href="./README.pt.md">Português</a> |
-  <a href="./README.ar.md">العربية</a>
+<p align="center">
+  <a href="https://github.com/icannotwait/MyCodeBuddy"><img src="https://img.shields.io/github/stars/icannotwait/MyCodeBuddy?style=flat&color=e91e63" alt="GitHub stars" /></a>
+  <a href="https://github.com/icannotwait/MyCodeBuddy/releases/latest"><img src="https://img.shields.io/github/v/release/icannotwait/MyCodeBuddy?style=flat&color=e91e63" alt="Latest release" /></a>
+  <a href="https://github.com/icannotwait/MyCodeBuddy/releases"><img src="https://img.shields.io/github/downloads/icannotwait/MyCodeBuddy/total?style=flat&color=e91e63" alt="Total downloads" /></a>
+  <a href="../../LICENSE"><img src="https://img.shields.io/github/license/icannotwait/MyCodeBuddy?style=flat&color=e91e63" alt="License" /></a>
+  <a href="https://docs.codeg.app"><img src="https://img.shields.io/badge/docs-docs.codeg.app-3451b2?style=flat" alt="Documentation" /></a>
+  <a href="https://docs.codeg.app/zh/getting-started/installation"><img src="https://img.shields.io/badge/macOS%20%7C%20Windows%20%7C%20Linux%20%7C%20Docker%20%7C%20iOS%20%7C%20Android-03a9f4?style=flat" alt="Platforms: macOS, Windows, Linux, Docker, iOS, Android" /></a>
 </p>
 
-Codeg（Code Generation）是一個多智慧體編碼工作台，它將多個智慧體（Claude Code、Codex CLI、OpenCode、Gemini CLI、Cline、Hermes Agent、CodeBuddy、Kimi Code、Pi、Grok Build、Cursor 等）統一到一個工作區中，支援會話彙整和多智慧體協作，支援桌面安裝、伺服器/Docker 部署。
+<p align="center">
+  <sub><a href="../../README.md">English</a> · <a href="./README.zh-CN.md">简体中文</a> · <strong>繁體中文</strong> · <a href="./README.ja.md">日本語</a> · <a href="./README.ko.md">한국어</a> · <a href="./README.es.md">Español</a> · <a href="./README.de.md">Deutsch</a> · <a href="./README.fr.md">Français</a> · <a href="./README.pt.md">Português</a> · <a href="./README.ar.md">العربية</a></sub>
+</p>
 
-![gallery](../images/workspace-light.png#gh-light-mode-only)
-![gallery](../images/workspace-dark.png#gh-dark-mode-only)
-它將所有支援的智慧體 CLI 的工作階段聚合進一個可搜尋的工作區，讓主智慧體在同一個任務內委派給其它類型的子智慧體。不想守著做完的活，可以寫進待辦任務：每個任務待在自己的分支上無人看管地跑，做完了等你驗收才落地。Codeg 可作為桌面應用、獨立伺服器或 Docker 容器執行，還有原生 iOS 與 Android 用戶端，讓你離開電腦後也能接手正在跑的任務；內建十四個智慧體，你也可以自行註冊任何其它相容 ACP 的智慧體。
+<p align="center">
+  <strong>多智慧體編碼工作台。</strong><br/>
+  把所有 AI 編碼智慧體收進同一個地方——並讓它們協同工作。
+</p>
 
-## 贊助
+<p align="center"><sub>Windows 版 DrawCode 由 <a href="https://github.com/icannotwait/MyCodeBuddy">MyCodeBuddy</a> 發布。</sub></p>
+
+<h3 align="center"><a href="https://github.com/icannotwait/MyCodeBuddy/releases/latest"><ins>下載 DrawCode</ins></a> · <a href="https://docs.codeg.app/zh"><ins>說明文件</ins></a></h3>
+
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="../images/workspace-dark.png" />
+    <img src="../images/workspace-light.png" alt="Codeg 工作區：與智慧體的對話，旁邊是它的即時 diff 與專案檔案" width="960" />
+  </picture>
+</p>
+
+<table>
+  <tr>
+    <td width="50%" valign="top">🧩 <strong>一個介面，容納所有智慧體</strong><br/>內建十四個智慧體，任何相容 ACP 的智慧體也都能加入——全部呈現為同一套結構化對話，而不是一個終端機。</td>
+    <td width="50%" valign="top">🔎 <strong>工作階段自由流轉</strong><br/>匯入、搜尋、接續每個智慧體留在磁碟上的歷史，還能把它交給另一個智慧體接手。</td>
+  </tr>
+  <tr>
+    <td width="50%" valign="top">🤝 <strong>智慧體協同工作</strong><br/>一個 <code>@</code> 就能跨智慧體委派，也可以把待辦任務排進佇列，在各自的工作樹裡無人看管地執行。</td>
+    <td width="50%" valign="top">🌍 <strong>無論你在哪裡工作</strong><br/>桌面應用、自架伺服器或 Docker，iPhone、iPad 與 Android——還有 Telegram、飛書或微信。</td>
+  </tr>
+</table>
+
+## 💖 贊助
 
 <table>
   <tr>
@@ -85,61 +102,200 @@ Codeg（Code Generation）是一個多智慧體編碼工作台，它將多個智
 
 > 想成為 Codeg 贊助商？[歡迎透過郵件與我們聯絡。](mailto:itpkcn@gmail.com)
 
-## 主介面
+## ✨ 功能特色
 
-![Codeg Light](../images/workspace-light.png#gh-light-mode-only)
-![Codeg Dark](../images/workspace-dark.png#gh-dark-mode-only)
-Claude Code · Codex · Gemini · OpenCode · Cline · Hermes · CodeBuddy · Kimi Code · Pi · Grok · Cursor · DeepSeek Harness · Qoder · Google Antigravity
+<table>
+<tr>
+<td width="50%" valign="middle">
 
-## 多智慧體協作
+### 一個介面，容納所有智慧體
 
-![Codeg Light](../images/collaboration-light.gif#gh-light-mode-only)
-![Codeg Dark](../images/collaboration-dark.gif#gh-dark-mode-only)
+內建十四個智慧體，任何其他相容 ACP 的智慧體也能從公開註冊表或它的 distribution JSON 加入。Codeg 透過 Agent Client Protocol 與每一個智慧體溝通，所以它們拿到的都是同一套豐富的對話介面——工具卡片、即時 diff、計畫與權限請求——而不是一個得瞇著眼看的終端機。
 
-## 日常辦公
+[文件 →](https://docs.codeg.app/zh/guide/supported-agents) · [自訂智慧體 →](https://docs.codeg.app/zh/guide/custom-agents)
 
-![Codeg Light](../images/office-light.png#gh-light-mode-only)
-![Codeg Dark](../images/office-dark.png#gh-dark-mode-only)
+</td>
+<td width="50%">
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="../images/features/agents-dark.gif" />
+  <img src="../images/features/agents-light.gif" alt="一個介面，容納所有智慧體" width="100%" />
+</picture>
+</td>
+</tr>
+<tr>
+<td width="50%" valign="middle">
 
-## 核心亮點
+### 每個工作階段，都搜得到
 
-- **會話聚合** — 將所有受支援智能體的會話匯入到統一工作台
-- **多智能體協作** — 在同一會話中，主智能體可呼叫不同類型的子智能體（如 Claude Code 呼叫 Codex、Gemini 等）協作完成任務，每個子智能體作為獨立會話執行
-- 內建 `git worktree` 並行開發流程
-- **專案啟動器** — 視覺化建立新專案，即時預覽效果
-- **Office 文件** — 透過內建的 officecli 工具集建立、分析、校對和編輯 .docx / .xlsx / .pptx 檔案，支援在檔案標籤頁內即時預覽，隨智慧體編輯即時更新
-- **科學研究** — 內建一系列科學研究技能（假設生成、實驗設計、統計、視覺化、批判性評估、文獻檢索），任意智慧體皆可呼叫，並按智慧體管理
-- **自動化** — 將任意輸入框設定儲存為可複用的自動化任務，按 cron 排程或手動觸發、無介面自動執行
-- **訊息渠道** — 連接 Telegram、飛書、iLink（微信）等即時通訊應用到編碼代理，即時接收通知、完整會話交互、遠端任務控制
-- MCP 管理（本地掃描 + 市場搜尋/安裝）
-- Skills 管理（全域與專案級）
-- Git 遠端帳號管理（支援 GitHub 及其他 Git 伺服器）
-- Web 服務模式 — 開啟後可在瀏覽器中存取 Codeg，支援遠端工作
-- **獨立伺服器部署** — 在任意 Linux/macOS 伺服器上執行 `codeg-server`，透過瀏覽器存取
-- **Docker 支援** — 使用 `docker compose up -d` 在本地建置，可自訂令牌、連接埠，支援資料持久化及專案目錄掛載
-- 執行時日誌 — 內建即時日誌檢視器，支援篩選和按模組設定日誌層級
-- 整合工程閉環（檔案樹、Diff、Git 變更、提交、終端）
+Codeg 會讀取每個智慧體 CLI 留在磁碟上的歷史：一鍵匯入，全部可搜尋，任何工作階段都能從停下的地方繼續。`@` 提及一個舊工作階段，你正在對話的智慧體就能讀到它——哪怕那是另一個智慧體留下的。
 
-## 支援的 Agent
+[文件 →](https://docs.codeg.app/zh/guide/aggregation)
 
-| Agent        | 環境變數優先路徑                      | macOS / Linux 預設路徑                | Windows 預設路徑                                      |
-| ------------ | ------------------------------------- | ------------------------------------- | ----------------------------------------------------- |
-| Claude Code  | `$CLAUDE_CONFIG_DIR/projects`         | `~/.claude/projects`                  | `%USERPROFILE%\\.claude\\projects`                    |
-| Codex CLI    | `$CODEX_HOME/sessions`                | `~/.codex/sessions`                   | `%USERPROFILE%\\.codex\\sessions`                     |
-| OpenCode     | `$XDG_DATA_HOME/opencode/opencode.db` | `~/.local/share/opencode/opencode.db` | `%USERPROFILE%\\.local\\share\\opencode\\opencode.db` |
-| Gemini CLI   | `$GEMINI_CLI_HOME/.gemini`            | `~/.gemini`                           | `%USERPROFILE%\\.gemini`                              |
-| Cline        | `$CLINE_DIR`                          | `~/.cline/data/tasks`                 | `%USERPROFILE%\\.cline\\data\\tasks`                  |
-| Hermes Agent | `$HERMES_HOME/state.db`               | `~/.hermes/state.db`                  | `%USERPROFILE%\\.hermes\\state.db`                    |
-| CodeBuddy    | `$CODEBUDDY_CONFIG_DIR/projects`      | `~/.codebuddy/projects`               | `%USERPROFILE%\\.codebuddy\\projects`                 |
-| Kimi Code    | `$KIMI_CODE_HOME/sessions`            | `~/.kimi-code/sessions`               | `%USERPROFILE%\\.kimi-code\\sessions`                 |
-| Pi           | `$PI_CODING_AGENT_SESSION_DIR`        | `~/.pi/agent/sessions`                | `%USERPROFILE%\\.pi\\agent\\sessions`                 |
-| Grok Build   | `$GROK_HOME/sessions`                 | `~/.grok/sessions`                    | `%USERPROFILE%\\.grok\\sessions`                      |
-| Cursor       | `$CURSOR_CONFIG_DIR/chats`            | `~/.cursor/chats`                     | `%USERPROFILE%\\.cursor\\chats`                       |
+</td>
+<td width="50%">
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="../images/features/sessions-dark.gif" />
+  <img src="../images/features/sessions-light.gif" alt="每個工作階段，都搜得到" width="100%" />
+</picture>
+</td>
+</tr>
+<tr>
+<td width="50%" valign="middle">
 
-> 注意：環境變數的優先順序高於預設路徑。
+### 多智慧體協作
 
+輸入 `@`，選取智慧體，送出。每個被提及的智慧體都以獨立工作階段並肩開工，工作即時匯流回你的對話——Claude Code 起草，Codex 同步審查——子智慧體則以卡片呈現，邊跑邊填。
 
-名單之外的呢？自己加就行。從公開的 ACP 註冊表裡挑一個，或者貼上它的 distribution JSON，Codeg 會安裝它、預檢它能否啟動，然後像對待內建智慧體一樣對待它——出現在選擇器裡，接受 `@` 委派與技能設定；即便這個智慧體本身不留下任何歷史，它的工作階段也會被記錄下來並可搜尋。→ [自訂智慧體](https://docs.codeg.app/zh/guide/custom-agents)
+[文件 →](https://docs.codeg.app/zh/guide/multi-agent)
+
+</td>
+<td width="50%">
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="../images/features/multi-agent-dark.gif" />
+  <img src="../images/features/multi-agent-light.gif" alt="多智慧體協作" width="100%" />
+</picture>
+</td>
+</tr>
+<tr>
+<td width="50%" valign="middle">
+
+### 無人看管也能跑的待辦任務
+
+把要做的事寫下來，就可以走開了。每個待辦任務都有自己的 git 工作樹與分支，可以立即開始或排程啟動，然後停在「待驗收」等你；你接受 diff 後，智慧體就會把它落地，而 Codeg 會先核對 git 才宣告完成。
+
+[文件 →](https://docs.codeg.app/zh/guide/tasks)
+
+</td>
+<td width="50%">
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="../images/features/todos-dark.gif" />
+  <img src="../images/features/todos-light.gif" alt="無人看管也能跑的待辦任務" width="100%" />
+</picture>
+</td>
+</tr>
+<tr>
+<td width="50%" valign="middle">
+
+### 無限畫布
+
+在空間中鋪排你的工作：對話、檔案、終端機與便籤都成為畫板上的卡片，依資料夾與智慧體分組，讓多個智慧體並排執行、一目了然。
+
+[文件 →](https://docs.codeg.app/zh/guide/canvas)
+
+</td>
+<td width="50%">
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="../images/features/canvas-dark.gif" />
+  <img src="../images/features/canvas-light.gif" alt="無限畫布" width="100%" />
+</picture>
+</td>
+</tr>
+<tr>
+<td width="50%" valign="middle">
+
+### 桌面、伺服器、行動裝置與聊天軟體
+
+Codeg 可以作為桌面應用、可用任何瀏覽器開啟的自架伺服器，或單一 Docker 容器來執行。原生 iPhone、iPad 與 Android 用戶端——再加上 Telegram、飛書與微信頻道——讓智慧體觸手可及，而檔案與工作階段始終留在你自己的機器上。
+
+[文件 →](https://docs.codeg.app/zh/getting-started/deployment) · [行動應用 →](https://docs.codeg.app/zh/getting-started/installation#mobile-apps) · [訊息頻道 →](https://docs.codeg.app/zh/guide/chat-channels)
+
+</td>
+<td width="50%">
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="../images/features/anywhere-dark.gif" />
+  <img src="../images/features/anywhere-light.gif" alt="桌面、伺服器、行動裝置與聊天軟體" width="100%" />
+</picture>
+</td>
+</tr>
+<tr>
+<td width="50%" valign="middle">
+
+### Office 文件與科學研究
+
+讓智慧體做一份簡報、一份報告或一張試算表，就能看著真正的 `.pptx`、`.docx` 或 `.xlsx` 在對話旁即時算繪。內建的科研技能——假設生成、實驗設計、統計、文獻檢索——可搭配任何智慧體使用。
+
+[文件 →](https://docs.codeg.app/zh/guide/office) · [科學研究 →](https://docs.codeg.app/zh/guide/research)
+
+</td>
+<td width="50%">
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="../images/features/office-dark.gif" />
+  <img src="../images/features/office-light.gif" alt="Office 文件與科學研究" width="100%" />
+</picture>
+</td>
+</tr>
+<tr>
+<td width="50%" valign="middle">
+
+### 瀏覽器與電腦操作
+
+在桌面應用中，連結會在檔案旁的內建瀏覽器裡開啟：把頁面、元素、截圖或主控台錯誤交給智慧體，或讓它直接操作你分享的頁面。處於預覽階段的電腦操作，還能讓智慧體看見並操作你分享的視窗——而且一鍵就能停止。
+
+[文件 →](https://docs.codeg.app/zh/guide/browser) · [電腦操作 →](https://docs.codeg.app/zh/guide/computer-use)
+
+</td>
+<td width="50%">
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="../images/features/browser-dark.gif" />
+  <img src="../images/features/browser-light.gif" alt="瀏覽器與電腦操作" width="100%" />
+</picture>
+</td>
+</tr>
+<tr>
+<td width="50%" valign="middle">
+
+### 完整的工程閉環
+
+編輯器、即時與並排 diff、附三欄合併編輯器的完整 Git 用戶端、一鍵工作樹、內建終端機與分割檢視——全都在智慧體旁邊，直接作用於你儲存庫裡的真實檔案。
+
+[文件 →](https://docs.codeg.app/zh/guide/workspace) · [Git 與工作樹 →](https://docs.codeg.app/zh/guide/git)
+
+</td>
+<td width="50%">
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="../images/features/workspace-dark.gif" />
+  <img src="../images/features/workspace-light.gif" alt="完整的工程閉環" width="100%" />
+</picture>
+</td>
+</tr>
+</table>
+
+**還有這些：**
+
+- **[儲存庫面板](https://docs.codeg.app/zh/guide/repository)** — GitHub、GitLab、Gitea 與 Forgejo 的議題、拉取請求、檢查項與合併；任何議題或 PR 都能轉成待辦任務
+- **[自動化](https://docs.codeg.app/zh/guide/automations)** — 把設定好的輸入框存下來，依 cron 排程或手動觸發，以無介面方式執行
+- **[Token 用量](https://docs.codeg.app/zh/guide/token-usage)** — 趨勢、快取命中率、活躍熱力圖，以及依資料夾、智慧體、模型與工作階段劃分的用量
+- **[分叉與插話](https://docs.codeg.app/zh/guide/workspace#follow-along-%E2%80%94-the-conversation)** — 在支援的智慧體上，從已完成的回覆分叉對話，或把訊息插入仍在進行中的回合
+- **[技能](https://docs.codeg.app/zh/guide/skills) 與 [MCP](https://docs.codeg.app/zh/guide/mcp)** — 依智慧體分別啟用的技能包、本機 MCP 掃描，以及註冊表搜尋與安裝
+- **[專案啟動器](https://docs.codeg.app/zh/guide/project-boot)** — 視覺化建立新專案，並即時預覽
+- **[外觀自訂](https://docs.codeg.app/zh/reference/settings/appearance)** — 十二套主題都能逐個色彩 token 重新調色，還有桌布、圓角與自訂 CSS——介面支援十種語言
+- **[備份與同步](https://docs.codeg.app/zh/reference/settings/system#backup-restore)** — 加密備份，以及透過檔案或你自己的 WebDAV 伺服器在多台機器之間同步設定
+- **[URL Scheme](../../docs/url-scheme.md)** — 用 `codeg://session/<id>` 從其他應用程式開啟對話（桌面端）
+- **還有更多** — 幾乎每個版本都會加入新東西；完整清單見 [發行說明](https://github.com/icannotwait/MyCodeBuddy/releases)
+
+## 🤖 支援的智慧體
+
+Codeg 透過 [Agent Client Protocol](https://agentclientprotocol.com) 與每個智慧體溝通，所以每一個都能用上同一套結構化介面。內建十四個，其中大部分 Codeg 都能替你安裝、鎖定版本並更新：
+
+<p>
+  <a href="https://www.anthropic.com/claude-code"><kbd><img src="../images/agents/claude-code.svg" alt="" width="16" valign="middle" /> Claude Code</kbd></a> &nbsp;
+  <a href="https://github.com/openai/codex"><kbd><img src="../images/agents/codex.svg" alt="" width="16" valign="middle" /> Codex</kbd></a> &nbsp;
+  <a href="https://github.com/google-gemini/gemini-cli"><kbd><img src="../images/agents/gemini-cli.svg" alt="" width="16" valign="middle" /> Gemini CLI</kbd></a> &nbsp;
+  <a href="https://opencode.ai"><kbd><picture><source media="(prefers-color-scheme: dark)" srcset="../images/agents/opencode-dark.svg" /><img src="../images/agents/opencode.svg" alt="" width="16" valign="middle" /></picture> OpenCode</kbd></a> &nbsp;
+  <a href="https://cline.bot"><kbd><picture><source media="(prefers-color-scheme: dark)" srcset="../images/agents/cline-dark.svg" /><img src="../images/agents/cline.svg" alt="" width="16" valign="middle" /></picture> Cline</kbd></a> &nbsp;
+  <a href="https://hermes-agent.nousresearch.com"><kbd><picture><source media="(prefers-color-scheme: dark)" srcset="../images/agents/hermes-agent-dark.svg" /><img src="../images/agents/hermes-agent.svg" alt="" width="16" valign="middle" /></picture> Hermes Agent</kbd></a> &nbsp;
+  <a href="https://www.codebuddy.ai"><kbd><picture><source media="(prefers-color-scheme: dark)" srcset="../images/agents/codebuddy-dark.svg" /><img src="../images/agents/codebuddy.svg" alt="" width="16" valign="middle" /></picture> CodeBuddy</kbd></a> &nbsp;
+  <a href="https://www.kimi.com/code"><kbd><img src="../images/agents/kimi-code.svg" alt="" width="16" valign="middle" /> Kimi Code</kbd></a> &nbsp;
+  <a href="https://pi.dev"><kbd><img src="../images/agents/pi.svg" alt="" width="16" valign="middle" /> Pi</kbd></a> &nbsp;
+  <a href="https://x.ai/cli"><kbd><picture><source media="(prefers-color-scheme: dark)" srcset="../images/agents/grok-dark.svg" /><img src="../images/agents/grok.svg" alt="" width="16" valign="middle" /></picture> Grok</kbd></a> &nbsp;
+  <a href="https://cursor.com/cli"><kbd><picture><source media="(prefers-color-scheme: dark)" srcset="../images/agents/cursor-dark.svg" /><img src="../images/agents/cursor.svg" alt="" width="16" valign="middle" /></picture> Cursor</kbd></a> &nbsp;
+  <a href="https://deepseek-harness.github.io/deepseek-harness/"><kbd><img src="../images/agents/deepseek-harness.svg" alt="" width="16" valign="middle" /> DeepSeek Harness</kbd></a> &nbsp;
+  <a href="https://qoder.com"><kbd><picture><source media="(prefers-color-scheme: dark)" srcset="../images/agents/qoder-dark.svg" /><img src="../images/agents/qoder.svg" alt="" width="16" valign="middle" /></picture> Qoder</kbd></a> &nbsp;
+  <a href="https://antigravity.google"><kbd><picture><source media="(prefers-color-scheme: dark)" srcset="../images/agents/google-antigravity-dark.svg" /><img src="../images/agents/google-antigravity.svg" alt="" width="16" valign="middle" /></picture> Google Antigravity</kbd></a> &nbsp;
+  <a href="https://docs.codeg.app/zh/guide/custom-agents"><kbd>+ 任何 ACP 智慧體</kbd></a>
+</p>
+
+名單之外的呢？從公開的 ACP 註冊表裡挑一個，或貼上它的 distribution JSON——Codeg 會安裝它、預檢它能否啟動，然後像對待內建智慧體一樣對待它。各智慧體的執行環境需求以及工作階段的存放位置，見 [支援的智慧體](https://docs.codeg.app/zh/guide/supported-agents)。
 
 ## 🪟 分割檢視
 
@@ -150,303 +306,107 @@ Claude Code · Codex · Gemini · OpenCode · Cline · Hermes · CodeBuddy · Ki
 ![把對話區拆分成標籤分組構成的網格](../images/split-light.gif#gh-light-mode-only)
 ![把對話區拆分成標籤分組構成的網格](../images/split-dark.gif#gh-dark-mode-only)
 
-<details>
-<summary><h2>專案啟動器</h2></summary>
+## 📦 安裝
 
-視覺化建立新專案：左側設定面板，右側即時預覽。
+**桌面端** — 本倉庫的 GitHub Releases 提供 Windows 版 **DrawCode**（NSIS）。日常使用請安裝桌面端，而不是獨立伺服器。
 
-
-### 功能特色
-
-- **視覺化設定** — 從下拉選單中選擇樣式、色彩主題、圖示庫、字型、圓角等，預覽面板即時更新
-- **即時預覽** — 在建立專案前，即時檢視所選樣式的渲染效果
-- **一鍵建立** — 點擊「建立專案」，啟動器將使用您的預設設定、框架範本（Next.js / Vite / React Router / Astro / Laravel）和套件管理器（pnpm / npm / yarn / bun）執行 `shadcn init`
-- **套件管理器偵測** — 自動偵測已安裝的套件管理器並顯示版本號
-- **無縫整合** — 新建立的專案會立即在 Codeg 工作台中開啟
-
-目前支援 **shadcn/ui** 專案腳手架，分頁式設計為未來支援更多專案類型做好了準備。
-
-</details>
-
-<details>
-<summary><h2>訊息渠道</h2></summary>
-
-連接你喜愛的即時通訊應用——Telegram、飛書、iLink（微信）等——到 AI 編碼代理。直接在聊天中建立任務、發送後續訊息、審批權限請求、恢復會話、監控代理活動——即時接收代理回應，包含工具呼叫詳情、權限提示和完成摘要。
-
-Telegram 論壇超級群組也可以使用 [Telegram topic mode](../chat-channels/telegram-topic-mode.md)，將每個 topic 綁定到獨立的 Codeg 會話。
-
-### 支援的渠道
-
-| 渠道          | 協定                   | 狀態 |
-| ------------- | ---------------------- | ---- |
-| Telegram      | Bot API（HTTP 長輪詢） | 內建 |
-| 飛書          | WebSocket + REST API   | 內建 |
-| iLink（微信） | WebSocket + REST API   | 內建 |
-
-> 更多渠道（Discord、Slack、釘釘等）計劃在未來版本中支援。
-
-</details>
-
-<details>
-<summary><h2>Office 文件</h2></summary>
-
-將 Word、Excel 和 PowerPoint 文件納入一等工作流程。內建的 **officecli** 工具集讓你的智慧體能夠建立、分析、校對和編輯 .docx、.xlsx、.pptx 文件——並可直接在 Codeg 內預覽結果。
-
-### 功能特性
-
-- **建立與編輯** — 建立新文件或修改現有 .docx / .xlsx / .pptx 檔案，支援圖表、表格和格式設定
-- **分析與校對** — 檢查文件結構、發現格式問題、校對內容
-- **即時預覽** — 在檔案標籤頁中開啟 .docx / .xlsx / .pptx，即可內嵌渲染，隨智慧體編輯自動刷新——底層由常駐的 `officecli watch` 服務支撐（在 Web 和獨立伺服器部署中經反向代理轉發，依能力鑑權）
-- **快捷操作** — 歡迎頁提供「編碼」、「Office」和「科學研究」三個標籤，一鍵將對應技能呼叫和提示詞範本填入輸入框；未對所選智慧體啟用的技能會顯示鎖定標記，並引導你前往可開啟的位置
-- **Office 工具設定** — 專屬設定頁可安裝 `officecli` 並透過技能×智慧體矩陣管理文件技能：切換任意（技能，智慧體）組合，支援一鍵批次啟停
-
-</details>
-
-<details>
-<summary><h2>科學研究</h2></summary>
-
-將任意智慧體變成嚴謹的研究助手。Codeg 內建一套精選的 MIT 授權**科學研究技能**——從構思到分析再到撰寫——它們會安裝到共用的中央技能庫，並連結到你所選擇的任意智慧體，就像專家與 Office 工具集一樣。
-
-### 功能特性
-
-- **精選技能** — 假設生成、實驗設計、統計檢定力、統計分析、探索性資料分析、科學視覺化、批判性評估、同儕審查、引用管理、學者評估、論文檢索以及 AI 示意圖
-- **快捷操作** — 歡迎頁的「科學研究」標籤只需一鍵，即可將對應的技能呼叫連同在地化的提示詞範本填入輸入框
-- **科學研究設定** — 專屬設定頁透過技能×智慧體矩陣管理這些技能，並以標記標示需要 API 金鑰或 Python 環境的技能
-
-</details>
-
-<details>
-<summary><h2>自動化</h2></summary>
-
-將任意輸入框設定——智慧體、模型、提示詞、工作目錄和選項——儲存為可複用的**自動化**任務，無需開啟 UI 即可執行。
-
-### 功能特性
-
-- **一次設定，隨時複用** — 將完整的輸入框設定儲存為具名自動化任務
-- **定時或按需觸發** — 按 cron 排程執行，或隨時手動觸發
-- **無介面執行** — 自動化任務在背景執行，建立真實會話，可隨時在工作台中開啟，啟動後自動返回工作台
-
-</details>
-
-<details>
-<summary><h2>快速開始</h2></summary>
-
-### 環境需求
-
-- Node.js `>=22`（建議）
-- pnpm `>=10`
-- Rust stable（2021 edition）
-- Tauri 2 建置依賴（僅桌面模式）
-
-Linux（Debian/Ubuntu）範例：
-
-```bash
-sudo apt-get update
-sudo apt-get install -y \
-  libwebkit2gtk-4.1-dev \
-  libayatana-appindicator3-dev \
-  librsvg2-dev \
-  patchelf
-```
-
-### 二進位檔
-
-Codeg 在單一 workspace 中提供三個 Rust 二進位檔：
-
-| 二進位         | 角色                                                                                          | 建置方式                                                                    |
-| -------------- | --------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------- |
-| `codeg`        | Tauri 桌面應用程式（視窗、系統匣、自動更新）                                                  | `pnpm tauri build`（發行）/ `pnpm tauri dev`（開發）                        |
-| `codeg-server` | 用於瀏覽器/無頭部署的獨立 HTTP + WebSocket 伺服器                                             | `pnpm server:build` / `pnpm server:dev`                                     |
-| `codeg-mcp`    | 單次啟動的 stdio MCP 協作行程，向 agent CLI 公開 `delegate_to_agent` 工具（多智慧體協作）     | `pnpm tauri:prepare-sidecars`（由 `tauri dev` / `tauri build` 自動呼叫）    |
-
-`codeg-mcp` 在執行階段必須與其父二進位位於同一目錄——安裝程式、Docker 映像和 Tauri sidecar 打包工具都會將它放在 `codeg` / `codeg-server` 旁邊。原始碼建置和自訂部署可以透過 `CODEG_MCP_BIN=/abs/path/codeg-mcp` 環境變數覆寫查詢路徑。若協作行程缺失，委派功能會被略過（僅記錄一則警告日誌），其餘 agent 會話仍可正常運作。
-
-### 開發命令
-
-```bash
-pnpm install
-
-# 僅前端（Next.js 開發伺服器，無需 Rust）
-pnpm dev
-
-# 前端靜態匯出到 out/
-pnpm build
-
-# 完整桌面應用（Tauri + Next.js，自動建置 codeg-mcp sidecar）
-pnpm tauri dev
-
-# 桌面發行建置（將 codeg-mcp 作為 externalBin 打包）
-pnpm tauri build
-
-# 獨立伺服器（無需 Tauri/GUI）
-pnpm server:dev
-pnpm server:build                  # 發行二進位位於 src-tauri/target/release/codeg-server
-
-# 顯式建置 codeg-mcp 協作行程（針對當前主機 triple）
-pnpm tauri:prepare-sidecars        # 輸出：src-tauri/binaries/codeg-mcp-<triple>
-
-# 當僅迭代前端且不需要委派功能時，略過 sidecar 準備
-CODEG_SKIP_SIDECAR=1 pnpm tauri dev
-
-# Lint
-pnpm eslint .
-
-# 前端測試（vitest）
-pnpm test
-pnpm test:watch
-pnpm test:coverage
-
-# Rust 檢查（在 src-tauri/ 下執行）
-cargo check                                                     # 桌面（預設 features）
-cargo check --no-default-features --bin codeg-server            # 伺服器模式
-cargo check --no-default-features --bin codeg-mcp               # MCP 協作行程
-cargo clippy --all-targets --features test-utils -- -D warnings
-
-# Rust 測試
-cargo test --features test-utils                                # 桌面（含整合）
-cargo test --no-default-features --bin codeg-server --lib       # 伺服器模式
-cargo insta review                                              # 接受解析器快照變更
-```
-
-> 提示：當你在 `src-tauri/target/release/` 下有新建置的 `codeg-mcp` 並想讓手動啟動的 `codeg-server` 在不重新安裝的情況下指向它時，可以匯出 `CODEG_MCP_BIN=$(pwd)/src-tauri/target/release/codeg-mcp`。
-
-### 伺服器部署
-
-Codeg 可以作為獨立 Web 伺服器執行，無需桌面環境。
-
-
-#### Remove a leftover Windows `codeg-server` install
+**伺服器** — `codeg-server` 僅供自行託管（Cargo feature `server`）。桌面使用者應安裝 DrawCode。Windows（PowerShell）：
 
 ```powershell
 .\uninstall-server.ps1
 # or:
 irm https://raw.githubusercontent.com/icannotwait/MyCodeBuddy/main/uninstall-server.ps1 | iex
+
+.\install.ps1 -Version v0.33.0-mycodebuddy.1
+# or:
+irm https://raw.githubusercontent.com/icannotwait/MyCodeBuddy/main/install.ps1 | iex
+$env:CODEG_STATIC_DIR="$env:LOCALAPPDATA\codeg-server\web"; codeg-server
 ```
 
-GitHub Releases ship desktop DrawCode (NSIS) plus signed standalone server
-archives such as `codeg-server-linux-x64.tar.gz` (and darwin/windows siblings).
-Self-host with the release archive, Docker, or a source build (`--features server`).
-Windows install:
+安裝程式預設目錄是 `%LOCALAPPDATA%\codeg-server`，因此不會覆蓋 DrawCode 桌面安裝。若舊版裝在桌面目錄裡，指令稿會把伺服器移出來。
 
-```powershell
-.\install.ps1 -Version v0.31.1-mycodebuddy.1
-```
+[GitHub Releases](https://github.com/icannotwait/MyCodeBuddy/releases) 也提供已簽章的自託管伺服器封存檔：`codeg-server-linux-x64.tar.gz`、`codeg-server-linux-arm64.tar.gz`、`codeg-server-darwin-x64.tar.gz`、`codeg-server-darwin-arm64.tar.gz` 和 `codeg-server-windows-x64.zip`。每份封存檔包含伺服器、MCP 伴生程序、電腦操作輔助程序、`web/` 資源和授權檔案。
 
-#### 方式三：Docker
+**Docker** — 從本倉庫建置選用伺服器：
 
 ```bash
 docker compose up -d
 ```
 
-Docker Compose 會從本倉庫在本地建置映像。多階段建置（Node.js + Rust → 精簡 Debian 執行環境）內建 `git` 和 `ssh`。資料儲存在 `/data` 卷中；令牌、連接埠與專案目錄掛載可在 `docker-compose.yml` 中設定。
+Docker Compose 會在本機建置映像並啟用 Cargo feature `server`。資料放在 `/data` 卷中；權杖、連接埠與專案目錄掛載在 `docker-compose.yml` 裡設定。
 
-#### 方式四：從原始碼建置
+**從原始碼建置** — `codeg-server` 需要 `--features server`，`codeg-mcp` 需要 `--features mcp-bin`：
 
 ```bash
-pnpm install && pnpm build          # 建置前端
+pnpm install && pnpm build
 cd src-tauri
 cargo build --release --bin codeg-server --no-default-features --features server
-cargo build --release --bin codeg-mcp --no-default-features    # 委派協作行程
-CODEG_STATIC_DIR=../out ./target/release/codeg-server          # codeg-mcp 會作為同級二進位被自動探測
+cargo build --release --bin codeg-mcp --no-default-features --features mcp-bin
+# 僅在啟用電腦操作時建置：
+cargo build --release --bin codeg-computer-helper --no-default-features --features computer-helper
+CODEG_STATIC_DIR=../out ./target/release/codeg-server
 ```
 
-> 若兩個二進位分別存放在不同目錄，請設定 `CODEG_MCP_BIN=/abs/path/to/codeg-mcp`，執行階段才能找到協作行程；否則多智慧體委派會被靜默停用。
-
-#### Linux/macOS 原始碼建置升級
+**Linux/macOS 原始碼建置升級** — 在儲存庫根目錄執行，拉取原始碼並重新建置：
 
 ```bash
 git pull
 pnpm install && pnpm build
 cd src-tauri
 cargo build --release --bin codeg-server --no-default-features --features server
-cargo build --release --bin codeg-mcp --no-default-features
-# 停止現有服務，重新部署兩個二進位檔與 Web 資源，然後重新啟動。
+cargo build --release --bin codeg-mcp --no-default-features --features mcp-bin
+# 僅在啟用電腦操作時建置：
+cargo build --release --bin codeg-computer-helper --no-default-features --features computer-helper
+# 停止服務，重新部署伺服器、MCP 伴生程序、選用的電腦操作輔助程序和 Web 資源，然後重新啟動。
 ```
 
-Linux/macOS 原始碼部署必須拉取目標原始碼、重新建置並重新部署；不能透過獨立
-伺服器端點原地下載或套用 GitHub Releases 更新。Docker 部署也應拉取原始碼後
-重建並重新建立容器。
+Docker 升級時，在儲存庫根目錄執行 `git pull && docker compose up --build -d --force-recreate`。
 
-#### 設定
+**行動裝置** — 安裝 [iOS 應用](https://apps.apple.com/app/codeg-client/id6785199071) 或 [Android APK](https://github.com/xintaofei/codeg-android/releases/latest)，再把它指向桌面應用的 **Web 服務**或你自己的 `codeg-server`：填位址、填權杖，完成。配對步驟見 [行動應用](https://docs.codeg.app/zh/getting-started/installation#mobile-apps)。
 
-環境變數：
+Compose、預編譯二進位檔、原始碼建置與就地升級見 [部署](https://docs.codeg.app/zh/getting-started/deployment)；環境變數見 [設定](https://docs.codeg.app/zh/getting-started/configuration)。
 
-| 變數                           | 預設值                 | 說明                                                                                                                                                                                                                                                                                                              |
-| ------------------------------ | ---------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `CODEG_PORT`                   | `3080`                 | HTTP 連接埠                                                                                                                                                                                                                                                                                                       |
-| `CODEG_HOST`                   | `0.0.0.0`              | 綁定位址                                                                                                                                                                                                                                                                                                          |
-| `CODEG_TOKEN`                  | _（隨機）_             | 認證令牌（啟動時輸出到 stderr）                                                                                                                                                                                                                                                                                   |
-| `CODEG_DATA_DIR`               | `~/.local/share/codeg` | SQLite 資料庫目錄（同時也是 `uploads/`、`pets/` 的根目錄）                                                                                                                                                                                                                                                        |
-| `CODEG_STATIC_DIR`             | `./web` 或 `./out`     | Next.js 靜態匯出目錄                                                                                                                                                                                                                                                                                              |
-| `CODEG_MCP_BIN`                | _（未設定）_           | `codeg-mcp` 協作行程的絕對路徑。會覆寫預設的「可執行檔同級目錄 + `PATH`」查詢邏輯。用於原始碼建置或協作行程不在伺服器安裝目錄內的自訂部署。                                                                                                                                                                       |
-| `CODEG_SKIP_SIDECAR`           | _（未設定）_           | 僅供 `pnpm tauri dev` / `pnpm tauri build` 調試前端時使用——當值為 `1` 時，略過 `codeg-mcp` sidecar 的建置。此類建置不支援委派功能；發行品質的產出物必須保持此變數未設定。                                                                                                                                          |
-| `CODEG_UPLOAD_MAX_TOTAL_BYTES` | _（未設定）_           | `<data dir>/uploads/` 下所有檔案總位元組數的硬上限。十進位位元組數（例如 `10737418240` 表示 10 GiB）。未設定、`0` 或無法解析的值會停用上限，並在啟動時印出一行日誌以便觀察當前狀態。該上限僅在單一 `codeg-server` 行程內生效——共用同一個 `uploads/` 卷的橫向擴展部署需要外部協調（檔案鎖、Redis、反向代理配額）。 |
-| `CODEG_UPLOAD_QUOTA_STRICT`    | _（未設定）_           | 當值為真（`1` / `true` / `yes` / `on`）時，若 `CODEG_UPLOAD_MAX_TOTAL_BYTES` 設定為無法解析的值，則以結束代碼 2 中止啟動，而不是發出 WARN 後繼續執行。當安全政策要求「設定的配額必須生效」時使用此選項。                                                                                                          |
+## 👥 社群與支援
 
-</details>
+- **微信** — 掃描下方 QR Code 加入我們的微信群，參與討論、回饋與更新：
 
-<details>
-<summary><h2>架構</h2></summary>
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="../images/weixin-dark.jpg" />
+    <img src="../images/weixin-light.jpg" alt="WeChat" width="200" />
+  </picture>
 
-```text
-Next.js 16 (Static Export) + React 19
-        |
-        | invoke() (desktop) / fetch() + WebSocket (web)
-        v
-  ┌─────────────────────────┐
-  │   Transport Abstraction  │
-  │  (Tauri IPC or HTTP/WS) │
-  └─────────────────────────┘
-        |
-        v
-┌─── Tauri Desktop ───┐    ┌─── codeg-server ───┐
-│  Tauri 2 Commands    │    │  Axum HTTP + WS    │
-│  (window management) │    │  (standalone mode)  │
-└──────────┬───────────┘    └──────────┬──────────┘
-           └──────────┬───────────────┘
-                      v
-            Shared Rust Core
-              |- AppState
-              |- ACP Manager
-              |- Parsers (conversation ingestion)
-              |- Chat Channels
-              |- Git / File Tree / Terminal
-              |- MCP marketplace + config
-              |- Office Tools (officecli) + Automations
-              |- SeaORM + SQLite
-                      |
-              ┌───────┼───────┐
-              v       v       v
-  Local Filesystem  Git   Chat Channels
-    / Git Repos    Repos  (Telegram, Lark, iLink)
-```
+- **問題回報** — 發現 bug，或是缺了什麼功能？[開一個 issue](https://github.com/icannotwait/MyCodeBuddy/issues)。
+- **隱私** — 本機優先：解析、儲存與專案操作都留在你的機器上，Web 模式與伺服器模式皆以權杖驗證把關。詳見 [隱私與安全](https://docs.codeg.app/zh/reference/privacy)。
+- **LinuxDO** — 感謝 [LinuxDO](https://linux.do) 社群的支持。
+- **支持我們** — [幫儲存庫點個 Star](https://github.com/icannotwait/MyCodeBuddy)，追蹤後續進展。
 
-</details>
+## 🤝 參與貢獻
 
-## 隱私與安全
+歡迎提交 issue 與 pull request。想自己建置 Codeg，可以從 [開發](https://docs.codeg.app/zh/reference/development) 與 [架構](https://docs.codeg.app/zh/reference/architecture) 開始。
 
-- 預設本地優先：解析、儲存、專案操作均在本地完成
-- 僅在使用者主動觸發時才存取網路
-- 支援系統代理，適配企業網路環境
-- Web 服務模式使用基於令牌的身份認證
+<a href="https://github.com/icannotwait/MyCodeBuddy/graphs/contributors">
+  <img src="https://contrib.rocks/image?repo=icannotwait/MyCodeBuddy" alt="Codeg 貢獻者" />
+</a>
 
-## 交流
+## ⭐ Star 歷史
 
-- 掃描下方 QR Code 加入我們的微信群，參與討論、回饋與更新
+<a href="https://www.star-history.com/?repos=icannotwait%2FMyCodeBuddy&type=date&releases=&legend=bottom-right">
+ <picture>
+   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/chart?repos=icannotwait/MyCodeBuddy&type=date&theme=dark&legend=bottom-right" />
+   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/chart?repos=icannotwait/MyCodeBuddy&type=date&legend=bottom-right" />
+   <img alt="Star History Chart" src="https://api.star-history.com/chart?repos=icannotwait/MyCodeBuddy&type=date&legend=bottom-right" />
+ </picture>
+</a>
 
-<img src="../images/weixin-light.jpg#gh-light-mode-only" alt="WeChat" width="240" />
-<img src="../images/weixin-dark.jpg#gh-dark-mode-only" alt="WeChat" width="240" />
+## 🙏 致謝
 
-- 感謝 [LinuxDO](https://linux.do) 社群的支持
+- MyCodeBuddy 發布 DrawCode，是原 Codeg 專案的分支；安裝檔與發布均來自本倉庫。
 
-## 致謝
-
-- MyCodeBuddy 是原始 [Codeg](https://github.com/xintaofei/codeg) 專案的分支。
-- [ACP](https://agentclientprotocol.com)：智能體客戶端協定 (ACP) 是 codeg 實現多智能體連接的基礎
+- [Agent Client Protocol](https://agentclientprotocol.com)：Codeg 得以連接所有支援的智慧體的基礎
 - [Superpowers](https://github.com/obra/superpowers)：為 Codeg 的專家技能模組提供支援
 - [OfficeCLI](https://github.com/iOfficeAI/OfficeCLI)：為 Codeg 的 Office 文件工作流程提供支援
 - [scientific-agent-skills](https://github.com/K-Dense-AI/scientific-agent-skills)：為 Codeg 的科學研究技能提供支援（MIT 授權子集）
 
-## 授權
+## 📜 授權
 
 Apache-2.0，詳見 [LICENSE](../../LICENSE)。

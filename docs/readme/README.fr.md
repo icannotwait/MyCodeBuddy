@@ -1,31 +1,48 @@
-# Codeg
+<h1 align="center">
+  <a href="https://docs.codeg.app"><img src="../../public/icon.svg" alt="Codeg logo" width="64" align="absmiddle" /></a> Codeg
+</h1>
 
-[![Release](https://img.shields.io/github/v/release/icannotwait/MyCodeBuddy)](https://github.com/icannotwait/MyCodeBuddy/releases)
-[![License](https://img.shields.io/github/license/icannotwait/MyCodeBuddy)](../../LICENSE)
-[![Tauri](https://img.shields.io/badge/Tauri-2.x-24C8DB)](https://tauri.app/)
-[![Next.js](https://img.shields.io/badge/Next.js-16-black)](https://nextjs.org/)
-[![Docker](https://img.shields.io/badge/Docker-ready-2496ED)](../../Dockerfile)
-
-<p>
-  <a href="../../README.md">English</a> |
-  <a href="./README.zh-CN.md">简体中文</a> |
-  <a href="./README.zh-TW.md">繁體中文</a> |
-  <a href="./README.ja.md">日本語</a> |
-  <a href="./README.ko.md">한국어</a> |
-  <a href="./README.es.md">Español</a> |
-  <a href="./README.de.md">Deutsch</a> |
-  <strong>Français</strong> |
-  <a href="./README.pt.md">Português</a> |
-  <a href="./README.ar.md">العربية</a>
+<p align="center">
+  <a href="https://github.com/icannotwait/MyCodeBuddy"><img src="https://img.shields.io/github/stars/icannotwait/MyCodeBuddy?style=flat&color=e91e63" alt="GitHub stars" /></a>
+  <a href="https://github.com/icannotwait/MyCodeBuddy/releases/latest"><img src="https://img.shields.io/github/v/release/icannotwait/MyCodeBuddy?style=flat&color=e91e63" alt="Latest release" /></a>
+  <a href="https://github.com/icannotwait/MyCodeBuddy/releases"><img src="https://img.shields.io/github/downloads/icannotwait/MyCodeBuddy/total?style=flat&color=e91e63" alt="Total downloads" /></a>
+  <a href="../../LICENSE"><img src="https://img.shields.io/github/license/icannotwait/MyCodeBuddy?style=flat&color=e91e63" alt="License" /></a>
+  <a href="https://docs.codeg.app"><img src="https://img.shields.io/badge/docs-docs.codeg.app-3451b2?style=flat" alt="Documentation" /></a>
+  <a href="https://docs.codeg.app/getting-started/installation"><img src="https://img.shields.io/badge/macOS%20%7C%20Windows%20%7C%20Linux%20%7C%20Docker%20%7C%20iOS%20%7C%20Android-03a9f4?style=flat" alt="Platforms: macOS, Windows, Linux, Docker, iOS, Android" /></a>
 </p>
 
-Codeg (Code Generation) est un espace de travail de codage multi-agent. Il réunit plusieurs agents (Claude Code, Codex CLI, OpenCode, Gemini CLI, Cline, Hermes Agent, CodeBuddy, Kimi Code, Pi, Grok Build, Cursor, etc.) dans un seul espace de travail, prend en charge l'agrégation des conversations et la collaboration multi-agent, ainsi que l'installation desktop et le déploiement serveur/Docker.
+<p align="center">
+  <sub><a href="../../README.md">English</a> · <a href="./README.zh-CN.md">简体中文</a> · <a href="./README.zh-TW.md">繁體中文</a> · <a href="./README.ja.md">日本語</a> · <a href="./README.ko.md">한국어</a> · <a href="./README.es.md">Español</a> · <a href="./README.de.md">Deutsch</a> · <strong>Français</strong> · <a href="./README.pt.md">Português</a> · <a href="./README.ar.md">العربية</a></sub>
+</p>
 
-![gallery](../images/workspace-light.png#gh-light-mode-only)
-![gallery](../images/workspace-dark.png#gh-dark-mode-only)
-Il regroupe les sessions de toutes les CLI d'agents supportées dans un espace de travail unique et consultable, et permet à un agent principal de déléguer à des sous-agents d'autres types au sein d'une même tâche. Le travail que vous préférez ne pas surveiller part sur un tableau de tâches à faire : chaque tâche sur sa propre branche, exécutée sans surveillance, en attente de votre relecture avant d'atterrir. Codeg fonctionne en application de bureau, en serveur autonome ou en conteneur Docker, avec des clients natifs iOS et Android pour les moments où vous n'êtes pas à votre bureau ; quatorze agents sont intégrés, et vous pouvez enregistrer vous-même n'importe quel autre agent compatible ACP.
+<p align="center">
+  <strong>L'espace de travail de programmation multi-agents.</strong><br/>
+  Faites tourner tous vos agents de codage IA au même endroit — et laissez-les travailler ensemble.
+</p>
 
-## Sponsors
+<p align="center"><sub>DrawCode pour Windows est publié depuis <a href="https://github.com/icannotwait/MyCodeBuddy">MyCodeBuddy</a>.</sub></p>
+
+<h3 align="center"><a href="https://github.com/icannotwait/MyCodeBuddy/releases/latest"><ins>Télécharger DrawCode</ins></a> · <a href="https://docs.codeg.app"><ins>Documentation</ins></a></h3>
+
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="../images/workspace-dark.png" />
+    <img src="../images/workspace-light.png" alt="L'espace de travail Codeg : une conversation avec un agent, à côté de ses diffs en direct et des fichiers du projet" width="960" />
+  </picture>
+</p>
+
+<table>
+  <tr>
+    <td width="50%" valign="top">🧩 <strong>Une interface pour tous les agents</strong><br/>Quatorze agents intégrés, et tout agent ACP peut s'y ajouter — tous affichés sous la même forme de conversation structurée, pas dans un terminal.</td>
+    <td width="50%" valign="top">🔎 <strong>Des sessions qui voyagent</strong><br/>Importez, fouillez et reprenez l'historique que chaque agent conserve sur le disque, puis confiez-le à un autre agent.</td>
+  </tr>
+  <tr>
+    <td width="50%" valign="top">🤝 <strong>Des agents qui travaillent ensemble</strong><br/>Déléguez d'un agent à l'autre avec un <code>@</code>, ou mettez en file des tâches à faire qui s'exécutent sans surveillance dans leurs propres worktrees.</td>
+    <td width="50%" valign="top">🌍 <strong>Où que vous travailliez</strong><br/>Application de bureau, serveur auto-hébergé ou Docker, iPhone, iPad et Android — et Telegram, Lark ou WeChat.</td>
+  </tr>
+</table>
+
+## 💖 Sponsors
 
 <table>
   <tr>
@@ -85,61 +102,200 @@ Il regroupe les sessions de toutes les CLI d'agents supportées dans un espace d
 
 > Vous souhaitez devenir sponsor de Codeg ? [Contactez-nous par e-mail.](mailto:itpkcn@gmail.com)
 
-## Interface principale
+## ✨ Fonctionnalités
 
-![Codeg Light](../images/workspace-light.png#gh-light-mode-only)
-![Codeg Dark](../images/workspace-dark.png#gh-dark-mode-only)
-Claude Code · Codex · Gemini · OpenCode · Cline · Hermes · CodeBuddy · Kimi Code · Pi · Grok · Cursor · DeepSeek Harness · Qoder · Google Antigravity
+<table>
+<tr>
+<td width="50%" valign="middle">
 
-## Collaboration multi-agents
+### Une interface pour tous les agents
 
-![Codeg Light](../images/collaboration-light.gif#gh-light-mode-only)
-![Codeg Dark](../images/collaboration-dark.gif#gh-dark-mode-only)
+Quatorze agents sont intégrés, et tout autre agent ACP peut les rejoindre depuis le registre public ou via son JSON de distribution. Codeg parle l'Agent Client Protocol avec chacun d'eux : tous bénéficient donc de la même conversation riche — cartes d'outils, diffs en direct, plans et demandes d'autorisation — au lieu d'un terminal à déchiffrer en plissant les yeux.
 
-## Flux de travail Office
+[Documentation →](https://docs.codeg.app/guide/supported-agents) · [Agents personnalisés →](https://docs.codeg.app/guide/custom-agents)
 
-![Codeg Light](../images/office-light.png#gh-light-mode-only)
-![Codeg Dark](../images/office-dark.png#gh-dark-mode-only)
+</td>
+<td width="50%">
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="../images/features/agents-dark.gif" />
+  <img src="../images/features/agents-light.gif" alt="Une interface pour tous les agents" width="100%" />
+</picture>
+</td>
+</tr>
+<tr>
+<td width="50%" valign="middle">
 
-## Points forts
+### Chaque session, à portée de recherche
 
-- **Agrégation de conversations** — importez les sessions de tous les agents pris en charge dans un workspace unifié
-- **Collaboration multi-agents** — au sein d'une même session, l'agent principal délègue à des sous-agents de différents types (p. ex. Claude Code appelant Codex, Gemini) pour accomplir une tâche conjointement, chacun s'exécutant comme une session indépendante
-- Développement parallèle avec flux `git worktree` intégré
-- **Lanceur de projet** — créez visuellement de nouveaux projets avec aperçu en temps réel
-- **Documents Office** — créez, analysez, relisez et modifiez des fichiers .docx / .xlsx / .pptx via l'outillage officecli intégré ; aperçu en temps réel dans un onglet de fichier mis à jour instantanément lors des modifications de l'agent
-- **Recherche scientifique** — compétences scientifiques intégrées (génération d'hypothèses, conception expérimentale, statistiques, visualisation, évaluation critique, recherche bibliographique) que n'importe quel agent peut invoquer, gérées par agent
-- **Automatisations** — enregistrez n'importe quelle configuration du compositeur comme automatisation réutilisable s'exécutant sans interface, selon un calendrier cron ou à la demande
-- **Canaux de chat** — connectez Telegram, Lark (Feishu), iLink (Weixin) et plus à vos agents de codage pour des notifications en temps réel, une interaction complète avec les sessions et le contrôle à distance des tâches
-- Gestion MCP (scan local + recherche/installation depuis le registre)
-- Gestion des Skills (portée globale et projet)
-- Gestion des comptes distants Git (GitHub et autres serveurs Git)
-- Mode service web — accédez à Codeg depuis n'importe quel navigateur pour le travail à distance
-- **Déploiement en serveur autonome** — exécutez `codeg-server` sur n'importe quel serveur Linux/macOS, accédez via le navigateur
-- **Support Docker** — build local avec `docker compose up -d`, avec token/port personnalisables, persistance des données et montage de répertoires de projets
-- Journaux d'exécution — visualiseur de journaux en temps réel intégré avec filtrage et niveaux de journalisation par module
-- Boucle d'ingénierie intégrée (arborescence de fichiers, diff, changements git, commit, terminal)
+Codeg lit l'historique que chaque CLI d'agent conserve sur le disque : importez-le en un clic, cherchez dans l'ensemble et reprenez n'importe quelle session là où elle s'était arrêtée. Mentionnez une ancienne session avec `@` et l'agent auquel vous parlez peut la lire — même si un autre agent l'a écrite.
 
-## Agents supportés
+[Documentation →](https://docs.codeg.app/guide/aggregation)
 
-| Agent        | Chemin via variable d'environnement   | Défaut macOS / Linux                  | Défaut Windows                                        |
-| ------------ | ------------------------------------- | ------------------------------------- | ----------------------------------------------------- |
-| Claude Code  | `$CLAUDE_CONFIG_DIR/projects`         | `~/.claude/projects`                  | `%USERPROFILE%\\.claude\\projects`                    |
-| Codex CLI    | `$CODEX_HOME/sessions`                | `~/.codex/sessions`                   | `%USERPROFILE%\\.codex\\sessions`                     |
-| OpenCode     | `$XDG_DATA_HOME/opencode/opencode.db` | `~/.local/share/opencode/opencode.db` | `%USERPROFILE%\\.local\\share\\opencode\\opencode.db` |
-| Gemini CLI   | `$GEMINI_CLI_HOME/.gemini`            | `~/.gemini`                           | `%USERPROFILE%\\.gemini`                              |
-| Cline        | `$CLINE_DIR`                          | `~/.cline/data/tasks`                 | `%USERPROFILE%\\.cline\\data\\tasks`                  |
-| Hermes Agent | `$HERMES_HOME/state.db`               | `~/.hermes/state.db`                  | `%USERPROFILE%\\.hermes\\state.db`                    |
-| CodeBuddy    | `$CODEBUDDY_CONFIG_DIR/projects`      | `~/.codebuddy/projects`               | `%USERPROFILE%\\.codebuddy\\projects`                 |
-| Kimi Code    | `$KIMI_CODE_HOME/sessions`            | `~/.kimi-code/sessions`               | `%USERPROFILE%\\.kimi-code\\sessions`                 |
-| Pi           | `$PI_CODING_AGENT_SESSION_DIR`        | `~/.pi/agent/sessions`                | `%USERPROFILE%\\.pi\\agent\\sessions`                 |
-| Grok Build   | `$GROK_HOME/sessions`                 | `~/.grok/sessions`                    | `%USERPROFILE%\\.grok\\sessions`                      |
-| Cursor       | `$CURSOR_CONFIG_DIR/chats`            | `~/.cursor/chats`                     | `%USERPROFILE%\\.cursor\\chats`                       |
+</td>
+<td width="50%">
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="../images/features/sessions-dark.gif" />
+  <img src="../images/features/sessions-light.gif" alt="Chaque session, à portée de recherche" width="100%" />
+</picture>
+</td>
+</tr>
+<tr>
+<td width="50%" valign="middle">
 
-> Remarque : les variables d'environnement ont priorité sur les chemins par défaut.
+### Collaboration multi-agents
 
+Tapez `@`, choisissez un agent, envoyez. Chaque agent mentionné tourne dans sa propre session, côte à côte, et son travail arrive en direct dans votre fil — Claude Code rédige pendant que Codex relit — tandis que les sous-agents apparaissent sous forme de cartes qui se remplissent pendant qu'ils travaillent.
 
-Pas dans la liste ? Ajoutez-le vous-même. Choisissez un agent dans le registre public ACP ou collez son JSON de distribution : Codeg l'installe, vérifie qu'il démarre et le traite comme un agent intégré — il apparaît dans le sélecteur, accepte la délégation `@` et les skills, et ses conversations sont enregistrées et consultables même quand l'agent ne conserve aucun historique. → [Agents personnalisés](https://docs.codeg.app/guide/custom-agents)
+[Documentation →](https://docs.codeg.app/guide/multi-agent)
+
+</td>
+<td width="50%">
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="../images/features/multi-agent-dark.gif" />
+  <img src="../images/features/multi-agent-light.gif" alt="Collaboration multi-agents" width="100%" />
+</picture>
+</td>
+</tr>
+<tr>
+<td width="50%" valign="middle">
+
+### Des tâches à faire exécutées sans surveillance
+
+Notez un travail et passez à autre chose. Chaque tâche à faire obtient son propre worktree git et sa propre branche, démarre tout de suite ou selon une planification, puis attend d'être validée ; acceptez le diff et l'agent la fait atterrir, et Codeg vérifie git avant de la déclarer terminée.
+
+[Documentation →](https://docs.codeg.app/guide/tasks)
+
+</td>
+<td width="50%">
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="../images/features/todos-dark.gif" />
+  <img src="../images/features/todos-light.gif" alt="Des tâches à faire exécutées sans surveillance" width="100%" />
+</picture>
+</td>
+</tr>
+<tr>
+<td width="50%" valign="middle">
+
+### Canevas infini
+
+Organisez votre travail dans l'espace : conversations, fichiers, terminaux et notes deviennent des cartes sur un tableau, regroupées par dossier et par agent, pour que plusieurs agents puissent tourner côte à côte, bien en vue.
+
+[Documentation →](https://docs.codeg.app/guide/canvas)
+
+</td>
+<td width="50%">
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="../images/features/canvas-dark.gif" />
+  <img src="../images/features/canvas-light.gif" alt="Canevas infini" width="100%" />
+</picture>
+</td>
+</tr>
+<tr>
+<td width="50%" valign="middle">
+
+### Bureau, serveur, mobile et chat
+
+Faites tourner Codeg en application de bureau, en serveur auto-hébergé que vous ouvrez dans n'importe quel navigateur, ou dans un seul conteneur Docker. Des clients natifs pour iPhone, iPad et Android — ainsi que des canaux Telegram, Lark et WeChat — gardent vos agents à portée de main, tandis que vos fichiers et vos sessions restent sur votre propre machine.
+
+[Documentation →](https://docs.codeg.app/getting-started/deployment) · [Applications mobiles →](https://docs.codeg.app/getting-started/installation#mobile-apps) · [Canaux de chat →](https://docs.codeg.app/guide/chat-channels)
+
+</td>
+<td width="50%">
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="../images/features/anywhere-dark.gif" />
+  <img src="../images/features/anywhere-light.gif" alt="Bureau, serveur, mobile et chat" width="100%" />
+</picture>
+</td>
+</tr>
+<tr>
+<td width="50%" valign="middle">
+
+### Documents Office et recherche
+
+Demandez une présentation, un rapport ou un classeur, et regardez le vrai `.pptx`, `.docx` ou `.xlsx` s'afficher en direct à côté de la conversation. Les compétences de recherche intégrées — hypothèses, plan d'expérience, statistiques, recherche bibliographique — fonctionnent avec n'importe quel agent.
+
+[Documentation →](https://docs.codeg.app/guide/office) · [Recherche →](https://docs.codeg.app/guide/research)
+
+</td>
+<td width="50%">
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="../images/features/office-dark.gif" />
+  <img src="../images/features/office-light.gif" alt="Documents Office et recherche" width="100%" />
+</picture>
+</td>
+</tr>
+<tr>
+<td width="50%" valign="middle">
+
+### Utilisation du navigateur et de l'ordinateur
+
+Dans l'application de bureau, les liens s'ouvrent dans un navigateur intégré à côté de vos fichiers : confiez à l'agent une page, un élément, une capture d'écran ou une erreur de console, ou laissez-le piloter une page que vous partagez. En préversion, les agents peuvent aussi voir et manipuler les fenêtres que vous partagez — et le bouton Arrêter n'est qu'à un clic.
+
+[Documentation →](https://docs.codeg.app/guide/browser) · [Utilisation de l'ordinateur →](https://docs.codeg.app/guide/computer-use)
+
+</td>
+<td width="50%">
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="../images/features/browser-dark.gif" />
+  <img src="../images/features/browser-light.gif" alt="Utilisation du navigateur et de l'ordinateur" width="100%" />
+</picture>
+</td>
+</tr>
+<tr>
+<td width="50%" valign="middle">
+
+### Toute la boucle d'ingénierie
+
+Un éditeur, des diffs en direct et côte à côte, un client git complet avec un éditeur de fusion à trois volets, des worktrees en un clic, un terminal intégré et des vues divisées — le tout à côté de l'agent, sur les vrais fichiers de votre dépôt.
+
+[Documentation →](https://docs.codeg.app/guide/workspace) · [Git et worktrees →](https://docs.codeg.app/guide/git)
+
+</td>
+<td width="50%">
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="../images/features/workspace-dark.gif" />
+  <img src="../images/features/workspace-light.gif" alt="Toute la boucle d'ingénierie" width="100%" />
+</picture>
+</td>
+</tr>
+</table>
+
+**Également inclus :**
+
+- **[Panneau du dépôt](https://docs.codeg.app/guide/repository)** — issues, pull requests, vérifications et fusions pour GitHub, GitLab, Gitea et Forgejo ; toute issue ou PR peut devenir une tâche à faire
+- **[Automatisations](https://docs.codeg.app/guide/automations)** — enregistrez une zone de saisie configurée et exécutez-la sans interface, selon une planification cron ou à la demande
+- **[Utilisation des tokens](https://docs.codeg.app/guide/token-usage)** — tendances, taux de succès du cache, carte de chaleur d'activité et utilisation par dossier, agent, modèle et session
+- **[Bifurquer et réorienter](https://docs.codeg.app/guide/workspace#follow-along-%E2%80%94-the-conversation)** — sur les agents qui le prennent en charge, faites bifurquer une conversation depuis une réponse terminée, ou envoyez un message dans un tour encore en cours
+- **[Compétences](https://docs.codeg.app/guide/skills) et [MCP](https://docs.codeg.app/guide/mcp)** — packs de compétences par agent, scan MCP local, recherche et installation depuis le registre
+- **[Lanceur de projet](https://docs.codeg.app/guide/project-boot)** — créez visuellement le squelette d'un nouveau projet, avec un aperçu en direct
+- **[À votre image](https://docs.codeg.app/reference/settings/appearance)** — douze thèmes que vous pouvez recolorer token par token, fonds d'écran, rayon des coins et CSS personnalisé — dans n'importe laquelle des dix langues de l'interface
+- **[Sauvegarde et synchronisation](https://docs.codeg.app/reference/settings/system#backup-restore)** — sauvegardes chiffrées et synchronisation de la configuration entre machines, via un fichier ou votre propre serveur WebDAV
+- **[Schéma d'URL](../../docs/url-scheme.md)** — `codeg://session/<id>` ouvre une conversation depuis une autre application (bureau)
+- **Et plus encore** — presque chaque version apporte du nouveau ; les [notes de version](https://github.com/icannotwait/MyCodeBuddy/releases) en donnent la liste complète
+
+## 🤖 Agents pris en charge
+
+Codeg communique avec chaque agent via l'[Agent Client Protocol](https://agentclientprotocol.com) : chacun bénéficie ainsi de la même interface structurée. Quatorze sont intégrés, et Codeg installe, épingle et met à jour la plupart d'entre eux pour vous :
+
+<p>
+  <a href="https://www.anthropic.com/claude-code"><kbd><img src="../images/agents/claude-code.svg" alt="" width="16" valign="middle" /> Claude Code</kbd></a> &nbsp;
+  <a href="https://github.com/openai/codex"><kbd><img src="../images/agents/codex.svg" alt="" width="16" valign="middle" /> Codex</kbd></a> &nbsp;
+  <a href="https://github.com/google-gemini/gemini-cli"><kbd><img src="../images/agents/gemini-cli.svg" alt="" width="16" valign="middle" /> Gemini CLI</kbd></a> &nbsp;
+  <a href="https://opencode.ai"><kbd><picture><source media="(prefers-color-scheme: dark)" srcset="../images/agents/opencode-dark.svg" /><img src="../images/agents/opencode.svg" alt="" width="16" valign="middle" /></picture> OpenCode</kbd></a> &nbsp;
+  <a href="https://cline.bot"><kbd><picture><source media="(prefers-color-scheme: dark)" srcset="../images/agents/cline-dark.svg" /><img src="../images/agents/cline.svg" alt="" width="16" valign="middle" /></picture> Cline</kbd></a> &nbsp;
+  <a href="https://hermes-agent.nousresearch.com"><kbd><picture><source media="(prefers-color-scheme: dark)" srcset="../images/agents/hermes-agent-dark.svg" /><img src="../images/agents/hermes-agent.svg" alt="" width="16" valign="middle" /></picture> Hermes Agent</kbd></a> &nbsp;
+  <a href="https://www.codebuddy.ai"><kbd><picture><source media="(prefers-color-scheme: dark)" srcset="../images/agents/codebuddy-dark.svg" /><img src="../images/agents/codebuddy.svg" alt="" width="16" valign="middle" /></picture> CodeBuddy</kbd></a> &nbsp;
+  <a href="https://www.kimi.com/code"><kbd><img src="../images/agents/kimi-code.svg" alt="" width="16" valign="middle" /> Kimi Code</kbd></a> &nbsp;
+  <a href="https://pi.dev"><kbd><img src="../images/agents/pi.svg" alt="" width="16" valign="middle" /> Pi</kbd></a> &nbsp;
+  <a href="https://x.ai/cli"><kbd><picture><source media="(prefers-color-scheme: dark)" srcset="../images/agents/grok-dark.svg" /><img src="../images/agents/grok.svg" alt="" width="16" valign="middle" /></picture> Grok</kbd></a> &nbsp;
+  <a href="https://cursor.com/cli"><kbd><picture><source media="(prefers-color-scheme: dark)" srcset="../images/agents/cursor-dark.svg" /><img src="../images/agents/cursor.svg" alt="" width="16" valign="middle" /></picture> Cursor</kbd></a> &nbsp;
+  <a href="https://deepseek-harness.github.io/deepseek-harness/"><kbd><img src="../images/agents/deepseek-harness.svg" alt="" width="16" valign="middle" /> DeepSeek Harness</kbd></a> &nbsp;
+  <a href="https://qoder.com"><kbd><picture><source media="(prefers-color-scheme: dark)" srcset="../images/agents/qoder-dark.svg" /><img src="../images/agents/qoder.svg" alt="" width="16" valign="middle" /></picture> Qoder</kbd></a> &nbsp;
+  <a href="https://antigravity.google"><kbd><picture><source media="(prefers-color-scheme: dark)" srcset="../images/agents/google-antigravity-dark.svg" /><img src="../images/agents/google-antigravity.svg" alt="" width="16" valign="middle" /></picture> Google Antigravity</kbd></a> &nbsp;
+  <a href="https://docs.codeg.app/guide/custom-agents"><kbd>+ tout agent ACP</kbd></a>
+</p>
+
+Pas dans la liste ? Choisissez n'importe quel agent dans le registre public ACP ou collez son JSON de distribution — Codeg l'installe, vérifie qu'il démarre et le traite comme un agent intégré. Prérequis d'exécution et emplacement des sessions de chaque agent : [Agents pris en charge](https://docs.codeg.app/guide/supported-agents).
 
 ## 🪟 Vue divisée
 
@@ -150,305 +306,107 @@ Faites glisser un onglet d'un groupe à l'autre : sa session continue de streame
 ![Division de la zone de conversation en une grille de groupes d'onglets](../images/split-light.gif#gh-light-mode-only)
 ![Division de la zone de conversation en une grille de groupes d'onglets](../images/split-dark.gif#gh-dark-mode-only)
 
-<details>
-<summary><h2>Lanceur de projet</h2></summary>
+## 📦 Installation
 
-Créez visuellement de nouveaux projets avec une interface à panneaux divisés : configuration à gauche, aperçu en temps réel à droite.
+**Bureau** — les Releases de ce dépôt publient **DrawCode** pour Windows (NSIS). L’usage quotidien passe par cet installeur de bureau.
 
-
-### Fonctionnalités
-
-- **Configuration visuelle** — sélectionnez le style, le thème de couleur, la bibliothèque d'icônes, la police, le rayon de bordure et plus dans les menus déroulants ; l'aperçu se met à jour instantanément
-- **Aperçu en direct** — visualisez le rendu de votre configuration en temps réel avant de créer quoi que ce soit
-- **Création en un clic** — cliquez sur « Créer un projet » et le launcher exécute `shadcn init` avec votre preset, le template de framework (Next.js / Vite / React Router / Astro / Laravel) et le gestionnaire de paquets (pnpm / npm / yarn / bun)
-- **Détection des gestionnaires de paquets** — vérifie automatiquement quels gestionnaires sont installés et affiche leurs versions
-- **Intégration transparente** — le projet nouvellement créé s'ouvre directement dans l'espace de travail Codeg
-
-Prend actuellement en charge le scaffolding de projets **shadcn/ui**, avec un design à onglets prêt pour d'autres types de projets à l'avenir.
-
-</details>
-
-<details>
-<summary><h2>Canaux de chat</h2></summary>
-
-Connectez vos applications de messagerie préférées — Telegram, Lark (Feishu), iLink (Weixin) et plus — à vos agents de codage IA. Créez des tâches, envoyez des messages de suivi, approuvez les permissions, reprenez des sessions et surveillez l'activité directement depuis votre chat — recevez les réponses des agents en temps réel avec les détails des appels d'outils, les demandes de permissions et les résumés de complétion, le tout sans ouvrir de navigateur.
-
-Les supergroupes forum Telegram peuvent aussi utiliser le [Telegram topic mode](../chat-channels/telegram-topic-mode.md) pour lier chaque topic à une session Codeg distincte.
-
-### Canaux pris en charge
-
-| Canal          | Protocole                   | Statut  |
-| -------------- | --------------------------- | ------- |
-| Telegram       | Bot API (HTTP long-polling) | Intégré |
-| Lark (Feishu)  | WebSocket + REST API        | Intégré |
-| iLink (Weixin) | WebSocket + REST API        | Intégré |
-
-> D'autres canaux (Discord, Slack, DingTalk, etc.) sont prévus pour de futures versions.
-
-</details>
-
-<details>
-<summary><h2>Documents Office</h2></summary>
-
-Travaillez avec des fichiers Word, Excel et PowerPoint comme flux de travail de premier plan. L'outillage **officecli** intégré permet à vos agents de créer, analyser, relire et modifier des documents .docx, .xlsx et .pptx — et de prévisualiser le résultat directement dans Codeg.
-
-### Fonctionnalités
-
-- **Créer et modifier** — générez de nouveaux documents ou modifiez des .docx / .xlsx / .pptx existants, y compris graphiques, tableaux et mise en forme
-- **Analyser et relire** — inspectez la structure du document, détectez les problèmes de mise en forme et relisez le contenu
-- **Aperçu en direct** — ouvrez un .docx / .xlsx / .pptx dans un onglet de fichier et il s'affiche en ligne, se mettant à jour automatiquement à chaque modification de l'agent — alimenté par un serveur `officecli watch` persistant (avec proxy inverse et authentification par capacité pour les environnements web et serveur)
-- **Actions rapides** — la page d'accueil propose des onglets Codage, Office et Recherche scientifique qui insèrent en un clic l'invocation de compétence correspondante et un modèle de prompt dans le compositeur ; les compétences non activées affichent un badge de verrouillage et renvoient vers l'activation
-- **Paramètres Office Tools** — une page de paramètres dédiée installe `officecli` et gère ses compétences documentaires via une matrice compétence×agent : basculez n'importe quelle paire (compétence, agent) et appliquez des modifications en bloc
-
-</details>
-
-<details>
-<summary><h2>Recherche scientifique</h2></summary>
-
-Transformez n'importe quel agent en assistant de recherche rigoureux. Codeg intègre un ensemble sélectionné de **compétences de recherche scientifique** sous licence MIT — de l'idéation à l'analyse jusqu'à la rédaction — qui s'installent dans le magasin central de compétences partagé et se lient aux agents de votre choix, exactement comme les outillages expert et office.
-
-### Fonctionnalités
-
-- **Compétences sélectionnées** — génération d'hypothèses, conception expérimentale, puissance statistique, analyse statistique, analyse exploratoire des données, visualisation scientifique, évaluation critique, évaluation par les pairs, gestion des citations, évaluation des chercheurs, recherche d'articles et schémas IA
-- **Actions rapides** — l'onglet Recherche scientifique de la page d'accueil insère en un clic l'invocation de compétence correspondante ainsi qu'un modèle de prompt localisé dans le compositeur
-- **Paramètres scientifiques** — une page de paramètres dédiée gère les compétences via une matrice compétence×agent, avec des badges signalant les compétences nécessitant une clé API ou un environnement Python
-
-</details>
-
-<details>
-<summary><h2>Automatisations</h2></summary>
-
-Transformez n'importe quelle configuration du compositeur — agent, modèle, prompt, répertoire de travail et options — en une **Automatisation** réutilisable s'exécutant sans ouvrir l'interface.
-
-### Fonctionnalités
-
-- **Configurer une fois, réutiliser à volonté** — enregistrez une configuration complète du compositeur comme automatisation nommée
-- **Planifiée ou à la demande** — exécutez-la selon un calendrier cron ou déclenchez-la manuellement
-- **Exécution sans interface** — les automatisations s'exécutent en arrière-plan et créent de vraies sessions que vous pouvez ouvrir dans le workspace à tout moment ; après le démarrage, l'interface revient automatiquement au workspace
-
-</details>
-
-<details>
-<summary><h2>Démarrage rapide</h2></summary>
-
-### Prérequis
-
-- Node.js `>=22` (recommandé)
-- pnpm `>=10`
-- Rust stable (2021 edition)
-- Dépendances de build Tauri 2 (mode bureau uniquement)
-
-Exemple Linux (Debian/Ubuntu) :
-
-```bash
-sudo apt-get update
-sudo apt-get install -y \
-  libwebkit2gtk-4.1-dev \
-  libayatana-appindicator3-dev \
-  librsvg2-dev \
-  patchelf
-```
-
-### Binaires
-
-Codeg fournit trois binaires Rust issus d'un seul workspace :
-
-| Binaire        | Rôle                                                                                                                  | Build                                                                          |
-| -------------- | --------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------ |
-| `codeg`        | Application de bureau Tauri (fenêtre, tray, updater)                                                                  | `pnpm tauri build` (release) / `pnpm tauri dev` (dev)                          |
-| `codeg-server` | Serveur HTTP + WebSocket autonome pour les déploiements navigateur/headless                                           | `pnpm server:build` / `pnpm server:dev`                                        |
-| `codeg-mcp`    | Compagnon MCP stdio lancé par session, qui expose l'outil `delegate_to_agent` aux CLI d'agents (collaboration multi-agents) | `pnpm tauri:prepare-sidecars` (invoqué automatiquement par `tauri dev` / `tauri build`) |
-
-`codeg-mcp` doit se trouver à côté de son binaire parent au moment de l'exécution — les installeurs, l'image Docker et le bundler de sidecar Tauri le placent tous à côté de `codeg` / `codeg-server`. Les builds depuis les sources et les agencements personnalisés peuvent surcharger la recherche via la variable d'environnement `CODEG_MCP_BIN=/chemin/abs/codeg-mcp`. Si le compagnon est absent, la délégation est ignorée (un seul avertissement est journalisé) et le reste de la session de l'agent continue de fonctionner.
-
-### Développement
-
-```bash
-pnpm install
-
-# Frontend uniquement (serveur de dev Next.js, sans Rust)
-pnpm dev
-
-# Export statique du frontend vers out/
-pnpm build
-
-# Application de bureau complète (Tauri + Next.js, compile automatiquement le sidecar codeg-mcp)
-pnpm tauri dev
-
-# Build de release de l'application de bureau (intègre codeg-mcp comme externalBin)
-pnpm tauri build
-
-# Serveur autonome (sans Tauri/GUI requis)
-pnpm server:dev
-pnpm server:build                  # binaire de release dans src-tauri/target/release/codeg-server
-
-# Compiler explicitement le compagnon codeg-mcp (pour la triplet hôte)
-pnpm tauri:prepare-sidecars        # sortie : src-tauri/binaries/codeg-mcp-<triple>
-
-# Sauter la préparation du sidecar lors d'itérations sur le frontend sans besoin de délégation
-CODEG_SKIP_SIDECAR=1 pnpm tauri dev
-
-# Lint
-pnpm eslint .
-
-# Tests frontend (vitest)
-pnpm test
-pnpm test:watch
-pnpm test:coverage
-
-# Vérifications Rust (exécuter dans src-tauri/)
-cargo check                                                     # bureau (features par défaut)
-cargo check --no-default-features --bin codeg-server            # mode serveur
-cargo check --no-default-features --bin codeg-mcp               # compagnon MCP
-cargo clippy --all-targets --features test-utils -- -D warnings
-
-# Tests Rust
-cargo test --features test-utils                                # bureau (avec intégration)
-cargo test --no-default-features --bin codeg-server --lib       # mode serveur
-cargo insta review                                              # accepter les mises à jour de snapshots de parser
-```
-
-> Astuce : lorsque vous avez un build récent de `codeg-mcp` sous `src-tauri/target/release/` et que vous voulez y faire pointer un `codeg-server` lancé manuellement sans réinstaller, exportez `CODEG_MCP_BIN=$(pwd)/src-tauri/target/release/codeg-mcp`.
-
-### Déploiement du serveur
-
-Codeg peut fonctionner comme un serveur web autonome sans environnement de bureau.
-
-
-#### Remove a leftover Windows `codeg-server` install
+**Serveur** — `codeg-server` est réservé à l’auto-hébergement (feature Cargo `server`). Les utilisateurs du bureau installent DrawCode. Sous Windows, dans PowerShell :
 
 ```powershell
 .\uninstall-server.ps1
 # or:
 irm https://raw.githubusercontent.com/icannotwait/MyCodeBuddy/main/uninstall-server.ps1 | iex
+
+.\install.ps1 -Version v0.33.0-mycodebuddy.1
+# or:
+irm https://raw.githubusercontent.com/icannotwait/MyCodeBuddy/main/install.ps1 | iex
+$env:CODEG_STATIC_DIR="$env:LOCALAPPDATA\codeg-server\web"; codeg-server
 ```
 
-GitHub Releases ship desktop DrawCode (NSIS) plus signed standalone server
-archives such as `codeg-server-linux-x64.tar.gz` (and darwin/windows siblings).
-Self-host with the release archive, Docker, or a source build (`--features server`).
-Windows install:
+L’installeur utilise par défaut `%LOCALAPPDATA%\codeg-server`, donc il n’écrase pas une installation de bureau DrawCode. Si une ancienne installation partageait le dossier du bureau, le script en sort le serveur.
 
-```powershell
-.\install.ps1 -Version v0.31.1-mycodebuddy.1
-```
+[GitHub Releases](https://github.com/icannotwait/MyCodeBuddy/releases) propose aussi des archives serveur signées pour l’auto-hébergement : `codeg-server-linux-x64.tar.gz`, `codeg-server-linux-arm64.tar.gz`, `codeg-server-darwin-x64.tar.gz`, `codeg-server-darwin-arm64.tar.gz` et `codeg-server-windows-x64.zip`. Chacune contient le serveur, le compagnon MCP, l’auxiliaire de contrôle de l’ordinateur, les ressources `web/` et les fichiers de licence.
 
-#### Option 3 : Docker
+**Docker** — construire le serveur facultatif depuis ce dépôt :
 
 ```bash
 docker compose up -d
 ```
 
-Docker Compose construit l'image localement depuis ce dépôt. Le build multi-stage (Node.js + Rust → runtime Debian allégé) inclut `git` et `ssh`. Les données sont conservées dans le volume `/data` ; le token, le port et les montages de projets se configurent dans `docker-compose.yml`.
+Docker Compose construit l’image localement et active la feature Cargo `server`. Les données restent dans le volume `/data` ; le jeton, le port et les montages de projets se règlent dans `docker-compose.yml`.
 
-#### Option 4 : Compiler depuis les sources
+**Depuis les sources** — `codeg-server` a besoin de `--features server`, et `codeg-mcp` de `--features mcp-bin` :
 
 ```bash
-pnpm install && pnpm build          # compiler le frontend
+pnpm install && pnpm build
 cd src-tauri
 cargo build --release --bin codeg-server --no-default-features --features server
-cargo build --release --bin codeg-mcp --no-default-features    # compagnon de délégation
-CODEG_STATIC_DIR=../out ./target/release/codeg-server          # codeg-mcp est détecté comme fichier voisin
+cargo build --release --bin codeg-mcp --no-default-features --features mcp-bin
+# Uniquement si le contrôle de l’ordinateur est activé :
+cargo build --release --bin codeg-computer-helper --no-default-features --features computer-helper
+CODEG_STATIC_DIR=../out ./target/release/codeg-server
 ```
 
-Si vous conservez les deux binaires dans des répertoires séparés, définissez `CODEG_MCP_BIN=/chemin/abs/vers/codeg-mcp` pour que le runtime puisse toujours trouver le compagnon ; sans cela, la délégation multi-agents est désactivée silencieusement.
-
-#### Mise à niveau des builds source Linux/macOS
+**Mise à niveau des builds source Linux/macOS** — Depuis la racine du dépôt, récupérez les sources et recompilez :
 
 ```bash
 git pull
 pnpm install && pnpm build
 cd src-tauri
 cargo build --release --bin codeg-server --no-default-features --features server
-cargo build --release --bin codeg-mcp --no-default-features
-# Arrêtez le service, redéployez les deux binaires et les ressources web, puis redémarrez.
+cargo build --release --bin codeg-mcp --no-default-features --features mcp-bin
+# Uniquement si le contrôle de l’ordinateur est activé :
+cargo build --release --bin codeg-computer-helper --no-default-features --features computer-helper
+# Arrêtez le service, redéployez le serveur, le compagnon MCP, l’auxiliaire facultatif et les ressources web, puis redémarrez.
 ```
 
-Les déploiements Linux/macOS compilés depuis les sources se mettent à niveau en
-récupérant la révision voulue, en recompilant et en redéployant. Les endpoints
-du serveur autonome ne téléchargent ni n'appliquent les versions GitHub
-Releases sur place. Les déploiements Docker reconstruisent aussi l'image et le
-conteneur.
+Pour mettre à jour Docker, exécutez `git pull && docker compose up --build -d --force-recreate` depuis la racine du dépôt.
 
-#### Configuration
+**Mobile** — installez l'[app iOS](https://apps.apple.com/app/codeg-client/id6785199071) ou l'[APK Android](https://github.com/xintaofei/codeg-android/releases/latest), puis pointez-la vers le **Service Web** de votre application de bureau ou vers votre propre `codeg-server` : URL, jeton, c'est prêt. Les étapes d'appairage sont dans [Applications mobiles](https://docs.codeg.app/getting-started/installation#mobile-apps).
 
-Variables d'environnement :
+Compose, binaires précompilés, compilation depuis les sources et mises à jour sur place sont traités dans [Déploiement](https://docs.codeg.app/getting-started/deployment) ; les variables d'environnement dans [Configuration](https://docs.codeg.app/getting-started/configuration).
 
-| Variable                       | Valeur par défaut      | Description                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               |
-| ------------------------------ | ---------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `CODEG_PORT`                   | `3080`                 | Port HTTP                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
-| `CODEG_HOST`                   | `0.0.0.0`              | Adresse de liaison                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
-| `CODEG_TOKEN`                  | _(aléatoire)_          | Jeton d'authentification (affiché sur stderr au démarrage)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
-| `CODEG_DATA_DIR`               | `~/.local/share/codeg` | Répertoire de la base de données SQLite (racine également de `uploads/`, `pets/`)                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
-| `CODEG_STATIC_DIR`             | `./web` ou `./out`     | Répertoire d'export statique Next.js                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
-| `CODEG_MCP_BIN`                | _(non défini)_         | Chemin absolu vers le compagnon `codeg-mcp`. Remplace la recherche par défaut (fichier voisin de l'exécutable + `PATH`). À utiliser pour les builds depuis les sources ou les agencements personnalisés où le compagnon réside en dehors du répertoire d'installation du serveur.                                                                                                                                                                                                                                                         |
-| `CODEG_SKIP_SIDECAR`           | _(non défini)_         | Variable de confort réservée au frontend pour `pnpm tauri dev` / `pnpm tauri build` — lorsqu'elle vaut `1`, la compilation du sidecar `codeg-mcp` est ignorée. La délégation est désactivée dans ce build ; les artefacts de qualité production doivent la laisser non définie.                                                                                                                                                                                                                                                          |
-| `CODEG_UPLOAD_MAX_TOTAL_BYTES` | _(non défini)_         | Limite stricte du nombre total d'octets résidant sous `<data dir>/uploads/`. Nombre d'octets en décimal (p. ex. `10737418240` pour 10 Gio). Non défini, `0` ou une valeur non analysable désactive la limite et imprime une ligne au démarrage pour que la configuration soit visible. La limite est appliquée au sein d'un seul processus `codeg-server` — les déploiements à mise à l'échelle horizontale partageant un même volume `uploads/` nécessitent une coordination externe (verrou de fichier, Redis, quota de proxy inverse). |
-| `CODEG_UPLOAD_QUOTA_STRICT`    | _(non défini)_         | Lorsque vrai (`1` / `true` / `yes` / `on`), interrompt le démarrage avec le code de sortie 2 si `CODEG_UPLOAD_MAX_TOTAL_BYTES` est défini sur une valeur non analysable, au lieu de continuer avec un WARN. Utilisez ceci lorsque votre politique de sécurité exige que « le quota configuré doit être effectif ».                                                                                                                                                                                                                        |
+## 👥 Communauté et support
 
-</details>
+- **WeChat** — scannez le QR code et rejoignez notre groupe pour des discussions, des retours et des mises à jour :
 
-<details>
-<summary><h2>Architecture</h2></summary>
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="../images/weixin-dark.jpg" />
+    <img src="../images/weixin-light.jpg" alt="WeChat" width="200" />
+  </picture>
 
-```text
-Next.js 16 (Static Export) + React 19
-        |
-        | invoke() (desktop) / fetch() + WebSocket (web)
-        v
-  ┌─────────────────────────┐
-  │   Transport Abstraction  │
-  │  (Tauri IPC or HTTP/WS) │
-  └─────────────────────────┘
-        |
-        v
-┌─── Tauri Desktop ───┐    ┌─── codeg-server ───┐
-│  Tauri 2 Commands    │    │  Axum HTTP + WS    │
-│  (window management) │    │  (standalone mode)  │
-└──────────┬───────────┘    └──────────┬──────────┘
-           └──────────┬───────────────┘
-                      v
-            Shared Rust Core
-              |- AppState
-              |- ACP Manager
-              |- Parsers (conversation ingestion)
-              |- Chat Channels
-              |- Git / File Tree / Terminal
-              |- MCP marketplace + config
-              |- Office Tools (officecli) + Automations
-              |- SeaORM + SQLite
-                      |
-              ┌───────┼───────┐
-              v       v       v
-  Local Filesystem  Git   Chat Channels
-    / Git Repos    Repos  (Telegram, Lark, iLink)
-```
+- **Issues** — un bug trouvé ou une fonctionnalité manquante ? [Ouvrez une issue](https://github.com/icannotwait/MyCodeBuddy/issues).
+- **Confidentialité** — local d'abord : l'analyse, le stockage et les opérations sur les projets restent sur votre machine, et les modes web et serveur sont protégés par une authentification par jeton. Détails dans [Confidentialité et sécurité](https://docs.codeg.app/reference/privacy).
+- **LinuxDO** — merci à la communauté [LinuxDO](https://linux.do) pour son soutien.
+- **Soutenez-nous** — [mettez une étoile au dépôt](https://github.com/icannotwait/MyCodeBuddy) pour suivre le projet.
 
-</details>
+## 🤝 Contribuer
 
-## Confidentialité et sécurité
+Les issues et les pull requests sont les bienvenues. Pour compiler Codeg vous-même, commencez par [Développement](https://docs.codeg.app/reference/development) et [Architecture](https://docs.codeg.app/reference/architecture).
 
-- Local-first par défaut pour l'analyse, le stockage et les opérations sur le projet
-- L'accès réseau ne se produit que lors d'actions déclenchées par l'utilisateur
-- Prise en charge du proxy système pour les environnements d'entreprise
-- Le mode service web utilise l'authentification par jeton
+<a href="https://github.com/icannotwait/MyCodeBuddy/graphs/contributors">
+  <img src="https://contrib.rocks/image?repo=icannotwait/MyCodeBuddy" alt="Contributeurs de Codeg" />
+</a>
 
-## Communauté
+## ⭐ Historique des étoiles
 
-- Scannez le QR code ci-dessous pour rejoindre notre groupe WeChat pour des discussions, des retours et des mises à jour
+<a href="https://www.star-history.com/?repos=icannotwait%2FMyCodeBuddy&type=date&releases=&legend=bottom-right">
+ <picture>
+   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/chart?repos=icannotwait/MyCodeBuddy&type=date&theme=dark&legend=bottom-right" />
+   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/chart?repos=icannotwait/MyCodeBuddy&type=date&legend=bottom-right" />
+   <img alt="Star History Chart" src="https://api.star-history.com/chart?repos=icannotwait/MyCodeBuddy&type=date&legend=bottom-right" />
+ </picture>
+</a>
 
-<img src="../images/weixin-light.jpg#gh-light-mode-only" alt="WeChat" width="240" />
-<img src="../images/weixin-dark.jpg#gh-dark-mode-only" alt="WeChat" width="240" />
+## 🙏 Remerciements
 
-- Merci à la communauté [LinuxDO](https://linux.do) pour son soutien
+- MyCodeBuddy publie DrawCode. C’est un fork du projet Codeg d’origine ; les versions et les installeurs viennent de ce dépôt.
 
-## Remerciements
-
-- MyCodeBuddy est un fork du projet [Codeg](https://github.com/xintaofei/codeg) original.
-- [ACP](https://agentclientprotocol.com) — l'Agent Client Protocol (ACP) est la base qui permet à Codeg de se connecter à plusieurs agents
+- [Agent Client Protocol](https://agentclientprotocol.com) — le socle qui permet à Codeg de se connecter à tous les agents qu'il supporte
 - [Superpowers](https://github.com/obra/superpowers) — alimente le module de compétences d'experts de Codeg
 - [OfficeCLI](https://github.com/iOfficeAI/OfficeCLI) — alimente le flux de travail des documents Office de Codeg
 - [scientific-agent-skills](https://github.com/K-Dense-AI/scientific-agent-skills) — alimente les compétences de Recherche scientifique de Codeg (sous-ensemble sous licence MIT)
 
-## Licence
+## 📜 Licence
 
 Apache-2.0. Voir [LICENSE](../../LICENSE).

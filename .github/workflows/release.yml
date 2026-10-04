@@ -214,8 +214,12 @@ jobs:
         shell: pwsh
         run: |
           $sidecars = @(
-            "src-tauri/binaries/${{ matrix.sidecar }}"
+            "src-tauri/binaries/${{ matrix.sidecar }}",
+            "src-tauri/binaries/codeg-computer-helper-${{ matrix.target }}.exe"
           )
+          foreach ($serverSidecar in @(Get-ChildItem "src-tauri/binaries" -Filter "codeg-server*" -ErrorAction SilentlyContinue)) {
+            throw "Desktop bundles must not ship codeg-server: $($serverSidecar.FullName)"
+          }
           foreach ($sidecar in $sidecars) {
             if (-not (Test-Path -LiteralPath $sidecar -PathType Leaf)) {
               throw "Missing staged sidecar: $sidecar"
@@ -352,14 +356,17 @@ jobs:
       - name: Build frontend
         run: pnpm build
 
-      - name: Build server + codeg-mcp companion
+      - name: Build server + codeg-mcp companion + computer-use helper
         working-directory: src-tauri
-        # This fork gates `codeg-server` behind Cargo feature `server` (upstream
-        # builds the bin with only `--no-default-features`). codeg-mcp is built
-        # with the same target so Linux arm64 shares the cross-compile env.
+        # This fork gates `codeg-server` behind Cargo feature `server`
+        # (release-policy tests search for `--features server`; upstream names
+        # the same gate `server-bin`). `codeg-mcp` needs `mcp-bin`.
+        # `codeg-computer-helper` serves computer use and ships beside the
+        # server. All three share the cross-compile env (Linux arm64).
         run: |
           cargo build --release --bin codeg-server --no-default-features --features server --target ${{ matrix.target }}
-          cargo build --release --bin codeg-mcp --no-default-features --target ${{ matrix.target }}
+          cargo build --release --bin codeg-mcp --no-default-features --features mcp-bin --target ${{ matrix.target }}
+          cargo build --release --bin codeg-computer-helper --no-default-features --features computer-helper --target ${{ matrix.target }}
 
       - name: Package (Unix)
         if: runner.os != 'Windows'
@@ -368,13 +375,15 @@ jobs:
           mkdir -p "dist/${{ matrix.artifact }}"
           cp "src-tauri/target/${{ matrix.target }}/release/codeg-server" "dist/${{ matrix.artifact }}/"
           cp "src-tauri/target/${{ matrix.target }}/release/codeg-mcp" "dist/${{ matrix.artifact }}/"
-          chmod +x "dist/${{ matrix.artifact }}/codeg-server" "dist/${{ matrix.artifact }}/codeg-mcp"
+          cp "src-tauri/target/${{ matrix.target }}/release/codeg-computer-helper" "dist/${{ matrix.artifact }}/"
+          chmod +x "dist/${{ matrix.artifact }}/codeg-server" "dist/${{ matrix.artifact }}/codeg-mcp" "dist/${{ matrix.artifact }}/codeg-computer-helper"
           cp -r out "dist/${{ matrix.artifact }}/web"
           cp LICENSE NOTICE "dist/${{ matrix.artifact }}/"
           cp src-tauri/resources/THIRD_PARTY_LICENSES.txt "dist/${{ matrix.artifact }}/"
           for required in \
             "dist/${{ matrix.artifact }}/codeg-server" \
             "dist/${{ matrix.artifact }}/codeg-mcp" \
+            "dist/${{ matrix.artifact }}/codeg-computer-helper" \
             "dist/${{ matrix.artifact }}/web/index.html" \
             "dist/${{ matrix.artifact }}/LICENSE" \
             "dist/${{ matrix.artifact }}/NOTICE" \
@@ -393,6 +402,7 @@ jobs:
           New-Item -ItemType Directory -Force -Path $bundleDir | Out-Null
           Copy-Item "src-tauri/target/${{ matrix.target }}/release/codeg-server.exe" "$bundleDir/codeg-server.exe"
           Copy-Item "src-tauri/target/${{ matrix.target }}/release/codeg-mcp.exe" "$bundleDir/codeg-mcp.exe"
+          Copy-Item "src-tauri/target/${{ matrix.target }}/release/codeg-computer-helper.exe" "$bundleDir/codeg-computer-helper.exe"
           Copy-Item -Recurse "out" "$bundleDir/web"
           Copy-Item "LICENSE" "$bundleDir/LICENSE"
           Copy-Item "NOTICE" "$bundleDir/NOTICE"
@@ -401,6 +411,7 @@ jobs:
           foreach ($required in @(
             "$bundleDir/codeg-server.exe",
             "$bundleDir/codeg-mcp.exe",
+            "$bundleDir/codeg-computer-helper.exe",
             "$bundleDir/web/index.html",
             "$bundleDir/LICENSE",
             "$bundleDir/NOTICE",
@@ -419,8 +430,10 @@ jobs:
           set -euo pipefail
           test -x "dist/${{ matrix.artifact }}/codeg-server"
           test -x "dist/${{ matrix.artifact }}/codeg-mcp"
-          # Only run --help for native targets; cross-compiled arm64 binaries
-          # cannot execute on the x64 runner.
+          test -x "dist/${{ matrix.artifact }}/codeg-computer-helper"
+          # `codeg-mcp --help` exits 0 without flags and prints the usage
+          # line. Only run it for native targets; cross-compiled arm64
+          # binaries cannot execute on the x64 runner.
           if [ "${{ matrix.target }}" = "x86_64-unknown-linux-gnu" ] || \
              [ "${{ matrix.target }}" = "x86_64-apple-darwin" ] || \
              [ "${{ matrix.target }}" = "aarch64-apple-darwin" ]; then
@@ -438,6 +451,9 @@ jobs:
           }
           if (-not (Test-Path "dist/${{ matrix.artifact }}/codeg-mcp.exe")) {
             throw "codeg-mcp.exe missing from packaged artifact"
+          }
+          if (-not (Test-Path "dist/${{ matrix.artifact }}/codeg-computer-helper.exe")) {
+            throw "codeg-computer-helper.exe missing from packaged artifact"
           }
           $help = & "dist/${{ matrix.artifact }}/codeg-mcp.exe" --help
           if ($LASTEXITCODE -ne 0) {

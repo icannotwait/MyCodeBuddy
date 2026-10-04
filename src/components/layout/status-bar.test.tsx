@@ -22,6 +22,9 @@ vi.mock("./status-bar-update", () => ({
 vi.mock("./status-bar-mcp", () => ({
   StatusBarMcp: () => <span data-testid="status-bar-mcp" />,
 }))
+vi.mock("./status-bar-computer", () => ({
+  StatusBarComputer: () => <span data-testid="status-bar-computer" />,
+}))
 vi.mock("./command-dropdown", () => ({
   CommandDropdown: () => <span data-testid="command-dropdown" />,
 }))
@@ -37,6 +40,13 @@ describe("StatusBar", () => {
       render(<StatusBar />)
 
       expect(screen.getByTestId("status-bar-stats")).toBeInTheDocument()
+      if (mobile) {
+        expect(
+          screen.queryByTestId("status-bar-computer")
+        ).not.toBeInTheDocument()
+      } else {
+        expect(screen.getByTestId("status-bar-computer")).toBeInTheDocument()
+      }
       expect(
         screen.queryByTestId("status-bar-session-model")
       ).not.toBeInTheDocument()

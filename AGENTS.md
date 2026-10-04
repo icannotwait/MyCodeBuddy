@@ -41,14 +41,14 @@ cargo test --test delegation_session_reuse_integration --features test-utils
 cargo test --features test-utils
 cargo clippy --all-targets --features test-utils -- -D warnings
 
-# 服务器模式
+# 服务器模式（`server`；`server-bin` 是启用同一二进制的别名）
 cargo check --no-default-features --features server --bin codeg-server
 cargo test --no-default-features --features server --bin codeg-server --lib
 cargo clippy --no-default-features --features server --bin codeg-server --lib -- -D warnings
 
 # codeg-mcp 协作伴生进程（多智能体委托）
-cargo check --no-default-features --bin codeg-mcp
-cargo clippy --no-default-features --bin codeg-mcp -- -D warnings
+cargo check --no-default-features --features mcp-bin --bin codeg-mcp
+cargo clippy --no-default-features --features mcp-bin --bin codeg-mcp -- -D warnings
 
 # 解析器快照评审（输出变化时）
 cargo insta review
@@ -94,8 +94,11 @@ Windows 整库测试程序包含 4,028 个测试，单个 `rustc` 在低内存�
 项目通过 Cargo feature flags 支持三种二进制：
 
 - **`codeg`**（`tauri-runtime`，默认）：完整桌面应用，包含 Tauri 窗口管理、系统通知、自动更新等
-- **`codeg-server`**（opt-in `server` feature，`--no-default-features --features server`）：独立服务器模式，仅编译 Axum HTTP API + WebSocket。默认不编此 bin（桌面发行不附带），避免杀软将远程监听进程误判为远控
-- **`codeg-mcp`**（无 feature）：per-launch stdio MCP 伴生进程，被注入到代理 CLI 的 MCP 配置中，向 LLM 暴露**异步**子智能体委托工具。
+- **`codeg-server`**（opt-in `server` feature，`--no-default-features --features server`；`server-bin` 会启用 `server`）：独立服务器模式，仅编译 Axum HTTP API + WebSocket。入口仍是 `src/server_bin/main.rs`，不放在 `src/bin/`。默认不编此 bin（桌面发行不附带），避免杀软将远程监听进程误判为远控
+- **`codeg-mcp`**（`--no-default-features --features mcp-bin`）：per-launch stdio MCP 伴生进程，被注入到代理 CLI 的 MCP 配置中，向 LLM 暴露**异步**子智能体委托工具。
+- **`codeg-computer-helper`**（`computer-helper`）：电脑操作辅助进程。默认不开。
+
+`codeg-server`、`codeg-mcp` 与 `codeg-computer-helper` 各要一个默认不开的 feature：Tauri CLI 会把所有 feature 已开的二进制目标打进桌面安装包，不开就不进包。服务器入口仍在 `src/server_bin/`，避免 Tauri CLI 扫描 `src/bin/` 时把远程监听进程打进安装包。
 
 ### 共享核心
 

@@ -21,7 +21,9 @@
     "remote-merge-*",
     "remote-stash-*",
     "remote-push-*",
-    "conversation-*"
+    "conversation-*",
+    "computer-indicator",
+    "computer-marker"
   ],
   "permissions": [
     "core:default",

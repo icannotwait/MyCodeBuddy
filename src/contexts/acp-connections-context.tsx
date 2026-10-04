@@ -206,6 +206,7 @@ import {
   upsertAsyncTask,
 } from "@/lib/async-tasks"
 import { presentSessionNotice, splitHeadline } from "@/lib/session-notices"
+import { presentPluginLoadFailures } from "@/lib/plugin-load-failures"
 import {
   acpErrorNotifiesDesktop,
   isTurnFailureCode,
@@ -229,6 +230,7 @@ import {
   notifyDesktop,
   withDesktopNotificationsSuppressed,
 } from "@/lib/desktop-notification"
+import { sessionNotificationPayload } from "@/lib/notification-session"
 import {
   playEventSound,
   primeNotificationSoundOutput,
@@ -1535,6 +1537,10 @@ function localizeBackendErrorMessage(
       })
     case "agent_auth_required":
       return translate("backendErrors.agentAuthRequired", { agent: agentLabel })
+    case "agent_runtime_outdated":
+      return translate("backendErrors.agentRuntimeOutdated", {
+        agent: agentLabel,
+      })
     case "sdk_not_installed":
       return translate("blocked.sdkMissing", { agent: agentLabel })
     case "platform_not_supported":
@@ -1785,6 +1791,88 @@ function findLiveToolCallInfo(
   return block?.type === "tool_call" ? block.info : null
 }
 
+/**
+ * The keys that carry an edit's text in a file tool's input, in every spelling
+ * the permission card reads (`parsePermissionToolCall`).
+ */
+const EDIT_TEXT_INPUT_KEYS = [
+  "old_string",
+  "oldString",
+  "old_text",
+  "oldText",
+  "new_string",
+  "newString",
+  "new_text",
+  "newText",
+  "content",
+  "text",
+  "new_source",
+  "changes",
+  "diff",
+  "patch",
+  "unified_diff",
+  "unifiedDiff",
+] as const
+
+/** The file a file tool's input names, in any spelling the card reads. */
+const EDIT_PATH_INPUT_KEYS = [
+  "file_path",
+  "filePath",
+  "path",
+  "notebook_path",
+  "target_file",
+  "targetFile",
+] as const
+
+function inputFilePath(input: Record<string, unknown>): string | null {
+  for (const key of EDIT_PATH_INPUT_KEYS) {
+    const value = input[key]
+    if (typeof value === "string" && value.trim().length > 0) return value
+  }
+  return null
+}
+
+function parseInputRecord(value: unknown): Record<string, unknown> | null {
+  if (typeof value === "string") {
+    try {
+      return asRecord(JSON.parse(value))
+    } catch {
+      return null
+    }
+  }
+  return asRecord(value)
+}
+
+/**
+ * A permission request's file-tool input with the edit text put back from the
+ * live call, or `null` when nothing is missing.
+ *
+ * claude-agent-acp 0.82.0 sends an AIR client (codeg) an approval whose
+ * `toolCall` is a bare update — `{toolCallId, title, rawInput}`, and for an
+ * Edit/Write `rawInput` is `{file_path}` alone: the text lives only in the
+ * diff the live call already carries, which the backend rebuilds into the live
+ * call's input. Without this the card would name the file and show no diff.
+ * Only a request input that has NONE of the text keys (in any spelling) is
+ * filled, and only from a live input naming the same file; the request's own
+ * keys win.
+ */
+function fillStrippedEditInput(
+  requestInput: unknown,
+  liveRawInput: string | null | undefined
+): Record<string, unknown> | null {
+  const request = parseInputRecord(requestInput)
+  const live = parseInputRecord(liveRawInput)
+  if (!request || !live) return null
+  if (EDIT_TEXT_INPUT_KEYS.some((key) => key in request)) return null
+  if (!EDIT_TEXT_INPUT_KEYS.some((key) => key in live)) return null
+  // Both must name the same file: the request is the authority on WHAT is
+  // being approved, and a live input about another file must never lend it
+  // text.
+  const requestPath = inputFilePath(request)
+  if (requestPath === null || requestPath !== inputFilePath(live)) return null
+  return { ...live, ...request }
+}
+
 function mergePermissionToolCallWithLiveInfo(
   toolCall: unknown,
   liveInfo: ToolCallInfo | null
@@ -1805,10 +1893,20 @@ function mergePermissionToolCallWithLiveInfo(
 
   const next = { ...record }
   let changed = false
-  const existingInput = serializePermissionInput(pickPermissionToolInput(next))
+  const requestInput = pickPermissionToolInput(next)
+  const existingInput = serializePermissionInput(requestInput)
   if (!existingInput && rawInput) {
     next.rawInput = rawInput
     changed = true
+  } else if (existingInput) {
+    const filled = fillStrippedEditInput(requestInput, liveInfo.raw_input)
+    if (filled) {
+      const inputKey =
+        PERMISSION_TOOL_INPUT_KEYS.find((key) => next[key] === requestInput) ??
+        "rawInput"
+      next[inputKey] = filled
+      changed = true
+    }
   }
   if (typeof next.title !== "string" || next.title.trim().length === 0) {
     next.title = liveInfo.title
@@ -5290,6 +5388,10 @@ function prepareMappedEnvelope(
     case "session_notice":
       // Fire-and-forget. Nothing is stored; the toast is post-commit.
       break
+    case "plugin_load_failures":
+      // Same as a notice: not replayed, not in the snapshot. The toast is
+      // post-commit and gated on delivery source.
+      break
     case "async_task":
       actions.push({
         type: "ASYNC_TASK",
@@ -6803,7 +6905,13 @@ type TurnFailurePart =
       description?: string
       actions: NotifyAction[]
     }
-  | { kind: "verdict"; title: string; evidence?: string }
+  | {
+      kind: "verdict"
+      title: string
+      evidence?: string
+      /** Buttons of the verdict's own, for a failure no typed record explains. */
+      actions?: NotifyAction[]
+    }
 
 /** A connect failure's notification key: one per surface. */
 function connectErrorNotificationKey(contextKey: string): string {
@@ -7244,6 +7352,28 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
       rememberResolvedIdentity(contextKey, { sessionId })
     },
     [rememberResolvedIdentity]
+  )
+
+  /**
+   * An OS notification payload naming the session `contextKey` serves (see
+   * `sessionNotificationPayload`).
+   *
+   * Its conversation is the one `connect()` was given or a first send linked
+   * (`conversation_linked`) — both remembered past the surface itself, which
+   * is when this matters: a tab closed while its agent is still busy keeps
+   * its connection, and the turn finishes under a tab id that no longer
+   * exists. Not the agent's session id: a Claude `/clear` re-points the row's
+   * `external_id` while the ACP session keeps its own.
+   */
+  const sessionNotification = useCallback(
+    (contextKey: string, content: { body: string; redactedBody?: string }) =>
+      sessionNotificationPayload(
+        contextKey,
+        lastConnectParamsRef.current.get(contextKey)?.conversationId,
+        folderNameRef.current,
+        content
+      ),
+    []
   )
 
   type ConnectBlockState =
@@ -8836,6 +8966,7 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
           key,
           title: part.title,
           evidence: part.evidence,
+          actions: part.actions,
         })
         return
       }
@@ -9365,10 +9496,10 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
       const replaceShadow = (table: SessionFailureRecord[]) => {
         shadows.set(shadowKey, table)
       }
-      const desktopTitle = () => {
-        const fn = folderNameRef.current
-        return fn ? `${fn} - Codeg` : "Codeg"
-      }
+      const notifySession = (
+        kind: Parameters<typeof notifyDesktop>[0],
+        content: { body: string; redactedBody?: string }
+      ) => notifyDesktop(kind, sessionNotification(shadowKey, content))
 
       // One owner: live streaming deltas that bypass the ingestor play in
       // `pushMappedEvents`. Everything accepted into this frame plays here.
@@ -9381,6 +9512,16 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
       }
 
       switch (event.type) {
+        case "session_started":
+          rememberResolvedIdentity(shadowKey, { sessionId: event.session_id })
+          break
+        case "conversation_linked":
+          if (event.conversation_id > 0) {
+            rememberResolvedIdentity(shadowKey, {
+              conversationId: event.conversation_id,
+            })
+          }
+          break
         case "status_changed":
           if (event.status === "prompting") {
             replaceShadow(settleSessionFailures(shadow(), "all"))
@@ -9399,11 +9540,9 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
           }
           if (!mayNotify || event.stop_reason !== "end_turn" || !conn) break
           const agentLabel = getAgentLabel(conn.agentType)
-          const title = desktopTitle()
           const failure = latestActiveTerminalFailure(shadow())
           if (failure) {
-            void notifyDesktop("error", {
-              title,
+            void notifySession("error", {
               body: translate("notificationError", {
                 agent: agentLabel,
                 message: failure.title.trim() || tFailure("category.unknown"),
@@ -9413,8 +9552,7 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
               }),
             })
           } else {
-            void notifyDesktop("turn_complete", {
-              title,
+            void notifySession("turn_complete", {
               body: translate("notificationTurnComplete", {
                 agent: agentLabel,
               }),
@@ -9424,8 +9562,7 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
         }
         case "question_request":
           if (mayNotify && conn) {
-            void notifyDesktop("question_request", {
-              title: desktopTitle(),
+            void notifySession("question_request", {
               body: translate("notificationQuestion", {
                 agent: getAgentLabel(conn.agentType),
               }),
@@ -9435,8 +9572,7 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
         case "permission_request":
           if (mayNotify && conn) {
             const agentLabel = getAgentLabel(conn.agentType)
-            void notifyDesktop("permission_request", {
-              title: desktopTitle(),
+            void notifySession("permission_request", {
               body: `${agentLabel}: ${tChat("permissionDialog.subtitle")}`,
             })
           }
@@ -9450,7 +9586,7 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
               count,
             })
             const single = event.settled[0]!
-            void notifyDesktop("background_task", {
+            void notifySession("background_task", {
               body:
                 count === 1
                   ? `${agentLabel}: ${
@@ -9466,7 +9602,6 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
                       agent: agentLabel,
                     })
                   : many,
-              title: desktopTitle(),
             })
           }
           break
@@ -9594,8 +9729,7 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
           )
           if (presented.route.kind === "transcript") break
           if (mayNotify && conn && acpErrorNotifiesDesktop(presented.route)) {
-            void notifyDesktop("error", {
-              title: desktopTitle(),
+            void notifySession("error", {
               body: translate("notificationError", {
                 agent: agentLabel,
                 message: presented.text,
@@ -9608,19 +9742,76 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
           if (!mayNotify) break
           const connKey = conn?.connectionId ?? event.connection_id
           if (isTurnFailureCode(event.code)) {
+            // A credential refusal gets its own Sign in button: newer adapters
+            // answer with ACP `authRequired` alone. A typed AIR record, when
+            // one still arrives, takes this notification over.
+            const signInAgentType = conn?.agentType
             notifyTurnFailure(connKey, {
               kind: "verdict",
               title: presented.text,
               evidence: presented.evidence,
+              actions:
+                event.code === "turn_failed_auth_required" && signInAgentType
+                  ? [
+                      {
+                        label: tFailure("action.login"),
+                        onClick: () => {
+                          openSettingsWindow("agents", {
+                            agentType: signInAgentType,
+                          }).catch((err) => {
+                            console.error(
+                              "[AcpConnections] open agent settings:",
+                              err
+                            )
+                          })
+                        },
+                      },
+                    ]
+                  : undefined,
             })
             break
           }
+          const errorAgentType = conn?.agentType
           notify({
             level: presented.route.level,
             key: `acp-error:${connKey}:${event.code || event.message}`,
             title: presented.text,
             description: presented.reason,
             evidence: presented.evidence,
+            actions:
+              presented.route.opensAgentSettings && errorAgentType
+                ? [
+                    {
+                      label: translate("actions.openAgentsSettings"),
+                      onClick: () => {
+                        openSettingsWindow("agents", {
+                          agentType: errorAgentType,
+                        }).catch((err) => {
+                          console.error(
+                            "[AcpConnections] open agent settings:",
+                            err
+                          )
+                        })
+                      },
+                    },
+                  ]
+                : undefined,
+          })
+          break
+        }
+        case "plugin_load_failures": {
+          if (!mayNotify) break
+          const agentType: AgentType = conn?.agentType ?? "claude_code"
+          const failures = presentPluginLoadFailures(agentType, event.failures)
+          if (!failures) break
+          notify({
+            level: "warning",
+            key: failures.key,
+            title: translate("pluginLoadFailedTitle", {
+              agent: getAgentLabel(agentType),
+              count: failures.count,
+            }),
+            description: failures.description,
           })
           break
         }
@@ -9630,8 +9821,10 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
     },
     [
       notifyTurnFailure,
+      rememberResolvedIdentity,
       retireTurnFailures,
       sessionFailureNotifyActions,
+      sessionNotification,
       t,
       tChat,
       tFailure,
