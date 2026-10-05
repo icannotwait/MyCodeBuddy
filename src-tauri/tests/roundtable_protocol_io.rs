@@ -12,3 +12,6 @@ mod roundtable_snapshot;
 
 #[path = "roundtable_cases/roundtable_mcp.rs"]
 mod roundtable_mcp;
+
+#[path = "roundtable_cases/roundtable_acceptance.rs"]
+mod roundtable_acceptance;

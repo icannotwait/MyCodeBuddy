@@ -4,7 +4,9 @@
 //! ordinary session rows and does not claim a live OS sandbox on hosts that
 //! cannot prove one.
 
+mod acceptance;
 pub(crate) mod capabilities;
+mod clock;
 mod companion;
 mod feature_gate;
 mod mcp;
@@ -73,6 +75,8 @@ pub use snapshot::{
     SnapshotEncoding, SnapshotLimits, SourceClass, SourceEntryV1, SourceManifestV1,
     SourceSelection, FRESH_CONTEXT_STATE, MAX_SNAPSHOT_READS,
 };
+pub use acceptance::{AcceptInput, CloseInput, ClosingSetRef, PublishInput};
+pub use clock::{deadline_reached, AcceptStep, FakeClock, LockGate, MonoClock, SystemMono};
 pub use store::{
     durability_from_report, migrate_roundtable, open_roundtable_store, promises_power_loss,
     verify_connection_profile, NewAttempt, NewBinding, NewClaim, NewCommand, NewEvent, NewEvidence,

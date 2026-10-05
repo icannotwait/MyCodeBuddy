@@ -10,6 +10,7 @@ pub mod completion;
 pub mod context;
 pub mod dto;
 pub mod model;
+pub mod projection;
 pub mod strategy;
 pub mod validation;
 
@@ -20,6 +21,7 @@ pub use completion::*;
 pub use context::*;
 pub use dto::*;
 pub use model::*;
+pub use projection::{project, RoomAggregate};
 pub use strategy::*;
 pub use validation::{
     submit_candidate, validate_consensus, validate_result, AliasVisibility, ClaimRef, DecisionKind,

@@ -9,6 +9,7 @@
 use std::future::Future;
 use std::path::PathBuf;
 use std::str::FromStr;
+use std::sync::{Arc, Mutex};
 
 use roundtable_protocol::{Epoch, ErrorCode, Hash256, IncarnationId, RtResult};
 use sea_orm::{
@@ -16,6 +17,7 @@ use sea_orm::{
     Statement, TransactionTrait, TryGetable, Value,
 };
 
+use super::clock::{AcceptFaults, AcceptStep, LockGate, MonoClock, SystemMono};
 use super::registry::{RegistryStore, StoredBinding};
 use super::sandbox::{DbIdentity, LaunchIntent, LaunchIntentStore, SandboxInstance};
 use super::{rt_error, schema};
@@ -30,6 +32,8 @@ const ACTIVE_STATES: &str =
 #[derive(Clone)]
 pub struct RoundtableStore {
     conn: DatabaseConnection,
+    clock: Arc<Mutex<Arc<dyn MonoClock>>>,
+    faults: Arc<Mutex<AcceptFaults>>,
 }
 
 #[derive(Clone, Debug)]
@@ -194,7 +198,11 @@ pub struct NewCommand {
 /// startup. This does not migrate and does not enable the product gate.
 pub async fn open_roundtable_store(conn: DatabaseConnection) -> RtResult<RoundtableStore> {
     ensure_ready(&conn).await?;
-    Ok(RoundtableStore { conn })
+    Ok(RoundtableStore {
+        conn,
+        clock: Arc::new(Mutex::new(Arc::new(SystemMono::new()))),
+        faults: Arc::new(Mutex::new(AcceptFaults::default())),
+    })
 }
 
 /// Apply the registered roundtable schema in one short transaction.
@@ -645,6 +653,29 @@ impl RoundtableStore {
         txn.commit().await.map_err(storage_err)?;
         Ok(())
     }
+
+    pub fn set_clock(&self, clock: Arc<dyn MonoClock>) {
+        *self.clock.lock().expect("clock") = clock;
+    }
+
+    pub fn set_accept_fault(&self, step: Option<AcceptStep>) {
+        self.faults.lock().expect("faults").fail_step = step;
+    }
+
+    pub fn arm_lock_gate(&self) -> Arc<LockGate> {
+        let gate = LockGate::new();
+        self.faults.lock().expect("faults").lock_gate = Some(Arc::clone(&gate));
+        gate
+    }
+
+    pub(crate) fn clock_sample(&self) -> (u64, String) {
+        let clock = Arc::clone(&self.clock.lock().expect("clock"));
+        (clock.now_ms(), clock.utc())
+    }
+
+    pub(crate) fn fault_snapshot(&self) -> AcceptFaults {
+        self.faults.lock().expect("faults").clone()
+    }
 }
 
 impl LaunchIntentStore for RoundtableStore {
@@ -1064,7 +1095,11 @@ async fn finish(txn: DatabaseTransaction, result: RtResult<()>) -> RtResult<()> 
     }
 }
 
-async fn exec(conn: &impl ConnectionTrait, sql: &str, values: Vec<Value>) -> RtResult<u64> {
+pub(crate) async fn exec(
+    conn: &impl ConnectionTrait,
+    sql: &str,
+    values: Vec<Value>,
+) -> RtResult<u64> {
     conn.execute(Statement::from_sql_and_values(
         DatabaseBackend::Sqlite,
         sql,
@@ -1075,12 +1110,16 @@ async fn exec(conn: &impl ConnectionTrait, sql: &str, values: Vec<Value>) -> RtR
     .map_err(constraint_err)
 }
 
-async fn query_i64(conn: &impl ConnectionTrait, sql: &str, values: Vec<Value>) -> RtResult<i64> {
+pub(crate) async fn query_i64(
+    conn: &impl ConnectionTrait,
+    sql: &str,
+    values: Vec<Value>,
+) -> RtResult<i64> {
     let row = one_row(conn, sql, values).await?;
     column(&row, 0)
 }
 
-async fn query_text(
+pub(crate) async fn query_text(
     conn: &impl ConnectionTrait,
     sql: &str,
     values: Vec<Value>,
@@ -1089,35 +1128,58 @@ async fn query_text(
     column(&row, 0)
 }
 
-async fn one_row(
+pub(crate) async fn one_row(
     conn: &impl ConnectionTrait,
     sql: &str,
     values: Vec<Value>,
 ) -> RtResult<QueryResult> {
+    optional_row(conn, sql, values)
+        .await?
+        .ok_or_else(|| rt_error(ErrorCode::StorageUnavailable, "roundtable_row"))
+}
+
+pub(crate) async fn optional_row(
+    conn: &impl ConnectionTrait,
+    sql: &str,
+    values: Vec<Value>,
+) -> RtResult<Option<QueryResult>> {
     conn.query_one(Statement::from_sql_and_values(
         DatabaseBackend::Sqlite,
         sql,
         values,
     ))
     .await
-    .map_err(storage_err)?
-    .ok_or_else(|| rt_error(ErrorCode::StorageUnavailable, "roundtable_row"))
+    .map_err(storage_err)
 }
 
-fn column<T: TryGetable>(row: &QueryResult, index: usize) -> RtResult<T> {
+pub(crate) async fn rows(
+    conn: &impl ConnectionTrait,
+    sql: &str,
+    values: Vec<Value>,
+) -> RtResult<Vec<QueryResult>> {
+    conn.query_all(Statement::from_sql_and_values(
+        DatabaseBackend::Sqlite,
+        sql,
+        values,
+    ))
+    .await
+    .map_err(storage_err)
+}
+
+pub(crate) fn column<T: TryGetable>(row: &QueryResult, index: usize) -> RtResult<T> {
     row.try_get_by_index(index)
         .map_err(|_| rt_error(ErrorCode::StorageUnavailable, "roundtable_column"))
 }
 
-fn text(value: &str) -> Value {
+pub(crate) fn text(value: &str) -> Value {
     value.into()
 }
 
-fn opt(value: Option<&str>) -> Value {
+pub(crate) fn opt(value: Option<&str>) -> Value {
     value.map(ToOwned::to_owned).into()
 }
 
-fn num(value: i64) -> Value {
+pub(crate) fn num(value: i64) -> Value {
     value.into()
 }
 
@@ -1130,7 +1192,7 @@ fn constraint_err(err: DbErr) -> roundtable_protocol::RtError {
     }
 }
 
-fn storage_err(err: DbErr) -> roundtable_protocol::RtError {
+pub(crate) fn storage_err(err: DbErr) -> roundtable_protocol::RtError {
     let _ = err;
     rt_error(ErrorCode::StorageUnavailable, "roundtable_storage")
 }
