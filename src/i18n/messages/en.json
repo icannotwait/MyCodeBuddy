@@ -7407,5 +7407,14 @@
         "probeFailed": "The built-in browser couldn't confirm that it reaches the remote host through the tunnel. Try again in a moment."
       }
     }
+  },
+  "roundtable": {
+    "start": "Start",
+    "parallel": "Parallel consultation",
+    "waiting": "Waiting for the other members",
+    "pause": "Pause now and keep finished results",
+    "retry": "Retry only the moderator",
+    "preview": "Generating, not a final result",
+    "unknown": "unknown"
   }
 }

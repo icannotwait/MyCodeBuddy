@@ -7407,5 +7407,14 @@
         "probeFailed": "内置浏览器无法确认它能通过隧道访问远端主机。请稍后重试。"
       }
     }
+  },
+  "roundtable": {
+    "start": "开始",
+    "parallel": "并行咨询",
+    "waiting": "等待其余成员",
+    "pause": "立即暂停，保留已完成结果",
+    "retry": "只重试主持",
+    "preview": "生成中，不是最终结果",
+    "unknown": "unknown"
   }
 }

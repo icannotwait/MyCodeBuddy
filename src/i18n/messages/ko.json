@@ -7407,5 +7407,14 @@
         "probeFailed": "내장 브라우저가 터널을 통해 원격 호스트에 도달하는지 확인할 수 없습니다. 잠시 후 다시 시도하세요."
       }
     }
+  },
+  "roundtable": {
+    "start": "Start",
+    "parallel": "Parallel consultation",
+    "waiting": "Waiting for the other members",
+    "pause": "Pause now and keep finished results",
+    "retry": "Retry only the moderator",
+    "preview": "Generating, not a final result",
+    "unknown": "unknown"
   }
 }

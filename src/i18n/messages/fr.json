@@ -7407,5 +7407,14 @@
         "probeFailed": "Le navigateur intégré n'a pas pu confirmer qu'il atteint l'hôte distant par le tunnel. Réessayez dans un instant."
       }
     }
+  },
+  "roundtable": {
+    "start": "Start",
+    "parallel": "Parallel consultation",
+    "waiting": "Waiting for the other members",
+    "pause": "Pause now and keep finished results",
+    "retry": "Retry only the moderator",
+    "preview": "Generating, not a final result",
+    "unknown": "unknown"
   }
 }

@@ -7407,5 +7407,14 @@
         "probeFailed": "內建瀏覽器無法確認它能透過通道連到遠端主機。請稍後再試。"
       }
     }
+  },
+  "roundtable": {
+    "start": "開始",
+    "parallel": "並行諮詢",
+    "waiting": "等待其餘成員",
+    "pause": "立即暫停，保留已完成結果",
+    "retry": "只重試主持",
+    "preview": "生成中，不是最終結果",
+    "unknown": "unknown"
   }
 }

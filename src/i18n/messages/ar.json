@@ -7407,5 +7407,14 @@
         "probeFailed": "تعذّر على المتصفح المدمج التأكد من أنه يصل إلى المضيف البعيد عبر النفق. حاول مرة أخرى بعد قليل."
       }
     }
+  },
+  "roundtable": {
+    "start": "Start",
+    "parallel": "Parallel consultation",
+    "waiting": "Waiting for the other members",
+    "pause": "Pause now and keep finished results",
+    "retry": "Retry only the moderator",
+    "preview": "Generating, not a final result",
+    "unknown": "unknown"
   }
 }

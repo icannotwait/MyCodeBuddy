@@ -15,6 +15,8 @@ import {
   Zap,
   type LucideIcon,
 } from "lucide-react"
+
+export const ROUNDTABLE_NAV_ENABLED = false
 import { useTranslations } from "next-intl"
 import { useActiveFolder } from "@/contexts/active-folder-context"
 import { useSidebarContext } from "@/contexts/sidebar-context"

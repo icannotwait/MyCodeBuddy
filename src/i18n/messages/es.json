@@ -7407,5 +7407,14 @@
         "probeFailed": "El navegador integrado no pudo confirmar que llega al host remoto a través del túnel. Vuelve a intentarlo en un momento."
       }
     }
+  },
+  "roundtable": {
+    "start": "Start",
+    "parallel": "Parallel consultation",
+    "waiting": "Waiting for the other members",
+    "pause": "Pause now and keep finished results",
+    "retry": "Retry only the moderator",
+    "preview": "Generating, not a final result",
+    "unknown": "unknown"
   }
 }
