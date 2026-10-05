@@ -9,3 +9,6 @@ mod roundtable_store_schema;
 
 #[path = "roundtable_cases/roundtable_snapshot.rs"]
 mod roundtable_snapshot;
+
+#[path = "roundtable_cases/roundtable_mcp.rs"]
+mod roundtable_mcp;

@@ -206,6 +206,10 @@ impl AdmittedToolScope {
         &self.result_scope
     }
 
+    pub fn evidence_ref(&self, alias: &str) -> Option<&ObjectRef> {
+        self.evidence.get(alias)
+    }
+
     pub fn tool_calls(&self) -> u32 {
         self.ledger.lock().expect("ledger").transcript.tool_calls
     }
@@ -216,6 +220,14 @@ impl AdmittedToolScope {
             .expect("ledger")
             .transcript
             .tool_reply_bytes
+    }
+
+    pub fn evidence_attempt_bytes(&self) -> u64 {
+        self.ledger
+            .lock()
+            .expect("ledger")
+            .transcript
+            .evidence_attempt_bytes
     }
 
     pub fn sealed_receipt(&self) -> Option<CandidateReceipt> {
@@ -250,6 +262,23 @@ pub trait ToolStore: Send + Sync {
         submission_id: &SubmissionId,
         validated: &ValidatedResult,
     ) -> RtResult<CandidateReceipt>;
+
+    /// Same seal as [`ToolStore::submit`], plus the canonical payload bytes.
+    async fn submit_canonical(
+        &self,
+        submission_id: &SubmissionId,
+        validated: &ValidatedResult,
+        raw: &[u8],
+    ) -> RtResult<CandidateReceipt>;
+
+    /// Record a field-error submission. The shared dispatcher already decided
+    /// the outcome. In-memory stores keep that decision in the attempt ledger.
+    async fn note_field_errors(
+        &self,
+        submission_id: &SubmissionId,
+        raw: &[u8],
+        scope: &ResultScope,
+    ) -> RtResult<()>;
 }
 
 pub struct InMemoryToolStore {
@@ -319,6 +348,26 @@ impl ToolStore for InMemoryToolStore {
         }
         sealed.insert(key, receipt.clone());
         Ok(receipt)
+    }
+
+    async fn submit_canonical(
+        &self,
+        submission_id: &SubmissionId,
+        validated: &ValidatedResult,
+        raw: &[u8],
+    ) -> RtResult<CandidateReceipt> {
+        let _ = raw;
+        self.submit(submission_id, validated).await
+    }
+
+    async fn note_field_errors(
+        &self,
+        submission_id: &SubmissionId,
+        raw: &[u8],
+        scope: &ResultScope,
+    ) -> RtResult<()> {
+        let _ = (submission_id, raw, scope);
+        Ok(())
     }
 }
 
@@ -464,10 +513,16 @@ async fn submit_result(
         if let Some(receipt) = &receipt {
             let validated = validate_result(&raw, &scope.result_scope)
                 .map_err(|_| rt_error(ErrorCode::InvalidState, "validator_disagreement"))?;
-            let stored = store.submit(&submission_id, &validated).await?;
+            let stored = store
+                .submit_canonical(&submission_id, &validated, &raw)
+                .await?;
             if &stored != receipt {
                 return Err(rt_error(ErrorCode::InvalidState, "receipt_mismatch"));
             }
+        } else if matches!(decision.outcome, DecisionKind::FieldErrors(_)) {
+            store
+                .note_field_errors(&submission_id, &raw, &scope.result_scope)
+                .await?;
         }
     }
     let argument_bytes = canonical_bytes(arguments)?;

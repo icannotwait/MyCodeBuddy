@@ -8,7 +8,9 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
-use roundtable_protocol::{ErrorCode, QualificationStatus, RtResult};
+use roundtable_protocol::{ErrorCode, QualificationStatus, RtResult, ServiceOwner};
+
+use crate::acp::manager::ConnectionOwner;
 use tokio::sync::Notify;
 
 use crate::acp::delegation::companion::{CompanionContext, CompanionFeatures};
@@ -551,4 +553,23 @@ fn required_value<'a>(
     iter.next()
         .cloned()
         .ok_or_else(|| format!("{flag} requires a value"))
+}
+
+/// The tool channel admits only a service-owned room attempt.
+/// A delegation companion lease is not a room lease and is not consulted.
+pub fn service_channel_owner(owner: &ConnectionOwner) -> RtResult<ServiceOwner> {
+    match owner {
+        ConnectionOwner::Service {
+            room_id,
+            attempt_id,
+            boot_epoch,
+        } => Ok(ServiceOwner {
+            room_id: *room_id,
+            attempt_id: *attempt_id,
+            boot_epoch: *boot_epoch,
+        }),
+        ConnectionOwner::Window { .. } => {
+            Err(rt_error(ErrorCode::Forbidden, "service_owner_required"))
+        }
+    }
 }

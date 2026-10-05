@@ -7,6 +7,7 @@
 mod capabilities;
 mod companion;
 mod feature_gate;
+mod mcp;
 mod gateway;
 pub(crate) mod ingress;
 mod qualification;
@@ -24,9 +25,10 @@ mod tool_core;
 
 pub use companion::{
     advertised_tools, bind_service_process, callable_tools, legacy_companion_context,
-    parse_companion_args, plan_service_launch, service_tools_ignoring_host_flags, tool_callable,
-    CompanionMode, CompanionParse, FakeBrokerTransport, LegacyParentArgs, ServiceLaunchInput,
-    ServiceLaunchPlan, ServiceProcess, ServiceWatchState, ServiceWatchdog, ATTEMPT_TOKEN_ENV,
+    parse_companion_args, plan_service_launch, service_channel_owner,
+    service_tools_ignoring_host_flags, tool_callable, CompanionMode, CompanionParse,
+    FakeBrokerTransport, LegacyParentArgs, ServiceLaunchInput, ServiceLaunchPlan, ServiceProcess,
+    ServiceWatchState, ServiceWatchdog, ATTEMPT_TOKEN_ENV,
 };
 pub use feature_gate::{
     scopes_convert, AdmissionFacts, ExecutionGate, ExecutionPolicy, ExecutionScope, GatePermit,
@@ -93,6 +95,13 @@ pub use sandbox::{
     attempt_live_escapes, build_sandbox_plan, DbIdentity, EscapeReport, IsolationProvider,
     JournalLaunchIntentStore, LaunchIntent, LaunchIntentStore, LinuxOciIsolator, PreparedSandbox,
     SandboxInput, SandboxInstance, SandboxPlan,
+};
+pub use mcp::{
+    invoke_scoped_tool, note_unverified_reference, persist_candidate, read_evidence,
+    register_input_evidence, search_evidence, DurableToolStore, EvidenceSearchHit,
+    EvidenceSearchPage, EvidenceSlice,
+    EvidenceUsage, GateToolAuthority, InputEvidence, PersistedEvidence, ReadEvidenceArgs,
+    SearchEvidenceArgs, SubmissionAudit, ToolAuthority, ToolSession,
 };
 pub use tool_core::{
     dispatch_tool, service_result_schema, service_tool_names, service_tool_schema,

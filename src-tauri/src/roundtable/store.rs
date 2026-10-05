@@ -252,6 +252,12 @@ pub fn promises_power_loss(profile: DurabilityProfile) -> bool {
 }
 
 impl RoundtableStore {
+    /// Shared pool for roundtable modules. Callers use ordinary transactions.
+    /// This does not set pragmas and does not change `synchronous`.
+    pub(crate) fn connection(&self) -> &DatabaseConnection {
+        &self.conn
+    }
+
     pub async fn durability(&self) -> RtResult<DurabilityProfile> {
         durability_from_report(&verify_connection_profile(&self.conn).await?)
     }
