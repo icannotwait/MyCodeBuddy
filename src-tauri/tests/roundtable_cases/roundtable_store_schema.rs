@@ -288,7 +288,10 @@ async fn registered_migration_is_idempotent_and_preserves_old_sessions() {
         .expect("roll back roundtable migration");
     assert_eq!(rt_table_count(&conn).await, 0);
     assert!(legacy_session_visible(&conn).await);
-    let refused = open_roundtable_store(conn.clone()).await.unwrap_err();
+    let refused = match open_roundtable_store(conn.clone()).await {
+        Ok(_) => panic!("expected storage refusal"),
+        Err(err) => err,
+    };
     assert_eq!(refused.code, ErrorCode::StorageUnavailable);
     Migrator::up(&conn, None).await.expect("reapply");
     assert_eq!(rt_table_count(&conn).await, tables);
@@ -460,7 +463,10 @@ async fn failed_roundtable_migration_leaves_old_sessions_readable() {
         legacy_sql
     );
     assert!(legacy_session_visible(&conn).await);
-    let refused = open_roundtable_store(conn).await.unwrap_err();
+    let refused = match open_roundtable_store(conn).await {
+        Ok(_) => panic!("expected storage refusal"),
+        Err(err) => err,
+    };
     assert_eq!(refused.code, ErrorCode::StorageUnavailable);
     assert!(!ExecutionGate::open(dir.path()).enabled());
 }
@@ -708,7 +714,10 @@ fn hash_hex() -> String {
     "ab".repeat(32)
 }
 
-fn parse<T: FromStr>(text: &str) -> T {
+fn parse<T: FromStr>(text: &str) -> T
+where
+    <T as FromStr>::Err: std::fmt::Debug,
+{
     text.parse().expect("id")
 }
 

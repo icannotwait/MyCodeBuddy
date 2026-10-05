@@ -4,6 +4,7 @@
 //! schema in its own transaction. A failed statement rolls that transaction
 //! back and leaves the migration unrecorded. The product gate stays off.
 
+use sea_orm::TransactionTrait;
 use sea_orm_migration::prelude::*;
 
 #[derive(DeriveMigrationName)]

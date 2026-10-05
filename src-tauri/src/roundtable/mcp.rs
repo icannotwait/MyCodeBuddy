@@ -291,7 +291,10 @@ impl GateToolAuthority {
     /// The completion gate is released before this returns. Waiting is separate.
     pub fn stop(&self) -> roundtable_protocol::CompletionBarrier {
         let mut linear = lock(&self.linear);
-        let wait = roundtable_protocol::CompletionWait::start(&mut linear.gate, &mut linear.state, 0);
+        let wait = {
+            let Linear { gate, state, .. } = &mut *linear;
+            roundtable_protocol::CompletionWait::start(gate, state, 0)
+        };
         let barrier = wait.barrier().clone();
         linear.wait = Some(wait);
         barrier

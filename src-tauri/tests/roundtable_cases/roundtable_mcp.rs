@@ -16,7 +16,7 @@ use codeg_lib::roundtable::{
     ExecutionGate, ExecutionScope, GateToolAuthority, InputEvidence, NewAttempt, NewBinding,
     NewManifest, NewPhase, NewRoom, NewSpeaker, NewTurn, ObjectStore, OsIdentity,
     QualificationKey, ReadEvidenceArgs, ReservationLedger, RoundtableToolCall, SearchEvidenceArgs,
-    TokenBinding, ToolSession, SERVICE_TOOL_VERSION,
+    TokenBinding, ToolAuthority, ToolSession, SERVICE_TOOL_VERSION,
 };
 use roundtable_protocol::{
     canonical_bytes, AliasVisibility, AttemptId, BindingId, CandidateReceipt, CandidateState,

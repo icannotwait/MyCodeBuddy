@@ -4,7 +4,7 @@
 //! ordinary session rows and does not claim a live OS sandbox on hosts that
 //! cannot prove one.
 
-mod capabilities;
+pub(crate) mod capabilities;
 mod companion;
 mod feature_gate;
 mod mcp;

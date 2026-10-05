@@ -519,7 +519,7 @@ async fn read_and_store(
         let path = open_source(&selection.root, &file.canonical)?;
         let meta = fs::symlink_metadata(&path)
             .map_err(|_| rt_error(ErrorCode::StorageUnavailable, "source_stat"))?;
-        ensure_regular_meta(&meta)?;
+        ensure_regular_meta(&path, &meta)?;
         let mode = file_mode(&meta);
         let (bytes, _) = read_stable(&path, selection.mutate_while_open.as_ref())?;
         let size = u64::try_from(bytes.len())
@@ -643,14 +643,14 @@ fn open_source(root: &Path, canonical: &str) -> RtResult<PathBuf> {
             return Err(rt_error(ErrorCode::InvalidArgument, "not_regular"));
         }
         if last {
-            ensure_regular_meta(&meta)?;
+            ensure_regular_meta(&cursor, &meta)?;
         }
     }
     ensure_within_root(root, &cursor)?;
     Ok(cursor)
 }
 
-fn ensure_regular_meta(meta: &fs::Metadata) -> RtResult<()> {
+fn ensure_regular_meta(path: &Path, meta: &fs::Metadata) -> RtResult<()> {
     let kind = meta.file_type();
     if kind.is_symlink() {
         return Err(rt_error(ErrorCode::InvalidArgument, "symlink"));
@@ -658,7 +658,7 @@ fn ensure_regular_meta(meta: &fs::Metadata) -> RtResult<()> {
     if !kind.is_file() {
         return Err(rt_error(ErrorCode::InvalidArgument, "not_regular"));
     }
-    if link_count(meta) > 1 {
+    if link_count(path)? > 1 {
         return Err(rt_error(ErrorCode::InvalidArgument, "hard_link"));
     }
     Ok(())
@@ -670,7 +670,7 @@ fn read_stable(path: &Path, hook: Option<&SnapshotReadHook>) -> RtResult<(Vec<u8
         let before = file
             .metadata()
             .map_err(|_| rt_error(ErrorCode::StorageUnavailable, "source_stat"))?;
-        ensure_regular_meta(&before)?;
+        ensure_regular_meta(path, &before)?;
         if let Some(hook) = hook {
             (hook.as_ref())(path);
         }
@@ -718,16 +718,35 @@ fn open_read(path: &Path) -> RtResult<File> {
         .map_err(|_| rt_error(ErrorCode::StorageUnavailable, "source_open"))
 }
 
-fn link_count(meta: &fs::Metadata) -> u64 {
+fn link_count(path: &Path) -> RtResult<u64> {
     #[cfg(windows)]
     {
-        use std::os::windows::fs::MetadataExt;
-        u64::from(meta.number_of_links())
+        use std::mem::MaybeUninit;
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::Foundation::HANDLE;
+        use windows_sys::Win32::Storage::FileSystem::{
+            GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION,
+        };
+
+        let file = open_read(path)?;
+        let mut info = MaybeUninit::<BY_HANDLE_FILE_INFORMATION>::zeroed();
+        // SAFETY: `file` owns a valid handle for this call, and `info` is writable.
+        let result = unsafe {
+            GetFileInformationByHandle(file.as_raw_handle() as HANDLE, info.as_mut_ptr())
+        };
+        if result == 0 {
+            return Err(rt_error(ErrorCode::StorageUnavailable, "source_stat"));
+        }
+        // SAFETY: a successful call initialized the complete structure.
+        let info = unsafe { info.assume_init() };
+        Ok(u64::from(info.nNumberOfLinks))
     }
     #[cfg(not(windows))]
     {
         use std::os::unix::fs::MetadataExt;
-        meta.nlink()
+        let meta = fs::symlink_metadata(path)
+            .map_err(|_| rt_error(ErrorCode::StorageUnavailable, "source_stat"))?;
+        Ok(meta.nlink())
     }
 }
 
@@ -748,7 +767,7 @@ fn file_mode(meta: &fs::Metadata) -> u32 {
 }
 
 fn normalized_components(path: &Path) -> Vec<String> {
-    let mut parts = Vec::new();
+    let mut parts: Vec<String> = Vec::new();
     for component in path.components() {
         match component {
             Component::CurDir => {}
