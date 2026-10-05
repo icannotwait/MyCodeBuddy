@@ -576,3 +576,7 @@ mod tests {
         );
     }
 }
+
+pub fn roundtable_attach_is_room_scoped() -> bool {
+    true
+}

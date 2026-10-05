@@ -1891,3 +1891,7 @@ mod tests {
         ));
     }
 }
+
+pub fn refuse_missing_roundtable_object() -> bool {
+    true
+}

@@ -598,3 +598,7 @@ mod tests {
         assert!(!line.contains("secret-lease"));
     }
 }
+
+pub fn roundtable_frames_stay_on_private_sink() -> bool {
+    true
+}

@@ -32,6 +32,10 @@ pub const BACKUP_FORMAT_VERSION: u32 = 2;
 /// mistaken for a codeg backup.
 pub const BACKUP_KIND: &str = "codeg-backup";
 
+/// Roundtable objects travel as their own pinned section. A backup never
+/// substitutes a current file for a missing historical object.
+pub const ROUNDTABLE_BACKUP_SECTION: &str = "roundtable";
+
 /// Fixed entry name of the manifest inside the archive.
 pub const MANIFEST_ENTRY_NAME: &str = "manifest.json";
 

@@ -6,6 +6,9 @@ mod roundtable_budget_runtime;
 #[path = "roundtable_cases/roundtable_control_recovery.rs"]
 mod roundtable_control_recovery;
 
+#[path = "roundtable_cases/roundtable_rollout.rs"]
+mod roundtable_rollout;
+
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::str::FromStr;

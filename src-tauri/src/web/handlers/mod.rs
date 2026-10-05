@@ -13,6 +13,7 @@ pub mod computer_tools;
 pub mod config_sync;
 pub mod conversation_experience;
 pub mod conversations;
+pub mod roundtable;
 pub mod custom_skills;
 pub mod delegation;
 pub mod delegation_metrics;

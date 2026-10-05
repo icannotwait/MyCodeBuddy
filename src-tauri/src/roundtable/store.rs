@@ -34,6 +34,7 @@ pub struct RoundtableStore {
     conn: DatabaseConnection,
     clock: Arc<Mutex<Arc<dyn MonoClock>>>,
     faults: Arc<Mutex<AcceptFaults>>,
+    catalog: Arc<Mutex<super::maintenance::ReferenceCatalog>>,
 }
 
 #[derive(Clone, Debug)]
@@ -202,7 +203,14 @@ pub async fn open_roundtable_store(conn: DatabaseConnection) -> RtResult<Roundta
         conn,
         clock: Arc::new(Mutex::new(Arc::new(SystemMono::new()))),
         faults: Arc::new(Mutex::new(AcceptFaults::default())),
+        catalog: Arc::new(Mutex::new(super::maintenance::ReferenceCatalog::empty())),
     })
+}
+
+impl RoundtableStore {
+    pub fn reference_catalog(&self) -> Arc<Mutex<super::maintenance::ReferenceCatalog>> {
+        Arc::clone(&self.catalog)
+    }
 }
 
 /// Apply the registered roundtable schema in one short transaction.

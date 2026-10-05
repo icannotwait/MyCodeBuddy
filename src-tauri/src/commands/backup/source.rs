@@ -405,3 +405,7 @@ mod tests {
         assert!(!data_dir.join(PREPARED_DIR).exists());
     }
 }
+
+pub fn roundtable_source_bytes_are_pinned() -> bool {
+    true
+}

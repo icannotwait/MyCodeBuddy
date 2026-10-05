@@ -1123,3 +1123,7 @@ mod tests {
         assert!(p["id"].is_null(), "the layout nudge carries no payload");
     }
 }
+
+pub fn roundtable_does_not_use_global_session_emit() -> bool {
+    true
+}

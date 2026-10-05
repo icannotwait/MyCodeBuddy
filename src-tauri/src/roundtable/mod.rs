@@ -6,22 +6,29 @@
 
 mod acceptance;
 mod actor;
+mod api;
+mod authorization;
 pub(crate) mod capabilities;
 mod clock;
 mod command_processor;
 mod companion;
 mod control;
 mod diagnostics;
+mod e2e;
+mod events;
 mod feature_gate;
+mod maintenance;
 mod mcp;
 mod gateway;
 pub(crate) mod ingress;
 mod qualification;
 mod qualification_harness;
 mod recovery;
+mod rollout;
 mod registry;
 mod relay;
 mod ownership;
+mod paging;
 mod budget_ledger;
 mod request_accounting;
 mod resources;
@@ -96,7 +103,14 @@ pub use command_processor::{next_phase, pause_again, retry_synthesis};
 pub use control::{
     apply_command, advance_control, ControlBook, MatrixOutcome, MatrixRow, MutationCommandV1,
 };
+pub use api::{execute, http_status, RoundtableRequestV1, RoundtableResponseV1};
+pub use authorization::{authorize_room, RoomDirectory, RoomGrant};
 pub use diagnostics::{seal_diagnostic, DiagnosticInput, DiagnosticRef};
+pub use e2e::{exercise_room, Trajectory};
+pub use events::{apply_projection, moderator_preview_allowed, projection_hash, SubscriptionHub};
+pub use maintenance::{backup_roundtable, gc_unreferenced, restore_roundtable, BackupManifest, GcReport, ReferenceCatalog, TrackedObject};
+pub use paging::{read_manifest_page, ManifestPage};
+pub use rollout::{disable_and_drain, may_start, Rollout};
 pub use usage::{archive_late_measurement, RoomMeter};
 pub use clock::{
     deadline_reached, AcceptStep, FakeClock, LockGate, MonoClock, MonotonicClock, SystemMono,

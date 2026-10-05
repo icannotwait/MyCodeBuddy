@@ -18,3 +18,6 @@ mod roundtable_acceptance;
 
 #[path = "roundtable_cases/roundtable_durability_usage.rs"]
 mod roundtable_durability_usage;
+
+#[path = "roundtable_cases/roundtable_backup_gc.rs"]
+mod roundtable_backup_gc;

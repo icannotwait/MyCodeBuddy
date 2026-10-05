@@ -314,3 +314,7 @@ mod tests {
         assert!(!is_excluded_section_entry(Path::new("a/b.png")));
     }
 }
+
+pub fn roundtable_section_pinned() -> &'static str {
+    super::manifest::ROUNDTABLE_BACKUP_SECTION
+}
