@@ -481,6 +481,7 @@ const STATEMENTS: &[&str] = &[
         singleton INTEGER NOT NULL CHECK (singleton = 1),
         logical_model TEXT NOT NULL,
         durability TEXT NOT NULL CHECK (durability = 'process_crash_recovery'),
+        coordinator_boot INTEGER NOT NULL DEFAULT 0,
         PRIMARY KEY (singleton)
     )",
     "INSERT OR IGNORE INTO rt_schema_meta (singleton, logical_model, durability)

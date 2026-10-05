@@ -421,6 +421,7 @@ async fn async_main() -> ExitCode {
         computer_service: std::sync::OnceLock::new(),
         system_op_lock: codeg_lib::app_state::default_system_op_lock(),
         update_state: codeg_lib::app_state::default_update_state(),
+        roundtable: std::sync::Arc::new(codeg_lib::roundtable::RoundtableSlot::new()),
     });
     codeg_lib::app_state::spawn_completion_outbox_dispatcher(completion_outbox_dispatcher);
     state

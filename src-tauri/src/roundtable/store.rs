@@ -270,6 +270,46 @@ impl RoundtableStore {
         durability_from_report(&verify_connection_profile(&self.conn).await?)
     }
 
+    pub(crate) async fn bump_coordinator_boot(&self) -> RtResult<u64> {
+        let txn = self.conn.begin().await.map_err(storage_err)?;
+        let result = async {
+            exec(
+                &txn,
+                "UPDATE rt_schema_meta SET coordinator_boot = coordinator_boot + 1 WHERE singleton = 1",
+                vec![],
+            )
+            .await?;
+            let boot = query_i64(
+                &txn,
+                "SELECT coordinator_boot FROM rt_schema_meta WHERE singleton = 1",
+                vec![],
+            )
+            .await?;
+            u64::try_from(boot).map_err(|_| rt_error(ErrorCode::InvalidArgument, "boot_epoch"))
+        }
+        .await;
+        finish(txn, result.map(|_| ())).await?;
+        self.coordinator_boot().await
+    }
+
+    #[cfg(any(test, feature = "test-utils"))]
+    pub async fn record_launch_for_test(
+        &self,
+        intent: super::sandbox::LaunchIntent,
+    ) -> RtResult<()> {
+        self.record_launch(intent).await
+    }
+
+    pub(crate) async fn coordinator_boot(&self) -> RtResult<u64> {
+        let boot = query_i64(
+            &self.conn,
+            "SELECT coordinator_boot FROM rt_schema_meta WHERE singleton = 1",
+            vec![],
+        )
+        .await?;
+        u64::try_from(boot).map_err(|_| rt_error(ErrorCode::InvalidArgument, "boot_epoch"))
+    }
+
     pub async fn recorded_durability(&self) -> RtResult<DurabilityProfile> {
         let recorded = query_text(
             &self.conn,
@@ -710,7 +750,7 @@ impl RegistryStore for RoundtableStore {
 }
 
 impl RoundtableStore {
-    async fn record_launch(&self, intent: LaunchIntent) -> RtResult<()> {
+    pub(crate) async fn record_launch(&self, intent: LaunchIntent) -> RtResult<()> {
         let txn = self.conn.begin().await.map_err(storage_err)?;
         let result = async {
             let incarnation = intent.incarnation.to_string();
@@ -810,7 +850,7 @@ impl RoundtableStore {
         finish(txn, result).await
     }
 
-    async fn list_unreaped_launches(&self) -> RtResult<Vec<LaunchIntent>> {
+    pub(crate) async fn list_unreaped_launches(&self) -> RtResult<Vec<LaunchIntent>> {
         let rows = self
             .conn
             .query_all(Statement::from_string(
@@ -828,7 +868,7 @@ impl RoundtableStore {
         rows.iter().map(intent_from_row).collect()
     }
 
-    async fn mark_launch_reaped(&self, incarnation: IncarnationId) -> RtResult<()> {
+    pub(crate) async fn mark_launch_reaped(&self, incarnation: IncarnationId) -> RtResult<()> {
         let txn = self.conn.begin().await.map_err(storage_err)?;
         let key = incarnation.to_string();
         let result = async {

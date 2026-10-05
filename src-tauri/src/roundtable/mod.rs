@@ -5,6 +5,7 @@
 //! cannot prove one.
 
 mod acceptance;
+mod actor;
 pub(crate) mod capabilities;
 mod clock;
 mod companion;
@@ -16,11 +17,13 @@ mod qualification;
 mod qualification_harness;
 mod registry;
 mod relay;
+mod ownership;
 mod request_accounting;
 mod runtime;
 mod objects;
 mod sandbox;
 mod schema;
+mod service;
 mod snapshot;
 mod store;
 mod tool_core;
@@ -76,7 +79,17 @@ pub use snapshot::{
     SourceSelection, FRESH_CONTEXT_STATE, MAX_SNAPSHOT_READS,
 };
 pub use acceptance::{AcceptInput, CloseInput, ClosingSetRef, PublishInput};
+pub use actor::{RoomActor, RoomGate};
 pub use clock::{deadline_reached, AcceptStep, FakeClock, LockGate, MonoClock, SystemMono};
+pub use ownership::{
+    lock_path_for, matches_instance, CoordinatorLock, OwnedProcess, RoundtableReadService,
+};
+pub use service::{
+    shutdown_order, OpenedRoundtable, ParticipantRuntime, QuarantineLease, RoomMessage,
+    RoomMessageKind, RoomReply,
+    RoundtableService, RoundtableSlot, RuntimeIdentity, ServiceConfig, ServiceReadiness,
+    ShutdownReport,
+};
 pub use store::{
     durability_from_report, migrate_roundtable, open_roundtable_store, promises_power_loss,
     verify_connection_profile, NewAttempt, NewBinding, NewClaim, NewCommand, NewEvent, NewEvidence,

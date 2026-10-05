@@ -1502,6 +1502,7 @@ mod tauri_app {
                     &internal_sessions,
                 );
                 app.manage(internal_sessions.clone());
+                app.manage(std::sync::Arc::new(crate::roundtable::RoundtableSlot::new()));
 
                 // Restore and apply saved system proxy settings before any network
                 // operation. reqwest clients (including the lazy title HTTP client)
