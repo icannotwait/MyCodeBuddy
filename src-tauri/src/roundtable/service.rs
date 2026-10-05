@@ -131,6 +131,8 @@ pub struct RoundtableService {
     unknown_occupancy: AtomicBool,
     allocator: ResourceAllocator,
     supervisor_online: AtomicBool,
+    usage_log: Mutex<Vec<roundtable_protocol::MeasurementV1>>,
+    meter: super::usage::RoomMeter,
 }
 
 impl RoundtableService {
@@ -169,6 +171,8 @@ impl RoundtableService {
             unknown_occupancy: AtomicBool::new(false),
             allocator: ResourceAllocator::new(1),
             supervisor_online: AtomicBool::new(true),
+            usage_log: Mutex::new(Vec::new()),
+            meter: super::usage::RoomMeter::frozen(),
         });
         if service.writable() {
             service.recover(&config).await?;
@@ -178,6 +182,14 @@ impl RoundtableService {
 
     pub fn writable(&self) -> bool {
         self.lock.lock().expect("lock").is_some()
+    }
+
+    pub fn room_meter(&self) -> super::usage::RoomMeter {
+        self.meter.clone()
+    }
+
+    pub(crate) fn record_usage(&self, measurement: roundtable_protocol::MeasurementV1) {
+        self.usage_log.lock().expect("usage").push(measurement);
     }
 
     pub fn allocator(&self) -> &ResourceAllocator {

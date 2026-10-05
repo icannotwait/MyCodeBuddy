@@ -11,6 +11,7 @@ mod clock;
 mod command_processor;
 mod companion;
 mod control;
+mod diagnostics;
 mod feature_gate;
 mod mcp;
 mod gateway;
@@ -28,6 +29,7 @@ mod runtime;
 mod objects;
 mod sandbox;
 mod schema;
+mod usage;
 mod service;
 mod snapshot;
 mod store;
@@ -94,6 +96,8 @@ pub use command_processor::{next_phase, pause_again, retry_synthesis};
 pub use control::{
     apply_command, advance_control, ControlBook, MatrixOutcome, MatrixRow, MutationCommandV1,
 };
+pub use diagnostics::{seal_diagnostic, DiagnosticInput, DiagnosticRef};
+pub use usage::{archive_late_measurement, RoomMeter};
 pub use clock::{
     deadline_reached, AcceptStep, FakeClock, LockGate, MonoClock, MonotonicClock, SystemMono,
 };

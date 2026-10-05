@@ -15,3 +15,6 @@ mod roundtable_mcp;
 
 #[path = "roundtable_cases/roundtable_acceptance.rs"]
 mod roundtable_acceptance;
+
+#[path = "roundtable_cases/roundtable_durability_usage.rs"]
+mod roundtable_durability_usage;

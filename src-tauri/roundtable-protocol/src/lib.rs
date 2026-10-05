@@ -12,6 +12,7 @@ pub mod dto;
 pub mod model;
 pub mod projection;
 pub mod strategy;
+pub mod usage;
 pub mod validation;
 
 pub use admission::*;
@@ -23,6 +24,7 @@ pub use dto::*;
 pub use model::*;
 pub use projection::{project, RoomAggregate};
 pub use strategy::*;
+pub use usage::{fold_measurement, MeasureSemantics, MeasurementV1, UsageState};
 pub use validation::{
     submit_candidate, validate_consensus, validate_result, AliasVisibility, ClaimRef, DecisionKind,
     EvidenceRef, FieldCode, RequiredTarget, ResponseRef, ResultScope, SubmissionDecision,
