@@ -119,6 +119,27 @@ impl SourceManifestV1 {
     }
 }
 
+/// Rebind immutable source bytes to a clone's room/version without reading live sources.
+pub fn rehome_manifest(
+    manifest: &SourceManifestV1,
+    room_id: RoomId,
+    version: i64,
+) -> RtResult<SourceManifestV1> {
+    let version_u64 =
+        u64::try_from(version).map_err(|_| rt_error(ErrorCode::InvalidArgument, "version"))?;
+    let mut cloned = manifest.clone();
+    cloned.room_id = room_id;
+    cloned.version = version;
+    cloned.manifest_id = fresh_manifest_id()?;
+    cloned.manifest_hash = canonical_hash(&ManifestIdentity {
+        entries: cloned.entries.iter().map(EntryIdentity::from).collect(),
+        read_limit: cloned.read_limit,
+        room_id: room_id.to_string(),
+        version: version_u64,
+    })?;
+    Ok(cloned)
+}
+
 #[derive(Clone, Debug)]
 pub struct PhaseInput {
     pub phase_id: PhaseId,
@@ -238,7 +259,7 @@ pub fn validate_relative_path(raw: &str) -> RtResult<String> {
         return Err(rt_error(ErrorCode::InvalidArgument, "absolute_path"));
     }
     let mut parts = Vec::new();
-    for part in raw.split(|ch| ch == '/' || ch == '\\') {
+    for part in raw.split(['/', '\\']) {
         if part.is_empty() || part == "." {
             return Err(rt_error(ErrorCode::InvalidArgument, "invalid_path"));
         }
@@ -288,7 +309,7 @@ pub fn lexical_within(root: &str, candidate: &str) -> bool {
 
 fn lexical_parts(raw: &str) -> Vec<String> {
     let mut parts = Vec::new();
-    for part in raw.split(|ch| ch == '/' || ch == '\\') {
+    for part in raw.split(['/', '\\']) {
         if part.is_empty() || part == "." {
             continue;
         }
@@ -364,8 +385,10 @@ pub async fn capture_snapshot(
         }
         Err(err) => {
             let removed = objects.discard_ids(&created) && objects.orphans_cleared();
-            if removed {
+            if removed && objects.retained_bytes() == 0 {
                 let _ = lease.release_after_partial_removed(true);
+            } else {
+                lease.commit_as_used(objects.retained_bytes());
             }
             Err(err)
         }
@@ -485,7 +508,10 @@ pub fn confirmation_echo(draft: &RoomDraft, recipients: &ResolvedRecipients) -> 
     }
 }
 
-fn plan_selection(selection: &SourceSelection, limits: &SnapshotLimits) -> RtResult<Vec<PlannedFile>> {
+fn plan_selection(
+    selection: &SourceSelection,
+    limits: &SnapshotLimits,
+) -> RtResult<Vec<PlannedFile>> {
     let mut planned = Vec::with_capacity(selection.files.len());
     for file in &selection.files {
         planned.push(PlannedFile {
@@ -785,11 +811,7 @@ fn normalized_components(path: &Path) -> Vec<String> {
 }
 
 fn is_structural(part: &str) -> bool {
-    part == "\\"
-        || part == "/"
-        || part.ends_with(':')
-        || part.starts_with('\\')
-        || part == ".."
+    part == "\\" || part == "/" || part.ends_with(':') || part.starts_with('\\') || part == ".."
 }
 
 fn now_ms() -> u64 {

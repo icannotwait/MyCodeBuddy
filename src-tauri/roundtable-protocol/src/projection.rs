@@ -38,12 +38,15 @@ pub fn project(state: &RoomAggregate) -> RtResult<ProjectionV1> {
             return Err(RtError::from_reason(InternalReason::MissingField));
         }
     }
-    let body_bytes = canonical_bytes(&state.body)?;
+    let mut body = state.body.clone();
+    body.messages = state.messages.clone();
+    body.evidence_manifests = state.evidence_manifests.clone();
+    let body_bytes = canonical_bytes(&body)?;
     Ok(ProjectionV1 {
         projection_ref: ProjectionRef {
             id: state.projection_id,
             hash: Hash256::sha256(&body_bytes),
         },
-        body: state.body.clone(),
+        body,
     })
 }

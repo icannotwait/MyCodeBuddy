@@ -189,7 +189,7 @@ fn view_with(
     }
 }
 
-fn by_ordinal<'a>(targets: &'a [SpeakerTargets], ordinal: u32) -> &'a SpeakerTargets {
+fn by_ordinal(targets: &[SpeakerTargets], ordinal: u32) -> &SpeakerTargets {
     targets
         .iter()
         .find(|target| target.speaker.ordinal == ordinal)

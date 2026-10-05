@@ -1,88 +1,79 @@
-//! Referenced objects stay pinned. A bad restore does not become runnable.
-
-use std::collections::BTreeSet;
-
-use codeg_lib::roundtable::{
-    backup_roundtable, gc_unreferenced, migrate_roundtable, open_roundtable_store,
-    restore_roundtable, TrackedObject,
-};
-use roundtable_protocol::ErrorCode;
-
+//! Actual SQLite references and content-addressed files govern backups.
 use crate::roundtable_support::open_pool;
-
-fn object(id: &str, hash: &str, age: u64, referenced: bool, kind: &str) -> TrackedObject {
-    TrackedObject {
-        id: id.to_string(),
-        hash: hash.to_string(),
-        age_hours: age,
-        referenced,
-        kind: kind.to_string(),
-        present: true,
-    }
-}
+use codeg_lib::roundtable::{
+    backup_roundtable, capture_snapshot, commit_captured_manifest, gc_unreferenced,
+    migrate_roundtable, open_roundtable_store, restore_roundtable, NewRoom, ObjectStore,
+    ReservationLedger, SelectedFile, SnapshotLimits, SourceClass, SourceSelection,
+};
+use roundtable_protocol::{PrincipalId, RoomId};
+use std::sync::Arc;
 
 #[tokio::test]
 async fn backup_gc_and_disk_failures() {
-    let (_dir, conn) = open_pool(1).await;
-    migrate_roundtable(&conn).await.expect("migrate");
-    let store = open_roundtable_store(conn).await.expect("store");
-    let catalog_ref = store.reference_catalog();
-    {
-        let mut catalog = catalog_ref.lock().expect("catalog");
-        catalog.watermark = "room-1".to_string();
-        catalog.objects = vec![
-            object("manifest", "h1", 48, true, "manifest"),
-            object("diagnostic", "h2", 48, true, "diagnostic"),
-            object("source", "h3", 48, true, "source"),
-            object("projection", "h4", 48, true, "projection"),
-            object("backup", "h5", 48, true, "backup"),
-            object("pending", "h6", 48, true, "pending"),
-            object("fresh-temp", "h7", 1, false, "temp"),
-            object("old-temp", "h8", 48, false, "temp"),
-            object("capture-temp", "h9", 48, false, "temp"),
-        ];
-        catalog.capture_ids.insert("capture-temp".to_string());
-    }
-    let manifest = backup_roundtable(&store).await.expect("backup");
+    let (dir, conn) = open_pool(1).await;
+    migrate_roundtable(&conn).await.unwrap();
+    let store = open_roundtable_store(conn).await.unwrap();
+    let room: RoomId = "00000000-0000-4000-8000-000000000001".parse().unwrap();
+    let principal: PrincipalId = "00000000-0000-4000-8000-000000000002".parse().unwrap();
+    store
+        .insert_room(&NewRoom {
+            room_id: room.to_string(),
+            principal_id: principal.to_string(),
+            status: "draft".into(),
+            config_ref: "{}".into(),
+            revision: 1,
+            run_epoch: 1,
+            boot_epoch: 1,
+            last_seq: 0,
+            remaining_active_ms: 1000,
+            blocked_reason: None,
+            result_quality: None,
+        })
+        .await
+        .unwrap();
+    let source = dir.path().join("source");
+    std::fs::create_dir(&source).unwrap();
+    std::fs::write(source.join("file.txt"), b"immutable source").unwrap();
+    let path = dir.path().join("objects");
+    let objects =
+        ObjectStore::open(&path, Arc::new(ReservationLedger::new(10000)), principal).unwrap();
+    let captured = capture_snapshot(
+        SourceSelection {
+            root: source,
+            room_id: room,
+            version: 1,
+            base_commit: None,
+            files: vec![SelectedFile {
+                relative_path: "file.txt".into(),
+                class: SourceClass::Untracked,
+            }],
+            mutate_while_open: None,
+        },
+        SnapshotLimits {
+            estimated_bytes: 1000,
+            max_file_bytes: 1000,
+            max_total_bytes: 1000,
+            max_files: 1,
+        },
+        &objects,
+    )
+    .await
+    .unwrap();
+    commit_captured_manifest(&store, &objects, &captured)
+        .await
+        .unwrap();
+    let manifest = backup_roundtable(&store).await.unwrap();
     assert_eq!(manifest.section, "roundtable");
-    assert!(manifest.referenced.contains_key("manifest"));
-    assert!(!manifest.referenced.contains_key("old-temp"));
-
-    let mut missing = manifest.clone();
-    missing.referenced.insert("gone".to_string(), "missing".to_string());
-    let error = restore_roundtable(&store, &missing).await.expect_err("missing");
-    assert_eq!(error.code, ErrorCode::StorageUnavailable);
-    {
-        let catalog = catalog_ref.lock().expect("catalog");
-        assert!(catalog.read_only);
-        assert!(!catalog.runnable);
-    }
-
-    {
-        let mut catalog = catalog_ref.lock().expect("catalog");
-        catalog.objects[0].hash = "tampered".to_string();
-        catalog.read_only = false;
-        catalog.runnable = true;
-    }
-    let error = restore_roundtable(&store, &manifest).await.expect_err("hash");
-    assert_eq!(error.code, ErrorCode::StorageUnavailable);
-    {
-        let catalog = catalog_ref.lock().expect("catalog");
-        assert!(catalog.read_only);
-        assert!(!catalog.runnable);
-        assert!(catalog.objects.iter().all(|object| object.id != "decoy"));
-    }
-
-    let report = gc_unreferenced(&store).await.expect("gc");
-    assert_eq!(report.deleted, BTreeSet::from(["old-temp".to_string()]));
-    let left: Vec<String> = catalog_ref
-        .lock()
-        .expect("catalog")
-        .objects
-        .iter()
-        .map(|object| object.id.clone())
-        .collect();
-    for pinned in ["manifest", "diagnostic", "source", "projection", "backup", "pending", "fresh-temp", "capture-temp"] {
-        assert!(left.iter().any(|id| id == pinned), "{pinned}");
-    }
+    assert_eq!(manifest.referenced.len(), 1);
+    restore_roundtable(&store, &manifest, &path).await.unwrap();
+    let blob = path.join(&captured.entries[0].object.object_id);
+    std::fs::write(&blob, b"tampered").unwrap();
+    assert!(restore_roundtable(&store, &manifest, &path).await.is_err());
+    std::fs::remove_file(&blob).unwrap();
+    assert!(restore_roundtable(&store, &manifest, &path).await.is_err());
+    let error = gc_unreferenced(&store).await.unwrap_err();
+    assert_eq!(
+        error.details.reason.as_deref(),
+        Some("gc_reference_proof_required")
+    );
 }

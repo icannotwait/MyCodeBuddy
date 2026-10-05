@@ -267,9 +267,11 @@ pub(crate) trait DiscoveryGate: Send + Sync {
     fn wait_shared(&self) -> Pin<Box<dyn Future<Output = SharedDiscoveryPermit> + Send + '_>>;
 }
 
+type DiscoveryHide = dyn Fn(AgentType, Option<&str>, Option<&str>) -> bool + Send + Sync;
+
 struct ExtraHide {
     id: u64,
-    hide: Arc<dyn Fn(AgentType, Option<&str>, Option<&str>) -> bool + Send + Sync>,
+    hide: Arc<DiscoveryHide>,
 }
 
 fn extra_hides() -> &'static StdMutex<Vec<ExtraHide>> {
@@ -282,9 +284,7 @@ fn next_hide_id() -> &'static AtomicU64 {
     &NEXT
 }
 
-pub(crate) fn install_extra_discovery_hide(
-    hide: Arc<dyn Fn(AgentType, Option<&str>, Option<&str>) -> bool + Send + Sync>,
-) -> u64 {
+pub(crate) fn install_extra_discovery_hide(hide: Arc<DiscoveryHide>) -> u64 {
     let id = next_hide_id().fetch_add(1, Ordering::Relaxed);
     extra_hides()
         .lock()

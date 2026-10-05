@@ -92,11 +92,8 @@ fn bus_bodies(
     rx: &mut broadcast::Receiver<Arc<codeg_lib::acp::InternalEventEnvelope>>,
 ) -> Vec<AcpEvent> {
     let mut events = Vec::new();
-    loop {
-        match rx.try_recv() {
-            Ok(envelope) => events.push(envelope.payload.clone()),
-            Err(_) => break,
-        }
+    while let Ok(envelope) = rx.try_recv() {
+        events.push(envelope.payload.clone());
     }
     events
 }
@@ -111,7 +108,7 @@ async fn private_sink_receives_raw_events_only() {
     emit_event(
         &emitter,
         "conversation://changed",
-        &json!({ "marker": "public-web-control" }),
+        json!({ "marker": "public-web-control" }),
     );
     let control = web_rx.try_recv().expect("web subscription is live");
     assert_eq!(
@@ -257,15 +254,12 @@ async fn private_sink_receives_raw_events_only() {
             .contains("roundtable-raw-")),
         "legacy bus received roundtable body: {leaked:?}"
     );
-    loop {
-        match web_rx.try_recv() {
-            Ok(event) => assert!(
-                !contains_roundtable_body(&event.payload),
-                "global web broadcast received roundtable body: {}",
-                event.payload
-            ),
-            Err(_) => break,
-        }
+    while let Ok(event) = web_rx.try_recv() {
+        assert!(
+            !contains_roundtable_body(&event.payload),
+            "global web broadcast received roundtable body: {}",
+            event.payload
+        );
     }
     assert!(primary_stream.try_recv().is_err());
     assert!(follow_stream.try_recv().is_err());

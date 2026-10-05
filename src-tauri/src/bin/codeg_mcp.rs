@@ -91,21 +91,29 @@ async fn run_service(socket_path: &str, incarnation: &str) -> ExitCode {
     {
         return ExitCode::from(2);
     }
-    let stdin = tokio::io::stdin();
-    let mut lines = BufReader::new(stdin).lines();
-    loop {
-        tokio::select! {
-            biased;
-            _ = process.watch_closed() => {
-                return ExitCode::SUCCESS;
-            }
-            line_result = lines.next_line() => {
-                match line_result {
-                    Ok(None) | Err(_) => return ExitCode::SUCCESS,
-                    Ok(Some(_)) => {}
-                }
+    let connection = match process.connect().await {
+        Ok(connection) => connection,
+        Err(_) => return ExitCode::from(2),
+    };
+    let relay = match env.get("CODEG_RT_MODEL_SOCKET") {
+        None => None,
+        Some(path) if path == "/run/codeg/gateway.sock" => {
+            match codeg_lib::roundtable::ServiceModelRelay::start().await {
+                Ok(relay) => Some(relay),
+                Err(_) => return ExitCode::from(2),
             }
         }
+        Some(_) => return ExitCode::from(2),
+    };
+    let result = connection
+        .serve_stdio(tokio::io::stdin(), tokio::io::stdout())
+        .await;
+    if let Some(relay) = relay {
+        relay.shutdown().await;
+    }
+    match result {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(_) => ExitCode::from(2),
     }
 }
 

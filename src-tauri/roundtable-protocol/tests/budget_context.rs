@@ -59,6 +59,56 @@ struct FakeTokens {
     capacity: Option<u64>,
 }
 
+#[test]
+fn delivery_prompt_contains_frozen_phase_context() {
+    let phase = phase_snapshot();
+    let encoded = DeliveryEncoder::prompt_utf8(
+        &phase,
+        &role_snapshot(),
+        &support::id::<BindingId>("binding"),
+    )
+    .unwrap();
+    let prompt: serde_json::Value = serde_json::from_slice(&encoded).unwrap();
+    assert_eq!(prompt["phase"], serde_json::to_value(&phase).unwrap());
+}
+
+#[test]
+fn delivery_context_is_hashed_and_capacity_checked_as_actual_bytes() {
+    let phase = phase_snapshot();
+    let role = role_snapshot();
+    let binding = support::id::<BindingId>("binding");
+    let context =
+        serde_json::json!({"topic":"圆桌", "sources":["frozen bytes"], "history":["published"]});
+    let capacity = 10_000_000;
+    let tokens = FakeTokens {
+        capacity: Some(capacity),
+    };
+    let profile = profile(capacity);
+    let bytes = DeliveryEncoder::prompt_with_context(&phase, &role, &binding, &context).unwrap();
+    let manifest =
+        DeliveryEncoder::encode_with_context(&phase, &role, &binding, &context, &tokens, &profile)
+            .unwrap();
+    assert_eq!(manifest.prompt_hash, Hash256::sha256(&bytes));
+    assert_eq!(manifest.prompt_bytes.0, bytes.len() as u64);
+    let decoded: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(decoded["context"], context);
+    assert_eq!(decoded["metadata"]["role"], role.role);
+    let changed = serde_json::json!({"topic":"different"});
+    assert_ne!(
+        manifest.prompt_hash,
+        DeliveryEncoder::encode_with_context(&phase, &role, &binding, &changed, &tokens, &profile)
+            .unwrap()
+            .prompt_hash
+    );
+    let huge = serde_json::json!({"topic":"x".repeat(capacity as usize)});
+    assert_eq!(
+        DeliveryEncoder::encode_with_context(&phase, &role, &binding, &huge, &tokens, &profile)
+            .unwrap_err()
+            .code,
+        ErrorCode::ContextTooLarge
+    );
+}
+
 impl TokenBound for FakeTokens {
     fn upper_bound(&self, utf8: &[u8]) -> roundtable_protocol::RtResult<u64> {
         u64::try_from(utf8.len()).map_err(|_| roundtable_protocol::RtError {
@@ -192,15 +242,10 @@ fn parameterized_budget_and_repair_slots() {
                 assert_eq!(early.code, ErrorCode::InvalidState);
                 assert_eq!(state.consumed_prompts, 0);
 
-                let mut revision = 1;
-                let mut admitted_in_revision = 0;
+                let revision = 1;
                 for phase in 0..=r {
                     state.current_phase_index = phase;
                     for ordinal in 0..n {
-                        if admitted_in_revision == 2 {
-                            revision += 1;
-                            admitted_in_revision = 0;
-                        }
                         let next = reserve_attempts(
                             &state,
                             request(
@@ -218,13 +263,9 @@ fn parameterized_budget_and_repair_slots() {
                         .unwrap();
                         assert!(next.consumed_prompt);
                         state = next.state;
-                        admitted_in_revision += 1;
                     }
                 }
                 state.current_phase_index = r + 1;
-                if admitted_in_revision == 2 {
-                    revision += 1;
-                }
                 let moderator = reserve_attempts(
                     &state,
                     request(
@@ -245,10 +286,10 @@ fn parameterized_budget_and_repair_slots() {
                         &state,
                         request(
                             ReservationKind::OptionalRetry,
-                            10_000 + index,
+                            revision,
                             AttemptSlot::Member {
-                                phase_index: 0,
-                                ordinal: 0,
+                                phase_index: (index / u64::from(n)) as u32,
+                                ordinal: (index % u64::from(n)) as u32,
                             },
                             DispatchObservation::Admitted,
                             0,
@@ -263,10 +304,10 @@ fn parameterized_budget_and_repair_slots() {
                     &state,
                     request(
                         ReservationKind::OptionalRetry,
-                        20_000,
+                        revision,
                         AttemptSlot::Member {
-                            phase_index: 0,
-                            ordinal: 0,
+                            phase_index: (spare / u64::from(n)) as u32,
+                            ordinal: (spare % u64::from(n)) as u32,
                         },
                         DispatchObservation::Admitted,
                         0,
@@ -305,7 +346,7 @@ fn parameterized_budget_and_repair_slots() {
         &state,
         request(
             ReservationKind::OptionalRetry,
-            2,
+            1,
             AttemptSlot::Member {
                 phase_index: 0,
                 ordinal: 0,
@@ -323,7 +364,7 @@ fn parameterized_budget_and_repair_slots() {
         &state,
         request(
             ReservationKind::OptionalRetry,
-            3,
+            1,
             AttemptSlot::Member {
                 phase_index: 0,
                 ordinal: 0,
@@ -334,12 +375,12 @@ fn parameterized_budget_and_repair_slots() {
         ),
     )
     .unwrap_err();
-    assert_eq!(stolen.code, ErrorCode::InsufficientBudget);
+    assert_eq!(stolen.code, ErrorCode::InvalidState);
     let still_first = reserve_attempts(
         &state,
         request(
             ReservationKind::FirstLaunch,
-            4,
+            1,
             AttemptSlot::Member {
                 phase_index: 0,
                 ordinal: 1,
@@ -360,7 +401,7 @@ fn parameterized_budget_and_repair_slots() {
             &future_state,
             request(
                 ReservationKind::FirstLaunch,
-                ordinal as u64,
+                1,
                 AttemptSlot::Member {
                     phase_index: 0,
                     ordinal,
@@ -392,7 +433,7 @@ fn parameterized_budget_and_repair_slots() {
     assert_eq!(future_retry.code, ErrorCode::InvalidState);
 
     let mut launches = BudgetState::fresh(3, 0, 1, plan.clone());
-    for ordinal in 0..2 {
+    for _ in 0..2 {
         let next = reserve_attempts(
             &launches,
             request(
@@ -400,7 +441,7 @@ fn parameterized_budget_and_repair_slots() {
                 1,
                 AttemptSlot::Member {
                     phase_index: 0,
-                    ordinal,
+                    ordinal: 0,
                 },
                 DispatchObservation::ReservedNotEnqueued,
                 0,
@@ -424,7 +465,7 @@ fn parameterized_budget_and_repair_slots() {
                 1,
                 AttemptSlot::Member {
                     phase_index: 0,
-                    ordinal: 2,
+                    ordinal: 0,
                 },
                 DispatchObservation::ReservedNotEnqueued,
                 0,
@@ -444,11 +485,15 @@ fn parameterized_budget_and_repair_slots() {
         admissions = reserve_attempts(
             &admissions,
             request(
-                ReservationKind::FirstLaunch,
+                if ordinal == 0 {
+                    ReservationKind::FirstLaunch
+                } else {
+                    ReservationKind::OptionalRetry
+                },
                 7,
                 AttemptSlot::Member {
                     phase_index: 0,
-                    ordinal,
+                    ordinal: 0,
                 },
                 observation,
                 0,
@@ -464,11 +509,11 @@ fn parameterized_budget_and_repair_slots() {
         reserve_attempts(
             &admissions,
             request(
-                ReservationKind::FirstLaunch,
+                ReservationKind::OptionalRetry,
                 7,
                 AttemptSlot::Member {
                     phase_index: 0,
-                    ordinal: 2,
+                    ordinal: 0,
                 },
                 DispatchObservation::Admitted,
                 0,
@@ -505,7 +550,7 @@ fn parameterized_budget_and_repair_slots() {
             &uncertain,
             request(
                 ReservationKind::FirstLaunch,
-                2,
+                1,
                 AttemptSlot::Member {
                     phase_index: 0,
                     ordinal: 0,
@@ -523,7 +568,7 @@ fn parameterized_budget_and_repair_slots() {
         &uncertain,
         request(
             ReservationKind::OptionalRetry,
-            3,
+            1,
             AttemptSlot::Member {
                 phase_index: 0,
                 ordinal: 0,

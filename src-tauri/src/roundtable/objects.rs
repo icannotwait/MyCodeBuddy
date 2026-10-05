@@ -9,7 +9,6 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use roundtable_protocol::{ErrorCode, Hash256, PrincipalId, RtResult, MAX_SAFE_INTEGER};
@@ -77,9 +76,10 @@ impl ReservationLedger {
         estimated_bytes: u64,
     ) -> RtResult<StorageLease> {
         let mut state = self.lock();
-        let reserved = state.reserved.checked_add(estimated_bytes).ok_or_else(|| {
-            rt_error(ErrorCode::InvalidArgument, "overflow")
-        })?;
+        let reserved = state
+            .reserved
+            .checked_add(estimated_bytes)
+            .ok_or_else(|| rt_error(ErrorCode::InvalidArgument, "overflow"))?;
         let total = reserved
             .checked_add(state.used)
             .ok_or_else(|| rt_error(ErrorCode::InvalidArgument, "overflow"))?;
@@ -109,7 +109,12 @@ impl ReservationLedger {
         }
     }
 
-    pub(crate) fn commit_reserved_as_used(&self, principal: PrincipalId, reserved: u64, actual: u64) {
+    pub(crate) fn commit_reserved_as_used(
+        &self,
+        principal: PrincipalId,
+        reserved: u64,
+        actual: u64,
+    ) {
         let mut state = self.lock();
         state.reserved = state.reserved.saturating_sub(reserved);
         state.used = state.used.saturating_add(actual);
@@ -121,7 +126,10 @@ impl ReservationLedger {
     pub(crate) fn revert_used(&self, actual: u64) -> RtResult<()> {
         let mut state = self.lock();
         if state.used < actual {
-            return Err(rt_error(ErrorCode::StorageUnavailable, "storage_accounting"));
+            return Err(rt_error(
+                ErrorCode::StorageUnavailable,
+                "storage_accounting",
+            ));
         }
         state.used -= actual;
         Ok(())
@@ -170,7 +178,6 @@ pub struct ObjectStore {
     committed: Mutex<BTreeSet<String>>,
     written: Mutex<BTreeSet<String>>,
     orphans: Mutex<Vec<PathBuf>>,
-    seq: AtomicU64,
 }
 
 impl ObjectStore {
@@ -180,7 +187,8 @@ impl ObjectStore {
         principal: PrincipalId,
     ) -> RtResult<Self> {
         let root = root.into();
-        fs::create_dir_all(&root).map_err(|_| rt_error(ErrorCode::StorageUnavailable, "object_root"))?;
+        fs::create_dir_all(&root)
+            .map_err(|_| rt_error(ErrorCode::StorageUnavailable, "object_root"))?;
         Ok(Self {
             root,
             ledger,
@@ -189,7 +197,6 @@ impl ObjectStore {
             committed: Mutex::new(BTreeSet::new()),
             written: Mutex::new(BTreeSet::new()),
             orphans: Mutex::new(Vec::new()),
-            seq: AtomicU64::new(0),
         })
     }
 
@@ -198,7 +205,10 @@ impl ObjectStore {
     }
 
     pub fn committed_ids(&self) -> BTreeSet<String> {
-        self.committed.lock().unwrap_or_else(|err| err.into_inner()).clone()
+        self.committed
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .clone()
     }
 
     pub fn remaining_files(&self) -> Vec<String> {
@@ -228,8 +238,14 @@ impl ObjectStore {
             return Err(rt_error(ErrorCode::StorageUnavailable, "object_hash"));
         }
         let final_path = self.root.join(&object_id);
-        if fault == ObjectFault::None && self.reusable(&final_path, content_hash, total_bytes) {
-            self.written_lock().insert(object_id.clone());
+        if final_path.exists() {
+            if !self.reusable(&final_path, content_hash, total_bytes) {
+                return Err(rt_error(ErrorCode::StorageUnavailable, "object_hash"));
+            }
+            self.committed
+                .lock()
+                .unwrap_or_else(|err| err.into_inner())
+                .insert(object_id.clone());
             return Ok(ObjectRef {
                 object_id,
                 content_hash,
@@ -237,14 +253,9 @@ impl ObjectStore {
             });
         }
 
-        let seq = self.seq.fetch_add(1, Ordering::Relaxed);
-        let tmp = self.root.join(format!(".partial-{seq}-{}", std::process::id()));
+        let tmp = self.root.join(format!(".partial-{}", uuid::Uuid::new_v4()));
         if fault == ObjectFault::Write {
-            let created = OpenOptions::new()
-                .write(true)
-                .create(true)
-                .truncate(true)
-                .open(&tmp);
+            let created = OpenOptions::new().write(true).create_new(true).open(&tmp);
             if let Ok(mut file) = created {
                 let _ = file.write_all(bytes);
             }
@@ -254,8 +265,7 @@ impl ObjectStore {
         {
             let mut file = OpenOptions::new()
                 .write(true)
-                .create(true)
-                .truncate(true)
+                .create_new(true)
                 .open(&tmp)
                 .map_err(|_| rt_error(ErrorCode::StorageUnavailable, "object_write"))?;
             file.write_all(bytes)
@@ -275,10 +285,19 @@ impl ObjectStore {
             self.remove_partial(&tmp);
             return Err(rt_error(ErrorCode::StorageUnavailable, "object_rename"));
         }
-        if let Err(_err) = replace_file(&tmp, &final_path) {
+        if let Err(err) = fs::hard_link(&tmp, &final_path) {
             self.remove_partial(&tmp);
-            return Err(rt_error(ErrorCode::StorageUnavailable, "object_rename"));
+            if err.kind() != std::io::ErrorKind::AlreadyExists
+                || !self.reusable(&final_path, content_hash, total_bytes)
+            {
+                return Err(rt_error(ErrorCode::StorageUnavailable, "object_rename"));
+            }
+            self.committed
+                .lock()
+                .unwrap_or_else(|err| err.into_inner())
+                .insert(object_id.clone());
         }
+        self.remove_partial(&tmp);
         if fault == ObjectFault::DirFsync {
             return self.fail_dir_fsync(&final_path, &object_id);
         }
@@ -295,8 +314,12 @@ impl ObjectStore {
     }
 
     pub async fn get_verified(&self, object: &ObjectRef) -> RtResult<Vec<u8>> {
+        if object.object_id != object.content_hash.to_hex() {
+            return Err(rt_error(ErrorCode::InvalidArgument, "object_id"));
+        }
         let path = self.root.join(&object.object_id);
-        let bytes = fs::read(&path).map_err(|_| rt_error(ErrorCode::StorageUnavailable, "object_read"))?;
+        let bytes =
+            fs::read(&path).map_err(|_| rt_error(ErrorCode::StorageUnavailable, "object_read"))?;
         let size = u64::try_from(bytes.len())
             .map_err(|_| rt_error(ErrorCode::InvalidArgument, "overflow"))?;
         if size != object.total_bytes {
@@ -309,6 +332,11 @@ impl ObjectStore {
     }
 
     pub(crate) fn reserve_estimated(&self, estimated_bytes: u64) -> RtResult<StorageLease> {
+        let disk_bytes = self.retained_bytes();
+        {
+            let mut state = self.ledger.lock();
+            state.used = state.used.max(disk_bytes);
+        }
         self.ledger.reserve_capture(self.principal, estimated_bytes)
     }
 
@@ -317,21 +345,19 @@ impl ObjectStore {
     }
 
     pub(crate) fn discard_ids(&self, ids: &[String]) -> bool {
-        let mut ok = true;
-        let committed = self.committed.lock().unwrap_or_else(|err| err.into_inner());
-        let mut written = self.written.lock().unwrap_or_else(|err| err.into_inner());
-        for id in ids {
-            if committed.contains(id) {
-                continue;
-            }
-            let path = self.root.join(id);
-            if !self.try_remove(&path) {
-                self.note_orphan(path);
-                ok = false;
-            }
-            written.remove(id);
-        }
-        ok
+        // Final hash paths can already be referenced by another capture or process.
+        // Only private partial files are removable without durable reference leases.
+        ids.iter().all(|id| !self.root.join(id).exists())
+    }
+
+    pub(crate) fn retained_bytes(&self) -> u64 {
+        fs::read_dir(&self.root)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter_map(|entry| entry.metadata().ok())
+            .filter(|meta| meta.is_file())
+            .fold(0u64, |total, meta| total.saturating_add(meta.len()))
     }
 
     pub(crate) fn orphans_cleared(&self) -> bool {
@@ -343,10 +369,10 @@ impl ObjectStore {
     }
 
     pub(crate) fn release_accounted(&self, bytes: u64, removed: bool) -> RtResult<()> {
-        if !removed {
-            return Err(rt_error(ErrorCode::StorageUnavailable, "partial_remains"));
+        if removed {
+            self.ledger.revert_used(bytes)?;
         }
-        self.ledger.revert_used(bytes)
+        Ok(())
     }
 
     pub(crate) fn mark_committed(&self, ids: &[String]) {
@@ -362,26 +388,13 @@ impl ObjectStore {
         let Ok(existing) = fs::read(path) else {
             return false;
         };
-        u64::try_from(existing.len()).ok() == Some(total_bytes) && Hash256::sha256(&existing) == hash
+        u64::try_from(existing.len()).ok() == Some(total_bytes)
+            && Hash256::sha256(&existing) == hash
     }
 
-    fn fail_dir_fsync(&self, final_path: &Path, object_id: &str) -> RtResult<ObjectRef> {
-        if !self.is_retained(object_id) {
-            self.remove_partial(final_path);
-        }
+    fn fail_dir_fsync(&self, _final_path: &Path, _object_id: &str) -> RtResult<ObjectRef> {
+        // A concurrent reader may already have committed this hash; retain it.
         Err(rt_error(ErrorCode::StorageUnavailable, "object_dir_fsync"))
-    }
-
-    fn is_retained(&self, object_id: &str) -> bool {
-        self.committed
-            .lock()
-            .unwrap_or_else(|err| err.into_inner())
-            .contains(object_id)
-            || self
-                .written
-                .lock()
-                .unwrap_or_else(|err| err.into_inner())
-                .contains(object_id)
     }
 
     fn remove_partial(&self, path: &Path) {
@@ -411,16 +424,5 @@ impl ObjectStore {
 
     fn written_lock(&self) -> std::sync::MutexGuard<'_, BTreeSet<String>> {
         self.written.lock().unwrap_or_else(|err| err.into_inner())
-    }
-}
-
-fn replace_file(from: &Path, to: &Path) -> std::io::Result<()> {
-    match fs::rename(from, to) {
-        Ok(()) => Ok(()),
-        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
-            fs::remove_file(to)?;
-            fs::rename(from, to)
-        }
-        Err(err) => Err(err),
     }
 }

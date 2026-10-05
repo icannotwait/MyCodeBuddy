@@ -5,6 +5,7 @@
 //! and it does not perform I/O. Reaching quorum does not close a phase.
 //! A failure is not an input to target assignment, so it cannot reassign one.
 
+use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::{
@@ -26,13 +27,13 @@ pub enum ScheduleMark {
     PhasedRounds,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SpeakerOrdinal {
     pub ordinal: u32,
     pub speaker_id: SpeakerId,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PublicationStatus {
     Accepted,
     Abstained,
@@ -40,13 +41,13 @@ pub enum PublicationStatus {
     Failed,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PublishedClaim {
     pub claim_id: ClaimId,
     pub text: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PublishedResponse {
     pub response_id: ResponseId,
     pub publication_seq: Seq,
@@ -56,7 +57,7 @@ pub struct PublishedResponse {
     pub target_response_id: Option<ResponseId>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PublishedMember {
     pub speaker: SpeakerOrdinal,
     pub kind: MemberKind,
@@ -92,7 +93,7 @@ pub fn classify_member(member: &PublishedMember) -> SlotOutcome {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PublishedPhase {
     pub phase_id: PhaseId,
     pub phase_index: u32,
@@ -101,7 +102,7 @@ pub struct PublishedPhase {
     pub members: Vec<PublishedMember>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct PublishedHistory {
     pub phases: Vec<PublishedPhase>,
 }
@@ -455,7 +456,7 @@ fn claim_owners(
     Ok(owners)
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SupportEdge {
     pub source_ordinal: u32,
     pub source_speaker_id: SpeakerId,
@@ -470,7 +471,7 @@ impl SupportEdge {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UnansweredChallenge {
     pub response_id: ResponseId,
     pub claim_id: ClaimId,
@@ -479,7 +480,7 @@ pub struct UnansweredChallenge {
     pub publication_seq: Seq,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CoverageV1 {
     pub assigned: u32,
     pub answered: u32,

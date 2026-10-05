@@ -1,6 +1,9 @@
 //! One command executor for the desktop invoke path and the HTTP path.
 
-use roundtable_protocol::{ErrorCode, RoomState, RtError, RtResult};
+use roundtable_protocol::RtError;
+#[cfg(any(test, feature = "test-utils"))]
+use roundtable_protocol::{ErrorCode, RoomState, RtResult};
+#[cfg(any(test, feature = "test-utils"))]
 use serde_json::{json, Value};
 
 pub const COMMANDS: &[&str] = &[
@@ -25,6 +28,7 @@ pub const COMMANDS: &[&str] = &[
 ];
 
 #[derive(Clone, Debug)]
+#[cfg(any(test, feature = "test-utils"))]
 pub struct RoundtableRequestV1 {
     pub command: String,
     pub method: String,
@@ -37,6 +41,7 @@ pub struct RoundtableRequestV1 {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg(any(test, feature = "test-utils"))]
 pub struct RoundtableResponseV1 {
     pub status: u16,
     pub room_state: Option<RoomState>,
@@ -44,6 +49,7 @@ pub struct RoundtableResponseV1 {
     pub body: Value,
 }
 
+#[cfg(any(test, feature = "test-utils"))]
 impl RoundtableResponseV1 {
     pub fn status(&self) -> u16 {
         self.status
@@ -54,6 +60,7 @@ pub fn http_status(error: &RtError) -> u16 {
     error.code.http_status()
 }
 
+#[cfg(any(test, feature = "test-utils"))]
 pub fn execute(request: RoundtableRequestV1) -> RtResult<RoundtableResponseV1> {
     if request.method != "POST" {
         return Err(denied(ErrorCode::InvalidArgument, "method"));
@@ -94,6 +101,7 @@ pub fn execute(request: RoundtableRequestV1) -> RtResult<RoundtableResponseV1> {
     })
 }
 
+#[cfg(any(test, feature = "test-utils"))]
 fn missing() -> RoundtableResponseV1 {
     RoundtableResponseV1 {
         status: 404,
@@ -103,6 +111,7 @@ fn missing() -> RoundtableResponseV1 {
     }
 }
 
+#[cfg(any(test, feature = "test-utils"))]
 fn denied(code: ErrorCode, reason: &str) -> RtError {
     RtError {
         code,

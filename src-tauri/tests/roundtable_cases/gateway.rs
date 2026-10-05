@@ -431,8 +431,15 @@ fn every_request_includes_prior_output_bounds() {
     let snap = capped
         .accounting(capped_handle.attempt_id())
         .expect("accounting");
-    assert_eq!(snap.generated_utf8_bytes, 262_144);
+    // The overflow byte was received and cannot be refunded.
+    assert_eq!(snap.generated_utf8_bytes, 262_145);
     assert_eq!(snap.model_requests, 2);
+    let mut replay = encoded(RECIPIENT);
+    replay.prior_output = vec![b'x'; 262_144];
+    assert!(capped
+        .handle(&capped_handle, model_request(19, scope.clone(), replay))
+        .is_err());
+    assert_eq!(capped.forward_count(), 2);
     let mut omitted = encoded(RECIPIENT);
     omitted.prior_output = Vec::new();
     let err = capped

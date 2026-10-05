@@ -154,6 +154,10 @@ impl HostCredential {
     fn matches(&self, presented: &str) -> bool {
         constant_eq(self.value.as_bytes(), presented.as_bytes())
     }
+
+    pub(crate) fn value_for_gateway(&self) -> &str {
+        &self.value
+    }
 }
 
 impl fmt::Debug for HostCredential {

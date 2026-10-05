@@ -127,6 +127,48 @@ function connectReady() {
 const ok200 = () => ({ status: 200, ok: true, json: async () => ({}) })
 const resp401 = () => ({ status: 401, ok: false, json: async () => ({}) })
 
+describe("private roundtable subscriptions", () => {
+  it("forwards successful attach and detach only to the requesting socket", async () => {
+    const { t, ws } = connectReady()
+    fetchMock.mockResolvedValue({
+      status: 200,
+      ok: true,
+      text: async () => JSON.stringify({ accepted: true }),
+    })
+    const request = {
+      room_id: "room",
+      subscription_id: "private",
+      protocol_version: 1,
+    }
+    await t.call("roundtable_attach", { request })
+    expect(ws.sent).toContain(
+      JSON.stringify({ action: "roundtable_attach", request })
+    )
+    await t.call("roundtable_detach", { request })
+    expect(ws.sent).toContain(
+      JSON.stringify({
+        action: "roundtable_detach",
+        subscription_id: "private",
+      })
+    )
+  })
+
+  it("does not forward a rejected room attach", async () => {
+    const { t, ws } = connectReady()
+    fetchMock.mockResolvedValue({
+      status: 403,
+      ok: false,
+      json: async () => ({ code: "forbidden" }),
+    })
+    await expect(
+      t.call("roundtable_attach", { request: { subscription_id: "private" } })
+    ).rejects.toEqual({ code: "forbidden" })
+    expect(ws.sent.some((frame) => frame.includes("roundtable_attach"))).toBe(
+      false
+    )
+  })
+})
+
 describe("WebTransport silent disconnect recovery", () => {
   function attachShared(t: WebTransport) {
     return t.eventStream().attach(

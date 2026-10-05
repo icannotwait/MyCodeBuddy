@@ -22,6 +22,9 @@ use super::tool_core::AttemptToken;
 
 pub const ATTEMPT_TOKEN_ENV: &str = "CODEG_ROUNDTABLE_ATTEMPT_TOKEN";
 
+mod transport;
+pub use transport::{ServiceBroker, ServiceConnection};
+
 const LEGACY_HELP: &str = "codeg-mcp --parent-connection-id <uuid> --socket-path <path> --token <secret> [--parent-pid <pid>] [--features delegation,coordination_v1,feedback,ask,sessions,workflow_v2] [--role root|delegation_child] [--can-spawn-child true|false] [--disabled-agents <agent>,...] [--custom-agents <ignored>]";
 
 const LEGACY_TOOL_CATALOG: &[&str] = &[
@@ -151,9 +154,7 @@ pub fn callable_tools(mode: &CompanionMode) -> Vec<String> {
 
 pub fn tool_callable(mode: &CompanionMode, name: &str) -> bool {
     match mode {
-        CompanionMode::ServiceRoundtable { .. } => {
-            service_names().iter().any(|tool| tool == name)
-        }
+        CompanionMode::ServiceRoundtable { .. } => service_names().iter().any(|tool| tool == name),
         CompanionMode::LegacyParent(args) => legacy_companion_context(args).allows_tool(name),
     }
 }
@@ -207,11 +208,9 @@ pub fn plan_service_launch(input: &ServiceLaunchInput<'_>) -> ServiceLaunchPlan 
         sandbox_env.insert(ATTEMPT_TOKEN_ENV.to_string(), token.to_string());
     }
     let manifest = capabilities::sealed_service_manifest();
-    let verified = capabilities::verify_service_manifest(
-        &manifest,
-        &capabilities::ManifestExtras::default(),
-    )
-    .is_ok();
+    let verified =
+        capabilities::verify_service_manifest(&manifest, &capabilities::ManifestExtras::default())
+            .is_ok();
     ServiceLaunchPlan {
         argv: if verified {
             vec![
@@ -327,8 +326,8 @@ impl ServiceWatchdog {
 
 pub struct ServiceProcess {
     token: String,
-    watch: ServiceWatchdog,
-    transport: FakeBrokerTransport,
+    socket_path: String,
+    incarnation: String,
 }
 
 impl ServiceProcess {
@@ -348,9 +347,8 @@ impl ServiceProcess {
         QualificationStatus::NotTested
     }
 
-    pub async fn watch_closed(&self) {
-        let _transport = &self.transport;
-        self.watch.closed().await;
+    pub async fn connect(&self) -> RtResult<ServiceConnection> {
+        transport::connect(&self.socket_path, &self.incarnation, &self.token).await
     }
 }
 
@@ -358,8 +356,8 @@ impl std::fmt::Debug for ServiceProcess {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("ServiceProcess")
-            .field("socket_path", &self.watch.socket_path())
-            .field("incarnation", &self.watch.incarnation())
+            .field("socket_path", &self.socket_path)
+            .field("incarnation", &self.incarnation)
             .field("reads_host_parent_pid", &false)
             .field("certificate", &"not_tested")
             .finish()
@@ -378,12 +376,10 @@ pub fn bind_service_process(
         .ok_or_else(|| rt_error(ErrorCode::Unauthenticated, "missing_attempt_token"))?;
     let manifest = capabilities::sealed_service_manifest();
     capabilities::verify_service_manifest(&manifest, &capabilities::ManifestExtras::default())?;
-    let transport = FakeBrokerTransport::open(socket_path, incarnation);
-    let watch = transport.watch();
     Ok(ServiceProcess {
         token,
-        watch,
-        transport,
+        socket_path: socket_path.to_owned(),
+        incarnation: incarnation.to_owned(),
     })
 }
 

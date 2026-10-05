@@ -929,41 +929,67 @@ pub(crate) fn plan_roundtable_process(
     })
 }
 
-/// Build the cleared-env command and then refuse to exec it.
-///
-/// The persistent gate is closed. `exec_roundtable_process` is the only call
-/// to `Command::spawn`, and `EXEC_ENABLED` keeps it off.
+/// Inspection-only member plans cannot bypass the attached OCI launcher.
+/// The service executor launches through a prepared, pinned isolator instead.
 pub(crate) fn spawn_roundtable_process(
     plan: &RoundtableProcessPlan,
 ) -> roundtable_protocol::RtResult<()> {
     use crate::roundtable::rt_error;
     use roundtable_protocol::ErrorCode;
 
-    let mut command = std::process::Command::new(&plan.program);
-    command.env_clear();
-    command.args(&plan.args);
-    for (key, value) in &plan.env {
-        command.env(key, value);
-    }
-    const EXEC_ENABLED: bool = false;
-    if EXEC_ENABLED {
-        exec_roundtable_process(&mut command)
-            .map_err(|_| rt_error(ErrorCode::PolicyUnenforceable, "policy_unenforceable"))?;
-    }
+    let _ = plan;
     Err(rt_error(
         ErrorCode::PolicyUnenforceable,
         "policy_unenforceable",
     ))
 }
 
-fn exec_roundtable_process(
-    command: &mut std::process::Command,
-) -> std::io::Result<std::process::Child> {
+/// The only real Roundtable exec seam. Callers have already checked the
+/// installed crun pin and recorded the immutable launch intent. Close every
+/// extra descriptor before exec, clear env, and retain attached ACP stdio.
+pub(crate) fn spawn_attached_roundtable_oci(
+    runtime: &Path,
+    args: &[String],
+    cwd: &Path,
+) -> roundtable_protocol::RtResult<tokio::process::Child> {
+    use crate::roundtable::rt_error;
+    use roundtable_protocol::ErrorCode;
+    if !cfg!(target_os = "linux")
+        || !runtime.is_absolute()
+        || !cwd.is_absolute()
+        || is_npx_path(runtime)
+    {
+        return Err(rt_error(
+            ErrorCode::PolicyUnenforceable,
+            "policy_unenforceable",
+        ));
+    }
+    let mut command = tokio::process::Command::new(runtime);
+    command
+        .args(args)
+        .current_dir(cwd)
+        .env_clear()
+        .kill_on_drop(true)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    #[cfg(target_os = "linux")]
+    unsafe {
+        command.pre_exec(|| {
+            // CLOEXEC preserves Tokio's exec-error pipe until its own exec.
+            if libc::syscall(libc::SYS_close_range, 3u32, u32::MAX, 4u32) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
     #[cfg(any(test, feature = "test-utils"))]
     {
         ROUNDTABLE_PROCESS_EXECS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     }
-    command.spawn()
+    command
+        .spawn()
+        .map_err(|_| rt_error(ErrorCode::PolicyUnenforceable, "oci_spawn"))
 }
 
 #[cfg(test)]

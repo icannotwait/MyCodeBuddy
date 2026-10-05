@@ -844,7 +844,7 @@ fn line_is_private(line: &str) -> bool {
     }
     let key_lower = key.to_ascii_lowercase();
     let key_token = key_lower
-        .rsplit(|ch: char| matches!(ch, ' ' | ',' | '{' | '"'))
+        .rsplit([' ', ',', '{', '"'])
         .next()
         .unwrap_or(key_lower.as_str());
     key_token.contains("token")
@@ -1469,11 +1469,12 @@ async fn archived_linux_codex_report_is_not_passed() {
 #[tokio::test(flavor = "current_thread")]
 #[ignore = "live linux-codex-2.1.1 qualification is not approved; ignored is not a pass"]
 async fn linux_codex_2_1_1_live_experiment() {
+    let profile = this_host_profile();
     assert!(
-        cfg!(target_os = "linux"),
+        !profile.platform_blocked && profile.host_os_name == "linux",
         "refusing to treat this host as a passed adapter qualification"
     );
-    let report = qualify_adapter(&this_host_profile(), &absent_approval(), &this_host_cases())
+    let report = qualify_adapter(&profile, &absent_approval(), &this_host_cases())
         .await
         .expect("checker");
     assert_ne!(report.verdict, CheckStatus::Passed);

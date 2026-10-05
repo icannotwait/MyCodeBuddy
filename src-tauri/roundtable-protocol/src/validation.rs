@@ -7,7 +7,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::{
@@ -58,7 +58,7 @@ const MODERATOR_FIELDS: &[&str] = &[
 ];
 
 /// Host-owned scope. The payload cannot choose the speaker.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ResultScope {
     pub phase_kind: PhaseKind,
     pub speaker_id: SpeakerId,
@@ -68,7 +68,7 @@ pub struct ResultScope {
     pub quota_bytes: u32,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct VisibleAliases {
     pub claims: BTreeMap<String, ClaimRef>,
     pub responses: BTreeMap<String, ResponseRef>,
@@ -77,34 +77,34 @@ pub struct VisibleAliases {
     pub speakers: BTreeMap<String, SpeakerId>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ClaimRef {
     pub claim_id: ClaimId,
     pub speaker_id: SpeakerId,
     pub published: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ResponseRef {
     pub response_id: ResponseId,
     pub speaker_id: SpeakerId,
     pub published: bool,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum AliasVisibility {
     Published,
     OwnAttempt,
     PeerStaged,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EvidenceRef {
     pub evidence_id: crate::EvidenceId,
     pub visibility: AliasVisibility,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RequiredTarget {
     pub claim_alias: String,
     pub claim_id: ClaimId,

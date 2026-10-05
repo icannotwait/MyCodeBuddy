@@ -26,9 +26,7 @@ fn ids<T: FromStr>(n: u8) -> T
 where
     T::Err: std::fmt::Debug,
 {
-    format!("00000000-0000-4000-8000-{n:012x}")
-        .parse()
-        .unwrap()
+    format!("00000000-0000-4000-8000-{n:012x}").parse().unwrap()
 }
 
 fn reason(err: &RtError) -> &str {
@@ -46,9 +44,50 @@ fn limits(estimated: u64) -> SnapshotLimits {
 
 fn open_objects(root: &Path, quota: u64) -> (Arc<ReservationLedger>, ObjectStore) {
     let ledger = Arc::new(ReservationLedger::new(quota));
-    let objects = ObjectStore::open(root.join("objects"), Arc::clone(&ledger), ids::<PrincipalId>(1))
-        .unwrap();
+    let objects = ObjectStore::open(
+        root.join("objects"),
+        Arc::clone(&ledger),
+        ids::<PrincipalId>(1),
+    )
+    .unwrap();
     (ledger, objects)
+}
+
+#[tokio::test]
+async fn storage_fix_reopened_object_survives_capture_rollback() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("src");
+    write_tree(&root);
+    let (_, first) = open_objects(dir.path(), 1_000_000);
+    let original = capture_snapshot(
+        selection(root.clone(), ids::<RoomId>(6), 1, None, sample_files()),
+        limits(10_000),
+        &first,
+    )
+    .await
+    .unwrap();
+    drop(first);
+    let (_, reopened) = open_objects(dir.path(), 1_000_000);
+    let reused = capture_snapshot(
+        selection(root, ids::<RoomId>(6), 2, None, sample_files()),
+        limits(10_000),
+        &reopened,
+    )
+    .await
+    .unwrap();
+    let (_pool_dir, conn) = super::roundtable_support::open_pool(1).await;
+    migrate_roundtable(&conn).await.unwrap();
+    let store = open_roundtable_store(conn).await.unwrap();
+    reopened.set_fault(ObjectFault::DbCommit);
+    assert!(commit_captured_manifest(&store, &reopened, &reused)
+        .await
+        .is_err());
+    for entry in original.entries {
+        reopened
+            .get_verified(&entry.object)
+            .await
+            .expect("pre-existing immutable object must survive rollback");
+    }
 }
 
 fn selection(
@@ -234,7 +273,13 @@ async fn capture_rejects_escape_and_mutation() {
 
     std::fs::create_dir(root.join("nested")).unwrap();
     let directory = capture_snapshot(
-        selection(root.clone(), room, 1, None, vec![("nested", SourceClass::Tracked)]),
+        selection(
+            root.clone(),
+            room,
+            1,
+            None,
+            vec![("nested", SourceClass::Tracked)],
+        ),
         limits(100),
         &objects,
     )
@@ -244,7 +289,12 @@ async fn capture_rejects_escape_and_mutation() {
 
     let link = root.join("link.txt");
     match try_symlink(&root.join("tracked.txt"), &link) {
-        Ok(()) if std::fs::symlink_metadata(&link).unwrap().file_type().is_symlink() => {
+        Ok(())
+            if std::fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink() =>
+        {
             let err = capture_snapshot(
                 selection(
                     root.clone(),
@@ -362,7 +412,10 @@ async fn capture_rejects_escape_and_mutation() {
     let err = unstable.unwrap_err();
     assert_eq!(err.code, ErrorCode::InvalidArgument);
     assert_eq!(reason(&err), InternalReason::SnapshotUnstable.as_str());
-    assert_eq!(hits.load(Ordering::SeqCst), usize::try_from(MAX_SNAPSHOT_READS).unwrap());
+    assert_eq!(
+        hits.load(Ordering::SeqCst),
+        usize::try_from(MAX_SNAPSHOT_READS).unwrap()
+    );
 }
 
 #[tokio::test]
@@ -388,9 +441,16 @@ async fn blob_failure_never_commits_reference() {
         .unwrap_err();
         assert_eq!(err.code, ErrorCode::StorageUnavailable, "{fault:?}");
         assert!(objects.committed_ids().is_empty(), "{fault:?}");
-        assert!(objects.remaining_files().is_empty(), "{fault:?} {:?}", objects.remaining_files());
+        assert!(objects
+            .remaining_files()
+            .iter()
+            .all(|name| !name.starts_with(".partial-")));
         assert_eq!(ledger.reserved_bytes(), 0, "{fault:?}");
-        assert_eq!(ledger.used_bytes(), 0, "{fault:?}");
+        if fault == ObjectFault::DirFsync {
+            assert!(ledger.used_bytes() > 0);
+        } else {
+            assert_eq!(ledger.used_bytes(), 0, "{fault:?}");
+        }
     }
 
     let dir = tempfile::tempdir().unwrap();
@@ -413,9 +473,15 @@ async fn blob_failure_never_commits_reference() {
         .unwrap_err();
     assert_eq!(reason(&err), "manifest_commit");
     assert!(objects.committed_ids().is_empty());
-    assert!(objects.remaining_files().is_empty());
+    assert!(objects
+        .remaining_files()
+        .iter()
+        .all(|name| !name.starts_with(".partial-")));
+    for entry in &manifest.entries {
+        objects.get_verified(&entry.object).await.unwrap();
+    }
     assert_eq!(ledger.reserved_bytes(), 0);
-    assert_eq!(ledger.used_bytes(), 0);
+    assert!(ledger.used_bytes() > 0);
 
     let room = ids::<RoomId>(7);
     let principal = ids::<PrincipalId>(7);
@@ -578,9 +644,11 @@ async fn confirmed_manifest_cannot_change_before_start() {
     assert_eq!(echo.secret_names, vec!["API_KEY".to_string()]);
     assert_eq!(echo.excluded_paths, vec![".env".to_string()]);
     assert!(!echo.confirmable);
-    assert!(!freeze_preflight(&actor, &exclusion, &manifest, &recipients)
-        .unwrap()
-        .confirmable);
+    assert!(
+        !freeze_preflight(&actor, &exclusion, &manifest, &recipients)
+            .unwrap()
+            .confirmable
+    );
 
     let record = freeze_preflight(&actor, &draft, &manifest, &recipients).unwrap();
     assert!(record.confirmable);
@@ -614,7 +682,10 @@ async fn confirmed_manifest_cannot_change_before_start() {
         .start_confirmed_manifest(&record.preflight_id, &changed)
         .unwrap_err();
     assert_eq!(err.code, ErrorCode::InvalidState);
-    assert_eq!(reason(&err), InternalReason::ReconfirmationRequired.as_str());
+    assert_eq!(
+        reason(&err),
+        InternalReason::ReconfirmationRequired.as_str()
+    );
 }
 
 #[test]
@@ -640,7 +711,12 @@ fn reservation_preflights_cannot_both_exceed() {
     assert_eq!(ledger.used_bytes(), 0);
 }
 
-fn match_label(result: &(RtResult<codeg_lib::roundtable::StorageLease>, RtResult<codeg_lib::roundtable::StorageLease>)) -> &'static str {
+fn match_label(
+    result: &(
+        RtResult<codeg_lib::roundtable::StorageLease>,
+        RtResult<codeg_lib::roundtable::StorageLease>,
+    ),
+) -> &'static str {
     match result {
         (Ok(_), Ok(_)) => "both reserved",
         (Err(_), Err(_)) => "both rejected",
@@ -651,7 +727,10 @@ fn match_label(result: &(RtResult<codeg_lib::roundtable::StorageLease>, RtResult
 #[tokio::test]
 async fn fixture_line_offsets_and_binary() {
     assert_eq!(line_start_offsets(b"alpha\r\nbeta").unwrap(), vec![0, 7]);
-    assert_eq!(line_start_offsets(b"alpha\r\nbeta\r\n").unwrap(), vec![0, 7]);
+    assert_eq!(
+        line_start_offsets(b"alpha\r\nbeta\r\n").unwrap(),
+        vec![0, 7]
+    );
     assert_eq!(line_start_offsets(b"abc").unwrap(), vec![0]);
     assert!(line_start_offsets(&[0xff, 0xfe, 0x00, 0x0a]).is_none());
 
@@ -702,10 +781,7 @@ async fn fixture_line_offsets_and_binary() {
     assert_eq!(offer_text_tool(crlf, &crlf_bytes).unwrap(), "alpha\r\nbeta");
     let bare = entry(&manifest, "no-final-newline.txt");
     assert_eq!(bare.line_offsets, vec![0]);
-    assert_eq!(
-        objects.get_verified(&bare.object).await.unwrap(),
-        b"abc"
-    );
+    assert_eq!(objects.get_verified(&bare.object).await.unwrap(), b"abc");
     let binary = entry(&manifest, "binary.bin");
     assert_eq!(binary.encoding, SnapshotEncoding::Binary);
     assert!(!binary.text_admissible);
@@ -797,7 +873,8 @@ async fn delivery_prompt_bytes_and_fresh_binding() {
         0,
         "proof",
     );
-    let delivery = build_delivery(&phase, &role, &binding, &ByteTokens(50_000_000), &profile).unwrap();
+    let delivery =
+        build_delivery(&phase, &role, &binding, &ByteTokens(50_000_000), &profile).unwrap();
     let prompt = DeliveryEncoder::prompt_utf8(&phase, &role, &binding).unwrap();
     assert_eq!(delivery.prompt_bytes.0, prompt.len() as u64);
     assert!(delivery.prior_cursor.is_none());
@@ -809,4 +886,53 @@ async fn delivery_prompt_bytes_and_fresh_binding() {
     assert_eq!(context.freshness, ContextFreshness::Fresh);
     assert_eq!(context.delivered_prompt_bytes, delivery.prompt_bytes);
     assert_eq!(FRESH_CONTEXT_STATE, "fresh");
+}
+
+#[tokio::test]
+async fn storage_fix_concurrent_stores_retain_shared_blob_on_rollback() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("src");
+    write_tree(&root);
+    let (ledger_a, a) = open_objects(dir.path(), 1_000_000);
+    let first = capture_snapshot(
+        selection(root.clone(), ids::<RoomId>(6), 1, None, sample_files()),
+        limits(10_000),
+        &a,
+    )
+    .await
+    .unwrap();
+    let (_, b) = open_objects(dir.path(), 1_000_000);
+    let second = capture_snapshot(
+        selection(root, ids::<RoomId>(7), 1, None, sample_files()),
+        limits(10_000),
+        &b,
+    )
+    .await
+    .unwrap();
+    let (_pool, conn) = super::roundtable_support::open_pool(1).await;
+    migrate_roundtable(&conn).await.unwrap();
+    let store = open_roundtable_store(conn).await.unwrap();
+    store
+        .insert_room(&NewRoom {
+            room_id: ids::<RoomId>(7).to_string(),
+            principal_id: ids::<PrincipalId>(1).to_string(),
+            status: "draft".into(),
+            config_ref: "{}".into(),
+            revision: 1,
+            run_epoch: 1,
+            boot_epoch: 1,
+            last_seq: 0,
+            remaining_active_ms: 1000,
+            blocked_reason: None,
+            result_quality: None,
+        })
+        .await
+        .unwrap();
+    commit_captured_manifest(&store, &b, &second).await.unwrap();
+    a.set_fault(ObjectFault::DbCommit);
+    assert!(commit_captured_manifest(&store, &a, &first).await.is_err());
+    for entry in &second.entries {
+        b.get_verified(&entry.object).await.unwrap();
+    }
+    assert!(ledger_a.used_bytes() >= first.accounted_bytes());
 }

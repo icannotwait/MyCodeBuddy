@@ -71,7 +71,7 @@ async fn occupy_five(conn: &DatabaseConnection) {
             .await
             .expect("probe read");
         assert_eq!(probe, index);
-        assert_raw_profile(&mut *connection).await;
+        assert_raw_profile(&mut connection).await;
         held.push(connection);
     }
     assert_eq!(held.len(), 5);

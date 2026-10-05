@@ -202,94 +202,6 @@ fn map_completion_mutation_error(error: CompletionMutationError) -> AppCommandEr
     }
 }
 
-#[cfg(test)]
-mod protocol_error_tests {
-    use super::*;
-    use crate::acp::delegation::workflow::CompletionEvidenceError;
-
-    #[test]
-    fn completion_protocol_mutations_preserve_stable_app_error_codes() {
-        let read_only = map_completion_mutation_error(CompletionMutationError::Protocol {
-            code: "legacy_completion_protocol_read_only",
-            message: "legacy workflow is read-only".into(),
-        });
-        assert_eq!(
-            read_only.code,
-            AppErrorCode::LegacyCompletionProtocolReadOnly
-        );
-        assert_eq!(
-            read_only.detail.as_deref(),
-            Some("legacy_completion_protocol_read_only")
-        );
-
-        let unsupported = map_completion_mutation_error(CompletionMutationError::Evidence(
-            CompletionEvidenceError::Protocol {
-                code: "unsupported_completion_protocol",
-                message: "workflow protocol header is unsupported".into(),
-            },
-        ));
-        assert_eq!(
-            unsupported.code,
-            AppErrorCode::UnsupportedCompletionProtocol
-        );
-        assert_eq!(
-            unsupported.detail.as_deref(),
-            Some("unsupported_completion_protocol")
-        );
-
-        for (code, expected) in [
-            ("workflow_v2_retired", AppErrorCode::WorkflowV2Retired),
-            (
-                "workflow_identity_corrupt",
-                AppErrorCode::WorkflowIdentityCorrupt,
-            ),
-        ] {
-            let mapped = map_completion_mutation_error(CompletionMutationError::Protocol {
-                code,
-                message: "structured workflow retirement failure".into(),
-            });
-            assert_eq!(mapped.code, expected);
-            assert_eq!(mapped.detail.as_deref(), Some(code));
-        }
-    }
-
-    #[test]
-    fn completion_entry_guard_preserves_retirement_navigation() {
-        let retired =
-            map_workflow_store_error(WorkflowStoreError::workflow_v2_retired_with_navigation(41));
-        assert_eq!(retired.code, AppErrorCode::WorkflowV2Retired);
-        assert_eq!(
-            retired.message,
-            "This workflow is archived and read-only. Create a new conversation and use a new Design."
-        );
-        let navigation = retired.i18n_params.expect("retirement navigation");
-        assert_eq!(
-            navigation.get("source_conversation_id").map(String::as_str),
-            Some("41")
-        );
-        assert!(!navigation.contains_key("successor_conversation_id"));
-        assert_eq!(
-            navigation
-                .get("can_create_simple_successor")
-                .map(String::as_str),
-            Some("false")
-        );
-
-        let corrupt = map_workflow_store_error(WorkflowStoreError::WorkflowIdentityCorrupt {
-            source_conversation_id: 41,
-        });
-        assert_eq!(corrupt.code, AppErrorCode::WorkflowIdentityCorrupt);
-        assert_eq!(
-            corrupt
-                .i18n_params
-                .as_ref()
-                .and_then(|params| params.get("source_conversation_id"))
-                .map(String::as_str),
-            Some("41")
-        );
-    }
-}
-
 #[cfg_attr(feature = "tauri-runtime", tauri::command)]
 pub async fn resolve_completion_decision(
     #[cfg(feature = "tauri-runtime")] db: tauri::State<'_, AppDatabase>,
@@ -431,5 +343,93 @@ mod tests {
             let error = desktop_completion_context_for_label(42, label).unwrap_err();
             assert_eq!(error.detail.as_deref(), Some("unauthorized"), "{label}");
         }
+    }
+}
+
+#[cfg(test)]
+mod protocol_error_tests {
+    use super::*;
+    use crate::acp::delegation::workflow::CompletionEvidenceError;
+
+    #[test]
+    fn completion_protocol_mutations_preserve_stable_app_error_codes() {
+        let read_only = map_completion_mutation_error(CompletionMutationError::Protocol {
+            code: "legacy_completion_protocol_read_only",
+            message: "legacy workflow is read-only".into(),
+        });
+        assert_eq!(
+            read_only.code,
+            AppErrorCode::LegacyCompletionProtocolReadOnly
+        );
+        assert_eq!(
+            read_only.detail.as_deref(),
+            Some("legacy_completion_protocol_read_only")
+        );
+
+        let unsupported = map_completion_mutation_error(CompletionMutationError::Evidence(
+            CompletionEvidenceError::Protocol {
+                code: "unsupported_completion_protocol",
+                message: "workflow protocol header is unsupported".into(),
+            },
+        ));
+        assert_eq!(
+            unsupported.code,
+            AppErrorCode::UnsupportedCompletionProtocol
+        );
+        assert_eq!(
+            unsupported.detail.as_deref(),
+            Some("unsupported_completion_protocol")
+        );
+
+        for (code, expected) in [
+            ("workflow_v2_retired", AppErrorCode::WorkflowV2Retired),
+            (
+                "workflow_identity_corrupt",
+                AppErrorCode::WorkflowIdentityCorrupt,
+            ),
+        ] {
+            let mapped = map_completion_mutation_error(CompletionMutationError::Protocol {
+                code,
+                message: "structured workflow retirement failure".into(),
+            });
+            assert_eq!(mapped.code, expected);
+            assert_eq!(mapped.detail.as_deref(), Some(code));
+        }
+    }
+
+    #[test]
+    fn completion_entry_guard_preserves_retirement_navigation() {
+        let retired =
+            map_workflow_store_error(WorkflowStoreError::workflow_v2_retired_with_navigation(41));
+        assert_eq!(retired.code, AppErrorCode::WorkflowV2Retired);
+        assert_eq!(
+            retired.message,
+            "This workflow is archived and read-only. Create a new conversation and use a new Design."
+        );
+        let navigation = retired.i18n_params.expect("retirement navigation");
+        assert_eq!(
+            navigation.get("source_conversation_id").map(String::as_str),
+            Some("41")
+        );
+        assert!(!navigation.contains_key("successor_conversation_id"));
+        assert_eq!(
+            navigation
+                .get("can_create_simple_successor")
+                .map(String::as_str),
+            Some("false")
+        );
+
+        let corrupt = map_workflow_store_error(WorkflowStoreError::WorkflowIdentityCorrupt {
+            source_conversation_id: 41,
+        });
+        assert_eq!(corrupt.code, AppErrorCode::WorkflowIdentityCorrupt);
+        assert_eq!(
+            corrupt
+                .i18n_params
+                .as_ref()
+                .and_then(|params| params.get("source_conversation_id"))
+                .map(String::as_str),
+            Some("41")
+        );
     }
 }

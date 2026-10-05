@@ -149,19 +149,26 @@ impl RequestAccounting {
         utf8: &[u8],
         profile: &QualifiedContextProfile,
     ) -> RtResult<()> {
-        let added = u64::try_from(utf8.len())
-            .map_err(|_| rt_error(ErrorCode::InvalidArgument, "overflow"))?;
-        let next = self
-            .transcript
-            .generated_utf8_bytes
-            .checked_add(added)
-            .ok_or_else(|| rt_error(ErrorCode::InvalidArgument, "overflow"))?;
-        if next > profile.max_attempt_generated_utf8_bytes {
+        self.consume_generated(utf8.len() as u64, profile)?;
+        self.commit_generated_prior(utf8);
+        Ok(())
+    }
+
+    /// Consumption is irreversible even when the response later fails parsing.
+    pub(crate) fn consume_generated(
+        &mut self,
+        added: u64,
+        profile: &QualifiedContextProfile,
+    ) -> RtResult<()> {
+        self.transcript.generated_utf8_bytes =
+            self.transcript.generated_utf8_bytes.saturating_add(added);
+        if self.transcript.generated_utf8_bytes > profile.max_attempt_generated_utf8_bytes {
             return Err(rt_error(ErrorCode::ContextTooLarge, "generated_utf8_limit"));
         }
-        self.transcript.generated_utf8_bytes = next;
-        self.required_prior.extend_from_slice(utf8);
         Ok(())
+    }
+    pub(crate) fn commit_generated_prior(&mut self, utf8: &[u8]) {
+        self.required_prior.extend_from_slice(utf8);
     }
 
     pub(crate) fn snapshot(&self) -> AccountingSnapshot {

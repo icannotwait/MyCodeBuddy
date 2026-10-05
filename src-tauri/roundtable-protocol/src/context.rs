@@ -55,7 +55,7 @@ pub fn cumulative_result_reading_bytes(n: u32, r: u32, result_bytes: u64) -> RtR
         .ok_or_else(|| invalid("overflow"))
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct QualifiedContextProfile {
     pub tokenizer_id: String,
@@ -254,6 +254,7 @@ impl DeliveryEncoder {
             effort: &role.effort,
             model: &role.model,
             phase_hash: canonical_hash(phase)?.to_hex(),
+            phase,
             provider_ref: &role.provider_ref,
             prompt_version: &role.prompt_version,
             role: &role.role,
@@ -273,6 +274,43 @@ impl DeliveryEncoder {
         profile: &QualifiedContextProfile,
     ) -> RtResult<DeliveryManifestV1> {
         let prompt = Self::prompt_utf8(phase, role, binding)?;
+        Self::encode_prompt(phase, role, binding, tokens, profile, &prompt)
+    }
+
+    /// Encode the actual immutable content delivered to the participant. User
+    /// content has its own field and cannot rewrite role or schema metadata.
+    pub fn prompt_with_context(
+        phase: &PhaseSnapshotV1,
+        role: &RoleSnapshot,
+        binding: &BindingId,
+        context: &serde_json::Value,
+    ) -> RtResult<Vec<u8>> {
+        let metadata: serde_json::Value =
+            serde_json::from_slice(&Self::prompt_utf8(phase, role, binding)?)
+                .map_err(|_| invalid("delivery_encoding"))?;
+        canonical_bytes(&serde_json::json!({"metadata": metadata, "context": context}))
+    }
+
+    pub fn encode_with_context(
+        phase: &PhaseSnapshotV1,
+        role: &RoleSnapshot,
+        binding: &BindingId,
+        context: &serde_json::Value,
+        tokens: &dyn TokenBound,
+        profile: &QualifiedContextProfile,
+    ) -> RtResult<DeliveryManifestV1> {
+        let prompt = Self::prompt_with_context(phase, role, binding, context)?;
+        Self::encode_prompt(phase, role, binding, tokens, profile, &prompt)
+    }
+
+    fn encode_prompt(
+        phase: &PhaseSnapshotV1,
+        role: &RoleSnapshot,
+        binding: &BindingId,
+        tokens: &dyn TokenBound,
+        profile: &QualifiedContextProfile,
+        prompt: &[u8],
+    ) -> RtResult<DeliveryManifestV1> {
         let exact = u64::try_from(prompt.len()).map_err(|_| invalid("overflow"))?;
         if exact > crate::MAX_SAFE_INTEGER {
             return Err(invalid("overflow"));
@@ -289,7 +327,7 @@ impl DeliveryEncoder {
             )?)
             .ok_or_else(|| invalid("overflow"))?;
         let admission = tokens
-            .upper_bound(&prompt)?
+            .upper_bound(prompt)?
             .checked_add(bound_length(tokens, future)?)
             .and_then(|value| value.checked_add(profile.adapter_hidden_bound_tokens))
             .and_then(|value| value.checked_add(profile.generation_reserve_tokens))
@@ -311,7 +349,7 @@ impl DeliveryEncoder {
             provider_ref: role.provider_ref.clone(),
             binding_id: *binding,
             prior_cursor: None,
-            prompt_hash: Hash256::sha256(&prompt),
+            prompt_hash: Hash256::sha256(prompt),
             prompt_bytes: SafeInt(exact),
         })
     }
@@ -491,6 +529,7 @@ struct DeliveryPrompt<'a> {
     effort: &'a str,
     model: &'a str,
     phase_hash: String,
+    phase: &'a PhaseSnapshotV1,
     provider_ref: &'a str,
     prompt_version: &'a str,
     role: &'a str,

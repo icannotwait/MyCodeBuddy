@@ -202,6 +202,24 @@ pub fn validate_manifest(manifest: &BackupManifest) -> Result<(), AppCommandErro
         if !safe {
             return Err(corrupted_error());
         }
+        // Only the canonical section survives marker normalization. Missing
+        // or alias-only declarations would restore references, then discard
+        // the objects. Recognize Windows directory aliases on every platform.
+        if manifest.managed_sections.as_deref().is_none_or(|sections| {
+            !sections
+                .iter()
+                .any(|section| section == "roundtable-objects")
+        }) && p.components().next().is_some_and(|top| {
+            top.as_os_str()
+                .to_string_lossy()
+                .split(':')
+                .next()
+                .unwrap_or_default()
+                .trim_end_matches(['.', ' '])
+                .eq_ignore_ascii_case("roundtable-objects")
+        }) {
+            return Err(corrupted_error());
+        }
         if !seen.insert(e.path.as_str()) {
             return Err(corrupted_error());
         }
@@ -500,5 +518,59 @@ mod tests {
             sha256: "y".into(),
         });
         assert!(validate_manifest(&m4).is_err());
+    }
+
+    #[test]
+    fn legacy_roundtable_object_guard_matches_only_the_root_component() {
+        for (path, accepted) in [
+            ("roundtable-objects/hash", false),
+            ("ROUNDTABLE-OBJECTS/hash", false),
+            ("roundtable-objects./hash", false),
+            ("roundtable-objects /hash", false),
+            ("Roundtable-Objects. ./hash", false),
+            ("roundtable-objects::$INDEX_ALLOCATION/hash", false),
+            ("roundtable-objects-old/hash", true),
+            ("uploads/roundtable-objects/hash", true),
+            ("acp-transcripts/session.jsonl", true),
+        ] {
+            let mut manifest = sample_manifest();
+            manifest.entries = ["db/codeg.db", path]
+                .map(|path| ManifestEntry {
+                    path: path.into(),
+                    size: 1,
+                    sha256: "x".into(),
+                })
+                .to_vec();
+            assert_eq!(validate_manifest(&manifest).is_ok(), accepted, "{path}");
+        }
+    }
+
+    #[test]
+    fn roundtable_object_alias_declaration_cannot_authorize_restore() {
+        for section in [
+            "ROUNDTABLE-OBJECTS",
+            "roundtable-objects.",
+            "roundtable-objects ",
+            "roundtable-objects::$INDEX_ALLOCATION",
+        ] {
+            let mut manifest = sample_manifest();
+            manifest.managed_sections = Some(vec![section.into()]);
+            manifest.entries = vec![
+                ManifestEntry {
+                    path: "db/codeg.db".into(),
+                    size: 1,
+                    sha256: "x".into(),
+                },
+                ManifestEntry {
+                    path: format!("{section}/hash"),
+                    size: 1,
+                    sha256: "x".into(),
+                },
+            ];
+            assert!(
+                validate_manifest(&manifest).is_err(),
+                "unknown section alias {section} cannot authorize the swap"
+            );
+        }
     }
 }

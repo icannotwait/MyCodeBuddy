@@ -77,6 +77,12 @@ pub struct AuthenticatedApplication {
 }
 
 impl AuthenticatedApplication {
+    pub fn is_global_operator(&self) -> bool {
+        matches!(
+            self.completion_root_scope,
+            CompletionRootScope::GlobalOperator
+        )
+    }
     fn server_operator() -> Self {
         Self {
             actor_identity: "web_server_operator".into(),

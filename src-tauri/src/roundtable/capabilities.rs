@@ -9,7 +9,9 @@
 use std::collections::HashMap;
 use std::sync::Mutex;
 
-use roundtable_protocol::{canonical_bytes, ErrorCode, Fence, Hash256, RtResult, RuntimeTurnCompleted};
+use roundtable_protocol::{
+    canonical_bytes, ErrorCode, Fence, Hash256, RtResult, RuntimeTurnCompleted,
+};
 use serde::Serialize;
 use serde_json::Value;
 
@@ -118,44 +120,20 @@ impl LaunchCapabilityManifestV1 {
     }
 }
 
-struct CapabilitySet {
-    tools: Vec<String>,
-    mcp_servers: Vec<String>,
-    native_fs: bool,
-    native_shell: bool,
-    native_subagent: bool,
-    network_destinations: Vec<String>,
-    mounts: Vec<String>,
-    inherited_fds: Vec<String>,
-    environment_keys: Vec<String>,
-}
-
-impl CapabilitySet {
-    fn empty() -> Self {
-        Self {
-            tools: Vec::new(),
-            mcp_servers: Vec::new(),
-            native_fs: false,
-            native_shell: false,
-            native_subagent: false,
-            network_destinations: Vec::new(),
-            mounts: Vec::new(),
-            inherited_fds: Vec::new(),
-            environment_keys: Vec::new(),
-        }
-    }
-}
-
-/// Service inventory. Built from [`CapabilitySet::empty`], not from host flags.
+/// Service inventory. Constructed exclusively from the sealed allowlist.
 pub fn sealed_service_manifest() -> LaunchCapabilityManifestV1 {
-    let _empty = CapabilitySet::empty();
     LaunchCapabilityManifestV1 {
         version: MANIFEST_VERSION.to_string(),
         launcher: SERVICE_LAUNCHER.to_string(),
         adapter: SERVICE_ADAPTER.to_string(),
         helper: SERVICE_HELPER.to_string(),
         config: SERVICE_CONFIG.to_string(),
-        environment_keys: vec![ATTEMPT_TOKEN_ENV.to_string()],
+        environment_keys: vec![
+            ATTEMPT_TOKEN_ENV.to_string(),
+            "CODEG_RT_MODEL_SOCKET".into(),
+            "OPENAI_API_KEY".into(),
+            "OPENAI_BASE_URL".into(),
+        ],
         mcp_servers: vec![SERVICE_MCP.to_string()],
         tool_names: service_tool_names()
             .iter()
@@ -173,7 +151,6 @@ pub fn sealed_service_manifest() -> LaunchCapabilityManifestV1 {
 /// Ordinary flags are accepted and ignored. They are not copied then stripped.
 pub fn service_manifest_for_session(flags: &OrdinarySessionFlags) -> LaunchCapabilityManifestV1 {
     let _ignored = flags.any_enabled();
-    let _empty = CapabilitySet::empty();
     sealed_service_manifest()
 }
 
@@ -396,11 +373,15 @@ pub(crate) fn decide_service_turn(
         None
     };
     let finish_reason = if blocked {
-        reason.clone().unwrap_or_else(|| "session_failure".to_string())
+        reason
+            .clone()
+            .unwrap_or_else(|| "session_failure".to_string())
     } else if completed.is_some() {
         "normal".to_string()
     } else {
-        reason.clone().unwrap_or_else(|| "no_submission".to_string())
+        reason
+            .clone()
+            .unwrap_or_else(|| "no_submission".to_string())
     };
     let candidate_id = completed
         .and_then(|done| done.candidate_id.clone())

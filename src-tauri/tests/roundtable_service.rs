@@ -55,7 +55,10 @@ impl FakeRuntime {
 
 #[async_trait]
 impl ParticipantRuntime for FakeRuntime {
-    async fn prepare(&self, _launch: RoundtableLaunch) -> roundtable_protocol::RtResult<PreparedRoundtableConnection> {
+    async fn prepare(
+        &self,
+        _launch: RoundtableLaunch,
+    ) -> roundtable_protocol::RtResult<PreparedRoundtableConnection> {
         self.prepare_entered.store(true, Ordering::Relaxed);
         let hold = self.hold.lock().expect("hold").take();
         if let Some(hold) = hold {
@@ -73,7 +76,10 @@ impl ParticipantRuntime for FakeRuntime {
         })
     }
 
-    async fn cancel_and_reap(&self, identity: RuntimeIdentity) -> roundtable_protocol::RtResult<CleanupProof> {
+    async fn cancel_and_reap(
+        &self,
+        identity: RuntimeIdentity,
+    ) -> roundtable_protocol::RtResult<CleanupProof> {
         self.reaped.store(true, Ordering::Relaxed);
         Ok(proof_for(&identity.incarnation))
     }
@@ -85,7 +91,10 @@ struct ListedDiscovery {
 
 #[async_trait]
 impl IsolationProvider for ListedDiscovery {
-    async fn prepare(&self, _plan: &codeg_lib::roundtable::SandboxPlan) -> roundtable_protocol::RtResult<PreparedSandbox> {
+    async fn prepare(
+        &self,
+        _plan: &codeg_lib::roundtable::SandboxPlan,
+    ) -> roundtable_protocol::RtResult<PreparedSandbox> {
         Err(unavailable("discover_only"))
     }
 
@@ -97,11 +106,17 @@ impl IsolationProvider for ListedDiscovery {
         Err(unavailable("discover_only"))
     }
 
-    async fn discover_owned(&self, _db: &DbIdentity) -> roundtable_protocol::RtResult<Vec<SandboxInstance>> {
+    async fn discover_owned(
+        &self,
+        _db: &DbIdentity,
+    ) -> roundtable_protocol::RtResult<Vec<SandboxInstance>> {
         Ok(self.instances.clone())
     }
 
-    async fn reap(&self, _instance: &SandboxInstance) -> roundtable_protocol::RtResult<ProcessTreeProof> {
+    async fn reap(
+        &self,
+        _instance: &SandboxInstance,
+    ) -> roundtable_protocol::RtResult<ProcessTreeProof> {
         Err(unavailable("discover_only"))
     }
 }
@@ -123,7 +138,7 @@ fn proof_for(incarnation: &IncarnationId) -> CleanupProof {
     CleanupProof {
         process: ProcessTreeProof {
             instance_id: "instance".to_string(),
-            incarnation: incarnation.clone(),
+            incarnation: *incarnation,
             process_tree_empty: true,
         },
         mailbox_empty: true,
@@ -210,7 +225,10 @@ async fn two_processes_one_coordinator() {
     assert_eq!(writable_services, 1);
     let automation = dir.path().join("codeg.db.lock");
     assert_ne!(
-        lock_path_for(dir.path(), &DbIdentity::new("roundtable-service-db").expect("id")),
+        lock_path_for(
+            dir.path(),
+            &DbIdentity::new("roundtable-service-db").expect("id")
+        ),
         automation
     );
     parent.shutdown().await.expect("shutdown");
@@ -250,7 +268,7 @@ async fn peer() {
     .await
     .expect("peer open");
     let room = RoomId::from_str(&id('2')).expect("room");
-    let start = service.start(room.clone()).await.expect("start");
+    let start = service.start(room).await.expect("start");
     let resume = service
         .send(
             room,
@@ -276,18 +294,14 @@ async fn actor_gate_enforces_fake_races_on_real_store() {
     let runtime = FakeRuntime::new();
     let (tx, rx) = oneshot::channel();
     *runtime.hold.lock().expect("hold") = Some(rx);
-    let service = RoundtableService::open(
-        config(dir.path(), Some(listed(Vec::new()))),
-        store,
-        {
-            let runtime: Arc<dyn ParticipantRuntime> = runtime.clone();
-            runtime
-        },
-    )
+    let service = RoundtableService::open(config(dir.path(), Some(listed(Vec::new()))), store, {
+        let runtime: Arc<dyn ParticipantRuntime> = runtime.clone();
+        runtime
+    })
     .await
     .expect("service");
     let room = RoomId::from_str(&id('3')).expect("room");
-    let actor = RoomActor::new(room.clone(), service.boot_epoch());
+    let actor = RoomActor::new(room, service.boot_epoch());
     let first = actor.admit();
     let second = actor.admit();
     assert!(first);
@@ -330,7 +344,7 @@ async fn crash_recovery_blocks_other_room_until_cleanup() {
     let conn = open_db(dir.path()).await;
     let store = open_roundtable_store(conn).await.expect("store");
     store
-        .record_launch_for_test(intent(dir.path(), incarnation.clone()))
+        .record_launch_for_test(intent(dir.path(), incarnation))
         .await
         .expect("intent");
     let service = RoundtableService::open(
@@ -349,11 +363,11 @@ async fn crash_recovery_blocks_other_room_until_cleanup() {
     let partial = PermitReleaseProof {
         lease_id: "lease".to_string(),
         proofs: std::collections::BTreeMap::from([(
-            incarnation.clone(),
+            incarnation,
             CleanupProof {
                 process: ProcessTreeProof {
                     instance_id: "instance".to_string(),
-                    incarnation: incarnation.clone(),
+                    incarnation,
                     process_tree_empty: false,
                 },
                 mailbox_empty: true,
@@ -363,7 +377,10 @@ async fn crash_recovery_blocks_other_room_until_cleanup() {
         )]),
     };
     assert_ne!(
-        service.acknowledge_cleanup(&partial).await.expect("partial"),
+        service
+            .acknowledge_cleanup(&partial)
+            .await
+            .expect("partial"),
         ServiceReadiness::Ready
     );
     let mut full_proof = proof_for(&incarnation);
@@ -409,7 +426,7 @@ async fn partial_cleanup_cannot_release_bundle() {
     let conn = open_db(dir.path()).await;
     let store = open_roundtable_store(conn).await.expect("store");
     store
-        .record_launch_for_test(intent(dir.path(), incarnation.clone()))
+        .record_launch_for_test(intent(dir.path(), incarnation))
         .await
         .expect("intent");
     let service = RoundtableService::open(
@@ -424,7 +441,10 @@ async fn partial_cleanup_cannot_release_bundle() {
         proofs: std::collections::BTreeMap::new(),
     };
     assert_eq!(
-        service.acknowledge_cleanup(&partial).await.expect("partial"),
+        service
+            .acknowledge_cleanup(&partial)
+            .await
+            .expect("partial"),
         ServiceReadiness::Blocked {
             reason: "partial_cleanup",
         }
@@ -465,7 +485,7 @@ fn intent(_dir: &Path, incarnation: IncarnationId) -> LaunchIntent {
     LaunchIntent {
         db: db.clone(),
         boot_epoch: Epoch(1),
-        incarnation: incarnation.clone(),
+        incarnation,
         owner_label: format!("db=roundtable-service-db;boot=1;incarnation={incarnation}"),
         image_digest: "sha256:intent".to_string(),
         plan_hash: Hash256::sha256(b"plan"),

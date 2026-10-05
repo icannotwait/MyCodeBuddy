@@ -75,6 +75,14 @@ pub enum HostToolsPolicy {
 }
 
 impl HostToolsPolicy {
+    /// Apply the service boundary at the handler wiring, not just Initialize.
+    pub fn for_purpose(self, purpose: crate::auto_title::ConnectionPurpose) -> Self {
+        if purpose == crate::auto_title::ConnectionPurpose::Roundtable {
+            Self::Agent
+        } else {
+            self
+        }
+    }
     /// Resolve from [`HOST_TOOLS_ENV`], checking the agent's `runtime_env`
     /// first (so it rides along in the existing per-agent `env_json`) then
     /// codeg's own process env — the same precedence, and the same helper, as
@@ -134,6 +142,10 @@ pub fn roundtable_hosts_terminal() -> bool {
 /// Roundtable turns cannot prompt the user.
 pub fn roundtable_interactive_permission() -> InteractivePermission {
     InteractivePermission::Deny
+}
+
+pub fn denies_interactive_permission(purpose: crate::auto_title::ConnectionPurpose) -> bool {
+    purpose.is_hidden_generation() || purpose == crate::auto_title::ConnectionPurpose::Roundtable
 }
 
 /// The only companion group a roundtable member may see. Delegation and the

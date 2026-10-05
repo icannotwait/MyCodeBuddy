@@ -300,7 +300,7 @@ fn parse_hash_hex(text: &str) -> Option<Hash256> {
 macro_rules! wire_u64 {
     ($($name:ident),+ $(,)?) => {$(
         /// Decimal string `0|[1-9][0-9]*` on the wire. Internal value is `u64`.
-        #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+        #[derive(Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
         pub struct $name(pub u64);
 
         impl fmt::Debug for $name {
@@ -344,7 +344,7 @@ fn parse_wire_u64(text: &str) -> Option<u64> {
 }
 
 /// JSON number in `0..=2^53-1`.
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct SafeInt(pub u64);
 
 impl fmt::Debug for SafeInt {
@@ -1585,10 +1585,179 @@ pub struct ProjectionBodyV1 {
     #[serde(deserialize_with = "de_nullable")]
     pub moderator_speaker_id: Option<SpeakerId>,
     pub phase_refs: Vec<PhaseRefV1>,
+    /// Ordered immutable membership at this watermark, including staged results.
+    pub messages: Vec<PublishedMessageRef>,
+    pub evidence_manifests: Vec<ManifestId>,
+    pub replay: ProjectionReplayV1,
     /// Persistent budget sample at this business commit. Not a start authorization.
     pub ledger_seq: Seq,
     pub sampled_active_ms: DurationMs,
     pub sampled_at_utc: String,
+}
+
+/// Durable business state only: no process handles, credentials or tool tokens.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProjectionReplayV1 {
+    #[serde(deserialize_with = "de_nullable")]
+    pub config: Option<RoundtableConfigV1>,
+    pub boot_epoch: Epoch,
+    #[serde(deserialize_with = "de_nullable")]
+    pub current_phase_id: Option<PhaseId>,
+    #[serde(deserialize_with = "de_nullable")]
+    pub active_control_id: Option<OperationId>,
+    #[serde(deserialize_with = "de_nullable")]
+    pub result_quality: Option<String>,
+    pub speakers: Vec<ProjectionSpeakerV1>,
+    pub turns: Vec<ProjectionTurnV1>,
+    pub attempts: Vec<ProjectionAttemptV1>,
+    pub bindings: Vec<ProjectionBindingV1>,
+    pub control_operations: Vec<ProjectionControlV1>,
+    pub inputs: Vec<ProjectionInputV1>,
+    pub budget: ProjectionBudgetV1,
+    #[serde(deserialize_with = "de_nullable")]
+    pub coverage: Option<crate::CoverageV1>,
+    pub message_memberships: Vec<MessageMembershipV1>,
+    pub evidence: Vec<ProjectionEvidenceV1>,
+    pub source_manifests: Vec<SourceManifestRefV1>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProjectionSpeakerV1 {
+    pub speaker_id: SpeakerId,
+    pub ordinal: u32,
+    pub role: String,
+    pub provider_ref: String,
+    pub model_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProjectionTurnV1 {
+    pub turn_id: TurnId,
+    pub phase_id: PhaseId,
+    pub speaker_id: SpeakerId,
+    pub status: String,
+    #[serde(deserialize_with = "de_nullable")]
+    pub accepted_attempt_id: Option<AttemptId>,
+    pub admitted_attempt_count: SafeInt,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProjectionAttemptV1 {
+    pub attempt_id: AttemptId,
+    pub turn_id: TurnId,
+    pub attempt_no: u32,
+    pub binding_id: BindingId,
+    pub state: String,
+    pub dispatch_state: String,
+    pub cleanup_state: String,
+    pub residual_remote_work: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProjectionBindingV1 {
+    pub binding_id: BindingId,
+    pub speaker_id: SpeakerId,
+    pub generation: Revision,
+    pub state: String,
+    pub context_state: String,
+    #[serde(deserialize_with = "de_nullable")]
+    pub retire_reason: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProjectionControlV1 {
+    pub operation_id: OperationId,
+    pub kind: ControlKind,
+    pub step: ControlStep,
+    #[serde(deserialize_with = "de_nullable")]
+    pub target_phase_id: Option<PhaseId>,
+    #[serde(deserialize_with = "de_nullable")]
+    pub target_revision: Option<Revision>,
+    pub requested_epoch: Epoch,
+    pub status: String,
+    #[serde(deserialize_with = "de_nullable")]
+    pub blocked_reason: Option<String>,
+    #[serde(deserialize_with = "de_nullable")]
+    pub successor_phase_id: Option<PhaseId>,
+    #[serde(deserialize_with = "de_nullable")]
+    pub superseded_by: Option<OperationId>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProjectionInputV1 {
+    pub input_id: String,
+    pub text: String,
+    pub mode: String,
+    pub accepted_seq: Seq,
+    pub target_phase_index: u32,
+    #[serde(deserialize_with = "de_nullable")]
+    pub applied_phase_id: Option<PhaseId>,
+    #[serde(deserialize_with = "de_nullable")]
+    pub applied_seq: Option<Seq>,
+    pub state: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProjectionBudgetV1 {
+    pub remaining_active_ms: DurationMs,
+    pub admitted_attempts: SafeInt,
+    pub reservations: Vec<ProjectionReservationV1>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProjectionReservationV1 {
+    pub reservation_id: String,
+    pub purpose: String,
+    pub amount_ms: DurationMs,
+    pub amount_bytes: SafeInt,
+    pub state: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MessageVisibility {
+    Staged,
+    Published,
+    Void,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MessageMembershipV1 {
+    pub message_id: MessageId,
+    pub membership_version: Revision,
+    pub visibility: MessageVisibility,
+    #[serde(deserialize_with = "de_nullable")]
+    pub published_seq: Option<Seq>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProjectionEvidenceV1 {
+    pub evidence_id: EvidenceId,
+    pub manifest_id: ManifestId,
+    pub owner_speaker_id: SpeakerId,
+    pub content_hash: Hash256,
+    /// Canonical evidence metadata and excerpt at the fixed projection.
+    pub body_hash: Hash256,
+    #[serde(deserialize_with = "de_nullable")]
+    pub published_seq: Option<Seq>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SourceManifestRefV1 {
+    pub manifest_id: ManifestId,
+    pub hash: Hash256,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1828,6 +1997,12 @@ pub struct UsageViewV1 {
     pub measurements: Vec<NamedCountV1>,
     pub totals: Vec<NamedCountV1>,
     pub unknown_count: SafeInt,
+    #[serde(default)]
+    pub confirmed_output_tokens: Option<SafeInt>,
+    #[serde(default)]
+    pub unknown_total: bool,
+    #[serde(default)]
+    pub uncertain: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

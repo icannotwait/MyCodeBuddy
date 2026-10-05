@@ -92,6 +92,11 @@ pub(crate) async fn create_backup_core(
         return Err(cancelled_error());
     }
     snapshot_db_to(inputs.conn, &db_snapshot).await?;
+    crate::roundtable::RoundtableStore::validate_backup_objects(
+        &db_snapshot,
+        &inputs.data_dir.join("roundtable/objects"),
+    )
+    .await?;
 
     // ── Phase 2: build the ZIP payload (blocking) ────────────────────────
     let manifest_template = BackupManifest {

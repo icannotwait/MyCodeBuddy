@@ -1,16 +1,21 @@
 "use client"
 
+import { useTranslations } from "next-intl"
+
 export function RoundtableDetail({
   order,
   partial,
   waiting,
   showSynthesis,
+  onSynthesis,
 }: {
   order: string[]
   partial?: string
   waiting?: boolean
   showSynthesis: boolean
+  onSynthesis?: () => void
 }) {
+  const t = useTranslations("Roundtable")
   return (
     <section>
       <ol>
@@ -19,8 +24,12 @@ export function RoundtableDetail({
         ))}
       </ol>
       {partial ? <p>{partial}</p> : null}
-      {waiting ? <p>等待其余成员</p> : null}
-      {showSynthesis ? <button type="button">综合</button> : null}
+      {waiting ? <p>{t("waiting")}</p> : null}
+      {showSynthesis ? (
+        <button type="button" onClick={onSynthesis} disabled={!onSynthesis}>
+          {t("synthesis")}
+        </button>
+      ) : null}
     </section>
   )
 }

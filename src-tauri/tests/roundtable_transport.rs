@@ -1,5 +1,14 @@
 //! Private subscriptions, frozen pages, and one command executor.
 
+#[path = "roundtable_support/mod.rs"]
+pub mod support;
+
+#[path = "roundtable_cases/product_commands.rs"]
+mod product_commands;
+
+#[path = "roundtable_cases/product_review.rs"]
+mod product_review;
+
 use roundtable_protocol::{
     ActorContext, ClientIdentity, ClientKind, DurableEnvelopeV1, ErrorCode, Hash256, ObjectKind,
     ObjectRefV1, OperatorScope, PhaseKind, PhaseRefV1, PhaseState, PrincipalId, ProjectionBodyV1,
@@ -34,13 +43,17 @@ fn actor(n: u8) -> ActorContext {
 }
 
 fn room() -> RoomId {
-    "00000000-0000-4000-8000-000000000010".parse().expect("room")
+    "00000000-0000-4000-8000-000000000010"
+        .parse()
+        .expect("room")
 }
 
 fn projection(hash: Hash256) -> ProjectionV1 {
     ProjectionV1 {
         projection_ref: ProjectionRef {
-            id: "00000000-0000-4000-8000-000000000020".parse().expect("projection"),
+            id: "00000000-0000-4000-8000-000000000020"
+                .parse()
+                .expect("projection"),
             hash,
         },
         body: ProjectionBodyV1 {
@@ -54,12 +67,17 @@ fn projection(hash: Hash256) -> ProjectionV1 {
             config_hash: Hash256::sha256(b"config"),
             moderator_speaker_id: None,
             phase_refs: vec![PhaseRefV1 {
-                phase_id: "00000000-0000-4000-8000-000000000030".parse().expect("phase"),
+                phase_id: "00000000-0000-4000-8000-000000000030"
+                    .parse()
+                    .expect("phase"),
                 index: 0,
                 revision: Revision(1),
                 kind: PhaseKind::Proposal,
                 state: PhaseState::Published,
             }],
+            messages: vec![],
+            evidence_manifests: vec![],
+            replay: Default::default(),
             ledger_seq: Seq(1),
             sampled_active_ms: DurationMs(0),
             sampled_at_utc: "2026-10-05T00:00:00Z".to_string(),
@@ -93,9 +111,11 @@ fn subscription_authorization_and_fold() {
     };
     let mut hub = SubscriptionHub::new();
     assert!(authorize_room(&actor(2), &room(), &directory).is_err());
-    hub.attach(&actor(2), &room(), &directory, "other").expect_err("hidden from other");
+    hub.attach(&actor(2), &room(), &directory, "other")
+        .expect_err("hidden from other");
     assert!(hub.frames_for("other").is_empty());
-    hub.attach(&actor(1), &room(), &directory, "owner").expect("owner");
+    hub.attach(&actor(1), &room(), &directory, "owner")
+        .expect("owner");
     hub.publish("owner", "frame".to_string());
     hub.publish("other", "secret".to_string());
     assert_eq!(hub.frames_for("owner"), vec!["frame".to_string()]);
@@ -104,21 +124,23 @@ fn subscription_authorization_and_fold() {
     assert_eq!(hub.preview_bounds("speaker"), Some((1, 4)));
     assert!(hub.admit_incarnation(2));
     assert!(!hub.admit_incarnation(1));
-    let speaker: SpeakerId = "00000000-0000-4000-8000-000000000040".parse().expect("speaker");
+    let speaker: SpeakerId = "00000000-0000-4000-8000-000000000040"
+        .parse()
+        .expect("speaker");
     assert!(moderator_preview_allowed(Some(&speaker), None));
 
     let hash = Hash256::sha256(b"projection");
-    let fetched = projection(hash.clone());
+    let fetched = projection(hash);
     let mut seq = 3;
-    let folded = apply_projection(&mut seq, &envelope(hash.clone(), 1), &fetched).expect("fold");
+    let folded = apply_projection(&mut seq, &envelope(hash, 1), &fetched).expect("fold");
     assert_eq!(projection_hash(&folded), projection_hash(&fetched));
     assert!(apply_projection(&mut seq, &envelope(hash, 2), &fetched).is_err());
     assert_eq!(seq, 4);
 
     let entries: Vec<_> = (0..250).map(|index| format!("m{index}")).collect();
     let body = Hash256::sha256(b"manifest");
-    let first = read_manifest_page(&entries, body.clone(), None, 100).expect("page");
-    let second = read_manifest_page(&entries, body.clone(), Some(&first.cursor), 100).expect("next");
+    let first = read_manifest_page(&entries, body, None, 100).expect("page");
+    let second = read_manifest_page(&entries, body, Some(&first.cursor), 100).expect("next");
     assert_eq!(first.entries.len(), 100);
     assert_eq!(second.body_hash, first.body_hash);
     assert_eq!(first.entries[0], "m0");
@@ -138,7 +160,10 @@ fn command_parity_and_closed_errors() {
     };
     let tauri = execute(request.clone()).expect("tauri");
     let http = execute(request).expect("http");
-    assert_eq!(serde_json::to_string(&tauri.body).unwrap(), serde_json::to_string(&http.body).unwrap());
+    assert_eq!(
+        serde_json::to_string(&tauri.body).unwrap(),
+        serde_json::to_string(&http.body).unwrap()
+    );
     assert_eq!(tauri.room_state, Some(RoomState::Pausing));
     assert_eq!(tauri.page_limit, 100);
     let limited = roundtable_protocol::RtError {
@@ -210,4 +235,3 @@ fn command_parity_and_closed_errors() {
     })
     .is_err());
 }
-

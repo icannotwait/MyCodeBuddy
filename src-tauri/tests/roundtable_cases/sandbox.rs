@@ -452,15 +452,13 @@ async fn sandbox_blocks_host_escape() {
     }
     assert!(plan.mounts.iter().all(|mount| {
         let source = mount.source.to_string_lossy();
-        !source.contains("docker.sock") && mount.source != PathBuf::from("/proc")
+        !source.contains("docker.sock") && mount.source != Path::new("/proc")
     }));
-    assert!(
-        plan.oci
-            .to_string()
-            .to_ascii_lowercase()
-            .contains("docker.sock")
-            == false
-    );
+    assert!(!plan
+        .oci
+        .to_string()
+        .to_ascii_lowercase()
+        .contains("docker.sock"));
 
     let mut relative = input.clone();
     relative.certificate.binaries[0].absolute_path = "crun".to_string();
@@ -567,10 +565,9 @@ async fn sandbox_blocks_host_escape() {
 #[tokio::test(flavor = "current_thread")]
 #[ignore = "linux os escape probe; ignored is not a sandbox pass"]
 async fn sandbox_blocks_host_escape_live() {
-    assert!(
-        cfg!(target_os = "linux"),
-        "refusing to treat a non-linux run as a sandbox pass"
-    );
+    if !cfg!(target_os = "linux") {
+        panic!("refusing to treat a non-linux run as a sandbox pass");
+    }
     let dir = tempdir().expect("temp dir");
     let plan = build_sandbox_plan(&SandboxInput {
         certificate: base_key(),
@@ -601,4 +598,151 @@ async fn sandbox_blocks_host_escape_live() {
     assert!(report.denied_socket);
     assert!(report.denied_global_mcp);
     assert!(report.denied_arbitrary_network);
+}
+
+#[tokio::test]
+async fn sandbox_prepare_rejects_oci_namespace_tampering() {
+    let dir = tempdir().unwrap();
+    let plan = build_sandbox_plan(&SandboxInput {
+        certificate: base_key(),
+        db: DbIdentity::new("sqlite:tamper-review").unwrap(),
+        boot_epoch: Epoch(1),
+        incarnation: "00000000-0000-4000-8000-00000000000c".parse().unwrap(),
+        scratch: abs_dir(dir.path(), "scratch"),
+        project: abs_dir(dir.path(), "project"),
+        home: abs_dir(dir.path(), "home"),
+        other_scratches: vec![],
+        decoy_paths: vec![],
+        inherited_env: BTreeMap::new(),
+        env_allowlist: BTreeMap::new(),
+        global_mcp: false,
+    })
+    .unwrap();
+    let isolator =
+        LinuxOciIsolator::new(JournalLaunchIntentStore::open(&dir.path().join("journal")).unwrap());
+    let mut edited = plan;
+    edited.oci["linux"]["namespaces"] = serde_json::json!([]);
+    assert!(
+        isolator.prepare(&edited).await.is_err(),
+        "OCI edits must invalidate a prepared plan"
+    );
+    edited.plan_hash = Hash256::sha256(&serde_json::to_vec(&edited.oci).unwrap());
+    assert!(
+        isolator.prepare(&edited).await.is_err(),
+        "a recomputed hash cannot replace required namespaces"
+    );
+}
+
+#[test]
+fn qualified_rootfs_digest_detects_frozen_file_changes() {
+    let dir = tempdir().unwrap();
+    fs::create_dir(dir.path().join("bin")).unwrap();
+    let binary = dir.path().join("bin/member");
+    fs::write(&binary, b"pinned member").unwrap();
+    let original = codeg_lib::roundtable::qualified_rootfs_digest(dir.path()).unwrap();
+    assert_eq!(
+        original,
+        codeg_lib::roundtable::qualified_rootfs_digest(dir.path()).unwrap()
+    );
+    fs::write(binary, b"replaced member").unwrap();
+    assert_ne!(
+        original,
+        codeg_lib::roundtable::qualified_rootfs_digest(dir.path()).unwrap()
+    );
+}
+
+#[test]
+fn qualified_profile_hash_binds_execution_template_without_attempt_socket_names() {
+    let dir = tempdir().unwrap();
+    let key = base_key();
+    let profile = codeg_lib::roundtable::QualifiedOciProfile {
+        runtime: key.binaries[0].clone(),
+        rootfs: dir.path().join("rootfs"),
+        rootfs_sha256: digest(41),
+        runtime_root: dir.path().join("runtime"),
+        cgroup_root: PathBuf::from("/sys/fs/cgroup/codeg"),
+        cli_args: vec!["--acp".into()],
+        service_socket: Some(dir.path().join("one.sock")),
+        gateway_socket: None,
+    };
+    let first = codeg_lib::roundtable::qualified_oci_profile_hash(&profile, &key).unwrap();
+    let mut next = profile.clone();
+    next.service_socket = Some(dir.path().join("two.sock"));
+    assert_eq!(
+        first,
+        codeg_lib::roundtable::qualified_oci_profile_hash(&next, &key).unwrap()
+    );
+    next.service_socket = None;
+    next.gateway_socket = Some(dir.path().join("gateway.sock"));
+    assert_eq!(
+        first,
+        codeg_lib::roundtable::qualified_oci_profile_hash(&next, &key).unwrap()
+    );
+    next.rootfs_sha256 = digest(42);
+    assert_ne!(
+        first,
+        codeg_lib::roundtable::qualified_oci_profile_hash(&next, &key).unwrap()
+    );
+    next = profile;
+    next.cli_args.push("--other-contract".into());
+    assert_ne!(
+        first,
+        codeg_lib::roundtable::qualified_oci_profile_hash(&next, &key).unwrap()
+    );
+}
+
+fn scratch_review_input(root: &Path) -> SandboxInput {
+    SandboxInput {
+        certificate: base_key(),
+        db: DbIdentity::new("scratch-review").unwrap(),
+        boot_epoch: Epoch(1),
+        incarnation: "00000000-0000-4000-8000-00000000000d".parse().unwrap(),
+        scratch: abs_dir(root, "scratch"),
+        project: abs_dir(root, "project"),
+        home: abs_dir(root, "home"),
+        other_scratches: vec![],
+        decoy_paths: vec![],
+        inherited_env: BTreeMap::new(),
+        env_allowlist: BTreeMap::new(),
+        global_mcp: false,
+    }
+}
+
+#[test]
+fn sandbox_scratch_cannot_mount_a_forbidden_parent() {
+    let dir = tempdir().unwrap();
+    let mut input = scratch_review_input(dir.path());
+    input.scratch = dir.path().canonicalize().unwrap();
+    assert!(
+        build_sandbox_plan(&input).is_err(),
+        "a parent scratch exposes the entire forbidden tree"
+    );
+}
+
+#[test]
+fn sandbox_scratch_cannot_use_a_parent_traversal_alias() {
+    let dir = tempdir().unwrap();
+    let mut input = scratch_review_input(dir.path());
+    fs::create_dir(input.project.join("child")).unwrap();
+    // Verbatim Windows Path::join normalizes dot-dot itself; use the normal
+    // spelling so the plan builder receives the unresolved alias.
+    let project = input.project.to_string_lossy();
+    input.scratch = PathBuf::from(project.strip_prefix(r"\\?\").unwrap_or(&project))
+        .join("child")
+        .join("..");
+    assert!(
+        build_sandbox_plan(&input).is_err(),
+        "canonical aliases must not mount the project"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn sandbox_scratch_cannot_use_a_symlink_to_a_forbidden_directory() {
+    let dir = tempdir().unwrap();
+    let mut input = scratch_review_input(dir.path());
+    let alias = dir.path().join("alias");
+    std::os::unix::fs::symlink(&input.project, &alias).unwrap();
+    input.scratch = alias;
+    assert!(build_sandbox_plan(&input).is_err());
 }

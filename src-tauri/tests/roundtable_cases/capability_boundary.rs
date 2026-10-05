@@ -13,10 +13,10 @@ use codeg_lib::roundtable::{
     host_broker_call, host_tools_agent_manifest, policy_hash_for, qualify_service,
     record_service_response, record_service_update, sealed_service_manifest,
     service_client_capabilities_value, service_manifest_for_session, verify_service_manifest,
-    AdvertisedToolsNotUsed, BarrierFact, CompletionCoordinator, CompletionMarker,
-    ConnectionOwner, FailureObservation, FailureSource, InMemoryToolStore, ManifestExtras,
-    OrdinarySessionFlags, PrivateRuntimeSink, QualificationReport, RoundtableToolCall,
-    ServiceTurnDecision, ATTEMPT_TOKEN_ENV, SERVICE_TOOL_VERSION,
+    BarrierFact, CompletionCoordinator, CompletionMarker, ConnectionOwner, FailureObservation,
+    FailureSource, InMemoryToolStore, ManifestExtras, OrdinarySessionFlags, PrivateRuntimeSink,
+    QualificationReport, RoundtableToolCall, ServiceTurnDecision, ATTEMPT_TOKEN_ENV,
+    SERVICE_TOOL_VERSION,
 };
 use roundtable_protocol::{
     canonical_bytes, submit_candidate, AcpUpdate, BindingId, CandidateState, DecisionKind, Epoch,
@@ -150,7 +150,13 @@ fn sealed_candidate() -> roundtable_protocol::CandidateReceipt {
     }
 }
 
-fn open_turn(fence: Fence, turn: u64) -> (CompletionCoordinator, roundtable_protocol::CompletionBarrier) {
+fn open_turn(
+    fence: Fence,
+    turn: u64,
+) -> (
+    CompletionCoordinator,
+    roundtable_protocol::CompletionBarrier,
+) {
     let mut coordinator = CompletionCoordinator::open(fence.clone());
     let handler = HandlerId::new("service-tool");
     coordinator.admit_handler(handler.clone()).expect("admit");
@@ -263,7 +269,9 @@ fn widen_attempts_cannot_expand_the_service_set() {
 
     let mut shell = sealed.clone();
     shell.native_shell = true;
-    shell.network_destinations.push("https://example.test".to_string());
+    shell
+        .network_destinations
+        .push("https://example.test".to_string());
     let err = verify_service_manifest(&shell, &ManifestExtras::default()).expect_err("shell");
     assert_eq!(reason(&err), "native_shell_egress");
 
@@ -303,7 +311,12 @@ fn manifest_hash_joins_policy_and_fake_pass_is_not_a_certificate() {
     assert!(!text.contains("super-secret-token"));
     assert_eq!(
         manifest.environment_keys,
-        vec![ATTEMPT_TOKEN_ENV.to_string()]
+        vec![
+            ATTEMPT_TOKEN_ENV.to_string(),
+            "CODEG_RT_MODEL_SOCKET".into(),
+            "OPENAI_API_KEY".into(),
+            "OPENAI_BASE_URL".into()
+        ]
     );
     assert!(manifest.inherited_fds.is_empty());
     let manifest_hash = manifest.canonical_hash().unwrap();
@@ -335,10 +348,7 @@ fn manifest_hash_joins_policy_and_fake_pass_is_not_a_certificate() {
     );
     let broker = codeg_lib::roundtable::FakeBrokerTransport::open("socket", "incarnation");
     assert!(!broker.is_certificate());
-    assert_eq!(
-        broker.certificate_status(),
-        QualificationStatus::NotTested
-    );
+    assert_eq!(broker.certificate_status(), QualificationStatus::NotTested);
 }
 
 #[tokio::test]
@@ -394,12 +404,7 @@ async fn dispatch_rejects_tools_outside_the_sealed_manifest() {
 #[test]
 fn recorded_session_failure_uses_the_typed_parser() {
     let fence = fence_for(2);
-    bind_private_ingress(
-        "p07e-record",
-        Arc::new(Sink),
-        fence.clone(),
-        4,
-    );
+    bind_private_ingress("p07e-record", Arc::new(Sink), fence.clone(), 4);
     let meta = air(error_record("turn-4"));
     record_service_update("p07e-record", Some(4), Some(&meta));
     record_service_response("p07e-record", Some(4), Some(&meta), "end_turn");
@@ -407,15 +412,28 @@ fn recorded_session_failure_uses_the_typed_parser() {
     assert_eq!(notes.len(), 2);
     assert!(drain_recorded_failures("p07e-record").is_empty());
     assert_eq!(notes[0].classification.records[0].severity, "error");
-    assert_eq!(notes[0].classification.records[0].source, FailureSource::Update);
-    assert_eq!(notes[1].classification.records[0].source, FailureSource::Response);
+    assert_eq!(
+        notes[0].classification.records[0].source,
+        FailureSource::Update
+    );
+    assert_eq!(
+        notes[1].classification.records[0].source,
+        FailureSource::Response
+    );
     assert!(!notes[0].classification.incompatible);
 }
 
 #[test]
 fn http_400_and_end_turn_blocks_accepted() {
     let fence = fence_for(2);
-    let note = observation(&fence, 4, None, FailureSource::Response, Some("end_turn"), Some(400));
+    let note = observation(
+        &fence,
+        4,
+        None,
+        FailureSource::Response,
+        Some("end_turn"),
+        Some(400),
+    );
     let (mut coordinator, barrier) = open_turn(fence.clone(), 4);
     coordinator.observe_service_failure(note);
     let decision = adjudicate(&mut coordinator, &fence, &barrier);
@@ -627,7 +645,10 @@ fn unrecognized_failure_shape_is_adapter_incompatible() {
     assert!(!decision.accepted);
     assert!(!decision.certificate);
     assert_eq!(decision.reason.as_deref(), Some("adapter_incompatible"));
-    assert_eq!(decision.public_code(), Some(ErrorCode::CapabilityUnqualified));
+    assert_eq!(
+        decision.public_code(),
+        Some(ErrorCode::CapabilityUnqualified)
+    );
     assert!(ErrorCode::parse("adapter_incompatible").is_none());
 }
 

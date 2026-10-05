@@ -34,7 +34,6 @@ pub struct RoundtableStore {
     conn: DatabaseConnection,
     clock: Arc<Mutex<Arc<dyn MonoClock>>>,
     faults: Arc<Mutex<AcceptFaults>>,
-    catalog: Arc<Mutex<super::maintenance::ReferenceCatalog>>,
 }
 
 #[derive(Clone, Debug)]
@@ -203,15 +202,10 @@ pub async fn open_roundtable_store(conn: DatabaseConnection) -> RtResult<Roundta
         conn,
         clock: Arc::new(Mutex::new(Arc::new(SystemMono::new()))),
         faults: Arc::new(Mutex::new(AcceptFaults::default())),
-        catalog: Arc::new(Mutex::new(super::maintenance::ReferenceCatalog::empty())),
     })
 }
 
-impl RoundtableStore {
-    pub fn reference_catalog(&self) -> Arc<Mutex<super::maintenance::ReferenceCatalog>> {
-        Arc::clone(&self.catalog)
-    }
-}
+impl RoundtableStore {}
 
 /// Apply the registered roundtable schema in one short transaction.
 ///
@@ -798,7 +792,7 @@ impl RoundtableStore {
         finish(txn, result).await
     }
 
-    async fn mark_launch_spawned(
+    pub(crate) async fn mark_launch_spawned(
         &self,
         incarnation: IncarnationId,
         instance: SandboxInstance,
@@ -900,7 +894,7 @@ impl RoundtableStore {
         finish(txn, result).await
     }
 
-    async fn load_bindings(&self) -> RtResult<Vec<StoredBinding>> {
+    pub(crate) async fn load_bindings(&self) -> RtResult<Vec<StoredBinding>> {
         let rows = self
             .conn
             .query_all(Statement::from_string(
@@ -915,7 +909,7 @@ impl RoundtableStore {
         rows.iter().map(binding_from_row).collect()
     }
 
-    async fn upsert_binding(&self, row: StoredBinding) -> RtResult<()> {
+    pub(crate) async fn upsert_binding(&self, row: StoredBinding) -> RtResult<()> {
         exec(
             &self.conn,
             "INSERT INTO rt_internal_bindings (

@@ -1,4 +1,22 @@
 use std::collections::{HashMap, HashSet};
+
+fn parse_client_message(text: &str) -> roundtable_protocol::RtResult<ClientMsg> {
+    let value = roundtable_protocol::parse_strict_json(
+        text.as_bytes(),
+        &roundtable_protocol::ParseLimits::suggested_profile(),
+    )?;
+    serde_json::from_value(value).map_err(|_| {
+        crate::roundtable::rt_error(
+            roundtable_protocol::ErrorCode::InvalidArgument,
+            "client_message",
+        )
+    })
+}
+
+fn admit_roundtable_subscription(tasks: &mut HashMap<String, JoinHandle<()>>, id: &str) -> bool {
+    tasks.retain(|_, task| !task.is_finished());
+    tasks.contains_key(id) || tasks.len() < 64
+}
 use std::sync::Arc;
 
 use axum::extract::ws::{Message, WebSocket};
@@ -50,7 +68,11 @@ fn apply_cleanup_signal(
 /// Other oversized frames are dropped by returning `None`; neither outcome
 /// closes the socket or removes the underlying agent connection.
 pub(super) fn serialize_server_msg(msg: &ServerMsg) -> Result<Option<Vec<u8>>, serde_json::Error> {
-    let encoded = serde_json::to_vec(msg)?;
+    let encoded = if let ServerMsg::RoundtablePrivate { channel, payload } = msg {
+        serde_json::to_vec(&serde_json::json!({"channel":channel,"payload":payload}))?
+    } else {
+        serde_json::to_vec(msg)?
+    };
     if encoded.len() <= MAX_ATTACH_FRAME_BYTES {
         return Ok(Some(encoded));
     }
@@ -88,15 +110,19 @@ pub async fn ws_handler(
     ws: WebSocketUpgrade,
     Extension(state): Extension<Arc<AppState>>,
     Extension(shutdown_signal): Extension<Arc<ShutdownSignal>>,
+    Extension(auth): Extension<super::auth::AuthenticatedApplication>,
 ) -> impl IntoResponse {
     ws.protocols([super::auth::WS_EVENT_PROTOCOL])
-        .on_upgrade(|socket| handle_ws_connection(socket, state, shutdown_signal))
+        .on_upgrade(move |socket| {
+            handle_ws_connection(socket, state, shutdown_signal, auth.is_global_operator())
+        })
 }
 
 async fn handle_ws_connection(
     mut socket: WebSocket,
     state: Arc<AppState>,
     shutdown_signal: Arc<ShutdownSignal>,
+    operator: bool,
 ) {
     // Late handshake guard: if shutdown already fired before this task
     // even started, exit before subscribing to anything else.
@@ -139,6 +165,17 @@ async fn handle_ws_connection(
     // epoch (see cleanup channel above) alongside the JoinHandle.
     let mut subscriptions: HashMap<String, ActiveSubscription> = HashMap::new();
     let mut next_epoch: u64 = 0;
+    let mut roundtable_subscriptions: HashMap<String, JoinHandle<()>> = HashMap::new();
+    let mut room_actor =
+        crate::commands::roundtable::operator_actor(roundtable_protocol::ClientKind::Web);
+    room_actor = roundtable_protocol::ActorContext::from_trusted_entry(
+        room_actor.principal_id(),
+        roundtable_protocol::OperatorScope::SingleOperator,
+        roundtable_protocol::ClientIdentity {
+            kind: roundtable_protocol::ClientKind::Web,
+            session_ref: uuid::Uuid::new_v4().to_string(),
+        },
+    );
 
     // Server→client ready handshake (legacy `__ready__` frame). Phase 1
     // keeps this so unmigrated transports still gate `acp_connect` on the
@@ -262,7 +299,41 @@ async fn handle_ws_connection(
             msg = socket.recv() => {
                 match msg {
                     Some(Ok(Message::Text(text))) => {
-                match serde_json::from_str::<ClientMsg>(&text) {
+                match parse_client_message(&text) {
+                            Ok(ClientMsg::RoundtableAttach { request }) => {
+                                if !operator {continue;}
+                                let Some(service)=state.roundtable.current() else {continue;};
+                                let Ok(attach)=roundtable_protocol::decode_json::<roundtable_protocol::AttachRequest>(&serde_json::to_vec(&request).unwrap_or_default(), &roundtable_protocol::ParseLimits::suggested_profile()) else {continue;};
+                                let id=attach.subscription_id.to_string();
+                                if !admit_roundtable_subscription(&mut roundtable_subscriptions,&id) {continue;}
+                                let initial=service.execute_command(&room_actor,"roundtable_attach",request).await;
+                                if let Ok(initial)=initial {
+                                    if let Some(old)=roundtable_subscriptions.remove(&id) {old.abort();}
+                                    let tx=outbound_tx.clone();let actor=room_actor.clone();
+                                    let channel=format!("roundtable://{id}");
+                                    let room=attach.room_id;
+                                    if tx.send(ServerMsg::RoundtablePrivate{channel:channel.clone(),payload:initial.clone()}).await.is_err() {break;}
+                                    let handle=tokio::spawn(async move {
+                                        let mut seq=0;
+                                        if crate::roundtable::advance_private_watermark(&mut seq,&initial).is_err(){return;}
+                                        let mut interval=tokio::time::interval(std::time::Duration::from_secs(1));
+                                        loop {
+                                            interval.tick().await;
+                                            match service.execute_command(&actor,"roundtable_get",serde_json::json!({"room_id":room})).await {
+                                                Ok(snapshot)=>{
+                                                    if crate::roundtable::advance_private_watermark(&mut seq,&snapshot).unwrap_or(false)
+                                                        && tx.send(ServerMsg::RoundtablePrivate{channel:channel.clone(),payload:snapshot}).await.is_err(){break;}
+                                                }
+                                                Err(_)=>break,
+                                            }
+                                        }
+                                    });
+                                    roundtable_subscriptions.insert(id,handle);
+                                }
+                            }
+                            Ok(ClientMsg::RoundtableDetach { subscription_id })=>{
+                                if let Some(handle)=roundtable_subscriptions.remove(&subscription_id){handle.abort();}
+                            }
                             Ok(cmsg) => {
                                 handle_client_msg(
                                     cmsg,
@@ -289,6 +360,9 @@ async fn handle_ws_connection(
 
     // Cleanup: abort all active forwarder tasks. Their broadcast receivers
     // will be dropped, freeing the per-connection broadcaster slot.
+    for (_, handle) in roundtable_subscriptions.drain() {
+        handle.abort();
+    }
     for (_, sub) in subscriptions.drain() {
         sub.handle.abort();
     }
@@ -377,6 +451,7 @@ async fn handle_client_msg(
                 sub.handle.abort();
             }
         }
+        ClientMsg::RoundtableAttach { .. } | ClientMsg::RoundtableDetach { .. } => {}
         ClientMsg::Ping => {
             let subscription_count = subscriptions.len();
             let mut bindings = Vec::new();
@@ -502,9 +577,41 @@ fn binding_key(binding: &LeaseSocketBinding) -> (String, u64, String) {
     )
 }
 
+pub fn roundtable_frames_stay_on_private_sink() -> bool {
+    true
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn roundtable_frame_rejects_duplicate_request_keys() {
+        assert!(parse_client_message(r#"{"action":"roundtable_attach","request":{}}"#).is_ok());
+        let frame = r#"{"action":"roundtable_attach","request":{"room_id":"00000000-0000-4000-8000-000000000001","room_id":"00000000-0000-4000-8000-000000000002","subscription_id":"00000000-0000-4000-8000-000000000003"}}"#;
+        assert!(parse_client_message(frame).is_err());
+    }
+
+    #[tokio::test]
+    async fn roundtable_subscription_cap_allows_replacement_and_prunes_finished() {
+        let mut tasks = HashMap::new();
+        for index in 0..64 {
+            tasks.insert(
+                index.to_string(),
+                tokio::spawn(std::future::pending::<()>()),
+            );
+        }
+        assert!(admit_roundtable_subscription(&mut tasks, "0"));
+        assert!(!admit_roundtable_subscription(&mut tasks, "new"));
+        tasks.remove("0").unwrap().abort();
+        tasks.insert("finished".into(), tokio::spawn(async {}));
+        tasks.get_mut("finished").unwrap().await.unwrap();
+        assert!(admit_roundtable_subscription(&mut tasks, "new"));
+        assert_eq!(tasks.len(), 63);
+        for (_, task) in tasks {
+            task.abort();
+        }
+    }
 
     /// Build an ActiveSubscription wrapping a no-op spawned task. The
     /// JoinHandle is real so abort() in cleanup paths is realistic.
@@ -597,8 +704,4 @@ mod tests {
         assert!(line.contains("connection=conn-detached generation=9 detached:lease_expired"));
         assert!(!line.contains("secret-lease"));
     }
-}
-
-pub fn roundtable_frames_stay_on_private_sink() -> bool {
-    true
 }

@@ -14,7 +14,11 @@ pub struct RoomDirectory {
     pub rooms: Vec<RoomGrant>,
 }
 
-pub fn authorize_room(actor: &ActorContext, room: &RoomId, directory: &RoomDirectory) -> RtResult<()> {
+pub fn authorize_room(
+    actor: &ActorContext,
+    room: &RoomId,
+    directory: &RoomDirectory,
+) -> RtResult<()> {
     let grant = directory
         .rooms
         .iter()

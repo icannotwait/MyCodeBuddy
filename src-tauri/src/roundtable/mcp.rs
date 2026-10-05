@@ -8,17 +8,17 @@
 
 use std::collections::HashMap;
 use std::str::FromStr;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
+use roundtable_protocol::validation::FieldError as SchemaFieldError;
 use roundtable_protocol::{
     canonical_bytes, charge_interjection, parse_strict_json, profile_suggestions, submit_candidate,
-    validate_result, AttemptId, CandidateReceipt, DecisionKind, ErrorCode, ErrorDetails, Fence,
-    FieldError as WireFieldError, FinishKind, HandlerId, Hash256, InternalReason, LimitsOrigin,
-    MonoMs, ParseLimits, ResultScope, RoomId, RtError, RtResult, SubmissionId, SubmissionState,
-    v1_1,
+    v1_1, validate_result, AttemptId, CandidateReceipt, DecisionKind, ErrorCode, ErrorDetails,
+    Fence, FieldError as WireFieldError, FinishKind, HandlerId, Hash256, InternalReason,
+    LimitsOrigin, MonoMs, ParseLimits, ResultScope, RoomId, RtError, RtResult, SubmissionId,
+    SubmissionState,
 };
-use roundtable_protocol::validation::FieldError as SchemaFieldError;
 use sea_orm::{
     ConnectionTrait, DatabaseBackend, DatabaseTransaction, DbErr, QueryResult, Statement,
     TransactionTrait, TryGetable, Value as DbValue,
@@ -157,12 +157,13 @@ struct Linear {
 /// P13's actor replaces this type; the trait stays.
 pub struct GateToolAuthority {
     registry: TokenRegistry,
-    gate: ExecutionGate,
+    data_dir: std::path::PathBuf,
     execution: ExecutionScope,
     facts: AdmissionFacts,
     pinned: TokenBinding,
     expires_at: MonoMs,
     now: Mutex<MonoMs>,
+    clock: Option<Arc<dyn super::clock::MonoClock>>,
     control: Mutex<TokenBinding>,
     issued: Mutex<HashMap<String, IssuedToken>>,
     interjection_used: Mutex<u64>,
@@ -182,12 +183,13 @@ impl GateToolAuthority {
         let state = roundtable_protocol::CompletionState::open(pinned.fence.clone());
         Self {
             registry: TokenRegistry::new(),
-            gate: ExecutionGate::open(data_dir),
+            data_dir: data_dir.to_path_buf(),
             execution,
             facts,
             pinned: pinned.clone(),
             expires_at,
             now: Mutex::new(now),
+            clock: None,
             control: Mutex::new(pinned),
             issued: Mutex::new(HashMap::new()),
             interjection_used: Mutex::new(0),
@@ -204,7 +206,13 @@ impl GateToolAuthority {
     }
 
     pub fn gate_enabled(&self) -> bool {
-        self.gate.enabled()
+        ExecutionGate::open(&self.data_dir).enabled()
+    }
+
+    /// Production authorities sample the host clock on every admission.
+    pub fn with_clock(mut self, clock: Arc<dyn super::clock::MonoClock>) -> Self {
+        self.clock = Some(clock);
+        self
     }
 
     pub fn gate_held(&self) -> bool {
@@ -220,7 +228,10 @@ impl GateToolAuthority {
         let token = self.registry.issue(binding.clone());
         lock(&self.issued).insert(
             token.reveal_for_same_sandbox().to_string(),
-            IssuedToken { binding, expires_at },
+            IssuedToken {
+                binding,
+                expires_at,
+            },
         );
         token
     }
@@ -263,11 +274,8 @@ impl GateToolAuthority {
     /// Creation-time interjection reserve. Overspend is rejected.
     pub fn note_interjection(&self, incoming: u64) -> RtResult<u64> {
         let mut used = lock(&self.interjection_used);
-        let remaining = charge_interjection(
-            u64::from(v1_1::DEFAULT_INTERJECTION_BYTES),
-            *used,
-            incoming,
-        )?;
+        let remaining =
+            charge_interjection(u64::from(v1_1::DEFAULT_INTERJECTION_BYTES), *used, incoming)?;
         *used = used.saturating_add(incoming);
         Ok(remaining)
     }
@@ -314,7 +322,10 @@ impl GateToolAuthority {
     }
 
     fn begin_admission(&self, token: &AttemptToken) -> RtResult<(AdmittedToolScope, HandlerId)> {
-        let now = *lock(&self.now);
+        let now = self
+            .clock
+            .as_ref()
+            .map_or_else(|| *lock(&self.now), |clock| MonoMs(clock.now_ms()));
         let secret = token.reveal_for_same_sandbox();
         let issued = lock(&self.issued)
             .get(secret)
@@ -343,8 +354,11 @@ impl GateToolAuthority {
             return Err(rt_error(ErrorCode::Forbidden, "alias_mismatch"));
         }
         // The permit is dropped before the caller performs evidence I/O.
-        let permit = self.gate.check(&self.execution, &self.facts, now)?;
-        let scope = self.registry.admit(secret, &issued.binding, "read_evidence")?;
+        let permit =
+            ExecutionGate::open(&self.data_dir).check(&self.execution, &self.facts, now)?;
+        let scope = self
+            .registry
+            .admit(secret, &issued.binding, "read_evidence")?;
         drop(permit);
         let mut linear = lock(&self.linear);
         let handler = HandlerId::new(format!("mcp-{}", linear.next_handler));
@@ -389,17 +403,35 @@ pub async fn invoke_scoped_tool(
         return Err(rt_error(ErrorCode::Forbidden, "tool_not_admitted"));
     }
     let (scope, handler) = authority.begin_admission(token)?;
+    let guard = AdmittedHandler {
+        authority,
+        handler,
+        evidence_bytes: None,
+    };
     let result = dispatch_tool(&scope, call, store).await;
     let charged = match &result {
-        Ok(response)
-            if response.tool == "read_evidence" || response.tool == "search_evidence" =>
-        {
+        Ok(response) if response.tool == "read_evidence" || response.tool == "search_evidence" => {
             Some(scope.evidence_attempt_bytes())
         }
         _ => None,
     };
-    authority.finish_call(&handler, charged);
+    let mut guard = guard;
+    guard.evidence_bytes = charged;
+    drop(guard);
     result
+}
+
+struct AdmittedHandler<'a> {
+    authority: &'a GateToolAuthority,
+    handler: HandlerId,
+    evidence_bytes: Option<u64>,
+}
+
+impl Drop for AdmittedHandler<'_> {
+    fn drop(&mut self) {
+        self.authority
+            .finish_call(&self.handler, self.evidence_bytes);
+    }
 }
 
 pub async fn read_evidence(
@@ -569,7 +601,12 @@ pub struct DurableToolStore {
 }
 
 impl DurableToolStore {
-    pub fn open(db: RoundtableStore, objects: ObjectStore, session: ToolSession, scope: ResultScope) -> Self {
+    pub fn open(
+        db: RoundtableStore,
+        objects: ObjectStore,
+        session: ToolSession,
+        scope: ResultScope,
+    ) -> Self {
         Self {
             db,
             objects,
@@ -714,22 +751,35 @@ impl DurableToolStore {
                 if Hash256::sha256(&canonical) != receipt.payload_hash {
                     return Err(rt_error(ErrorCode::InvalidState, "validator_disagreement"));
                 }
-                validate_result(&canonical, scope).map_err(|_| {
-                    rt_error(ErrorCode::InvalidState, "validator_disagreement")
-                })?;
+                validate_result(&canonical, scope)
+                    .map_err(|_| rt_error(ErrorCode::InvalidState, "validator_disagreement"))?;
                 if let Some(stored) = sealed_row(&rows, submission_id) {
                     return original_receipt(stored, &receipt).map(Applied::Receipt);
                 }
+                exec(
+                    txn,
+                    "INSERT INTO rt_submission_scopes (room_id,attempt_id,scope_json)
+                    VALUES (?,?,?)",
+                    vec![
+                        text(&self.session.room_id),
+                        text(&self.session.attempt_id),
+                        text(
+                            &serde_json::to_string(scope)
+                                .map_err(|_| rt_error(ErrorCode::InvalidState, "scope_encode"))?,
+                        ),
+                    ],
+                )
+                .await?;
                 self.insert_submission(
                     txn,
                     submission_id,
                     &receipt.payload_hash.to_hex(),
                     &canonical,
                     "[]",
-                    Some(&serde_json::to_string(&receipt).map_err(|_| {
-                        rt_error(ErrorCode::InvalidState, "receipt_encode")
-                    })?),
-                    1,
+                    Some(
+                        &serde_json::to_string(&receipt)
+                            .map_err(|_| rt_error(ErrorCode::InvalidState, "receipt_encode"))?,
+                    ),
                 )
                 .await?;
                 Ok(Applied::Receipt(receipt))
@@ -744,11 +794,9 @@ impl DurableToolStore {
                         submission_id,
                         &Hash256::sha256(raw).to_hex(),
                         raw,
-                        &serde_json::to_string(&stored_errors(&errors)).map_err(|_| {
-                            rt_error(ErrorCode::InvalidState, "field_error_encode")
-                        })?,
+                        &serde_json::to_string(&stored_errors(&errors))
+                            .map_err(|_| rt_error(ErrorCode::InvalidState, "field_error_encode"))?,
                         None,
-                        0,
                     )
                     .await?;
                     if closes {
@@ -786,8 +834,8 @@ impl DurableToolStore {
         raw: &[u8],
         errors_json: &str,
         receipt_json: Option<&str>,
-        sealed: i64,
     ) -> RtResult<()> {
+        let sealed = i64::from(receipt_json.is_some());
         let raw = std::str::from_utf8(raw)
             .map_err(|_| rt_error(ErrorCode::InvalidArgument, "submission_encoding"))?;
         txn.execute(Statement::from_sql_and_values(
@@ -1111,7 +1159,10 @@ fn sealed_row<'a>(
         .find(|row| row.submission_id == submission_id.to_string() && row.sealed == 1)
 }
 
-fn original_receipt(stored: &SubmissionRow, receipt: &CandidateReceipt) -> RtResult<CandidateReceipt> {
+fn original_receipt(
+    stored: &SubmissionRow,
+    receipt: &CandidateReceipt,
+) -> RtResult<CandidateReceipt> {
     let json = stored
         .receipt_json
         .as_deref()
@@ -1259,7 +1310,11 @@ async fn count_i64(conn: &impl ConnectionTrait, sql: &str, values: Vec<DbValue>)
     column(&row, 0)
 }
 
-async fn query_text(conn: &impl ConnectionTrait, sql: &str, values: Vec<DbValue>) -> RtResult<String> {
+async fn query_text(
+    conn: &impl ConnectionTrait,
+    sql: &str,
+    values: Vec<DbValue>,
+) -> RtResult<String> {
     let row = one_row(conn, sql, values).await?;
     column(&row, 0)
 }

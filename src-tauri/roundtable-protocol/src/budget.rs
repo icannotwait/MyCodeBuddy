@@ -161,8 +161,10 @@ pub struct BudgetState {
     pub plan: BudgetPlan,
     pub current_phase_index: u32,
     pub consumed_prompts: u64,
-    spent: BTreeSet<AttemptSlot>,
-    revisions: BTreeMap<u64, TurnAccounting>,
+    spent: BTreeSet<(u64, AttemptSlot)>,
+    revisions: BTreeMap<(u64, AttemptSlot), TurnAccounting>,
+    phase_revisions: BTreeMap<u32, u64>,
+    moderator_revision: u64,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -182,19 +184,37 @@ impl BudgetState {
             consumed_prompts: 0,
             spent: BTreeSet::new(),
             revisions: BTreeMap::new(),
+            phase_revisions: BTreeMap::new(),
+            moderator_revision: 1,
         }
     }
 
     pub fn launch_starts(&self, revision: u64) -> u32 {
         self.revisions
-            .get(&revision)
+            .iter()
+            .filter(|((rev, _), _)| *rev == revision)
+            .map(|(_, turn)| turn.launch_starts)
+            .sum()
+    }
+
+    pub fn turn_launch_starts(&self, revision: u64, slot: AttemptSlot) -> u32 {
+        self.revisions
+            .get(&(revision, slot))
             .map(|turn| turn.launch_starts)
             .unwrap_or(0)
     }
 
     pub fn admissions(&self, revision: u64) -> u32 {
         self.revisions
-            .get(&revision)
+            .iter()
+            .filter(|((rev, _), _)| *rev == revision)
+            .map(|(_, turn)| turn.admissions)
+            .sum()
+    }
+
+    pub fn turn_admissions(&self, revision: u64, slot: AttemptSlot) -> u32 {
+        self.revisions
+            .get(&(revision, slot))
             .map(|turn| turn.admissions)
             .unwrap_or(0)
     }
@@ -210,13 +230,17 @@ impl BudgetState {
                         phase_index: phase,
                         ordinal,
                     };
-                    if !self.spent.contains(&slot) {
+                    let revision = self.phase_revisions.get(&phase).copied().unwrap_or(1);
+                    if !self.spent.contains(&(revision, slot)) {
                         reserved += 1;
                     }
                 }
             }
         }
-        if !self.spent.contains(&AttemptSlot::Moderator) {
+        if !self
+            .spent
+            .contains(&(self.moderator_revision, AttemptSlot::Moderator))
+        {
             reserved += 1;
         }
         reserved
@@ -236,7 +260,14 @@ pub fn reserve_attempts(
         return Err(invalid_state("deadline_reached"));
     }
     validate_slot(state, request.slot)?;
-    let spent = state.spent.contains(&request.slot);
+    let current_revision = match request.slot {
+        AttemptSlot::Member { phase_index, .. } => state.phase_revisions.get(&phase_index).copied(),
+        AttemptSlot::Moderator => Some(state.moderator_revision),
+    };
+    if current_revision.is_some_and(|revision| request.revision < revision) {
+        return Err(invalid_state("stale_revision"));
+    }
+    let spent = state.spent.contains(&(request.revision, request.slot));
     match request.kind {
         ReservationKind::OptionalRetry if !spent => {
             return Err(invalid_state("retry_before_first_launch"));
@@ -247,6 +278,14 @@ pub fn reserve_attempts(
         ReservationKind::OptionalRetry | ReservationKind::FirstLaunch => {}
     }
     let consumes_prompt = request.observation.consumes_prompt();
+    if let Some(turn) = state.revisions.get(&(request.revision, request.slot)) {
+        if turn.launch_starts >= 2 {
+            return Err(invalid_state("launch_limit"));
+        }
+        if consumes_prompt && turn.admissions >= 2 {
+            return Err(invalid_state("admission_limit"));
+        }
+    }
     let consumed_prompts = if consumes_prompt {
         let next_consumed = state
             .consumed_prompts
@@ -272,13 +311,10 @@ pub fn reserve_attempts(
     let launch_counted = true;
     let admission_counted = consumes_prompt;
     {
-        let turn = next.revisions.entry(request.revision).or_default();
-        if turn.launch_starts >= 2 {
-            return Err(invalid_state("launch_limit"));
-        }
-        if admission_counted && turn.admissions >= 2 {
-            return Err(invalid_state("admission_limit"));
-        }
+        let turn = next
+            .revisions
+            .entry((request.revision, request.slot))
+            .or_default();
         turn.launch_starts = turn
             .launch_starts
             .checked_add(1)
@@ -292,7 +328,13 @@ pub fn reserve_attempts(
     }
     next.consumed_prompts = consumed_prompts;
     if consumes_prompt && request.kind == ReservationKind::FirstLaunch {
-        next.spent.insert(request.slot);
+        next.spent.insert((request.revision, request.slot));
+    }
+    match request.slot {
+        AttemptSlot::Member { phase_index, .. } => {
+            next.phase_revisions.insert(phase_index, request.revision);
+        }
+        AttemptSlot::Moderator => next.moderator_revision = request.revision,
     }
     let reserved_first_launches = next.reserved_first_launches();
     Ok(BudgetReservation {

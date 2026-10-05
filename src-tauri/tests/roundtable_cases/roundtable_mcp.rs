@@ -14,9 +14,9 @@ use codeg_lib::roundtable::{
     read_evidence, register_input_evidence, search_evidence, service_channel_owner,
     verify_connection_profile, AdmissionFacts, ConnectionOwner, DurableToolStore, EvidenceUsage,
     ExecutionGate, ExecutionScope, GateToolAuthority, InputEvidence, NewAttempt, NewBinding,
-    NewManifest, NewPhase, NewRoom, NewSpeaker, NewTurn, ObjectStore, OsIdentity,
-    QualificationKey, ReadEvidenceArgs, ReservationLedger, RoundtableToolCall, SearchEvidenceArgs,
-    TokenBinding, ToolAuthority, ToolSession, SERVICE_TOOL_VERSION,
+    NewManifest, NewPhase, NewRoom, NewSpeaker, NewTurn, ObjectStore, OsIdentity, QualificationKey,
+    ReadEvidenceArgs, ReservationLedger, RoundtableToolCall, SearchEvidenceArgs, TokenBinding,
+    ToolAuthority, ToolSession, SERVICE_TOOL_VERSION,
 };
 use roundtable_protocol::{
     canonical_bytes, AliasVisibility, AttemptId, BindingId, CandidateReceipt, CandidateState,
@@ -56,14 +56,11 @@ async fn open_harness(slot: u8) -> Harness {
     let manifest_hash = "ab".repeat(32);
     seed_graph(
         &db,
-        &room_id,
-        &speaker_id,
-        &phase,
+        (&room_id, &speaker_id, &phase),
         &binding_id,
         &turn,
         &attempt_id,
-        &manifest,
-        &manifest_hash,
+        (&manifest, &manifest_hash),
     )
     .await;
 
@@ -130,15 +127,14 @@ async fn open_harness(slot: u8) -> Harness {
 
 async fn seed_graph(
     db: &codeg_lib::roundtable::RoundtableStore,
-    room_id: &RoomId,
-    speaker_id: &SpeakerId,
-    phase: &PhaseId,
+    identity: (&RoomId, &SpeakerId, &PhaseId),
     binding_id: &BindingId,
     turn: &str,
     attempt_id: &AttemptId,
-    manifest: &str,
-    manifest_hash: &str,
+    manifest: (&str, &str),
 ) {
+    let (room_id, speaker_id, phase) = identity;
+    let (manifest, manifest_hash) = manifest;
     let room = room_id.to_string();
     let speaker = speaker_id.to_string();
     db.insert_room(&NewRoom {
@@ -422,9 +418,169 @@ async fn invoke<'a>(
 }
 
 #[tokio::test]
+async fn runtime_fix_budget_rejection_does_not_seal() {
+    let harness = open_harness(17).await;
+    let mut binding = harness.authority.binding_of(&harness.token).unwrap();
+    binding.profile.max_tool_calls = 0;
+    let authority = GateToolAuthority::open(
+        harness._dir.path(),
+        ExecutionScope::Fake,
+        facts(),
+        MonoMs(0),
+        MonoMs(1_000_000),
+        binding,
+    );
+    let token = authority.issue();
+    let result = codeg_lib::roundtable::invoke_scoped_tool(
+        &token,
+        RoundtableToolCall {
+            name: "submit_result".into(),
+            arguments: json!({"submission_id":"over-budget", "result": {
+                "kind":"proposal", "summary":"summary", "claims":[{
+                    "local_key":"c0", "text":"claim", "evidence_aliases":[], "confidence":"low"
+                }]
+            }}),
+        },
+        &authority,
+        &harness.store,
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(reason(&result), "tool_budget");
+    assert_eq!(harness.store.audit().await.unwrap().sealed_count, 0);
+}
+
+#[tokio::test]
+async fn runtime_fix_argument_errors_consume_budget() {
+    let harness = open_harness(18).await;
+    let mut binding = harness.authority.binding_of(&harness.token).unwrap();
+    binding.profile.max_tool_calls = 1;
+    let authority = GateToolAuthority::open(
+        harness._dir.path(),
+        ExecutionScope::Fake,
+        facts(),
+        MonoMs(0),
+        MonoMs(1_000_000),
+        binding,
+    );
+    let token = authority.issue();
+    let call = || RoundtableToolCall {
+        name: "search_evidence".into(),
+        arguments: json!({"file_alias":"e0", "query":"a", "limit":0}),
+    };
+    let first =
+        codeg_lib::roundtable::invoke_scoped_tool(&token, call(), &authority, &harness.store)
+            .await
+            .unwrap_err();
+    assert_eq!(reason(&first), "query_bounds");
+    let view = authority.admit_tool(&token).await.unwrap();
+    assert_eq!(view.tool_calls(), 1);
+    assert!(view.tool_reply_bytes() > 0);
+    let second =
+        codeg_lib::roundtable::invoke_scoped_tool(&token, call(), &authority, &harness.store)
+            .await
+            .unwrap_err();
+    assert_eq!(reason(&second), "tool_budget");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn runtime_fix_startup_loads_persisted_internal_binding() {
+    use sea_orm::{ConnectionTrait, DatabaseBackend, Statement};
+    let harness = open_harness(19).await;
+    let binding = harness.authority.binding_of(&harness.token).unwrap();
+    let external = uuid::Uuid::new_v4().to_string();
+    harness.conn.execute(Statement::from_sql_and_values(
+        DatabaseBackend::Sqlite,
+        "INSERT INTO rt_internal_bindings (agent_type,external_id,room_id,binding_id,incarnation,reserved_root,running) VALUES ('codex',?,?,?,?,?,0)",
+        vec![external.clone().into(), harness.room_id.to_string().into(),
+            id_text(194).into(), binding.fence.incarnation.to_string().into(),
+            harness._dir.path().join("member").to_string_lossy().to_string().into()],
+    )).await.unwrap();
+    let internal = codeg_lib::auto_title::InternalAgentSessionRegistry::empty(
+        harness.conn.clone(),
+        harness._dir.path(),
+    )
+    .unwrap();
+    codeg_lib::roundtable::RoundtableSessionRegistry::install_process_discovery(&internal)
+        .await
+        .unwrap();
+    let (_guard, filter) = internal.shared_filter().await.unwrap();
+    assert!(filter.contains(codeg_lib::models::AgentType::Codex, Some(&external), None));
+}
+
+#[tokio::test]
+async fn runtime_fix_real_companion_round_trip_and_eof() {
+    use codeg_lib::roundtable::{ServiceBroker, ServiceProcess};
+    let harness = open_harness(20).await;
+    let authority = Arc::new(GateToolAuthority::open(
+        harness._dir.path(),
+        ExecutionScope::Fake,
+        facts(),
+        MonoMs(0),
+        MonoMs(1_000_000),
+        harness.authority.binding_of(&harness.token).unwrap(),
+    ));
+    let token = Arc::new(authority.issue());
+    let incarnation = "companion-test-incarnation";
+    #[cfg(windows)]
+    let path = format!(r"\\.\pipe\codeg-rt-test-{}", uuid::Uuid::new_v4());
+    #[cfg(unix)]
+    let path = harness
+        ._dir
+        .path()
+        .join("broker.sock")
+        .to_string_lossy()
+        .to_string();
+    let broker = ServiceBroker::bind(
+        &path,
+        incarnation,
+        Arc::clone(&token),
+        authority,
+        Arc::new(harness.store),
+    )
+    .await
+    .unwrap();
+    let mut env = std::collections::HashMap::new();
+    env.insert(
+        codeg_lib::roundtable::ATTEMPT_TOKEN_ENV.to_string(),
+        "wrong".to_string(),
+    );
+    let forged = codeg_lib::roundtable::bind_service_process(&path, incarnation, &env).unwrap();
+    assert!(forged.connect().await.is_err());
+    env.insert(
+        codeg_lib::roundtable::ATTEMPT_TOKEN_ENV.to_string(),
+        token.reveal_for_same_sandbox().to_string(),
+    );
+    let process: ServiceProcess =
+        codeg_lib::roundtable::bind_service_process(&path, incarnation, &env).unwrap();
+    let mut connection = process.connect().await.unwrap();
+    let init = connection.request(json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05"}})).await.unwrap();
+    assert!(init.get("result").is_some());
+    let listed = connection
+        .request(json!({"jsonrpc":"2.0","id":2,"method":"tools/list"}))
+        .await
+        .unwrap();
+    assert_eq!(listed["result"]["tools"].as_array().unwrap().len(), 3);
+    let reply = connection.request(json!({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"read_evidence","arguments":{"file_alias":"e0","start_line":1,"end_line":1}}})).await.unwrap();
+    assert_eq!(reply["result"]["isError"], false);
+    assert!(reply["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap()
+        .contains("alpha"));
+    broker.shutdown().await;
+    assert!(connection
+        .request(json!({"jsonrpc":"2.0","id":4,"method":"ping"}))
+        .await
+        .is_err());
+}
+
+#[tokio::test]
 async fn token_scope_and_tool_budget() {
     let harness = open_harness(1).await;
-    let binding = harness.authority.binding_of(&harness.token).expect("binding");
+    let binding = harness
+        .authority
+        .binding_of(&harness.token)
+        .expect("binding");
     assert_eq!(binding.attempt_id, harness.attempt_id);
     assert_eq!(binding.room_id, harness.room_id);
     assert_eq!(binding.speaker_id, harness.speaker_id);
@@ -470,7 +626,10 @@ async fn token_scope_and_tool_budget() {
         u64::from(roundtable_protocol::v1_1::DEFAULT_INTERJECTION_BYTES),
         16_384
     );
-    assert_eq!(harness.authority.note_interjection(16_384).expect("quota"), 0);
+    assert_eq!(
+        harness.authority.note_interjection(16_384).expect("quota"),
+        0
+    );
     assert!(harness.authority.note_interjection(1).is_err());
     let fresh = GateToolAuthority::open(
         harness._dir.path(),
@@ -478,7 +637,10 @@ async fn token_scope_and_tool_budget() {
         facts(),
         MonoMs(0),
         MonoMs(10),
-        harness.authority.binding_of(&harness.token).expect("pinned"),
+        harness
+            .authority
+            .binding_of(&harness.token)
+            .expect("pinned"),
     );
     assert!(fresh.note_interjection(16_385).is_err());
 
@@ -513,9 +675,11 @@ async fn token_scope_and_tool_budget() {
     assert!(!url.verified && !cli.verified);
     assert_eq!(url.attribution, "unverified_reference");
     assert_eq!(cli.origin, "cli_native_read");
-    assert!(note_unverified_reference(&harness.store, "file", "src/lib.rs")
-        .await
-        .is_err());
+    assert!(
+        note_unverified_reference(&harness.store, "file", "src/lib.rs")
+            .await
+            .is_err()
+    );
 
     let slice = read_evidence(
         &harness.scope,
@@ -679,7 +843,11 @@ async fn token_scope_and_tool_budget() {
     assert_eq!(forged.code, ErrorCode::Forbidden);
     assert_eq!(reason(&forged), "identity_not_selectable");
     assert_eq!(
-        harness.authority.binding_of(&harness.token).expect("still").room_id,
+        harness
+            .authority
+            .binding_of(&harness.token)
+            .expect("still")
+            .room_id,
         harness.room_id
     );
     assert_eq!(
@@ -763,7 +931,11 @@ async fn token_scope_and_tool_budget() {
     assert_eq!(reason(&revoked), "token_revoked");
 
     harness.authority.complete_inflight();
-    let inflight = harness.authority.admit_tool(&harness.token).await.expect("inflight");
+    let inflight = harness
+        .authority
+        .admit_tool(&harness.token)
+        .await
+        .expect("inflight");
     let barrier = harness.authority.stop();
     assert_eq!(barrier.pending_tools.len(), 1);
     assert!(!harness.authority.gate_held());
@@ -852,16 +1024,18 @@ async fn candidate_receipt_survives_lost_reply() {
     assert!(harness.scope.tool_calls() > calls_after_error);
 
     let raw = valid_raw("成员摘要");
-    let first_receipt = persist_candidate(&harness.scope, sid("seal-1"), raw.clone(), &harness.store)
-        .await
-        .expect("commit");
+    let first_receipt =
+        persist_candidate(&harness.scope, sid("seal-1"), raw.clone(), &harness.store)
+            .await
+            .expect("commit");
     assert_eq!(first_receipt.state, CandidateState::Staged);
     let _lost_reply = first_receipt.clone();
     drop(_lost_reply);
-    let retry_receipt = persist_candidate(&harness.scope, sid("seal-1"), raw.clone(), &harness.store)
-        .await
-        .expect("retry");
-    assert_eq!(retry_receipt,first_receipt);
+    let retry_receipt =
+        persist_candidate(&harness.scope, sid("seal-1"), raw.clone(), &harness.store)
+            .await
+            .expect("retry");
+    assert_eq!(retry_receipt, first_receipt);
     assert_eq!(harness.store.audit().await.expect("audit").sealed_count, 1);
 
     let conflict = persist_candidate(
@@ -882,7 +1056,10 @@ async fn candidate_receipt_survives_lost_reply() {
         facts(),
         MonoMs(0),
         MonoMs(1_000_000),
-        harness.authority.binding_of(&harness.token).expect("binding"),
+        harness
+            .authority
+            .binding_of(&harness.token)
+            .expect("binding"),
     );
     let replay_token = replay.issue();
     let first_call = codeg_lib::roundtable::invoke_scoped_tool(
@@ -938,7 +1115,7 @@ async fn candidate_receipt_survives_lost_reply() {
         .await
         .expect("cancel");
     let accepted_count_after_cancel = harness.store.audit().await.expect("audit").accepted_count;
-    assert_eq!(accepted_count_after_cancel,0);
+    assert_eq!(accepted_count_after_cancel, 0);
     let late = persist_candidate(
         &harness.scope,
         sid("seal-2"),
@@ -1035,8 +1212,18 @@ async fn concurrent_invalid_third_fourth_close_once() {
     assert_ne!(open.attempt_state, "accepted");
 
     let (third, fourth) = tokio::join!(
-        persist_candidate(&harness.scope, sid("bad-3"), bad_raw("three"), &harness.store),
-        persist_candidate(&harness.scope, sid("bad-4"), bad_raw("four"), &harness.store),
+        persist_candidate(
+            &harness.scope,
+            sid("bad-3"),
+            bad_raw("three"),
+            &harness.store
+        ),
+        persist_candidate(
+            &harness.scope,
+            sid("bad-4"),
+            bad_raw("four"),
+            &harness.store
+        ),
     );
     for result in [third, fourth] {
         let err = result.expect_err("invalid");

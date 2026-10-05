@@ -95,17 +95,17 @@ struct TokenRecord {
     binding: TokenBinding,
     revoked: bool,
     ledger: Arc<Mutex<AttemptLedger>>,
+    dispatch_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
+#[derive(Default)]
 pub struct TokenRegistry {
     records: Mutex<HashMap<String, TokenRecord>>,
 }
 
 impl TokenRegistry {
     pub fn new() -> Self {
-        Self {
-            records: Mutex::new(HashMap::new()),
-        }
+        Self::default()
     }
 
     pub fn issue(&self, binding: TokenBinding) -> AttemptToken {
@@ -119,6 +119,7 @@ impl TokenRegistry {
                     submissions: SubmissionState::open(),
                     transcript: RequestTranscriptBound::empty(),
                 })),
+                dispatch_lock: Arc::new(tokio::sync::Mutex::new(())),
             },
         );
         AttemptToken { secret }
@@ -175,6 +176,7 @@ impl TokenRegistry {
         }
         Ok(AdmittedToolScope {
             ledger: Arc::clone(&record.ledger),
+            dispatch_lock: Arc::clone(&record.dispatch_lock),
             aliases: record.binding.aliases.clone(),
             result_scope: record.binding.result_scope.clone(),
             evidence: record.binding.evidence.clone(),
@@ -185,6 +187,7 @@ impl TokenRegistry {
 
 pub struct AdmittedToolScope {
     ledger: Arc<Mutex<AttemptLedger>>,
+    dispatch_lock: Arc<tokio::sync::Mutex<()>>,
     aliases: VisibleAliases,
     result_scope: ResultScope,
     evidence: BTreeMap<String, ObjectRef>,
@@ -281,6 +284,7 @@ pub trait ToolStore: Send + Sync {
     ) -> RtResult<()>;
 }
 
+#[derive(Default)]
 pub struct InMemoryToolStore {
     objects: Mutex<BTreeMap<String, Vec<u8>>>,
     sealed: Mutex<BTreeMap<String, CandidateReceipt>>,
@@ -288,10 +292,7 @@ pub struct InMemoryToolStore {
 
 impl InMemoryToolStore {
     pub fn new() -> Self {
-        Self {
-            objects: Mutex::new(BTreeMap::new()),
-            sealed: Mutex::new(BTreeMap::new()),
-        }
+        Self::default()
     }
 
     pub fn insert_object(&self, object: &ObjectRef, bytes: &[u8]) -> RtResult<()> {
@@ -376,9 +377,45 @@ pub async fn dispatch_tool(
     call: RoundtableToolCall,
     store: &dyn ToolStore,
 ) -> RtResult<RoundtableToolResponse> {
+    let _dispatch = scope.dispatch_lock.lock().await;
+    let arguments = canonical_bytes(&call.arguments)?;
+    // Reserve each admitted call before validation or I/O. Errors consume the
+    // same call/argument allowance as successful requests.
+    {
+        let mut ledger = scope.ledger.lock().expect("ledger");
+        let mut projected = ledger.transcript.clone();
+        projected
+            .record_exchange(
+                &ToolExchange {
+                    arguments,
+                    reply: Vec::new(),
+                    generated_utf8_bytes: 0,
+                    evidence_bytes: 0,
+                    model_requests: 0,
+                    tool_calls: 1,
+                },
+                &scope.profile,
+            )
+            .map_err(|err| rt_error(err.code, "tool_budget"))?;
+        bound_request(&projected, &scope.profile)
+            .map_err(|err| rt_error(err.code, "tool_budget"))?;
+        ledger.transcript = projected;
+    }
+    let result = dispatch_admitted(scope, call, store).await;
+    if let Err(error) = &result {
+        let body = canonical_bytes(error)?;
+        charge_exchange(scope, &[], &body, false)?;
+    }
+    result
+}
+
+async fn dispatch_admitted(
+    scope: &AdmittedToolScope,
+    call: RoundtableToolCall,
+    store: &dyn ToolStore,
+) -> RtResult<RoundtableToolResponse> {
     let tool_name = call.name.as_str();
     if !service_tool_names().contains(&tool_name) {
-        charge_static(scope, "tool_not_admitted")?;
         return Err(rt_error(ErrorCode::Forbidden, "tool_not_admitted"));
     }
     let arguments = call
@@ -389,7 +426,6 @@ pub async fn dispatch_tool(
         .keys()
         .any(|key| IDENTITY_KEYS.contains(&key.as_str()))
     {
-        charge_static(scope, "identity_not_selectable")?;
         return Err(rt_error(ErrorCode::Forbidden, "identity_not_selectable"));
     }
     match call.name.as_str() {
@@ -507,7 +543,17 @@ async fn submit_result(
         candidate_id: receipt.as_ref().map(|item| item.candidate_id.as_str()),
         kind,
         submission_id: submission_text,
+        field_errors: match &decision.outcome {
+            DecisionKind::FieldErrors(errors) => errors
+                .iter()
+                .map(|error| serde_json::json!({"path": error.path, "reason": error.code.as_str()}))
+                .collect(),
+            _ => Vec::new(),
+        },
     })?;
+    let argument_bytes = canonical_bytes(arguments)?;
+    // A refused reply must never leave a sealed candidate in the durable store.
+    charge_exchange(scope, &argument_bytes, &body, false)?;
     let prior_sealed = scope.sealed_receipt();
     if prior_sealed.is_none() {
         if let Some(receipt) = &receipt {
@@ -525,10 +571,8 @@ async fn submit_result(
                 .await?;
         }
     }
-    let argument_bytes = canonical_bytes(arguments)?;
     {
         let mut ledger = scope.ledger.lock().expect("ledger");
-        charge_ledger(&mut ledger, &argument_bytes, &body, false, &scope.profile)?;
         ledger.submissions = decision.next_state.clone();
     }
     Ok(RoundtableToolResponse {
@@ -537,11 +581,6 @@ async fn submit_result(
         receipt,
         decision: Some(decision),
     })
-}
-
-fn charge_static(scope: &AdmittedToolScope, reason: &str) -> RtResult<()> {
-    let body = canonical_bytes(&StaticBody { kind: reason })?;
-    charge_exchange(scope, &[], &body, false)
 }
 
 fn charge_exchange(
@@ -571,12 +610,13 @@ fn charge_ledger(
         0
     };
     let exchange = ToolExchange {
-        arguments: arguments.to_vec(),
+        // Arguments and the call itself were reserved by dispatch_tool.
+        arguments: Vec::new(),
         reply: reply.to_vec(),
         generated_utf8_bytes: 0,
         evidence_bytes,
         model_requests: 0,
-        tool_calls: 1,
+        tool_calls: 0,
     };
     let mut projected = ledger.transcript.clone();
     projected
@@ -682,9 +722,5 @@ struct SubmitBody<'a> {
     candidate_id: Option<&'a str>,
     kind: &'a str,
     submission_id: &'a str,
-}
-
-#[derive(Serialize)]
-struct StaticBody<'a> {
-    kind: &'a str,
+    field_errors: Vec<Value>,
 }

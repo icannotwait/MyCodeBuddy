@@ -17,11 +17,11 @@ use serde_json::{json, Value};
 use uuid::Uuid;
 
 use super::clock::{deadline_reached, AcceptFaults, AcceptStep};
+use super::rt_error;
 use super::store::{
     column, exec, num, one_row, opt, optional_row, query_i64, rows, storage_err, text,
     RoundtableStore,
 };
-use super::rt_error;
 use roundtable_protocol::RtResult;
 
 #[derive(Clone, Debug)]
@@ -64,6 +64,24 @@ pub struct ClosingSetRef {
 }
 
 impl RoundtableStore {
+    /// Caller owns the mutation transaction and has advanced revision/last_seq.
+    pub(crate) async fn emit_current_in(
+        &self,
+        txn: &DatabaseTransaction,
+        room: &str,
+        cause: &str,
+    ) -> RtResult<ProjectionRef> {
+        let (now, utc) = self.clock_sample();
+        self.emit(
+            txn,
+            &self.fault_snapshot(),
+            room,
+            (cause, &Uuid::new_v4().to_string()),
+            (&[], &[]),
+            (now, now, &utc),
+        )
+        .await
+    }
     pub async fn accept(&self, input: AcceptInput) -> RtResult<ProjectionRef> {
         if let Some(gate) = self.fault_snapshot().lock_gate {
             gate.wait().await;
@@ -163,74 +181,50 @@ impl RoundtableStore {
         if body.last_seq.0 != u64_from(seq)? {
             return Err(rt_error(ErrorCode::InvalidState, "projection_seq"));
         }
-        let parsed: Value = serde_json::from_str(&changed)
-            .map_err(|_| rt_error(ErrorCode::InvalidState, "projection_refs"))?;
-        let message_ids = string_list(&parsed, "message_ids");
-        let evidence_ids = string_list(&parsed, "evidence_ids");
-        let manifest_ids = string_list(&parsed, "manifest_ids");
-        let mut messages = Vec::new();
-        for message_id in &message_ids {
-            let row = optional_row(
-                conn,
-                "SELECT body_hash FROM rt_messages WHERE room_id = ? AND message_id = ?",
-                vec![text(&room.to_string()), text(message_id)],
-            )
-            .await?;
-            let Some(row) = row else {
-                return Err(rt_error(ErrorCode::InvalidState, "message_manifest_missing"));
-            };
-            let hash: String = column(&row, 0)?;
-            messages.push(PublishedMessageRef {
-                message_id: parse_id(message_id)?,
-                hash: hash_hex(&hash)?,
-            });
-        }
-        for evidence_id in &evidence_ids {
-            let count = query_i64(
-                conn,
-                "SELECT COUNT(*) FROM rt_evidence WHERE room_id = ? AND evidence_id = ?",
-                vec![text(&room.to_string()), text(evidence_id)],
-            )
-            .await?;
-            if count != 1 {
-                return Err(rt_error(
-                    ErrorCode::InvalidState,
-                    "evidence_manifest_missing",
-                ));
-            }
-        }
-        for manifest_id in &manifest_ids {
-            let count = query_i64(
-                conn,
-                "SELECT COUNT(*) FROM rt_source_manifests WHERE room_id = ? AND manifest_id = ?",
-                vec![text(&room.to_string()), text(manifest_id)],
-            )
-            .await?;
-            if count != 1 {
-                return Err(rt_error(
-                    ErrorCode::InvalidState,
-                    "evidence_manifest_missing",
-                ));
-            }
-        }
-        let id = parse_id::<ProjectionId>(&projection_id)?;
+        let _ = changed;
         let projected = project(&RoomAggregate {
-            projection_id: id,
+            projection_id: parse_id(&projection_id)?,
             body: body.clone(),
-            messages,
-            evidence_manifests: manifest_ids
-                .iter()
-                .map(|item| parse_id(item))
-                .collect::<RtResult<Vec<_>>>()?,
-            required_message_ids: message_ids
-                .iter()
-                .map(|item| parse_id(item))
-                .collect::<RtResult<Vec<_>>>()?,
-            required_evidence_manifests: manifest_ids
-                .iter()
-                .map(|item| parse_id(item))
-                .collect::<RtResult<Vec<_>>>()?,
+            messages: body.messages.clone(),
+            evidence_manifests: body.evidence_manifests.clone(),
+            required_message_ids: body.messages.iter().map(|item| item.message_id).collect(),
+            required_evidence_manifests: body.evidence_manifests.clone(),
         })?;
+        for message in &body.messages {
+            let stored = query_text_local(
+                conn,
+                "SELECT body_hash FROM rt_messages WHERE room_id=? AND message_id=?",
+                vec![
+                    text(&room.to_string()),
+                    text(&message.message_id.to_string()),
+                ],
+            )
+            .await?;
+            if stored != message.hash.to_hex() {
+                return Err(rt_error(
+                    ErrorCode::InvalidState,
+                    "message_manifest_missing",
+                ));
+            }
+        }
+        for evidence in &body.replay.evidence {
+            let row = one_row(
+                conn,
+                "SELECT body_json FROM rt_evidence WHERE room_id=? AND evidence_id=?",
+                vec![
+                    text(&room.to_string()),
+                    text(&evidence.evidence_id.to_string()),
+                ],
+            )
+            .await?;
+            let raw: Option<String> = column(&row, 0)?;
+            if evidence_body_hash(raw.as_deref())? != evidence.body_hash {
+                return Err(rt_error(
+                    ErrorCode::StorageUnavailable,
+                    "evidence_body_changed",
+                ));
+            }
+        }
         if projected.projection_ref.hash.to_hex() != projection_hash {
             return Err(rt_error(ErrorCode::InvalidState, "projection_hash"));
         }
@@ -253,15 +247,14 @@ impl RoundtableStore {
         if input.completion.fence != input.fence {
             return Err(rt_error(ErrorCode::InvalidState, "fence_mismatch"));
         }
-        if input.completion.finish_reason != "completed" || !input.completion.tool_barrier.drained
-        {
+        if input.completion.finish_reason != "completed" || !input.completion.tool_barrier.drained {
             return Err(rt_error(ErrorCode::InvalidState, "finish_not_normal"));
         }
         if input
             .completion
             .candidate_id
             .as_ref()
-            .is_some_and(|candidate| candidate != &input.candidate_id)
+            .is_none_or(|candidate| candidate != &input.candidate_id)
         {
             return Err(rt_error(ErrorCode::InvalidState, "candidate_mismatch"));
         }
@@ -279,7 +272,9 @@ impl RoundtableStore {
         let binding_id: String = column(&attempt, 1)?;
         let state: String = column(&attempt, 2)?;
         if state == "accepted" {
-            return self.replay_accept(txn, &room_id, &attempt_id, &input.candidate_id).await;
+            return self
+                .replay_accept(txn, &room_id, &attempt_id, &input.candidate_id)
+                .await;
         }
         if state != "validating" {
             return Err(rt_error(ErrorCode::InvalidState, "attempt_not_ready"));
@@ -307,9 +302,9 @@ impl RoundtableStore {
         {
             return Err(rt_error(ErrorCode::InvalidState, "fence_mismatch"));
         }
+        check_phase_fence(txn, &room_id, &phase_id, &input.fence).await?;
         let phase = phase_row(txn, &room_id, &phase_id).await?;
-        if phase.status != "running" || phase.revision != i64_from(input.fence.phase_revision.0)?
-        {
+        if phase.status != "running" || phase.revision != i64_from(input.fence.phase_revision.0)? {
             return Err(rt_error(ErrorCode::InvalidState, "fence_mismatch"));
         }
         let binding = one_row(
@@ -337,7 +332,7 @@ impl RoundtableStore {
         }
         let submission = optional_row(
             txn,
-            "SELECT payload_hash, receipt_json FROM rt_submissions
+            "SELECT payload_hash, candidate_ref FROM rt_submissions
              WHERE room_id = ? AND attempt_id = ? AND sealed = 1",
             vec![text(&room_id), text(&attempt_id)],
         )
@@ -346,16 +341,32 @@ impl RoundtableStore {
             return Err(rt_error(ErrorCode::InvalidState, "candidate_missing"));
         };
         let payload_hash: String = column(&submission, 0)?;
-        let receipt: Option<String> = column(&submission, 1).unwrap_or(None);
+        let candidate: String = column(&submission, 1)?;
+        let value: Value = serde_json::from_str(&candidate)
+            .map_err(|_| rt_error(ErrorCode::InvalidState, "candidate_body"))?;
+        let canonical = roundtable_protocol::canonical_bytes(&value)?;
+        if canonical != candidate.as_bytes() || Hash256::sha256(&canonical).to_hex() != payload_hash
+        {
+            return Err(rt_error(ErrorCode::InvalidState, "candidate_hash"));
+        }
+        let scope_json = query_text_local(
+            txn,
+            "SELECT scope_json FROM rt_submission_scopes WHERE room_id=? AND attempt_id=?",
+            vec![text(&room_id), text(&attempt_id)],
+        )
+        .await?;
+        let scope: roundtable_protocol::ResultScope = serde_json::from_str(&scope_json)
+            .map_err(|_| rt_error(ErrorCode::InvalidState, "candidate_scope"))?;
+        if scope.speaker_id.to_string() != speaker_id
+            || scope.phase_kind != phase_kind(&phase.snapshot_ref)
+        {
+            return Err(rt_error(ErrorCode::InvalidState, "candidate_scope"));
+        }
+        let validated = roundtable_protocol::validate_result(&canonical, &scope)
+            .map_err(|_| rt_error(ErrorCode::InvalidState, "candidate_invalid"))?;
         if payload_hash != input.candidate_id {
             return Err(rt_error(ErrorCode::InvalidState, "candidate_mismatch"));
         }
-        let role = query_text_local(
-            txn,
-            "SELECT role FROM rt_speakers WHERE room_id = ? AND speaker_id = ?",
-            vec![text(&room_id), text(&speaker_id)],
-        )
-        .await?;
         let faults = self.fault_snapshot();
         let message_id = Uuid::new_v4().to_string();
         trip(&faults, AcceptStep::Message)?;
@@ -369,16 +380,12 @@ impl RoundtableStore {
                 text(&message_id),
                 text(&attempt_id),
                 text(&speaker_id),
-                text(receipt.as_deref().unwrap_or("{}")),
+                text(&candidate),
                 text(&payload_hash),
             ],
         )
         .await?;
-        let visibility = if role == "moderator" {
-            "published"
-        } else {
-            "staged"
-        };
+        let visibility = "staged";
         exec(
             txn,
             "INSERT INTO rt_message_memberships (
@@ -387,15 +394,16 @@ impl RoundtableStore {
             vec![text(&room_id), text(&message_id), text(visibility)],
         )
         .await?;
-        let receipt_json = receipt.as_deref();
+        let receipt_json = Some(candidate.as_str());
         trip(&faults, AcceptStep::Claims)?;
         insert_claims(txn, &room_id, &message_id, receipt_json).await?;
         trip(&faults, AcceptStep::Responses)?;
-        insert_responses(txn, &room_id, &message_id, receipt_json).await?;
+        insert_responses(txn, &room_id, &message_id, receipt_json, &scope).await?;
         trip(&faults, AcceptStep::PositionChanges)?;
-        insert_positions(txn, &room_id, &message_id, receipt_json).await?;
+        insert_positions(txn, &room_id, &message_id, receipt_json, &scope).await?;
         trip(&faults, AcceptStep::Evidence)?;
-        let evidence_ids = insert_evidence_links(txn, &room_id, &message_id, receipt_json).await?;
+        let evidence_ids =
+            insert_evidence_links(txn, &room_id, &message_id, &attempt_id, &value, &scope).await?;
         trip(&faults, AcceptStep::Budget)?;
         exec(
             txn,
@@ -415,19 +423,45 @@ impl RoundtableStore {
         if deadline_reached(decision_mono, input.deadline_mono) {
             return Err(rt_error(ErrorCode::InvalidState, "deadline_exceeded"));
         }
+        let accepted = exec(
+            txn,
+            "UPDATE rt_attempts
+             SET state = 'accepted', cleanup_state = 'confirmed', finished_at = ?, finish_reason = 'completed'
+             WHERE room_id = ? AND attempt_id = ? AND state = 'validating'",
+            vec![text(&utc), text(&room_id), text(&attempt_id)],
+        )
+        .await?;
+        if accepted != 1 {
+            return Err(rt_error(ErrorCode::InvalidState, "attempt_not_ready"));
+        }
+        let turned = exec(
+            txn,
+            "UPDATE rt_turns SET accepted_attempt_id = ?, status = ?
+             WHERE room_id = ? AND turn_id = ? AND accepted_attempt_id IS NULL",
+            vec![
+                text(&attempt_id),
+                text(if validated.abstained {
+                    "abstained"
+                } else {
+                    "valid"
+                }),
+                text(&room_id),
+                text(&turn_id),
+            ],
+        )
+        .await?;
+        if turned != 1 {
+            return Err(rt_error(ErrorCode::InvalidState, "attempt_not_ready"));
+        }
         let event_id = format!("accept-{attempt_id}");
         let projection = self
             .emit(
                 txn,
                 &faults,
                 &room_id,
-                "accept",
-                &event_id,
-                &[message_id.clone()],
-                &evidence_ids,
-                decision_mono,
-                0,
-                &utc,
+                ("accept", &event_id),
+                (std::slice::from_ref(&message_id), &evidence_ids),
+                (decision_mono, 0, &utc),
             )
             .await?;
         let (commit_mono, _) = self.clock_sample();
@@ -448,27 +482,6 @@ impl RoundtableStore {
             ],
         )
         .await?;
-        let accepted = exec(
-            txn,
-            "UPDATE rt_attempts
-             SET state = 'accepted', cleanup_state = 'confirmed', finished_at = ?, finish_reason = 'completed'
-             WHERE room_id = ? AND attempt_id = ? AND state = 'validating'",
-            vec![text(&utc), text(&room_id), text(&attempt_id)],
-        )
-        .await?;
-        if accepted != 1 {
-            return Err(rt_error(ErrorCode::InvalidState, "attempt_not_ready"));
-        }
-        let turned = exec(
-            txn,
-            "UPDATE rt_turns SET accepted_attempt_id = ?
-             WHERE room_id = ? AND turn_id = ? AND accepted_attempt_id IS NULL",
-            vec![text(&attempt_id), text(&room_id), text(&turn_id)],
-        )
-        .await?;
-        if turned != 1 {
-            return Err(rt_error(ErrorCode::InvalidState, "attempt_not_ready"));
-        }
         let _ = bumped;
         trip(&faults, AcceptStep::Commit)?;
         Ok(projection)
@@ -515,9 +528,14 @@ impl RoundtableStore {
     ) -> RtResult<ClosingSetRef> {
         let room_id = input.room_id.to_string();
         let phase_id = input.phase_id.to_string();
+        check_phase_fence(txn, &room_id, &phase_id, &input.fence).await?;
         let phase = phase_row(txn, &room_id, &phase_id).await?;
         if phase.revision != i64_from(input.fence.phase_revision.0)? {
             return Err(rt_error(ErrorCode::InvalidState, "fence_mismatch"));
+        }
+        let (now, _) = self.clock_sample();
+        if deadline_reached(now, input.deadline_mono) {
+            exec(txn,"UPDATE rt_attempts SET state='timed_out',finish_reason='phase_timeout',cleanup_state='cleaning' WHERE room_id=? AND turn_id IN(SELECT turn_id FROM rt_turns WHERE room_id=? AND phase_id=?) AND state IN('reserved','launching','admitting','admitted','streaming','validating','active')",vec![text(&room_id),text(&room_id),text(&phase_id)]).await?;
         }
         let turns = query_i64(
             txn,
@@ -530,26 +548,25 @@ impl RoundtableStore {
             "SELECT COUNT(*) FROM rt_turns t
              JOIN rt_attempts a ON a.room_id = t.room_id AND a.turn_id = t.turn_id
              WHERE t.room_id = ? AND t.phase_id = ?
+               AND a.attempt_no = (SELECT MAX(newer.attempt_no) FROM rt_attempts newer WHERE newer.room_id=a.room_id AND newer.turn_id=a.turn_id)
                AND a.state IN ('accepted','invalid','failed','timed_out','interrupted')",
             vec![text(&room_id), text(&phase_id)],
         )
         .await?;
-        if terminal < turns {
-            let (now, _) = self.clock_sample();
-            if deadline_reached(now, input.deadline_mono) {
-                return Err(rt_error(ErrorCode::InvalidState, "deadline_exceeded"));
-            }
+        if terminal < turns
+            || (turns < phase.expected && !deadline_reached(now, input.deadline_mono))
+        {
             if input.cancel_unfinished {
                 self.insert_cancel(txn, &room_id, &phase_id, phase.revision)
                     .await?;
             }
-            return Ok(self.status_ref(txn, &room_id, &phase_id, false, None).await?);
+            return self.status_ref(txn, &room_id, &phase_id, false, None).await;
         }
         let accepted = query_i64(
             txn,
             "SELECT COUNT(*) FROM rt_turns t
              JOIN rt_attempts a ON a.room_id = t.room_id AND a.turn_id = t.turn_id
-             WHERE t.room_id = ? AND t.phase_id = ? AND a.state = 'accepted'",
+             WHERE t.room_id = ? AND t.phase_id = ? AND a.state = 'accepted' AND t.accepted_attempt_id=a.attempt_id AND t.status!='abstained'",
             vec![text(&room_id), text(&phase_id)],
         )
         .await?;
@@ -559,11 +576,12 @@ impl RoundtableStore {
              JOIN rt_attempts a ON a.room_id = t.room_id AND a.turn_id = t.turn_id
              JOIN rt_speakers s ON s.room_id = t.room_id AND s.speaker_id = t.speaker_id
              WHERE t.room_id = ? AND t.phase_id = ? AND s.role = 'moderator'
+               AND a.attempt_no = (SELECT MAX(newer.attempt_no) FROM rt_attempts newer WHERE newer.room_id=a.room_id AND newer.turn_id=a.turn_id)
                AND a.state IN ('failed','timed_out','invalid','interrupted')",
             vec![text(&room_id), text(&phase_id)],
         )
         .await?;
-        let closing_ref = if moderator_failed > 0 {
+        let closing_ref = if phase.snapshot_ref == "synthesis" && moderator_failed > 0 {
             exec(
                 txn,
                 "UPDATE rt_rooms SET status = 'paused', blocked_reason = 'synthesis_failed'
@@ -607,27 +625,127 @@ impl RoundtableStore {
             }
             frozen
         };
-        let (now, utc) = self.clock_sample();
-        if deadline_reached(now, input.deadline_mono) {
-            return Err(rt_error(ErrorCode::InvalidState, "deadline_exceeded"));
+        let mut slots = Vec::new();
+        for row in rows(txn,"SELECT t.turn_id,t.speaker_id,CASE WHEN t.accepted_attempt_id IS NOT NULL THEN t.status ELSE COALESCE((SELECT a.state FROM rt_attempts a WHERE a.room_id=t.room_id AND a.turn_id=t.turn_id ORDER BY a.attempt_no DESC LIMIT 1),'absent') END,t.accepted_attempt_id,m.message_id,m.body_hash FROM rt_turns t LEFT JOIN rt_messages m ON m.room_id=t.room_id AND m.attempt_id=t.accepted_attempt_id WHERE t.room_id=? AND t.phase_id=? ORDER BY t.turn_id",vec![text(&room_id),text(&phase_id)]).await? {
+            slots.push(json!({"turn_id":column::<String>(&row,0)?,"speaker_id":column::<String>(&row,1)?,"outcome":column::<String>(&row,2)?,"attempt_id":column::<Option<String>>(&row,3)?,"message_id":column::<Option<String>>(&row,4)?,"body_hash":column::<Option<String>>(&row,5)?}));
         }
+        let expected = if let Some(row) = optional_row(
+            txn,
+            "SELECT snapshot_json FROM rt_phase_contexts WHERE room_id=? AND phase_id=?",
+            vec![text(&room_id), text(&phase_id)],
+        )
+        .await?
+        {
+            let snapshot: roundtable_protocol::PhaseSnapshotV1 =
+                serde_json::from_str(&column::<String>(&row, 0)?)
+                    .map_err(|_| rt_error(ErrorCode::StorageUnavailable, "phase_snapshot"))?;
+            if snapshot.phase_id != input.phase_id
+                || snapshot.members.len() as i64 != phase.expected
+            {
+                return Err(rt_error(ErrorCode::StorageUnavailable, "phase_members"));
+            }
+            snapshot
+                .members
+                .into_iter()
+                .map(|member| member.speaker_id.to_string())
+                .collect::<Vec<_>>()
+        } else {
+            // Legacy persisted phases lack a context record. Keep their
+            // existing turns and recover missing members from the room roster.
+            let members=rows(txn,"SELECT s.speaker_id FROM rt_speakers s WHERE s.room_id=? AND (s.role=? OR EXISTS(SELECT 1 FROM rt_turns t WHERE t.room_id=s.room_id AND t.speaker_id=s.speaker_id AND t.phase_id=?)) ORDER BY s.ordinal",vec![text(&room_id),text(if phase.snapshot_ref=="synthesis" {"moderator"} else {"member"}),text(&phase_id)]).await?;
+            members
+                .iter()
+                .map(|row| column::<String>(row, 0))
+                .collect::<RtResult<Vec<_>>>()?
+        };
+        let mut complete_slots = Vec::with_capacity(expected.len());
+        for speaker in expected {
+            let slot = if let Some(index) =
+                slots.iter().position(|slot| slot["speaker_id"] == speaker)
+            {
+                slots.remove(index)
+            } else {
+                json!({"turn_id":null,"speaker_id":speaker,"outcome":"absent","attempt_id":null,"message_id":null,"body_hash":null})
+            };
+            complete_slots.push(slot);
+        }
+        if !slots.is_empty() {
+            return Err(rt_error(ErrorCode::StorageUnavailable, "phase_members"));
+        }
+        let slots = complete_slots;
+        let frozen=String::from_utf8(roundtable_protocol::canonical_bytes(&json!({"fence":input.fence,"context_hash":input.fence.context_hash,"accepted_attempts":closing_ref,"slots":slots}))?).map_err(|_|rt_error(ErrorCode::StorageUnavailable,"closing_set"))?;
+        exec(
+            txn,
+            "INSERT INTO rt_closing_sets(room_id,phase_id,body_json) VALUES(?,?,?)",
+            vec![text(&room_id), text(&phase_id), text(&frozen)],
+        )
+        .await?;
+        let (now, utc) = self.clock_sample();
         let _ = bump_room(txn, &room_id).await?;
         let event_id = format!("close-{phase_id}");
         self.emit(
             txn,
             &self.fault_snapshot(),
             &room_id,
-            "close",
-            &event_id,
-            &[],
-            &[],
-            now,
-            now,
-            &utc,
+            ("close", &event_id),
+            (&[], &[]),
+            (now, now, &utc),
         )
         .await?;
         self.status_ref(txn, &room_id, &phase_id, true, Some(closing_ref))
             .await
+    }
+
+    pub(crate) async fn recover_frozen_in(
+        &self,
+        txn: &DatabaseTransaction,
+        room_id: &str,
+    ) -> RtResult<()> {
+        let row=optional_row(txn,"SELECT p.phase_id,p.revision,a.attempt_id,a.binding_id,b.incarnation,b.policy_ref,a.delivery_hash,r.run_epoch,r.boot_epoch FROM rt_rooms r JOIN rt_phases p ON p.room_id=r.room_id AND p.phase_id=r.current_phase_id JOIN rt_turns t ON t.room_id=p.room_id AND t.phase_id=p.phase_id JOIN rt_attempts a ON a.room_id=t.room_id AND a.attempt_id=t.accepted_attempt_id JOIN rt_bindings b ON b.room_id=a.room_id AND b.binding_id=a.binding_id WHERE r.room_id=? AND r.active_control_id IS NULL AND p.status='closing' ORDER BY t.turn_id LIMIT 1",vec![text(room_id)]).await?;
+        let Some(row) = row else {
+            return Ok(());
+        };
+        let phase: String = column(&row, 0)?;
+        let fence = Fence {
+            phase_id: parse_id(&phase)?,
+            phase_revision: Revision(u64_from(column(&row, 1)?)?),
+            attempt_id: parse_id(&column::<String>(&row, 2)?)?,
+            binding_id: parse_id(&column::<String>(&row, 3)?)?,
+            incarnation: parse_id(&column::<String>(&row, 4)?)?,
+            policy_hash: hash_hex(&column::<String>(&row, 5)?)?,
+            context_hash: hash_hex(&column::<String>(&row, 6)?)?,
+            run_epoch: Epoch(u64_from(column(&row, 7)?)?),
+            boot_epoch: Epoch(u64_from(column(&row, 8)?)?),
+        };
+        let original = one_row(
+            txn,
+            "SELECT body_json FROM rt_closing_sets WHERE room_id=? AND phase_id=?",
+            vec![text(room_id), text(&phase)],
+        )
+        .await?;
+        let _: Value = serde_json::from_str(&column::<String>(&original, 0)?)
+            .map_err(|_| rt_error(ErrorCode::StorageUnavailable, "closing_set"))?;
+        let operation = Uuid::new_v4().to_string();
+        exec(txn,"INSERT INTO rt_control_operations(room_id,operation_id,kind,target_phase_id,target_revision,requested_epoch,step,status) VALUES(?,?,'recover',?,?,?,'done','completed')",vec![text(room_id),text(&operation),text(&phase),num(i64_from(fence.phase_revision.0)?),num(i64_from(fence.run_epoch.0)?)]).await?;
+        exec(txn,"UPDATE rt_closing_sets SET recovery_boot_epoch=?,recovery_operation_id=? WHERE room_id=? AND phase_id=?",vec![num(i64_from(fence.boot_epoch.0)?),text(&operation),text(room_id),text(&phase)]).await?;
+        exec(
+            txn,
+            "UPDATE rt_rooms SET status='running' WHERE room_id=?",
+            vec![text(room_id)],
+        )
+        .await?;
+        self.publish_in(
+            txn,
+            &PublishInput {
+                room_id: parse_id(room_id)?,
+                phase_id: parse_id(&phase)?,
+                fence,
+                deadline_mono: u64::MAX,
+                cleanup_confirmed: true,
+            },
+        )
+        .await?;
+        Ok(())
     }
 
     async fn publish_in(
@@ -640,15 +758,65 @@ impl RoundtableStore {
         }
         let room_id = input.room_id.to_string();
         let phase_id = input.phase_id.to_string();
+        check_phase_fence(txn, &room_id, &phase_id, &input.fence).await?;
         let phase = phase_row(txn, &room_id, &phase_id).await?;
         if phase.status != "closing" {
             return Err(rt_error(ErrorCode::InvalidState, "phase_not_closing"));
         }
+        let frozen = query_text_local(
+            txn,
+            "SELECT closing_set_ref FROM rt_phases WHERE room_id=? AND phase_id=?",
+            vec![text(&room_id), text(&phase_id)],
+        )
+        .await?;
+        let set=one_row(txn,"SELECT body_json,recovery_boot_epoch,recovery_operation_id FROM rt_closing_sets WHERE room_id=? AND phase_id=?",vec![text(&room_id),text(&phase_id)]).await?;
+        let raw: String = column(&set, 0)?;
+        let document: Value = serde_json::from_str(&raw)
+            .map_err(|_| rt_error(ErrorCode::StorageUnavailable, "closing_set"))?;
+        let original: Fence = serde_json::from_value(document["fence"].clone())
+            .map_err(|_| rt_error(ErrorCode::StorageUnavailable, "closing_fence"))?;
+        if document["accepted_attempts"].as_str() != Some(frozen.as_str()) {
+            return Err(rt_error(ErrorCode::InvalidState, "closing_set_changed"));
+        }
+        if original != input.fence {
+            let boot: Option<i64> = column(&set, 1)?;
+            let operation: Option<String> = column(&set, 2)?;
+            let operation =
+                operation.ok_or_else(|| rt_error(ErrorCode::InvalidState, "closing_fence"))?;
+            if boot!=Some(i64_from(input.fence.boot_epoch.0)?) || query_i64(txn,"SELECT COUNT(*) FROM rt_control_operations WHERE room_id=? AND operation_id=? AND kind='recover' AND requested_epoch=? AND step='done'",vec![text(&room_id),text(&operation),num(i64_from(input.fence.run_epoch.0)?)]).await?!=1 {return Err(rt_error(ErrorCode::InvalidState,"closing_fence"));}
+        }
+        for slot in document["slots"]
+            .as_array()
+            .ok_or_else(|| rt_error(ErrorCode::StorageUnavailable, "closing_set"))?
+        {
+            if let Some(id) = slot["message_id"].as_str() {
+                let row = one_row(
+                    txn,
+                    "SELECT body_json,body_hash FROM rt_messages WHERE room_id=? AND message_id=?",
+                    vec![text(&room_id), text(id)],
+                )
+                .await?;
+                let body: String = column(&row, 0)?;
+                let hash: String = column(&row, 1)?;
+                if slot["body_hash"].as_str() != Some(hash.as_str())
+                    || Hash256::sha256(body.as_bytes()).to_hex() != hash
+                {
+                    return Err(rt_error(
+                        ErrorCode::StorageUnavailable,
+                        "closing_message_changed",
+                    ));
+                }
+            }
+        }
+        if frozen != self.accepted_attempt_list(txn, &room_id, &phase_id).await? {
+            return Err(rt_error(ErrorCode::InvalidState, "closing_set_changed"));
+        }
+        if query_i64(txn,"SELECT COUNT(*) FROM rt_attempts a JOIN rt_turns t ON t.room_id=a.room_id AND t.turn_id=a.turn_id WHERE t.room_id=? AND t.phase_id=? AND a.cleanup_state!='confirmed'",vec![text(&room_id),text(&phase_id)]).await? != 0 {return Err(rt_error(ErrorCode::InvalidState,"cleanup_incomplete"));}
         let accepted = query_i64(
             txn,
             "SELECT COUNT(*) FROM rt_turns t
              JOIN rt_attempts a ON a.room_id = t.room_id AND a.turn_id = t.turn_id
-             WHERE t.room_id = ? AND t.phase_id = ? AND a.state = 'accepted'
+             WHERE t.room_id = ? AND t.phase_id = ? AND a.state = 'accepted' AND t.accepted_attempt_id=a.attempt_id AND t.status!='abstained'
                AND a.cleanup_state = 'confirmed'",
             vec![text(&room_id), text(&phase_id)],
         )
@@ -663,26 +831,24 @@ impl RoundtableStore {
              JOIN rt_attempts a ON a.room_id = msg.room_id AND a.attempt_id = msg.attempt_id
              JOIN rt_turns t ON t.room_id = a.room_id AND t.turn_id = a.turn_id
              JOIN rt_speakers s ON s.room_id = msg.room_id AND s.speaker_id = msg.speaker_id
-             WHERE msg.room_id = ? AND t.phase_id = ? AND a.state = 'accepted'
+             WHERE msg.room_id = ? AND t.phase_id = ? AND a.state = 'accepted' AND t.accepted_attempt_id=a.attempt_id
              ORDER BY s.ordinal ASC",
             vec![text(&room_id), text(&phase_id)],
         )
         .await?;
+        let bumped = bump_room(txn, &room_id).await?;
         let mut message_ids = Vec::new();
         for row in &ordinals {
             let message_id: String = column(row, 0)?;
-            let ordinal: i64 = column(row, 1)?;
+
             exec(
                 txn,
-                "UPDATE rt_message_memberships
-                 SET visibility = 'published', published_seq = ?
-                 WHERE room_id = ? AND message_id = ? AND membership_version = 1",
-                vec![num(ordinal), text(&room_id), text(&message_id)],
+                "INSERT INTO rt_message_memberships(room_id,message_id,membership_version,visibility,published_seq) SELECT room_id,message_id,MAX(membership_version)+1,'published',? FROM rt_message_memberships WHERE room_id=? AND message_id=? GROUP BY room_id,message_id",
+                vec![num(bumped.seq), text(&room_id), text(&message_id)],
             )
             .await?;
             message_ids.push(message_id);
         }
-        let bumped = bump_room(txn, &room_id).await?;
         exec(
             txn,
             "UPDATE rt_phases SET status = 'published', published_seq = ?
@@ -693,40 +859,13 @@ impl RoundtableStore {
         exec(
             txn,
             "UPDATE rt_evidence SET publish_seq = ?
-             WHERE room_id = ? AND evidence_id IN (
-                 SELECT evidence_id FROM rt_message_evidence WHERE room_id = ?
+             WHERE room_id = ? AND publish_seq IS NULL AND evidence_id IN (
+                 SELECT me.evidence_id FROM rt_message_evidence me JOIN rt_messages m ON m.room_id=me.room_id AND m.message_id=me.message_id JOIN rt_attempts a ON a.room_id=m.room_id AND a.attempt_id=m.attempt_id JOIN rt_turns t ON t.room_id=a.room_id AND t.turn_id=a.turn_id WHERE t.room_id=? AND t.phase_id=? AND a.state='accepted'
              )",
-            vec![num(bumped.seq), text(&room_id), text(&room_id)],
+            vec![num(bumped.seq), text(&room_id), text(&room_id), text(&phase_id)],
         )
         .await?;
-        if phase.snapshot_ref != "synthesis" {
-            let next_id = Uuid::new_v4().to_string();
-            exec(
-                txn,
-                "INSERT INTO rt_phases (
-                    room_id, phase_id, phase_index, revision, status, snapshot_ref, snapshot_hash,
-                    expected, quorum, remaining_ms, closing_set_ref, published_seq, manifest_id
-                 ) VALUES (?, ?, ?, 1, 'ready', ?, ?, ?, ?, ?, NULL, NULL, ?)",
-                vec![
-                    text(&room_id),
-                    text(&next_id),
-                    num(phase.index + 1),
-                    text(&phase.snapshot_ref),
-                    text(&phase.snapshot_hash),
-                    num(phase.expected),
-                    num(phase.quorum),
-                    num(phase.remaining_ms),
-                    opt(phase.manifest_id.as_deref()),
-                ],
-            )
-            .await?;
-            exec(
-                txn,
-                "UPDATE rt_rooms SET current_phase_id = ? WHERE room_id = ?",
-                vec![text(&next_id), text(&room_id)],
-            )
-            .await?;
-        } else {
+        if phase.snapshot_ref == "synthesis" {
             exec(
                 txn,
                 "UPDATE rt_rooms SET status = 'completed' WHERE room_id = ?",
@@ -735,20 +874,13 @@ impl RoundtableStore {
             .await?;
         }
         let (now, utc) = self.clock_sample();
-        if deadline_reached(now, input.deadline_mono) {
-            return Err(rt_error(ErrorCode::InvalidState, "deadline_exceeded"));
-        }
         self.emit(
             txn,
             &self.fault_snapshot(),
             &room_id,
-            "publish",
-            &format!("publish-{phase_id}"),
-            &message_ids,
-            &[],
-            now,
-            now,
-            &utc,
+            ("publish", &format!("publish-{phase_id}")),
+            (&message_ids, &[]),
+            (now, now, &utc),
         )
         .await
     }
@@ -758,14 +890,13 @@ impl RoundtableStore {
         txn: &DatabaseTransaction,
         faults: &AcceptFaults,
         room_id: &str,
-        cause: &str,
-        event_id: &str,
-        message_ids: &[String],
-        evidence_ids: &[String],
-        decision_mono: u64,
-        commit_mono: u64,
-        utc: &str,
+        event: (&str, &str),
+        entities: (&[String], &[String]),
+        timing: (u64, u64, &str),
     ) -> RtResult<ProjectionRef> {
+        let (cause, event_id) = event;
+        let (message_ids, evidence_ids) = entities;
+        let (decision_mono, commit_mono, utc) = timing;
         let room = room_row(txn, room_id).await?;
         let phase_rows = rows(
             txn,
@@ -791,8 +922,14 @@ impl RoundtableStore {
                 state: parse_snake(&status)?,
             });
         }
-        if let Some(manifest) = room_manifest(txn, room_id).await? {
-            manifest_ids.push(manifest);
+        for row in rows(
+            txn,
+            "SELECT manifest_id FROM rt_source_manifests WHERE room_id=? ORDER BY version",
+            vec![text(room_id)],
+        )
+        .await?
+        {
+            manifest_ids.push(column::<String>(&row, 0)?);
         }
         let moderator = optional_row(
             txn,
@@ -807,6 +944,32 @@ impl RoundtableStore {
             }
             None => None,
         };
+        let remaining = query_i64(
+            txn,
+            "SELECT remaining_active_ms FROM rt_rooms WHERE room_id=?",
+            vec![text(room_id)],
+        )
+        .await?
+        .max(0) as u64;
+        let config: Option<roundtable_protocol::RoundtableConfigV1> =
+            serde_json::from_str(&room.config_ref).ok();
+        let prepaid=query_i64(txn,"SELECT COALESCE(SUM(prepaid_ms),0) FROM rt_active_time_leases WHERE room_id=? AND boot_epoch=? AND run_epoch=?",vec![text(room_id),num(room.boot_epoch),num(room.run_epoch)]).await?.max(0) as u64;
+        let sampled = config
+            .map(|config| {
+                config
+                    .budgets
+                    .room_budget
+                    .0
+                    .saturating_sub(remaining.saturating_add(prepaid))
+            })
+            .unwrap_or(0);
+        let ledger_seq = query_i64(
+            txn,
+            "SELECT COALESCE(MAX(ledger_seq),0)+1 FROM rt_measurements WHERE room_id=?",
+            vec![text(room_id)],
+        )
+        .await?;
+        exec(txn,"INSERT INTO rt_measurements(room_id,measurement_id,ledger_seq,sampled_active_ms,sampled_at_utc,kind) VALUES(?,?,?,?,?,'active')",vec![text(room_id),text(&Uuid::new_v4().to_string()),num(ledger_seq),num(i64_from(sampled)?),text(utc)]).await?;
         let projection_id = Uuid::new_v4().to_string();
         let body = ProjectionBodyV1 {
             schema_version: 1,
@@ -822,20 +985,25 @@ impl RoundtableStore {
             config_hash: Hash256::sha256(room.config_ref.as_bytes()),
             moderator_speaker_id,
             phase_refs,
-            ledger_seq: Seq(u64_from(room.revision)?),
-            sampled_active_ms: roundtable_protocol::DurationMs(0),
+            messages: Vec::new(),
+            evidence_manifests: Vec::new(),
+            replay: load_replay(txn, room_id, &room).await?,
+            ledger_seq: Seq(u64_from(ledger_seq)?),
+            sampled_active_ms: roundtable_protocol::DurationMs(sampled),
             sampled_at_utc: utc.to_string(),
         };
+        let message_rows = rows(
+            txn,
+            "SELECT message_id,body_hash FROM rt_messages WHERE room_id=? ORDER BY message_id",
+            vec![text(room_id)],
+        )
+        .await?;
         let mut messages = Vec::new();
-        for message_id in message_ids {
-            let hash = query_text_local(
-                txn,
-                "SELECT body_hash FROM rt_messages WHERE room_id = ? AND message_id = ?",
-                vec![text(room_id), text(message_id)],
-            )
-            .await?;
+        for row in message_rows {
+            let id: String = column(&row, 0)?;
+            let hash: String = column(&row, 1)?;
             messages.push(PublishedMessageRef {
-                message_id: parse_id(message_id)?,
+                message_id: parse_id(&id)?,
                 hash: hash_hex(&hash)?,
             });
         }
@@ -873,6 +1041,27 @@ impl RoundtableStore {
         )
         .await?;
         trip(faults, AcceptStep::Event)?;
+        exec(txn, "INSERT INTO rt_page_manifests(room_id,manifest_id,projection_id,high_water_seq) VALUES(?,?,?,?)",
+            vec![text(room_id),text(&projection_id),text(&projection_id),num(room.last_seq)]).await?;
+        for (offset, message) in projected.body.messages.iter().enumerate() {
+            let member = projected
+                .body
+                .replay
+                .message_memberships
+                .iter()
+                .filter(|member| member.message_id == message.message_id)
+                .max_by_key(|member| member.membership_version);
+            let (version, visibility) = member
+                .map(|member| (member.membership_version.0, member.visibility))
+                .unwrap_or((1, roundtable_protocol::MessageVisibility::Staged));
+            let visibility = match visibility {
+                roundtable_protocol::MessageVisibility::Staged => "staged",
+                roundtable_protocol::MessageVisibility::Published => "published",
+                roundtable_protocol::MessageVisibility::Void => "void",
+            };
+            exec(txn,"INSERT INTO rt_page_manifest_entries(room_id,manifest_id,entry_offset,message_id,body_hash,membership_version,visibility,staged) VALUES(?,?,?,?,?,?,?,?)",
+                vec![text(room_id),text(&projection_id),num(i64_from(offset as u64)?),text(&message.message_id.to_string()),text(&message.hash.to_hex()),num(i64_from(version)?),text(visibility),num(i64::from(visibility=="staged"))]).await?;
+        }
         exec(
             txn,
             "INSERT INTO rt_events (
@@ -947,7 +1136,7 @@ impl RoundtableStore {
             "SELECT a.attempt_id FROM rt_attempts a
              JOIN rt_turns t ON t.room_id = a.room_id AND t.turn_id = a.turn_id
              JOIN rt_speakers s ON s.room_id = t.room_id AND s.speaker_id = t.speaker_id
-             WHERE a.room_id = ? AND t.phase_id = ? AND a.state = 'accepted'
+             WHERE a.room_id = ? AND t.phase_id = ? AND a.state = 'accepted' AND t.accepted_attempt_id=a.attempt_id
              ORDER BY s.ordinal ASC",
             vec![text(room_id), text(phase_id)],
         )
@@ -999,12 +1188,9 @@ struct RoomSnap {
 struct PhaseSnap {
     revision: i64,
     status: String,
-    index: i64,
     snapshot_ref: String,
-    snapshot_hash: String,
     expected: i64,
     quorum: i64,
-    remaining_ms: i64,
     manifest_id: Option<String>,
 }
 
@@ -1032,7 +1218,11 @@ async fn room_row(txn: &impl ConnectionTrait, room_id: &str) -> RtResult<RoomSna
     })
 }
 
-async fn phase_row(txn: &impl ConnectionTrait, room_id: &str, phase_id: &str) -> RtResult<PhaseSnap> {
+async fn phase_row(
+    txn: &impl ConnectionTrait,
+    room_id: &str,
+    phase_id: &str,
+) -> RtResult<PhaseSnap> {
     let row = one_row(
         txn,
         "SELECT revision, status, phase_index, snapshot_ref, snapshot_hash, expected, quorum,
@@ -1044,12 +1234,9 @@ async fn phase_row(txn: &impl ConnectionTrait, room_id: &str, phase_id: &str) ->
     Ok(PhaseSnap {
         revision: column(&row, 0)?,
         status: column(&row, 1)?,
-        index: column(&row, 2)?,
         snapshot_ref: column(&row, 3)?,
-        snapshot_hash: column(&row, 4)?,
         expected: column(&row, 5)?,
         quorum: column(&row, 6)?,
-        remaining_ms: column(&row, 7)?,
         manifest_id: column(&row, 8).unwrap_or(None),
     })
 }
@@ -1073,112 +1260,205 @@ async fn bump_room(txn: &impl ConnectionTrait, room_id: &str) -> RtResult<Bump> 
     Ok(Bump { seq })
 }
 
-async fn room_manifest(txn: &impl ConnectionTrait, room_id: &str) -> RtResult<Option<String>> {
-    let row = optional_row(
-        txn,
-        "SELECT manifest_id FROM rt_phases
-         WHERE room_id = ? AND manifest_id IS NOT NULL
-         ORDER BY phase_index ASC LIMIT 1",
-        vec![text(room_id)],
-    )
-    .await?;
-    match row {
-        Some(row) => Ok(Some(column(&row, 0)?)),
-        None => Ok(None),
+async fn check_phase_fence(
+    txn: &impl ConnectionTrait,
+    room: &str,
+    phase: &str,
+    fence: &Fence,
+) -> RtResult<()> {
+    if phase != fence.phase_id.to_string() {
+        return Err(rt_error(ErrorCode::InvalidState, "fence_mismatch"));
     }
+    let valid=query_i64(txn,"SELECT COUNT(*) FROM rt_rooms r JOIN rt_phases p ON p.room_id=r.room_id AND p.phase_id=r.current_phase_id JOIN rt_turns t ON t.room_id=p.room_id AND t.phase_id=p.phase_id JOIN rt_attempts a ON a.room_id=t.room_id AND a.turn_id=t.turn_id JOIN rt_bindings b ON b.room_id=a.room_id AND b.binding_id=a.binding_id WHERE r.room_id=? AND r.status='running' AND r.active_control_id IS NULL AND r.boot_epoch=? AND r.run_epoch=? AND p.phase_id=? AND p.revision=? AND a.attempt_id=? AND b.binding_id=? AND b.incarnation=? AND b.policy_ref=? AND a.delivery_hash=?",vec![text(room),num(i64_from(fence.boot_epoch.0)?),num(i64_from(fence.run_epoch.0)?),text(phase),num(i64_from(fence.phase_revision.0)?),text(&fence.attempt_id.to_string()),text(&fence.binding_id.to_string()),text(&fence.incarnation.to_string()),text(&fence.policy_hash.to_hex()),text(&fence.context_hash.to_hex())]).await?;
+    if valid != 1 {
+        return Err(rt_error(ErrorCode::InvalidState, "fence_mismatch"));
+    }
+    Ok(())
 }
 
 async fn insert_claims(
     txn: &DatabaseTransaction,
-    room_id: &str,
-    message_id: &str,
-    receipt: Option<&str>,
+    room: &str,
+    message: &str,
+    body: Option<&str>,
 ) -> RtResult<()> {
-    for claim in receipt_array(receipt, "claims") {
+    for claim in receipt_array(body, "claims") {
         let key = claim_str(&claim, "local_key")?;
-        let statement = claim_str(&claim, "statement")?;
+        let statement = claim_str(&claim, "text")?;
         exec(
             txn,
-            "INSERT INTO rt_claims (room_id, message_id, local_key, statement) VALUES (?, ?, ?, ?)",
-            vec![text(room_id), text(message_id), text(&key), text(&statement)],
+            "INSERT INTO rt_claims(room_id,message_id,local_key,statement) VALUES(?,?,?,?)",
+            vec![text(room), text(message), text(&key), text(&statement)],
+        )
+        .await?;
+        exec(
+            txn,
+            "INSERT INTO rt_claim_ids(room_id,claim_id,message_id,local_key) VALUES(?,?,?,?)",
+            vec![
+                text(room),
+                text(&Uuid::new_v4().to_string()),
+                text(message),
+                text(&key),
+            ],
         )
         .await?;
     }
     Ok(())
 }
 
+async fn claim_target(
+    txn: &DatabaseTransaction,
+    room: &str,
+    alias: &str,
+    scope: &roundtable_protocol::ResultScope,
+) -> RtResult<(String, String)> {
+    let target = scope
+        .aliases
+        .claims
+        .get(alias)
+        .ok_or_else(|| rt_error(ErrorCode::InvalidState, "claim_alias"))?;
+    let row=one_row(txn,"SELECT c.message_id,c.local_key FROM rt_claim_ids c WHERE c.room_id=? AND c.claim_id=? AND EXISTS(SELECT 1 FROM rt_message_memberships m WHERE m.room_id=c.room_id AND m.message_id=c.message_id AND m.visibility='published')",vec![text(room),text(&target.claim_id.to_string())]).await?;
+    Ok((column(&row, 0)?, column(&row, 1)?))
+}
+
 async fn insert_responses(
     txn: &DatabaseTransaction,
-    room_id: &str,
-    message_id: &str,
-    receipt: Option<&str>,
+    room: &str,
+    message: &str,
+    body: Option<&str>,
+    scope: &roundtable_protocol::ResultScope,
 ) -> RtResult<()> {
-    for response in receipt_array(receipt, "responses") {
-        exec(
-            txn,
-            "INSERT INTO rt_responses (
-                room_id, response_id, message_id, target_message_id, target_local_key, stance
-             ) VALUES (?, ?, ?, ?, ?, ?)",
-            vec![
-                text(room_id),
-                text(&claim_str(&response, "response_id")?),
-                text(message_id),
-                text(&claim_str(&response, "target_message_id")?),
-                text(&claim_str(&response, "target_local_key")?),
-                text(&claim_str(&response, "stance")?),
-            ],
-        )
-        .await?;
+    for response in receipt_array(body, "responses") {
+        let mut response_target = None;
+        let (target_message, target_key) = if let Some(alias) =
+            response.get("target_claim_alias").and_then(Value::as_str)
+        {
+            claim_target(txn, room, alias, scope).await?
+        } else {
+            let alias = claim_str(&response, "target_response_alias")?;
+            let target = scope
+                .aliases
+                .responses
+                .get(&alias)
+                .ok_or_else(|| rt_error(ErrorCode::InvalidState, "response_alias"))?;
+            response_target = Some(target.response_id.to_string());
+            let row=one_row(txn,"SELECT r.target_message_id,r.target_local_key FROM rt_responses r WHERE r.room_id=? AND r.response_id=? AND EXISTS(SELECT 1 FROM rt_message_memberships m WHERE m.room_id=r.room_id AND m.message_id=r.message_id AND m.visibility='published')",vec![text(room),text(&target.response_id.to_string())]).await?;
+            (column::<String>(&row, 0)?, column::<String>(&row, 1)?)
+        };
+        let id = Uuid::new_v4().to_string();
+        exec(txn,"INSERT INTO rt_responses(room_id,response_id,message_id,target_message_id,target_local_key,stance) VALUES(?,?,?,?,?,?)",vec![text(room),text(&id),text(message),text(&target_message),text(&target_key),text(&claim_str(&response,"stance")?)]).await?;
+        exec(txn,"INSERT INTO rt_response_details(room_id,response_id,target_response_id,body_json) VALUES(?,?,?,?)",vec![text(room),text(&id),opt(response_target.as_deref()),text(&response.to_string())]).await?;
     }
     Ok(())
 }
 
 async fn insert_positions(
     txn: &DatabaseTransaction,
-    room_id: &str,
-    message_id: &str,
-    receipt: Option<&str>,
+    room: &str,
+    message: &str,
+    body: Option<&str>,
+    scope: &roundtable_protocol::ResultScope,
 ) -> RtResult<()> {
-    for change in receipt_array(receipt, "position_changes") {
-        exec(
+    for change in receipt_array(body, "position_changes") {
+        let alias = claim_str(&change, "own_prior_claim_alias")?;
+        if scope
+            .aliases
+            .claims
+            .get(&alias)
+            .is_none_or(|claim| claim.speaker_id != scope.speaker_id)
+        {
+            return Err(rt_error(ErrorCode::InvalidState, "claim_owner"));
+        }
+        let (target_message, target_key) = claim_target(txn, room, &alias, scope).await?;
+        let old = query_text_local(
             txn,
-            "INSERT INTO rt_position_changes (
-                room_id, position_change_id, message_id, target_message_id, target_local_key,
-                from_position, to_position
-             ) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            "SELECT statement FROM rt_claims WHERE room_id=? AND message_id=? AND local_key=?",
+            vec![text(room), text(&target_message), text(&target_key)],
+        )
+        .await?;
+        let new = query_text_local(
+            txn,
+            "SELECT statement FROM rt_claims WHERE room_id=? AND message_id=? AND local_key=?",
             vec![
-                text(room_id),
-                text(&claim_str(&change, "position_change_id")?),
-                text(message_id),
-                text(&claim_str(&change, "target_message_id")?),
-                text(&claim_str(&change, "target_local_key")?),
-                text(&claim_str(&change, "from_position")?),
-                text(&claim_str(&change, "to_position")?),
+                text(room),
+                text(message),
+                text(&claim_str(&change, "new_local_claim_key")?),
             ],
         )
         .await?;
+        exec(txn,"INSERT INTO rt_position_changes(room_id,position_change_id,message_id,target_message_id,target_local_key,from_position,to_position) VALUES(?,?,?,?,?,?,?)",vec![text(room),text(&Uuid::new_v4().to_string()),text(message),text(&target_message),text(&target_key),text(&old),text(&new)]).await?;
     }
     Ok(())
 }
 
+fn evidence_aliases(value: &Value, aliases: &mut std::collections::BTreeSet<String>) {
+    match value {
+        Value::Object(map) => {
+            if let Some(items) = map.get("evidence_aliases").and_then(Value::as_array) {
+                for item in items {
+                    if let Some(alias) = item.as_str() {
+                        aliases.insert(alias.to_owned());
+                    }
+                }
+            }
+            if map.get("kind").and_then(Value::as_str) == Some("evidence") {
+                if let Some(alias) = map.get("alias").and_then(Value::as_str) {
+                    aliases.insert(alias.to_owned());
+                }
+            }
+            for child in map.values() {
+                evidence_aliases(child, aliases);
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                evidence_aliases(item, aliases);
+            }
+        }
+        _ => {}
+    }
+}
+
 async fn insert_evidence_links(
     txn: &DatabaseTransaction,
-    room_id: &str,
-    message_id: &str,
-    receipt: Option<&str>,
+    room: &str,
+    message: &str,
+    attempt: &str,
+    body: &Value,
+    scope: &roundtable_protocol::ResultScope,
 ) -> RtResult<Vec<String>> {
+    let mut aliases = std::collections::BTreeSet::new();
+    evidence_aliases(body, &mut aliases);
     let mut ids = Vec::new();
-    for evidence in receipt_array(receipt, "evidence_ids") {
-        let Some(evidence_id) = evidence.as_str() else {
-            return Err(rt_error(ErrorCode::InvalidArgument, "evidence_id"));
-        };
-        exec(
+    for alias in aliases {
+        let target = scope
+            .aliases
+            .evidence
+            .get(&alias)
+            .ok_or_else(|| rt_error(ErrorCode::InvalidState, "evidence_alias"))?;
+        let id = target.evidence_id.to_string();
+        let row = one_row(
             txn,
-            "INSERT INTO rt_message_evidence (room_id, message_id, evidence_id) VALUES (?, ?, ?)",
-            vec![text(room_id), text(message_id), text(evidence_id)],
+            "SELECT publish_seq,body_json FROM rt_evidence WHERE room_id=? AND evidence_id=?",
+            vec![text(room), text(&id)],
         )
         .await?;
-        ids.push(evidence_id.to_string());
+        let published: Option<i64> = column(&row, 0)?;
+        let raw: Option<String> = column(&row, 1)?;
+        let evidence: Value = serde_json::from_str(raw.as_deref().unwrap_or("null"))
+            .map_err(|_| rt_error(ErrorCode::InvalidState, "evidence_body"))?;
+        if published.is_none()
+            && evidence.get("owner_attempt_id").and_then(Value::as_str) != Some(attempt)
+        {
+            return Err(rt_error(ErrorCode::InvalidState, "evidence_visibility"));
+        }
+        exec(
+            txn,
+            "INSERT INTO rt_message_evidence(room_id,message_id,evidence_id) VALUES(?,?,?)",
+            vec![text(room), text(message), text(&id)],
+        )
+        .await?;
+        ids.push(id);
     }
     Ok(ids)
 }
@@ -1240,20 +1520,6 @@ fn audit_json(
     .to_string()
 }
 
-fn string_list(value: &Value, key: &str) -> Vec<String> {
-    value
-        .get(key)
-        .and_then(Value::as_array)
-        .map(|items| {
-            items
-                .iter()
-                .filter_map(Value::as_str)
-                .map(ToOwned::to_owned)
-                .collect()
-        })
-        .unwrap_or_default()
-}
-
 fn phase_kind(snapshot_ref: &str) -> PhaseKind {
     match snapshot_ref {
         "critique" => PhaseKind::Critique,
@@ -1294,3 +1560,82 @@ async fn query_text_local(
     column(&row, 0)
 }
 
+async fn json_rows<T: serde::de::DeserializeOwned>(
+    txn: &impl ConnectionTrait,
+    room: &str,
+    sql: &str,
+) -> RtResult<Vec<T>> {
+    let mut result = Vec::new();
+    for row in rows(txn, sql, vec![text(room)]).await? {
+        let raw: String = column(&row, 0)?;
+        result.push(
+            serde_json::from_str(&raw)
+                .map_err(|_| rt_error(ErrorCode::StorageUnavailable, "projection_row"))?,
+        );
+    }
+    Ok(result)
+}
+
+async fn load_replay(
+    txn: &impl ConnectionTrait,
+    room_id: &str,
+    room: &RoomSnap,
+) -> RtResult<roundtable_protocol::ProjectionReplayV1> {
+    use roundtable_protocol::{DurationMs, ProjectionReplayV1, SafeInt};
+    let row=one_row(txn,"SELECT current_phase_id,active_control_id,result_quality,remaining_active_ms FROM rt_rooms WHERE room_id=?",vec![text(room_id)]).await?;
+    let phase: Option<String> = column(&row, 0)?;
+    let operation: Option<String> = column(&row, 1)?;
+    let mut replay = ProjectionReplayV1 {
+        config: serde_json::from_str(&room.config_ref).ok(),
+        boot_epoch: Epoch(u64_from(room.boot_epoch)?),
+        current_phase_id: phase.as_deref().map(parse_id).transpose()?,
+        active_control_id: operation.as_deref().map(parse_id).transpose()?,
+        result_quality: column(&row, 2)?,
+        ..Default::default()
+    };
+    replay.budget.remaining_active_ms = DurationMs(u64_from(column(&row, 3)?)?);
+    replay.budget.admitted_attempts = SafeInt(u64_from(
+        query_i64(
+            txn,
+            "SELECT COALESCE(SUM(admitted_attempt_count),0) FROM rt_turns WHERE room_id=?",
+            vec![text(room_id)],
+        )
+        .await?,
+    )?);
+    replay.speakers=json_rows(txn,room_id,"SELECT json_object('speaker_id',speaker_id,'ordinal',ordinal,'role',role,'provider_ref',provider_ref,'model_id',model_id) FROM rt_speakers WHERE room_id=? ORDER BY ordinal").await?;
+    replay.turns=json_rows(txn,room_id,"SELECT json_object('turn_id',turn_id,'phase_id',phase_id,'speaker_id',speaker_id,'status',status,'accepted_attempt_id',accepted_attempt_id,'admitted_attempt_count',admitted_attempt_count) FROM rt_turns WHERE room_id=? ORDER BY turn_id").await?;
+    replay.attempts=json_rows(txn,room_id,"SELECT json_object('attempt_id',attempt_id,'turn_id',turn_id,'attempt_no',attempt_no,'binding_id',binding_id,'state',state,'dispatch_state',dispatch_state,'cleanup_state',cleanup_state,'residual_remote_work',json(CASE residual_remote_work WHEN 1 THEN 'true' ELSE 'false' END)) FROM rt_attempts WHERE room_id=? ORDER BY turn_id,attempt_no").await?;
+    replay.bindings=json_rows(txn,room_id,"SELECT json_object('binding_id',binding_id,'speaker_id',speaker_id,'generation',CAST(generation AS TEXT),'state',state,'context_state',context_state,'retire_reason',retire_reason) FROM rt_bindings WHERE room_id=? ORDER BY binding_id").await?;
+    replay.control_operations=json_rows(txn,room_id,"SELECT json_object('operation_id',operation_id,'kind',kind,'step',step,'target_phase_id',target_phase_id,'target_revision',CAST(target_revision AS TEXT),'requested_epoch',CAST(requested_epoch AS TEXT),'status',status,'blocked_reason',blocked_reason,'successor_phase_id',successor_phase_id,'superseded_by',superseded_by) FROM rt_control_operations WHERE room_id=? ORDER BY operation_id").await?;
+    replay.inputs=json_rows(txn,room_id,"SELECT json_object('input_id',input_id,'text',text,'mode',mode,'accepted_seq',CAST(accepted_seq AS TEXT),'target_phase_index',target_phase_index,'applied_phase_id',applied_phase_id,'applied_seq',CAST(applied_seq AS TEXT),'state',state) FROM rt_user_inputs WHERE room_id=? ORDER BY accepted_seq").await?;
+    replay.budget.reservations=json_rows(txn,room_id,"SELECT json_object('reservation_id',reservation_id,'purpose',purpose,'amount_ms',CAST(amount_ms AS TEXT),'amount_bytes',amount_bytes,'state',state) FROM rt_budget_reservations WHERE room_id=? ORDER BY reservation_id").await?;
+    replay.message_memberships=json_rows(txn,room_id,"SELECT json_object('message_id',message_id,'membership_version',CAST(membership_version AS TEXT),'visibility',visibility,'published_seq',CAST(published_seq AS TEXT)) FROM rt_message_memberships WHERE room_id=? ORDER BY message_id,membership_version").await?;
+    for row in rows(txn,"SELECT evidence_id,manifest_id,owner_speaker_id,content_hash,publish_seq,body_json FROM rt_evidence WHERE room_id=? ORDER BY evidence_id",vec![text(room_id)]).await? {
+        let id:String=column(&row,0)?;let manifest:String=column(&row,1)?;let speaker:String=column(&row,2)?;let hash:String=column(&row,3)?;
+        let seq:Option<i64>=column(&row,4)?;let body:Option<String>=column(&row,5)?;
+        replay.evidence.push(roundtable_protocol::ProjectionEvidenceV1 {
+            evidence_id:parse_id(&id)?,manifest_id:parse_id(&manifest)?,owner_speaker_id:parse_id(&speaker)?,
+            content_hash:hash_hex(&hash)?,published_seq:seq.map(u64_from).transpose()?.map(Seq),body_hash:evidence_body_hash(body.as_deref())?,
+        });
+    }
+    let history = super::owned_runtime::load_history_in(txn, &parse_id(room_id)?).await?;
+    let mut targets = Vec::new();
+    if let Some(row)=optional_row(txn,"SELECT pc.snapshot_json FROM rt_phase_contexts pc JOIN rt_rooms r ON r.room_id=pc.room_id AND r.current_phase_id=pc.phase_id WHERE r.room_id=?",vec![text(room_id)]).await? {
+        let snapshot:roundtable_protocol::PhaseSnapshotV1=serde_json::from_str(&column::<String>(&row,0)?).map_err(|_|rt_error(ErrorCode::StorageUnavailable,"phase_snapshot"))?;
+        for speaker in &replay.speakers {
+            let required=snapshot.mandatory_targets.iter().filter(|target|target.speaker_id==speaker.speaker_id).map(|target|roundtable_protocol::AssignedTarget{claim_id:target.claim_id,response_id:target.response_id,source_ordinal:0,publication_seq:Seq(0),priority:roundtable_protocol::Priority::Normal}).collect();
+            targets.push(roundtable_protocol::SpeakerTargets{speaker:roundtable_protocol::SpeakerOrdinal{speaker_id:speaker.speaker_id,ordinal:speaker.ordinal},required});
+        }
+    }
+    replay.coverage = Some(roundtable_protocol::coverage(&history, &targets));
+    replay.source_manifests=json_rows(txn,room_id,"SELECT json_object('manifest_id',manifest_id,'hash',manifest_hash) FROM rt_source_manifests WHERE room_id=? ORDER BY version").await?;
+    Ok(replay)
+}
+
+fn evidence_body_hash(body: Option<&str>) -> RtResult<Hash256> {
+    let parsed: Value = serde_json::from_str(body.unwrap_or("null"))
+        .map_err(|_| rt_error(ErrorCode::StorageUnavailable, "evidence_body"))?;
+    Ok(Hash256::sha256(&roundtable_protocol::canonical_bytes(
+        &parsed,
+    )?))
+}

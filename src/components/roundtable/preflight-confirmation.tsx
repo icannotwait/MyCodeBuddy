@@ -1,5 +1,7 @@
 "use client"
 
+import { useTranslations } from "next-intl"
+
 export function PreflightConfirmation({
   targets,
   tools,
@@ -13,17 +15,18 @@ export function PreflightConfirmation({
   writes: string
   budget: string
 }) {
+  const t = useTranslations("Roundtable")
   return (
     <dl>
-      <dt>目标</dt>
+      <dt>{t("targets")}</dt>
       <dd>{targets.join("、")}</dd>
-      <dt>工具</dt>
+      <dt>{t("tools")}</dt>
       <dd>{tools.join("、")}</dd>
-      <dt>网络</dt>
+      <dt>{t("network")}</dt>
       <dd>{network}</dd>
-      <dt>写入</dt>
+      <dt>{t("writes")}</dt>
       <dd>{writes}</dd>
-      <dt>预算</dt>
+      <dt>{t("budget")}</dt>
       <dd>{budget}</dd>
     </dl>
   )

@@ -67,6 +67,23 @@ impl ResourceAllocator {
     /// All or nothing. A failed acquire leaves the previous occupancy unchanged
     /// and never keeps a partial slot.
     pub fn try_acquire(&self, room: RoomId, slots: u32) -> RtResult<PermitBundle> {
+        self.acquire(room, slots, None)
+    }
+
+    pub(crate) fn acquire_incarnation(
+        &self,
+        room: RoomId,
+        incarnation: IncarnationId,
+    ) -> RtResult<PermitBundle> {
+        self.acquire(room, 1, Some(incarnation))
+    }
+
+    fn acquire(
+        &self,
+        room: RoomId,
+        slots: u32,
+        incarnation: Option<IncarnationId>,
+    ) -> RtResult<PermitBundle> {
         if slots == 0 {
             return Err(rt_error(ErrorCode::CapacityLimited, "capacity_limited"));
         }
@@ -90,9 +107,11 @@ impl ResourceAllocator {
         state.active_room = Some(room.to_string());
         let lease_id = format!("lease-{}", state.next_lease);
         state.next_lease += 1;
-        let incarnations = (0..slots)
-            .map(|index| incarnation_for(state.next_lease, index))
-            .collect::<Vec<_>>();
+        let incarnations = incarnation.map(|id| vec![id]).unwrap_or_else(|| {
+            (0..slots)
+                .map(|index| incarnation_for(state.next_lease, index))
+                .collect::<Vec<_>>()
+        });
         state.leases.insert(lease_id.clone(), incarnations.clone());
         Ok(PermitBundle {
             lease_id,
@@ -103,7 +122,12 @@ impl ResourceAllocator {
     }
 
     /// Resume takes `min(C, remaining)`, never the larger concurrency.
-    pub fn try_resume(&self, room: RoomId, concurrency: u32, remaining: u32) -> RtResult<PermitBundle> {
+    pub fn try_resume(
+        &self,
+        room: RoomId,
+        concurrency: u32,
+        remaining: u32,
+    ) -> RtResult<PermitBundle> {
         let slots = remaining.min(concurrency);
         if slots == 0 {
             return Err(rt_error(ErrorCode::CapacityLimited, "capacity_limited"));

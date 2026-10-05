@@ -158,3 +158,60 @@ fn mount_private_socket() -> std::io::Result<InstanceSocket> {
         listener,
     })
 }
+
+/// Real per-companion relay. The socket and TCP address are fixed inside the
+/// qualified network namespace; each accepted stream is owned until shutdown.
+pub struct ServiceModelRelay {
+    task: tokio::task::JoinHandle<()>,
+    cancel: tokio_util::sync::CancellationToken,
+}
+impl ServiceModelRelay {
+    pub async fn start() -> RtResult<Self> {
+        #[cfg(unix)]
+        {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:39173")
+                .await
+                .map_err(|_| rt_error(ErrorCode::RuntimeUnavailable, "relay_bind"))?;
+            let cancel = tokio_util::sync::CancellationToken::new();
+            let stop = cancel.clone();
+            let task = tokio::spawn(async move {
+                let mut clients = tokio::task::JoinSet::new();
+                loop {
+                    tokio::select! {
+                        _ = stop.cancelled() => break,
+                        _ = clients.join_next(), if !clients.is_empty() => {},
+                        accepted = listener.accept(), if clients.len() < 4 => {
+                            let Ok((mut tcp,_)) = accepted else {break};
+                            clients.spawn(async move {
+                                let _ = tokio::time::timeout(std::time::Duration::from_secs(600),async {
+                                    let mut unix = tokio::net::UnixStream::connect("/run/codeg/gateway.sock").await?;
+                                    tokio::io::copy_bidirectional(&mut tcp,&mut unix).await
+                                }).await;
+                            });
+                        }
+                    }
+                }
+                clients.abort_all();
+                while clients.join_next().await.is_some() {}
+            });
+            Ok(Self { task, cancel })
+        }
+        #[cfg(not(unix))]
+        {
+            Err(rt_error(
+                ErrorCode::PolicyUnenforceable,
+                "platform_unqualified",
+            ))
+        }
+    }
+    pub async fn shutdown(mut self) {
+        self.cancel.cancel();
+        let _ = (&mut self.task).await;
+    }
+}
+impl Drop for ServiceModelRelay {
+    fn drop(&mut self) {
+        self.cancel.cancel();
+        self.task.abort();
+    }
+}

@@ -226,11 +226,7 @@ fn ordinary_session_hidden(
     working_dir: Option<&str>,
 ) -> bool {
     filter.contains(agent_type, external_id, working_dir)
-        || crate::roundtable::hidden_from_ordinary_discovery(
-            agent_type,
-            external_id,
-            working_dir,
-        )
+        || crate::roundtable::hidden_from_ordinary_discovery(agent_type, external_id, working_dir)
 }
 
 /// Drop internal agent sessions before search / aggregation / import.

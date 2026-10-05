@@ -20,10 +20,7 @@ const REQUIRED_IDS = [
 const CRITICAL_CHAINS = [
   {
     id: "rootless_process",
-    covers: [
-      "rootless_crun_create_list_reap",
-      "namespace_cgroup_isolation",
-    ],
+    covers: ["rootless_crun_create_list_reap", "namespace_cgroup_isolation"],
   },
   {
     id: "model_gateway",
@@ -226,9 +223,8 @@ function statusFor(item, profileState) {
 }
 
 function buildCase(item, host, profileState) {
-  const planned = typeof item.planned_command === "string"
-    ? item.planned_command
-    : ""
+  const planned =
+    typeof item.planned_command === "string" ? item.planned_command : ""
   return {
     id: item.id,
     chain: item.chain,
@@ -279,9 +275,7 @@ function profileBlockReason(profileState, host) {
 function criticalChainReport(cases) {
   return CRITICAL_CHAINS.map((chain) => {
     const covered = cases.filter((item) => chain.covers.includes(item.id))
-    const verdict = covered.every(
-      (item) => item.status === "blocked_platform"
-    )
+    const verdict = covered.every((item) => item.status === "blocked_platform")
       ? "blocked_platform"
       : "not_tested"
     return {

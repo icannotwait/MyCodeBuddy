@@ -8,8 +8,10 @@ mod acceptance;
 mod actor;
 mod api;
 mod authorization;
+mod budget_ledger;
 pub(crate) mod capabilities;
 mod clock;
+#[cfg(any(test, feature = "test-utils"))]
 mod command_processor;
 mod companion;
 mod control;
@@ -17,37 +19,76 @@ mod diagnostics;
 mod e2e;
 mod events;
 mod feature_gate;
-mod maintenance;
-mod mcp;
 mod gateway;
 pub(crate) mod ingress;
+mod installed_runtime;
+mod live_gateway;
+mod live_runtime;
+mod maintenance;
+mod mcp;
+mod objects;
+mod owned_runtime;
+mod ownership;
+mod paging;
+mod product;
 mod qualification;
 mod qualification_harness;
 mod recovery;
-mod rollout;
 mod registry;
 mod relay;
-mod ownership;
-mod paging;
-mod budget_ledger;
 mod request_accounting;
 mod resources;
+mod rollout;
 mod runtime;
-mod objects;
 mod sandbox;
 mod schema;
-mod usage;
 mod service;
 mod snapshot;
 mod store;
 mod tool_core;
+mod usage;
 
+pub use acceptance::{AcceptInput, CloseInput, ClosingSetRef, PublishInput};
+pub use actor::{RoomActor, RoomGate};
+pub use api::http_status;
+#[cfg(any(test, feature = "test-utils"))]
+pub use api::{execute, RoundtableRequestV1, RoundtableResponseV1};
+pub use authorization::{authorize_room, RoomDirectory, RoomGrant};
+pub use budget_ledger::ActiveBudgetLease;
+#[cfg(any(test, feature = "test-utils"))]
+pub use budget_ledger::{
+    checkpoint_active, recompute_room_budget, reserve_budget, AdmissionWindow, BillingSplit,
+    RoomClockLedger,
+};
+pub use capabilities::{
+    classify_service_failure, drain_recorded_failures, host_broker_call, host_tools_agent_manifest,
+    policy_hash_for, record_service_response, record_service_update, sealed_service_manifest,
+    service_client_capabilities_value, service_manifest_for_session, verify_service_manifest,
+    FailureObservation, FailureSource, LaunchCapabilityManifestV1, ManifestExtras,
+    OrdinarySessionFlags, ServiceTurnDecision,
+};
+pub use clock::{
+    deadline_reached, AcceptStep, FakeClock, LockGate, MonoClock, MonotonicClock, SystemMono,
+};
+#[cfg(any(test, feature = "test-utils"))]
+pub use command_processor::{next_phase, pause_again, retry_synthesis};
 pub use companion::{
     advertised_tools, bind_service_process, callable_tools, legacy_companion_context,
     parse_companion_args, plan_service_launch, service_channel_owner,
     service_tools_ignoring_host_flags, tool_callable, CompanionMode, CompanionParse,
-    FakeBrokerTransport, LegacyParentArgs, ServiceLaunchInput, ServiceLaunchPlan, ServiceProcess,
-    ServiceWatchState, ServiceWatchdog, ATTEMPT_TOKEN_ENV,
+    FakeBrokerTransport, LegacyParentArgs, ServiceBroker, ServiceConnection, ServiceLaunchInput,
+    ServiceLaunchPlan, ServiceProcess, ServiceWatchState, ServiceWatchdog, ATTEMPT_TOKEN_ENV,
+};
+pub use control::ControlRequest;
+#[cfg(any(test, feature = "test-utils"))]
+pub use control::{
+    advance_control, apply_command, ControlBook, MatrixOutcome, MatrixRow, MutationCommandV1,
+};
+pub use diagnostics::{seal_diagnostic, DiagnosticCapture, DiagnosticInput, DiagnosticRef};
+pub use e2e::{exercise_room, Trajectory};
+pub use events::{
+    advance_private_watermark, apply_projection, moderator_preview_allowed, projection_hash,
+    SubscriptionHub,
 };
 pub use feature_gate::{
     scopes_convert, AdmissionFacts, ExecutionGate, ExecutionPolicy, ExecutionScope, GatePermit,
@@ -60,75 +101,51 @@ pub use ingress::{
     bind_private_ingress, BarrierFact, CompletionCoordinator, CompletionMarker, IngressKind,
     RuntimeIngress,
 };
-pub use capabilities::{
-    classify_service_failure, drain_recorded_failures, host_broker_call,
-    host_tools_agent_manifest, policy_hash_for, record_service_response, record_service_update,
-    sealed_service_manifest, service_client_capabilities_value, service_manifest_for_session,
-    verify_service_manifest, FailureObservation, FailureSource, LaunchCapabilityManifestV1,
-    ManifestExtras, OrdinarySessionFlags, ServiceTurnDecision,
+#[cfg(any(test, feature = "test-utils"))]
+pub use installed_runtime::verify_runtime_contract_fixture;
+#[cfg(any(test, feature = "test-utils"))]
+pub use live_gateway::{
+    exercise_gateway_shutdown_fixture, exercise_live_gateway_fixture,
+    exercise_queued_gateway_fixture, GatewayFixtureObservation,
 };
+#[cfg(any(test, feature = "test-utils"))]
+pub use live_runtime::{
+    persist_runtime_diagnostic_fixture, rejected_live_executor_fixture,
+    retired_live_executor_fixture, verify_confirmed_option_fixture,
+};
+pub use maintenance::{
+    backup_roundtable, gc_unreferenced, restore_roundtable, BackupManifest, GcReport,
+};
+pub use mcp::{
+    invoke_scoped_tool, note_unverified_reference, persist_candidate, read_evidence,
+    register_input_evidence, search_evidence, DurableToolStore, EvidenceSearchHit,
+    EvidenceSearchPage, EvidenceSlice, EvidenceUsage, GateToolAuthority, InputEvidence,
+    PersistedEvidence, ReadEvidenceArgs, SearchEvidenceArgs, SubmissionAudit, ToolAuthority,
+    ToolSession,
+};
+pub use objects::{ObjectFault, ObjectRef, ObjectStore, ReservationLedger, StorageLease};
+pub use owned_runtime::{
+    OwnedParticipantRuntime, RoundtableTurnExecutor, RoundtableTurnOutcome, RoundtableTurnRequest,
+    RuntimeCapability,
+};
+pub use ownership::{
+    lock_path_for, matches_instance, CoordinatorLock, OwnedProcess, RoundtableReadService,
+};
+pub use paging::{read_manifest_page, CursorScope, ManifestPage, ScopedCursors};
 pub use qualification::{
     evaluate_certificate, qualify_service, CertifiedBinary, OsIdentity, QualificationKey,
     QualificationReport,
 };
 pub use qualification_harness::QualificationHarness;
-pub use recovery::{recover_service, recovery_action, RecoveryAction, RecoveryReport, RecoveryState};
+pub use recovery::{recover_service, RecoveryReport};
+#[cfg(any(test, feature = "test-utils"))]
+pub use recovery::{recovery_action, RecoveryAction, RecoveryState};
 pub use registry::{
     downgrade_is_silent_compatible, hidden_from_ordinary_discovery, DiscoveryLease, ExternalId,
     InternalBindingRecord, ObserverWindow, RegisteredBinding, RegistryStore, RootLease,
     RoundtableSessionRegistry, StoredBinding,
 };
-pub use schema::{
-    apply_roundtable_schema, drop_roundtable_schema, roundtable_table_names, DurabilityProfile,
-    LOGICAL_MODEL, RECORDED_DURABILITY,
-};
-pub use objects::{
-    ObjectFault, ObjectRef, ObjectStore, ReservationLedger, StorageLease,
-};
-pub use snapshot::{
-    build_delivery, canonical_path_bytes, capture_snapshot, commit_captured_manifest,
-    confirmation_echo, ensure_within_root, freeze_phase, freeze_preflight, fresh_binding_context,
-    lexical_within, line_start_offsets, offer_text_tool, path_within_root, validate_relative_path,
-    ConfirmationEcho, PhaseInput, PreflightLog, ResolvedRecipients, RoomDraft, SelectedFile,
-    SnapshotEncoding, SnapshotLimits, SourceClass, SourceEntryV1, SourceManifestV1,
-    SourceSelection, FRESH_CONTEXT_STATE, MAX_SNAPSHOT_READS,
-};
-pub use acceptance::{AcceptInput, CloseInput, ClosingSetRef, PublishInput};
-pub use actor::{RoomActor, RoomGate};
-pub use budget_ledger::{
-    checkpoint_active, recompute_room_budget, reserve_budget, AdmissionWindow, BillingSplit,
-    RoomClockLedger,
-};
-pub use command_processor::{next_phase, pause_again, retry_synthesis};
-pub use control::{
-    apply_command, advance_control, ControlBook, MatrixOutcome, MatrixRow, MutationCommandV1,
-};
-pub use api::{execute, http_status, RoundtableRequestV1, RoundtableResponseV1};
-pub use authorization::{authorize_room, RoomDirectory, RoomGrant};
-pub use diagnostics::{seal_diagnostic, DiagnosticInput, DiagnosticRef};
-pub use e2e::{exercise_room, Trajectory};
-pub use events::{apply_projection, moderator_preview_allowed, projection_hash, SubscriptionHub};
-pub use maintenance::{backup_roundtable, gc_unreferenced, restore_roundtable, BackupManifest, GcReport, ReferenceCatalog, TrackedObject};
-pub use paging::{read_manifest_page, ManifestPage};
-pub use rollout::{disable_and_drain, may_start, Rollout};
-pub use usage::{archive_late_measurement, RoomMeter};
-pub use clock::{
-    deadline_reached, AcceptStep, FakeClock, LockGate, MonoClock, MonotonicClock, SystemMono,
-};
-pub use ownership::{
-    lock_path_for, matches_instance, CoordinatorLock, OwnedProcess, RoundtableReadService,
-};
-pub use service::{
-    shutdown_order, OpenedRoundtable, ParticipantRuntime, QuarantineLease, RoomMessage,
-    RoomMessageKind, RoomReply,
-    RoundtableService, RoundtableSlot, RuntimeIdentity, ServiceConfig, ServiceReadiness,
-    ShutdownReport,
-};
-pub use store::{
-    durability_from_report, migrate_roundtable, open_roundtable_store, promises_power_loss,
-    verify_connection_profile, NewAttempt, NewBinding, NewClaim, NewCommand, NewEvent, NewEvidence,
-    NewManifest, NewMessage, NewPhase, NewRoom, NewSpeaker, NewSubmission, NewTurn, RoundtableStore,
-};
+pub use relay::ServiceModelRelay;
 pub use relay::{
     forward_to_caller_target, probe_instance_socket, relay_from_helper, InstanceSocket,
     LoopbackRelay, SocketProbe, SANDBOX_ENDPOINT,
@@ -137,6 +154,7 @@ pub use request_accounting::{
     AccountingSnapshot, EncodedModelRequest, RequestAccounting, RequestPermit,
 };
 pub use resources::{ExecutionLease, PermitBundle, ResourceAllocator};
+pub use rollout::{disable_and_drain, may_start, Rollout};
 pub use runtime::{
     prepare_roundtable_connection, try_enqueue, AdmittedPrompt, ConnectionOwner,
     InteractivePermission, PreparedPrompt, PreparedRoundtableConnection, PrivateRuntimeSink,
@@ -144,22 +162,41 @@ pub use runtime::{
     ROUNDTABLE_SERVICE_LABEL,
 };
 pub use sandbox::{
-    attempt_live_escapes, build_sandbox_plan, DbIdentity, EscapeReport, IsolationProvider,
-    JournalLaunchIntentStore, LaunchIntent, LaunchIntentStore, LinuxOciIsolator, PreparedSandbox,
-    SandboxInput, SandboxInstance, SandboxPlan,
+    attempt_live_escapes, build_qualified_sandbox_plan, build_sandbox_plan,
+    qualified_oci_profile_hash, qualified_rootfs_digest, verify_qualified_oci_profile, DbIdentity,
+    EscapeReport, IsolationProvider, JournalLaunchIntentStore, LaunchIntent, LaunchIntentStore,
+    LinuxOciIsolator, PreparedSandbox, QualifiedOciProfile, SandboxInput, SandboxInstance,
+    SandboxPlan,
 };
-pub use mcp::{
-    invoke_scoped_tool, note_unverified_reference, persist_candidate, read_evidence,
-    register_input_evidence, search_evidence, DurableToolStore, EvidenceSearchHit,
-    EvidenceSearchPage, EvidenceSlice,
-    EvidenceUsage, GateToolAuthority, InputEvidence, PersistedEvidence, ReadEvidenceArgs,
-    SearchEvidenceArgs, SubmissionAudit, ToolAuthority, ToolSession,
+pub use schema::{
+    apply_roundtable_schema, drop_roundtable_schema, roundtable_table_names, DurabilityProfile,
+    LOGICAL_MODEL, RECORDED_DURABILITY,
+};
+pub use service::{
+    build_production_service, shutdown_order, OpenedRoundtable, ParticipantRuntime,
+    QuarantineLease, RoomMessage, RoomMessageKind, RoomReply, RoundtableService, RoundtableSlot,
+    RuntimeIdentity, ServiceConfig, ServiceReadiness, ShutdownReport,
+};
+pub use snapshot::{
+    build_delivery, canonical_path_bytes, capture_snapshot, commit_captured_manifest,
+    confirmation_echo, ensure_within_root, freeze_phase, freeze_preflight, fresh_binding_context,
+    lexical_within, line_start_offsets, offer_text_tool, path_within_root, rehome_manifest,
+    validate_relative_path, ConfirmationEcho, PhaseInput, PreflightLog, ResolvedRecipients,
+    RoomDraft, SelectedFile, SnapshotEncoding, SnapshotLimits, SourceClass, SourceEntryV1,
+    SourceManifestV1, SourceSelection, FRESH_CONTEXT_STATE, MAX_SNAPSHOT_READS,
+};
+pub use store::{
+    durability_from_report, migrate_roundtable, open_roundtable_store, promises_power_loss,
+    verify_connection_profile, NewAttempt, NewBinding, NewClaim, NewCommand, NewEvent, NewEvidence,
+    NewManifest, NewMessage, NewPhase, NewRoom, NewSpeaker, NewSubmission, NewTurn,
+    RoundtableStore,
 };
 pub use tool_core::{
     dispatch_tool, service_result_schema, service_tool_names, service_tool_schema,
     AdmittedToolScope, AttemptToken, InMemoryToolStore, RoundtableToolCall, RoundtableToolResponse,
     TokenBinding, TokenRegistry, ToolStore, SERVICE_RESULT_SCHEMA_ID, SERVICE_TOOL_VERSION,
 };
+pub use usage::{archive_late_measurement, RoomMeter};
 
 use roundtable_protocol::{ErrorCode, ErrorDetails, RtError};
 

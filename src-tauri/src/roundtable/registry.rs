@@ -20,9 +20,7 @@ use std::sync::{Arc, Mutex, Weak};
 use roundtable_protocol::{BindingId, ErrorCode, IncarnationId, RoomId, RtResult};
 use serde::{Deserialize, Serialize};
 
-use crate::auto_title::internal_sessions::{
-    self, DiscoveryGate, SharedDiscoveryPermit,
-};
+use crate::auto_title::internal_sessions::{self, DiscoveryGate, SharedDiscoveryPermit};
 use crate::models::AgentType;
 use crate::parsers::normalize_path_for_matching;
 
@@ -156,7 +154,12 @@ impl Drop for Inner {
 }
 
 impl Inner {
-    fn hidden(&self, agent: AgentType, external_id: Option<&str>, working_dir: Option<&str>) -> bool {
+    fn hidden(
+        &self,
+        agent: AgentType,
+        external_id: Option<&str>,
+        working_dir: Option<&str>,
+    ) -> bool {
         let state = lock_state(&self.state);
         if let Some(id) = external_id.filter(|id| !id.is_empty()) {
             if state
@@ -170,7 +173,10 @@ impl Inner {
         let Some(path) = working_dir.filter(|path| !path.is_empty()) else {
             return false;
         };
-        let under_root = state.roots.iter().any(|root| is_lexically_below(path, &root.path))
+        let under_root = state
+            .roots
+            .iter()
+            .any(|root| is_lexically_below(path, &root.path))
             || state
                 .bindings
                 .iter()
@@ -247,15 +253,18 @@ impl RoundtableSessionRegistry {
 
     /// Qualification store. `dir` must outlive the registry; the harness holds it.
     pub fn temporary(dir: &Path) -> RtResult<Self> {
-        std::fs::create_dir_all(dir).map_err(|_| {
-            rt_error(ErrorCode::StorageUnavailable, "registry_store_unavailable")
-        })?;
+        std::fs::create_dir_all(dir)
+            .map_err(|_| rt_error(ErrorCode::StorageUnavailable, "registry_store_unavailable"))?;
         let path = dir.join("roundtable-registry.json");
         Self::open(Arc::new(FileRegistryStore::new(path)))
     }
 
     fn open(store: Arc<dyn RegistryStore>) -> RtResult<Self> {
         let loaded = store.load()?;
+        Ok(Self::from_loaded(store, loaded))
+    }
+
+    fn from_loaded(store: Arc<dyn RegistryStore>, loaded: Vec<StoredBinding>) -> Self {
         let inner = Arc::new(Inner {
             store,
             state: Mutex::new(State::from_loaded(loaded)),
@@ -271,20 +280,25 @@ impl RoundtableSessionRegistry {
             },
         ));
         inner.hide_id.store(hide_id, Ordering::Relaxed);
-        Ok(Self { inner })
+        Self { inner }
     }
 
-    /// Install the process placeholder on the shared internal-session registry.
-    /// The placeholder is not the P09b table.
-    pub fn install_process_discovery(internal: &crate::auto_title::InternalAgentSessionRegistry) {
-        let mut slot = process_slot().lock().unwrap_or_else(|err| err.into_inner());
-        if let Some(existing) = slot.as_ref() {
-            existing.attach_discovery(internal);
-            return;
-        }
-        let registry = Self::in_memory();
+    /// Restore hidden bindings before ordinary discovery starts. The internal
+    /// registry retains this instance for the lifetime of its database.
+    pub async fn install_process_discovery(
+        internal: &crate::auto_title::InternalAgentSessionRegistry,
+    ) -> RtResult<Self> {
+        let store =
+            super::store::open_roundtable_store(internal.database_connection().clone()).await?;
+        let loaded = store.load_bindings().await?;
+        let registry = Self::from_loaded(Arc::new(store), loaded);
         registry.attach_discovery(internal);
-        *slot = Some(registry);
+        Ok(registry)
+    }
+
+    pub(crate) async fn open_live(store: super::store::RoundtableStore) -> RtResult<Self> {
+        let loaded = store.load_bindings().await?;
+        Ok(Self::from_loaded(Arc::new(store), loaded))
     }
 
     pub fn attach_discovery(&self, internal: &crate::auto_title::InternalAgentSessionRegistry) {
@@ -339,9 +353,11 @@ impl RoundtableSessionRegistry {
         if !reserved {
             return Err(rt_error(ErrorCode::InvalidArgument, "root_not_reserved"));
         }
-        if let Some(existing) = state.bindings.iter().find(|row| {
-            row.agent == record.agent && row.external_id == record.external_id.as_str()
-        }) {
+        if let Some(existing) = state
+            .bindings
+            .iter()
+            .find(|row| row.agent == record.agent && row.external_id == record.external_id.as_str())
+        {
             if same_binding(existing, &record) {
                 return Ok(());
             }
@@ -408,11 +424,6 @@ impl DiscoveryGate for RoundtableSessionRegistry {
         let lock = Arc::clone(&self.inner.discovery_lock);
         Box::pin(async move { SharedDiscoveryPermit::hold(lock.read_owned().await) })
     }
-}
-
-fn process_slot() -> &'static Mutex<Option<RoundtableSessionRegistry>> {
-    static PROCESS: Mutex<Option<RoundtableSessionRegistry>> = Mutex::new(None);
-    &PROCESS
 }
 
 fn lock_state(state: &Mutex<State>) -> std::sync::MutexGuard<'_, State> {

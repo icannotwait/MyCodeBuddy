@@ -7,8 +7,8 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use roundtable_protocol::{
-    BlockedReason, ControlKind, ControlStep, ErrorCode, OperationId, PhaseId, PhaseKind, PrincipalId,
-    ProcessTreeProof, RoomId, RoomState,
+    BlockedReason, ControlKind, ControlStep, ErrorCode, OperationId, PhaseId, PhaseKind,
+    PrincipalId, ProcessTreeProof, RoomId, RoomState,
 };
 use sea_orm::DatabaseConnection;
 
@@ -62,7 +62,7 @@ fn book(nibble: char) -> ControlBook {
 #[test]
 fn closing_control_matrix_at_every_crash_point() {
     let mut ledger = book('d');
-    let original = ledger.operation_id().clone();
+    let original = *ledger.operation_id();
     let steps = [
         ControlStep::Requested,
         ControlStep::Revoking,
@@ -133,7 +133,14 @@ fn closing_control_matrix_at_every_crash_point() {
     let rejected = ledger
         .apply(
             &actor,
-            command(typed('d'), '2', "restart", ControlKind::RestartCurrent, false, false),
+            command(
+                typed('d'),
+                '2',
+                "restart",
+                ControlKind::RestartCurrent,
+                false,
+                false,
+            ),
         )
         .expect_err("budget");
     assert_eq!(rejected.code, ErrorCode::InsufficientBudget);
@@ -143,7 +150,10 @@ fn closing_control_matrix_at_every_crash_point() {
     let phase = next_phase(&ledger, PhaseKind::Synthesis).expect_err("synthesis");
     assert_eq!(phase.code, ErrorCode::NoNextPhase);
     let actual: PhaseId = typed('c');
-    assert_eq!(next_phase(&ledger, PhaseKind::Proposal).expect("actual"), actual);
+    assert_eq!(
+        next_phase(&ledger, PhaseKind::Proposal).expect("actual"),
+        actual
+    );
 
     assert!(pause_again(&mut ledger).is_ok());
     let exhausted = pause_again(&mut ledger).expect_err("quorum");
@@ -164,46 +174,60 @@ fn closing_control_matrix_at_every_crash_point() {
 #[tokio::test]
 async fn idempotency_processing_and_stop_supersession() {
     let room: RoomId = typed('e');
-    let actor = RoomActor::new(room.clone(), 1);
+    let actor = RoomActor::new(room, 1);
     let principal: PrincipalId = typed('1');
-    let first = command(room.clone(), '4', "same", ControlKind::Pause, true, true);
-    let original = apply_command(&actor, principal.clone(), first.clone())
+    let first = command(room, '4', "same", ControlKind::Pause, true, true);
+    let original = apply_command(&actor, principal, first.clone())
         .await
         .expect("first");
-    let replay = apply_command(&actor, principal.clone(), first.clone())
+    let replay = apply_command(&actor, principal, first.clone())
         .await
         .expect("replay");
     assert_eq!(replay.operation_id, original.operation_id);
     assert_eq!(replay.request_id, original.request_id);
     let mut changed = first.clone();
     changed.canonical_hash = "different".to_string();
-    let conflict = apply_command(&actor, principal.clone(), changed)
+    let conflict = apply_command(&actor, principal, changed)
         .await
         .expect_err("hash");
     assert_eq!(conflict.code, ErrorCode::IdempotencyConflict);
     assert_eq!(conflict.code.http_status(), 409);
 
     let restart_room: RoomId = typed('f');
-    let restart_actor = RoomActor::new(restart_room.clone(), 1);
+    let restart_actor = RoomActor::new(restart_room, 1);
     apply_command(
         &restart_actor,
-        principal.clone(),
-        command(restart_room.clone(), '5', "r1", ControlKind::RestartCurrent, true, true),
+        principal,
+        command(
+            restart_room,
+            '5',
+            "r1",
+            ControlKind::RestartCurrent,
+            true,
+            true,
+        ),
     )
     .await
     .expect("restart");
     let second = apply_command(
         &restart_actor,
-        principal.clone(),
-        command(restart_room.clone(), '6', "r2", ControlKind::RestartCurrent, true, true),
+        principal,
+        command(
+            restart_room,
+            '6',
+            "r2",
+            ControlKind::RestartCurrent,
+            true,
+            true,
+        ),
     )
     .await
     .expect_err("second restart");
     assert_eq!(second.code, ErrorCode::ControlInProgress);
     apply_command(
         &restart_actor,
-        principal.clone(),
-        command(restart_room.clone(), '7', "stop", ControlKind::Stop, true, true),
+        principal,
+        command(restart_room, '7', "stop", ControlKind::Stop, true, true),
     )
     .await
     .expect("stop covers");
@@ -252,11 +276,17 @@ impl IsolationProvider for EmptyDiscovery {
         Err(unavailable())
     }
 
-    async fn discover_owned(&self, _db: &DbIdentity) -> roundtable_protocol::RtResult<Vec<SandboxInstance>> {
+    async fn discover_owned(
+        &self,
+        _db: &DbIdentity,
+    ) -> roundtable_protocol::RtResult<Vec<SandboxInstance>> {
         Ok(Vec::new())
     }
 
-    async fn reap(&self, _instance: &SandboxInstance) -> roundtable_protocol::RtResult<ProcessTreeProof> {
+    async fn reap(
+        &self,
+        _instance: &SandboxInstance,
+    ) -> roundtable_protocol::RtResult<ProcessTreeProof> {
         Err(unavailable())
     }
 }

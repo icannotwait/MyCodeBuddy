@@ -1,6 +1,7 @@
 "use client"
 
 import { useCallback, useEffect, useRef, useState, type ReactNode } from "react"
+import Link from "next/link"
 import {
   Crosshair,
   Eye,
@@ -16,7 +17,7 @@ import {
   type LucideIcon,
 } from "lucide-react"
 
-export const ROUNDTABLE_NAV_ENABLED = false
+export const ROUNDTABLE_NAV_ENABLED = true
 import { useTranslations } from "next-intl"
 import { useActiveFolder } from "@/contexts/active-folder-context"
 import { useSidebarContext } from "@/contexts/sidebar-context"
@@ -152,6 +153,7 @@ function SidebarNavButton({
 
 export function Sidebar() {
   const t = useTranslations("Folder.sidebar")
+  const tRoundtable = useTranslations("Roundtable")
   const { isOpen, toggle } = useSidebarContext()
   const { activeFolder } = useActiveFolder()
   const { openNewConversationTab, openChatModeTab } = useTabActions()
@@ -495,6 +497,15 @@ export function Sidebar() {
           the list below. Each row is a `group` so its shortcut hint reveals on
           hover / keyboard focus. */}
       <div className="flex shrink-0 flex-col gap-0.5 px-1.5 pt-1.5">
+        {ROUNDTABLE_NAV_ENABLED && activeFolder ? (
+          <Link
+            className="flex h-8 items-center gap-2 rounded-full pl-2 text-sm hover:bg-sidebar-accent focus-visible:ring-2 focus-visible:ring-ring"
+            href={`/roundtable?workspace_id=${encodeURIComponent(String(activeFolder.id))}`}
+          >
+            <MessagesSquare className="h-3.5 w-3.5 text-muted-foreground" />
+            {tRoundtable("title")}
+          </Link>
+        ) : null}
         <SidebarNavButton
           icon={SquarePen}
           label={t("newChat")}

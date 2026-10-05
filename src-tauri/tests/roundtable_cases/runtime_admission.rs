@@ -22,6 +22,28 @@ use codeg_lib::roundtable::{
 use roundtable_protocol::{AttemptId, Epoch, ErrorCode, Hash256, IncarnationId, RoomId};
 use tempfile::tempdir;
 
+#[test]
+fn runtime_fix_roundtable_host_policy_is_noninteractive_and_unhosted() {
+    use codeg_lib::acp::host_tools_policy::HostToolsPolicy;
+    assert!(!HostToolsPolicy::Default
+        .for_purpose(ConnectionPurpose::Roundtable)
+        .hosts_channels());
+    assert!(HostToolsPolicy::Default
+        .for_purpose(ConnectionPurpose::User)
+        .hosts_channels());
+    assert!(!HostToolsPolicy::Agent
+        .for_purpose(ConnectionPurpose::User)
+        .hosts_channels());
+    assert!(
+        codeg_lib::acp::host_tools_policy::denies_interactive_permission(
+            ConnectionPurpose::Roundtable
+        )
+    );
+    assert!(
+        !codeg_lib::acp::host_tools_policy::denies_interactive_permission(ConnectionPurpose::User)
+    );
+}
+
 fn digest(byte: u8) -> Hash256 {
     Hash256::from_bytes([byte; 32])
 }

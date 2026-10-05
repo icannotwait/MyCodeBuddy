@@ -301,6 +301,19 @@ export class WebTransport implements Transport {
     const body = await res.text()
     const parsed = parseJsonOrThrow<T>(body, `API ${command}`)
     this.captureCompletionContext(command, res, parsed)
+    const request = args?.request
+    if (request && typeof request === "object") {
+      // HTTP authorization precedes the per-socket private forwarder.
+      if (command === "roundtable_attach") {
+        this.sendWsFrame({ action: "roundtable_attach", request })
+      } else if (command === "roundtable_detach") {
+        this.sendWsFrame({
+          action: "roundtable_detach",
+          subscription_id: (request as { subscription_id?: unknown })
+            .subscription_id,
+        })
+      }
+    }
     return parsed
   }
 

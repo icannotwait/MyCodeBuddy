@@ -28,19 +28,28 @@ pub const TABLES: &[&str] = &[
     "rt_speakers",
     "rt_source_manifests",
     "rt_phases",
+    "rt_phase_contexts",
     "rt_bindings",
     "rt_turns",
     "rt_attempts",
+    "rt_deliveries",
     "rt_submissions",
+    "rt_submission_scopes",
     "rt_messages",
     "rt_message_memberships",
     "rt_claims",
+    "rt_claim_ids",
     "rt_responses",
+    "rt_response_details",
     "rt_position_changes",
     "rt_evidence",
     "rt_message_evidence",
     "rt_budget_reservations",
     "rt_control_operations",
+    "rt_control_inputs",
+    "rt_closing_sets",
+    "rt_active_time_leases",
+    "rt_metric_counters",
     "rt_user_inputs",
     "rt_commands",
     "rt_projection_versions",
@@ -48,6 +57,7 @@ pub const TABLES: &[&str] = &[
     "rt_page_manifests",
     "rt_page_manifest_entries",
     "rt_measurements",
+    "rt_usage_archive",
     "rt_diagnostics",
     "rt_launch_intents",
     "rt_internal_bindings",
@@ -55,6 +65,38 @@ pub const TABLES: &[&str] = &[
 ];
 
 const STATEMENTS: &[&str] = &[
+    "CREATE TABLE IF NOT EXISTS rt_metric_counters(room_id TEXT NOT NULL,key TEXT NOT NULL,value INTEGER NOT NULL,PRIMARY KEY(room_id,key),FOREIGN KEY(room_id) REFERENCES rt_rooms(room_id))",
+    "CREATE TABLE IF NOT EXISTS rt_active_time_leases(room_id TEXT NOT NULL PRIMARY KEY, lease_id TEXT NOT NULL, boot_epoch INTEGER NOT NULL, run_epoch INTEGER NOT NULL, phase_id TEXT, prepaid_ms INTEGER NOT NULL CHECK(prepaid_ms>=0 AND prepaid_ms<=1000), last_sample_mono INTEGER NOT NULL, FOREIGN KEY(room_id) REFERENCES rt_rooms(room_id), FOREIGN KEY(room_id,phase_id) REFERENCES rt_phases(room_id,phase_id))",
+    "CREATE TABLE IF NOT EXISTS rt_closing_sets (room_id TEXT NOT NULL, phase_id TEXT NOT NULL, body_json TEXT NOT NULL, recovery_boot_epoch INTEGER, recovery_operation_id TEXT, PRIMARY KEY(room_id,phase_id), FOREIGN KEY(room_id,phase_id) REFERENCES rt_phases(room_id,phase_id), FOREIGN KEY(room_id,recovery_operation_id) REFERENCES rt_control_operations(room_id,operation_id))",
+    "CREATE TABLE IF NOT EXISTS rt_phase_contexts (room_id TEXT NOT NULL, phase_id TEXT NOT NULL, snapshot_json TEXT NOT NULL, context_json TEXT NOT NULL, PRIMARY KEY(room_id,phase_id), FOREIGN KEY(room_id,phase_id) REFERENCES rt_phases(room_id,phase_id))",
+    "CREATE TABLE IF NOT EXISTS rt_deliveries (room_id TEXT NOT NULL, attempt_id TEXT NOT NULL, body_json TEXT NOT NULL, prompt_utf8 TEXT NOT NULL, PRIMARY KEY(room_id,attempt_id), FOREIGN KEY(room_id,attempt_id) REFERENCES rt_attempts(room_id,attempt_id))",
+    "CREATE TABLE IF NOT EXISTS rt_usage_archive (
+        room_id TEXT NOT NULL, measurement_id TEXT NOT NULL, attempt_id TEXT NOT NULL,
+        ledger_seq INTEGER NOT NULL, body_json TEXT NOT NULL,
+        PRIMARY KEY(room_id,measurement_id),
+        FOREIGN KEY(room_id,attempt_id) REFERENCES rt_attempts(room_id,attempt_id)
+    )",
+    "CREATE TABLE IF NOT EXISTS rt_response_details (
+        room_id TEXT NOT NULL, response_id TEXT NOT NULL, target_response_id TEXT, body_json TEXT NOT NULL,
+        PRIMARY KEY(room_id,response_id),
+        FOREIGN KEY(room_id,response_id) REFERENCES rt_responses(room_id,response_id),
+        FOREIGN KEY(room_id,target_response_id) REFERENCES rt_responses(room_id,response_id)
+    )",
+    "CREATE TABLE IF NOT EXISTS rt_submission_scopes (
+        room_id TEXT NOT NULL, attempt_id TEXT NOT NULL, scope_json TEXT NOT NULL,
+        PRIMARY KEY(room_id, attempt_id),
+        FOREIGN KEY(room_id, attempt_id) REFERENCES rt_attempts(room_id, attempt_id)
+    )",
+    "CREATE TABLE IF NOT EXISTS rt_claim_ids (
+        room_id TEXT NOT NULL, claim_id TEXT NOT NULL, message_id TEXT NOT NULL, local_key TEXT NOT NULL,
+        PRIMARY KEY(room_id, claim_id), UNIQUE(room_id,message_id,local_key),
+        FOREIGN KEY(room_id,message_id,local_key) REFERENCES rt_claims(room_id,message_id,local_key)
+    )",
+    "CREATE TABLE IF NOT EXISTS rt_control_inputs (
+        room_id TEXT NOT NULL, operation_id TEXT NOT NULL, input_json TEXT NOT NULL,
+        PRIMARY KEY(room_id,operation_id),
+        FOREIGN KEY(room_id,operation_id) REFERENCES rt_control_operations(room_id,operation_id)
+    )",
     "CREATE TABLE IF NOT EXISTS rt_rooms (
         room_id TEXT NOT NULL,
         principal_id TEXT NOT NULL,

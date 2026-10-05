@@ -322,7 +322,18 @@ async fn async_main() -> ExitCode {
                 return ExitCode::FAILURE;
             }
         };
-    codeg_lib::roundtable::RoundtableSessionRegistry::install_process_discovery(&internal_sessions);
+    let _roundtable_registry =
+        match codeg_lib::roundtable::RoundtableSessionRegistry::install_process_discovery(
+            &internal_sessions,
+        )
+        .await
+        {
+            Ok(registry) => registry,
+            Err(error) => {
+                tracing::error!("[SERVER] roundtable registry recovery failed: {error}");
+                return ExitCode::FAILURE;
+            }
+        };
     let title_db = Arc::new(codeg_lib::db::AppDatabase {
         conn: db.conn.clone(),
     });
@@ -423,6 +434,21 @@ async fn async_main() -> ExitCode {
         update_state: codeg_lib::app_state::default_update_state(),
         roundtable: std::sync::Arc::new(codeg_lib::roundtable::RoundtableSlot::new()),
     });
+    match codeg_lib::roundtable::build_production_service(
+        state.db.conn.clone(),
+        state.data_dir.clone(),
+        Arc::new(state.connection_manager.clone_ref()),
+    )
+    .await
+    {
+        Ok(service) => {
+            state.roundtable.install(service);
+        }
+        Err(error) => {
+            tracing::error!("[SERVER] roundtable startup failed: {error}");
+            return ExitCode::FAILURE;
+        }
+    }
     codeg_lib::app_state::spawn_completion_outbox_dispatcher(completion_outbox_dispatcher);
     state
         .connection_manager
@@ -885,6 +911,11 @@ async fn async_main() -> ExitCode {
     connection_manager
         .drain_for_shutdown(codeg_lib::acp::termination::AcpDisconnectOrigin::ApplicationShutdown)
         .await;
+    if let Some(service) = state.roundtable.current() {
+        if let Err(error) = service.shutdown().await {
+            tracing::error!("[SERVER] roundtable shutdown failed: {error}");
+        }
+    }
     codeg_lib::acp::terminal_runtime::kill_all_registered_acp_terminals().await;
     // Graceful shutdown: release any live office watch preview servers
     // (kill_on_drop is the backstop, but this frees their ports promptly).

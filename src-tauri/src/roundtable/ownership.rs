@@ -81,20 +81,20 @@ fn open_lock(path: &Path) -> Result<File, LockAttempt> {
     #[cfg(windows)]
     {
         use std::os::windows::fs::OpenOptionsExt;
-        return OpenOptions::new()
+        OpenOptions::new()
             .read(true)
             .write(true)
             .create(true)
+            .truncate(false)
             .share_mode(0)
             .open(path)
             .map_err(|err| {
-                if err.raw_os_error() == Some(32) || err.raw_os_error() == Some(33)
-                {
+                if err.raw_os_error() == Some(32) || err.raw_os_error() == Some(33) {
                     LockAttempt::Taken
                 } else {
                     LockAttempt::Unavailable
                 }
-            });
+            })
     }
     #[cfg(not(windows))]
     {
@@ -102,6 +102,7 @@ fn open_lock(path: &Path) -> Result<File, LockAttempt> {
             .read(true)
             .write(true)
             .create(true)
+            .truncate(false)
             .open(path)
             .map_err(|_| LockAttempt::Unavailable)?;
         let fd = std::os::unix::io::AsRawFd::as_raw_fd(&file);
@@ -119,6 +120,9 @@ pub struct RoundtableReadService {
 }
 
 impl RoundtableReadService {
+    pub(crate) fn connection(&self) -> &DatabaseConnection {
+        &self.conn
+    }
     pub async fn open(db_path: &Path) -> RtResult<Self> {
         let url = format!(
             "sqlite:{}?mode=ro",

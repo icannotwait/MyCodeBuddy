@@ -130,6 +130,10 @@ pub async fn init_database(
 
     service::app_metadata_service::update_app_version(&conn, app_version).await?;
 
+    crate::roundtable::migrate_roundtable(&conn)
+        .await
+        .map_err(|error| DbError::Migration(error.to_string()))?;
+
     // Publish user-registered ACP agents into the process-global launch
     // registry before anything can ask for agent metadata. This is the single
     // chokepoint every runtime (desktop, server) goes through, so custom agents
@@ -170,9 +174,7 @@ pub async fn open_configured_sqlite(options: &DbOpenOptions) -> RtResult<Databas
 pub async fn verify_connection_profile(
     conn: &DatabaseConnection,
 ) -> RtResult<ConnectionProfileReport> {
-    read_connection_profile(conn)
-        .await
-        .map_err(db_error_to_rt)
+    read_connection_profile(conn).await.map_err(db_error_to_rt)
 }
 
 async fn connect_configured(options: &DbOpenOptions) -> Result<DatabaseConnection, DbError> {

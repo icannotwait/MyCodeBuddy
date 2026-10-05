@@ -4,7 +4,6 @@ pub mod app_update;
 pub mod automation;
 pub mod background;
 pub mod backup;
-pub mod roundtable;
 #[cfg(feature = "tauri-runtime")]
 pub mod browser;
 /// The browser tool group's on/off switch. Unlike `browser` itself this is not
@@ -62,6 +61,7 @@ pub mod reference_search;
 pub mod remote_proxy;
 #[cfg(feature = "tauri-runtime")]
 pub mod remote_workspace;
+pub mod roundtable;
 pub mod science;
 pub mod session_info;
 pub mod simple_workflow;

@@ -44,22 +44,12 @@ pub struct AdmissionFacts {
     pub recipient: String,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ExecutionPolicy {
     pub enabled: bool,
     pub generation: u64,
     pub allowed_qualification_keys: Vec<QualificationKey>,
-}
-
-impl Default for ExecutionPolicy {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            generation: 0,
-            allowed_qualification_keys: Vec::new(),
-        }
-    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

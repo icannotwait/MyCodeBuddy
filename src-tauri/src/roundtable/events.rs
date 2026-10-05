@@ -3,13 +3,12 @@
 use std::collections::BTreeMap;
 
 use roundtable_protocol::{
-    ActorContext, DurableEnvelopeV1, ErrorCode, Hash256, ProjectionV1, RtError, RtResult,
-    SpeakerId,
+    ActorContext, DurableEnvelopeV1, ErrorCode, Hash256, ProjectionV1, RtError, RtResult, SpeakerId,
 };
 
 use super::authorization::{authorize_room, RoomDirectory};
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct SubscriptionHub {
     frames: BTreeMap<String, Vec<String>>,
     previews: BTreeMap<String, (u64, u64)>,
@@ -18,11 +17,7 @@ pub struct SubscriptionHub {
 
 impl SubscriptionHub {
     pub fn new() -> Self {
-        Self {
-            frames: BTreeMap::new(),
-            previews: BTreeMap::new(),
-            incarnation: 0,
-        }
+        Self::default()
     }
 
     pub fn attach(
@@ -35,6 +30,10 @@ impl SubscriptionHub {
         authorize_room(actor, room, directory)?;
         self.frames.entry(sink.to_string()).or_default();
         Ok(())
+    }
+
+    pub fn detach(&mut self, sink: &str) {
+        self.frames.remove(sink);
     }
 
     pub fn publish(&mut self, sink: &str, frame: String) {
@@ -73,7 +72,9 @@ pub fn apply_projection(
     envelope: &DurableEnvelopeV1,
     fetched: &ProjectionV1,
 ) -> RtResult<ProjectionV1> {
-    if envelope.schema_version != 1 || envelope.object_ref.content_hash != fetched.projection_ref.hash {
+    if envelope.schema_version != 1
+        || envelope.object_ref.content_hash != fetched.projection_ref.hash
+    {
         return Err(RtError {
             code: ErrorCode::InvalidState,
             message: "projection cause is missing".to_string(),
@@ -90,5 +91,19 @@ pub fn apply_projection(
 }
 
 pub fn projection_hash(projection: &ProjectionV1) -> Hash256 {
-    projection.projection_ref.hash.clone()
+    projection.projection_ref.hash
+}
+
+/// Shared by private WebSocket and targeted desktop delivery.
+pub fn advance_private_watermark(seq: &mut u64, snapshot: &serde_json::Value) -> RtResult<bool> {
+    let next = serde_json::from_value::<roundtable_protocol::Seq>(
+        snapshot["projection"]["body"]["last_seq"].clone(),
+    )
+    .map_err(|_| super::rt_error(ErrorCode::InvalidArgument, "subscription_sequence"))?
+    .0;
+    if next <= *seq {
+        return Ok(false);
+    }
+    *seq = next;
+    Ok(true)
 }

@@ -8064,6 +8064,7 @@ async fn run_connection(
     host_tools: HostToolsPolicy,
     stderr_tail: Arc<StderrTail>,
 ) -> Result<(), AcpError> {
+    let host_tools = host_tools.for_purpose(state.read().await.purpose);
     let parent_connection_exit_evidence = delegation_injection
         .as_ref()
         .map(|injection| Arc::clone(&injection.parent_connection_exit_causes));
@@ -10948,7 +10949,10 @@ async fn handle_permission_request(
     // still emit so the private-stream runner observes Interactive failure.
     let (is_hidden_generation, request_turn_generation) = {
         let s = state.read().await;
-        (s.purpose.is_hidden_generation(), s.active_turn_generation)
+        (
+            crate::acp::host_tools_policy::denies_interactive_permission(s.purpose),
+            s.active_turn_generation,
+        )
     };
     if is_hidden_generation {
         let request_id = uuid::Uuid::new_v4().to_string();

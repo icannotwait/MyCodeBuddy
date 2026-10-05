@@ -144,7 +144,10 @@ async fn discovery_before_registration_stays_hidden() {
     let internal_dir = tempfile::tempdir().expect("internal");
     let internal = InternalAgentSessionRegistry::empty(db.conn.clone(), internal_dir.path())
         .expect("internal registry");
-    let (_, filter) = internal.shared_filter().await.expect("filter before attach");
+    let (_, filter) = internal
+        .shared_filter()
+        .await
+        .expect("filter before attach");
     let hidden = summary("rt-before-ack", &hidden_path);
     let ordinary = summary("ordinary-session", &ordinary_path);
     let visible = filter_internal_summaries(
@@ -165,26 +168,22 @@ async fn discovery_before_registration_stays_hidden() {
     .is_err());
 
     let folder_id = seed_folder(&db, ordinary_path.to_string_lossy().as_ref()).await;
-    assert!(
-        !import_service::import_one_accepted_for_test(
-            &db.conn,
-            folder_id,
-            &AgentType::Codex,
-            &hidden,
-        )
-        .await
-        .expect("skip hidden import")
-    );
-    assert!(
-        import_service::import_one_accepted_for_test(
-            &db.conn,
-            folder_id,
-            &AgentType::Codex,
-            &ordinary,
-        )
-        .await
-        .expect("import ordinary")
-    );
+    assert!(!import_service::import_one_accepted_for_test(
+        &db.conn,
+        folder_id,
+        &AgentType::Codex,
+        &hidden,
+    )
+    .await
+    .expect("skip hidden import"));
+    assert!(import_service::import_one_accepted_for_test(
+        &db.conn,
+        folder_id,
+        &AgentType::Codex,
+        &ordinary,
+    )
+    .await
+    .expect("import ordinary"));
 
     registry.attach_discovery(&internal);
     let pending = {
@@ -306,10 +305,7 @@ async fn restart_parser_and_direct_lookup_respect_registry() {
 #[tokio::test]
 async fn baseline_database_ordinary_sessions_still_open() {
     assert!(!downgrade_is_silent_compatible());
-    assert_eq!(
-        legacy_purpose(InternalAgentSessionPurpose::Title),
-        "title"
-    );
+    assert_eq!(legacy_purpose(InternalAgentSessionPurpose::Title), "title");
     assert_eq!(
         legacy_purpose(InternalAgentSessionPurpose::Translate),
         "translate"
@@ -331,16 +327,9 @@ async fn baseline_database_ordinary_sessions_still_open() {
         .expect("open");
     assert_eq!(opened.id, created.id);
     assert_eq!(opened.title.as_deref(), Some("ordinary"));
-    let listed = conversation_service::list_by_folder(
-        &db.conn,
-        folder_id,
-        None,
-        None,
-        None,
-        None,
-    )
-    .await
-    .expect("list");
+    let listed = conversation_service::list_by_folder(&db.conn, folder_id, None, None, None, None)
+        .await
+        .expect("list");
     assert!(listed.iter().any(|row| row.id == created.id));
 
     let conversation_sql = codeg_lib::db::entities::conversation::Entity::find()
@@ -380,7 +369,9 @@ async fn baseline_database_ordinary_sessions_still_open() {
         .iter()
         .map(|row| row.try_get::<String>("", "name").expect("name"))
         .collect::<Vec<_>>();
-    assert!(roundtable_names.iter().any(|name| name == "rt_internal_bindings"));
+    assert!(roundtable_names
+        .iter()
+        .any(|name| name == "rt_internal_bindings"));
     assert!(roundtable_names.iter().all(|name| name.starts_with("rt_")));
 
     let definition = db

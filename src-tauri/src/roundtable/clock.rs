@@ -49,7 +49,7 @@ impl MonoClock for SystemMono {
     }
 
     fn utc(&self) -> String {
-        "1970-01-01T00:00:00Z".to_string()
+        chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
     }
 }
 

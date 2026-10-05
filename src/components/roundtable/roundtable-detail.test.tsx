@@ -1,14 +1,32 @@
-import { render, screen } from "@testing-library/react"
-import { describe, expect, it } from "vitest"
+import { fireEvent, render, screen } from "@testing-library/react"
+import { describe, expect, it, vi } from "vitest"
 
 import { RoundtableControls } from "@/components/roundtable/roundtable-controls"
 import { RoundtableDetail } from "@/components/roundtable/roundtable-detail"
 import { RoundtableSafeContent } from "@/components/roundtable/roundtable-safe-content"
 import { ROUNDTABLE_NAV_ENABLED } from "@/components/layout/sidebar"
+import messages from "@/i18n/messages/zh-CN.json"
+vi.mock("next-intl", () => ({
+  useTranslations: () => (key: keyof typeof messages.Roundtable) =>
+    messages.Roundtable[key],
+}))
 
 describe("roundtable detail", () => {
+  it("dispatches pause and moderator retry callbacks", () => {
+    const pause = vi.fn()
+    const retry = vi.fn()
+    render(
+      <RoundtableControls moderatorFailed onPause={pause} onRetry={retry} />
+    )
+    fireEvent.click(
+      screen.getByRole("button", { name: "立即暂停，保留已完成结果" })
+    )
+    fireEvent.click(screen.getByRole("button", { name: "只重试主持" }))
+    expect(pause).toHaveBeenCalledOnce()
+    expect(retry).toHaveBeenCalledOnce()
+  })
   it("keeps order, pause copy, and unsafe text out of the page", () => {
-    expect(ROUNDTABLE_NAV_ENABLED).toBe(false)
+    expect(ROUNDTABLE_NAV_ENABLED).toBe(true)
     render(
       <RoundtableDetail
         order={["成员甲", "成员乙", "主持人"]}
@@ -17,19 +35,22 @@ describe("roundtable detail", () => {
         showSynthesis={false}
       />
     )
-    expect(screen.getAllByRole("listitem").map((item) => item.textContent)).toEqual([
-      "成员甲",
-      "成员乙",
-      "主持人",
-    ])
+    expect(
+      screen.getAllByRole("listitem").map((item) => item.textContent)
+    ).toEqual(["成员甲", "成员乙", "主持人"])
     expect(screen.getByText("等待其余成员")).toBeTruthy()
     expect(screen.queryByRole("button", { name: "综合" })).toBeNull()
     render(<RoundtableControls moderatorFailed />)
-    expect(screen.getByRole("button", { name: "立即暂停，保留已完成结果" })).toBeTruthy()
+    expect(
+      screen.getByRole("button", { name: "立即暂停，保留已完成结果" })
+    ).toBeTruthy()
     expect(screen.getByRole("button", { name: "只重试主持" })).toBeTruthy()
     expect(screen.queryByRole("button", { name: "整轮重来" })).toBeNull()
     const { container } = render(
-      <RoundtableSafeContent text="C:\\secret\\note sk-live-secret 思考过程" rtl />
+      <RoundtableSafeContent
+        text="C:\\secret\\note sk-live-secret 思考过程"
+        rtl
+      />
     )
     const article = container.querySelector("article")
     expect(article?.getAttribute("dir")).toBe("rtl")

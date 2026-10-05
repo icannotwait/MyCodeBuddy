@@ -653,6 +653,10 @@ where
     true
 }
 
+pub fn roundtable_does_not_use_global_session_emit() -> bool {
+    true
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1122,8 +1126,4 @@ mod tests {
         assert!(p["group"].is_null(), "the layout nudge carries no payload");
         assert!(p["id"].is_null(), "the layout nudge carries no payload");
     }
-}
-
-pub fn roundtable_does_not_use_global_session_emit() -> bool {
-    true
 }

@@ -133,6 +133,24 @@ mod tauri_app {
     macro_rules! production_tauri_commands {
         ($consumer:ident) => {
             $consumer![
+                crate::commands::roundtable::roundtable_preflight,
+                crate::commands::roundtable::roundtable_create,
+                crate::commands::roundtable::roundtable_update_draft,
+                crate::commands::roundtable::roundtable_start,
+                crate::commands::roundtable::roundtable_get,
+                crate::commands::roundtable::roundtable_list,
+                crate::commands::roundtable::roundtable_pause,
+                crate::commands::roundtable::roundtable_resume,
+                crate::commands::roundtable::roundtable_stop,
+                crate::commands::roundtable::roundtable_interject,
+                crate::commands::roundtable::roundtable_retry_synthesis,
+                crate::commands::roundtable::roundtable_events,
+                crate::commands::roundtable::roundtable_messages,
+                crate::commands::roundtable::roundtable_evidence,
+                crate::commands::roundtable::roundtable_operation,
+                crate::commands::roundtable::roundtable_clone,
+                crate::commands::roundtable::roundtable_attach,
+                crate::commands::roundtable::roundtable_detach,
                 conversations::list_conversations,
                 conversations::get_conversation,
                 conversations::list_all_conversations,
@@ -831,6 +849,13 @@ mod tauri_app {
                 ),
             );
         }
+        if let Some(slot) = app.try_state::<std::sync::Arc<crate::roundtable::RoundtableSlot>>() {
+            if let Some(service) = slot.current() {
+                if let Err(error) = tauri::async_runtime::block_on(service.shutdown()) {
+                    tracing::error!("roundtable shutdown failed: {error}");
+                }
+            }
+        }
         tauri::async_runtime::block_on(
             crate::acp::terminal_runtime::kill_all_registered_acp_terminals(),
         );
@@ -1498,11 +1523,18 @@ mod tauri_app {
                     )
                     .map_err(|e| e.to_string())?
                 };
-                crate::roundtable::RoundtableSessionRegistry::install_process_discovery(
-                    &internal_sessions,
-                );
+                let roundtable_registry = tauri::async_runtime::block_on(
+                    crate::roundtable::RoundtableSessionRegistry::install_process_discovery(&internal_sessions)
+                ).map_err(|e| e.to_string())?;
+                app.manage(roundtable_registry);
                 app.manage(internal_sessions.clone());
-                app.manage(std::sync::Arc::new(crate::roundtable::RoundtableSlot::new()));
+                let roundtable_slot=std::sync::Arc::new(crate::roundtable::RoundtableSlot::new());
+                let roundtable_service=tauri::async_runtime::block_on(crate::roundtable::build_production_service(
+                    app.state::<db::AppDatabase>().conn.clone(),effective_data_dir.clone(),
+                    std::sync::Arc::new(app.state::<ConnectionManager>().clone_ref()),
+                )).map_err(|error|error.to_string())?;
+                roundtable_slot.install(roundtable_service);
+                app.manage(roundtable_slot);
 
                 // Restore and apply saved system proxy settings before any network
                 // operation. reqwest clients (including the lazy title HTTP client)

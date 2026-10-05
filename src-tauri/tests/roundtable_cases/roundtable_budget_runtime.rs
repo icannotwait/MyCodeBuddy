@@ -4,8 +4,8 @@ use std::str::FromStr;
 use std::time::Duration;
 
 use roundtable_protocol::{
-    budget_plan, CleanupProof, ErrorCode, IncarnationId, MonoMs, PermitReleaseProof, ProcessTreeProof,
-    RoomId, Timeouts,
+    budget_plan, CleanupProof, ErrorCode, IncarnationId, MonoMs, PermitReleaseProof,
+    ProcessTreeProof, RoomId, Timeouts,
 };
 use sea_orm::DatabaseConnection;
 
@@ -27,13 +27,13 @@ fn proof_for(incarnation: &IncarnationId, lease_id: &str) -> PermitReleaseProof 
     PermitReleaseProof {
         lease_id: lease_id.to_string(),
         proofs: [(
-            incarnation.clone(),
+            *incarnation,
             CleanupProof {
                 process: ProcessTreeProof {
                     instance_id: "instance".to_string(),
-                    incarnation: incarnation.clone(),
+                    incarnation: *incarnation,
                     process_tree_empty: true,
-                    },
+                },
                 mailbox_empty: true,
                 tools_drained: true,
                 ingress_drained: true,
@@ -81,7 +81,7 @@ fn active_room_permit_is_global_and_atomic() {
     };
     assert!(alloc.release(&bundle, &partial).is_err());
     assert_eq!(alloc.held_slots(), 1);
-    let incarnation = bundle.incarnations()[0].clone();
+    let incarnation = bundle.incarnations()[0];
     alloc
         .release(&bundle, &proof_for(&incarnation, &bundle.lease_id))
         .expect("reap");
@@ -168,7 +168,7 @@ fn late_checkpoint_ack_cannot_resurrect_expired_lease() {
 fn single_proof_cannot_release_two_slots() {
     let alloc = ResourceAllocator::new(2);
     let bundle = alloc.try_acquire(room('d'), 2).expect("two");
-    let one = bundle.incarnations()[0].clone();
+    let one = bundle.incarnations()[0];
     let err = alloc
         .release(&bundle, &proof_for(&one, &bundle.lease_id))
         .expect_err("partial");

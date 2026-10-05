@@ -83,13 +83,16 @@ pub struct PreparedRoundtableConnection {
     _control_rx: Mutex<mpsc::Receiver<crate::acp::connection::ConnectionControl>>,
 }
 
+#[cfg(any(test, feature = "test-utils"))]
+pub type BeforeSendHook = Arc<dyn Fn(&SessionState) + Send + Sync>;
+
 /// Prompt text already accepted by the caller. The permit is not reserved yet.
 pub struct AdmittedPrompt {
     pub blocks: Vec<PromptInputBlock>,
     /// Test observation between the generation write and `permit.send`.
     /// Must not lock `state`: the gate already holds it.
     #[cfg(any(test, feature = "test-utils"))]
-    pub before_send: Option<Arc<dyn Fn(&SessionState) + Send + Sync>>,
+    pub before_send: Option<BeforeSendHook>,
 }
 
 /// Owned reservation plus the state the gate will recheck.

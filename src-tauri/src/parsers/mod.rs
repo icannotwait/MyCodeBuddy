@@ -485,7 +485,9 @@ impl AgentParser for RouteSanitized {
     fn get_conversation(&self, conversation_id: &str) -> Result<ConversationDetail, ParseError> {
         let detail = sanitize_detail(self.0.get_conversation(conversation_id)?);
         if roundtable_detail_hidden(conversation_id, &detail) {
-            return Err(ParseError::ConversationNotFound(conversation_id.to_string()));
+            return Err(ParseError::ConversationNotFound(
+                conversation_id.to_string(),
+            ));
         }
         Ok(detail)
     }
@@ -495,20 +497,17 @@ impl AgentParser for RouteSanitized {
         query: &RecoveryQuery<'_>,
         accept: &dyn Fn(&ConversationSummary) -> bool,
     ) -> Result<Option<ConversationDetail>, ParseError> {
-        let gate = |summary: &ConversationSummary| {
-            accept(summary) && !roundtable_summary_hidden(summary)
-        };
-        self.0
-            .recover_conversation(query, &gate)
-            .map(|detail| {
-                detail.and_then(|detail| {
-                    if roundtable_summary_hidden(&detail.summary) {
-                        None
-                    } else {
-                        Some(sanitize_detail(detail))
-                    }
-                })
+        let gate =
+            |summary: &ConversationSummary| accept(summary) && !roundtable_summary_hidden(summary);
+        self.0.recover_conversation(query, &gate).map(|detail| {
+            detail.and_then(|detail| {
+                if roundtable_summary_hidden(&detail.summary) {
+                    None
+                } else {
+                    Some(sanitize_detail(detail))
+                }
             })
+        })
     }
 }
 

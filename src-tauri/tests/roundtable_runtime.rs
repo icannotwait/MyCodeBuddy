@@ -1,3 +1,6 @@
+#[path = "roundtable_support/mod.rs"]
+pub mod support;
+
 #[path = "roundtable_cases/sandbox.rs"]
 mod sandbox;
 
@@ -21,3 +24,6 @@ mod registry;
 
 #[path = "roundtable_cases/roundtable_qualification.rs"]
 mod roundtable_qualification;
+
+#[path = "roundtable_cases/runtime_scheduler.rs"]
+mod runtime_scheduler;
