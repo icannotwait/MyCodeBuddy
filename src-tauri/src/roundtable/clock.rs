@@ -14,6 +14,17 @@ pub trait MonoClock: Send + Sync {
     fn utc(&self) -> String;
 }
 
+/// P14 name for the same monotonic sample. Absolute values stay in-process.
+pub trait MonotonicClock: Send + Sync {
+    fn now_ms(&self) -> roundtable_protocol::MonoMs;
+}
+
+impl<T: MonoClock + ?Sized> MonotonicClock for T {
+    fn now_ms(&self) -> roundtable_protocol::MonoMs {
+        roundtable_protocol::MonoMs(MonoClock::now_ms(self))
+    }
+}
+
 pub struct SystemMono {
     start: Instant,
 }

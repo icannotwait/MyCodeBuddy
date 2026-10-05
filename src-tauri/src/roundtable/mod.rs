@@ -18,7 +18,9 @@ mod qualification_harness;
 mod registry;
 mod relay;
 mod ownership;
+mod budget_ledger;
 mod request_accounting;
+mod resources;
 mod runtime;
 mod objects;
 mod sandbox;
@@ -80,7 +82,13 @@ pub use snapshot::{
 };
 pub use acceptance::{AcceptInput, CloseInput, ClosingSetRef, PublishInput};
 pub use actor::{RoomActor, RoomGate};
-pub use clock::{deadline_reached, AcceptStep, FakeClock, LockGate, MonoClock, SystemMono};
+pub use budget_ledger::{
+    checkpoint_active, recompute_room_budget, reserve_budget, AdmissionWindow, BillingSplit,
+    RoomClockLedger,
+};
+pub use clock::{
+    deadline_reached, AcceptStep, FakeClock, LockGate, MonoClock, MonotonicClock, SystemMono,
+};
 pub use ownership::{
     lock_path_for, matches_instance, CoordinatorLock, OwnedProcess, RoundtableReadService,
 };
@@ -102,6 +110,7 @@ pub use relay::{
 pub use request_accounting::{
     AccountingSnapshot, EncodedModelRequest, RequestAccounting, RequestPermit,
 };
+pub use resources::{ExecutionLease, PermitBundle, ResourceAllocator};
 pub use runtime::{
     prepare_roundtable_connection, try_enqueue, AdmittedPrompt, ConnectionOwner,
     InteractivePermission, PreparedPrompt, PreparedRoundtableConnection, PrivateRuntimeSink,

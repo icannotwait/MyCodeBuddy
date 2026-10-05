@@ -1,5 +1,8 @@
 //! Coordinator ownership. Two processes share one database and one lock.
 
+#[path = "roundtable_cases/roundtable_budget_runtime.rs"]
+mod roundtable_budget_runtime;
+
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::str::FromStr;

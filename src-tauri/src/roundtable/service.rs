@@ -13,6 +13,7 @@ use roundtable_protocol::{CleanupProof, ErrorCode, IncarnationId, PermitReleaseP
 
 use super::actor::RoomActor;
 use super::ownership::{lock_path_for, try_acquire, CoordinatorLock, LockAttempt, RoundtableReadService};
+use super::resources::ResourceAllocator;
 use super::runtime::{try_enqueue, PreparedPrompt, PreparedRoundtableConnection, RoundtableLaunch};
 use super::rt_error;
 use super::sandbox::{DbIdentity, IsolationProvider};
@@ -128,6 +129,7 @@ pub struct RoundtableService {
     steps: Mutex<Vec<&'static str>>,
     observer_open: AtomicBool,
     unknown_occupancy: AtomicBool,
+    allocator: ResourceAllocator,
 }
 
 impl RoundtableService {
@@ -164,6 +166,7 @@ impl RoundtableService {
             steps: Mutex::new(Vec::new()),
             observer_open: AtomicBool::new(true),
             unknown_occupancy: AtomicBool::new(false),
+            allocator: ResourceAllocator::new(1),
         });
         if service.writable() {
             service.recover(&config).await?;
@@ -173,6 +176,10 @@ impl RoundtableService {
 
     pub fn writable(&self) -> bool {
         self.lock.lock().expect("lock").is_some()
+    }
+
+    pub fn allocator(&self) -> &ResourceAllocator {
+        &self.allocator
     }
 
     pub fn boot_epoch(&self) -> u64 {
