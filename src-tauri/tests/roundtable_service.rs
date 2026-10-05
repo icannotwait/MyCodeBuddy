@@ -3,6 +3,9 @@
 #[path = "roundtable_cases/roundtable_budget_runtime.rs"]
 mod roundtable_budget_runtime;
 
+#[path = "roundtable_cases/roundtable_control_recovery.rs"]
+mod roundtable_control_recovery;
+
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::str::FromStr;

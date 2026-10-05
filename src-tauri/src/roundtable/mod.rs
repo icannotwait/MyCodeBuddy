@@ -8,13 +8,16 @@ mod acceptance;
 mod actor;
 pub(crate) mod capabilities;
 mod clock;
+mod command_processor;
 mod companion;
+mod control;
 mod feature_gate;
 mod mcp;
 mod gateway;
 pub(crate) mod ingress;
 mod qualification;
 mod qualification_harness;
+mod recovery;
 mod registry;
 mod relay;
 mod ownership;
@@ -60,6 +63,7 @@ pub use qualification::{
     QualificationReport,
 };
 pub use qualification_harness::QualificationHarness;
+pub use recovery::{recover_service, recovery_action, RecoveryAction, RecoveryReport, RecoveryState};
 pub use registry::{
     downgrade_is_silent_compatible, hidden_from_ordinary_discovery, DiscoveryLease, ExternalId,
     InternalBindingRecord, ObserverWindow, RegisteredBinding, RegistryStore, RootLease,
@@ -85,6 +89,10 @@ pub use actor::{RoomActor, RoomGate};
 pub use budget_ledger::{
     checkpoint_active, recompute_room_budget, reserve_budget, AdmissionWindow, BillingSplit,
     RoomClockLedger,
+};
+pub use command_processor::{next_phase, pause_again, retry_synthesis};
+pub use control::{
+    apply_command, advance_control, ControlBook, MatrixOutcome, MatrixRow, MutationCommandV1,
 };
 pub use clock::{
     deadline_reached, AcceptStep, FakeClock, LockGate, MonoClock, MonotonicClock, SystemMono,

@@ -130,6 +130,7 @@ pub struct RoundtableService {
     observer_open: AtomicBool,
     unknown_occupancy: AtomicBool,
     allocator: ResourceAllocator,
+    supervisor_online: AtomicBool,
 }
 
 impl RoundtableService {
@@ -167,6 +168,7 @@ impl RoundtableService {
             observer_open: AtomicBool::new(true),
             unknown_occupancy: AtomicBool::new(false),
             allocator: ResourceAllocator::new(1),
+            supervisor_online: AtomicBool::new(true),
         });
         if service.writable() {
             service.recover(&config).await?;
@@ -180,6 +182,28 @@ impl RoundtableService {
 
     pub fn allocator(&self) -> &ResourceAllocator {
         &self.allocator
+    }
+
+    pub fn quarantine_pending(&self) -> bool {
+        self.unknown_occupancy.load(Ordering::Relaxed)
+            || !self.quarantine.lock().expect("quarantine").is_empty()
+    }
+
+    pub fn supervisor_online(&self) -> bool {
+        self.supervisor_online.load(Ordering::Relaxed)
+    }
+
+    pub fn set_supervisor_online(&self, online: bool) {
+        self.supervisor_online.store(online, Ordering::Relaxed);
+    }
+
+    pub(crate) fn mark_ready_after_recovery(&self) -> RtResult<()> {
+        let mut readiness = self.readiness.lock().expect("readiness");
+        if !matches!(*readiness, ServiceReadiness::Recovering) {
+            return Err(rt_error(ErrorCode::InvalidState, "not_recovering"));
+        }
+        *readiness = ServiceReadiness::Ready;
+        Ok(())
     }
 
     pub fn boot_epoch(&self) -> u64 {
