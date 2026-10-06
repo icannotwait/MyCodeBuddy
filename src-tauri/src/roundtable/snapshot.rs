@@ -722,6 +722,9 @@ fn open_source(root: &Path, canonical: &str) -> RtResult<File> {
             let reason = match code {
                 Some(libc::ELOOP) | Some(libc::ENOTDIR) => "symlink",
                 Some(libc::ENXIO) | Some(libc::ENODEV) => "not_regular",
+                // XNU rejects pathname sockets with EOPNOTSUPP, not ENOTSUP.
+                #[cfg(target_os = "macos")]
+                Some(libc::EOPNOTSUPP) => "not_regular",
                 _ => "source_missing",
             };
             return Err(rt_error(ErrorCode::InvalidArgument, reason));

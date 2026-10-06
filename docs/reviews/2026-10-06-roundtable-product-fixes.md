@@ -119,3 +119,35 @@ The original macOS `roundtable_protocol_io` run at `f2fd110` reached 58 passes a
 `roundtable_transport` were audited for the same setup defect. Rust compilation,
 these regressions, and rustfmt have not run locally because no Rust toolchain is
 installed; existing CI must verify the updated tests.
+
+
+## macOS pathname socket rejection classification
+
+The macOS desktop run at `5bdc5b1` passed 68 `roundtable_protocol_io` tests and
+failed only the existing Unix-socket case: capture rejected it as `source_missing`
+rather than `not_regular`. Apple XNU's
+[`vn_authorize_open_existing`](https://github.com/apple-oss-distributions/xnu/blob/main/bsd/vfs/vfs_subr.c#L7889-L7890)
+rejects pathname socket vnodes with `EOPNOTSUPP`. Darwin's
+[`errno.h`](https://github.com/apple-oss-distributions/xnu/blob/main/bsd/sys/errno.h#L235-L238)
+and the pinned
+[`libc 0.2.180` Apple bindings](https://github.com/rust-lang/libc/blob/4b38c69e31afadbead63af49794850b5a41f7dc4/src/unix/bsd/apple/mod.rs#L2228-L2285)
+distinguish `EOPNOTSUPP` (102) from `ENOTSUP` (45). Only macOS `EOPNOTSUPP` is added
+to the existing nonregular-source rejection class; `ENOTSUP` and unknown errors
+are not broadened. The failed `openat` still immediately returns an error, with
+no retry, metadata-based permission fallback, or change to descriptor traversal,
+`O_NOFOLLOW`, `O_NONBLOCK`, or handle validation.
+
+Listener teardown is not an unlink: XNU's
+[`unp_detach`](https://github.com/apple-oss-distributions/xnu/blob/main/bsd/kern/uipc_usrreq.c#L1011-L1028)
+clears the vnode's socket association and releases its reference. The existing
+fixture now retains its listener and checks that its pathname is a socket.
+A focused regression covers both live and closed-listener socket paths, requires
+macOS's exact raw errno, and keeps the result `InvalidArgument/not_regular` with
+no read-hook invocation or object creation. A missing-file control still requires
+`source_missing`. Existing FIFO, symlink, size, and mutation expectations remain.
+
+The kernel explanation is source-grounded; the earlier CI log did not print its
+raw errno. Rust/macOS execution and rustfmt remain pending in existing CI because
+there is no local Rust toolchain. An attempted local Linux syscall reproduction
+was blocked by the executor returning `EPERM` when creating an `AF_UNIX` socket;
+no permissions were changed and no alternate execution route was attempted.

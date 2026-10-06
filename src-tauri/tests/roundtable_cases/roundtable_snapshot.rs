@@ -366,7 +366,10 @@ async fn capture_rejects_escape_and_mutation() {
             eprintln!("skip fifo physical fixture: mkfifo unavailable");
         }
         let sock = root.join("probe.sock");
-        if std::os::unix::net::UnixListener::bind(&sock).is_ok() {
+        if let Ok(listener) = std::os::unix::net::UnixListener::bind(&sock) {
+            use std::os::unix::fs::FileTypeExt;
+            let metadata = std::fs::symlink_metadata(&sock).unwrap();
+            assert!(metadata.file_type().is_socket());
             let err = capture_snapshot(
                 selection(
                     root.clone(),
@@ -381,6 +384,7 @@ async fn capture_rejects_escape_and_mutation() {
             .await
             .unwrap_err();
             assert_eq!(reason(&err), "not_regular");
+            drop(listener);
         } else {
             eprintln!("skip socket physical fixture: bind failed");
         }
@@ -416,6 +420,67 @@ async fn capture_rejects_escape_and_mutation() {
         hits.load(Ordering::SeqCst),
         usize::try_from(MAX_SNAPSHOT_READS).unwrap()
     );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn capture_rejects_live_and_closed_unix_sockets_without_reading() {
+    use std::os::unix::fs::FileTypeExt;
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let socket = root.join("sock");
+    let mut listener = Some(std::os::unix::net::UnixListener::bind(&socket).unwrap());
+    let (_, objects) = open_objects(&root, 1_000_000);
+    let reads = Arc::new(AtomicUsize::new(0));
+    for listening in [true, false] {
+        if !listening {
+            drop(listener.take());
+        }
+        let metadata = std::fs::symlink_metadata(&socket).unwrap();
+        assert!(metadata.file_type().is_socket());
+        #[cfg(target_os = "macos")]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            let error = std::fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+                .open(&socket)
+                .unwrap_err();
+            assert_eq!(error.raw_os_error(), Some(libc::EOPNOTSUPP));
+        }
+        let mut source = selection(
+            root.clone(),
+            ids(9),
+            1,
+            None,
+            vec![("sock", SourceClass::Selected)],
+        );
+        let observed = Arc::clone(&reads);
+        source.mutate_while_open = Some(Arc::new(move |_| {
+            observed.fetch_add(1, Ordering::SeqCst);
+        }));
+        let error = capture_snapshot(source, limits(100), &objects)
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, ErrorCode::InvalidArgument);
+        assert_eq!(reason(&error), "not_regular");
+        assert_eq!(reads.load(Ordering::SeqCst), 0);
+        assert!(objects.remaining_files().is_empty());
+    }
+    let missing = capture_snapshot(
+        selection(
+            root,
+            ids(9),
+            1,
+            None,
+            vec![("missing.txt", SourceClass::Selected)],
+        ),
+        limits(100),
+        &objects,
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(reason(&missing), "source_missing");
 }
 
 #[tokio::test]
