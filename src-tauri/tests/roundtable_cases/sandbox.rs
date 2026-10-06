@@ -664,6 +664,8 @@ fn qualified_profile_hash_binds_execution_template_without_attempt_socket_names(
         cli_args: vec!["--acp".into()],
         service_socket: Some(dir.path().join("one.sock")),
         gateway_socket: None,
+        auth_mounts: Vec::new(),
+        container_env: BTreeMap::new(),
     };
     let first = codeg_lib::roundtable::qualified_oci_profile_hash(&profile, &key).unwrap();
     let mut next = profile.clone();

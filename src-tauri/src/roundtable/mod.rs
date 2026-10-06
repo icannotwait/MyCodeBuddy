@@ -33,6 +33,9 @@ mod paging;
 mod product;
 mod qualification;
 mod qualification_harness;
+mod qualification_linux;
+mod qualification_probe;
+mod qualification_profiles;
 mod recovery;
 mod registry;
 mod relay;
@@ -103,6 +106,7 @@ pub use ingress::{
 };
 #[cfg(any(test, feature = "test-utils"))]
 pub use installed_runtime::verify_runtime_contract_fixture;
+pub use installed_runtime::ProviderBinding;
 #[cfg(any(test, feature = "test-utils"))]
 pub use live_gateway::{
     exercise_gateway_shutdown_fixture, exercise_live_gateway_fixture,
@@ -137,6 +141,13 @@ pub use qualification::{
     QualificationReport,
 };
 pub use qualification_harness::QualificationHarness;
+#[cfg(any(test, feature = "test-utils"))]
+pub use qualification_probe::{assemble_probe_report_for_test, verify_installed_report_for_test};
+pub use qualification_probe::{
+    qualify_adapter_on_host, roundtable_qualify_requested, run_roundtable_qualify, ProbeCheck,
+    ProbeFacts, ProbeOutcome, ProbeRequest,
+};
+pub use qualification_profiles::{adapter_profiles, os_accepted, profile_for_agent};
 pub use recovery::{recover_service, RecoveryReport};
 #[cfg(any(test, feature = "test-utils"))]
 pub use recovery::{recovery_action, RecoveryAction, RecoveryState};

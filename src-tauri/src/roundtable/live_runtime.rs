@@ -31,6 +31,7 @@ struct Active {
     gateway_server: tokio::sync::Mutex<Option<LiveGatewayServer>>,
     gateway: Arc<LiveModelGateway>,
     authority: Arc<GateToolAuthority>,
+    agent: String,
     cleanup: tokio::sync::Mutex<Option<CleanupProof>>,
     stderr: tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
     assistant: Mutex<Option<super::DiagnosticCapture>>,
@@ -39,7 +40,7 @@ struct Active {
 
 pub(crate) struct LiveParticipantExecutor {
     data_dir: PathBuf,
-    installed: InstalledRuntime,
+    adapters: BTreeMap<String, InstalledRuntime>,
     isolator: Arc<LinuxOciIsolator>,
     db_identity: DbIdentity,
     active: Mutex<HashMap<IncarnationId, Arc<Active>>>,
@@ -47,22 +48,75 @@ pub(crate) struct LiveParticipantExecutor {
     registry: tokio::sync::Mutex<Option<super::RoundtableSessionRegistry>>,
 }
 
+fn auth_denylist(installed: &InstalledRuntime, seeds: &[String]) -> Vec<String> {
+    let mut secrets = seeds.to_vec();
+    for mount in &installed.oci.auth_mounts {
+        let Ok(bytes) = std::fs::read(&mount.source) else {
+            continue;
+        };
+        if bytes.len() > 65_536 {
+            continue;
+        }
+        if let Ok(text) = String::from_utf8(bytes) {
+            if !text.trim().is_empty() {
+                secrets.push(text);
+            }
+        }
+    }
+    secrets
+}
+
+fn participant_agent(participant: &ParticipantV1) -> RtResult<String> {
+    let agent = participant
+        .agent
+        .clone()
+        .unwrap_or_else(|| "codex".to_string());
+    if !is_roundtable_agent(&agent) {
+        return Err(rt_error(ErrorCode::InvalidArgument, "unknown_agent"));
+    }
+    Ok(agent)
+}
+
+fn agent_type_for(agent: &str) -> RtResult<crate::models::AgentType> {
+    crate::models::AgentType::from_wire(agent)
+        .filter(|value| is_roundtable_agent(value.as_wire().as_ref()))
+        .ok_or_else(|| rt_error(ErrorCode::InvalidArgument, "unknown_agent"))
+}
+
+fn file_auth_ready(installed: &InstalledRuntime) -> bool {
+    !installed.oci.auth_mounts.is_empty()
+        && installed.oci.auth_mounts.iter().all(|mount| {
+            let path = std::path::Path::new(&mount.source);
+            path.is_absolute() && path.is_file()
+        })
+}
+
+fn credential_ready(
+    installed: &InstalledRuntime,
+    binding: &super::installed_runtime::ProviderBinding,
+) -> bool {
+    std::env::var_os(&binding.credential_env).is_some() || file_auth_ready(installed)
+}
+
 impl LiveParticipantExecutor {
     pub(crate) fn load(data_dir: PathBuf) -> RtResult<Self> {
-        let installed = InstalledRuntime::load(&data_dir)?;
+        let adapters = InstalledRuntime::load_catalog(&data_dir)?;
         let canonical = data_dir
             .join(crate::db::database_file_name())
             .canonicalize()
             .map_err(|_| rt_error(ErrorCode::StorageUnavailable, "db_identity"))?;
         let db_identity = DbIdentity::new(canonical.to_string_lossy().into_owned())?;
         let journal = JournalLaunchIntentStore::open(&data_dir.join("roundtable/launch-journal"))?;
-        let isolator = Arc::new(LinuxOciIsolator::with_profile(
-            journal,
-            installed.oci.clone(),
-        ));
+        let profile = adapters
+            .values()
+            .next()
+            .ok_or_else(|| rt_error(ErrorCode::CapabilityUnqualified, "runtime_installation"))?
+            .oci
+            .clone();
+        let isolator = Arc::new(LinuxOciIsolator::with_profile(journal, profile));
         Ok(Self {
             data_dir,
-            installed,
+            adapters,
             isolator,
             db_identity,
             active: Mutex::new(HashMap::new()),
@@ -70,12 +124,23 @@ impl LiveParticipantExecutor {
             registry: tokio::sync::Mutex::new(None),
         })
     }
+
+    fn adapter(&self, agent: &str) -> RtResult<InstalledRuntime> {
+        self.adapters
+            .get(agent)
+            .cloned()
+            .ok_or_else(|| rt_error(ErrorCode::CapabilityUnqualified, "adapter_unqualified"))
+    }
+
+    fn isolator_for(&self, agent: &str) -> RtResult<LinuxOciIsolator> {
+        Ok(self.isolator.for_profile(self.adapter(agent)?.oci))
+    }
     pub(crate) fn discovery(&self) -> Arc<dyn IsolationProvider + Send + Sync> {
         self.isolator.clone()
     }
 
-    async fn verified(&self) -> RtResult<()> {
-        let installed = self.installed.clone();
+    async fn verified(&self, agent: &str) -> RtResult<InstalledRuntime> {
+        let installed = self.adapter(agent)?;
         tokio::task::spawn_blocking(move || {
             installed.verify_report()?;
             installed.verify_host()?;
@@ -95,12 +160,16 @@ impl LiveParticipantExecutor {
                     "qualification_policy_changed",
                 ));
             }
-            Ok(())
+            Ok(installed)
         })
         .await
         .map_err(|_| rt_error(ErrorCode::RuntimeUnavailable, "qualification_worker"))?
     }
-    fn policy(&self, model: &str) -> RtResult<(ExecutionScope, AdmissionFacts)> {
+    fn policy(
+        &self,
+        installed: &InstalledRuntime,
+        model: &str,
+    ) -> RtResult<(ExecutionScope, AdmissionFacts)> {
         let policy: ExecutionPolicy = serde_json::from_slice(
             &std::fs::read(self.data_dir.join("roundtable/execution-policy.json"))
                 .map_err(|_| rt_error(ErrorCode::CapabilityUnqualified, "product_disabled"))?,
@@ -111,7 +180,7 @@ impl LiveParticipantExecutor {
         };
         let facts = AdmissionFacts {
             certificate: QualificationStatus::Passed,
-            presented_key: self.installed.qualification_key.clone(),
+            presented_key: installed.qualification_key.clone(),
             qualification_attempts_used: 0,
             qualification_spend_used: 0,
             fixture_hash: Hash256::from_bytes([0; 32]),
@@ -210,18 +279,19 @@ impl LiveParticipantExecutor {
                 .remove(&incarnation);
             return Ok(proof);
         }
+        let isolator = self.isolator_for(&active.agent)?;
         let instance = active
             .instance
             .lock()
             .expect("runtime instance")
             .clone()
             .or_else(|| {
-                self.isolator
+                isolator
                     .recorded_instance(&self.db_identity, incarnation)
                     .ok()?
             })
             .ok_or_else(|| rt_error(ErrorCode::RuntimeUnavailable, "cleanup_identity_unknown"))?;
-        let process = self.isolator.reap(&instance).await?;
+        let process = isolator.reap(&instance).await?;
         let proof = CleanupProof {
             process,
             mailbox_empty: true,
@@ -252,17 +322,23 @@ impl TokenBound for LiveParticipantExecutor {
         Ok(bytes.len() as u64)
     }
     fn capacity_tokens(&self) -> Option<u64> {
-        Some(self.installed.context_profile.model_capacity_tokens)
+        self.adapters
+            .values()
+            .map(|installed| installed.context_profile.model_capacity_tokens)
+            .min()
     }
 }
 #[async_trait]
 impl RoundtableTurnExecutor for LiveParticipantExecutor {
     async fn capability(&self, config: &RoundtableConfigV1) -> RtResult<RuntimeCapability> {
-        self.verified().await?;
         let mut recipients = Vec::new();
+        let mut keys = Vec::new();
+        let mut policy_hash = None;
+        let mut profile = None;
         for participant in &config.participants {
-            let binding = self
-                .installed
+            let agent = participant_agent(participant)?;
+            let installed = self.verified(&agent).await?;
+            let binding = installed
                 .providers
                 .iter()
                 .find(|binding| {
@@ -285,21 +361,31 @@ impl RoundtableTurnExecutor for LiveParticipantExecutor {
                     "effort_unqualified",
                 ));
             }
-            self.policy(&binding.model)?;
+            self.policy(&installed, &binding.model)?;
             super::ApprovedOrigin::parse(&binding.origin)?;
-            if std::env::var_os(&binding.credential_env).is_none() {
+            if !credential_ready(&installed, binding) {
                 return Err(rt_error(
                     ErrorCode::Unauthenticated,
                     "provider_credential_missing",
                 ));
             }
-            recipients.push(json!({"provider_ref":binding.provider_ref,"model":binding.model,"origin":binding.origin}));
+            if policy_hash.is_some_and(|hash| hash != installed.qualification_key.policy_hash) {
+                return Err(rt_error(
+                    ErrorCode::CapabilityUnqualified,
+                    "qualification_policy_changed",
+                ));
+            }
+            policy_hash = Some(installed.qualification_key.policy_hash);
+            profile = Some(installed.context_profile.clone());
+            keys.push(json!(installed.qualification_key));
+            recipients.push(json!({"provider_ref":binding.provider_ref,"model":binding.model,"origin":binding.origin,"agent":agent}));
         }
         Ok(RuntimeCapability {
             recipients: Value::Array(recipients),
-            qualification_keys: json!([self.installed.qualification_key]),
-            policy_hash: self.installed.qualification_key.policy_hash,
-            profile: self.installed.context_profile.clone(),
+            qualification_keys: Value::Array(keys),
+            policy_hash: policy_hash
+                .ok_or_else(|| rt_error(ErrorCode::InvalidArgument, "participants"))?,
+            profile: profile.ok_or_else(|| rt_error(ErrorCode::InvalidArgument, "participants"))?,
         })
     }
     fn token_bound(&self) -> &(dyn TokenBound + Send + Sync) {
@@ -317,9 +403,9 @@ impl RoundtableTurnExecutor for LiveParticipantExecutor {
             .lock()
             .expect("launch lifecycle")
             .insert(request.fence.incarnation, false);
-        self.verified().await?;
-        let provider = self
-            .installed
+        let agent = participant_agent(&request.participant)?;
+        let installed = self.verified(&agent).await?;
+        let provider = installed
             .providers
             .iter()
             .find(|provider| {
@@ -330,10 +416,16 @@ impl RoundtableTurnExecutor for LiveParticipantExecutor {
                         .as_ref()
                         .is_none_or(|model| model == &provider.model)
             })
+            .cloned()
             .ok_or_else(|| rt_error(ErrorCode::CapabilityUnqualified, "provider_unqualified"))?;
-        let (execution, facts) = self.policy(&provider.model)?;
-        let directory = self
-            .installed
+        if !credential_ready(&installed, &provider) {
+            return Err(rt_error(
+                ErrorCode::Unauthenticated,
+                "provider_credential_missing",
+            ));
+        }
+        let (execution, facts) = self.policy(&installed, &provider.model)?;
+        let directory = installed
             .oci
             .runtime_root
             .join("runs")
@@ -358,7 +450,7 @@ impl RoundtableTurnExecutor for LiveParticipantExecutor {
             aliases: request.scope.aliases.clone(),
             result_scope: request.scope.clone(),
             evidence: evidence_objects(&request.prompt)?,
-            profile: self.installed.context_profile.clone(),
+            profile: installed.context_profile.clone(),
         };
         let authority = Arc::new(
             GateToolAuthority::open(
@@ -378,9 +470,9 @@ impl RoundtableTurnExecutor for LiveParticipantExecutor {
             self.data_dir.clone(),
             (
                 super::ApprovedOrigin::parse(&provider.origin)?,
-                super::HostCredential::injected(std::env::var(&provider.credential_env).map_err(
-                    |_| rt_error(ErrorCode::Unauthenticated, "provider_credential_missing"),
-                )?),
+                super::HostCredential::injected(
+                    std::env::var(&provider.credential_env).unwrap_or_default(),
+                ),
                 provider.model.clone(),
                 request.participant.effort.clone(),
             ),
@@ -388,7 +480,7 @@ impl RoundtableTurnExecutor for LiveParticipantExecutor {
             (execution, facts),
             MonoMs(request.deadline_mono),
             Arc::new(move || MonoMs(store_clock.clock_sample().0)),
-            self.installed.context_profile.clone(),
+            installed.context_profile.clone(),
         )?);
         let principal_row = one_row(
             request.store.connection(),
@@ -445,21 +537,25 @@ impl RoundtableTurnExecutor for LiveParticipantExecutor {
             authority,
             cleanup: tokio::sync::Mutex::new(None),
             stderr: tokio::sync::Mutex::new(None),
-            assistant: Mutex::new(Some(super::DiagnosticCapture::new(vec![
-                provider_token.clone(),
-                token.reveal_for_same_sandbox().to_owned(),
-                std::env::var(&provider.credential_env).unwrap_or_default(),
-            ]))),
+            assistant: Mutex::new(Some(super::DiagnosticCapture::new(auth_denylist(
+                &installed,
+                &[
+                    provider_token.clone(),
+                    token.reveal_for_same_sandbox().to_owned(),
+                    std::env::var(&provider.credential_env).unwrap_or_default(),
+                ],
+            )))),
             finish_reason: Mutex::new(None),
+            agent: agent.clone(),
         });
         self.active
             .lock()
             .expect("active runtimes")
             .insert(request.fence.incarnation, active.clone());
         let attempt_isolator = self
-            .isolator
+            .isolator_for(&agent)?
             .with_attempt_sockets(service_path.clone(), gateway_path.clone())?;
-        let mut oci = self.installed.oci.clone();
+        let mut oci = installed.oci.clone();
         oci.service_socket = Some(service_path);
         oci.gateway_socket = Some(gateway_path);
         let config = one_row(
@@ -503,7 +599,7 @@ impl RoundtableTurnExecutor for LiveParticipantExecutor {
             );
         }
         let input = SandboxInput {
-            certificate: self.installed.qualification_key.clone(),
+            certificate: installed.qualification_key.clone(),
             db: self.db_identity.clone(),
             boot_epoch: request.fence.boot_epoch,
             incarnation: request.fence.incarnation,
@@ -556,8 +652,7 @@ impl RoundtableTurnExecutor for LiveParticipantExecutor {
             .store
             .mark_launch_spawned(request.fence.incarnation, instance)
             .await?;
-        let mcp = self
-            .installed
+        let mcp = installed
             .qualification_key
             .binaries
             .iter()
@@ -573,6 +668,7 @@ impl RoundtableTurnExecutor for LiveParticipantExecutor {
             token.reveal_for_same_sandbox(),
             &active,
             &self.registry,
+            agent_type_for(&agent)?,
         )
         .await;
         *active.finish_reason.lock().expect("finish reason") = Some(
@@ -647,6 +743,7 @@ async fn drive_acp(
     token: &str,
     active: &Active,
     registry: &tokio::sync::Mutex<Option<super::RoundtableSessionRegistry>>,
+    agent: crate::models::AgentType,
 ) -> RtResult<u64> {
     let mut stdout = BufReader::new(stdout);
     let mut seq = 0;
@@ -662,9 +759,7 @@ async fn drive_acp(
         }
         let registry = registry.as_ref().expect("registry initialized").clone();
         let root = registry.reserve_root(active.scratch.clone());
-        let discovery = registry
-            .begin_discovery(crate::models::AgentType::Codex)
-            .await;
+        let discovery = registry.begin_discovery(agent).await;
         (registry, root, discovery)
     };
     let session=rpc(&mut stdin,&mut stdout,2,"session/new",json!({"cwd":"/scratch","mcpServers":[{"name":"roundtable","command":mcp,"args":["--service-roundtable","--socket-path","/run/codeg/roundtable.sock","--incarnation",request.fence.incarnation.to_string()],"env":[{"name":super::ATTEMPT_TOKEN_ENV,"value":token},{"name":"CODEG_RT_MODEL_SOCKET","value":"/run/codeg/gateway.sock"}]}]}),&mut seq,active).await?;
@@ -677,7 +772,7 @@ async fn drive_acp(
             room_id: request.room_id,
             binding_id: request.fence.binding_id,
             incarnation: request.fence.incarnation,
-            agent: crate::models::AgentType::Codex,
+            agent,
             external_id: session_id.to_owned().into(),
             reserved_root: active.scratch.clone(),
         };
@@ -934,6 +1029,8 @@ fn unqualified_live_fixture(
         cli_args: Vec::new(),
         service_socket: None,
         gateway_socket: None,
+        auth_mounts: Vec::new(),
+        container_env: BTreeMap::new(),
     };
     let installed = InstalledRuntime {
         schema_version: 1,

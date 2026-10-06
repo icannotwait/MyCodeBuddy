@@ -59,6 +59,8 @@ export interface RoundtableConfig {
     provider_ref: string
     model?: string
     effort?: string
+    /** `codex`, `grok`, `cursor`, or `antigravity`. Absent means Codex. */
+    agent?: string
   }[]
   moderator_ordinal: number
   strategy: { type: "phased_rounds"; version: 1; critique_rounds: number }

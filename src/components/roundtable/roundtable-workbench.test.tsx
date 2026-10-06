@@ -178,7 +178,12 @@ describe("roundtable product page", () => {
             topic: "Revised question",
             display_name: "Saved label",
             source_refs: [],
-            participants: body.replay.config.participants,
+            participants: body.replay.config.participants.map(
+              (member: { agent?: string }) => ({
+                ...member,
+                agent: member.agent || "codex",
+              })
+            ),
           }),
         }),
       })
@@ -223,6 +228,9 @@ describe("roundtable product page", () => {
         3
       )
     )
+    fireEvent.change(screen.getByLabelText("moderator"), {
+      target: { value: "2" },
+    })
     fireEvent.click(screen.getByRole("button", { name: "preflight" }))
     await screen.findByText("disabled")
     expect(screen.getByRole("button", { name: "create" })).toBeDisabled()
@@ -231,9 +239,24 @@ describe("roundtable product page", () => {
         config: expect.objectContaining({
           topic: "Question",
           workspace_id: "workspace",
-          participants: expect.arrayContaining([
-            expect.objectContaining({ provider_ref: "provider:1" }),
-          ]),
+          participants: [
+            expect.objectContaining({
+              ordinal: 0,
+              provider_ref: "provider:1",
+              agent: "grok",
+            }),
+            expect.objectContaining({
+              ordinal: 1,
+              provider_ref: "provider:1",
+              agent: "cursor",
+            }),
+            expect.objectContaining({
+              ordinal: 2,
+              provider_ref: "provider:1",
+              agent: "antigravity",
+            }),
+          ],
+          moderator_ordinal: 2,
         }),
       },
     })

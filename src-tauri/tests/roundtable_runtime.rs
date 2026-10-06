@@ -25,5 +25,8 @@ mod registry;
 #[path = "roundtable_cases/roundtable_qualification.rs"]
 mod roundtable_qualification;
 
+#[path = "roundtable_cases/qualification_probe.rs"]
+mod qualification_probe;
+
 #[path = "roundtable_cases/runtime_scheduler.rs"]
 mod runtime_scheduler;

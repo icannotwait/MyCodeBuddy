@@ -258,7 +258,7 @@ fn oci_document(
 
 // A frozen deny-default syscall contract. Filesystem access remains bounded by
 // the read-only root, scratch mount and fixed per-attempt Unix socket mounts.
-const SYSCALLS: &[&str] = &[
+pub(crate) const SYSCALLS: &[&str] = &[
     "read",
     "write",
     "readv",
@@ -479,6 +479,7 @@ pub(super) fn profile_hash(
         "rootfs":profile.rootfs,"rootfs_sha256":profile.rootfs_sha256,
         "runtime_root":profile.runtime_root,"cgroup_root":profile.cgroup_root,
         "cli_args":profile.cli_args,"socket_destinations":["/run/codeg/roundtable.sock","/run/codeg/gateway.sock"],
+        "auth_mounts":profile.auth_mounts,"container_env":profile.container_env,
         "binaries":key.binaries,"image_digest":key.image_digest,"policy_hash":key.policy_hash,
         "syscalls":SYSCALLS,"memory":MEMORY_MAX_BYTES,"pids":PIDS_MAX,"cpu":CPU_QUOTA_US
     }))
@@ -541,6 +542,7 @@ pub(super) fn build_qualified_plan(
                 .push(json!({"source":source,"destination":destination,"type":"bind","options":["bind","ro","nosuid","nodev","noexec"]}));
         }
     }
+    apply_auth_mounts(&mut plan, profile)?;
     plan.plan_hash = document_hash(&plan.oci)?;
     verify_profile(&plan, profile)?;
     Ok(plan)
@@ -641,6 +643,101 @@ pub(super) fn rootfs_digest(root: &Path) -> RtResult<Hash256> {
     Ok(Hash256::from_bytes(hash.finalize().into()))
 }
 
+fn apply_auth_mounts(plan: &mut SandboxPlan, profile: &QualifiedOciProfile) -> RtResult<()> {
+    for (key, value) in &profile.container_env {
+        if !container_env_allowed(key, value) {
+            return Err(rt_error(ErrorCode::InvalidArgument, "container_env"));
+        }
+        plan.env.insert(key.clone(), value.clone());
+    }
+    let env_list: Vec<String> = plan
+        .env
+        .iter()
+        .map(|(key, value)| format!("{key}={value}"))
+        .collect();
+    plan.oci["process"]["env"] = json!(env_list);
+    for mount in &profile.auth_mounts {
+        if !auth_destination_allowed(&mount.destination) || !mount.source.is_absolute() {
+            return Err(rt_error(ErrorCode::InvalidArgument, "auth_mount"));
+        }
+        let root = profile
+            .rootfs
+            .canonicalize()
+            .map_err(|_| rt_error(ErrorCode::CapabilityUnqualified, "rootfs_unreadable"))?;
+        let source = mount
+            .source
+            .canonicalize()
+            .map_err(|_| rt_error(ErrorCode::CapabilityUnqualified, "auth_mount"))?;
+        if source.starts_with(&root) || !source.is_file() {
+            return Err(rt_error(
+                ErrorCode::CapabilityUnqualified,
+                "credential_baked_into_image",
+            ));
+        }
+        plan.mounts.push(PlanMount {
+            source: mount.source.clone(),
+            destination: mount.destination.clone(),
+            read_only: true,
+        });
+        plan.home_mounted = false;
+        plan.oci["mounts"]
+            .as_array_mut()
+            .ok_or_else(|| rt_error(ErrorCode::InvalidArgument, "oci_mounts"))?
+            .push(json!({
+                "source": mount.source,
+                "destination": mount.destination,
+                "type": "bind",
+                "options": ["bind", "ro", "nosuid", "nodev", "noexec", "nosymfollow"]
+            }));
+    }
+    Ok(())
+}
+
+fn container_env_allowed(key: &str, value: &str) -> bool {
+    match key {
+        "HOME" => value == "/rt-home",
+        "PATH" => value == "/usr/local/bin:/usr/bin:/bin",
+        "GEMINI_HOME" => value == "/rt-home/.gemini",
+        "CURSOR_CONFIG_DIR" => value == "/rt-home/.cursor",
+        _ => false,
+    }
+}
+
+fn auth_destination_allowed(destination: &str) -> bool {
+    destination.starts_with("/rt-home/")
+        && !destination.contains("..")
+        && !destination.ends_with('/')
+}
+
+fn reject_baked_credential(profile: &QualifiedOciProfile, mount: &PlanMount) -> RtResult<()> {
+    let root = profile
+        .rootfs
+        .canonicalize()
+        .map_err(|_| rt_error(ErrorCode::CapabilityUnqualified, "rootfs_unreadable"))?;
+    let source = mount
+        .source
+        .canonicalize()
+        .map_err(|_| rt_error(ErrorCode::CapabilityUnqualified, "auth_mount"))?;
+    if source.starts_with(&root) {
+        return Err(rt_error(
+            ErrorCode::CapabilityUnqualified,
+            "credential_baked_into_image",
+        ));
+    }
+    let target = profile
+        .rootfs
+        .join(mount.destination.trim_start_matches('/'));
+    let metadata = fs::symlink_metadata(&target)
+        .map_err(|_| rt_error(ErrorCode::CapabilityUnqualified, "rootfs_mount_target"))?;
+    if metadata.len() != 0 {
+        return Err(rt_error(
+            ErrorCode::CapabilityUnqualified,
+            "credential_baked_into_image",
+        ));
+    }
+    Ok(())
+}
+
 pub(super) fn verify_profile(plan: &SandboxPlan, profile: &QualifiedOciProfile) -> RtResult<()> {
     validate_document(plan)?;
     if !profile.runtime_root.is_absolute()
@@ -682,6 +779,13 @@ pub(super) fn verify_profile(plan: &SandboxPlan, profile: &QualifiedOciProfile) 
             "/run/codeg/gateway.sock" => {
                 profile.gateway_socket.as_ref() == Some(&mount.source) && mount.read_only
             }
+            destination if destination.starts_with("/rt-home/") => {
+                mount.read_only
+                    && profile
+                        .auth_mounts
+                        .iter()
+                        .any(|item| item.destination == destination && item.source == mount.source)
+            }
             _ => false,
         };
         if !allowed {
@@ -703,14 +807,26 @@ pub(super) fn verify_profile(plan: &SandboxPlan, profile: &QualifiedOciProfile) 
             .join(mount.destination.trim_start_matches('/'));
         let metadata = fs::symlink_metadata(&target)
             .map_err(|_| rt_error(ErrorCode::CapabilityUnqualified, "rootfs_mount_target"))?;
+        let file_mount = mount.destination.starts_with("/run/codeg/")
+            || mount.destination.starts_with("/rt-home/");
         if metadata.file_type().is_symlink()
-            || (mount.destination.starts_with("/run/codeg/") && !metadata.is_file())
-            || (!mount.destination.starts_with("/run/codeg/") && !metadata.is_dir())
+            || (file_mount && !metadata.is_file())
+            || (!file_mount && !metadata.is_dir())
         {
             return Err(rt_error(
                 ErrorCode::CapabilityUnqualified,
                 "rootfs_mount_target",
             ));
+        }
+        if mount.destination.starts_with("/rt-home/") {
+            reject_baked_credential(profile, mount)?;
+        }
+    }
+    for (key, value) in &profile.container_env {
+        if !container_env_allowed(key, value)
+            || plan.env.get(key).map(String::as_str) != Some(value)
+        {
+            return Err(rt_error(ErrorCode::CapabilityUnqualified, "container_env"));
         }
     }
     verify_container_binaries(profile, &plan.allowed_binaries)?;
@@ -787,6 +903,41 @@ pub(super) fn verify_installed_profile(
                 ErrorCode::CapabilityUnqualified,
                 "rootfs_mount_target",
             ));
+        }
+    }
+    for mount in &profile.auth_mounts {
+        if !auth_destination_allowed(&mount.destination) || !mount.source.is_absolute() {
+            return Err(rt_error(ErrorCode::CapabilityUnqualified, "auth_mount"));
+        }
+        let target = profile
+            .rootfs
+            .join(mount.destination.trim_start_matches('/'));
+        let metadata = fs::symlink_metadata(&target)
+            .map_err(|_| rt_error(ErrorCode::CapabilityUnqualified, "rootfs_mount_target"))?;
+        if metadata.file_type().is_symlink() || !metadata.is_file() || metadata.len() != 0 {
+            return Err(rt_error(
+                ErrorCode::CapabilityUnqualified,
+                "credential_baked_into_image",
+            ));
+        }
+        let root = profile
+            .rootfs
+            .canonicalize()
+            .map_err(|_| rt_error(ErrorCode::CapabilityUnqualified, "rootfs_unreadable"))?;
+        let source = mount
+            .source
+            .canonicalize()
+            .map_err(|_| rt_error(ErrorCode::CapabilityUnqualified, "auth_mount"))?;
+        if source.starts_with(&root) || !source.is_file() {
+            return Err(rt_error(
+                ErrorCode::CapabilityUnqualified,
+                "credential_baked_into_image",
+            ));
+        }
+    }
+    for (key, value) in &profile.container_env {
+        if !container_env_allowed(key, value) {
+            return Err(rt_error(ErrorCode::CapabilityUnqualified, "container_env"));
         }
     }
     Ok(())

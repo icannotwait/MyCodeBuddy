@@ -7428,6 +7428,7 @@
     "member": "Membro",
     "role": "Função",
     "provider": "Fornecedor",
+    "agent": "Agente",
     "addMember": "Adicionar membro",
     "removeMember": "Remover membro",
     "rounds": "Rodadas de revisão",

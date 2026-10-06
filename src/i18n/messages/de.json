@@ -7428,6 +7428,7 @@
     "member": "Mitglied",
     "role": "Rolle",
     "provider": "Anbieter",
+    "agent": "Agent",
     "addMember": "Mitglied hinzufügen",
     "removeMember": "Mitglied entfernen",
     "rounds": "Prüfrunden",

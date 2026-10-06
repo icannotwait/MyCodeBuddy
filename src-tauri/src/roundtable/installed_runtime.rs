@@ -6,11 +6,12 @@ use super::sandbox::QualifiedOciProfile;
 use roundtable_protocol::{canonical_hash, ErrorCode, Hash256, QualifiedContextProfile, RtResult};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct ProviderBinding {
+pub struct ProviderBinding {
     pub provider_ref: String,
     pub model: String,
     pub origin: String,
@@ -47,6 +48,51 @@ impl InstalledRuntime {
         // Parsing retains the pinned cleanup provider after report/core drift.
         // New turns still require verify_report + verify_host before admission.
         Ok(value)
+    }
+
+    /// Schema 1 is the original single Codex runtime. Schema 2 lists one
+    /// installed runtime per adapter (`codex`, `grok`, `cursor`, `antigravity`).
+    pub(crate) fn load_catalog(data_dir: &Path) -> RtResult<BTreeMap<String, Self>> {
+        let path = data_dir.join("roundtable/qualified-runtime.json");
+        let bytes = bounded_read(&path, 4_194_304)?;
+        let value = roundtable_protocol::parse_strict_json(
+            &bytes,
+            &roundtable_protocol::ParseLimits::suggested_profile(),
+        )?;
+        if value.get("adapters").is_some() {
+            if value["schema_version"] != 2 {
+                return Err(unqualified("runtime_installation"));
+            }
+            let entries = value["adapters"]
+                .as_array()
+                .ok_or_else(|| unqualified("runtime_installation"))?;
+            let mut adapters = BTreeMap::new();
+            for entry in entries {
+                let agent = entry["agent"]
+                    .as_str()
+                    .ok_or_else(|| unqualified("runtime_installation"))?;
+                if !matches!(agent, "codex" | "grok" | "cursor" | "antigravity") {
+                    return Err(unqualified("runtime_installation"));
+                }
+                let runtime: Self = serde_json::from_value(entry["runtime"].clone())
+                    .map_err(|_| unqualified("runtime_installation"))?;
+                if runtime.schema_version != 1
+                    || runtime.providers.is_empty()
+                    || !runtime.report_path.is_absolute()
+                {
+                    return Err(unqualified("runtime_installation"));
+                }
+                adapters.insert(agent.to_string(), runtime);
+            }
+            if adapters.is_empty() {
+                return Err(unqualified("runtime_installation"));
+            }
+            return Ok(adapters);
+        }
+        let runtime = Self::load(data_dir)?;
+        let mut adapters = BTreeMap::new();
+        adapters.insert("codex".to_string(), runtime);
+        Ok(adapters)
     }
 
     pub(crate) fn verify_host(&self) -> RtResult<()> {

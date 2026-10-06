@@ -7428,6 +7428,7 @@
     "member": "참여자",
     "role": "역할",
     "provider": "제공자",
+    "agent": "에이전트",
     "addMember": "참여자 추가",
     "removeMember": "참여자 제거",
     "rounds": "검토 횟수",

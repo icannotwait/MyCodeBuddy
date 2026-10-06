@@ -17,6 +17,7 @@ pub fn config(n: u32, r: u32, c: u32) -> RoundtableConfigV1 {
             provider_ref: "provider:test".to_string(),
             model: None,
             effort: None,
+            agent: None,
         })
         .collect();
     RoundtableConfigV1 {

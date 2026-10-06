@@ -7428,6 +7428,7 @@
     "member": "Member",
     "role": "Role",
     "provider": "Provider",
+    "agent": "Agent",
     "addMember": "Add member",
     "removeMember": "Remove member",
     "rounds": "Critique rounds",

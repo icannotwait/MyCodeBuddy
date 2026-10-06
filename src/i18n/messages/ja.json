@@ -7428,6 +7428,7 @@
     "member": "参加者",
     "role": "役割",
     "provider": "プロバイダー",
+    "agent": "エージェント",
     "addMember": "参加者を追加",
     "removeMember": "参加者を削除",
     "rounds": "批評ラウンド",

@@ -131,6 +131,20 @@ pub struct QualifiedOciProfile {
     pub service_socket: Option<PathBuf>,
     #[serde(default)]
     pub gateway_socket: Option<PathBuf>,
+    /// Read-only bind mounts of specific auth files. Never a home directory.
+    #[serde(default)]
+    pub auth_mounts: Vec<AuthMount>,
+    /// Fixed in-container environment. Host `HOME` and `PATH` are not copied.
+    #[serde(default)]
+    pub container_env: BTreeMap<String, String>,
+}
+
+/// One credential file mounted read-only at a fixed container path.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AuthMount {
+    pub source: PathBuf,
+    pub destination: String,
 }
 
 pub fn qualified_rootfs_digest(rootfs: &Path) -> RtResult<Hash256> {
@@ -153,6 +167,10 @@ pub fn verify_qualified_oci_profile(
     certificate: &QualificationKey,
 ) -> RtResult<()> {
     linux_oci::verify_installed_profile(profile, certificate)
+}
+
+pub(crate) fn linux_oci_syscalls() -> &'static [&'static str] {
+    linux_oci::SYSCALLS
 }
 
 pub fn build_qualified_sandbox_plan(
@@ -557,6 +575,14 @@ impl LinuxOciIsolator {
 
     /// Resolve one attempt's sockets while retaining the installed pins and
     /// the journal lock/state used by discovery and cleanup.
+    /// Another adapter image that shares this launch journal.
+    pub fn for_profile(&self, profile: QualifiedOciProfile) -> Self {
+        Self {
+            intents: Arc::clone(&self.intents),
+            profile: Some(profile),
+        }
+    }
+
     pub fn with_attempt_sockets(
         &self,
         service_socket: PathBuf,
@@ -790,6 +816,8 @@ mod shared_journal_tests {
             cli_args: vec!["--acp".into()],
             service_socket: None,
             gateway_socket: None,
+            auth_mounts: Vec::new(),
+            container_env: BTreeMap::new(),
         };
         let db = DbIdentity::new("cleanup-retry-review").unwrap();
         let incarnation: IncarnationId = "00000000-0000-4000-8000-00000000000f".parse().unwrap();
@@ -923,6 +951,8 @@ mod shared_journal_tests {
             cli_args: vec!["--acp".into()],
             service_socket: None,
             gateway_socket: None,
+            auth_mounts: Vec::new(),
+            container_env: BTreeMap::new(),
         };
         let base = LinuxOciIsolator::with_profile(
             JournalLaunchIntentStore::open(&journal_dir).unwrap(),

@@ -7428,6 +7428,7 @@
     "member": "Membre",
     "role": "Rôle",
     "provider": "Fournisseur",
+    "agent": "Agent",
     "addMember": "Ajouter un membre",
     "removeMember": "Retirer un membre",
     "rounds": "Tours de critique",

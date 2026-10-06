@@ -35,6 +35,8 @@ import { RoundtableSafeContent } from "./roundtable-safe-content"
 type LoadedRoom = Awaited<ReturnType<typeof loadRoundtable>>
 type RoomSummary = { room_id: string; status: string; config: RoundtableConfig }
 
+const ROUNDTABLE_AGENTS = ["grok", "cursor", "antigravity", "codex"] as const
+
 export function RoundtableWorkbench({
   workspaceId,
   roomId,
@@ -49,6 +51,11 @@ export function RoundtableWorkbench({
   const [loaded, setLoaded] = useState<LoadedRoom | null>(null)
   const [topic, setTopic] = useState("")
   const [roles, setRoles] = useState(["", "", ""])
+  const [agents, setAgents] = useState<string[]>([
+    "grok",
+    "cursor",
+    "antigravity",
+  ])
   const [providerIds, setProviderIds] = useState<string[]>([])
   const [rounds, setRounds] = useState(2)
   const [concurrency, setConcurrency] = useState(3)
@@ -256,6 +263,7 @@ export function RoundtableWorkbench({
         ordinal,
         role: role.trim() || `${t("member")} ${ordinal + 1}`,
         provider_ref: `provider:${providerIds[ordinal] || providers[0]?.id || ""}`,
+        agent: agents[ordinal] || "codex",
         ...(original?.participants[ordinal]?.model &&
         original.participants[ordinal].provider_ref ===
           `provider:${providerIds[ordinal]}`
@@ -393,6 +401,7 @@ export function RoundtableWorkbench({
         member.provider_ref.replace(/^provider:/, "")
       )
     )
+    setAgents(config.participants.map((member) => member.agent || "codex"))
     setRounds(config.strategy.critique_rounds)
     setConcurrency(config.concurrency)
     setModerator(config.moderator_ordinal)
@@ -480,6 +489,30 @@ export function RoundtableWorkbench({
                     }}
                   />
                   <label>
+                    {t("agent")}
+                    <select
+                      aria-label={`${t("agent")} ${index + 1}`}
+                      className="ml-2 rounded border bg-background p-2"
+                      value={agents[index] || "codex"}
+                      onChange={(event) => {
+                        setAgents(
+                          roles.map((_, i) =>
+                            i === index
+                              ? event.target.value
+                              : agents[i] || "codex"
+                          )
+                        )
+                        invalidate()
+                      }}
+                    >
+                      {ROUNDTABLE_AGENTS.map((agent) => (
+                        <option key={agent} value={agent}>
+                          {agent}
+                        </option>
+                      ))}
+                    </select>
+                  </label>
+                  <label>
                     {t("provider")}
                     <select
                       aria-label={`${t("provider")} ${index + 1}`}
@@ -511,6 +544,7 @@ export function RoundtableWorkbench({
                   disabled={roles.length >= 7}
                   onClick={() => {
                     setRoles([...roles, ""])
+                    setAgents([...agents, "codex"])
                     invalidate()
                   }}
                 >
@@ -521,6 +555,7 @@ export function RoundtableWorkbench({
                   disabled={roles.length <= 2}
                   onClick={() => {
                     setRoles(roles.slice(0, -1))
+                    setAgents(agents.slice(0, -1))
                     setConcurrency(Math.min(concurrency, roles.length - 1))
                     setModerator(Math.min(moderator, roles.length - 2))
                     invalidate()

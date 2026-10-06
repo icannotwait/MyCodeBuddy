@@ -7428,6 +7428,7 @@
     "member": "成员",
     "role": "角色",
     "provider": "提供商",
+    "agent": "智能体",
     "addMember": "添加成员",
     "removeMember": "移除成员",
     "rounds": "交叉评议轮数",
