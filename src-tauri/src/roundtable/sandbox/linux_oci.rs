@@ -1512,13 +1512,23 @@ fn helper_process_exited(fd: &std::os::fd::OwnedFd) -> bool {
         events: libc::POLLIN,
         revents: 0,
     };
-    (unsafe { libc::poll(&mut poll, 1, 0) }) > 0 && poll.revents & libc::POLLIN != 0
+    let result = unsafe { libc::poll(&mut poll, 1, 0) };
+    #[cfg(test)]
+    {
+        let errno = (result < 0)
+            .then(|| std::io::Error::last_os_error().raw_os_error())
+            .flatten();
+        control_tests::record_exit_poll(fd.as_raw_fd(), result, poll.revents, errno);
+    }
+    result > 0 && poll.revents & libc::POLLIN != 0
 }
 
 #[cfg(target_os = "linux")]
 fn retained_helper_is_live(retained: &BTreeMap<i32, std::os::fd::OwnedFd>, pid: i32) -> bool {
     use std::os::fd::AsRawFd;
     let Some(fd) = retained.get(&pid) else {
+        #[cfg(test)]
+        control_tests::record_retained_poll(pid, None);
         return false;
     };
     let mut poll = libc::pollfd {
@@ -1528,7 +1538,15 @@ fn retained_helper_is_live(retained: &BTreeMap<i32, std::os::fd::OwnedFd>, pid: 
     };
     // Only a successful no-readiness poll proves this original identity is
     // still live. An exited, invalid or inconclusive fd cannot exempt a PID.
-    (unsafe { libc::poll(&mut poll, 1, 0) }) == 0
+    let result = unsafe { libc::poll(&mut poll, 1, 0) };
+    #[cfg(test)]
+    {
+        let errno = (result < 0)
+            .then(|| std::io::Error::last_os_error().raw_os_error())
+            .flatten();
+        control_tests::record_retained_poll(pid, Some((result, poll.revents, errno)));
+    }
+    result == 0
 }
 
 #[cfg(target_os = "linux")]
@@ -1719,9 +1737,22 @@ pub(super) fn stop_slirp(runtime_root: &Path, id: &str, expected: bool) -> RtRes
                         if helper_process_exited(&fd) {
                             return Ok(None);
                         }
+                        #[cfg(test)]
+                        let parent_pid = stat.as_ref().ok().and_then(|stat| {
+                            stat.rsplit_once(") ")
+                                .and_then(|(_, rest)| rest.split_whitespace().nth(1))
+                                .and_then(|value| value.parse::<i32>().ok())
+                        });
                         let start = helper_start_ticks(
                             &stat.map_err(|_| unproven_at("slirp_proc_start_unreadable"))?,
                         )?;
+                        #[cfg(test)]
+                        control_tests::record_candidate_stat(
+                            pid,
+                            parent_pid,
+                            start,
+                            birth.creator_start_ticks,
+                        );
                         // The pinned identity remained alive across the stat
                         // read, so the numeric path cannot name a replacement.
                         if birth.predates(start) {
@@ -1730,13 +1761,22 @@ pub(super) fn stop_slirp(runtime_root: &Path, id: &str, expected: bool) -> RtRes
                     }
                     let environment = fs::read(entry.path().join("environ"));
                     #[cfg(test)]
+                    let read_errno = environment
+                        .as_ref()
+                        .err()
+                        .and_then(|error| error.raw_os_error());
+                    #[cfg(test)]
                     let environment = control_tests::helper_environment(pid, environment);
-                    let Some(environment) = resolve_helper_environment(
+                    let environment = resolve_helper_environment(
                         &fd,
                         environment,
                         birth.is_some_and(|birth| birth.zero_boottime_offset),
-                    )?
-                    else {
+                    );
+                    #[cfg(test)]
+                    if environment.is_err() {
+                        control_tests::record_environment_denial(pid, fd.as_raw_fd(), read_errno);
+                    }
+                    let Some(environment) = environment? else {
                         return Ok(None);
                     };
                     if !marked(&environment, runtime_root, id, None) {
@@ -2912,6 +2952,189 @@ pub(super) async fn reap(
 #[cfg(test)]
 mod control_tests {
     #[cfg(target_os = "linux")]
+    pub(super) type PollDiagnostic = (i32, i16, Option<i32>);
+
+    #[cfg(target_os = "linux")]
+    #[derive(Clone, Copy, Debug)]
+    enum RetainedPollObservation {
+        NotObserved,
+        NotRetained,
+        Polled {
+            result: i32,
+            revents: i16,
+            errno: Option<i32>,
+        },
+    }
+
+    #[cfg(target_os = "linux")]
+    #[derive(Clone, Copy, Debug)]
+    struct CandidateStatDiagnostic {
+        pid: i32,
+        parent_pid: Option<i32>,
+        start_ticks: u64,
+        creator_start_ticks: u64,
+    }
+
+    #[cfg(target_os = "linux")]
+    #[derive(Debug)]
+    struct CleanupDenialDiagnostic {
+        sweep: u32,
+        pid: i32,
+        fixture_role: &'static str,
+        parent_fixture_role: Option<&'static str>,
+        stat: Option<CandidateStatDiagnostic>,
+        retained: RetainedPollObservation,
+        exit_poll: Option<PollDiagnostic>,
+        read_errno: Option<i32>,
+        injected: bool,
+    }
+
+    #[cfg(target_os = "linux")]
+    #[derive(Debug)]
+    struct CleanupDiagnostics {
+        fixture_pids: [(&'static str, i32); 3],
+        sweep: u32,
+        denials: Vec<CleanupDenialDiagnostic>,
+        omitted_denials: u32,
+        last_retained: Option<(i32, RetainedPollObservation)>,
+        last_exit: Option<(i32, PollDiagnostic)>,
+        last_stat: Option<CandidateStatDiagnostic>,
+    }
+
+    #[cfg(target_os = "linux")]
+    std::thread_local! {
+        static CLEANUP_DIAGNOSTICS: std::cell::RefCell<Option<CleanupDiagnostics>> = const { std::cell::RefCell::new(None) };
+    }
+
+    #[cfg(target_os = "linux")]
+    struct CleanupDiagnosticCapture;
+
+    #[cfg(target_os = "linux")]
+    impl CleanupDiagnosticCapture {
+        fn start(fixture_pids: [(&'static str, i32); 3]) -> Self {
+            CLEANUP_DIAGNOSTICS.with(|state| {
+                *state.borrow_mut() = Some(CleanupDiagnostics {
+                    fixture_pids,
+                    sweep: 0,
+                    denials: Vec::new(),
+                    omitted_denials: 0,
+                    last_retained: None,
+                    last_exit: None,
+                    last_stat: None,
+                });
+            });
+            Self
+        }
+
+        fn finish(self) -> CleanupDiagnostics {
+            CLEANUP_DIAGNOSTICS.with(|state| {
+                let mut snapshot = state.borrow_mut().take().expect("diagnostics armed");
+                // Only per-denial observations are meaningful in the report.
+                snapshot.last_retained = None;
+                snapshot.last_exit = None;
+                snapshot.last_stat = None;
+                snapshot
+            })
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    impl Drop for CleanupDiagnosticCapture {
+        fn drop(&mut self) {
+            CLEANUP_DIAGNOSTICS.with(|state| *state.borrow_mut() = None);
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(super) fn record_retained_poll(pid: i32, observed: Option<PollDiagnostic>) {
+        CLEANUP_DIAGNOSTICS.with(|state| {
+            if let Some(state) = state.borrow_mut().as_mut() {
+                let poll = match observed {
+                    Some((result, revents, errno)) => RetainedPollObservation::Polled {
+                        result,
+                        revents,
+                        errno,
+                    },
+                    None => RetainedPollObservation::NotRetained,
+                };
+                state.last_retained = Some((pid, poll));
+                state.last_exit = None;
+                state.last_stat = None;
+            }
+        });
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(super) fn record_candidate_stat(
+        pid: i32,
+        parent_pid: Option<i32>,
+        start_ticks: u64,
+        creator_start_ticks: u64,
+    ) {
+        CLEANUP_DIAGNOSTICS.with(|state| {
+            if let Some(state) = state.borrow_mut().as_mut() {
+                state.last_stat = Some(CandidateStatDiagnostic {
+                    pid,
+                    parent_pid,
+                    start_ticks,
+                    creator_start_ticks,
+                });
+            }
+        });
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(super) fn record_exit_poll(fd: i32, result: i32, revents: i16, errno: Option<i32>) {
+        CLEANUP_DIAGNOSTICS.with(|state| {
+            if let Some(state) = state.borrow_mut().as_mut() {
+                state.last_exit = Some((fd, (result, revents, errno)));
+            }
+        });
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(super) fn record_environment_denial(pid: i32, fd: i32, read_errno: Option<i32>) {
+        CLEANUP_DIAGNOSTICS.with(|state| {
+            let mut state = state.borrow_mut();
+            let Some(state) = state.as_mut() else {
+                return;
+            };
+            if state.denials.len() == 16 {
+                state.omitted_denials = state.omitted_denials.saturating_add(1);
+                return;
+            }
+            let role = |pid| {
+                state
+                    .fixture_pids
+                    .iter()
+                    .find_map(|(role, fixture_pid)| (*fixture_pid == pid).then_some(*role))
+                    .unwrap_or("other")
+            };
+            let stat = state.last_stat.filter(|stat| stat.pid == pid);
+            let fixture_role = role(pid);
+            let parent_fixture_role = stat.and_then(|stat| stat.parent_pid).map(role);
+            state.denials.push(CleanupDenialDiagnostic {
+                sweep: state.sweep,
+                pid,
+                fixture_role,
+                parent_fixture_role,
+                stat,
+                retained: state
+                    .last_retained
+                    .filter(|(last_pid, _)| *last_pid == pid)
+                    .map(|(_, poll)| poll)
+                    .unwrap_or(RetainedPollObservation::NotObserved),
+                exit_poll: state
+                    .last_exit
+                    .filter(|(last_fd, _)| *last_fd == fd)
+                    .map(|(_, poll)| poll),
+                read_errno,
+                injected: DENIED_ENVIRONMENT_PID.with(|denied| denied.get() == Some(pid)),
+            });
+        });
+    }
+
+    #[cfg(target_os = "linux")]
     type SweepObserver = Box<dyn FnMut() -> roundtable_protocol::RtResult<()>>;
 
     #[cfg(target_os = "linux")]
@@ -2921,6 +3144,14 @@ mod control_tests {
 
     #[cfg(target_os = "linux")]
     pub(super) fn before_cleanup_sweep() -> roundtable_protocol::RtResult<()> {
+        CLEANUP_DIAGNOSTICS.with(|state| {
+            if let Some(state) = state.borrow_mut().as_mut() {
+                state.sweep = state.sweep.saturating_add(1);
+                state.last_retained = None;
+                state.last_exit = None;
+                state.last_stat = None;
+            }
+        });
         SWEEP_OBSERVER.with(|observer| match observer.borrow_mut().as_mut() {
             Some(callback) => callback(),
             None => Ok(()),
@@ -2935,6 +3166,64 @@ mod control_tests {
         fn drop(&mut self) {
             SWEEP_OBSERVER.with(|observer| *observer.borrow_mut() = None);
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn cleanup_diagnostics_are_bounded_and_distinguish_fixture_and_unknown_identity() {
+        let capture =
+            CleanupDiagnosticCapture::start([("helper", 10), ("watcher", 11), ("descendant", 12)]);
+        before_cleanup_sweep().unwrap();
+        record_retained_poll(12, Some((-1, 0, Some(libc::EINTR))));
+        record_exit_poll(7, 0, 0, None);
+        record_candidate_stat(12, Some(11), 30, 20);
+        DENIED_ENVIRONMENT_PID.with(|denied| denied.set(Some(12)));
+        record_environment_denial(12, 7, None);
+        DENIED_ENVIRONMENT_PID.with(|denied| denied.set(None));
+        record_retained_poll(99, None);
+        // Even a reused fd number must not borrow the previous PID's data.
+        record_environment_denial(99, 7, Some(libc::EACCES));
+        record_exit_poll(8, 0, 0, None);
+        record_candidate_stat(99, Some(77), 40, 20);
+        for _ in 0..20 {
+            record_environment_denial(99, 8, Some(libc::EACCES));
+        }
+        let diagnostics = capture.finish();
+        assert_eq!(diagnostics.denials.len(), 16);
+        assert_eq!(diagnostics.omitted_denials, 6);
+        let target = &diagnostics.denials[0];
+        assert_eq!(target.fixture_role, "descendant");
+        assert_eq!(target.pid, 12);
+        assert_eq!(target.parent_fixture_role, Some("watcher"));
+        assert_eq!(target.stat.unwrap().start_ticks, 30);
+        assert_eq!(target.stat.unwrap().creator_start_ticks, 20);
+        assert_eq!(target.sweep, 1);
+        assert!(target.injected);
+        assert_eq!(target.read_errno, None);
+        assert!(matches!(
+            target.retained,
+            RetainedPollObservation::Polled {
+                result: -1,
+                revents: 0,
+                errno: Some(libc::EINTR),
+            }
+        ));
+        assert_eq!(target.exit_poll, Some((0, 0, None)));
+        let reset = &diagnostics.denials[1];
+        assert!(reset.stat.is_none());
+        assert!(reset.exit_poll.is_none());
+        assert!(reset.parent_fixture_role.is_none());
+        let unknown = &diagnostics.denials[2];
+        assert_eq!(unknown.fixture_role, "other");
+        assert_eq!(unknown.pid, 99);
+        assert_eq!(unknown.parent_fixture_role, Some("other"));
+        assert!(!unknown.injected);
+        assert_eq!(unknown.read_errno, Some(libc::EACCES));
+        assert!(matches!(
+            unknown.retained,
+            RetainedPollObservation::NotRetained
+        ));
+        CLEANUP_DIAGNOSTICS.with(|state| assert!(state.borrow().is_none()));
     }
 
     #[cfg(target_os = "linux")]
@@ -3531,7 +3820,13 @@ mod control_tests {
             }));
         });
         let observer = SweepObserverGuard;
+        let capture = CleanupDiagnosticCapture::start([
+            ("helper", helper.id() as i32),
+            ("watcher", watcher.id() as i32),
+            ("descendant", descendant.id() as i32),
+        ]);
         let result = super::stop_slirp(root.path(), id, true);
+        let diagnostics = capture.finish();
         drop(observer);
         DENIED_ENVIRONMENT_PID.with(|denied| denied.set(None));
         let ended = descendant.try_wait().unwrap();
@@ -3544,7 +3839,7 @@ mod control_tests {
             sweeps.get() >= 2,
             "the denial must follow initial retention"
         );
-        result.unwrap();
+        result.unwrap_or_else(|error| panic!("{error:?}; cleanup diagnostics: {diagnostics:?}"));
         assert!(ended.is_some_and(|status| status.signal() == Some(libc::SIGKILL)));
         assert_eq!(
             std::fs::read_to_string(pin.with_extension("pid.state")).unwrap(),
@@ -3615,7 +3910,13 @@ mod control_tests {
             &pin,
             &(pin_line("slirp", helper.id()) + &pin_line("watcher", watcher.id())),
         );
+        let capture = CleanupDiagnosticCapture::start([
+            ("helper", helper.id() as i32),
+            ("watcher", watcher.id() as i32),
+            ("descendant", descendant.id() as i32),
+        ]);
         let result = super::stop_slirp(root.path(), id, true);
+        let diagnostics = capture.finish();
         let ended = descendant.try_wait().unwrap();
         let _ = helper.kill();
         let _ = watcher.kill();
@@ -3623,7 +3924,7 @@ mod control_tests {
         let _ = helper.wait();
         let _ = watcher.wait();
         let _ = descendant.wait();
-        result.unwrap();
+        result.unwrap_or_else(|error| panic!("{error:?}; cleanup diagnostics: {diagnostics:?}"));
         assert!(
             changed.exists(),
             "descendant must run its TERM-to-exec path"

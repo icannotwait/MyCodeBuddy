@@ -282,3 +282,38 @@ fake hook tests pass 3/3. Native aggregate remains 96/98 with missing rustc and
 Cargo prerequisites. Rust test commands exit 127; local Rust tests and rustfmt
 remain UNRUN. Existing CI must verify the patch and whether it resolves the
 reported failure; genuine unknown live unreadable processes remain unproven.
+
+## Desktop-only denial attribution at 4850a5d
+
+The Linux server job at `4850a5d` passes 7771 library tests, with one ignored,
+plus four binary tests and Clippy. The Linux desktop job reports 8080 passed,
+2 failed, 1 ignored. Its failures are the retained-identity diagnostic
+regression and the original marker-clearing descendant test, both with
+`slirp_proc_environment_denied_within_scope`. The contrast does not identify
+the denied process and does not justify suppressing the error.
+
+This batch adds test-only diagnostics, armed only by those two process
+fixtures. A thread-local capture retains at most 16 denied-candidate records
+and an omitted-record count. Each record includes the sweep, candidate PID,
+fixed fixture-role comparison, actual retained-gate poll result/revents/errno,
+actual candidate-exit poll observation, original environment-read errno and
+whether the test injected that denial. Numeric PPID, start tick and creator
+birth tick come from the stat buffer already read by discovery. Observed
+parentage is diagnostic only: reparenting can make a fixture child appear to
+have another parent.
+
+No environment bytes, process names, commands or paths enter the diagnostic
+records. Poll results are captured from the existing calls, with errno read
+immediately; there are no diagnostic polls or additional proc reads. Pending
+observations reset per candidate and per sweep, preventing reused fd numbers
+from inheriting another candidate's data. The snapshot is printed only when
+the existing cleanup result assertion fails, after the fixture's existing
+child cleanup. No cleanup is rerun and no production proof/signal decision or
+termination assertion changes.
+
+A pure collector regression checks role classification, injected versus real
+read errors, EINTR preservation, candidate-cache reset, the record cap and
+thread-local release. Local Rust execution remains UNRUN (Cargo command exits
+127), as does rustfmt. Fake hook tests pass 3/3; native aggregate remains
+96/98, with the missing-rustc and missing-Cargo prerequisites. Existing CI
+must provide the denied-candidate evidence before any further behavioral fix.

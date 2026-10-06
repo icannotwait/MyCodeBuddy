@@ -4,7 +4,7 @@ Date: 2026-10-06 UTC
 
 This checklist tracks the 21 findings from the review of `2f57bcde4418bb014b09ba6e127416af07396a81`. The repairs preserve upstream `a470c4aeedd3c6f8e8c999e8d4ec47b37b171870`, including the shared live/probe ACP exchange, production resolver configuration, phase-pinned tool schema, bounded submission repair and Grok session restrictions.
 
-**Verification state:** repair implementation is integrated; required dynamic verification remains outstanding. Rust compilation, Rust tests, formatting, React/Vitest, project type checking, lint and application build have not run locally. Source review and native checks are not substitutes for those checks. The execution gate must remain disabled; this checklist does not certify a live adapter or host.
+**Verification state:** the finding table and local-check section below preserve the initial integration checkpoint. Later executable CI checkpoints record actual validation and remaining failures. Rust compilation, Rust tests, formatting, React/Vitest, project type checking, lint and application build have not run locally. Source review and native checks are not substitutes for those checks. The execution gate must remain disabled; this checklist does not certify a live adapter or host.
 
 ## Finding coverage
 
@@ -193,6 +193,39 @@ handle/reused-key regressions preserve all cleanup and quarantine assertions.
 The CI log did not identify the denied PID; attribution of that observed
 failure to the descendant's exec transition remains an inference until
 subsequent execution verifies the correction.
+
+### Cross-platform checkpoint: `4850a5d`
+
+At 2026-10-06 10:46 UTC, the [CI run for `4850a5d`](https://github.com/icannotwait/MyCodeBuddy/actions/runs/37448668644)
+had these exact-commit results:
+
+- Formatting and protocol jobs passed; the protocol suite passed all 45 tests
+- Runtime passed 122 tests, with 1 live-host test ignored
+- Frontend passed lint, browser bundle/type checks, 688 Vitest files with
+  11,192 tests passed and 15 skipped, 103 release-script tests and static export
+- Linux server passed 7,771 library tests, with 1 ignored, plus 4 binary tests
+  and Clippy
+- Windows server passed 7,579 library tests, with 1 ignored, plus 4 binary tests
+  and Clippy; Windows desktop passed test compilation (`--no-run`) and Clippy
+- Linux desktop ran 8,080 passing library tests, 2 failures and 1 ignored;
+  later integration and Clippy steps were not reached
+- macOS server and desktop were still in their `cargo test` steps, with no
+  terminal result available
+
+Both Linux desktop failures returned
+`slirp_proc_environment_denied_within_scope`: the original descendant
+environment-clear test and the deterministic retained-identity read-denial
+test. Both passed in the Linux server suite. The logs did not identify which
+process denied access, so these results do not establish that the failing
+candidate was the retained descendant or that the positive-live-handle guard
+failed. F16 remains unresolved until evidence distinguishes the cause.
+
+The next diagnostic change records only bounded, test-only numeric identities,
+fixed fixture roles and results of already-executed reads/polls in these two
+fixtures. It adds no process observations or cleanup retries and does not
+relax production ownership, signaling or proof decisions. Further production
+changes require the actual denied identity; an unknown live process must
+continue to invalidate cleanup proof.
 
 ## Capability boundaries retained
 
