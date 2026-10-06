@@ -1847,8 +1847,7 @@ pub(super) fn stop_slirp(runtime_root: &Path, id: &str, expected: bool) -> RtRes
                 match inspect() {
                     Ok(Some(identity)) => {
                         if found.len() >= 1024 {
-                            first_error
-                                .get_or_insert_with(|| unproven_at("slirp_discovery_limit"));
+                            first_error.get_or_insert_with(|| unproven_at("slirp_discovery_limit"));
                             break;
                         }
                         found.push(identity);
@@ -2090,7 +2089,7 @@ pub(super) fn stop_slirp(runtime_root: &Path, id: &str, expected: bool) -> RtRes
             }
             if began.elapsed() > Duration::from_secs(3) {
                 return Err(
-                    discovery_error.unwrap_or_else(|| unproven_at("slirp_cleanup_deadline")),
+                    discovery_error.unwrap_or_else(|| unproven_at("slirp_cleanup_deadline"))
                 );
             }
             std::thread::sleep(Duration::from_millis(20));
