@@ -2983,7 +2983,8 @@ mod control_tests {
             assert!(pids.iter().all(|pid| *pid > 1 && *pid <= i32::MAX as u32));
             let unique: std::collections::BTreeSet<_> = pids.iter().copied().collect();
             assert_eq!(
-                unique.len(), pids.len(),
+                unique.len(),
+                pids.len(),
                 "inventory must be explicit and unique"
             );
             CONTROLLED_INVENTORY.with(|state| {
@@ -3034,9 +3035,7 @@ mod control_tests {
 
     #[cfg(target_os = "linux")]
     fn candidate_inventory() -> Option<Vec<i32>> {
-        CONTROLLED_INVENTORY.with(|state| {
-            state.borrow().as_ref().map(|state| state.pids.clone())
-        })
+        CONTROLLED_INVENTORY.with(|state| state.borrow().as_ref().map(|state| state.pids.clone()))
     }
 
     #[cfg(target_os = "linux")]
@@ -3349,10 +3348,7 @@ mod control_tests {
                 .unwrap()
                 .map(|entry| entry.unwrap().file_name())
                 .collect();
-            assert_eq!(
-                entries,
-                ["10", "11", "99"].map(std::ffi::OsString::from)
-            );
+            assert_eq!(entries, ["10", "11", "99"].map(std::ffi::OsString::from));
             assert!(force_rediscovery());
             std::thread::spawn(|| {
                 assert!(candidate_inventory().is_none());
@@ -3999,10 +3995,8 @@ mod control_tests {
             &pin,
             &(pin_line("slirp", helper.id()) + &pin_line("watcher", watcher.id())),
         );
-        let _inventory = ControlledInventory::start(
-            &[helper.id(), watcher.id(), descendant.id()],
-            false,
-        );
+        let _inventory =
+            ControlledInventory::start(&[helper.id(), watcher.id(), descendant.id()], false);
         let identities = [helper.id(), watcher.id(), descendant.id()].map(|pid| {
             let raw = unsafe { libc::syscall(libc::SYS_pidfd_open, pid as i32, 0) };
             assert!(raw >= 0);
@@ -4146,7 +4140,8 @@ mod control_tests {
             ));
             assert_eq!(phase, "cleanup-in-progress-started\n");
         } else {
-            result.unwrap_or_else(|error| panic!("{error:?}; cleanup diagnostics: {diagnostics:?}"));
+            result
+                .unwrap_or_else(|error| panic!("{error:?}; cleanup diagnostics: {diagnostics:?}"));
             assert!(diagnostics.denials.is_empty());
             assert_eq!(phase, "cleanup-proven-started\n");
         }
@@ -4222,10 +4217,8 @@ mod control_tests {
             ("watcher", watcher.id() as i32),
             ("descendant", descendant.id() as i32),
         ]);
-        let _inventory = ControlledInventory::start(
-            &[helper.id(), watcher.id(), descendant.id()],
-            false,
-        );
+        let _inventory =
+            ControlledInventory::start(&[helper.id(), watcher.id(), descendant.id()], false);
         let result = super::stop_slirp(root.path(), id, true);
         let diagnostics = capture.finish();
         let ended = descendant.try_wait().unwrap();
@@ -4294,10 +4287,8 @@ mod control_tests {
             }));
         });
         let fault = SweepObserverGuard;
-        let _inventory = ControlledInventory::start(
-            &[helper.id(), watcher.id(), descendant.id()],
-            false,
-        );
+        let _inventory =
+            ControlledInventory::start(&[helper.id(), watcher.id(), descendant.id()], false);
         let first = super::stop_slirp(root.path(), id, true);
         drop(fault);
         let alive_after_fault = descendant.try_wait().unwrap().is_none();
