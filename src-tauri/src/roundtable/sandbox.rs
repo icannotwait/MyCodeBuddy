@@ -1078,10 +1078,12 @@ mod shared_journal_tests {
     #[tokio::test]
     async fn a_failed_pre_exec_launch_has_a_durable_no_process_proof() {
         let dir = tempfile::tempdir().unwrap();
-        let (profile, _, _) = cleanup_fixture(dir.path());
-        let journal_dir = dir.path().join("journal");
+        // macOS temporary paths can have a symlinked /var ancestor.
+        let root = dir.path().canonicalize().unwrap();
+        let (profile, _, _) = cleanup_fixture(&root);
+        let journal_dir = root.join("journal");
         for name in ["scratch", "project", "home"] {
-            fs::create_dir_all(dir.path().join(name)).unwrap();
+            fs::create_dir_all(root.join(name)).unwrap();
         }
         let key = QualificationKey {
             os: super::super::qualification::OsIdentity {
@@ -1092,7 +1094,7 @@ mod shared_journal_tests {
                 profile.runtime.clone(),
                 CertifiedBinary {
                     role: "cli".into(),
-                    absolute_path: dir.path().join("cli").display().to_string(),
+                    absolute_path: root.join("cli").display().to_string(),
                     version: "fake".into(),
                     sha256: Hash256::from_bytes([8; 32]),
                 },
@@ -1110,9 +1112,9 @@ mod shared_journal_tests {
             db: DbIdentity::new("pre-exec-review").unwrap(),
             boot_epoch: Epoch(1),
             incarnation: "00000000-0000-4000-8000-000000000011".parse().unwrap(),
-            scratch: dir.path().join("scratch"),
-            project: dir.path().join("project"),
-            home: dir.path().join("home"),
+            scratch: root.join("scratch"),
+            project: root.join("project"),
+            home: root.join("home"),
             other_scratches: vec![],
             decoy_paths: vec![],
             inherited_env: BTreeMap::new(),

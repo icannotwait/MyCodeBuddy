@@ -750,13 +750,20 @@ impl RoundtableStore {
 
     #[cfg(any(test, feature = "test-utils"))]
     pub(crate) fn take_completed_run_gate(&self) -> Option<Arc<LockGate>> {
-        self.faults.lock().expect("faults").completed_run_gate.take()
+        self.faults
+            .lock()
+            .expect("faults")
+            .completed_run_gate
+            .take()
     }
 
     #[cfg(any(test, feature = "test-utils"))]
     pub fn arm_completion_observation_gate(&self) -> Arc<LockGate> {
         let gate = LockGate::new();
-        self.faults.lock().expect("faults").completion_observation_gate = Some(gate.clone());
+        self.faults
+            .lock()
+            .expect("faults")
+            .completion_observation_gate = Some(gate.clone());
         gate
     }
 

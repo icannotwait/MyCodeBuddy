@@ -540,6 +540,7 @@ fn acp_session_error_stops_slirp_and_deletes_the_container() {
     fs::set_permissions(&crun, fs::Permissions::from_mode(0o755)).expect("chmod");
     let runtime_root = dir.join("runtime");
     fs::create_dir_all(runtime_root.join("slirp-pids")).expect("pids");
+    initialize_fake_helper_lifecycle(&runtime_root, "cq-acp-9");
     let mut slirp = Command::new("sleep")
         .env("CODEG_ROUNDTABLE_SLIRP_ROLE", "slirp")
         .env("CODEG_ROUNDTABLE_SLIRP_OWNER", "cq-acp-9")
@@ -1160,6 +1161,7 @@ fn probe_cleanup_cannot_leave_a_slirp_helper_that_ignores_term() {
     let root = tempfile::tempdir().unwrap();
     let runtime_root = root.path().join("runtime");
     fs::create_dir_all(runtime_root.join("slirp-pids")).unwrap();
+    initialize_fake_helper_lifecycle(&runtime_root, "cq-acp-review");
     let ready = root.path().join("helper-ready");
     let mut helper = std::process::Command::new("sh")
         .env("CODEG_ROUNDTABLE_SLIRP_ROLE", "slirp")
@@ -1227,6 +1229,7 @@ fn stale_slirp_pidfile_cannot_signal_an_unrelated_process() {
     let root = tempfile::tempdir().unwrap();
     let runtime_root = root.path().join("runtime");
     fs::create_dir_all(runtime_root.join("slirp-pids")).unwrap();
+    initialize_fake_helper_lifecycle(&runtime_root, "cq-acp-stale");
     let mut unrelated = std::process::Command::new("sleep")
         .arg("30")
         .spawn()
@@ -1272,6 +1275,14 @@ fn spawn_owned_watcher(runtime_root: &Path, id: &str) -> std::process::Child {
 }
 
 #[cfg(target_os = "linux")]
+fn initialize_fake_helper_lifecycle(runtime_root: &Path, id: &str) {
+    // The actual initializer publishes birth evidence before fake children,
+    // exactly as it does before returning a production hook specification.
+    codeg_lib::roundtable::live_slirp_document(runtime_root, id, &runtime_root.join("unused-slirp"))
+        .expect("initialize fake helper lifecycle");
+}
+
+#[cfg(target_os = "linux")]
 fn write_helper_lifecycle_pins(runtime_root: &Path, id: &str, pins: &[(&str, u32)]) {
     use std::os::unix::fs::PermissionsExt;
     let mut body = String::new();
@@ -1289,9 +1300,5 @@ fn write_helper_lifecycle_pins(runtime_root: &Path, id: &str, pins: &[(&str, u32
     let path = runtime_root.join("slirp-pids").join(format!("{id}.pid"));
     fs::write(&path, body).unwrap();
     fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
-    for (suffix, body) in [("pid.lock", ""), ("pid.state", "running\n")] {
-        let state = path.with_extension(suffix);
-        fs::write(&state, body).unwrap();
-        fs::set_permissions(state, fs::Permissions::from_mode(0o600)).unwrap();
-    }
+    fs::write(path.with_extension("pid.state"), "running\n").unwrap();
 }

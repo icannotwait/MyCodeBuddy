@@ -1226,9 +1226,168 @@ pub fn live_slirp_document(runtime_root: &Path, id: &str, slirp_bin: &Path) -> R
     Ok(oci)
 }
 
+#[cfg(target_os = "linux")]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct HelperBirthContext {
+    version: u32,
+    boot_id: String,
+    pid_namespace: String,
+    time_namespace: Option<String>,
+    zero_boottime_offset: bool,
+    creator_start_ticks: u64,
+}
+
+#[cfg(target_os = "linux")]
+fn validate_proc_number_space(link: &str, pid: u32) -> RtResult<()> {
+    if link.parse::<u32>().ok() != Some(pid) {
+        return Err(rt_error(
+            ErrorCode::PolicyUnenforceable,
+            "slirp_proc_number_space",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn helper_start_ticks(stat: &str) -> RtResult<u64> {
+    stat.rsplit_once(") ")
+        .and_then(|(_, rest)| rest.split_whitespace().nth(19))
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .ok_or_else(|| rt_error(ErrorCode::PolicyUnenforceable, "slirp_proc_start_unreadable"))
+}
+
+#[cfg(target_os = "linux")]
+fn zero_boottime_offset(offsets: &str) -> bool {
+    let mut boot = offsets
+        .lines()
+        .filter(|line| line.split_whitespace().next() == Some("boottime"));
+    let Some(line) = boot.next() else {
+        return false;
+    };
+    let fields: Vec<_> = line.split_whitespace().collect();
+    boot.next().is_none() && fields == ["boottime", "0", "0"]
+}
+
+#[cfg(target_os = "linux")]
+fn usable_helper_boot_clock(
+    current: Option<&str>,
+    children: Option<&str>,
+    offsets: Option<&str>,
+) -> bool {
+    current.is_some() && current == children && offsets.is_some_and(zero_boottime_offset)
+}
+
+#[cfg(target_os = "linux")]
+impl HelperBirthContext {
+    fn capture() -> RtResult<Self> {
+        let unavailable = || {
+            rt_error(ErrorCode::PolicyUnenforceable, "slirp_birth_context_unavailable")
+        };
+        let read = |path: &str| -> RtResult<String> {
+            let mut text = String::new();
+            fs::File::open(path)
+                .map_err(|_| unavailable())?
+                .take(4097)
+                .read_to_string(&mut text)
+                .map_err(|_| unavailable())?;
+            if text.len() > 4096 {
+                return Err(unavailable());
+            }
+            Ok(text)
+        };
+        let tid = unsafe { libc::syscall(libc::SYS_gettid) };
+        if tid <= 0 {
+            return Err(unavailable());
+        }
+        let thread_link = fs::read_link("/proc/thread-self").map_err(|_| unavailable())?;
+        if thread_link != PathBuf::from(format!("{}/task/{tid}", std::process::id())) {
+            return Err(unavailable());
+        }
+        let namespace = |name: &str| -> RtResult<Option<String>> {
+            match fs::read_link(format!("/proc/{tid}/ns/{name}")) {
+                Ok(link) => link
+                    .to_str()
+                    .map(|link| Some(link.to_string()))
+                    .ok_or_else(unavailable),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+                Err(_) => Err(unavailable()),
+            }
+        };
+        let self_link = fs::read_link("/proc/self").map_err(|_| unavailable())?;
+        validate_proc_number_space(
+            self_link.to_str().ok_or_else(unavailable)?,
+            std::process::id(),
+        )?;
+        let boot_id = uuid::Uuid::parse_str(read("/proc/sys/kernel/random/boot_id")?.trim())
+            .map_err(|_| unavailable())?;
+        if boot_id.is_nil() {
+            return Err(unavailable());
+        }
+        let pid_namespace = namespace("pid")?.ok_or_else(unavailable)?;
+        // Unavailable time context is explicitly unsupported, never evidence
+        // for exclusion. Boot/PID identity errors above still prevent use of
+        // numeric process identities altogether.
+        let time_namespace = namespace("time").unwrap_or(None);
+        let time_for_children = namespace("time_for_children").unwrap_or(None);
+        // timens_offsets describes the children namespace, while proc stat
+        // uses the reader's current time namespace. A negative offset can
+        // wrap an old birth timestamp, so only an exact zero offset is usable.
+        // Numeric TID lookup uses proc's top-level entry table, which
+        // exposes timens_offsets; /proc/thread-self's task table does not.
+        let offsets = if time_namespace.is_some() && time_namespace == time_for_children {
+            read(&format!("/proc/{tid}/timens_offsets")).ok()
+        } else {
+            None
+        };
+        let zero_boottime_offset = usable_helper_boot_clock(
+            time_namespace.as_deref(),
+            time_for_children.as_deref(),
+            offsets.as_deref(),
+        );
+        Ok(Self {
+            version: 1,
+            boot_id: boot_id.to_string(),
+            pid_namespace,
+            time_namespace,
+            zero_boottime_offset,
+            creator_start_ticks: helper_start_ticks(&read("/proc/self/stat")?)?,
+        })
+    }
+
+    fn validate(&self, current: &Self) -> RtResult<()> {
+        if self.version != 1
+            || current.version != 1
+            || self.boot_id != current.boot_id
+            || self.pid_namespace != current.pid_namespace
+            || self.time_namespace != current.time_namespace
+            || self.zero_boottime_offset != current.zero_boottime_offset
+            || self.creator_start_ticks == 0
+            || self.creator_start_ticks > current.creator_start_ticks
+            || (self.zero_boottime_offset && self.time_namespace.is_none())
+        {
+            return Err(rt_error(
+                ErrorCode::PolicyUnenforceable,
+                "slirp_birth_context_changed",
+            ));
+        }
+        Ok(())
+    }
+
+    fn predates(&self, start_ticks: u64) -> bool {
+        self.time_namespace.is_some()
+            && self.zero_boottime_offset
+            && start_ticks > 0
+            && start_ticks < self.creator_start_ticks
+    }
+}
+
 fn initialize_slirp_lifecycle(pidfile: &Path) -> RtResult<()> {
+    let unavailable = || rt_error(ErrorCode::StorageUnavailable, "slirp_lifecycle");
+    let parent = pidfile.parent().ok_or_else(unavailable)?;
     let mut options = fs::OpenOptions::new();
-    options.write(true).create_new(true);
+    options.write(true).read(true).create_new(true);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
@@ -1236,26 +1395,56 @@ fn initialize_slirp_lifecycle(pidfile: &Path) -> RtResult<()> {
             .mode(0o600)
             .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
     }
-    for (path, body) in [
-        (pidfile.with_extension("pid.lock"), b"".as_slice()),
-        (
-            pidfile.with_extension("pid.state"),
-            b"prepared\n".as_slice(),
-        ),
-    ] {
-        let mut file = options
-            .open(path)
-            .map_err(|_| rt_error(ErrorCode::StorageUnavailable, "slirp_lifecycle"))?;
-        file.write_all(body)
-            .and_then(|()| file.sync_all())
-            .map_err(|_| rt_error(ErrorCode::StorageUnavailable, "slirp_lifecycle"))?;
+    let lock = options
+        .open(pidfile.with_extension("pid.lock"))
+        .map_err(|_| unavailable())?;
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::fd::AsRawFd;
+        if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+            return Err(unavailable());
+        }
     }
-    crate::roundtable::feature_gate::fsync_dir(
-        pidfile
-            .parent()
-            .ok_or_else(|| rt_error(ErrorCode::StorageUnavailable, "slirp_lifecycle"))?,
-    )
-    .map_err(|_| rt_error(ErrorCode::StorageUnavailable, "slirp_lifecycle"))
+    // Never attach fresh birth evidence to a legacy/running artifact set.
+    for path in [
+        pidfile.to_path_buf(),
+        pidfile.with_extension("pid.state"),
+        pidfile.with_extension("pid.birth"),
+    ] {
+        match fs::symlink_metadata(path) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            _ => return Err(unavailable()),
+        }
+    }
+    let mut state = options
+        .open(pidfile.with_extension("pid.state"))
+        .map_err(|_| unavailable())?;
+    state
+        .write_all(b"preparing\n")
+        .and_then(|()| state.sync_all())
+        .map_err(|_| unavailable())?;
+    #[cfg(target_os = "linux")]
+    {
+        let context = HelperBirthContext::capture()?;
+        let body = serde_json::to_vec(&context).map_err(|_| unavailable())?;
+        let mut birth = options
+            .open(pidfile.with_extension("pid.birth"))
+            .map_err(|_| unavailable())?;
+        birth
+            .write_all(&body)
+            .and_then(|()| birth.sync_all())
+            .map_err(|_| unavailable())?;
+        crate::roundtable::feature_gate::fsync_dir(parent).map_err(|_| unavailable())?;
+    }
+    use std::io::{Seek, SeekFrom};
+    state
+        .seek(SeekFrom::Start(0))
+        .and_then(|_| state.set_len(0))
+        .and_then(|()| state.write_all(b"prepared\n"))
+        .and_then(|()| state.sync_all())
+        .map_err(|_| unavailable())?;
+    lock.sync_all().map_err(|_| unavailable())?;
+    crate::roundtable::feature_gate::fsync_dir(parent).map_err(|_| unavailable())
 }
 
 #[cfg(target_os = "linux")]
@@ -1278,6 +1467,7 @@ fn helper_process_exited(fd: &std::os::fd::OwnedFd) -> bool {
 fn resolve_helper_environment(
     fd: &std::os::fd::OwnedFd,
     result: std::io::Result<Vec<u8>>,
+    age_proof: bool,
 ) -> RtResult<Option<Vec<u8>>> {
     match result {
         Ok(environment) => Ok(Some(environment)),
@@ -1285,10 +1475,11 @@ fn resolve_helper_environment(
         Err(error) => {
             // A zombie can deny environ even when its proc directory remains.
             // Only the identity pinned before this read can prove it exited.
-            let reason = if error.kind() == std::io::ErrorKind::PermissionDenied {
-                "slirp_proc_environment_denied_live"
-            } else {
-                "slirp_proc_environment_unreadable_live"
+            let reason = match (error.kind() == std::io::ErrorKind::PermissionDenied, age_proof) {
+                (true, true) => "slirp_proc_environment_denied_within_scope",
+                (true, false) => "slirp_proc_environment_denied_no_age_proof",
+                (false, true) => "slirp_proc_environment_unreadable_within_scope",
+                (false, false) => "slirp_proc_environment_unreadable_no_age_proof",
             };
             Err(rt_error(ErrorCode::PolicyUnenforceable, reason))
         }
@@ -1405,6 +1596,7 @@ pub(super) fn stop_slirp(runtime_root: &Path, id: &str, expected: bool) -> RtRes
         fn owned_helpers(
             runtime_root: &Path,
             id: &str,
+            birth: Option<&HelperBirthContext>,
         ) -> (Vec<(i32, OwnedFd)>, RtResult<()>) {
             let mut found = Vec::new();
             let mut first_error = None;
@@ -1444,10 +1636,28 @@ pub(super) fn stop_slirp(runtime_root: &Path, id: &str, expected: bool) -> RtRes
                     let Some(fd) = pidfd(pid)? else {
                         return Ok(None);
                     };
+                    if let Some(birth) = birth.filter(|birth| birth.zero_boottime_offset) {
+                        let stat = fs::read_to_string(entry.path().join("stat"));
+                        if helper_process_exited(&fd) {
+                            return Ok(None);
+                        }
+                        let start = helper_start_ticks(
+                            &stat.map_err(|_| unproven_at("slirp_proc_start_unreadable"))?,
+                        )?;
+                        // The pinned identity remained alive across the stat
+                        // read, so the numeric path cannot name a replacement.
+                        if birth.predates(start) {
+                            return Ok(None);
+                        }
+                    }
                     let environment = fs::read(entry.path().join("environ"));
                     #[cfg(test)]
                     let environment = control_tests::helper_environment(pid, environment);
-                    let Some(environment) = resolve_helper_environment(&fd, environment)? else {
+                    let Some(environment) = resolve_helper_environment(
+                        &fd,
+                        environment,
+                        birth.is_some_and(|birth| birth.zero_boottime_offset),
+                    )? else {
                         return Ok(None);
                     };
                     if !marked(&environment, runtime_root, id, None) {
@@ -1548,6 +1758,7 @@ pub(super) fn stop_slirp(runtime_root: &Path, id: &str, expected: bool) -> RtRes
             .read_to_string(&mut phase)
             .map_err(|_| unproven_at("slirp_lifecycle_state_unreadable"))?;
         let never_started = match phase.trim() {
+            "preparing" => return Err(unproven_at("slirp_lifecycle_initializing")),
             "prepared" | "cleanup-proven-never-started" => true,
             "starting" | "running" | "cleanup-proven-started" => false,
             // Old cancelled states did not persist descendant obligations.
@@ -1563,6 +1774,31 @@ pub(super) fn stop_slirp(runtime_root: &Path, id: &str, expected: bool) -> RtRes
             }
             _ => return Err(unproven_at("slirp_lifecycle_state_invalid")),
         };
+        // Proc numbers and pidfds must refer to the same current namespace.
+        // A missing/corrupt persisted record remains an error, never a new
+        // birth cutoff inferred from this cleanup process.
+        let current_context = HelperBirthContext::capture()?;
+        let birth = (|| -> RtResult<HelperBirthContext> {
+            let mut body = String::new();
+            private_file(&pidfile.with_extension("pid.birth"), false)?
+                .take(4097)
+                .read_to_string(&mut body)
+                .map_err(|_| unproven_at("slirp_birth_evidence_unreadable"))?;
+            if body.len() > 4096 {
+                return Err(unproven_at("slirp_birth_evidence_invalid"));
+            }
+            let value: Value = serde_json::from_str(&body)
+                .map_err(|_| unproven_at("slirp_birth_evidence_invalid"))?;
+            // An explicit null means unsupported. Omission is incomplete
+            // evidence, not permission to infer the current clock domain.
+            if value.get("time_namespace").is_none() {
+                return Err(unproven_at("slirp_birth_evidence_invalid"));
+            }
+            let evidence: HelperBirthContext = serde_json::from_str(&body)
+                .map_err(|_| unproven_at("slirp_birth_evidence_invalid"))?;
+            evidence.validate(&current_context)?;
+            Ok(evidence)
+        })();
         // Persist quarantine before the first signal can make a process
         // erase its markers. Only this lock-owning invocation can discharge
         // its in-memory pidfd obligations and publish a successful proof.
@@ -1580,11 +1816,14 @@ pub(super) fn stop_slirp(runtime_root: &Path, id: &str, expected: bool) -> RtRes
         let began = std::time::Instant::now();
         let mut empty_observations = 0;
         let mut retained: BTreeMap<i32, OwnedFd> = BTreeMap::new();
-        let mut discovery_error = None;
+        let (birth, mut discovery_error) = match birth {
+            Ok(birth) => (Some(birth), None),
+            Err(error) => (None, Some(error)),
+        };
         loop {
             #[cfg(test)]
             control_tests::before_cleanup_sweep()?;
-            let (found, discovery) = owned_helpers(runtime_root, id);
+            let (found, discovery) = owned_helpers(runtime_root, id, birth.as_ref());
             if let Err(error) = discovery {
                 discovery_error.get_or_insert(error);
             }
@@ -2621,6 +2860,282 @@ mod control_tests {
 
     #[cfg(target_os = "linux")]
     #[test]
+    fn helper_birth_exclusion_is_strict_and_keeps_the_original_context() {
+        let mut original = super::HelperBirthContext::capture().unwrap();
+        original.creator_start_ticks = 100;
+        original.time_namespace = Some("time:[123]".into());
+        original.zero_boottime_offset = true;
+        let mut recovered = original.clone();
+        recovered.creator_start_ticks = 200;
+        original.validate(&recovered).unwrap();
+        assert!(original.predates(99));
+        assert!(!original.predates(100));
+        assert!(!original.predates(101));
+        assert_eq!(
+            original.creator_start_ticks, 100,
+            "recovery cannot renew the bound"
+        );
+        let mut unavailable = original.clone();
+        unavailable.time_namespace = None;
+        assert!(
+            !unavailable.predates(99),
+            "unknown clock domain cannot exclude a live process"
+        );
+        let mut nonzero = original.clone();
+        nonzero.zero_boottime_offset = false;
+        assert!(
+            !nonzero.predates(99),
+            "shifted boot clock cannot exclude a process"
+        );
+        assert!(super::zero_boottime_offset("monotonic 0 0\nboottime 0 0\n"));
+        assert!(super::usable_helper_boot_clock(
+            Some("time:[123]"),
+            Some("time:[123]"),
+            Some("boottime 0 0"),
+        ));
+        assert!(!super::usable_helper_boot_clock(
+            Some("time:[123]"),
+            Some("time:[456]"),
+            Some("boottime 0 0"),
+        ));
+        assert!(!super::usable_helper_boot_clock(
+            Some("time:[123]"),
+            Some("time:[123]"),
+            None,
+        ));
+        assert!(!super::usable_helper_boot_clock(
+            None,
+            None,
+            Some("boottime 0 0"),
+        ));
+        for offsets in [
+            "boottime -100 0",
+            "boottime 1 0",
+            "boottime 0 1",
+            "",
+            "boottime 0 0\nboottime 0 0",
+        ] {
+            assert!(!super::zero_boottime_offset(offsets), "{offsets}");
+        }
+        for field in ["boot", "pid", "time", "offset", "future", "version"] {
+            let mut changed = recovered.clone();
+            match field {
+                "boot" => changed.boot_id = uuid::Uuid::new_v4().to_string(),
+                "pid" => changed.pid_namespace.push('x'),
+                "time" => changed.time_namespace = Some("time:[456]".into()),
+                "offset" => changed.zero_boottime_offset = false,
+                "future" => changed.creator_start_ticks = 99,
+                _ => changed.version += 1,
+            }
+            assert!(original.validate(&changed).is_err(), "{field}");
+        }
+        assert!(super::validate_proc_number_space("17", 17).is_ok());
+        assert!(super::validate_proc_number_space("17", 18).is_err());
+        assert!(super::validate_proc_number_space("self", 17).is_err());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn helper_birth_is_persisted_once_before_prepared_and_rejects_old_artifacts() {
+        use std::os::unix::fs::MetadataExt;
+        let root = tempfile::tempdir().unwrap();
+        let pin = helper_fixture(root.path(), "birth-order", "prepared\n");
+        let birth = pin.with_extension("pid.birth");
+        let bytes = std::fs::read(&birth).unwrap();
+        let evidence: super::HelperBirthContext = serde_json::from_slice(&bytes).unwrap();
+        evidence
+            .validate(&super::HelperBirthContext::capture().unwrap())
+            .unwrap();
+        assert_eq!(std::fs::metadata(&birth).unwrap().mode() & 0o777, 0o600);
+        assert_eq!(
+            std::fs::read_to_string(pin.with_extension("pid.state")).unwrap(),
+            "prepared\n"
+        );
+        assert!(super::initialize_slirp_lifecycle(&pin).is_err());
+        assert_eq!(std::fs::read(&birth).unwrap(), bytes);
+        for suffix in ["pid", "pid.state", "pid.birth"] {
+            let path = root.path().join(format!("old-{suffix}.pid"));
+            let artifact = if suffix == "pid" {
+                path.clone()
+            } else {
+                path.with_extension(suffix)
+            };
+            std::fs::write(&artifact, b"old artifact").unwrap();
+            assert!(super::initialize_slirp_lifecycle(&path).is_err(), "{suffix}");
+            assert_eq!(std::fs::read(&artifact).unwrap(), b"old artifact");
+            if suffix != "pid.birth" {
+                assert!(!path.with_extension("pid.birth").exists());
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn missing_or_mismatched_birth_evidence_cannot_be_upgraded_during_cleanup() {
+        for kind in [
+            "missing", "malformed", "missing-time", "duplicate", "boot", "pid", "time",
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            let pin = helper_fixture(root.path(), kind, "prepared\n");
+            let birth = pin.with_extension("pid.birth");
+            let mut evidence: super::HelperBirthContext =
+                serde_json::from_slice(&std::fs::read(&birth).unwrap()).unwrap();
+            match kind {
+                "missing" => std::fs::remove_file(&birth).unwrap(),
+                "malformed" => std::fs::write(&birth, b"{}").unwrap(),
+                "duplicate" => {
+                    let body = serde_json::to_string(&evidence).unwrap();
+                    std::fs::write(&birth, format!("{{\"version\":1,{}", &body[1..])).unwrap();
+                }
+                "missing-time" => {
+                    let mut value = serde_json::to_value(&evidence).unwrap();
+                    value.as_object_mut().unwrap().remove("time_namespace");
+                    std::fs::write(&birth, serde_json::to_vec(&value).unwrap()).unwrap();
+                }
+                _ => {
+                    match kind {
+                        "boot" => evidence.boot_id = uuid::Uuid::new_v4().to_string(),
+                        "pid" => evidence.pid_namespace.push('x'),
+                        _ => evidence.time_namespace = Some("time:[123]".into()),
+                    }
+                    std::fs::write(&birth, serde_json::to_vec(&evidence).unwrap()).unwrap();
+                }
+            }
+            let before = std::fs::read(&birth).ok();
+            assert!(super::stop_slirp(root.path(), kind, true).is_err(), "{kind}");
+            assert_eq!(std::fs::read(&birth).ok(), before, "{kind}");
+            assert_ne!(
+                std::fs::read_to_string(pin.with_extension("pid.state")).unwrap(),
+                "cleanup-proven-never-started\n"
+            );
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn helper_birth_context_subprocess_fixture() {
+        let Some(root) = std::env::var_os("CODEG_TEST_HELPER_BIRTH_ROOT") else {
+            return;
+        };
+        let root = std::path::PathBuf::from(root);
+        let action = std::env::var("CODEG_TEST_HELPER_BIRTH_ACTION").unwrap();
+        if action == "prepare" {
+            helper_fixture(&root, "restored-birth", "prepared\n");
+        } else {
+            let denied = std::env::var("CODEG_TEST_HELPER_DENIED_PID")
+                .unwrap()
+                .parse()
+                .unwrap();
+            DENIED_ENVIRONMENT_PID.with(|slot| slot.set(Some(denied)));
+            let result = super::stop_slirp(&root, "restored-birth", true);
+            DENIED_ENVIRONMENT_PID.with(|slot| slot.set(None));
+            let reason = result
+                .map(|()| "passed".to_string())
+                .unwrap_or_else(|error| error.details.reason.unwrap());
+            std::fs::write(root.join("cleanup-result"), reason).unwrap();
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn persisted_birth_excludes_only_an_older_unreadable_child_after_restart() {
+        let root = tempfile::tempdir().unwrap();
+        let mut foreign = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let foreign_start = super::helper_start_ticks(
+            &std::fs::read_to_string(format!("/proc/{}/stat", foreign.id())).unwrap(),
+        )
+        .unwrap();
+        // Cross at least two kernel userspace ticks before creating the
+        // initializer process. No synthetic birth evidence is written.
+        let ticks = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
+        assert!(ticks > 0);
+        std::thread::sleep(std::time::Duration::from_nanos(
+            2_000_000_000u64.div_ceil(ticks as u64),
+        ));
+        let run = |action, denied_pid: u32| {
+            std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "roundtable::sandbox::linux_oci::control_tests::helper_birth_context_subprocess_fixture",
+                    "--nocapture",
+                ])
+                .env("CODEG_TEST_HELPER_BIRTH_ROOT", root.path())
+                .env("CODEG_TEST_HELPER_BIRTH_ACTION", action)
+                .env("CODEG_TEST_HELPER_DENIED_PID", denied_pid.to_string())
+                .output()
+                .unwrap()
+        };
+        let prepared = run("prepare", foreign.id());
+        let birth_path = root.path().join("slirp-pids/restored-birth.pid.birth");
+        let before = std::fs::read(&birth_path);
+        let cleaned = run("cleanup", foreign.id());
+        let outcome = std::fs::read_to_string(root.path().join("cleanup-result"));
+        let mut newer = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let newer_start = super::helper_start_ticks(
+            &std::fs::read_to_string(format!("/proc/{}/stat", newer.id())).unwrap(),
+        )
+        .unwrap();
+        std::thread::sleep(std::time::Duration::from_nanos(
+            2_000_000_000u64.div_ceil(ticks as u64),
+        ));
+        // A second recovery process is newer than this candidate. It must
+        // still use the original creator's bound, never its own birth time.
+        let retried = run("cleanup", newer.id());
+        let retry_outcome = std::fs::read_to_string(root.path().join("cleanup-result"));
+        let after = std::fs::read(&birth_path);
+        let survived = foreign.try_wait().unwrap().is_none();
+        let newer_survived = newer.try_wait().unwrap().is_none();
+        for child in [&mut foreign, &mut newer] {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        assert!(
+            prepared.status.success(),
+            "{}",
+            String::from_utf8_lossy(&prepared.stderr)
+        );
+        assert!(
+            cleaned.status.success(),
+            "{}",
+            String::from_utf8_lossy(&cleaned.stderr)
+        );
+        assert!(
+            retried.status.success(),
+            "{}",
+            String::from_utf8_lossy(&retried.stderr)
+        );
+        let before = before.unwrap();
+        let birth: super::HelperBirthContext = serde_json::from_slice(&before).unwrap();
+        assert!(foreign_start < birth.creator_start_ticks);
+        assert!(newer_start >= birth.creator_start_ticks);
+        assert_eq!(after.unwrap(), before, "restart cannot refresh provenance");
+        let expected = if birth.zero_boottime_offset {
+            "passed"
+        } else {
+            "slirp_proc_environment_denied_no_age_proof"
+        };
+        assert_eq!(outcome.unwrap(), expected);
+        assert!(
+            survived && newer_survived,
+            "age exclusion cannot authorize a foreign signal"
+        );
+        let expected_retry = if birth.zero_boottime_offset {
+            "slirp_proc_environment_denied_within_scope"
+        } else {
+            // The first attempt already quarantined the unsupported domain.
+            "slirp_cleanup_interrupted"
+        };
+        assert_eq!(retry_outcome.unwrap(), expected_retry);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
     fn proc_disappearance_does_not_hide_permission_or_live_read_errors() {
         for code in [libc::ENOENT, libc::ESRCH] {
             let error = std::io::Error::from_raw_os_error(code);
@@ -2644,13 +3159,14 @@ mod control_tests {
         assert!(raw >= 0);
         let fd = unsafe { std::os::fd::OwnedFd::from_raw_fd(raw as i32) };
         let denied = || Err(std::io::Error::from_raw_os_error(libc::EACCES));
-        let live = super::resolve_helper_environment(&fd, denied());
+        let live = super::resolve_helper_environment(&fd, denied(), false);
+        let scoped_live = super::resolve_helper_environment(&fd, denied(), true);
         let was_alive = child.try_wait().unwrap().is_none();
         child.kill().unwrap();
         // Keep the child unreaped: a zombie's numeric PID still exists.
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
         let dead = loop {
-            let observed = super::resolve_helper_environment(&fd, denied());
+            let observed = super::resolve_helper_environment(&fd, denied(), false);
             if observed.is_ok() || std::time::Instant::now() >= deadline {
                 break observed;
             }
@@ -2660,7 +3176,11 @@ mod control_tests {
         assert!(was_alive);
         assert_eq!(
             live.unwrap_err().details.reason.as_deref(),
-            Some("slirp_proc_environment_denied_live")
+            Some("slirp_proc_environment_denied_no_age_proof")
+        );
+        assert_eq!(
+            scoped_live.unwrap_err().details.reason.as_deref(),
+            Some("slirp_proc_environment_denied_within_scope")
         );
         assert_eq!(dead.unwrap(), None);
     }
@@ -2714,7 +3234,11 @@ mod control_tests {
         }
         assert_eq!(
             result.unwrap_err().details.reason.as_deref(),
-            Some("slirp_proc_environment_denied_live")
+            Some(if super::HelperBirthContext::capture().unwrap().zero_boottime_offset {
+                "slirp_proc_environment_denied_within_scope"
+            } else {
+                "slirp_proc_environment_denied_no_age_proof"
+            })
         );
         assert!(owned_ended, "verified helpers must still be terminated");
         assert!(

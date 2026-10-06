@@ -133,3 +133,89 @@ then checks a duplicated input descriptor's shared offset: at a four-byte
 limit the copy must consume exactly five bytes, fail, and publish no copy.
 Local Rust execution remains UNRUN because Cargo is absent; no real auth
 material or provider was used.
+
+## Scoped discovery provenance after 382fd2e
+
+Runtime CI at `382fd2e` reports 120 passed, 2 failed, 1 ignored. Both helper
+positives retain `slirp_proc_environment_denied_live`. Linux server CI reports
+7760 passed, 3 failed, 1 ignored; its remaining failures are both-root cleanup,
+prepared/no-helper cleanup and retained-descendant proof. The new zombie,
+best-effort termination and bounded auth-copy regressions pass there. These
+results establish a live unreadable host candidate beyond the zombie case;
+they do not identify that process or its environment.
+
+### Design and source basis
+
+Each new helper lifecycle now writes a private, bounded, write-once birth
+record containing its creator's process start tick, boot UUID, PID/time
+namespace identity and whether the boot-clock comparison is usable. The
+creator's birth predates all subsequently launched crun hooks and their
+children. Linux initializes child birth time before publishing the new task,
+and reports process start time in clock ticks. The comparison is strictly
+older, so rounding into the same tick cannot exclude a possible helper.
+[Linux fork implementation](https://raw.githubusercontent.com/torvalds/linux/master/kernel/fork.c),
+[proc_pid_stat](https://man7.org/linux/man-pages/man5/proc_pid_stat.5.html)
+
+A boot UUID alone is insufficient. Proc stat applies the reader's time
+namespace offset; a negative offset can wrap a historical unsigned birth
+timestamp. Age exclusion therefore requires a known matching time namespace
+and an explicitly zero boottime offset. The offsets interface describes the
+children namespace, which must equal the reader's current namespace.
+Unavailable, malformed, nonzero or mismatched clock information disables age
+exclusion. [Proc stat implementation](https://raw.githubusercontent.com/torvalds/linux/master/fs/proc/array.c),
+[time-namespace arithmetic](https://raw.githubusercontent.com/torvalds/linux/master/include/linux/time_namespace.h),
+[time_namespaces](https://man7.org/linux/man-pages/man7/time_namespaces.7.html)
+
+Context is read for the calling thread. Numeric `/proc/<tid>` lookup exposes
+the top-level proc entry table, including `timens_offsets`; the
+`/proc/thread-self` task table lacks that entry. Before associating proc
+numbers with pidfds, both `/proc/self` and `/proc/thread-self` must match the
+calling process/thread IDs. [Proc lookup and entry tables](https://raw.githubusercontent.com/torvalds/linux/master/fs/proc/base.c)
+
+### Publication, cleanup and recovery
+
+- Initialization owns a fresh lifecycle lock and provisional `preparing`
+  state, rejects existing artifacts, syncs the birth record and directory,
+  and only then publishes `prepared`. The production attachment is returned
+  afterward. Linux provenance capture is guarded so non-Linux document-only
+  tests retain their existing behavior
+- Cleanup validates bounded private evidence, required fields, duplicate
+  rejection and the original context. Missing, malformed or mismatched
+  evidence stays unproven and is never regenerated. Independently verified
+  identities still receive bounded best-effort cleanup when record validation
+  fails; current boot/PID/proc-number identity failures prevent unsafe use of
+  numeric identities
+- With a usable record, discovery pins a process before reading start time.
+  Only an identity that remains alive across that read and started strictly
+  before the persisted creator birth can be excluded. Same-tick/newer
+  unreadable candidates remain unproven. No raw PID authorizes a signal
+- The bound is not renewed after restart. Durable interrupted-cleanup
+  quarantine, retained descendant pidfds, startup serialization and the final
+  post-container sweep remain required
+- Safe failure reasons now distinguish unreadable live processes inside a
+  usable lifecycle scope from inability to establish any age exclusion.
+  They contain no process environment data
+
+### Regression and verification boundary
+
+Tests cover strict/equal/newer ordering, zero/nonzero/unavailable clock
+contexts, boot/PID/time drift, proc-number mismatch, write-once publication,
+pre-existing artifacts, missing/duplicate/malformed evidence and unchanged
+records on cleanup. A controlled subprocess test initializes the real record,
+then recovers in a later process: an older injected-unreadable fake child
+must be excluded only in a usable clock domain. A second child born after
+initialization but before another restarter must remain in scope, detecting
+any attempt to replace the persisted bound with the restarter's birth.
+Unsupported clocks explicitly expect strict-scan quarantine instead.
+Integration fixtures now initialize the real lifecycle before spawning their
+fake helpers.
+
+Local fake hook tests pass 3/3. Native aggregate remains 96/98, with the two
+missing Rust-tool prerequisites. Cargo test attempts exit 127; local Rust
+compilation, test execution and rustfmt remain UNRUN. The next existing CI
+run must verify this patch. A live unreadable same-tick/newer process, an
+unsupported clock domain, or legacy/incomplete lifecycle evidence can still
+prevent cleanup proof. Such evidence requires separate host-level recovery;
+resetting quarantine or synthesizing a fresh birth record is not supported.
+No live qualification capability, native credential isolation, receipt/drain
+measurement, request-envelope measurement or gate enablement is claimed.

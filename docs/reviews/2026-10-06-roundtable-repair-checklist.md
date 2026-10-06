@@ -133,6 +133,30 @@ awaits the scheduler's actual result. Deterministic regressions retain changed-
 epoch rejection and final storage errors. These changes still require CI on
 their final commit.
 
+### Follow-up executable checkpoint: `382fd2e`
+
+The [CI run for `382fd2e`](https://github.com/icannotwait/MyCodeBuddy/actions/runs/37434820799)
+passed protocol, frontend, Windows server and Windows desktop jobs. Windows
+desktop remains compilation-only (`--no-run`) plus Clippy. Runtime executed
+120 passed, 2 helper-proof failures and 1 ignored host test. All three new
+terminal-budget regressions and the original staged-result/gateway-error case
+passed. Linux server executed 7,760 passed, 3 helper-proof failures and 1 ignored;
+the new zombie, best-effort cleanup and bounded auth-copy regressions passed.
+The remaining helper reason is an unreadable **live** process, not a zombie.
+
+macOS server executed 7,773 passed, 1 failed and 2 ignored. The pre-exec fixture
+was rejected before launch because an unresolved temporary-root alias had a
+symlinked ancestor. That fixture now uses its canonical temporary root, while
+production scratch restrictions and cleanup assertions remain unchanged.
+
+The next correction binds helper discovery to durable creation provenance:
+only strictly older identities can be excluded, with a matching boot/PID/time
+context and confirmed zero boottime offset. Same-tick/newer or unsupported
+contexts remain failclosed; recovery never refreshes the original bound.
+Separate-process regressions exercise older exclusion and newer-process
+rejection after restart. Three formatter-only hunks from this CI run are also
+applied exactly. These changes still require CI on their final commit.
+
 ## Capability boundaries retained
 
 The false-success and unsafe-admission defects are addressed by fail-closed guards, but the corresponding live capabilities in F02, F03 and F14 remain unimplemented. They are not closed feature-delivery items. Rerunning the current host probe cannot produce a usable certificate or supply the missing measurements.
