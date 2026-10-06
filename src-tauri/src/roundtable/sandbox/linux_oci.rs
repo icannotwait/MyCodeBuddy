@@ -27,6 +27,11 @@ const CPU_QUOTA_US: u64 = 100_000;
 const CPU_PERIOD_US: u64 = 100_000;
 
 pub(super) fn build_plan(input: &SandboxInput) -> RtResult<SandboxPlan> {
+    let scratch = reject_host_path(&input.scratch, input)?;
+    build_plan_with_scratch(input, scratch)
+}
+
+fn build_plan_with_scratch(input: &SandboxInput, scratch: PathBuf) -> RtResult<SandboxPlan> {
     if input.global_mcp {
         return Err(rt_error(ErrorCode::InvalidArgument, "global_mcp"));
     }
@@ -37,7 +42,6 @@ pub(super) fn build_plan(input: &SandboxInput) -> RtResult<SandboxPlan> {
     {
         return Err(rt_error(ErrorCode::InvalidArgument, "binary_not_absolute"));
     }
-    let scratch = reject_host_path(&input.scratch, input)?;
     let env = clear_then_allow(&input.inherited_env, &input.env_allowlist)?;
     let label = owner_label(&input.db, input.boot_epoch, &input.incarnation);
     let mounts = standard_plan_mounts(&scratch);
@@ -134,6 +138,46 @@ fn reject_host_path(scratch: &Path, input: &SandboxInput) -> RtResult<PathBuf> {
         let forbidden = path
             .canonicalize()
             .map_err(|_| rt_error(ErrorCode::InvalidArgument, "forbidden_path"))?;
+        if scratch.starts_with(&forbidden) || forbidden.starts_with(&scratch) {
+            return Err(rt_error(ErrorCode::InvalidArgument, "scratch_is_host_path"));
+        }
+    }
+    Ok(scratch)
+}
+
+/// The HOME exception is limited to the exact installed per-incarnation
+/// subtree. The generic builder never has this authority.
+fn owned_scratch(scratch: &Path, profile: &QualifiedOciProfile, incarnation: &str) -> RtResult<PathBuf> {
+    let scratch = canonical_directory(scratch)?;
+    let runtime_root = canonical_directory(&profile.runtime_root)?;
+    let expected = runtime_root.join("runs").join(incarnation).join("scratch");
+    if scratch != expected {
+        return Err(rt_error(ErrorCode::InvalidArgument, "scratch_not_owned"));
+    }
+    let private_parent = scratch.parent().ok_or_else(|| rt_error(ErrorCode::InvalidArgument, "scratch_not_owned"))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let metadata = fs::symlink_metadata(private_parent)
+            .map_err(|_| rt_error(ErrorCode::InvalidArgument, "scratch_not_owned"))?;
+        if metadata.uid() != unsafe { libc::geteuid() } || metadata.mode() & 0o077 != 0 {
+            return Err(rt_error(ErrorCode::InvalidArgument, "scratch_not_owned"));
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = private_parent;
+    Ok(scratch)
+}
+
+fn qualified_scratch(input: &SandboxInput, profile: &QualifiedOciProfile) -> RtResult<PathBuf> {
+    let scratch = owned_scratch(&input.scratch, profile, &input.incarnation.to_string())?;
+    let runtime_root = canonical_directory(&profile.runtime_root)?;
+    let home = canonical_directory(&input.home)?;
+    if runtime_root == home || home.starts_with(&runtime_root) {
+        return Err(rt_error(ErrorCode::InvalidArgument, "scratch_not_owned"));
+    }
+    for path in std::iter::once(&input.project).chain(&input.other_scratches).chain(&input.decoy_paths) {
+        let forbidden = path.canonicalize().map_err(|_| rt_error(ErrorCode::InvalidArgument, "forbidden_path"))?;
         if scratch.starts_with(&forbidden) || forbidden.starts_with(&scratch) {
             return Err(rt_error(ErrorCode::InvalidArgument, "scratch_is_host_path"));
         }
@@ -607,7 +651,8 @@ pub(super) fn build_qualified_plan(
             "attempt_sockets_required",
         ));
     }
-    let mut plan = build_plan(input)?;
+    let scratch = qualified_scratch(input, profile)?;
+    let mut plan = build_plan_with_scratch(input, scratch)?;
     if binary(&input.certificate.binaries, "crun")? != &profile.runtime
         || profile_hash(profile, &input.certificate)? != input.certificate.plan_hash
     {
@@ -899,28 +944,46 @@ pub(crate) const SLIRP_HOOK_SCRIPT: &str = r#"#!/bin/sh
 state=$(cat)
 pid=$(printf '%s' "$state" | sed -n 's/.*"pid"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' | head -n 1)
 [ -n "$pid" ] || exit 1
-# poststart: the user namespace exists. A closed ready fifo is EOF, not the
-# ready byte, so require "1". Do not exec slirp: crun is a child subreaper
-# and waits on that orphan, so `crun run` would never return.
-ready="${TMPDIR:-/tmp}/codeg-slirp-ready-$$"
-rm -f "$ready"
-mkfifo "$ready" || exit 1
-"$1" --configure --disable-host-loopback --mtu=65520 \
+[ "$CODEG_ROUNDTABLE_SLIRP_OWNER" = "$3" ] || exit 1
+[ "$CODEG_ROUNDTABLE_SLIRP_ROOT" = "$4" ] || exit 1
+# Cleanup holds this same lock while closing the startup gate. All helper
+# children close fd 9 so the hook alone owns the startup critical section.
+[ -f "$2.lock" ] && [ ! -L "$2.lock" ] || exit 1
+exec 9<>"$2.lock" || exit 1
+flock -x -w 10 9 || exit 1
+[ "$(cat "$2.state")" = "prepared" ] || exit 1
+printf 'starting\n' > "$2.state" && sync -f "$2.state" || exit 1
+umask 077
+ready="$2.ready"
+exit_pipe="$2.exit"
+mkfifo "$ready" "$exit_pipe" || exit 1
+# The parent opens the ready FIFO before forking. A failed pin publication
+# cannot strand a child blocked on opening a FIFO with no reader.
+exec 8<>"$ready" || exit 1
+container_start=$(sed 's/^.*) //' "/proc/$pid/stat" | cut -d ' ' -f20)
+[ -n "$container_start" ] || exit 1
+CODEG_ROUNDTABLE_SLIRP_ROLE=watcher /bin/sh -c '
+  while kill -0 "$1" 2>/dev/null; do
+    current=$(sed "s/^.*) //" "/proc/$1/stat" 2>/dev/null | cut -d " " -f20)
+    [ "$current" = "$2" ] || break
+    sleep 0.2
+  done
+' watcher "$pid" "$container_start" 8>&- 9>&- >"$exit_pipe" &
+watcher=$!
+CODEG_ROUNDTABLE_SLIRP_ROLE=slirp "$1" --configure --disable-host-loopback --mtu=65520 \
   --userns-path="/proc/$pid/ns/user" \
-  --netns-type=path \
-  --ready-fd 3 \
-  "/proc/$pid/ns/net" \
-  tap0 >/dev/null 2>&1 3>"$ready" </dev/null &
+  --netns-type=path --ready-fd 3 --exit-fd=0 \
+  "/proc/$pid/ns/net" tap0 8>&- 9>&- <"$exit_pipe" >/dev/null 2>&1 3>"$ready" &
 slirp=$!
-echo "$slirp" > "$2"
-ready_byte=$(timeout 8 dd bs=1 count=1 <"$ready" 2>/dev/null || true)
+slirp_start=$(sed 's/^.*) //' "/proc/$slirp/stat" | cut -d ' ' -f20)
+watcher_start=$(sed 's/^.*) //' "/proc/$watcher/stat" | cut -d ' ' -f20)
+[ -n "$slirp_start" ] && [ -n "$watcher_start" ] || exit 1
+printf 'slirp %s %s\nwatcher %s %s\n' "$slirp" "$slirp_start" "$watcher" "$watcher_start" > "$2" && sync -f "$2" || exit 1
+ready_byte=$(timeout 8 dd bs=1 count=1 <&8 2>/dev/null || true)
+exec 8>&-
 rm -f "$ready"
-if [ "$ready_byte" != "1" ]; then
-  kill "$slirp" 2>/dev/null || true
-  exit 1
-fi
-# Kill slirp when the container pid exits so crun can finish waiting.
-( while kill -0 "$pid"; do sleep 0.2; done; kill "$slirp" ) &
+[ "$ready_byte" = "1" ] || exit 1
+printf 'running\n' > "$2.state" && sync -f "$2.state" || exit 1
 exit 0
 "#;
 
@@ -993,8 +1056,9 @@ pub(crate) fn attach_slirp(
             .map_err(|_| rt_error(ErrorCode::StorageUnavailable, "slirp_hook"))?;
     }
     let dir = runtime_root.join("slirp-pids");
-    fs::create_dir_all(&dir).map_err(|_| rt_error(ErrorCode::StorageUnavailable, "slirp_hook"))?;
+    secure_directory(&dir)?;
     let pidfile = dir.join(format!("{id}.pid"));
+    initialize_slirp_lifecycle(&pidfile)?;
     let resolv = slirp_resolv_path(runtime_root);
     fs::write(&resolv, SLIRP_RESOLV_BODY)
         .map_err(|_| rt_error(ErrorCode::StorageUnavailable, "slirp_resolv"))?;
@@ -1002,8 +1066,12 @@ pub(crate) fn attach_slirp(
         hooks: json!({
             SLIRP_HOOK_PHASE: [{
                 "path": hook_path,
-                "args": ["slirp-hook.sh", slirp_bin, pidfile],
-                "env": []
+                "args": ["slirp-hook.sh", slirp_bin, pidfile, id, runtime_root],
+                "env": [
+                    format!("CODEG_ROUNDTABLE_SLIRP_OWNER={id}"),
+                    format!("CODEG_ROUNDTABLE_SLIRP_ROOT={}", runtime_root.display()),
+                    "CODEG_ROUNDTABLE_SLIRP_ROLE=hook"
+                ]
             }]
         }),
         resolv_mount: json!({
@@ -1144,18 +1212,237 @@ pub fn live_slirp_document(runtime_root: &Path, id: &str, slirp_bin: &Path) -> R
     Ok(oci)
 }
 
-pub(super) fn stop_slirp(runtime_root: &Path, id: &str) {
-    let pidfile = runtime_root.join("slirp-pids").join(format!("{id}.pid"));
-    if let Ok(text) = fs::read_to_string(&pidfile) {
-        if let Ok(pid) = text.trim().parse::<i32>() {
-            #[cfg(unix)]
-            unsafe {
-                libc::kill(pid, libc::SIGTERM);
+fn initialize_slirp_lifecycle(pidfile: &Path) -> RtResult<()> {
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600).custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+    }
+    for (path, body) in [
+        (pidfile.with_extension("pid.lock"), b"".as_slice()),
+        (pidfile.with_extension("pid.state"), b"prepared\n".as_slice()),
+    ] {
+        let mut file = options.open(path)
+            .map_err(|_| rt_error(ErrorCode::StorageUnavailable, "slirp_lifecycle"))?;
+        file.write_all(body).and_then(|()| file.sync_all())
+            .map_err(|_| rt_error(ErrorCode::StorageUnavailable, "slirp_lifecycle"))?;
+    }
+    crate::roundtable::feature_gate::fsync_dir(pidfile.parent().ok_or_else(|| rt_error(ErrorCode::StorageUnavailable, "slirp_lifecycle"))?)
+        .map_err(|_| rt_error(ErrorCode::StorageUnavailable, "slirp_lifecycle"))
+}
+
+pub(super) fn stop_slirp(runtime_root: &Path, id: &str, expected: bool) -> RtResult<()> {
+    if !expected {
+        return Ok(());
+    }
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+        use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+        use std::io::{Seek, SeekFrom};
+
+        fn unproven() -> roundtable_protocol::RtError {
+            rt_error(ErrorCode::PolicyUnenforceable, "slirp_cleanup_unproven")
+        }
+        fn private_file(path: &Path, writable: bool) -> RtResult<fs::File> {
+            let file = fs::OpenOptions::new().read(true).write(writable)
+                // A FIFO must not block before fstat can reject it.
+                .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
+                .open(path).map_err(|_| unproven())?;
+            let meta = file.metadata().map_err(|_| unproven())?;
+            if !meta.is_file() || meta.uid() != unsafe { libc::geteuid() } || meta.mode() & 0o077 != 0 {
+                return Err(unproven());
             }
-            let _ = pid;
+            Ok(file)
+        }
+        fn persist_phase(file: &mut fs::File, body: &[u8]) -> RtResult<()> {
+            file.seek(SeekFrom::Start(0)).and_then(|_| file.set_len(0)).map_err(|_| unproven())?;
+            file.write_all(body).and_then(|()| file.sync_all()).map_err(|_| unproven())
+        }
+        fn pidfd(pid: i32) -> RtResult<Option<OwnedFd>> {
+            if pid <= 1 { return Err(unproven()); }
+            let raw = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
+            if raw >= 0 {
+                return Ok(Some(unsafe { OwnedFd::from_raw_fd(raw as i32) }));
+            }
+            if std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) {
+                Ok(None)
+            } else {
+                Err(unproven())
+            }
+        }
+        fn exited(fd: &OwnedFd) -> bool {
+            let mut poll = libc::pollfd { fd: fd.as_raw_fd(), events: libc::POLLIN, revents: 0 };
+            (unsafe { libc::poll(&mut poll, 1, 0) }) > 0 && poll.revents & libc::POLLIN != 0
+        }
+        fn marked(env: &[u8], runtime_root: &Path, id: &str, role: Option<&str>) -> bool {
+            let owner = format!("CODEG_ROUNDTABLE_SLIRP_OWNER={id}");
+            let root = format!("CODEG_ROUNDTABLE_SLIRP_ROOT={}", runtime_root.display());
+            let has = |expected: &str| env.split(|byte| *byte == 0).any(|value| value == expected.as_bytes());
+            has(&owner) && has(&root) && match role {
+                Some(role) => has(&format!("CODEG_ROUNDTABLE_SLIRP_ROLE={role}")),
+                None => ["hook", "watcher", "slirp"].iter().any(|role| has(&format!("CODEG_ROUNDTABLE_SLIRP_ROLE={role}"))),
+            }
+        }
+        fn verify(fd: &OwnedFd, pid: i32, start: Option<u64>, runtime_root: &Path, id: &str, role: Option<&str>) -> RtResult<()> {
+            if exited(fd) { return Ok(()); }
+            let inspect = || {
+                let metadata = fs::metadata(format!("/proc/{pid}")).map_err(|_| unproven())?;
+                let stat = fs::read_to_string(format!("/proc/{pid}/stat")).map_err(|_| unproven())?;
+                let observed = stat.rsplit_once(") ").and_then(|(_, rest)| rest.split_whitespace().nth(19))
+                    .and_then(|value| value.parse::<u64>().ok());
+                let env = fs::read(format!("/proc/{pid}/environ")).map_err(|_| unproven())?;
+                if metadata.uid() != unsafe { libc::geteuid() } || observed.is_none()
+                    || start.is_some_and(|expected| observed != Some(expected))
+                    || !marked(&env, runtime_root, id, role) { return Err(unproven()); }
+                Ok(())
+            };
+            match inspect() {
+                Err(_) if exited(fd) => Ok(()),
+                result => result,
+            }
+        }
+        fn owned_helpers(runtime_root: &Path, id: &str) -> RtResult<Vec<(i32, OwnedFd)>> {
+            let mut found = Vec::new();
+            for entry in fs::read_dir("/proc").map_err(|_| unproven())? {
+                let entry = entry.map_err(|_| unproven())?;
+                let Some(pid) = entry.file_name().to_str().and_then(|name| name.parse::<i32>().ok()) else { continue; };
+                let metadata = match entry.metadata() {
+                    Ok(metadata) => metadata,
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                    Err(_) => return Err(unproven()),
+                };
+                if metadata.uid() != unsafe { libc::geteuid() } { continue; }
+                let env = match fs::read(entry.path().join("environ")) {
+                    Ok(env) => env,
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                    Err(_) => return Err(unproven()),
+                };
+                if !marked(&env, runtime_root, id, None) { continue; }
+                if let Some(fd) = pidfd(pid)? {
+                    verify(&fd, pid, None, runtime_root, id, None)?;
+                    if !exited(&fd) {
+                        if found.len() >= 1024 { return Err(unproven()); }
+                        found.push((pid, fd));
+                    }
+                }
+            }
+            Ok(found)
+        }
+        fn verify_pins(pidfile: &Path, runtime_root: &Path, id: &str, never_started: bool) -> RtResult<Vec<OwnedFd>> {
+            if !pidfile.try_exists().map_err(|_| unproven())? {
+                return if never_started { Ok(Vec::new()) } else { Err(unproven()) };
+            }
+            let mut body = String::new();
+            private_file(pidfile, false)?.take(1025).read_to_string(&mut body).map_err(|_| unproven())?;
+            if body.len() > 1024 { return Err(unproven()); }
+            let mut roles = std::collections::BTreeSet::new();
+            let mut roots = Vec::new();
+            for line in body.lines() {
+                let fields: Vec<_> = line.split_whitespace().collect();
+                if fields.len() != 3 || !matches!(fields[0], "slirp" | "watcher") || !roles.insert(fields[0]) {
+                    return Err(unproven());
+                }
+                let pid = fields[1].parse::<i32>().map_err(|_| unproven())?;
+                let start = fields[2].parse::<u64>().map_err(|_| unproven())?;
+                if start == 0 { return Err(unproven()); }
+                if let Some(fd) = pidfd(pid)? {
+                    verify(&fd, pid, Some(start), runtime_root, id, Some(fields[0]))?;
+                    roots.push(fd);
+                }
+            }
+            if never_started || roles.len() != 2 { return Err(unproven()); }
+            Ok(roots)
+        }
+
+        let pidfile = runtime_root.join("slirp-pids").join(format!("{id}.pid"));
+        let lock = private_file(&pidfile.with_extension("pid.lock"), true)?;
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 { break; }
+            let error = std::io::Error::last_os_error().raw_os_error();
+            if (error != Some(libc::EWOULDBLOCK) && error != Some(libc::EAGAIN)) || std::time::Instant::now() >= deadline {
+                return Err(unproven());
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let mut state = private_file(&pidfile.with_extension("pid.state"), true)?;
+        let mut phase = String::new();
+        (&mut state).take(128).read_to_string(&mut phase).map_err(|_| unproven())?;
+        let never_started = match phase.trim() {
+            "prepared" | "cleanup-proven-never-started" => true,
+            "starting" | "running" | "cleanup-proven-started" => false,
+            // Old cancelled states did not persist descendant obligations.
+            // They are just as unproven as an interrupted new cleanup.
+            "cancelled-never-started" | "cancelled-started"
+            | "cleanup-in-progress-never-started" | "cleanup-in-progress-started" => {
+                return Err(rt_error(ErrorCode::PolicyUnenforceable, "slirp_cleanup_interrupted"));
+            }
+            _ => return Err(unproven()),
+        };
+        // Persist quarantine before the first signal can make a process
+        // erase its markers. Only this lock-owning invocation can discharge
+        // its in-memory pidfd obligations and publish a successful proof.
+        persist_phase(&mut state, if never_started {
+            b"cleanup-in-progress-never-started\n"
+        } else {
+            b"cleanup-in-progress-started\n"
+        })?;
+        // Invalid/missing pins after startup cannot prove cleanup, but safely
+        // stop any independently owner-marked survivors before reporting it.
+        let pin_proof = verify_pins(&pidfile, runtime_root, id, never_started);
+        let began = std::time::Instant::now();
+        let mut empty_observations = 0;
+        let mut retained: BTreeMap<i32, OwnedFd> = BTreeMap::new();
+        loop {
+            #[cfg(test)]
+            control_tests::before_cleanup_sweep()?;
+            for (pid, fd) in owned_helpers(runtime_root, id)? {
+                match retained.entry(pid) {
+                    std::collections::btree_map::Entry::Vacant(entry) => { entry.insert(fd); }
+                    std::collections::btree_map::Entry::Occupied(mut entry) => {
+                        // A PID can be reused only after the old pinned
+                        // process exits. Never replace a still-live identity.
+                        if exited(entry.get()) { entry.insert(fd); }
+                    }
+                }
+            }
+            retained.retain(|_, fd| !exited(fd));
+            // Bound handles by distinct live processes, not sweep count.
+            if retained.len() > 1024 { return Err(unproven()); }
+            let roots_exited = pin_proof.as_ref().map(|roots| roots.iter().all(exited)).unwrap_or(true);
+            if retained.is_empty() && roots_exited {
+                empty_observations += 1;
+                if empty_observations >= 2 {
+                    drop(pin_proof?);
+                    persist_phase(&mut state, if never_started {
+                        b"cleanup-proven-never-started\n"
+                    } else {
+                        b"cleanup-proven-started\n"
+                    })?;
+                    return Ok(());
+                }
+            } else {
+                empty_observations = 0;
+                // Every verified descendant stays owned until its pinned
+                // process exits, even after exec clears its environment.
+                for fd in retained.values().chain(pin_proof.as_ref().ok().into_iter().flatten()) {
+                    let signal = if began.elapsed() < Duration::from_millis(200) { libc::SIGTERM } else { libc::SIGKILL };
+                    let result = unsafe { libc::syscall(libc::SYS_pidfd_send_signal, fd.as_raw_fd(), signal, std::ptr::null::<libc::siginfo_t>(), 0) };
+                    if result < 0 && std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH) { return Err(unproven()); }
+                }
+            }
+            if began.elapsed() > Duration::from_secs(3) { return Err(unproven()); }
+            std::thread::sleep(Duration::from_millis(20));
         }
     }
-    let _ = fs::remove_file(&pidfile);
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (runtime_root, id);
+        Err(rt_error(ErrorCode::PolicyUnenforceable, "slirp_cleanup_unproven"))
+    }
 }
 
 pub(super) fn cgroup_delegation_error(cgroup_root: &Path) -> Option<String> {
@@ -1320,7 +1607,8 @@ pub(super) fn verify_profile(plan: &SandboxPlan, profile: &QualifiedOciProfile) 
             "/dev/shm" => mount.source == Path::new("shm") && !mount.read_only,
             "/sys" => mount.source == Path::new("sysfs") && mount.read_only,
             "/tmp" => mount.source == Path::new("tmpfs") && !mount.read_only,
-            "/scratch" => !mount.read_only && mount.source.is_absolute(),
+            "/scratch" => !mount.read_only
+                && owned_scratch(&mount.source, profile, &plan.incarnation.to_string())? == mount.source,
             "/rt-home" => home_upper_allowed(plan, mount),
             "/run/codeg/roundtable.sock" => {
                 profile.service_socket.as_ref() == Some(&mount.source) && mount.read_only
@@ -1670,10 +1958,32 @@ fn command_args(profile: &QualifiedOciProfile) -> Vec<String> {
         "cgroupfs".into(),
     ]
 }
-pub(super) async fn spawn_attached(
+pub(super) fn launch_artifacts_present(profile: &QualifiedOciProfile, intent: &LaunchIntent) -> RtResult<bool> {
+    let instance = recorded_intent_instance(profile, intent);
+    for path in [
+        profile.runtime_root.join("bundles").join(&instance.runtime_id).join("config.json"),
+        profile.runtime_root.join("state").join(&instance.runtime_id),
+        profile.runtime_root.join("slirp-pids").join(format!("{}.pid", instance.runtime_id)),
+        profile.cgroup_root.join(&instance.runtime_id),
+    ] {
+        if path.try_exists().map_err(|_| rt_error(ErrorCode::PolicyUnenforceable, "instance_unowned"))? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+pub(super) struct PendingLaunch {
+    instance: SandboxInstance,
+    runtime_path: PathBuf,
+    args: Vec<String>,
+    bundle: PathBuf,
+}
+
+pub(super) fn prepare_spawn(
     plan: &SandboxPlan,
     profile: &QualifiedOciProfile,
-) -> RtResult<(SandboxInstance, tokio::process::Child)> {
+) -> RtResult<PendingLaunch> {
     verify_runtime(profile)?;
     if let Some(reason) = cgroup_delegation_error(&profile.cgroup_root) {
         tracing::warn!(%reason, "roundtable cgroup delegation");
@@ -1709,12 +2019,14 @@ pub(super) async fn spawn_attached(
         bundle.to_string_lossy().into_owned(),
         instance.runtime_id.clone(),
     ]);
+    Ok(PendingLaunch { instance, runtime_path: plan.runtime_path.clone(), args, bundle })
+}
+
+pub(super) fn spawn_prepared(launch: PendingLaunch) -> RtResult<(SandboxInstance, tokio::process::Child)> {
     let child = crate::acp::agent_process::spawn_attached_roundtable_oci(
-        &plan.runtime_path,
-        &args,
-        &bundle,
+        &launch.runtime_path, &launch.args, &launch.bundle,
     )?;
-    Ok((instance, child))
+    Ok((launch.instance, child))
 }
 
 async fn control(profile: &QualifiedOciProfile, tail: &[&str]) -> RtResult<std::process::Output> {
@@ -1817,7 +2129,7 @@ fn verify_instance(profile: &QualifiedOciProfile, instance: &SandboxInstance) ->
     Ok(())
 }
 fn cgroup_empty(path: &Path) -> RtResult<bool> {
-    if !path.exists() {
+    if !path.try_exists().map_err(|_| rt_error(ErrorCode::PolicyUnenforceable, "cgroup_unproven"))? {
         return Ok(true);
     }
     if fs::symlink_metadata(path)
@@ -1984,7 +2296,7 @@ pub(super) async fn reap(
     }
     verify_runtime(profile)?;
     verify_instance(profile, instance)?;
-    stop_slirp(&profile.runtime_root, &instance.runtime_id);
+    let _ = stop_slirp(&profile.runtime_root, &instance.runtime_id, true);
     let exists = list(profile)
         .await?
         .iter()
@@ -2004,6 +2316,7 @@ pub(super) async fn reap(
                 .any(|entry| entry["id"] == instance.runtime_id)
             && !launcher_present(profile, &instance.runtime_id)?
         {
+            stop_slirp(&profile.runtime_root, &instance.runtime_id, true)?;
             return Ok(ProcessTreeProof {
                 instance_id: instance.runtime_id.clone(),
                 incarnation: instance.incarnation,
@@ -2017,6 +2330,266 @@ pub(super) async fn reap(
 
 #[cfg(test)]
 mod control_tests {
+    #[cfg(target_os = "linux")]
+    type SweepObserver = Box<dyn FnMut() -> roundtable_protocol::RtResult<()>>;
+
+    #[cfg(target_os = "linux")]
+    std::thread_local! {
+        static SWEEP_OBSERVER: std::cell::RefCell<Option<SweepObserver>> = const { std::cell::RefCell::new(None) };
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(super) fn before_cleanup_sweep() -> roundtable_protocol::RtResult<()> {
+        SWEEP_OBSERVER.with(|observer| match observer.borrow_mut().as_mut() {
+            Some(callback) => callback(),
+            None => Ok(()),
+        })
+    }
+
+    #[cfg(target_os = "linux")]
+    struct SweepObserverGuard;
+
+    #[cfg(target_os = "linux")]
+    impl Drop for SweepObserverGuard {
+        fn drop(&mut self) {
+            SWEEP_OBSERVER.with(|observer| *observer.borrow_mut() = None);
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn helper_fixture(root: &std::path::Path, id: &str, phase: &str) -> std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = root.join("slirp-pids");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let pin = dir.join(format!("{id}.pid"));
+        super::initialize_slirp_lifecycle(&pin).unwrap();
+        std::fs::write(pin.with_extension("pid.state"), phase).unwrap();
+        pin
+    }
+
+    #[cfg(target_os = "linux")]
+    fn fake_helper(root: &std::path::Path, id: &str, role: &str) -> std::process::Child {
+        std::process::Command::new("sleep").arg("30")
+            .env("CODEG_ROUNDTABLE_SLIRP_OWNER", id)
+            .env("CODEG_ROUNDTABLE_SLIRP_ROOT", root)
+            .env("CODEG_ROUNDTABLE_SLIRP_ROLE", role)
+            .spawn().unwrap()
+    }
+
+    #[cfg(target_os = "linux")]
+    fn pin_line(role: &str, pid: u32) -> String {
+        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).unwrap();
+        let start = stat.rsplit_once(") ").unwrap().1.split_whitespace().nth(19).unwrap();
+        format!("{role} {pid} {start}\n")
+    }
+
+    #[cfg(target_os = "linux")]
+    fn write_pins(path: &std::path::Path, body: &str) {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::write(path, body).unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn configured_missing_pin_cannot_prove_cleanup_even_after_owned_survivor_is_stopped() {
+        let root = tempfile::tempdir().unwrap();
+        let id = "fake-missing-pin";
+        helper_fixture(root.path(), id, "running\n");
+        let mut helper = fake_helper(root.path(), id, "slirp");
+        let result = super::stop_slirp(root.path(), id, true);
+        let ended = helper.try_wait().unwrap().is_some();
+        let _ = helper.kill();
+        let _ = helper.wait();
+        assert!(result.is_err(), "missing configured-helper pin is not proof");
+        assert!(ended, "independently owner-marked helper should still be stopped");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn helper_cleanup_waits_for_both_pinned_helper_and_watcher() {
+        let root = tempfile::tempdir().unwrap();
+        let id = "fake-complete-tree";
+        let pin = helper_fixture(root.path(), id, "running\n");
+        let mut helper = fake_helper(root.path(), id, "slirp");
+        let mut watcher = fake_helper(root.path(), id, "watcher");
+        // Descendants inherit the watcher marker but do not get a root pin.
+        let mut descendant = fake_helper(root.path(), id, "watcher");
+        write_pins(&pin, &(pin_line("slirp", helper.id()) + &pin_line("watcher", watcher.id())));
+        let result = super::stop_slirp(root.path(), id, true);
+        let helper_ended = helper.try_wait().unwrap().is_some();
+        let watcher_ended = watcher.try_wait().unwrap().is_some();
+        let descendant_ended = descendant.try_wait().unwrap().is_some();
+        let _ = helper.kill(); let _ = watcher.kill(); let _ = descendant.kill();
+        let _ = helper.wait(); let _ = watcher.wait(); let _ = descendant.wait();
+        result.unwrap();
+        assert!(helper_ended && watcher_ended && descendant_ended);
+        assert_eq!(std::fs::read_to_string(pin.with_extension("pid.state")).unwrap(), "cleanup-proven-started\n");
+        // Retained pins and the closed startup gate support safe retries.
+        super::stop_slirp(root.path(), id, true).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn verified_descendant_remains_owned_after_term_clears_its_environment() {
+        use std::os::unix::process::ExitStatusExt;
+        let root = tempfile::tempdir().unwrap();
+        let id = "fake-cleared-markers";
+        let pin = helper_fixture(root.path(), id, "running\n");
+        let mut helper = fake_helper(root.path(), id, "slirp");
+        let mut watcher = fake_helper(root.path(), id, "watcher");
+        let ready = root.path().join("descendant-ready");
+        let changed = root.path().join("descendant-execed");
+        let mut descendant = std::process::Command::new("sh")
+            .arg("-c")
+            .arg("trap 'trap \"\" TERM; : > \"$2\"; exec /usr/bin/env -i /bin/sleep 30' TERM; : > \"$1\"; while :; do sleep 0.02; done")
+            .arg("fake-descendant").arg(&ready).arg(&changed)
+            .env("CODEG_ROUNDTABLE_SLIRP_OWNER", id)
+            .env("CODEG_ROUNDTABLE_SLIRP_ROOT", root.path())
+            .env("CODEG_ROUNDTABLE_SLIRP_ROLE", "watcher")
+            .spawn().unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while !ready.exists() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        write_pins(&pin, &(pin_line("slirp", helper.id()) + &pin_line("watcher", watcher.id())));
+        let result = super::stop_slirp(root.path(), id, true);
+        let ended = descendant.try_wait().unwrap();
+        let _ = helper.kill(); let _ = watcher.kill(); let _ = descendant.kill();
+        let _ = helper.wait(); let _ = watcher.wait(); let _ = descendant.wait();
+        result.unwrap();
+        assert!(changed.exists(), "descendant must run its TERM-to-exec path");
+        assert!(ended.is_some_and(|status| status.signal() == Some(libc::SIGKILL)), "verified descendant escaped after clearing markers");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn interrupted_cleanup_cannot_forget_a_descendant_on_retry() {
+        let root = tempfile::tempdir().unwrap();
+        let id = "fake-interrupted-cleanup";
+        let pin = helper_fixture(root.path(), id, "running\n");
+        let mut helper = fake_helper(root.path(), id, "slirp");
+        let mut watcher = fake_helper(root.path(), id, "watcher");
+        let ready = root.path().join("descendant-ready");
+        let changed = root.path().join("descendant-execed");
+        let mut descendant = std::process::Command::new("sh")
+            .arg("-c")
+            .arg("trap 'trap \"\" TERM; : > \"$2\"; exec /usr/bin/env -i /bin/sleep 30' TERM; : > \"$1\"; while :; do sleep 0.02; done")
+            .arg("fake-descendant").arg(&ready).arg(&changed)
+            .env("CODEG_ROUNDTABLE_SLIRP_OWNER", id)
+            .env("CODEG_ROUNDTABLE_SLIRP_ROOT", root.path())
+            .env("CODEG_ROUNDTABLE_SLIRP_ROLE", "watcher")
+            .spawn().unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while !ready.exists() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        write_pins(&pin, &(pin_line("slirp", helper.id()) + &pin_line("watcher", watcher.id())));
+        let descendant_pid = descendant.id();
+        let changed_marker = changed.clone();
+        SWEEP_OBSERVER.with(|observer| {
+            *observer.borrow_mut() = Some(Box::new(move || {
+                let environment = std::fs::read(format!("/proc/{descendant_pid}/environ")).unwrap_or_default();
+                if changed_marker.exists() && !environment.windows(b"CODEG_ROUNDTABLE_SLIRP_OWNER=".len()).any(|part| part == b"CODEG_ROUNDTABLE_SLIRP_OWNER=") {
+                    return Err(super::rt_error(roundtable_protocol::ErrorCode::PolicyUnenforceable, "injected_helper_enumeration"));
+                }
+                Ok(())
+            }));
+        });
+        let fault = SweepObserverGuard;
+        let first = super::stop_slirp(root.path(), id, true);
+        drop(fault);
+        let alive_after_fault = descendant.try_wait().unwrap().is_none();
+        // No observer/fault is installed for the second call. It reopens the
+        // durable state exactly as a new cleanup process would after restart.
+        let retry = super::stop_slirp(root.path(), id, true);
+        let alive_after_retry = descendant.try_wait().unwrap().is_none();
+        let phase = std::fs::read_to_string(pin.with_extension("pid.state")).unwrap();
+        let _ = helper.kill(); let _ = watcher.kill(); let _ = descendant.kill();
+        let _ = helper.wait(); let _ = watcher.wait(); let _ = descendant.wait();
+        assert_eq!(first.unwrap_err().details.reason.as_deref(), Some("injected_helper_enumeration"));
+        assert!(changed.exists() && alive_after_fault);
+        assert_eq!(retry.unwrap_err().details.reason.as_deref(), Some("slirp_cleanup_interrupted"));
+        assert!(alive_after_retry, "retry must not act on lost process identity");
+        assert_eq!(phase, "cleanup-in-progress-started\n");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn fifo_pin_fails_promptly_without_a_writer_or_unrelated_signal() {
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::fs::OpenOptionsExt;
+        let root = tempfile::tempdir().unwrap();
+        let id = "fake-fifo-pin";
+        let pin = helper_fixture(root.path(), id, "running\n");
+        let path = std::ffi::CString::new(pin.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
+        let mut foreign = std::process::Command::new("sleep").arg("30").spawn().unwrap();
+        let (send, receive) = std::sync::mpsc::channel();
+        let runtime_root = root.path().to_path_buf();
+        let cleanup = std::thread::spawn(move || {
+            let _ = send.send(super::stop_slirp(&runtime_root, id, true));
+        });
+        let result = receive.recv_timeout(std::time::Duration::from_secs(2));
+        if result.is_err() {
+            // Rescue the red test's blocked reader so the suite never leaves
+            // its stand-in thread/process behind after reporting the failure.
+            let _ = std::fs::OpenOptions::new().write(true)
+                .custom_flags(libc::O_NONBLOCK).open(&pin);
+        }
+        cleanup.join().unwrap();
+        let survived = foreign.try_wait().unwrap().is_none();
+        let _ = foreign.kill(); let _ = foreign.wait();
+        assert!(result.is_ok(), "FIFO evidence blocked outside the cleanup deadline");
+        assert!(result.unwrap().is_err());
+        assert!(survived, "FIFO evidence authorized an unrelated signal");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn no_helper_and_durable_never_started_are_distinct_from_missing_configuration() {
+        let root = tempfile::tempdir().unwrap();
+        assert!(super::stop_slirp(root.path(), "no-network", false).is_ok());
+        assert!(super::stop_slirp(root.path(), "missing-network-state", true).is_err());
+        let pin = helper_fixture(root.path(), "not-started", "prepared\n");
+        super::stop_slirp(root.path(), "not-started", true).unwrap();
+        assert_eq!(std::fs::read_to_string(pin.with_extension("pid.state")).unwrap(), "cleanup-proven-never-started\n");
+        assert!(!pin.exists());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn legacy_cancelled_cleanup_cannot_be_upgraded_into_a_proof() {
+        for phase in ["cancelled-started", "cancelled-never-started"] {
+            let root = tempfile::tempdir().unwrap();
+            helper_fixture(root.path(), "legacy-cleanup", phase);
+            let error = super::stop_slirp(root.path(), "legacy-cleanup", true).unwrap_err();
+            assert_eq!(error.details.reason.as_deref(), Some("slirp_cleanup_interrupted"));
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn forged_legacy_and_reused_pid_pins_never_authorize_signals() {
+        for kind in ["forged", "legacy", "reused"] {
+            let root = tempfile::tempdir().unwrap();
+            let pin = helper_fixture(root.path(), kind, "running\n");
+            let mut foreign = std::process::Command::new("sleep").arg("30").spawn().unwrap();
+            let body = match kind {
+                "legacy" => format!("{}\n", foreign.id()),
+                "reused" => format!("slirp {} 1\nwatcher {} 1\n", foreign.id(), foreign.id()),
+                _ => pin_line("slirp", foreign.id()) + &pin_line("watcher", foreign.id()),
+            };
+            write_pins(&pin, &body);
+            let result = super::stop_slirp(root.path(), kind, true);
+            let survived = foreign.try_wait().unwrap().is_none();
+            let _ = foreign.kill(); let _ = foreign.wait();
+            assert!(result.is_err(), "{kind}");
+            assert!(survived, "{kind} pin signaled a foreign process");
+        }
+    }
+
     #[tokio::test]
     async fn oversized_control_output_stops_before_the_complete_stream() {
         let data = vec![b'x'; 2 * 1024 * 1024];

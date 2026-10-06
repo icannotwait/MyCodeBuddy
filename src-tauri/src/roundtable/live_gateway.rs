@@ -8,14 +8,31 @@ use super::request_accounting::{EncodedModelRequest, RequestAccounting};
 use super::rt_error;
 use futures_util::StreamExt;
 use roundtable_protocol::{
-    canonical_bytes, ErrorCode, MonoMs, QualifiedContextProfile, RtResult, ToolExchange,
+    canonical_bytes, ErrorCode, MonoMs, QualifiedContextProfile, RtError, RtResult, ToolExchange,
 };
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 use std::sync::{
     atomic::{AtomicBool, Ordering},
-    Arc,
+    Arc, Mutex,
 };
+
+/// Typed owner cancellation survives body-extractor error wrapping. It is
+/// distinct from genuine request/provider errors that happen during drain.
+#[derive(Debug, Clone, Copy)]
+struct GatewayRevoked;
+impl std::fmt::Display for GatewayRevoked {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { f.write_str("gateway owner revoked") }
+}
+impl std::error::Error for GatewayRevoked {}
+
+fn caused_by_owner_revocation(mut error: &(dyn std::error::Error + 'static)) -> bool {
+    loop {
+        if error.is::<GatewayRevoked>() || error.downcast_ref::<std::io::Error>()
+            .and_then(std::io::Error::get_ref).is_some_and(|inner| inner.is::<GatewayRevoked>()) { return true; }
+        match error.source() { Some(source) => error = source, None => return false }
+    }
+}
 
 struct Transcript {
     accounting: RequestAccounting,
@@ -34,12 +51,14 @@ pub(crate) struct LiveModelGateway {
     scope: ExecutionScope,
     facts: AdmissionFacts,
     expires: MonoMs,
+    execution_lease: Option<Arc<super::resources::ExecutionLease>>,
     now: Arc<dyn Fn() -> MonoMs + Send + Sync>,
     profile: QualifiedContextProfile,
     client: reqwest::Client,
     transcript: tokio::sync::Mutex<Transcript>,
     revoked: AtomicBool,
     uncertain: AtomicBool,
+    fatal_failure: Mutex<Option<RtError>>,
     cancelled: tokio_util::sync::CancellationToken,
     #[cfg(any(test, feature = "test-utils"))]
     fixture_origin: Option<String>,
@@ -72,6 +91,7 @@ impl LiveModelGateway {
             scope,
             facts,
             expires,
+            execution_lease: None,
             now,
             profile,
             client: ClientPolicy::approved().build_client()?,
@@ -83,10 +103,22 @@ impl LiveModelGateway {
             }),
             revoked: AtomicBool::new(false),
             uncertain: AtomicBool::new(false),
+            fatal_failure: Mutex::new(None),
             cancelled: tokio_util::sync::CancellationToken::new(),
             #[cfg(any(test, feature = "test-utils"))]
             fixture_origin: None,
         })
+    }
+
+    pub(crate) fn with_execution_lease(mut self, lease: Option<Arc<super::resources::ExecutionLease>>) -> Self {
+        self.execution_lease = lease;
+        self
+    }
+
+    fn lease_expired(&self) -> bool {
+        let now = (self.now)().0;
+        now >= self.expires.0
+            || self.execution_lease.as_ref().is_some_and(|lease| lease.admit_forward(now) == 0)
     }
 
     pub(crate) fn revoke(&self) {
@@ -97,7 +129,44 @@ impl LiveModelGateway {
         self.uncertain.load(Ordering::Acquire)
     }
 
+    pub(crate) fn completion_error(&self) -> Option<RtError> {
+        self.fatal_failure.lock().expect("gateway failure").clone()
+    }
+    fn observe_failure(&self, error: &RtError) {
+        // Revocation is normal during drain/cancel. It must not manufacture a
+        // failed turn or erase a real provider/policy failure already observed.
+        if error.details.reason.as_deref() == Some("gateway_revoked") { return; }
+        let mut failure = self.fatal_failure.lock().expect("gateway failure");
+        if failure.is_none() { *failure = Some(error.clone()); }
+    }
     async fn forward(
+        &self,
+        headers: axum::http::HeaderMap,
+        bytes: axum::body::Bytes,
+    ) -> RtResult<(String, Vec<u8>)> {
+        let result = self.forward_inner(headers, bytes).await;
+        if let Err(error) = &result { self.observe_failure(error); }
+        result
+    }
+
+    fn admit_upstream_chunk(&self, chunk: Result<axum::body::Bytes,reqwest::Error>) -> RtResult<axum::body::Bytes> {
+        // Inspect an already-yielded transport error before revocation. Owner
+        // shutdown cannot relabel an observed provider failure as cancellation.
+        let chunk=chunk.map_err(|_| {
+            let error=rt_error(ErrorCode::RuntimeUnavailable,"upstream_transport");
+            self.observe_failure(&error);
+            error
+        })?;
+        if self.revoked.load(Ordering::Acquire) {
+            return Err(rt_error(ErrorCode::RuntimeUnavailable,"gateway_revoked"));
+        }
+        if self.lease_expired() {
+            return Err(rt_error(ErrorCode::CapabilityUnqualified,"lease_expired"));
+        }
+        Ok(chunk)
+    }
+
+    async fn forward_inner(
         &self,
         headers: axum::http::HeaderMap,
         bytes: axum::body::Bytes,
@@ -110,7 +179,10 @@ impl LiveModelGateway {
         if !constant_eq(supplied.as_bytes(), expected.as_bytes()) {
             return Err(rt_error(ErrorCode::Unauthenticated, "gateway_token"));
         }
-        if self.revoked.load(Ordering::Acquire) || (self.now)().0 >= self.expires.0 {
+        if self.revoked.load(Ordering::Acquire) {
+            return Err(rt_error(ErrorCode::RuntimeUnavailable, "gateway_revoked"));
+        }
+        if self.lease_expired() {
             return Err(rt_error(ErrorCode::CapabilityUnqualified, "lease_expired"));
         }
         ExecutionGate::open(&self.data_dir).check(&self.scope, &self.facts, (self.now)())?;
@@ -200,7 +272,10 @@ impl LiveModelGateway {
         let mut transcript = self.transcript.lock().await;
         // A previous HTTP call may have held this lock beyond the lease or a
         // policy change. Admission must be fresh at the actual send boundary.
-        if self.revoked.load(Ordering::Acquire) || (self.now)().0 >= self.expires.0 {
+        if self.revoked.load(Ordering::Acquire) {
+            return Err(rt_error(ErrorCode::RuntimeUnavailable, "gateway_revoked"));
+        }
+        if self.lease_expired() {
             return Err(rt_error(ErrorCode::CapabilityUnqualified, "lease_expired"));
         }
         ExecutionGate::open(&self.data_dir).check(&self.scope, &self.facts, (self.now)())?;
@@ -279,11 +354,7 @@ impl LiveModelGateway {
         let mut stream = response.bytes_stream();
         let mut received = Vec::new();
         while let Some(chunk) = stream.next().await {
-            if self.revoked.load(Ordering::Acquire) || (self.now)().0 >= self.expires.0 {
-                return Err(rt_error(ErrorCode::CapabilityUnqualified, "lease_expired"));
-            }
-            let chunk =
-                chunk.map_err(|_| rt_error(ErrorCode::RuntimeUnavailable, "upstream_transport"))?;
+            let chunk=self.admit_upstream_chunk(chunk)?;
             transcript
                 .accounting
                 .consume_generated(chunk.len() as u64, &self.profile)?;
@@ -419,7 +490,7 @@ mod connections {
             if self.cancelled.as_mut().poll(cx).is_ready() {
                 Err(io::Error::new(
                     io::ErrorKind::ConnectionAborted,
-                    "gateway revoked",
+                    super::GatewayRevoked,
                 ))
             } else {
                 Ok(())
@@ -471,10 +542,7 @@ impl LiveGatewayServer {
             std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
                 .map_err(|_| rt_error(ErrorCode::RuntimeUnavailable, "gateway_permissions"))?;
             let cancelled = gateway.cancelled.clone();
-            let router = axum::Router::new()
-                .route("/v1/responses", axum::routing::post(handle))
-                .layer(axum::extract::DefaultBodyLimit::max(1_048_576))
-                .with_state(gateway);
+            let router = gateway_router(gateway);
             let task = connections::spawn(listener, router, cancelled.clone());
             Ok(Self {
                 task,
@@ -484,7 +552,7 @@ impl LiveGatewayServer {
         }
         #[cfg(not(unix))]
         {
-            let _ = (path, gateway, handle);
+            let _ = (path, gateway, handle, gateway_router);
             Err(rt_error(
                 ErrorCode::PolicyUnenforceable,
                 "platform_unqualified",
@@ -503,13 +571,71 @@ impl Drop for LiveGatewayServer {
         let _ = std::fs::remove_file(&self.path);
     }
 }
+fn gateway_routes() -> axum::Router<Arc<LiveModelGateway>> {
+    axum::Router::new()
+        .route("/v1/responses", axum::routing::post(handle))
+        .fallback(reject_gateway_route)
+        .method_not_allowed_fallback(reject_gateway_method)
+        .layer(axum::extract::DefaultBodyLimit::max(1_048_576))
+}
+fn gateway_router(gateway: Arc<LiveModelGateway>) -> axum::Router {
+    gateway_routes()
+        .layer(axum::middleware::from_fn_with_state(gateway.clone(), observe_http_failure))
+        .with_state(gateway)
+}
+
+async fn observe_http_failure(
+    axum::extract::State(gateway): axum::extract::State<Arc<LiveModelGateway>>,
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let response = next.run(request).await;
+    // A genuine rejection remains fatal even if normal draining began while
+    // next.run was in flight. Exempt only an explicitly typed owner result.
+    if (response.status().is_client_error() || response.status().is_server_error())
+        && response.extensions().get::<GatewayRevoked>().is_none() {
+        gateway.observe_failure(&rt_error(ErrorCode::RuntimeUnavailable,"gateway_http_error"));
+    }
+    response
+}
+
+async fn reject_gateway_route(axum::extract::State(gateway): axum::extract::State<Arc<LiveModelGateway>>) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    gateway.observe_failure(&rt_error(ErrorCode::RuntimeUnavailable,"gateway_http_error"));
+    axum::http::StatusCode::NOT_FOUND.into_response()
+}
+async fn reject_gateway_method(axum::extract::State(gateway): axum::extract::State<Arc<LiveModelGateway>>) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    gateway.observe_failure(&rt_error(ErrorCode::RuntimeUnavailable,"gateway_http_error"));
+    axum::http::StatusCode::METHOD_NOT_ALLOWED.into_response()
+}
+
+fn gateway_error_response(error: RtError) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    let revoked=error.details.reason.as_deref()==Some("gateway_revoked");
+    let mut response=(axum::http::StatusCode::BAD_REQUEST,axum::Json(json!({"error":error}))).into_response();
+    if revoked { response.extensions_mut().insert(GatewayRevoked); }
+    response
+}
+
 async fn handle(
     axum::extract::State(gateway): axum::extract::State<Arc<LiveModelGateway>>,
     headers: axum::http::HeaderMap,
-    body: axum::body::Bytes,
+    body: Result<axum::body::Bytes,axum::extract::rejection::BytesRejection>,
 ) -> axum::response::Response {
     use axum::response::IntoResponse;
+    let body=match body {
+        Ok(body)=>body,
+        Err(error) if caused_by_owner_revocation(&error)=>return gateway_error_response(rt_error(ErrorCode::RuntimeUnavailable,"gateway_revoked")),
+        Err(error)=>{
+            // Observe before generating the response, not after middleware
+            // yields or shutdown cancels its connection task.
+            gateway.observe_failure(&rt_error(ErrorCode::RuntimeUnavailable,"gateway_http_error"));
+            return error.into_response();
+        }
+    };
     let result = tokio::select! {
+        biased;
         result = gateway.forward(headers, body) => result,
         _ = gateway.cancelled.cancelled() => Err(rt_error(ErrorCode::RuntimeUnavailable,"gateway_revoked")),
     };
@@ -517,11 +643,7 @@ async fn handle(
         Ok((content_type, bytes)) => {
             ([(axum::http::header::CONTENT_TYPE, content_type)], bytes).into_response()
         }
-        Err(error) => (
-            axum::http::StatusCode::BAD_REQUEST,
-            axum::Json(json!({"error":error})),
-        )
-            .into_response(),
+        Err(error) => gateway_error_response(error),
     }
 }
 
@@ -532,6 +654,8 @@ pub struct GatewayFixtureObservation {
     pub requests_sent: usize,
     pub uncertain: bool,
     pub forwarded_bodies: Vec<Value>,
+    pub completion: RtResult<()>,
+    pub prompt_requests: usize,
 }
 
 /// Controlled loopback fixture invokes the production forward path. This seam
@@ -694,12 +818,26 @@ async fn exercise_gateway_fixture(
         .snapshot()
         .generated_utf8_bytes;
     let forwarded_bodies = forwarded.lock().expect("fixture bodies").clone();
+    let cancelled_frames=[
+        json!({"id":11,"method":"session/request_permission","params":{"toolCall":{"title":"run_terminal_command","kind":"execute"},"options":[{"optionId":"reject","kind":"reject_once"}]}}),
+        json!({"id":5,"result":{"stopReason":"cancelled"}}),
+        json!({"id":6,"result":{"stopReason":"end_turn"}}),
+    ];
+    let (acp,prompt_requests)=super::live_runtime::permission_repair_frames_fixture(&cancelled_frames,Some(&gateway)).await;
+    gateway.revoke();
+    // A late request caused by ordinary cleanup is not a fatal observation.
+    let mut late_headers = axum::http::HeaderMap::new();
+    late_headers.insert(axum::http::header::AUTHORIZATION,axum::http::HeaderValue::from_static("Bearer fixture-attempt-token"));
+    assert_eq!(gateway.forward(late_headers, axum::body::Bytes::from_static(b"{}")).await.unwrap_err().details.reason.as_deref(),Some("gateway_revoked"));
+    let completion = super::live_runtime::complete_after_gateway_drain(acp, &gateway).map(|_| ());
     Ok(GatewayFixtureObservation {
         errors,
         generated_bytes,
         requests_sent: sent.load(Ordering::Relaxed),
         uncertain: gateway.remote_work_uncertain(),
         forwarded_bodies,
+        completion,
+        prompt_requests,
     })
 }
 
@@ -737,6 +875,7 @@ fn fixture_gateway(root: &Path, profile: QualifiedContextProfile) -> RtResult<Li
         bearer: "fixture-attempt-token".into(),
         scope: ExecutionScope::Fake,
         facts,
+        execution_lease: None,
         expires: MonoMs(u64::MAX),
         now: Arc::new(|| MonoMs(0)),
         profile,
@@ -749,6 +888,7 @@ fn fixture_gateway(root: &Path, profile: QualifiedContextProfile) -> RtResult<Li
         }),
         revoked: AtomicBool::new(false),
         uncertain: AtomicBool::new(false),
+        fatal_failure: Mutex::new(None),
         cancelled: tokio_util::sync::CancellationToken::new(),
         fixture_origin: None,
     })
@@ -756,6 +896,13 @@ fn fixture_gateway(root: &Path, profile: QualifiedContextProfile) -> RtResult<Li
 
 /// Exercise the production handler and graceful server shutdown with real TCP
 /// clients. The fake scope never acquires a qualification or upstream endpoint.
+#[cfg(any(test, feature = "test-utils"))]
+pub(crate) fn uncertain_gateway_for_cleanup_fixture(root: &Path, profile: QualifiedContextProfile) -> RtResult<LiveModelGateway> {
+    let gateway = fixture_gateway(root, profile)?;
+    gateway.uncertain.store(true, Ordering::Release);
+    Ok(gateway)
+}
+
 #[cfg(any(test, feature = "test-utils"))]
 pub async fn exercise_gateway_shutdown_fixture(
     root: &Path,
@@ -775,9 +922,7 @@ pub async fn exercise_gateway_shutdown_fixture(
     });
     let body_started = Arc::new(tokio::sync::Notify::new());
     let started = body_started.clone();
-    let router = axum::Router::new()
-        .route("/v1/responses", axum::routing::post(handle))
-        .layer(axum::extract::DefaultBodyLimit::max(1_048_576))
+    let router = gateway_router(gateway.clone())
         .layer(axum::middleware::from_fn(
             move |request: axum::extract::Request, next: axum::middleware::Next| {
                 let started = started.clone();
@@ -786,8 +931,7 @@ pub async fn exercise_gateway_shutdown_fixture(
                     next.run(request).await
                 }
             },
-        ))
-        .with_state(gateway.clone());
+        ));
     let cancelled = gateway.cancelled.clone();
     let task = connections::spawn(listener, router, cancelled.clone());
     let server = LiveGatewayServer {
@@ -843,5 +987,159 @@ pub async fn exercise_gateway_shutdown_fixture(
         closed &= matches!(result, Ok(Ok(_)))
             || matches!(result, Ok(Err(ref error)) if matches!(error.kind(), std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::ConnectionAborted));
     }
+    assert!(gateway.completion_error().is_none(),"cleanup cancellation created a failure");
     Ok((true, closed))
+}
+
+
+#[cfg(test)]
+mod prepaid_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn lifecycle_live_gateway_rejects_expired_room_lease_before_network() {
+        let dir = tempfile::tempdir().unwrap();
+        let profile = QualifiedContextProfile::proposed("test-bytes", roundtable_protocol::Hash256::from_bytes([1;32]), 2_000_000, 0, "prepaid-test");
+        let lease = Arc::new(super::super::resources::ExecutionLease::issue(0, 1000));
+        let mut gateway = fixture_gateway(dir.path(), profile).unwrap().with_execution_lease(Some(lease));
+        gateway.now = Arc::new(|| MonoMs(1000));
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(axum::http::header::AUTHORIZATION, axum::http::HeaderValue::from_static("Bearer fixture-attempt-token"));
+        let error = gateway.forward(headers, b"{}".as_slice().into()).await.unwrap_err();
+        assert_eq!(error.details.reason.as_deref(), Some("lease_expired"));
+        assert!(!gateway.remote_work_uncertain(), "no upstream request was admitted");
+    }
+}
+
+/// Real loopback HTTP request through the production router, including rejection
+/// before the handler/body extractor. No external service or provider is used.
+#[cfg(any(test, feature = "test-utils"))]
+pub async fn exercise_gateway_http_failure_fixture(root:&Path, profile:QualifiedContextProfile, oversized:bool) -> RtResult<(u16,RtResult<()>)> {
+    let gateway=Arc::new(fixture_gateway(root,profile)?);
+    let listener=tokio::net::TcpListener::bind("127.0.0.1:0").await.map_err(|_|rt_error(ErrorCode::RuntimeUnavailable,"fixture_bind"))?;
+    let address=listener.local_addr().map_err(|_|rt_error(ErrorCode::RuntimeUnavailable,"fixture_bind"))?;
+    let task=connections::spawn(listener,gateway_router(gateway.clone()),gateway.cancelled.clone());
+    let client=ClientPolicy::approved().build_client()?;
+    let response=if oversized {
+        client.post(format!("http://{address}/v1/responses")).bearer_auth("fixture-attempt-token").body(vec![b' ';1_048_577]).send().await
+    } else {
+        client.get(format!("http://{address}/unsupported")).bearer_auth("fixture-attempt-token").send().await
+    }.map_err(|_|rt_error(ErrorCode::RuntimeUnavailable,"fixture_request"))?;
+    let status=response.status().as_u16();
+    drop(response);
+    gateway.revoke();
+    let _=task.await;
+    let acp=super::live_runtime::drive_prompt_frames_fixture(&[json!({"id":5,"result":{"stopReason":"end_turn"}})]).await;
+    Ok((status,super::live_runtime::complete_after_gateway_drain(acp,&gateway).map(|_| ())))
+}
+
+#[cfg(test)]
+mod completion_drain_tests {
+    use super::*;
+    fn profile() -> QualifiedContextProfile {
+        QualifiedContextProfile::proposed("test-bytes",roundtable_protocol::Hash256::sha256(b"fake bound"),2_000_000,0,"test-only")
+    }
+    fn headers() -> axum::http::HeaderMap {
+        let mut headers=axum::http::HeaderMap::new();
+        headers.insert(axum::http::header::AUTHORIZATION,axum::http::HeaderValue::from_static("Bearer fixture-attempt-token"));
+        headers
+    }
+
+    #[tokio::test]
+    async fn revocation_between_admission_loads_is_not_reported_as_expiry() {
+        let dir=tempfile::tempdir().unwrap();
+        let gateway=Arc::new_cyclic(|weak:&std::sync::Weak<LiveModelGateway>| {
+            let mut gateway=fixture_gateway(dir.path(),profile()).unwrap();
+            let target=weak.clone();
+            gateway.now=Arc::new(move || { target.upgrade().unwrap().revoke(); MonoMs(0) });
+            gateway
+        });
+        let body=json!({"model":"fixture-model","store":false,"input":[],"tools":[],"reasoning":{"effort":"low"}});
+        let error=gateway.forward(headers(),canonical_bytes(&body).unwrap().into()).await.unwrap_err();
+        assert_eq!(error.details.reason.as_deref(),Some("gateway_revoked"));
+        assert!(gateway.completion_error().is_none());
+        assert!(!gateway.remote_work_uncertain());
+    }
+
+    #[tokio::test]
+    async fn owner_io_marker_survives_actual_body_extractor() {
+        use axum::extract::FromRequest;
+        let dir=tempfile::tempdir().unwrap();
+        let gateway=Arc::new(fixture_gateway(dir.path(),profile()).unwrap());
+        let body=axum::body::Body::from_stream(futures_util::stream::once(async {
+            Err::<axum::body::Bytes,_>(std::io::Error::new(std::io::ErrorKind::ConnectionAborted,GatewayRevoked))
+        }));
+        let error=axum::body::Bytes::from_request(axum::extract::Request::new(body),&()).await.unwrap_err();
+        assert!(caused_by_owner_revocation(&error));
+        gateway.revoke();
+        let response=handle(axum::extract::State(gateway.clone()),headers(),Err(error)).await;
+        assert!(response.extensions().get::<GatewayRevoked>().is_some());
+        assert!(gateway.completion_error().is_none());
+    }
+
+    #[tokio::test]
+    async fn completed_router_and_body_rejections_remain_fatal_when_drain_starts() {
+        for oversized in [false,true] {
+            let dir=tempfile::tempdir().unwrap();
+            let gateway=Arc::new(fixture_gateway(dir.path(),profile()).unwrap());
+            let rejected=Arc::new(tokio::sync::Notify::new());
+            let release=Arc::new(tokio::sync::Notify::new());
+            let ready=rejected.clone(); let go=release.clone();
+            let router=gateway_routes()
+                .layer(axum::middleware::from_fn(move |request:axum::extract::Request,next:axum::middleware::Next| {
+                    let ready=ready.clone();let go=go.clone();
+                    async move {
+                        let response=next.run(request).await;
+                        ready.notify_one(); go.notified().await;
+                        response
+                    }
+                }))
+                .layer(axum::middleware::from_fn_with_state(gateway.clone(),observe_http_failure))
+                .with_state(gateway.clone());
+            let listener=tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address=listener.local_addr().unwrap();
+            let (stop,stopped)=tokio::sync::oneshot::channel::<()>();
+            let server=tokio::spawn(async move { axum::serve(listener,router).with_graceful_shutdown(async { let _=stopped.await; }).await.unwrap(); });
+            let request=tokio::spawn(async move {
+                let client=ClientPolicy::approved().build_client().unwrap();
+                if oversized { client.post(format!("http://{address}/v1/responses")).bearer_auth("fixture-attempt-token").body(vec![b' ';1_048_577]).send().await.unwrap() }
+                else { client.get(format!("http://{address}/unsupported")).send().await.unwrap() }
+            });
+            tokio::time::timeout(std::time::Duration::from_secs(5),rejected.notified()).await.unwrap();
+            gateway.revoke();
+            release.notify_one();
+            let response=request.await.unwrap();
+            assert_eq!(response.status().as_u16(),if oversized {413}else{404});
+            drop(response);
+            let _=stop.send(());
+            tokio::time::timeout(std::time::Duration::from_secs(5),server).await.unwrap().unwrap();
+            assert_eq!(gateway.completion_error().unwrap().details.reason.as_deref(),Some("gateway_http_error"));
+            assert!(super::super::live_runtime::complete_after_gateway_drain(Ok(1),&gateway).is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn already_yielded_upstream_body_error_is_not_relabelled_by_revoke() {
+        use tokio::io::{AsyncReadExt,AsyncWriteExt};
+        let dir=tempfile::tempdir().unwrap();
+        let gateway=fixture_gateway(dir.path(),profile()).unwrap();
+        let listener=tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address=listener.local_addr().unwrap();
+        let server=tokio::spawn(async move {
+            let (mut socket,_)=listener.accept().await.unwrap();
+            let mut request=[0u8;1024];let _=socket.read(&mut request).await.unwrap();
+            socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\nConnection: close\r\n\r\nx").await.unwrap();
+            socket.shutdown().await.unwrap();
+        });
+        let response=ClientPolicy::approved().build_client().unwrap().get(format!("http://{address}/")).send().await.unwrap();
+        let mut stream=response.bytes_stream();
+        let yielded=loop {
+            match stream.next().await { Some(Err(error))=>break Err(error),Some(Ok(_))=>{},None=>panic!("truncated upstream body must fail") }
+        };
+        gateway.revoke();
+        let error=gateway.admit_upstream_chunk(yielded).unwrap_err();
+        assert_eq!(error.details.reason.as_deref(),Some("upstream_transport"));
+        assert_eq!(gateway.completion_error().unwrap().details.reason.as_deref(),Some("upstream_transport"));
+        server.await.unwrap();
+    }
 }

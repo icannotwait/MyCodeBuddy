@@ -50,6 +50,59 @@ pub async fn seal_diagnostic(input: DiagnosticInput) -> RtResult<DiagnosticRef> 
     })
 }
 
+#[cfg(unix)]
+fn open_auth_file(path: &std::path::Path) -> RtResult<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    std::fs::OpenOptions::new().read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)
+        .map_err(|_| super::rt_error(roundtable_protocol::ErrorCode::CapabilityUnqualified,"auth_redaction_unavailable"))
+}
+#[cfg(not(unix))]
+fn open_auth_file(_path: &std::path::Path) -> RtResult<std::fs::File> {
+    // File-auth execution has no qualified no-follow/nonblocking boundary here.
+    Err(super::rt_error(roundtable_protocol::ErrorCode::CapabilityUnqualified,"auth_redaction_unavailable"))
+}
+
+/// Authentication files are untrusted in size and format. Keep their raw text
+/// and every JSON string value so value-only or reordered output is covered.
+/// Collecting all string leaves is deliberately conservative across supported
+/// adapter formats (Codex, Cursor, Grok and OAuth variants).
+pub(crate) fn auth_file_secrets(path: &std::path::Path) -> RtResult<Vec<String>> {
+    use std::io::Read;
+    let invalid = || super::rt_error(roundtable_protocol::ErrorCode::CapabilityUnqualified, "auth_redaction_unavailable");
+    let file = open_auth_file(path)?;
+    if !file.metadata().map_err(|_| invalid())?.is_file() { return Err(invalid()); }
+    let mut bytes = Vec::new();
+    file.take(65_537).read_to_end(&mut bytes).map_err(|_| invalid())?;
+    if bytes.len() > 65_536 { return Err(invalid()); }
+    let raw = String::from_utf8(bytes).map_err(|_| invalid())?;
+    if raw.trim().is_empty() { return Err(invalid()); }
+    let mut secrets = vec![raw.clone()];
+    let trimmed = raw.trim();
+    if trimmed.starts_with('{') || trimmed.starts_with('[') {
+        let json: serde_json::Value = serde_json::from_str(trimmed).map_err(|_| invalid())?;
+        let mut pending = vec![&json];
+        while let Some(value) = pending.pop() {
+            match value {
+                serde_json::Value::String(value) if !value.is_empty() => {
+                    secrets.push(value.clone());
+                    // JSON-escaped output must not expose a transformed credential.
+                    let quoted = serde_json::to_string(value).map_err(|_| invalid())?;
+                    secrets.push(quoted[1..quoted.len() - 1].to_owned());
+                }
+                serde_json::Value::Object(values) => pending.extend(values.values()),
+                serde_json::Value::Array(values) => pending.extend(values),
+                _ => {}
+            }
+            if secrets.len() > 2_048 { return Err(invalid()); }
+        }
+    } else { secrets.push(trimmed.to_owned()); }
+    secrets.sort();
+    secrets.dedup();
+    Ok(secrets)
+}
+
 /// Streaming capture keeps possible secret prefixes across chunk boundaries.
 /// Redaction happens before the bounded UTF-8 excerpt is clipped.
 #[derive(Clone)]
@@ -62,8 +115,9 @@ pub struct DiagnosticCapture {
     hash: sha2::Sha256,
 }
 impl DiagnosticCapture {
-    pub fn new(secrets: Vec<String>) -> Self {
+    pub fn new(mut secrets: Vec<String>) -> Self {
         use sha2::Digest;
+        secrets.sort_by_key(|secret| std::cmp::Reverse(secret.len()));
         Self {
             secrets: secrets
                 .into_iter()
@@ -87,21 +141,20 @@ impl DiagnosticCapture {
         let mut offset = 0;
         while offset < self.pending.len() {
             let rest = &self.pending[offset..];
+            if self.secrets.iter().any(|secret| secret.len() > rest.len() && secret.starts_with(rest)) {
+                if !finished { break; }
+                // EOF can interrupt the longer of two overlapping secrets.
+                offset = self.pending.len();
+                self.retained.push_str("[redacted]");
+                self.redacted_bytes = self.redacted_bytes.saturating_add(10);
+                continue;
+            }
             if let Some(secret) = self
                 .secrets
                 .iter()
                 .find(|secret| rest.starts_with(secret.as_str()))
             {
                 offset += secret.len();
-                self.retained.push_str("[redacted]");
-                self.redacted_bytes = self.redacted_bytes.saturating_add(10);
-            } else if self.secrets.iter().any(|secret| secret.starts_with(rest)) {
-                if !finished {
-                    break;
-                }
-                // An interrupted stream may end inside a secret. Preserve the
-                // conservative redaction even when it overlaps ordinary text.
-                offset = self.pending.len();
                 self.retained.push_str("[redacted]");
                 self.redacted_bytes = self.redacted_bytes.saturating_add(10);
             } else {
@@ -140,129 +193,120 @@ impl DiagnosticCapture {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn auth_json_values_redact_reordered_split_and_interrupted_streams() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("auth.json");
+        std::fs::write(&path, r#"{"tokens":{"access_token":"secret-access-123","refresh_token":"secret-refresh-456"},"OPENAI_API_KEY":"secret-api-789"}"#).unwrap();
+        let secrets = auth_file_secrets(&path).unwrap();
+        for chunks in [
+            vec!["secret-access-123"],
+            vec!["{\"refresh_token\":\"secret-refresh-456\",\"access_token\":\"secret-access-123\"}"],
+            vec!["value: secret-api-", "789 end"],
+            vec!["value: secret-ref"],
+        ] {
+            let mut capture = DiagnosticCapture::new(secrets.clone());
+            for chunk in chunks { capture.push(chunk); }
+            let (result, _) = capture.finish().await.unwrap();
+            assert!(!result.text.contains("secret-"), "{}", result.text);
+            assert!(result.text.contains("[redacted]"));
+        }
+    }
+
+    #[tokio::test]
+    async fn overlapping_secret_prefix_is_not_released_early() {
+        let mut capture = DiagnosticCapture::new(vec!["short".into(), "short-long-token".into()]);
+        capture.push("short");
+        capture.push("-long-token");
+        let (result, _) = capture.finish().await.unwrap();
+        assert_eq!(result.text, "[redacted]");
+        let mut partial = DiagnosticCapture::new(vec!["short".into(), "short-long-token".into()]);
+        partial.push("short-long");
+        assert_eq!(partial.finish().await.unwrap().0.text, "[redacted]");
+    }
+
+    #[test]
+    fn rejected_payload_logging_never_retains_short_or_interrupted_values() {
+        for payload in [br#"{"payload":"short-secret","short-key-secret":"x"}"#.as_slice(), b"short-secret", br#"{"token":"short-se"#] {
+            let excerpt=redact_untrusted_excerpt(payload);
+            assert!(!excerpt.contains("short-"),"{excerpt}");
+            assert!(excerpt.contains("[redacted]"));
+            assert!(excerpt.chars().count()<=200);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn auth_fifo_and_symlink_are_rejected_without_waiting_for_a_writer() {
+        use std::os::unix::{ffi::OsStrExt,fs::{OpenOptionsExt,symlink}};
+        let dir=tempfile::tempdir().unwrap();
+        let fifo=dir.path().join("auth.fifo");
+        let name=std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        // This creates only the fixture FIFO, never opens a host credential.
+        assert_eq!(unsafe { libc::mkfifo(name.as_ptr(),0o600) },0);
+        let path=fifo.clone();
+        let (send,receive)=std::sync::mpsc::channel();
+        let reader=std::thread::spawn(move || { let _=send.send(auth_file_secrets(&path)); });
+        let result=receive.recv_timeout(std::time::Duration::from_secs(2));
+        // Unblock and join even the unfixed implementation before asserting.
+        let _rescue=if result.is_err() {
+            Some(std::fs::OpenOptions::new().read(true).write(true).custom_flags(libc::O_NONBLOCK).open(&fifo).unwrap())
+        } else { None };
+        reader.join().unwrap();
+        assert!(result.expect("auth open waited for a FIFO writer").is_err());
+        let real=dir.path().join("real.json"); std::fs::write(&real,b"{\"token\":\"fixture-secret\"}").unwrap();
+        let link=dir.path().join("linked.json"); symlink(&real,&link).unwrap();
+        assert!(auth_file_secrets(&link).is_err());
+    }
+
+    #[cfg(not(unix))]
+    #[test]
+    fn file_auth_read_requires_a_qualified_open_boundary() {
+        assert!(auth_file_secrets(std::path::Path::new("unused-auth.json")).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn auth_file_read_is_bounded_and_fails_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("auth.json");
+        std::fs::write(&path, vec![b'a'; 65_537]).unwrap();
+        assert!(auth_file_secrets(&path).is_err());
+        std::fs::write(&path, b"{malformed json").unwrap();
+        assert!(auth_file_secrets(&path).is_err());
+    }
+}
+
 /// One log line for an untrusted ACP frame or submit payload.
-/// Token-like values are removed before the excerpt is clipped.
+/// Payload values are omitted; only bounded safe field/shape metadata remains.
 pub(crate) fn redact_untrusted_excerpt(bytes: &[u8]) -> String {
     const LIMIT: usize = 200;
     let text = String::from_utf8_lossy(bytes);
-    let scrubbed = scrub_long_runs(&scrub_secret_values(&text));
-    let mut excerpt = String::new();
-    for ch in scrubbed.chars() {
-        excerpt.push(if ch.is_control() { ' ' } else { ch });
-        if excerpt.chars().count() >= LIMIT {
-            break;
-        }
-    }
-    while !excerpt.is_char_boundary(excerpt.len()) {
-        excerpt.pop();
-    }
-    excerpt
-}
-
-fn is_sensitive_key(key: &str) -> bool {
-    let key = key.trim().to_ascii_lowercase();
-    if key.is_empty() {
-        return false;
-    }
-    matches!(
-        key.as_str(),
-        "token"
-            | "secret"
-            | "authorization"
-            | "refresh_token"
-            | "access_token"
-            | "api_key"
-            | "password"
-            | "id_token"
-            | "credential"
-    ) || key.contains("token")
-        || key.contains("secret")
-        || key.contains("password")
-        || key.contains("authorization")
-}
-
-fn scrub_secret_values(input: &str) -> String {
-    let chars: Vec<char> = input.chars().collect();
-    let mut out = String::with_capacity(input.len().min(240));
-    let mut index = 0;
-    while index < chars.len() {
-        if chars[index] != '"' {
-            out.push(chars[index]);
-            index += 1;
-            continue;
-        }
-        let start = index;
-        index += 1;
-        let mut key = String::new();
-        while index < chars.len() && chars[index] != '"' {
-            if chars[index] == '\\' && index + 1 < chars.len() {
-                key.push(chars[index]);
-                index += 1;
-            }
-            key.push(chars[index]);
-            index += 1;
-        }
-        if index < chars.len() && chars[index] == '"' {
-            index += 1;
-        }
-        let mut cursor = index;
-        while cursor < chars.len() && chars[cursor].is_whitespace() {
-            cursor += 1;
-        }
-        if !is_sensitive_key(&key) || cursor >= chars.len() || chars[cursor] != ':' {
-            for ch in &chars[start..index] {
-                out.push(*ch);
-            }
-            continue;
-        }
-        cursor += 1;
-        while cursor < chars.len() && chars[cursor].is_whitespace() {
-            cursor += 1;
-        }
-        if cursor >= chars.len() || chars[cursor] != '"' {
-            for ch in &chars[start..index] {
-                out.push(*ch);
-            }
-            continue;
-        }
-        cursor += 1;
-        while cursor < chars.len() && chars[cursor] != '"' {
-            if chars[cursor] == '\\' && cursor + 1 < chars.len() {
-                cursor += 2;
-                continue;
-            }
-            cursor += 1;
-        }
-        if cursor < chars.len() {
-            cursor += 1;
-        }
-        out.push('"');
-        out.push_str(&key);
-        out.push_str("\":\"[redacted]\"");
-        index = cursor;
-    }
-    out
-}
-
-fn scrub_long_runs(input: &str) -> String {
-    let mut out = String::new();
-    let mut run = String::new();
-    let flush = |run: &mut String, out: &mut String| {
-        if run.chars().count() >= 24 {
-            out.push_str("[redacted]");
-        } else {
-            out.push_str(run);
-        }
-        run.clear();
+    // These callers do not have an attempt credential denylist. Retain only
+    // bounded protocol shape, never arbitrary short values or malformed tails.
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) else {
+        return format!("[redacted] malformed JSON ({} bytes)",bytes.len());
     };
-    for ch in input.chars() {
-        if ch.is_ascii_alphanumeric() || matches!(ch, '+' | '/' | '=' | '_' | '-') {
-            run.push(ch);
-        } else {
-            flush(&mut run, &mut out);
-            out.push(ch);
+    fn shape(value: &serde_json::Value, depth: usize) -> serde_json::Value {
+        use serde_json::{json, Value};
+        if depth == 8 { return json!("[redacted]"); }
+        match value {
+            Value::Object(values) => Value::Object(values.iter().take(32).map(|(key,value)| {
+                let safe = match key.as_str() {
+                    "jsonrpc"|"id"|"method"|"params"|"result"|"error"|"code"|"message"|"data"|"update"|"sessionUpdate"|"content"|"type"|"text"|"score"|"toolCall"|"rawInput"|"_meta"|"refresh_token"|"access_token"|"api_key"|"authorization"|"token"|"password" => key.as_str(),
+                    _ => "[redacted-field]",
+                };
+                (safe.to_owned(),shape(value,depth+1))
+            }).collect()),
+            Value::Array(values) => Value::Array(values.iter().take(32).map(|value|shape(value,depth+1)).collect()),
+            Value::Null => Value::Null,
+            _ => json!("[redacted]"),
         }
     }
-    flush(&mut run, &mut out);
-    out
+    shape(&value,0).to_string().chars().take(LIMIT).collect()
 }

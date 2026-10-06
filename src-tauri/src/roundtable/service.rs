@@ -140,6 +140,13 @@ pub trait ParticipantRuntime: Send + Sync {
         ))
     }
 
+    /// Revoke and reap known process-local owners before any database access.
+    async fn cleanup_local_room(&self, _room: RoomId) -> RtResult<()> { Ok(()) }
+
+    /// Snapshot and clean every process-local owner without querying storage.
+    async fn cleanup_all_local(&self) -> RtResult<()> { Ok(()) }
+
+
     async fn run_room(
         &self,
         _store: RoundtableStore,
@@ -462,33 +469,11 @@ impl RoundtableService {
         for task in tasks {
             let _ = task.await;
         }
-        if self.writable() {
-            use sea_orm::TransactionTrait;
-            let store = self.command_store()?;
-            let txn = store
-                .connection()
-                .begin()
-                .await
-                .map_err(super::store::storage_err)?;
-            let rooms = super::store::rows(
-                &txn,
-                "SELECT room_id FROM rt_rooms WHERE status='running'",
-                vec![],
-            )
-            .await?;
-            for row in rooms {
-                let room: String = super::store::column(&row, 0)?;
-                super::store::exec(&txn,"UPDATE rt_rooms SET status='paused',run_epoch=run_epoch+1,revision=revision+1,last_seq=last_seq+1,blocked_reason='recovery_required' WHERE room_id=?",vec![super::store::text(&room)]).await?;
-                super::store::exec(
-                    &txn,
-                    "DELETE FROM rt_active_time_leases WHERE room_id=?",
-                    vec![super::store::text(&room)],
-                )
-                .await?;
-                store.emit_current_in(&txn, &room, "recovery").await?;
-            }
-            txn.commit().await.map_err(super::store::storage_err)?;
-        }
+        // This must happen before any database reads or writes: task abort
+        // revokes admission, but only the runtime can reap its local children.
+        self.note("cleanup");
+        let mut cleanup_ok = self.runtime.cleanup_all_local().await.is_ok()
+            && !self.unknown_occupancy.load(Ordering::Relaxed);
         let mut identities: Vec<RuntimeIdentity> = self
             .quarantine
             .lock()
@@ -499,10 +484,19 @@ impl RoundtableService {
                 pid: 0,
             })
             .collect();
+        let quarantined: std::collections::HashSet<_> = identities.iter().map(|identity| identity.incarnation).collect();
+        let mut proven = Vec::new();
+        for identity in identities.drain(..) {
+            let incarnation = identity.incarnation;
+            match self.runtime.cancel_and_reap(identity).await {
+                Ok(proof) if proof.process.incarnation == incarnation && proof.process.process_tree_empty && proof.mailbox_empty && proof.tools_drained && proof.ingress_drained => proven.push(incarnation),
+                _ => cleanup_ok = false,
+            }
+        }
         if self.writable() {
             let store = self.command_store()?;
             for intent in store.list_unreaped_launches().await? {
-                if !identities
+                if !quarantined.contains(&intent.incarnation) && !identities
                     .iter()
                     .any(|identity| identity.incarnation == intent.incarnation)
                 {
@@ -519,13 +513,11 @@ impl RoundtableService {
                 vec![]).await? {
                 let incarnation = super::store::column::<String>(&row, 0)?.parse()
                     .map_err(|_| rt_error(ErrorCode::StorageUnavailable,"incarnation"))?;
-                if !identities.iter().any(|identity| identity.incarnation == incarnation) {
+                if !quarantined.contains(&incarnation) && !identities.iter().any(|identity| identity.incarnation == incarnation) {
                     identities.push(RuntimeIdentity { incarnation, pid: 0 });
                 }
             }
         }
-        self.note("cleanup");
-        let mut cleanup_ok = !self.unknown_occupancy.load(Ordering::Relaxed);
         for identity in identities {
             let incarnation = identity.incarnation;
             match self.runtime.cancel_and_reap(identity).await {
@@ -536,10 +528,32 @@ impl RoundtableService {
                         && proof.tools_drained
                         && proof.ingress_drained =>
                 {
-                    self.confirm_runtime_cleanup(incarnation).await?;
+                    proven.push(incarnation);
                 }
                 _ => cleanup_ok = false,
             }
+        }
+        // All known owners have now been attempted; a persistence failure can
+        // no longer prevent local reaping of a later owner.
+        for incarnation in proven { self.confirm_runtime_cleanup(incarnation).await?; }
+        if self.writable() {
+            let store = self.command_store()?;
+            let txn = store.write_transaction().await?;
+            let rooms = super::store::rows(&txn,
+                "SELECT room_id FROM rt_rooms WHERE status='running' OR EXISTS(SELECT 1 FROM rt_active_time_leases l WHERE l.room_id=rt_rooms.room_id)", vec![]).await?;
+            for row in rooms {
+                let room: String = super::store::column(&row, 0)?;
+                super::store::exec(&txn,"UPDATE rt_rooms SET status=CASE WHEN status='running' THEN 'paused' ELSE status END,run_epoch=run_epoch+CASE WHEN status='running' THEN 1 ELSE 0 END,revision=revision+1,last_seq=last_seq+1,blocked_reason=CASE WHEN status='running' THEN 'recovery_required' ELSE blocked_reason END WHERE room_id=?",vec![super::store::text(&room)]).await?;
+                let pending = super::store::query_i64(&txn,
+                    "SELECT (SELECT COUNT(*) FROM rt_attempts WHERE room_id=? AND cleanup_state<>'confirmed')+(SELECT COUNT(*) FROM rt_bindings b JOIN rt_launch_intents l ON l.incarnation=b.incarnation WHERE b.room_id=? AND l.reaped=0)",
+                    vec![super::store::text(&room), super::store::text(&room)]).await?;
+                if pending == 0 {
+                    let room_id = room.parse().map_err(|_| rt_error(ErrorCode::StorageUnavailable, "room_id"))?;
+                    super::budget_ledger::settle_room_in(&txn, &store, &room_id).await?;
+                }
+                store.emit_current_in(&txn, &room, "recovery").await?;
+            }
+            txn.commit().await.map_err(super::store::storage_err)?;
         }
         for actor in self.actors.lock().expect("actors").values() {
             actor.stop();
@@ -581,9 +595,8 @@ impl RoundtableService {
     /// Only called after a matching full proof from the owned runtime.
     async fn confirm_runtime_cleanup(&self, incarnation: IncarnationId) -> RtResult<()> {
         use super::store::{column, exec, rows, storage_err, text};
-        use sea_orm::TransactionTrait;
         let store = self.command_store()?;
-        let txn = store.connection().begin().await.map_err(storage_err)?;
+        let txn = store.write_transaction().await?;
         let changed_rooms = rows(&txn,"SELECT DISTINCT b.room_id FROM rt_bindings b WHERE b.incarnation=? AND (b.state<>'retired' OR EXISTS(SELECT 1 FROM rt_attempts a WHERE a.room_id=b.room_id AND a.binding_id=b.binding_id AND a.cleanup_state<>'confirmed'))",vec![text(&incarnation.to_string())]).await?;
         exec(
             &txn,
@@ -591,7 +604,7 @@ impl RoundtableService {
             vec![text(&incarnation.to_string())],
         )
         .await?;
-        exec(&txn,"UPDATE rt_attempts SET cleanup_state='confirmed',state=CASE WHEN state IN ('reserved','launching','admitting','admitted','streaming','validating','active') THEN 'interrupted' ELSE state END WHERE EXISTS(SELECT 1 FROM rt_bindings b WHERE b.room_id=rt_attempts.room_id AND b.binding_id=rt_attempts.binding_id AND b.incarnation=?)",vec![text(&incarnation.to_string())]).await?;
+        exec(&txn,"UPDATE rt_attempts SET residual_remote_work=CASE WHEN cleanup_state<>'confirmed' AND dispatch_state IN('sent','unknown') AND state<>'accepted' THEN 1 ELSE residual_remote_work END,cleanup_state='confirmed',state=CASE WHEN state IN ('reserved','launching','admitting','admitted','streaming','validating','active') THEN 'interrupted' ELSE state END WHERE EXISTS(SELECT 1 FROM rt_bindings b WHERE b.room_id=rt_attempts.room_id AND b.binding_id=rt_attempts.binding_id AND b.incarnation=?)",vec![text(&incarnation.to_string())]).await?;
         exec(
             &txn,
             "UPDATE rt_bindings SET state='retired',retire_reason='cleanup' WHERE incarnation=?",
@@ -614,6 +627,7 @@ impl RoundtableService {
 
     pub(crate) async fn cleanup_room(&self, room: RoomId) -> RtResult<()> {
         use super::store::{column, rows, text};
+        self.runtime.cleanup_local_room(room).await?;
         let store = self.command_store()?;
         let bindings=rows(store.connection(),"SELECT DISTINCT b.incarnation FROM rt_bindings b WHERE b.room_id=? AND (EXISTS(SELECT 1 FROM rt_attempts a WHERE a.room_id=b.room_id AND a.binding_id=b.binding_id AND a.cleanup_state<>'confirmed') OR EXISTS(SELECT 1 FROM rt_launch_intents l WHERE l.incarnation=b.incarnation AND l.reaped=0))",vec![text(&room.to_string())]).await?;
         for binding in bindings {
@@ -637,6 +651,9 @@ impl RoundtableService {
             }
             self.confirm_runtime_cleanup(incarnation).await?;
         }
+        let txn = store.write_transaction().await?;
+        super::budget_ledger::settle_room_in(&txn, &store, &room).await?;
+        txn.commit().await.map_err(super::store::storage_err)?;
         Ok(())
     }
 

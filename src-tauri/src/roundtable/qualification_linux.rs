@@ -143,8 +143,11 @@ pub async fn measure_host(request: &ProbeRequest) -> ProbeFacts {
         let placeholder = request
             .rootfs
             .join(file.destination.trim_start_matches('/'));
-        match fs::metadata(&placeholder) {
-            Ok(metadata) if metadata.is_file() && metadata.len() == 0 => {}
+        match fs::symlink_metadata(&placeholder) {
+            Ok(metadata)
+                if metadata.is_file()
+                    && !metadata.file_type().is_symlink()
+                    && metadata.len() == 0 => {}
             _ => failures.push(fail(
                 "model_credential_material_in_sandbox",
                 "auth placeholder missing or not empty",
@@ -168,6 +171,12 @@ pub async fn measure_host(request: &ProbeRequest) -> ProbeFacts {
     }
 
     let adapter_version = version_inside(request, profile.container_cli, &["--version"]).await;
+    if adapter_version.is_none() {
+        failures.push(not_tested(
+            "cancel_and_reap",
+            "version probe did not return a final cleanup proof",
+        ));
+    }
     let version_ok = adapter_version
         .as_deref()
         .is_some_and(|text| text.contains(profile.version_needle));
@@ -213,15 +222,6 @@ pub async fn measure_host(request: &ProbeRequest) -> ProbeFacts {
         failures.push(fail("api_credential_scope", &reason));
         Vec::new()
     });
-    let credential_in_env = facts.providers.iter().any(|provider| {
-        std::env::var(&provider.credential_env)
-            .ok()
-            .is_some_and(|value| !value.is_empty() && value.len() > 8)
-            && false
-    });
-    // The sandbox env is built below and must not contain the provider secret.
-    let _ = credential_in_env;
-
     let mut container_env = BTreeMap::new();
     for (key, value) in profile.container_env {
         container_env.insert((*key).to_string(), (*value).to_string());
@@ -296,25 +296,9 @@ pub async fn measure_host(request: &ProbeRequest) -> ProbeFacts {
                 count: Some(idle),
                 flag: None,
             });
-            facts.checks.push(pass_flag(
-                "native_read_boundary",
-                "host secret path was not readable in the container",
-                false,
-            ));
-            facts.checks.push(pass_flag(
-                "model_credential_material_in_sandbox",
-                "credential bytes were not in the rootfs",
-                false,
-            ));
-            facts.checks.push(pass_flag(
-                "model_credentials_visible_to_agent",
-                "provider credential env was not copied into the container",
-                false,
-            ));
-            if idle != 0 || facts.isolation_marker != "ISOLATION_OK" {
-                // The flag checks above are only true when the script proved them.
-                revoke_unproven(&mut facts);
-            }
+            // This shell probe measures host-path isolation only. It does not
+            // exercise the adapter's native tools or its authentication files.
+
         }
         Err(reason) => {
             facts.checks.push(fail("strict_isolation", &reason));
@@ -327,8 +311,8 @@ pub async fn measure_host(request: &ProbeRequest) -> ProbeFacts {
     match run_mcp(request, &probe_token).await {
         Ok(()) => {
             facts.checks.push(pass(
-                "roundtable_mcp",
-                "codeg-mcp connected to the mounted socket",
+                "companion_socket_connection",
+                "codeg-mcp connected to the mounted socket; no production broker submission was performed",
             ));
             facts.checks.push(pass(
                 "companion_lifecycle",
@@ -336,6 +320,10 @@ pub async fn measure_host(request: &ProbeRequest) -> ProbeFacts {
             ));
         }
         Err(reason) => {
+            facts.checks.push(not_tested(
+                "cancel_and_reap",
+                "MCP probe failure did not return a final cleanup proof",
+            ));
             facts.checks.push(fail("roundtable_mcp", &reason));
             facts.checks.push(fail("companion_lifecycle", &reason));
         }
@@ -356,7 +344,7 @@ pub async fn measure_host(request: &ProbeRequest) -> ProbeFacts {
                 .push(pass("new_session", "ACP initialize and session/new"));
             match model_binding_error(&request.agent, &turn.session, &facts.providers) {
                 None => facts.checks.push(pass(
-                    "endpoint_compatibility",
+                    "advertised_model_binding",
                     &format!("protocolVersion 1; {}", turn.egress_note),
                 )),
                 Some(reason) => facts.checks.push(fail(
@@ -369,42 +357,12 @@ pub async fn measure_host(request: &ProbeRequest) -> ProbeFacts {
                 "session/prompt stopReason=end_turn",
                 turn.completed,
             ));
-            facts.checks.push(pass(
-                "bounded_context_delivery",
-                "prompt stayed inside the byte cap",
-            ));
-            facts
-                .checks
-                .push(pass("private_events", "no ordinary event bus was attached"));
-            facts.checks.push(ProbeCheck {
-                name: "sidebar_discovery".into(),
-                status: "passed".into(),
-                evidence: "roundtable registry is hidden from ordinary discovery".into(),
-                input: b"sidebar".to_vec(),
-                output: b"0".to_vec(),
-                count: Some(0),
-                flag: None,
-            });
-            facts.checks.push(ProbeCheck {
-                name: "global_body_events".into(),
-                status: "passed".into(),
-                evidence: "probe wrote no global body events".into(),
-                input: b"events".to_vec(),
-                output: b"0".to_vec(),
-                count: Some(0),
-                flag: None,
-            });
-            if !failures
-                .iter()
-                .any(|check| check.name == "api_credential_scope")
-            {
-                facts.checks.push(pass(
-                    "api_credential_scope",
-                    "container env did not receive the provider credential",
-                ));
-            }
         }
         Err(reason) => {
+            facts.checks.push(not_tested(
+                "cancel_and_reap",
+                "ACP probe failure did not return a final cleanup proof",
+            ));
             facts.checks.push(fail("new_session", &reason));
             facts.checks.push(fail("endpoint_compatibility", &reason));
             facts.checks.push(fail("ordered_turn_completion", &reason));
@@ -413,6 +371,38 @@ pub async fn measure_host(request: &ProbeRequest) -> ProbeFacts {
             facts.checks.push(fail("api_credential_scope", &reason));
         }
     }
+    for name in [
+        "submit_receipt_completion",
+        "roundtable_mcp",
+        "bounded_context_delivery",
+        "private_events",
+        "sidebar_discovery",
+        "global_body_events",
+        "model_credentials_visible_to_agent",
+        "native_read_boundary",
+        "api_credential_scope",
+        "endpoint_compatibility",
+    ] {
+        if !facts.checks.iter().any(|check| check.name == name) {
+            facts.checks.push(not_tested(
+                name,
+                "production path was not exercised by this smoke probe",
+            ));
+        }
+    }
+    facts.checks.push(if auth_mounts.is_empty() {
+        not_tested(
+            "model_credential_material_in_sandbox",
+            "native authentication boundary was not measured",
+        )
+    } else {
+        let mut check = fail(
+            "model_credential_material_in_sandbox",
+            "native auth files are mounted or copied into the adapter sandbox and remain readable",
+        );
+        check.flag = Some(true);
+        check
+    });
     stamp_failures(&mut facts, &failures);
     facts
 }
@@ -440,24 +430,20 @@ fn empty_facts(agent: &str) -> ProbeFacts {
 
 fn stamp_failures(facts: &mut ProbeFacts, failures: &[ProbeCheck]) {
     for failure in failures {
-        if !facts.checks.iter().any(|check| check.name == failure.name) {
+        if let Some(existing) = facts.checks.iter_mut().find(|check| check.name == failure.name) {
+            if existing.status != "failed" || failure.status == "failed" {
+                *existing = failure.clone();
+            }
+        } else {
             facts.checks.push(failure.clone());
         }
     }
 }
 
-fn revoke_unproven(facts: &mut ProbeFacts) {
-    for name in [
-        "native_read_boundary",
-        "model_credential_material_in_sandbox",
-        "model_credentials_visible_to_agent",
-    ] {
-        if let Some(check) = facts.checks.iter_mut().find(|check| check.name == name) {
-            check.status = "failed".into();
-            check.flag = None;
-            check.evidence.push_str("\nisolation marker missing");
-        }
-    }
+fn not_tested(name: &str, evidence: &str) -> ProbeCheck {
+    let mut check = fail(name, evidence);
+    check.status = "not_tested".into();
+    check
 }
 
 fn fail(name: &str, evidence: &str) -> ProbeCheck {
@@ -555,13 +541,9 @@ fn recorded_crun_version(text: &str) -> Option<String> {
 }
 
 async fn command_text(bin: &Path, args: &[&str]) -> Option<String> {
-    let output = Command::new(bin)
-        .args(args)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()
-        .await
-        .ok()?;
+    let output = tokio::time::timeout(Duration::from_secs(10), Command::new(bin)
+        .args(args).stdout(Stdio::piped()).stderr(Stdio::piped()).kill_on_drop(true).output())
+        .await.ok()?.ok()?;
     let mut text = String::from_utf8_lossy(&output.stdout).into_owned();
     if text.trim().is_empty() {
         text = String::from_utf8_lossy(&output.stderr).into_owned();
@@ -666,7 +648,8 @@ async fn run_mcp(request: &ProbeRequest, token: &str) -> Result<(), String> {
             "qualify".into(),
         ];
         let prepared = prepare_bundle(request, &argv, &mounts, None, false, Some(token))?;
-        let mut child = Command::new(&request.crun)
+        let mut container = ProbeContainer { request, id: prepared.id.clone(), child: None, reaped: false, slirp_expected: false };
+        container.child = Some(Command::new(&request.crun)
             .args(crun_prefix(request))
             .arg("run")
             .arg("--bundle")
@@ -676,7 +659,7 @@ async fn run_mcp(request: &ProbeRequest, token: &str) -> Result<(), String> {
             .stderr(Stdio::null())
             .kill_on_drop(true)
             .spawn()
-            .map_err(|error| error.to_string())?;
+            .map_err(|error| error.to_string())?);
         let start = std::time::Instant::now();
         let connected = loop {
             match listener.accept() {
@@ -690,10 +673,8 @@ async fn run_mcp(request: &ProbeRequest, token: &str) -> Result<(), String> {
                 Err(_) => break false,
             }
         };
-        let _ = child.start_kill();
-        let _ = child.wait().await;
-        let reaped = reap(request, &prepared.id).await.is_ok();
-        if connected && reaped {
+        container.finish().await?;
+        if connected {
             Ok(())
         } else {
             Err("mcp did not connect inside the isolator".into())
@@ -741,7 +722,7 @@ async fn run_acp(
             .set_nonblocking(true)
             .map_err(|error| error.to_string())?;
         mounts.push((socket_path, "/run/codeg/roundtable.sock".into(), false));
-        tokio::spawn(async move {
+        AbortOnDrop(tokio::spawn(async move {
             let start = std::time::Instant::now();
             let mut held = Vec::new();
             loop {
@@ -757,7 +738,7 @@ async fn run_acp(
                 }
             }
             drop(held);
-        })
+        }))
     };
     let egress_note = match run_egress(request, &mounts).await {
         Ok(note) => note,
@@ -765,25 +746,71 @@ async fn run_acp(
     };
     let output = run_acp_session(request, &argv, &mounts, token, egress_note).await;
     #[cfg(unix)]
-    accept.abort();
+    drop(accept);
     output
+}
+
+#[cfg(unix)]
+struct AbortOnDrop(tokio::task::JoinHandle<()>);
+#[cfg(unix)]
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
 }
 
 /// Stops the ACP `crun run` process, its slirp helper, and the container
 /// when dropped. initialize and session/new return before the normal reap,
 /// and those paths must not leave `cq-acp-*` running.
-struct AcpContainer<'a> {
+struct ProbeContainer<'a> {
     request: &'a ProbeRequest,
     id: String,
     child: Option<tokio::process::Child>,
+    reaped: bool,
+    slirp_expected: bool,
 }
 
-impl Drop for AcpContainer<'_> {
+impl ProbeContainer<'_> {
+    async fn finish(&mut self) -> Result<(), String> {
+        if let Some(child) = self.child.as_mut() {
+            let _ = child.start_kill();
+            child.wait().await.map_err(|error| error.to_string())?;
+        }
+        reap(self.request, &self.id, self.slirp_expected).await?;
+        self.reaped = true;
+        Ok(())
+    }
+}
+
+impl Drop for ProbeContainer<'_> {
     fn drop(&mut self) {
+        if self.reaped {
+            return;
+        }
+        let pid = self.child.as_ref().and_then(|child| child.id());
         if let Some(child) = self.child.as_mut() {
             let _ = child.start_kill();
         }
-        let _ = reap_blocking(self.request, &self.id);
+        // Dropping a cancelled future cannot await. This is our own Child,
+        // already sent SIGKILL; waitpid cannot target an unrelated process.
+        #[cfg(unix)]
+        if let Some(pid) = pid {
+            loop {
+                let result = unsafe { libc::waitpid(pid as i32, std::ptr::null_mut(), 0) };
+                if result >= 0
+                    || std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted
+                {
+                    break;
+                }
+            }
+        }
+        #[cfg(not(unix))]
+        let _ = pid;
+        // Reap the launcher before the final helper sweep: it cannot create
+        // another poststart hook after this point.
+        if let Err(reason) = reap_blocking(self.request, &self.id, self.slirp_expected) {
+            tracing::warn!(container = %self.id, %reason, "qualification cleanup unproven");
+        }
     }
 }
 
@@ -795,10 +822,12 @@ async fn run_acp_session(
     egress_note: String,
 ) -> Result<TurnOutcome, String> {
     let prepared = prepare_bundle(request, argv, mounts, None, true, None)?;
-    let mut container = AcpContainer {
+    let mut container = ProbeContainer {
         request,
         id: prepared.id.clone(),
         child: None,
+        reaped: false,
+        slirp_expected: true,
     };
     container.child = Some(
         Command::new(&request.crun)
@@ -864,6 +893,7 @@ async fn run_acp_session(
         }),
     )
     .await?;
+    container.finish().await?;
     Ok(TurnOutcome {
         completed: result["stopReason"] == "end_turn",
         session,
@@ -914,28 +944,42 @@ async fn run_container(
     token: Option<&str>,
 ) -> Result<String, String> {
     let prepared = prepare_bundle(request, argv, mounts, secret, slirp, token)?;
-    let output = tokio::time::timeout(
-        timeout,
-        Command::new(&request.crun)
-            .args(crun_prefix(request))
-            .arg("run")
-            .arg("--bundle")
-            .arg(&prepared.bundle)
-            .arg(&prepared.id)
-            .output(),
-    )
-    .await
-    .map_err(|_| "container timed out".to_string())?
-    .map_err(|error| error.to_string())?;
+    let mut container = ProbeContainer { request, id: prepared.id.clone(), child: None, reaped: false, slirp_expected: slirp };
+    container.child = Some(Command::new(&request.crun)
+        .args(crun_prefix(request)).arg("run").arg("--bundle").arg(&prepared.bundle).arg(&prepared.id)
+        .stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).kill_on_drop(true)
+        .spawn().map_err(|error| error.to_string())?);
+    let child = container.child.as_mut().ok_or("container child")?;
+    let stdout = child.stdout.take().ok_or("container stdout")?;
+    let stderr = child.stderr.take().ok_or("container stderr")?;
+    let result = tokio::time::timeout(timeout, async {
+        let (stdout, stderr, status) = tokio::try_join!(
+            bounded_probe_output(stdout), bounded_probe_output(stderr),
+            async { child.wait().await.map_err(|error| error.to_string()) }
+        )?;
+        Ok::<_, String>(std::process::Output { status, stdout, stderr })
+    }).await.map_err(|_| "container timed out".to_string()).and_then(|result| result);
+    let cleanup = container.finish().await;
+    let output = match (result, cleanup) {
+        (Ok(output), Ok(())) => output,
+        (Err(reason), Ok(())) => return Err(reason),
+        (result, Err(cleanup)) => return Err(format!("{}; cleanup unproven: {cleanup}", result.err().unwrap_or_else(|| "container completed".into()))),
+    };
     let mut text = String::from_utf8_lossy(&output.stdout).into_owned();
     text.push_str(&String::from_utf8_lossy(&output.stderr));
-    if reap(request, &prepared.id).await.is_ok() {
-        text.push_str("\nREAPED\n");
-    }
+    text.push_str("\nREAPED\n");
     if !output.status.success() && !text.contains("ISOLATION_OK") {
         return Err(format!("container exit {}: {text}", output.status));
     }
     Ok(text)
+}
+
+async fn bounded_probe_output(reader: impl tokio::io::AsyncRead + Unpin) -> Result<Vec<u8>, String> {
+    use tokio::io::AsyncReadExt;
+    let mut bytes = Vec::new();
+    reader.take(1024 * 1024 + 1).read_to_end(&mut bytes).await.map_err(|error| error.to_string())?;
+    if bytes.len() > 1024 * 1024 { return Err("container output limit".into()); }
+    Ok(bytes)
 }
 
 fn crun_prefix(request: &ProbeRequest) -> Vec<String> {
@@ -1002,6 +1046,13 @@ fn prepare_bundle(
     } else {
         format!("cq-acp-{}", std::process::id())
     };
+    // Concurrent probes must never reap one another's deterministic names.
+    let id = format!("{id}-{}", uuid::Uuid::new_v4().simple());
+    for path in [request.runtime_root.join("state").join(&id), request.cgroup_root.join(&id), request.runtime_root.join("slirp-pids").join(format!("{id}.pid"))] {
+        if path.try_exists().map_err(|error| error.to_string())? {
+            return Err("previous probe cleanup unproven".into());
+        }
+    }
     let bundle = request.runtime_root.join("bundles").join(&id);
     let _ = fs::remove_dir_all(&bundle);
     fs::create_dir_all(&bundle).map_err(|error| error.to_string())?;
@@ -1437,6 +1488,9 @@ fn classify_container_reap(
             delete_stderr.to_string()
         });
     }
+    if state_dir_exists {
+        return Err("container state directory still exists".into());
+    }
     if cgroup_dir_exists {
         return Err("container cgroup directory still exists".to_string());
     }
@@ -1452,46 +1506,58 @@ fn delete_reports_missing_container(stderr: &str) -> bool {
         || lower.contains("does not exist")
 }
 
-fn cgroup_dir_released(path: &Path) -> bool {
+fn cgroup_dir_released(path: &Path) -> Result<bool, String> {
     for _ in 0..25 {
-        if !path.exists() {
-            return true;
+        if !path.try_exists().map_err(|error| error.to_string())? {
+            return Ok(true);
         }
         std::thread::sleep(Duration::from_millis(40));
     }
-    !path.exists()
+    Ok(!path.try_exists().map_err(|error| error.to_string())?)
 }
 
-fn reap_blocking(request: &ProbeRequest, id: &str) -> Result<(), String> {
-    super::sandbox::linux_stop_slirp(&request.runtime_root, id);
-    let _ = std::process::Command::new(&request.crun)
-        .args(crun_prefix(request))
-        .arg("kill")
-        .arg(id)
-        .arg("KILL")
-        .output();
-    let output = std::process::Command::new(&request.crun)
-        .args(crun_prefix(request))
-        .arg("delete")
-        .arg(id)
-        .output()
-        .map_err(|error| error.to_string())?;
-    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+fn bounded_reap_command(request: &ProbeRequest, tail: &[&str]) -> Result<(std::process::ExitStatus, String), String> {
+    use std::io::{Seek, SeekFrom};
+    let mut stderr = tempfile::tempfile().map_err(|error| error.to_string())?;
+    let mut child = std::process::Command::new(&request.crun).args(crun_prefix(request)).args(tail)
+        .stdin(Stdio::null()).stdout(Stdio::null()).stderr(stderr.try_clone().map_err(|error| error.to_string())?)
+        .spawn().map_err(|error| error.to_string())?;
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if std::time::Instant::now() < deadline => std::thread::sleep(Duration::from_millis(10)),
+            result => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(result.err().map(|error| error.to_string()).unwrap_or_else(|| "container cleanup command timed out".into()));
+            }
+        }
+    };
+    stderr.seek(SeekFrom::Start(0)).map_err(|error| error.to_string())?;
+    let mut text = String::new();
+    stderr.take(64 * 1024).read_to_string(&mut text).map_err(|error| error.to_string())?;
+    Ok((status, text))
+}
+
+fn reap_blocking(request: &ProbeRequest, id: &str, slirp_expected: bool) -> Result<(), String> {
+    let _ = super::sandbox::linux_stop_slirp(&request.runtime_root, id, slirp_expected)
+        .map_err(|error| error.details.reason.unwrap_or_else(|| "slirp cleanup unproven".into()));
+    let _ = bounded_reap_command(request, &["kill", id, "KILL"]);
+    let (status, stderr) = bounded_reap_command(request, &["delete", id])?;
     let state_dir = request.runtime_root.join("state").join(id);
     let cgroup_dir = request.cgroup_root.join(id);
-    let cgroup_exists = !cgroup_dir_released(&cgroup_dir);
-    classify_container_reap(
-        output.status.success(),
-        &stderr,
-        state_dir.exists(),
-        cgroup_exists,
-    )
+    let cgroup_exists = !cgroup_dir_released(&cgroup_dir)?;
+    let state_exists = state_dir.try_exists().map_err(|error| error.to_string())?;
+    classify_container_reap(status.success(), &stderr, state_exists, cgroup_exists)?;
+    super::sandbox::linux_stop_slirp(&request.runtime_root, id, slirp_expected)
+        .map_err(|error| error.details.reason.unwrap_or_else(|| "slirp cleanup unproven".into()))
 }
 
-async fn reap(request: &ProbeRequest, id: &str) -> Result<(), String> {
+async fn reap(request: &ProbeRequest, id: &str, slirp_expected: bool) -> Result<(), String> {
     let request = request.clone();
     let id = id.to_string();
-    tokio::task::spawn_blocking(move || reap_blocking(&request, &id))
+    tokio::task::spawn_blocking(move || reap_blocking(&request, &id, slirp_expected))
         .await
         .unwrap_or_else(|error| Err(error.to_string()))
 }
@@ -1560,10 +1626,12 @@ pub fn probe_recorded_crun_version(text: &str) -> Option<String> {
 /// stops slirp and deletes the container.
 #[cfg(any(test, feature = "test-utils"))]
 pub fn probe_acp_exit_cleans_container(request: &ProbeRequest, id: &str) -> Result<(), String> {
-    let _container = AcpContainer {
+    let _container = ProbeContainer {
         request,
         id: id.to_string(),
         child: None,
+        reaped: false,
+        slirp_expected: true,
     };
     Err("session/new rejected".into())
 }
@@ -1621,3 +1689,111 @@ try "$origin" || true
 try "$other" || true
 exit 0
 "#;
+
+#[cfg(all(test, unix))]
+mod cleanup_regressions {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    struct FakeRuntime {
+        root: tempfile::TempDir,
+        request: ProbeRequest,
+    }
+
+    impl FakeRuntime {
+        fn new() -> Self {
+            let root = tempfile::tempdir().unwrap();
+            let crun = root.path().join("fake-crun");
+            let log = root.path().join("calls");
+            let pid = root.path().join("pid");
+            fs::write(&crun, format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\nfor arg in \"$@\"; do\n if [ \"$arg\" = run ]; then echo $$ > '{}'; exec sleep 30; fi\ndone\nexit 0\n", log.display(), pid.display()
+            )).unwrap();
+            fs::set_permissions(&crun, fs::Permissions::from_mode(0o700)).unwrap();
+            let request = ProbeRequest {
+                data_dir: root.path().to_path_buf(), agent: "grok".into(),
+                rootfs: root.path().join("rootfs"), crun,
+                // Only joined/read by the fake runner; never creates a cgroup.
+                cgroup_root: PathBuf::from(format!("/sys/fs/cgroup/codeg-fake-{}", uuid::Uuid::new_v4())),
+                runtime_root: root.path().join("runtime"),
+                provider_bindings: root.path().join("bindings.json"), home: root.path().join("home"), profile_id: None,
+            };
+            Self { root, request }
+        }
+        fn calls(&self) -> String {
+            fs::read_to_string(self.root.path().join("calls")).unwrap_or_default()
+        }
+        async fn wait_for_run(&self) {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while !self.root.path().join("pid").is_file() {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            }).await.unwrap();
+        }
+        fn assert_cleaned(&self, prefix: &str) {
+            let calls = self.calls();
+            let id = calls.lines().find(|line| line.contains(" run --bundle "))
+                .and_then(|line| line.split_whitespace().last()).expect("owned run id");
+            assert!(id.starts_with(&format!("{prefix}-")), "{id}");
+            assert!(calls.contains(&format!("kill {id} KILL")), "{calls}");
+            assert!(calls.contains(&format!("delete {id}")), "{calls}");
+            let pid = fs::read_to_string(self.root.path().join("pid")).unwrap().trim().parse::<i32>().unwrap();
+            assert_eq!(unsafe { libc::kill(pid, 0) }, -1, "launcher remains alive or unreaped");
+        }
+    }
+    impl Drop for FakeRuntime {
+        fn drop(&mut self) {
+            // The red test must not leak its stand-in even on assertion failure.
+            if let Ok(pid) = fs::read_to_string(self.root.path().join("pid")) {
+                if let Ok(pid) = pid.trim().parse::<i32>() {
+                    unsafe { libc::kill(pid, libc::SIGKILL); }
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn version_isolation_and_egress_timeouts_reap_the_owned_container() {
+        for (arg, id) in [("--version", "cq-version"), ("/scratch/probe.sh", "cq-isolation"), ("/scratch/egress.sh", "cq-egress")] {
+            let fake = FakeRuntime::new();
+            let error = run_container(&fake.request, &[arg.into()], &[], None, Duration::from_millis(50), false, None).await.unwrap_err();
+            assert!(error.contains("timed out"), "{error}");
+            fake.assert_cleaned(id);
+        }
+    }
+
+    #[tokio::test]
+    async fn cancelled_container_future_reaps_the_owned_container() {
+        let fake = FakeRuntime::new();
+        let request = fake.request.clone();
+        let task = tokio::spawn(async move {
+            run_container(&request, &["--version".into()], &[], None, Duration::from_secs(30), false, None).await
+        });
+        fake.wait_for_run().await;
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        fake.assert_cleaned("cq-version");
+    }
+
+    #[tokio::test]
+    async fn cancelled_mcp_future_reaps_the_owned_container() {
+        let fake = FakeRuntime::new();
+        let request = fake.request.clone();
+        let task = tokio::spawn(async move { run_mcp(&request, "fake-only-token").await });
+        fake.wait_for_run().await;
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        fake.assert_cleaned("cq-mcp");
+    }
+
+    #[test]
+    fn measured_failures_replace_unrelated_pass_observations() {
+        let mut facts = empty_facts("grok");
+        facts.checks.push(pass_flag("model_credential_material_in_sandbox", "placeholder", false));
+        stamp_failures(&mut facts, &[fail("model_credential_material_in_sandbox", "nonempty placeholder")]);
+        assert_eq!(facts.checks.len(), 1);
+        assert_eq!(facts.checks[0].status, "failed");
+        stamp_failures(&mut facts, &[not_tested("model_credential_material_in_sandbox", "later missing probe")]);
+        assert_eq!(facts.checks[0].status, "failed", "unknown cannot replace a measured failure");
+    }
+}

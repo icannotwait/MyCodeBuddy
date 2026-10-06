@@ -26,7 +26,7 @@ pub use projection::{project, RoomAggregate};
 pub use strategy::*;
 pub use usage::{fold_measurement, MeasureSemantics, MeasurementV1, UsageState};
 pub use validation::{
-    seat_schema_example, submit_candidate, submit_result_input_schema, validate_consensus,
+    result_schema, seat_schema_example, submit_candidate, submit_result_input_schema, validate_consensus,
     validate_result, AliasVisibility, ClaimRef, DecisionKind, EvidenceRef, FieldCode,
     RequiredTarget, ResponseRef, ResultScope, SubmissionDecision, SubmissionState, ValidatedResult,
     VisibleAliases, MAX_REPAIRABLE_INVALID_SUBMISSIONS, MAX_REPAIRABLE_SHAPE_SUBMISSIONS,

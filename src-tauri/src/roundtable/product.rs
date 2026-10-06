@@ -143,9 +143,13 @@ impl RoundtableService {
                                 .revision
                                 .ok_or_else(|| rt_error(ErrorCode::InvalidArgument, "revision"))?,
                         )?;
-                        if config_hash(&request.config)?
-                            != config_hash(&decode::<RoundtableConfigV1>(&current.config)?)?
-                        {
+                        let mut prospective: RoundtableConfigV1 = decode(&current.config)?;
+                        // Resume may change concurrency only. Bind the exact prospective
+                        // config to this paused revision; all other edits still conflict.
+                        if current.status == "paused" {
+                            prospective.concurrency = request.config.concurrency;
+                        }
+                        if config_hash(&request.config)? != config_hash(&prospective)? {
                             return Err(rt_error(ErrorCode::RevisionConflict, "config_changed"));
                         }
                         Some((room, current))
@@ -159,6 +163,9 @@ impl RoundtableService {
                 };
                 let sources =
                     frozen_sources(&store, actor, request.room_id, &request.config).await?;
+                if let Some(room) = request.room_id {
+                    check_interjection_context(store.connection(), room, &request.config, None).await?;
+                }
                 let runtime = self.participant_runtime().preflight(&request.config).await;
                 let mut confirmation = None;
                 if let (Some((room, current)), Ok(capability)) = (&current, &runtime) {
@@ -210,6 +217,7 @@ impl RoundtableService {
                     request.request_id,
                     request.config,
                     self.boot_epoch(),
+                    Some((&self.data_dir, &request.selected_source_paths)),
                 )
                 .await
             }
@@ -294,6 +302,7 @@ impl RoundtableService {
                     request.request_id,
                     config,
                     self.boot_epoch(),
+                    None,
                 )
                 .await
             }
@@ -345,6 +354,7 @@ impl RoundtableService {
                     return Ok(json!(ack));
                 }
                 self.require_mutation(fake, false)?;
+                let mut confirmed = None;
                 if matches!(
                     request.kind,
                     ControlKind::RestartCurrent | ControlKind::RetrySynthesis
@@ -352,9 +362,18 @@ impl RoundtableService {
                     self.require_mutation(fake, true)?;
                     self.require_capacity(&store, request.room_id, true).await?;
                     let current = authorized_room(&store, actor, &request.room_id).await?;
-                    self.participant_runtime()
-                        .preflight(&decode(&current.config)?)
-                        .await?;
+                    let config = decode(&current.config)?;
+                    let proposed = if request.kind == ControlKind::RestartCurrent {
+                        request.input.get("text").and_then(Value::as_str)
+                            .map(|text| (request.request_id.to_string(), text))
+                    } else { None };
+                    check_interjection_context(store.connection(), request.room_id, &config, proposed).await?;
+                    let capability = self.participant_runtime().preflight(&config).await?;
+                    let id = body.get("confirmed_preflight_id").and_then(Value::as_str);
+                    if !fake || id.is_some() {
+                        confirmed = Some(self.confirmed_inputs(&store, actor, request.room_id,
+                            Revision(current.revision as u64), &config, &capability, id).await?);
+                    }
                 }
                 let ack = store.request_control(actor, &request).await?;
                 if let Some(operation) = ack.operation_id {
@@ -371,6 +390,10 @@ impl RoundtableService {
                         return Ok(json!(ack));
                     }
                     self.stop_room_task(request.room_id).await;
+                    // Local revocation never waits for a successful database write.
+                    if let Err(error) = self.participant_runtime().cleanup_local_room(request.room_id).await {
+                        tracing::warn!(room=%request.room_id, reason=?error.details.reason, "roundtable local control cleanup pending");
+                    }
                     // The store itself verifies whether real cleanup is necessary.
                     // A pending process leaves a durable operation for supervision.
                     match store
@@ -378,7 +401,7 @@ impl RoundtableService {
                         .await
                     {
                         Ok(_) => {
-                            self.continue_control(&store, actor, request.room_id, operation, fake)
+                            self.continue_control(&store, actor, request.room_id, operation, fake, confirmed.clone())
                                 .await?;
                             Ok(json!(ack))
                         }
@@ -408,7 +431,7 @@ impl RoundtableService {
                                             Ok(store)=>{
                                                 let result=async {
                                                     store.advance_durable_control(&actor,room,operation,false).await?;
-                                                    service.continue_control(&store,&actor,room,operation,fake).await
+                                                    service.continue_control(&store,&actor,room,operation,fake,confirmed.clone()).await
                                                 }.await;
                                                 if let Err(error)=result {
                                                     if let Err(error)=block_control_failure(&store,room,operation,&error).await {tracing::warn!(room=%room,reason=?error.details.reason,"roundtable blocked control persistence failed");}
@@ -459,7 +482,7 @@ impl RoundtableService {
                             request.room_id,
                             request.request_id,
                             request.expected_revision,
-                            None,
+                            request.confirmed_preflight_id,
                             request.concurrency,
                         )
                     };
@@ -479,36 +502,11 @@ impl RoundtableService {
                 {
                     return Err(rt_error(ErrorCode::InvalidState, "draft_required"));
                 }
+                check_interjection_context(store.connection(), room, &config, None).await?;
                 let capability = self.participant_runtime().preflight(&config).await?;
-                if command == "roundtable_start" {
-                    let id = confirmation.as_deref().ok_or_else(|| {
-                        rt_error(ErrorCode::InvalidArgument, "preflight_confirmation")
-                    })?;
-                    let record = self
-                        .preflights
-                        .lock()
-                        .expect("preflights")
-                        .get(id)
-                        .cloned()
-                        .ok_or_else(|| {
-                            rt_error(ErrorCode::InvalidArgument, "preflight_confirmation")
-                        })?;
-                    let sources = frozen_sources(&store, actor, Some(room), &config).await?;
-                    if record.principal != actor.principal_id()
-                        || record.room != room
-                        || record.revision != revision
-                        || record.config_hash != config_hash(&config)?
-                        || record.expires_ms <= store.clock_sample().0
-                        || record.capability_hash
-                            != roundtable_protocol::canonical_hash(&capability)?.to_hex()
-                        || record.source_hash
-                            != roundtable_protocol::canonical_hash(&sources)?.to_hex()
-                    {
-                        return Err(rt_error(
-                            ErrorCode::InvalidArgument,
-                            "preflight_confirmation",
-                        ));
-                    }
+                if command == "roundtable_start" || !fake || confirmation.is_some() {
+                    self.confirmed_inputs(&store, actor, room, revision, &config,
+                        &capability, confirmation.as_deref()).await?;
                 }
                 let ack = start(
                     &store,
@@ -543,16 +541,28 @@ impl RoundtableService {
                 .run_room(store.clone(), room, config)
                 .await
             {
-                let _gate = service.command_gate.lock().await;
-                match fail_run(&store, room, boot, epoch, &error).await {
-                    Ok(true) => {
-                        if let Err(error) = service.cleanup_room(room).await {
-                            tracing::warn!(room=%room,reason=?error.details.reason,"roundtable failed run cleanup blocked");
-                        }
+                loop {
+                    // Always revoke/reap known owners first, including when the
+                    // same storage outage also prevents fail_run from committing.
+                    if let Err(cleanup) = service.participant_runtime().cleanup_local_room(room).await {
+                        tracing::warn!(%room, reason=?cleanup.details.reason, "roundtable local failure cleanup pending");
                     }
-                    Ok(false) => {}
-                    Err(error) => {
-                        tracing::warn!(room=%room,reason=?error.details.reason,"roundtable failure fencing unavailable")
+                    let persisted = {
+                        let _gate = service.command_gate.lock().await;
+                        match fail_run(&store, room, boot, epoch, &error).await {
+                            Ok(_) => service.cleanup_room(room).await,
+                            Err(error) => Err(error),
+                        }
+                    };
+                    match persisted {
+                        Ok(()) => break,
+                        Err(error) if error.code == ErrorCode::StorageUnavailable && !service.draining() => {
+                            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                        },
+                        Err(error) => {
+                            tracing::warn!(%room, reason=?error.details.reason, "roundtable failure cleanup blocked");
+                            break;
+                        }
                     }
                 }
             }
@@ -577,6 +587,43 @@ impl RoundtableService {
         Ok(())
     }
 
+    async fn confirmed_inputs(
+        &self,
+        store: &RoundtableStore,
+        actor: &ActorContext,
+        room: RoomId,
+        revision: Revision,
+        config: &RoundtableConfigV1,
+        capability: &Value,
+        id: Option<&str>,
+    ) -> RtResult<ConfirmedPreflight> {
+        let record = id.and_then(|id| self.preflights.lock().expect("preflights").get(id).cloned())
+            .ok_or_else(|| rt_error(ErrorCode::InvalidArgument, "preflight_confirmation"))?;
+        if record.principal != actor.principal_id() || record.room != room || record.revision != revision {
+            return Err(rt_error(ErrorCode::InvalidArgument, "preflight_confirmation"));
+        }
+        self.verify_confirmed_inputs(store, actor, config, capability, &record).await?;
+        Ok(record)
+    }
+
+    async fn verify_confirmed_inputs(
+        &self,
+        store: &RoundtableStore,
+        actor: &ActorContext,
+        config: &RoundtableConfigV1,
+        capability: &Value,
+        record: &ConfirmedPreflight,
+    ) -> RtResult<()> {
+        let sources = frozen_sources(store, actor, Some(record.room), config).await?;
+        if record.config_hash != config_hash(config)?
+            || record.expires_ms <= store.clock_sample().0
+            || record.capability_hash != roundtable_protocol::canonical_hash(capability)?.to_hex()
+            || record.source_hash != roundtable_protocol::canonical_hash(&sources)?.to_hex() {
+            return Err(rt_error(ErrorCode::InvalidArgument, "preflight_confirmation"));
+        }
+        Ok(())
+    }
+
     /// Explicit restart/retry completes cleanup before dispatching its successor.
     /// Startup recovery uses only the store and never calls this paid path.
     async fn continue_control(
@@ -586,6 +633,7 @@ impl RoundtableService {
         room: RoomId,
         operation: roundtable_protocol::OperationId,
         fake: bool,
+        confirmed: Option<ConfirmedPreflight>,
     ) -> RtResult<()> {
         let op = optional_row(store.connection(),"SELECT o.kind,o.status,o.requested_epoch,o.successor_phase_id,r.run_epoch,r.status,r.current_phase_id,r.active_control_id FROM rt_control_operations o JOIN rt_rooms r ON r.room_id=o.room_id WHERE o.room_id=? AND o.operation_id=?",vec![text(&room.to_string()),text(&operation.to_string())]).await?.ok_or_else(||rt_error(ErrorCode::InvalidState,"control_missing"))?;
         let kind: String = column(&op, 0)?;
@@ -603,8 +651,14 @@ impl RoundtableService {
             self.require_mutation(fake,true)?;
             self.require_capacity(store,room,true).await?;
             let config:RoundtableConfigV1=decode(&authorized_room(store,actor,&room).await?.config)?;
-            self.participant_runtime().preflight(&config).await?;
-            let txn=store.connection().begin().await.map_err(storage_err)?;
+            check_interjection_context(store.connection(), room, &config, None).await?;
+            let capability = self.participant_runtime().preflight(&config).await?;
+            if let Some(record) = &confirmed {
+                self.verify_confirmed_inputs(store, actor, &config, &capability, record).await?;
+            } else if !fake {
+                return Err(rt_error(ErrorCode::InvalidArgument, "preflight_confirmation"));
+            }
+            let txn=store.write_transaction().await?;
             let updated=exec(&txn,"UPDATE rt_rooms SET status='running',boot_epoch=?,run_epoch=run_epoch+1,revision=revision+1,last_seq=last_seq+1,blocked_reason=NULL WHERE room_id=? AND status='paused' AND run_epoch=? AND active_control_id IS NULL",vec![num(as_i64(self.boot_epoch())?),text(&room.to_string()),num(column(&op,4)?)]).await?;
             if updated!=1 { return Err(rt_error(ErrorCode::InvalidState,"control_superseded")); }
             store.emit_current_in(&txn,&room.to_string(),"control").await?;
@@ -745,9 +799,13 @@ async fn create(
     request: RequestId,
     mut config: RoundtableConfigV1,
     boot: u64,
+    capture: Option<(&std::path::Path, &[String])>,
 ) -> RtResult<Value> {
     validate_config(&config, &ResourceLimits::suggested_profile())?;
-    let txn = store.connection().begin().await.map_err(storage_err)?;
+    if command == "roundtable_create" && !config.source_refs.is_empty() {
+        return Err(rt_error(ErrorCode::InvalidArgument, "source_room_required"));
+    }
+    let txn = store.write_transaction().await?;
     if let Some(value) = saved(&txn, actor, command, request, body).await? {
         txn.rollback().await.map_err(storage_err)?;
         return Ok(value);
@@ -756,9 +814,34 @@ async fn create(
         .to_string()
         .parse()
         .map_err(|_| rt_error(ErrorCode::InvalidArgument, "room_id"))?;
+    let captured = match capture {
+        Some((data_dir, paths)) if !paths.is_empty() => {
+            let (manifest, objects) = capture_selected_sources(&txn, actor, room, &config, data_dir, paths).await?;
+            config.source_refs.push(roundtable_protocol::SourceRefV1 {
+                snapshot_id: manifest.manifest_id.to_string().parse()
+                    .map_err(|_| rt_error(ErrorCode::InvalidArgument, "manifest_id"))?,
+                base_commit: manifest.base_commit.clone(),
+            });
+            Some((manifest, objects))
+        }
+        _ => None,
+    };
+    if let Some((manifest, _)) = &captured {
+        check_source_metadata_budget(&config, &[json!({"manifest":manifest,"hash":manifest.manifest_hash.to_hex()})])?;
+    } else if config.source_refs.is_empty() {
+        check_source_metadata_budget(&config, &[])?;
+    }
     exec(&txn,"INSERT INTO rt_rooms(room_id,principal_id,status,config_ref,revision,run_epoch,boot_epoch,last_seq,remaining_active_ms) VALUES(?,?,'draft',?,1,0,?,1,?)",vec![text(&room.to_string()),text(&actor.principal_id().to_string()),text(&String::from_utf8(canonical_bytes(&config)?).map_err(|_|rt_error(ErrorCode::InvalidArgument,"config"))?),num(as_i64(boot)?),num(as_i64(config.budgets.room_budget.0)?)]).await?;
+    if let Some((manifest, _)) = &captured {
+        exec(&txn, "INSERT INTO rt_source_manifests(room_id,manifest_id,version,manifest_hash,body_json) VALUES(?,?,?,?,?)", vec![
+            text(&room.to_string()), text(&manifest.manifest_id.to_string()), num(manifest.version),
+            text(&manifest.manifest_hash.to_hex()), text(&serde_json::to_string(manifest)
+                .map_err(|_| rt_error(ErrorCode::InvalidArgument, "manifest"))?),
+        ]).await?;
+    }
     if command == "roundtable_clone" {
         let source: RoomId = decode(&body["room_id"])?;
+        let mut cloned_sources = Vec::new();
         for (index, source_ref) in config.source_refs.iter_mut().enumerate() {
             let row = optional_row(
                 &txn,
@@ -773,6 +856,7 @@ async fn create(
             let manifest: super::SourceManifestV1 =
                 decode(&json_text(&column::<String>(&row, 0)?)?)?;
             let copied = super::rehome_manifest(&manifest, room, index as i64 + 1)?;
+            cloned_sources.push(json!({"manifest":copied,"hash":copied.manifest_hash.to_hex()}));
             source_ref.snapshot_id = copied
                 .manifest_id
                 .to_string()
@@ -780,6 +864,7 @@ async fn create(
                 .map_err(|_| rt_error(ErrorCode::InvalidArgument, "manifest_id"))?;
             exec(&txn,"INSERT INTO rt_source_manifests(room_id,manifest_id,version,manifest_hash,body_json) VALUES(?,?,?,?,?)",vec![text(&room.to_string()),text(&copied.manifest_id.to_string()),num(copied.version),text(&copied.manifest_hash.to_hex()),text(&serde_json::to_string(&copied).map_err(|_|rt_error(ErrorCode::InvalidArgument,"manifest"))?)]).await?;
         }
+        check_source_metadata_budget(&config, &cloned_sources)?;
         exec(
             &txn,
             "UPDATE rt_rooms SET config_ref=? WHERE room_id=?",
@@ -812,14 +897,76 @@ async fn create(
             exec(&txn,"INSERT INTO rt_user_inputs(room_id,input_id,text,mode,accepted_seq,target_phase_index,state) VALUES(?,?,?,'next_phase',1,0,'queued')",vec![text(&room.to_string()),text(&Uuid::new_v4().to_string()),text(&context)]).await?;
         }
     }
+    if command == "roundtable_clone" && body["carry_published_context"] == true {
+        check_interjection_context(&txn, room, &config, None).await?;
+    }
     let projection = store
         .emit_current_in(&txn, &room.to_string(), "create")
         .await?;
     let response = json!({"request_id":request,"accepted":true,"operation_id":null,"room_id":room,"revision":Revision(1),"run_epoch":Epoch(0),"last_seq":Seq(1),"status":"draft","projection_ref":projection});
     save(&txn, actor, command, request, body, &room, &response).await?;
     txn.commit().await.map_err(storage_err)?;
+    if let Some((manifest, objects)) = captured {
+        objects.mark_committed(&manifest.object_ids());
+    }
     Ok(response)
 }
+
+async fn capture_selected_sources(
+    txn: &DatabaseTransaction,
+    actor: &ActorContext,
+    room: RoomId,
+    config: &RoundtableConfigV1,
+    data_dir: &std::path::Path,
+    paths: &[String],
+) -> RtResult<(super::SourceManifestV1, super::ObjectStore)> {
+    // Full-path Windows walks are not proven safe against in-place reparse
+    // mutation. Keep the public capture route closed until handle-relative
+    // containment has a qualified implementation and regression evidence.
+    if cfg!(windows) {
+        return Err(rt_error(ErrorCode::PolicyUnenforceable, "source_capture_unqualified"));
+    }
+    const MAX_FILES: u32 = 32;
+    const MAX_FILE_BYTES: u64 = 1024 * 1024;
+    const MAX_TOTAL_BYTES: u64 = 4 * 1024 * 1024;
+    const OBJECT_QUOTA_BYTES: u64 = 256 * 1024 * 1024;
+    if paths.len() > MAX_FILES as usize || paths.iter().any(|path| path.len() > 4096) {
+        return Err(rt_error(ErrorCode::InvalidArgument, "source_limit"));
+    }
+    // workspace_id is the registered folder ID, never a caller-supplied root.
+    let workspace = config.workspace_id.parse::<i32>()
+        .ok().filter(|id| *id > 0)
+        .ok_or_else(|| rt_error(ErrorCode::InvalidArgument, "workspace_id"))?;
+    let row = optional_row(txn, "SELECT path FROM folder WHERE id=? AND deleted_at IS NULL AND kind='regular'", vec![num(i64::from(workspace))])
+        .await?.ok_or_else(|| rt_error(ErrorCode::Forbidden, "workspace_not_found"))?;
+    let root = std::path::PathBuf::from(column::<String>(&row, 0)?);
+    if !root.is_absolute() {
+        return Err(rt_error(ErrorCode::InvalidArgument, "source_root"));
+    }
+    let files = paths.iter().map(|path| {
+        Ok(super::SelectedFile {
+            relative_path: super::validate_relative_path(path)?,
+            // Explicit selection is independent of Git status. No Git command
+            // or repository-wide enumeration is needed to freeze these bytes.
+            class: super::SourceClass::Selected,
+        })
+    }).collect::<RtResult<Vec<_>>>()?;
+    let objects = super::ObjectStore::open(
+        data_dir.join("roundtable/objects"),
+        Arc::new(super::ReservationLedger::new(OBJECT_QUOTA_BYTES)),
+        actor.principal_id(),
+    )?;
+    let manifest = super::snapshot::capture_snapshot_validated(super::SourceSelection {
+        root, room_id: room, version: 1, base_commit: None, files, mutate_while_open: None,
+    }, super::SnapshotLimits {
+        estimated_bytes: MAX_TOTAL_BYTES, max_file_bytes: MAX_FILE_BYTES,
+        max_total_bytes: MAX_TOTAL_BYTES, max_files: MAX_FILES,
+    }, &objects, |manifest| check_source_metadata_budget(config,
+        &[json!({"manifest":manifest,"hash":manifest.manifest_hash.to_hex()})]
+    )).await?;
+    Ok((manifest, objects))
+}
+
 async fn write_speakers(
     txn: &DatabaseTransaction,
     room: &RoomId,
@@ -828,7 +975,9 @@ async fn write_speakers(
     for member in &config.participants {
         exec(txn,"INSERT INTO rt_speakers(room_id,speaker_id,ordinal,role,provider_ref,model_id,model_snapshot_json) VALUES(?,?,?,?,?,?,?)",vec![text(&room.to_string()),text(&Uuid::new_v4().to_string()),num(i64::from(member.ordinal)),text("member"),text(&member.provider_ref),text(member.model.as_deref().unwrap_or("default")),text(&serde_json::to_string(member).map_err(|_|rt_error(ErrorCode::InvalidArgument,"participant"))?)]).await?;
     }
-    let moderator = &config.participants[config.moderator_ordinal as usize];
+    let moderator = config.participants.iter()
+        .find(|member| member.ordinal == config.moderator_ordinal)
+        .ok_or_else(|| rt_error(ErrorCode::InvalidArgument, "moderator_ordinal"))?;
     exec(txn,"INSERT INTO rt_speakers(room_id,speaker_id,ordinal,role,provider_ref,model_id,model_snapshot_json) VALUES(?,?,?,'moderator',?,?,?)",vec![text(&room.to_string()),text(&Uuid::new_v4().to_string()),num(config.participants.len() as i64),text(&moderator.provider_ref),text(moderator.model.as_deref().unwrap_or("default")),text(&serde_json::to_string(moderator).map_err(|_|rt_error(ErrorCode::InvalidArgument,"moderator"))?)]).await?;
     Ok(())
 }
@@ -841,7 +990,8 @@ async fn update(
 ) -> RtResult<Value> {
     validate_config(&request.config, &ResourceLimits::suggested_profile())?;
     let current = authorized_room(store, actor, &request.room_id).await?;
-    let txn = store.connection().begin().await.map_err(storage_err)?;
+    frozen_sources(store, actor, Some(request.room_id), &request.config).await?;
+    let txn = store.write_transaction().await?;
     if let Some(value) = saved(&txn, actor, command, request.request_id, body).await? {
         txn.rollback().await.map_err(storage_err)?;
         return Ok(value);
@@ -948,7 +1098,7 @@ async fn block_control_failure(
     operation: roundtable_protocol::OperationId,
     error: &roundtable_protocol::RtError,
 ) -> RtResult<()> {
-    let txn = store.connection().begin().await.map_err(storage_err)?;
+    let txn = store.write_transaction().await?;
     let reason: String = error
         .details
         .reason
@@ -980,7 +1130,7 @@ async fn start(
     config: &RoundtableConfigV1,
 ) -> RtResult<Value> {
     let (room, request, revision) = identity;
-    let txn = store.connection().begin().await.map_err(storage_err)?;
+    let txn = store.write_transaction().await?;
     if let Some(response) = saved(&txn, actor, command, request, body).await? {
         txn.rollback().await.map_err(storage_err)?;
         return Ok(response);
@@ -1025,15 +1175,9 @@ async fn fail_run(
     epoch: u64,
     error: &roundtable_protocol::RtError,
 ) -> RtResult<bool> {
-    let txn = store.connection().begin().await.map_err(storage_err)?;
+    let txn = store.write_transaction().await?;
     let fenced = exec(&txn,"UPDATE rt_rooms SET status='paused',run_epoch=run_epoch+1,revision=revision+1,last_seq=last_seq+1,blocked_reason='recovery_required' WHERE room_id=? AND boot_epoch=? AND run_epoch=? AND status='running'",vec![text(&room.to_string()),num(as_i64(boot)?),num(as_i64(epoch)?)]).await?==1;
     if fenced {
-        exec(
-            &txn,
-            "DELETE FROM rt_active_time_leases WHERE room_id=?",
-            vec![text(&room.to_string())],
-        )
-        .await?;
         store
             .emit_current_in(&txn, &room.to_string(), "terminal")
             .await?;
@@ -1341,7 +1485,7 @@ async fn record_rejection(
     room: RoomId,
     error: &roundtable_protocol::RtError,
 ) -> RtResult<()> {
-    let txn = store.connection().begin().await.map_err(storage_err)?;
+    let txn = store.write_transaction().await?;
     let kind = format!(
         "admission_rejected:{}",
         serde_json::to_value(error.code)
@@ -1423,9 +1567,55 @@ async fn frozen_sources(
         if body["base_commit"] != json!(source.base_commit) {
             return Err(rt_error(ErrorCode::InvalidArgument, "source_version"));
         }
+        let manifest: super::SourceManifestV1 = decode(&body)?;
+        let checked = super::rehome_manifest(&manifest, room, manifest.version)?;
+        if checked.manifest_hash != manifest.manifest_hash || manifest.manifest_hash.to_hex() != column::<String>(&row, 1)? {
+            return Err(rt_error(ErrorCode::StorageUnavailable, "source_manifest_hash"));
+        }
         manifests.push(json!({"manifest":body,"hash":column::<String>(&row,1)?}));
     }
+    check_source_metadata_budget(config, &manifests)?;
     Ok(manifests)
+}
+
+/// Conservative bound for the initial question, source manifest and the
+/// per-file evidence/alias descriptors constructed by the runtime. Include
+/// space for a freshly rehomed manifest even in topic-only rooms.
+fn check_source_metadata_budget(config: &RoundtableConfigV1, manifests: &[Value]) -> RtResult<()> {
+    let mut size = canonical_bytes(&json!({"topic":config.topic,"sources":manifests}))?.len() as u64;
+    size = size.checked_add(1024).ok_or_else(|| rt_error(ErrorCode::InvalidArgument, "overflow"))?;
+    for manifest in manifests {
+        let entries = manifest["manifest"]["entries"].as_array()
+            .ok_or_else(|| rt_error(ErrorCode::StorageUnavailable, "source_manifest"))?;
+        for entry in entries {
+            let path = canonical_bytes(&entry["path"])?;
+            // UUID aliases, object references and JSON syntax, plus escaped path.
+            size = size.checked_add(1024 + path.len() as u64)
+                .ok_or_else(|| rt_error(ErrorCode::InvalidArgument, "overflow"))?;
+        }
+    }
+    // Stored manifests must also remain decodable by the strict public reader.
+    let maximum = config.quotas.input_byte_limit.0.min(ParseLimits::suggested_profile().max_bytes as u64);
+    if size > maximum {
+        return Err(rt_error(ErrorCode::InsufficientBudget, "source_metadata_bytes"));
+    }
+    Ok(())
+}
+
+async fn check_interjection_context(
+    conn: &impl sea_orm::ConnectionTrait,
+    room: RoomId,
+    config: &RoundtableConfigV1,
+    proposed: Option<(String, &str)>,
+) -> RtResult<()> {
+    let stored = rows(conn, "SELECT input_id,text FROM rt_user_inputs WHERE room_id=? ORDER BY accepted_seq,input_id", vec![text(&room.to_string())]).await?;
+    let mut inputs = Vec::with_capacity(stored.len() + usize::from(proposed.is_some()));
+    for row in stored {
+        inputs.push(json!({"input_id":column::<String>(&row,0)?,"text":column::<String>(&row,1)?}));
+    }
+    if let Some((id, value)) = proposed { inputs.push(json!({"input_id":id,"text":value})); }
+    roundtable_protocol::validate_interjection_context(&json!(inputs), config.quotas.interjection_byte_limit.0)?;
+    Ok(())
 }
 
 async fn next_input(
@@ -1435,7 +1625,7 @@ async fn next_input(
     body: &Value,
     request: InterjectRequest,
 ) -> RtResult<Value> {
-    let txn = store.connection().begin().await.map_err(storage_err)?;
+    let txn = store.write_transaction().await?;
     if let Some(replay) = saved(&txn, actor, command, request.request_id, body).await? {
         txn.rollback().await.map_err(storage_err)?;
         return Ok(replay);
@@ -1468,6 +1658,8 @@ async fn next_input(
             "interjection_bytes",
         ));
     }
+    let input_id = Uuid::new_v4().to_string();
+    check_interjection_context(&txn, request.room_id, &config, Some((input_id.clone(), &request.text))).await?;
     let phase: Option<String> = column(&row, 3)?;
     let phase = phase.ok_or_else(|| rt_error(ErrorCode::NoNextPhase, "no_next_phase"))?;
     let phase_row = optional_row(
@@ -1488,7 +1680,7 @@ async fn next_input(
         vec![text(&request.room_id.to_string())],
     )
     .await?;
-    exec(&txn,"INSERT INTO rt_user_inputs(room_id,input_id,text,mode,accepted_seq,target_phase_index,state) VALUES(?,?,?,'next_phase',?,?,'queued')",vec![text(&request.room_id.to_string()),text(&Uuid::new_v4().to_string()),text(&request.text),num(seq),num(index+1)]).await?;
+    exec(&txn,"INSERT INTO rt_user_inputs(room_id,input_id,text,mode,accepted_seq,target_phase_index,state) VALUES(?,?,?,'next_phase',?,?,'queued')",vec![text(&request.room_id.to_string()),text(&input_id),text(&request.text),num(seq),num(index+1)]).await?;
     store
         .emit_current_in(&txn, &request.room_id.to_string(), "input")
         .await?;

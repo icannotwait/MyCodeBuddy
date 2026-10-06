@@ -25,6 +25,7 @@ const REQUIRED_CAPABILITIES: &[&str] = &[
     "new_session",
     "roundtable_mcp",
     "ordered_turn_completion",
+    "submit_receipt_completion",
     "cancel_and_reap",
     "strict_isolation",
     "bounded_context_delivery",
@@ -276,7 +277,34 @@ fn revoke_passed_report(path: &Path) {
     }
 }
 
-pub(crate) fn write_outcome(data_dir: &Path, facts: ProbeFacts) -> ProbeOutcome {
+pub(crate) fn write_outcome(data_dir: &Path, mut facts: ProbeFacts) -> ProbeOutcome {
+    // A report contains one conservative observation per name. A later pass
+    // can never erase measured failure or incomplete/conflicting evidence.
+    if facts.oci.as_ref().is_some_and(|oci| !oci.auth_mounts.is_empty()) {
+        facts.checks.push(ProbeCheck {
+            name: "model_credential_material_in_sandbox".into(),
+            status: "failed".into(),
+            evidence: "native auth files are readable inside the sandbox, including attempt-local copies".into(),
+            input: b"configured-auth-mounts".to_vec(),
+            output: b"credential-material-present".to_vec(),
+            count: None,
+            flag: Some(true),
+        });
+    }
+    let mut checks: BTreeMap<String, ProbeCheck> = BTreeMap::new();
+    for check in std::mem::take(&mut facts.checks) {
+        match checks.entry(check.name.clone()) {
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                entry.insert(check);
+            }
+            std::collections::btree_map::Entry::Occupied(mut entry) => {
+                if observation_severity(&check) > observation_severity(entry.get()) {
+                    entry.insert(check);
+                }
+            }
+        }
+    }
+    facts.checks = checks.into_values().collect();
     let profile = if facts.profile_id.is_empty() {
         profile_for_agent(&facts.agent)
     } else {
@@ -456,6 +484,7 @@ const REQUIRED_CHECKS: &[&str] = &[
     "new_session",
     "roundtable_mcp",
     "ordered_turn_completion",
+    "submit_receipt_completion",
     "cancel_and_reap",
     "strict_isolation",
     "bounded_context_delivery",
@@ -471,6 +500,16 @@ const REQUIRED_CHECKS: &[&str] = &[
     "companion_lifecycle",
 ];
 
+fn observation_severity(check: &ProbeCheck) -> u8 {
+    if check.status == "failed" {
+        3 + u8::from(check.flag == Some(true))
+    } else if !check_accepted(check) {
+        2
+    } else {
+        0
+    }
+}
+
 fn check_accepted(check: &ProbeCheck) -> bool {
     if check.status != "passed" || check.evidence.trim().is_empty() {
         return false;
@@ -480,7 +519,7 @@ fn check_accepted(check: &ProbeCheck) -> bool {
         "model_credential_material_in_sandbox"
         | "model_credentials_visible_to_agent"
         | "native_read_boundary" => check.flag == Some(false),
-        "actual_binary_match" | "ordered_turn_completion" => check.flag == Some(true),
+        "actual_binary_match" | "ordered_turn_completion" | "submit_receipt_completion" => check.flag == Some(true),
         _ => true,
     }
 }
@@ -501,7 +540,7 @@ fn render_report(
         format!(
             "{}{}",
             super::tool_core::SERVICE_TOOL_SCHEMA,
-            super::tool_core::SERVICE_RESULT_SCHEMA
+            super::tool_core::service_result_schema()
         )
         .as_bytes(),
     );
@@ -600,6 +639,7 @@ fn render_report(
         "runtime_implementation_version": "roundtable-oci-acp-v1",
         "provider_bindings_hash": provider_hash,
         "context_profile_hash": context_hash,
+        "request_envelope": {"status": "not_tested", "max_bytes": null, "evidence_hash": null},
         "host_kernel_release": facts.kernel,
         "host_arch": facts.arch,
         "profile": {
@@ -626,19 +666,26 @@ fn render_report(
         "anomalies": if passed { json!([]) } else { json!(reasons) },
         "required_capabilities": checks,
         "private_events": field("private_events"),
-        "ordinary_sidebar_imports": count("sidebar_discovery").unwrap_or(1),
+        "ordinary_sidebar_imports": count("sidebar_discovery"),
         "sidebar_discovery": field("sidebar_discovery"),
-        "global_body_events": count("global_body_events").unwrap_or(1),
-        "model_credential_material_in_sandbox": flag("model_credential_material_in_sandbox").unwrap_or(true),
-        "model_credentials_visible_to_agent": flag("model_credentials_visible_to_agent").unwrap_or(true),
-        "credentials_unreachable": if flag("model_credential_material_in_sandbox") == Some(false)
-            && flag("model_credentials_visible_to_agent") == Some(false) { "passed" } else { "failed" },
+        "global_body_events": count("global_body_events"),
+        "model_credential_material_in_sandbox": flag("model_credential_material_in_sandbox"),
+        "model_credentials_visible_to_agent": flag("model_credentials_visible_to_agent"),
+        "credentials_unreachable": if field("model_credential_material_in_sandbox") == "passed"
+            && field("model_credentials_visible_to_agent") == "passed"
+            && flag("model_credential_material_in_sandbox") == Some(false)
+            && flag("model_credentials_visible_to_agent") == Some(false) { "passed" }
+            else if field("model_credential_material_in_sandbox") == "failed"
+                || field("model_credentials_visible_to_agent") == "failed"
+                || flag("model_credential_material_in_sandbox") == Some(true)
+                || flag("model_credentials_visible_to_agent") == Some(true) { "failed" }
+            else { "not_tested" },
         "api_credential_scope": field("api_credential_scope"),
         "chatgpt_account_scope": "not_tested",
         "actual_resolved_binary_matches_certificate": flag("actual_binary_match").unwrap_or(false),
         "binary_match": field("actual_binary_match"),
-        "idle_processes_after_reap": count("cancel_and_reap").unwrap_or(1),
-        "normal_completion_after_submit_receipt": flag("ordered_turn_completion").unwrap_or(false),
+        "idle_processes_after_reap": count("cancel_and_reap"),
+        "normal_completion_after_submit_receipt": field("submit_receipt_completion") == "passed" && flag("submit_receipt_completion") == Some(true),
         "endpoint_compatibility": field("endpoint_compatibility"),
         "native_read_boundary": field("native_read_boundary"),
         "companion_lifecycle": field("companion_lifecycle"),
@@ -776,7 +823,7 @@ fn install_certificate(
         format!(
             "{}{}",
             super::tool_core::SERVICE_TOOL_SCHEMA,
-            super::tool_core::SERVICE_RESULT_SCHEMA
+            super::tool_core::service_result_schema()
         )
         .as_bytes(),
     );

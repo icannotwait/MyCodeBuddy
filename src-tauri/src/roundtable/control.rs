@@ -181,7 +181,7 @@ fn replacement_budget(
     Ok((minimum_ms, phase_ms, attempts))
 }
 
-#[cfg(feature = "test-utils")]
+#[cfg(any(test, feature = "test-utils"))]
 mod legacy_test_model {
     use std::collections::BTreeMap;
     use std::sync::{Mutex, OnceLock};
@@ -542,7 +542,7 @@ mod legacy_test_model {
         book.advance(operation)
     }
 }
-#[cfg(feature = "test-utils")]
+#[cfg(any(test, feature = "test-utils"))]
 pub use legacy_test_model::*;
 
 /// Persisted control request. The authenticated actor, not the body, owns identity.
@@ -623,12 +623,7 @@ impl super::store::RoundtableStore {
         actor: &roundtable_protocol::ActorContext,
         request: &ControlRequest,
     ) -> RtResult<MutationAck> {
-        use sea_orm::TransactionTrait;
-        let txn = self
-            .connection()
-            .begin()
-            .await
-            .map_err(super::store::storage_err)?;
+        let txn = self.write_transaction().await?;
         let result = self.request_control_in(&txn, actor, request).await;
         match result {
             Ok(ack) => {
@@ -836,12 +831,8 @@ impl super::store::RoundtableStore {
             exec(txn,"UPDATE rt_control_operations SET budget_reservation_id=? WHERE room_id=? AND operation_id=?",vec![text(&reservation),text(&room),text(&operation)]).await?;
         }
         exec(txn,"UPDATE rt_attempts SET state=CASE WHEN state='admitting' THEN 'uncertain' ELSE 'interrupted' END,cleanup_state='cleaning' WHERE room_id=? AND state IN ('reserved','launching','admitting','admitted','streaming','validating','active')",vec![text(&room)]).await?;
-        exec(
-            txn,
-            "DELETE FROM rt_active_time_leases WHERE room_id=?",
-            vec![text(&room)],
-        )
-        .await?;
+        // The old owner remains chargeable through cancellation and cleanup.
+        // advance_durable_control settles it only after a full cleanup proof.
         self.emit_current_in(txn, &room, "control").await?;
         let ack = control_ack(
             txn,
@@ -866,12 +857,7 @@ impl super::store::RoundtableStore {
         cleanup_confirmed: bool,
     ) -> RtResult<MutationAck> {
         use super::store::{column, exec, num, one_row, opt, query_i64, text};
-        use sea_orm::TransactionTrait;
-        let txn = self
-            .connection()
-            .begin()
-            .await
-            .map_err(super::store::storage_err)?;
+        let txn = self.write_transaction().await?;
         let result=async {
             let room=room_id.to_string();let operation=operation_id.to_string();
             one_row(&txn,"SELECT room_id FROM rt_rooms WHERE room_id=? AND principal_id=?",vec![text(&room),text(&actor.principal_id().to_string())]).await?;
@@ -888,6 +874,7 @@ impl super::store::RoundtableStore {
                 exec(&txn,"UPDATE rt_attempts SET cleanup_state='confirmed' WHERE room_id=?",vec![text(&room)]).await?;
                 exec(&txn,"UPDATE rt_bindings SET state='retired',retire_reason='control' WHERE room_id=?",vec![text(&room)]).await?;
             }
+            super::budget_ledger::settle_room_in(&txn, self, &room_id).await?;
             let kind:String=column(&saved,0)?;let phase:Option<String>=column(&saved,2)?;
             let mut successor:Option<String>=column(&saved,4)?;
             if matches!(kind.as_str(),"restart_current"|"retry_synthesis") && successor.is_none() {
@@ -935,12 +922,7 @@ impl super::store::RoundtableStore {
     /// Called only after owned processes/mailboxes have been reconciled. It never restarts a paid prompt.
     pub async fn recover_durable(&self, boot_epoch: u64) -> RtResult<()> {
         use super::store::{column, exec, num, query_i64, rows, text};
-        use sea_orm::TransactionTrait;
-        let txn = self
-            .connection()
-            .begin()
-            .await
-            .map_err(super::store::storage_err)?;
+        let txn = self.write_transaction().await?;
         let mut controls = Vec::new();
         let result=async {
             let boot=i64::try_from(boot_epoch).map_err(|_|rt_error(ErrorCode::InvalidArgument,"boot_epoch"))?;

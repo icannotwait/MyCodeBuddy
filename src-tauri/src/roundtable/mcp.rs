@@ -162,6 +162,7 @@ pub struct GateToolAuthority {
     facts: AdmissionFacts,
     pinned: TokenBinding,
     expires_at: MonoMs,
+    execution_lease: Option<Arc<super::resources::ExecutionLease>>,
     now: Mutex<MonoMs>,
     clock: Option<Arc<dyn super::clock::MonoClock>>,
     control: Mutex<TokenBinding>,
@@ -188,6 +189,7 @@ impl GateToolAuthority {
             facts,
             pinned: pinned.clone(),
             expires_at,
+            execution_lease: None,
             now: Mutex::new(now),
             clock: None,
             control: Mutex::new(pinned),
@@ -218,6 +220,11 @@ impl GateToolAuthority {
     /// Production authorities sample the host clock on every admission.
     pub fn with_clock(mut self, clock: Arc<dyn super::clock::MonoClock>) -> Self {
         self.clock = Some(clock);
+        self
+    }
+
+    pub fn with_execution_lease(mut self, lease: Option<Arc<super::resources::ExecutionLease>>) -> Self {
+        self.execution_lease = lease;
         self
     }
 
@@ -337,6 +344,9 @@ impl GateToolAuthority {
             .get(secret)
             .cloned()
             .ok_or_else(|| rt_error(ErrorCode::Unauthenticated, "token_unknown"))?;
+        if self.execution_lease.as_ref().is_some_and(|lease| lease.admit_tool(now.0) == 0) {
+            return Err(rt_error(ErrorCode::Unauthenticated, "prepaid_lease_expired"));
+        }
         if now.0 >= issued.expires_at.0 {
             return Err(rt_error(ErrorCode::Unauthenticated, "token_expired"));
         }

@@ -4,7 +4,9 @@
 //! delivery prompt is `DeliveryEncoder`; this module does not encode a second
 //! prompt. `base_commit` is stored and is not part of `manifest_hash`.
 
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, File};
+#[cfg(windows)]
+use std::fs::OpenOptions;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
@@ -34,6 +36,8 @@ pub type SnapshotReadHook = Arc<dyn Fn(&Path) + Send + Sync>;
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SourceClass {
+    /// User selected this file explicitly; no Git-status claim is made.
+    Selected,
     Tracked,
     Dirty,
     Untracked,
@@ -375,10 +379,21 @@ pub async fn capture_snapshot(
     limits: SnapshotLimits,
     objects: &ObjectStore,
 ) -> RtResult<SourceManifestV1> {
+    capture_snapshot_validated(selection, limits, objects, |_| Ok(())).await
+}
+
+/// Validate the complete manifest before writing any immutable source bytes.
+/// This keeps public admission failures (for example metadata quota) side-effect-free.
+pub(crate) async fn capture_snapshot_validated(
+    selection: SourceSelection,
+    limits: SnapshotLimits,
+    objects: &ObjectStore,
+    validate: impl Fn(&SourceManifestV1) -> RtResult<()> + Send + Sync,
+) -> RtResult<SourceManifestV1> {
     let planned = plan_selection(&selection, &limits)?;
     let lease = objects.reserve_estimated(limits.estimated_bytes)?;
     let mut created = Vec::new();
-    match read_and_store(&selection, &limits, objects, &planned, &mut created).await {
+    match read_and_store(&selection, &limits, objects, &planned, &mut created, &validate).await {
         Ok(manifest) => {
             lease.commit_as_used(manifest.accounted_bytes());
             Ok(manifest)
@@ -537,17 +552,19 @@ async fn read_and_store(
     objects: &ObjectStore,
     planned: &[PlannedFile],
     created: &mut Vec<String>,
+    validate: &(dyn Fn(&SourceManifestV1) -> RtResult<()> + Send + Sync),
 ) -> RtResult<SourceManifestV1> {
     let captured_at_ms = now_ms();
     let mut copied = Vec::with_capacity(planned.len());
     let mut total = 0u64;
     for file in planned {
-        let path = open_source(&selection.root, &file.canonical)?;
-        let meta = fs::symlink_metadata(&path)
-            .map_err(|_| rt_error(ErrorCode::StorageUnavailable, "source_stat"))?;
-        ensure_regular_meta(&path, &meta)?;
+        let path = selection.root.join(&file.canonical);
+        let handle = open_source(&selection.root, &file.canonical)?;
+        // Bound the read itself, including growth after the metadata sample.
+        let remaining = limits.max_total_bytes.saturating_sub(total);
+        let maximum = limits.max_file_bytes.min(remaining);
+        let (bytes, meta) = read_stable(handle, &path, maximum, selection.mutate_while_open.as_ref())?;
         let mode = file_mode(&meta);
-        let (bytes, _) = read_stable(&path, selection.mutate_while_open.as_ref())?;
         let size = u64::try_from(bytes.len())
             .map_err(|_| rt_error(ErrorCode::InvalidArgument, "overflow"))?;
         if size > limits.max_file_bytes {
@@ -566,11 +583,10 @@ async fn read_and_store(
     }
     let mut entries = Vec::with_capacity(copied.len());
     for (file, mode, bytes, size) in &copied {
-        let object = match objects.put(bytes).await {
-            Ok(object) => object,
-            Err(err) => return Err(err),
+        let content_hash = Hash256::sha256(bytes);
+        let object = ObjectRef {
+            object_id: content_hash.to_hex(), content_hash, total_bytes: *size,
         };
-        created.push(object.object_id.clone());
         let (encoding, line_offsets, text_admissible) = match line_start_offsets(bytes) {
             Some(offsets) => (SnapshotEncoding::Utf8, offsets, true),
             None => (SnapshotEncoding::Binary, Vec::new(), false),
@@ -596,7 +612,7 @@ async fn read_and_store(
         room_id: selection.room_id.to_string(),
         version,
     })?;
-    Ok(SourceManifestV1 {
+    let manifest = SourceManifestV1 {
         schema_version: SCHEMA_VERSION,
         manifest_id: fresh_manifest_id()?,
         room_id: selection.room_id,
@@ -605,7 +621,13 @@ async fn read_and_store(
         read_limit: MAX_SNAPSHOT_READS,
         entries,
         manifest_hash,
-    })
+    };
+    validate(&manifest)?;
+    for (_, _, bytes, _) in &copied {
+        let object = objects.put(bytes).await?;
+        created.push(object.object_id);
+    }
+    Ok(manifest)
 }
 
 #[derive(Serialize)]
@@ -649,74 +671,123 @@ fn fresh_manifest_id() -> RtResult<ManifestId> {
         .map_err(|_| rt_error(ErrorCode::InvalidArgument, "manifest_id"))
 }
 
-fn open_source(root: &Path, canonical: &str) -> RtResult<PathBuf> {
-    let root_meta = fs::symlink_metadata(root)
+/// Walk every component through pinned handles. Path checks alone are not an
+/// authority: a directory may be exchanged for a symlink between check and open.
+#[cfg(unix)]
+fn open_source(root: &Path, canonical: &str) -> RtResult<File> {
+    use std::ffi::CString;
+    use std::os::fd::{AsRawFd, FromRawFd};
+    use std::os::unix::ffi::OsStrExt;
+    let path = root.join(canonical);
+    let start = if path.is_absolute() { "/" } else { "." };
+    let mut directory = File::open(start)
         .map_err(|_| rt_error(ErrorCode::StorageUnavailable, "source_root"))?;
-    if root_meta.file_type().is_symlink() {
-        return Err(rt_error(ErrorCode::InvalidArgument, "symlink"));
-    }
-    let mut cursor = root.to_path_buf();
-    let parts: Vec<&str> = canonical.split('/').collect();
+    let parts: Vec<_> = path.components().filter_map(|part| match part {
+        Component::Normal(name) => Some(Ok(name)),
+        Component::ParentDir => Some(Err(rt_error(ErrorCode::InvalidArgument, "parent_escape"))),
+        Component::RootDir | Component::CurDir => None,
+        _ => Some(Err(rt_error(ErrorCode::InvalidArgument, "invalid_path"))),
+    }).collect::<RtResult<_>>()?;
     for (index, part) in parts.iter().enumerate() {
-        cursor.push(part);
-        let meta = fs::symlink_metadata(&cursor)
+        let name = CString::new(part.as_bytes())
+            .map_err(|_| rt_error(ErrorCode::InvalidArgument, "invalid_path"))?;
+        let last = index + 1 == parts.len();
+        let flags = libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK
+            | if last { 0 } else { libc::O_DIRECTORY };
+        // SAFETY: directory and name are live handles/strings; no ownership is
+        // transferred unless openat returns a fresh descriptor.
+        let fd = unsafe { libc::openat(directory.as_raw_fd(), name.as_ptr(), flags) };
+        if fd < 0 {
+            let code = std::io::Error::last_os_error().raw_os_error();
+            let reason = match code {
+                Some(libc::ELOOP) | Some(libc::ENOTDIR) => "symlink",
+                Some(libc::ENXIO) | Some(libc::ENODEV) => "not_regular",
+                _ => "source_missing",
+            };
+            return Err(rt_error(ErrorCode::InvalidArgument, reason));
+        }
+        // SAFETY: openat returned this newly owned descriptor.
+        let next = unsafe { File::from_raw_fd(fd) };
+        if last {
+            ensure_regular_handle(&next)?;
+            return Ok(next);
+        }
+        directory = next;
+    }
+    Err(rt_error(ErrorCode::InvalidArgument, "empty_path"))
+}
+
+#[cfg(windows)]
+fn open_source(root: &Path, canonical: &str) -> RtResult<File> {
+    use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
+    const OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+    const BACKUP_SEMANTICS: u32 = 0x0200_0000;
+    const REPARSE_POINT: u32 = 0x400;
+    let path = root.join(canonical);
+    if !path.is_absolute() {
+        return Err(rt_error(ErrorCode::InvalidArgument, "source_root"));
+    }
+    let mut cursor = PathBuf::new();
+    // Excluding FILE_SHARE_DELETE blocks rename replacement, but does not
+    // qualify this full-path walk against in-place reparse mutation. Public
+    // workspace capture remains disabled on Windows in product.rs.
+    let mut parents = Vec::new();
+    for part in path.components() {
+        match part {
+            Component::Prefix(_) | Component::RootDir => { cursor.push(part.as_os_str()); continue; }
+            Component::CurDir => continue,
+            Component::ParentDir => return Err(rt_error(ErrorCode::InvalidArgument, "parent_escape")),
+            Component::Normal(_) => cursor.push(part.as_os_str()),
+        }
+        let file = OpenOptions::new().read(true).share_mode(0x1 | 0x2)
+            .custom_flags(OPEN_REPARSE_POINT | BACKUP_SEMANTICS).open(&cursor)
             .map_err(|_| rt_error(ErrorCode::InvalidArgument, "source_missing"))?;
-        if meta.file_type().is_symlink() {
+        let meta = file.metadata().map_err(|_| rt_error(ErrorCode::StorageUnavailable, "source_stat"))?;
+        if meta.file_attributes() & REPARSE_POINT != 0 {
             return Err(rt_error(ErrorCode::InvalidArgument, "symlink"));
         }
-        let last = index + 1 == parts.len();
-        if !last && !meta.is_dir() {
+        if cursor == path {
+            ensure_regular_handle(&file)?;
+            return Ok(file);
+        }
+        if !meta.is_dir() {
             return Err(rt_error(ErrorCode::InvalidArgument, "not_regular"));
         }
-        if last {
-            ensure_regular_meta(&cursor, &meta)?;
-        }
+        parents.push(file);
     }
-    ensure_within_root(root, &cursor)?;
-    Ok(cursor)
+    Err(rt_error(ErrorCode::InvalidArgument, "empty_path"))
 }
 
-fn ensure_regular_meta(path: &Path, meta: &fs::Metadata) -> RtResult<()> {
-    let kind = meta.file_type();
-    if kind.is_symlink() {
-        return Err(rt_error(ErrorCode::InvalidArgument, "symlink"));
-    }
-    if !kind.is_file() {
+fn ensure_regular_handle(file: &File) -> RtResult<fs::Metadata> {
+    let meta = file.metadata().map_err(|_| rt_error(ErrorCode::StorageUnavailable, "source_stat"))?;
+    if !meta.is_file() {
         return Err(rt_error(ErrorCode::InvalidArgument, "not_regular"));
     }
-    if link_count(path)? > 1 {
+    if link_count(file, &meta)? > 1 {
         return Err(rt_error(ErrorCode::InvalidArgument, "hard_link"));
     }
-    Ok(())
+    Ok(meta)
 }
 
-fn read_stable(path: &Path, hook: Option<&SnapshotReadHook>) -> RtResult<(Vec<u8>, fs::Metadata)> {
-    let mut file = open_read(path)?;
+fn read_stable(mut file: File, path: &Path, maximum: u64, hook: Option<&SnapshotReadHook>) -> RtResult<(Vec<u8>, fs::Metadata)> {
     for _ in 0..MAX_SNAPSHOT_READS {
-        let before = file
-            .metadata()
-            .map_err(|_| rt_error(ErrorCode::StorageUnavailable, "source_stat"))?;
-        ensure_regular_meta(path, &before)?;
-        if let Some(hook) = hook {
-            (hook.as_ref())(path);
+        let before = ensure_regular_handle(&file)?;
+        if before.len() > maximum {
+            return Err(rt_error(ErrorCode::InvalidArgument, "source_limit"));
         }
+        if let Some(hook) = hook { (hook.as_ref())(path); }
         file.seek(SeekFrom::Start(0))
             .map_err(|_| rt_error(ErrorCode::StorageUnavailable, "source_read"))?;
         let mut bytes = Vec::new();
-        file.read_to_end(&mut bytes)
+        (&mut file).take(maximum.saturating_add(1)).read_to_end(&mut bytes)
             .map_err(|_| rt_error(ErrorCode::StorageUnavailable, "source_read"))?;
-        let after = file
-            .metadata()
-            .map_err(|_| rt_error(ErrorCode::StorageUnavailable, "source_stat"))?;
         let read_len = u64::try_from(bytes.len())
             .map_err(|_| rt_error(ErrorCode::InvalidArgument, "overflow"))?;
-        let path_len = fs::symlink_metadata(path).ok().map(|meta| meta.len());
-        let path_ok = path_len
-            .map(|len| len == after.len() && len == read_len)
-            .unwrap_or(true);
-        if sample_stable(&before, &after, read_len) && path_ok {
-            return Ok((bytes, after));
+        if read_len > maximum {
+            return Err(rt_error(ErrorCode::InvalidArgument, "source_limit"));
         }
+        let after = ensure_regular_handle(&file)?;
+        if sample_stable(&before, &after, read_len) { return Ok((bytes, after)); }
     }
     Err(RtError::from_reason(InternalReason::SnapshotUnstable))
 }
@@ -725,53 +796,38 @@ fn sample_stable(before: &fs::Metadata, after: &fs::Metadata, read_len: u64) -> 
     let len_ok = before.len() == after.len() && read_len == after.len();
     let mtime_ok = match (before.modified(), after.modified()) {
         (Ok(left), Ok(right)) => left == right,
-        _ => true,
+        _ => false,
     };
-    len_ok && mtime_ok
-}
-
-fn open_read(path: &Path) -> RtResult<File> {
-    let mut options = OpenOptions::new();
-    options.read(true);
+    #[cfg(unix)]
+    let identity_ok = {
+        use std::os::unix::fs::MetadataExt;
+        before.dev() == after.dev() && before.ino() == after.ino()
+            && before.ctime() == after.ctime() && before.ctime_nsec() == after.ctime_nsec()
+    };
     #[cfg(windows)]
-    {
-        use std::os::windows::fs::OpenOptionsExt;
-        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
-        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
-    }
-    options
-        .open(path)
-        .map_err(|_| rt_error(ErrorCode::StorageUnavailable, "source_open"))
+    let identity_ok = true; // Both samples come from the same pinned file handle.
+    len_ok && mtime_ok && identity_ok
 }
 
-fn link_count(path: &Path) -> RtResult<u64> {
+fn link_count(file: &File, meta: &fs::Metadata) -> RtResult<u64> {
     #[cfg(windows)]
     {
         use std::mem::MaybeUninit;
         use std::os::windows::io::AsRawHandle;
         use windows_sys::Win32::Foundation::HANDLE;
-        use windows_sys::Win32::Storage::FileSystem::{
-            GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION,
-        };
-
-        let file = open_read(path)?;
+        use windows_sys::Win32::Storage::FileSystem::{GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION};
+        let _ = meta;
         let mut info = MaybeUninit::<BY_HANDLE_FILE_INFORMATION>::zeroed();
-        // SAFETY: `file` owns a valid handle for this call, and `info` is writable.
-        let result = unsafe {
-            GetFileInformationByHandle(file.as_raw_handle() as HANDLE, info.as_mut_ptr())
-        };
-        if result == 0 {
-            return Err(rt_error(ErrorCode::StorageUnavailable, "source_stat"));
-        }
-        // SAFETY: a successful call initialized the complete structure.
-        let info = unsafe { info.assume_init() };
-        Ok(u64::from(info.nNumberOfLinks))
+        // SAFETY: file owns a live handle and info is writable.
+        let result = unsafe { GetFileInformationByHandle(file.as_raw_handle() as HANDLE, info.as_mut_ptr()) };
+        if result == 0 { return Err(rt_error(ErrorCode::StorageUnavailable, "source_stat")); }
+        // SAFETY: a successful call initialized the structure.
+        Ok(u64::from(unsafe { info.assume_init() }.nNumberOfLinks))
     }
-    #[cfg(not(windows))]
+    #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
-        let meta = fs::symlink_metadata(path)
-            .map_err(|_| rt_error(ErrorCode::StorageUnavailable, "source_stat"))?;
+        let _ = file;
         Ok(meta.nlink())
     }
 }

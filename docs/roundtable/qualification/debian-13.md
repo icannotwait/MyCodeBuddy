@@ -6,6 +6,25 @@ certificates. The probe writes a certificate only when every check on
 this machine passed. A missing isolator, a failed escape, a hash
 mismatch, or a failed ACP turn is a failing report and no certificate.
 
+## Current qualification limitation
+
+The host probe currently measures OS isolation, adapter startup, and a basic
+ACP prompt. It does not yet exercise production `submit_result` receipt plus
+completion/drain, the product's private event/sidebar/global-body paths,
+or the adapter's native tools against mounted authentication files. Those
+checks remain `not_tested`; this version cannot issue a usable product
+certificate. A successful `pong` response is only an ACP smoke test.
+
+Auth files are readable by the adapter process inside its sandbox. Read-only
+binds still expose their bytes; Grok's writable attempt-local copy exposes
+bytes too. No verified separate model-tool credential boundary is implemented.
+The report must describe this material as present and refuse certification.
+These are limitations to fix in code, not checks an operator may waive by
+editing the report or enabling the execution gate.
+
+The setup and probe commands below are preparatory diagnostics. They do not
+restore live qualification or authorize real provider calls by themselves.
+
 Profiles accept Debian 12 and Debian 13 as profile parameters. The
 issued key still pins the OS, kernel, and architecture that were
 measured. A Debian 12 certificate does not verify on Debian 13.
@@ -70,10 +89,31 @@ also answers. It does not claim an origin-only filter.
 The slirp helper is an OCI `poststart` hook. `createRuntime` runs while
 container init is still non-dumpable, so `/proc/<pid>/ns/user` does not
 exist and slirp exits before it writes the ready byte. The hook reads
-that byte and fails unless it is `1`. It then leaves a watcher,
-`( while kill -0 $pid; do sleep 0.2; done; kill $slirp ) &`, because
-crun adopts the orphaned slirp process and `crun run` would otherwise
-wait on it forever.
+that byte and fails unless it is `1`. A watcher compares the container's
+PID/start time and holds a pipe open only while that same process lives.
+Slirp reads the pipe through `--exit-fd=0` and exits on EOF, so the watcher
+never signals a reusable numeric PID. This is the upstream
+[slirp4netns exit-fd contract](https://github.com/rootless-containers/slirp4netns/blob/master/slirp4netns.1.md).
+The launcher can then finish waiting for its adopted helper. Explicit
+cleanup and the hook share a private startup lock and durable lifecycle
+state. Cleanup closes that gate before signaling and checks again after the
+container and launcher can no longer create hooks. Hook startup requires
+successful durable publication of both helper and watcher PID/start-time
+pins. Hook, watcher and all their descendants carry per-container owner
+markers; cleanup enumerates that owned tree and signals only verified
+Linux pidfds. An old plain PID file, missing configured-helper pin or
+unprovable ownership leaves cleanup failed rather than signaling another
+process. A durable never-started state is distinct from version/isolation/
+MCP probes that intentionally configure no slirp helper.
+
+Cleanup durably records an in-progress quarantine before signaling anything.
+Only that same successful, lock-owning cleanup call can publish a proven
+state after every retained process identity exits. An interrupted call or a
+legacy cancelled marker cannot be retried into a success merely because
+processes erased their environment markers. It remains
+`slirp_cleanup_interrupted` and requires explicit host-level recovery that
+proves the complete owned process tree is gone. Do not delete or reset the
+quarantine marker merely to unblock execution; bare saved PIDs are not proof.
 
 The qualification probe and the live room write that hook, the watcher,
 the seccomp allowlist, and the resolver through one shared path. The
@@ -81,18 +121,22 @@ image's `/etc/resolv.conf` stays an empty regular file. Both paths
 bind-mount `<runtime-root>/slirp-resolv.conf` read-only over it. That
 file contains `nameserver 10.0.2.3`, which is slirp4netns's DNS proxy
 inside the container network namespace. The image digest does not change.
-`plan_hash` hashes the execution template, including the paths in it.
-The same live paths keep the same `plan_hash` when only the resolver
-file contents change. `core_hash` hashes the shared roundtable code,
-including the validator, the seat prompt, the MCP broker, and the live
-ACP client. It changes
-again whenever those files change. Keys issued for `15313e62d`
-(generation 3) do not match a later commit. Re-run `roundtable-qualify`
-and replace `execution-policy.json`. A probe that uses a different
-`--runtime-root` or rootfs path changes `plan_hash` only. The
-`submit_result` JSON Schema is answered by the codeg-server broker on
-`tools/list`. The `codeg-mcp` process in the rootfs only proxies that
-socket, so a schema-only broker change does not require a new rootfs.
+`plan_hash` binds the execution template, including runtime and rootfs
+paths. The same paths retain that template hash when only the resolver
+contents change. `core_hash` separately binds the shared implementation;
+the changes between `2f57bcde4` and `a8ee4042f` therefore invalidate
+previously issued certificates. Probe/profile implementation sources are
+also bound into new certificates. Changed production or probe semantics
+require fresh qualification once the missing product checks and credential
+boundary are implemented. Keep the execution policy disabled meanwhile.
+A different `--runtime-root` or rootfs path also changes `plan_hash` even
+when the implementation is unchanged.
+The shared-core hash includes the validator, seat prompt, MCP broker and
+live ACP client. The `submit_result` JSON Schema is answered by the
+codeg-server broker on `tools/list`; the `codeg-mcp` process in the rootfs
+only proxies that socket, so a schema-only broker change does not require
+a new rootfs. Rerunning the current diagnostic probe cannot produce a
+usable live certificate or resolve the missing product measurements.
 Without that mount the live container keeps the empty file, so
 `auth.x.ai` and `cli-chat-proxy.grok.com` fail with
 `dns error: failed to lookup address information` until the attempt
@@ -323,12 +367,13 @@ adapter. Grok 1.0.46's `session/new` advertises `grok-4.6`. Antigravity
 2026.09.28-64d2043 advertises `composer-2.5[fast=true]` once ACP
 authentication succeeds. The probe reads ids from that response
 (`currentModelId`, `models`, and `configOptions` whose id contains
-`model`) and fails `endpoint_compatibility` when the selected binding
-is missing from that list or when the adapter advertises no model. Do
+`model`) and records the advertised model binding. This alone does not prove
+production `session/set_config_option` selection or endpoint compatibility. Do
 not invent an id the adapter did not report. Origins must be `https`
 with no user, path, or query.
-File-auth adapters (Grok, Cursor, Antigravity) are admitted when the
-mounted auth files exist even if that environment variable is unset.
+File-auth adapters (Grok, Cursor, Antigravity) can perform an ACP startup
+probe with mounted auth files even if that environment variable is unset.
+The existence of those files does not qualify them for product admission.
 Codex still uses the named variable as the host-side gateway
 credential. The value is never copied into the image.
 
@@ -373,25 +418,33 @@ A failing report has `verdict` other than `passed`,
 a report into a pass. The product checks the report hash, the host OS
 and kernel, the binary hashes, and the image digest again at launch.
 
+The default production scratch is
+`$CODEG_DATA_DIR/roundtable/oci/runs/<incarnation>/scratch`. A dedicated
+per-incarnation subtree may live below HOME. Validation must bind it to the
+installed runtime root and exact incarnation; mounting HOME, the runtime
+parent, a project/decoy/other-attempt subtree, or a symlink alias remains
+forbidden. The generic sandbox-plan builder has no HOME exception.
+
 ## Execution policy
 
-The probe does not enable the gate. After the adapters you need have
-passed, merge their qualification keys into one file:
+Keep the execution gate disabled while the missing product qualification
+checks or native credential boundary remain unimplemented. The probe does
+not enable it. The policy file is:
 
 `$CODEG_DATA_DIR/roundtable/execution-policy.json`
 
 ```json
 {
-  "enabled": true,
+  "enabled": false,
   "generation": 1,
   "allowed_qualification_keys": []
 }
 ```
 
-Replace `allowed_qualification_keys` with the key objects from each
-`execution-policy.example.json` you intend to run. `enabled` must be
-true. `generation` must match the file the server reads. A key that is
-not in this list cannot start a turn.
+Do not populate this allowlist from synthetic test fixtures or old reports.
+A future release with complete measured production evidence will need fresh
+certificates and an explicit operator decision to enable execution. The
+policy generation and accepted keys must match what the server reads.
 
 ## Seat ACP client
 
@@ -401,31 +454,32 @@ advertises `terminal: false` and filesystem read and write false.
 `/scratch` and mounts only the roundtable MCP server.
 
 `session/request_permission` selects an option from that request.
-The match uses structured fields only: `toolCall.title`, `toolCall.name`,
-`toolCall.kind`, or `rawInput` keys `name`, `tool`, `toolName`, and
-`tool_name`. The value must be exactly `submit_result`, `read_evidence`,
-or `search_evidence`, or the same name prefixed with `roundtable/`,
-`mcp__roundtable__`, or `roundtable__`. Grok's `use_tool` wrapper is
-allowed when `tool_name` is `roundtable__search_evidence` (and the other
-two tools). A terminal command whose text contains `submit_result` is
-rejected. Free-text titles are rejected too. An allowed call selects
-`allow_once`, or `allow_always` when `allow_once` is absent. Every other
-tool selects `reject_once`, or `reject_always` when `reject_once` is
-absent. The reply is
+`submit_result`, `read_evidence`, and `search_evidence`, including
+`roundtable/<tool>`, `roundtable__<tool>` and `mcp__roundtable__<tool>`, select only `allow_once`.
+If that option is absent, the request is rejected: `allow_always` is not
+qualified as confined to the sealed tool and disposable attempt. An explicit
+`use_tool` identity may wrap a scoped roundtable tool only when its `rawInput`
+contains the exact `tool_name` and an object `tool_input`, with no other keys.
+A conflicting machine name or a native-operation kind cannot be overridden by
+a display title or argument. Every other tool,
+including `run_terminal_command`, selects `reject_once`, or
+`reject_always` when `reject_once` is absent. The reply is
 `{"outcome":{"outcome":"selected","optionId":"..."}}`. The client never
 sends `outcome: cancelled`. A rejected tool does not finish the attempt
 by itself. If Grok still ends the turn with `stopReason` `cancelled`
-after a rejection, the same session sends at most two follow-up prompts:
+after a rejection, the same session sends at most two follow-up prompts,
+provided no fatal gateway or session failure has been observed:
 `Only use roundtable__read_evidence, roundtable__search_evidence, and roundtable__submit_result. Call submit_result now.`
 Other stop reasons are not retried. A request with no usable option gets
-JSON-RPC `-32601`.
+JSON-RPC `-32601`. Failure observations are checked again after gateway drain
+and before a staged candidate may be accepted.
 
 `tools/list` publishes the full `submit_result` JSON Schema for the
-attempt's phase. Proposal and critique results are `oneOf` an active
-result (`kind`, `summary`, `claims` of `local_key`, `text`,
-`evidence_aliases`, `confidence`) and an abstain result. Synthesis omits
-`speaker_id` and `coverage`. The seat prompt includes one compact
-example, not the whole schema. A missing or invalid nested field is
+attempt's phase. Proposal and critique schemas declare `kind`, `summary`,
+and `claims` of `local_key`, `text`, `evidence_aliases`, and `confidence`,
+with conditional requirements for abstention. Synthesis omits `speaker_id`
+and `coverage`. MCP schemas, prompt schemas and examples derive from the same
+validator contract. A missing or invalid nested field is
 reported at its path, for example `$.claims[0].local_key`. Pure
 schema-shape mistakes stay open through 8 submissions and close on the
 9th. Alias and consensus failures still close on the 4th.
@@ -441,8 +495,9 @@ this session uses. Antigravity and Cursor sessions omit that `_meta`.
 ACP transport frames use a bounded lenient JSON parser, at most 1 MiB.
 A float in a `session/update` does not fail the turn. The strict
 no-float parser still applies only to the `submit_result` payload. A
-frame or payload that is rejected is logged as a truncated excerpt with
-token-like values removed.
+frame or payload that is rejected is logged only as a bounded structural
+diagnostic. Arbitrary values are redacted; malformed bytes retain only a
+redacted marker and byte count.
 
 ## Three-member room
 

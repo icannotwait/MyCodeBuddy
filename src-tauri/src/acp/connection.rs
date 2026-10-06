@@ -19332,6 +19332,15 @@ pub(crate) fn classify_service_failure(
             }),
             None => incompatible = true,
         }
+    } else if meta
+        .and_then(|value| value.get("jetbrains"))
+        .and_then(|value| value.get("air"))
+        .and_then(|value| value.get("sessionFailure"))
+        .is_some()
+    {
+        // A declared record outside air_session_failure's envelope/version
+        // domain is incompatible, never an absent successful observation.
+        incompatible = true;
     }
     crate::roundtable::capabilities::FailureClassification {
         records,

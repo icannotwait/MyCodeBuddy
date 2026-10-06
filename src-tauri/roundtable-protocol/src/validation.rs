@@ -64,6 +64,56 @@ const MODERATOR_FIELDS: &[&str] = &[
     "decision_requests",
 ];
 
+/// Complete model-facing JSON Schema shared by all delivery transports.
+/// Enum serialization and quotas use the validator's types/constants; property
+/// and required-field parity is maintained by validator/corpus tests. Dynamic
+/// alias/ownership rules are documented and remain enforced by the validator.
+/// Identity and coverage stay host-owned and absent from the model input.
+pub fn result_schema(phase: Option<PhaseKind>) -> Value {
+    use serde_json::json;
+    fn object(required: &[&str], properties: Value) -> Value {
+        json!({"type":"object","additionalProperties":false,"required":required,"properties":properties})
+    }
+    fn array(items: Value) -> Value { json!({"type":"array","items":items}) }
+    fn enumeration(values: impl Serialize) -> Value { json!({"type":"string","enum":values}) }
+    let text = json!({"type":"string","minLength":1,"pattern":"\\S"});
+    let aliases = array(json!({"type":"string","minLength":1}));
+    let alias = object(&["kind","alias"], json!({
+        "kind":enumeration([AliasKind::Message, AliasKind::Claim, AliasKind::Evidence]),
+        "alias":{"type":"string","minLength":1}
+    }));
+    let conclusion = object(&["text","aliases","inference"], json!({"text":text,"aliases":array(alias.clone()),"inference":{"type":"boolean"}}));
+    let mut member = object(&["kind","summary","claims"], json!({
+        "kind": enumeration(match phase { Some(PhaseKind::Proposal) => vec![MemberKind::Proposal,MemberKind::Abstain], Some(PhaseKind::Critique) => vec![MemberKind::Critique,MemberKind::Abstain], _ => vec![MemberKind::Proposal,MemberKind::Critique,MemberKind::Abstain] }),
+        "summary":text,
+        "claims":{"type":"array","maxItems":v1_1::MAX_CLAIMS,"items":object(&["local_key","text","evidence_aliases","confidence"],json!({
+            "local_key":{"type":"string","minLength":1},"text":text,"evidence_aliases":aliases,
+            "confidence":enumeration([crate::Confidence::Low,crate::Confidence::Medium,crate::Confidence::High])
+        }))},
+        "responses":{"type":"array","maxItems":v1_1::MAX_RESPONSES,"items":{
+            "type":"object","additionalProperties":false,"required":["stance","priority","text","evidence_aliases"],
+            "oneOf":[{"required":["target_claim_alias"],"not":{"required":["target_response_alias"]}},{"required":["target_response_alias"],"not":{"required":["target_claim_alias"]}}],
+            "properties":{"target_claim_alias":{"type":"string","minLength":1},"target_response_alias":{"type":"string","minLength":1},"stance":enumeration([Stance::Support,Stance::Challenge,Stance::Clarify,Stance::Revise]),"priority":enumeration([crate::Priority::Normal,crate::Priority::Critical]),"text":text,"evidence_aliases":aliases}
+        }},
+        "open_questions":{"type":"array","maxItems":v1_1::MAX_OPEN_QUESTIONS,"items":text},
+        "position_changes":{"type":"array","maxItems":v1_1::MAX_POSITION_CHANGES,"items":object(&["own_prior_claim_alias","new_local_claim_key","reason","trigger_response_aliases"],json!({"own_prior_claim_alias":{"type":"string"},"new_local_claim_key":{"type":"string"},"reason":text,"trigger_response_aliases":aliases}))},
+        "reason":{"type":"string"}
+    }));
+    member["allOf"] = json!([{"if":{"properties":{"kind":{"const":"abstain"}}},"then":{"required":["reason"],"properties":{"reason":text,"claims":{"maxItems":0},"responses":{"maxItems":0},"position_changes":{"maxItems":0}}},"else":{"properties":{"claims":{"minItems":1}}}}]);
+    member["examples"] = json!([{"kind":if phase==Some(PhaseKind::Critique){"critique"}else{"proposal"},"summary":"A reasoned position","claims":[{"local_key":"a","text":"An explicitly stated claim","evidence_aliases":[],"confidence":"low"}],"responses":[],"open_questions":[],"position_changes":[]}]);
+    let mut moderator = object(MODERATOR_FIELDS, json!({
+        "kind":enumeration([ModeratorKind::Synthesis]),"recommendation":conclusion,
+        "alternatives":array(conclusion.clone()),"disagreements":array(conclusion.clone()),"risks":array(conclusion.clone()),"decision_requests":array(conclusion),
+        "consensus_items":array(object(&["text","agreement_level","aliases","supporter_aliases","support_response_aliases","inference"],json!({"text":text,"agreement_level":enumeration([AgreementLevel::ExplicitAgreement,AgreementLevel::CompatiblePositions,AgreementLevel::Unresolved]),"aliases":array(alias),"supporter_aliases":aliases,"support_response_aliases":aliases,"inference":{"type":"boolean"}})))
+    }));
+    moderator["examples"] = json!([{"kind":"synthesis","recommendation":{"text":"This recommendation is an inference","aliases":[],"inference":true},"alternatives":[],"consensus_items":[],"disagreements":[],"risks":[],"decision_requests":[]}]);
+    let mut schema = match phase { Some(PhaseKind::Synthesis) => moderator, Some(_) => member, None => json!({"oneOf":[member,moderator]}) };
+    schema["$schema"] = json!("http://json-schema.org/draft-07/schema#");
+    schema["$id"] = json!("roundtable_result_v1");
+    schema["description"] = json!("Submit only this result object through submit_result with a fresh UUID submission_id. Do not submit identity fields or coverage. Optional fields must be omitted, never null. Use only visible aliases supplied in context.aliases and context.alias_catalog; IDs are not aliases. Claim local_key values must be unique within your result. Cite evidence aliases only after reading the frozen evidence. A non-abstaining member must answer every metadata.mandatory_targets entry with exactly one target_claim_alias or target_response_alias per response. Support cannot target your own claims. Position changes must refer to your published prior claim, a local claim key in this result and published response aliases. Moderator conclusions require visible message/claim/evidence aliases or inference=true. Explicit agreement requires at least two published support responses from distinct other speakers on the same claim, with matching supporter aliases. Stay within metadata.phase.output_byte_limit canonical UTF-8 bytes. An abstention requires a non-empty reason and no claims, responses or position changes. A staged receipt is not turn acceptance; finish the ACP turn normally after receiving the receipt.");
+    schema
+}
+
 /// Host-owned scope. The payload cannot choose the speaker.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ResultScope {
@@ -1178,6 +1228,21 @@ fn decision(
     }
 }
 
+#[cfg(test)]
+mod schema_parity_tests {
+    use super::*;
+
+    #[test]
+    fn model_schema_property_names_match_validator_allowlists() {
+        for (kind, allowed) in [(PhaseKind::Proposal, MEMBER_FIELDS), (PhaseKind::Synthesis, MODERATOR_FIELDS)] {
+            let schema = result_schema(Some(kind));
+            let actual: BTreeSet<_> = schema["properties"].as_object().unwrap().keys().map(String::as_str).collect();
+            let expected: BTreeSet<_> = allowed.iter().copied().collect();
+            assert_eq!(actual,expected);
+        }
+    }
+}
+
 fn shape_only(errors: &[FieldError]) -> bool {
     !errors.is_empty() && errors.iter().all(|error| error.code.is_schema_shape())
 }
@@ -1508,189 +1573,16 @@ pub fn submit_result_input_schema(phase: PhaseKind) -> Value {
                 "minLength": 1,
                 "description": "New id for this body. Reuse an id only to retry the identical body."
             },
-            "result": result_json_schema(phase)
+            "result": result_schema(Some(phase))
         }
     })
 }
 
-/// Compact example embedded in the seat prompt. The MCP inputSchema carries
-/// the full schema.
+/// Compact example from the exact same contract as the prompt and MCP schema.
+/// Dynamic mandatory targets still require the corresponding covering responses.
 pub fn seat_schema_example(phase: PhaseKind) -> &'static str {
-    match phase {
-        PhaseKind::Proposal => "Use a new submission_id. Proposal example result: {\"kind\":\"proposal\",\"summary\":\"one sentence\",\"claims\":[{\"local_key\":\"c1\",\"text\":\"claim\",\"evidence_aliases\":[],\"confidence\":\"medium\"}]}. Abstain: {\"kind\":\"abstain\",\"summary\":\"why\",\"claims\":[],\"reason\":\"missing evidence\"}.",
-        PhaseKind::Critique => "Use a new submission_id. Critique example result: {\"kind\":\"critique\",\"summary\":\"one sentence\",\"claims\":[{\"local_key\":\"c1\",\"text\":\"claim\",\"evidence_aliases\":[],\"confidence\":\"medium\"}]}. Abstain: {\"kind\":\"abstain\",\"summary\":\"why\",\"claims\":[],\"reason\":\"missing evidence\"}.",
-        PhaseKind::Synthesis => "Use a new submission_id. Omit speaker_id and coverage. Synthesis example result: {\"kind\":\"synthesis\",\"recommendation\":{\"text\":\"one sentence\",\"aliases\":[],\"inference\":false},\"alternatives\":[],\"consensus_items\":[],\"disagreements\":[],\"risks\":[],\"decision_requests\":[]}.",
-    }
-}
-
-fn result_json_schema(phase: PhaseKind) -> Value {
-    match phase {
-        PhaseKind::Proposal => json!({
-            "description": "proposal requires 1 to 20 claims. abstain uses an empty claims array, a non-empty reason, and no responses or position_changes.",
-            "oneOf": [member_result_schema("proposal"), abstain_result_schema()]
-        }),
-        PhaseKind::Critique => json!({
-            "description": "critique requires 1 to 20 claims. abstain uses an empty claims array, a non-empty reason, and no responses or position_changes.",
-            "oneOf": [member_result_schema("critique"), abstain_result_schema()]
-        }),
-        PhaseKind::Synthesis => moderator_result_schema(),
-    }
-}
-
-fn member_result_schema(kind: &str) -> Value {
-    json!({
-        "type": "object",
-        "additionalProperties": false,
-        "required": ["kind", "summary", "claims"],
-        "properties": {
-            "kind": {"type": "string", "enum": [kind]},
-            "summary": {"type": "string", "minLength": 1},
-            "claims": {
-                "type": "array",
-                "minItems": 1,
-                "maxItems": v1_1::MAX_CLAIMS,
-                "items": claim_schema()
-            },
-            "responses": {
-                "type": "array",
-                "maxItems": v1_1::MAX_RESPONSES,
-                "items": response_schema()
-            },
-            "open_questions": {
-                "type": "array",
-                "maxItems": v1_1::MAX_OPEN_QUESTIONS,
-                "items": {"type": "string", "minLength": 1}
-            },
-            "position_changes": {
-                "type": "array",
-                "maxItems": v1_1::MAX_POSITION_CHANGES,
-                "items": position_schema()
-            },
-            "reason": {"type": "string"}
-        }
-    })
-}
-
-fn abstain_result_schema() -> Value {
-    json!({
-        "type": "object",
-        "additionalProperties": false,
-        "required": ["kind", "summary", "claims", "reason"],
-        "properties": {
-            "kind": {"type": "string", "enum": ["abstain"]},
-            "summary": {"type": "string", "minLength": 1},
-            "claims": {"type": "array", "maxItems": 0},
-            "reason": {"type": "string", "minLength": 1},
-            "responses": {"type": "array", "maxItems": 0},
-            "open_questions": {
-                "type": "array",
-                "maxItems": v1_1::MAX_OPEN_QUESTIONS,
-                "items": {"type": "string", "minLength": 1}
-            },
-            "position_changes": {"type": "array", "maxItems": 0}
-        }
-    })
-}
-
-fn claim_schema() -> Value {
-    json!({
-        "type": "object",
-        "additionalProperties": false,
-        "required": ["local_key", "text", "evidence_aliases", "confidence"],
-        "properties": {
-            "local_key": {"type": "string", "minLength": 1},
-            "text": {"type": "string", "minLength": 1},
-            "evidence_aliases": {"type": "array", "items": {"type": "string"}},
-            "confidence": {"type": "string", "enum": ["low", "medium", "high"]}
-        }
-    })
-}
-
-fn response_schema() -> Value {
-    json!({
-        "type": "object",
-        "additionalProperties": false,
-        "required": ["stance", "priority", "text", "evidence_aliases"],
-        "properties": {
-            "target_claim_alias": {"type": "string", "minLength": 1},
-            "target_response_alias": {"type": "string", "minLength": 1},
-            "stance": {"type": "string", "enum": ["support", "challenge", "clarify", "revise"]},
-            "priority": {"type": "string", "enum": ["normal", "critical"]},
-            "text": {"type": "string", "minLength": 1},
-            "evidence_aliases": {"type": "array", "items": {"type": "string"}}
-        }
-    })
-}
-
-fn position_schema() -> Value {
-    json!({
-        "type": "object",
-        "additionalProperties": false,
-        "required": ["own_prior_claim_alias", "new_local_claim_key", "reason", "trigger_response_aliases"],
-        "properties": {
-            "own_prior_claim_alias": {"type": "string", "minLength": 1},
-            "new_local_claim_key": {"type": "string", "minLength": 1},
-            "reason": {"type": "string", "minLength": 1},
-            "trigger_response_aliases": {"type": "array", "items": {"type": "string"}}
-        }
-    })
-}
-
-fn moderator_result_schema() -> Value {
-    json!({
-        "type": "object",
-        "additionalProperties": false,
-        "description": "Do not send speaker_id or coverage. The host assigns those.",
-        "required": ["kind", "recommendation", "alternatives", "consensus_items", "disagreements", "risks", "decision_requests"],
-        "properties": {
-            "kind": {"type": "string", "enum": ["synthesis"]},
-            "recommendation": conclusion_schema(),
-            "alternatives": {"type": "array", "items": conclusion_schema()},
-            "consensus_items": {"type": "array", "items": consensus_schema()},
-            "disagreements": {"type": "array", "items": conclusion_schema()},
-            "risks": {"type": "array", "items": conclusion_schema()},
-            "decision_requests": {"type": "array", "items": conclusion_schema()}
-        }
-    })
-}
-
-fn conclusion_schema() -> Value {
-    json!({
-        "type": "object",
-        "additionalProperties": false,
-        "required": ["text", "aliases", "inference"],
-        "properties": {
-            "text": {"type": "string", "minLength": 1},
-            "aliases": {"type": "array", "items": alias_schema()},
-            "inference": {"type": "boolean"}
-        }
-    })
-}
-
-fn alias_schema() -> Value {
-    json!({
-        "type": "object",
-        "additionalProperties": false,
-        "required": ["kind", "alias"],
-        "properties": {
-            "kind": {"type": "string", "enum": ["message", "claim", "evidence"]},
-            "alias": {"type": "string", "minLength": 1}
-        }
-    })
-}
-
-fn consensus_schema() -> Value {
-    json!({
-        "type": "object",
-        "additionalProperties": false,
-        "required": ["text", "agreement_level", "aliases", "supporter_aliases", "support_response_aliases", "inference"],
-        "properties": {
-            "text": {"type": "string", "minLength": 1},
-            "agreement_level": {"type": "string", "enum": ["explicit_agreement", "compatible_positions", "unresolved"]},
-            "aliases": {"type": "array", "items": alias_schema()},
-            "supporter_aliases": {"type": "array", "items": {"type": "string"}},
-            "support_response_aliases": {"type": "array", "items": {"type": "string"}},
-            "inference": {"type": "boolean"}
-        }
-    })
+    static EXAMPLES: std::sync::OnceLock<[String;3]> = std::sync::OnceLock::new();
+    let examples=EXAMPLES.get_or_init(|| [PhaseKind::Proposal,PhaseKind::Critique,PhaseKind::Synthesis]
+        .map(|phase|format!("Use a new submission_id and address every mandatory target. Omit identity and coverage. Example result: {}",result_schema(Some(phase))["examples"][0])));
+    &examples[match phase { PhaseKind::Proposal=>0,PhaseKind::Critique=>1,PhaseKind::Synthesis=>2 }]
 }

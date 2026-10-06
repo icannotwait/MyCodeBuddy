@@ -12,7 +12,7 @@ use roundtable_protocol::{
     PhaseKind, PhaseRefV1, ProjectionBodyV1, ProjectionId, ProjectionRef, ProjectionV1,
     PublishedMessageRef, Revision, RoomAggregate, RoomId, RuntimeTurnCompleted, Seq,
 };
-use sea_orm::{ConnectionTrait, DatabaseTransaction, TransactionTrait};
+use sea_orm::{ConnectionTrait, DatabaseTransaction};
 use serde_json::{json, Value};
 use uuid::Uuid;
 
@@ -86,7 +86,9 @@ impl RoundtableStore {
         if let Some(gate) = self.fault_snapshot().lock_gate {
             gate.wait().await;
         }
-        let txn = self.connection().begin().await.map_err(storage_err)?;
+        let txn = self.write_transaction().await?;
+        #[cfg(any(test, feature = "test-utils"))]
+        if let Some(gate) = self.take_accept_writer_gate() { gate.wait().await; }
         match self.accept_in(&txn, &input).await {
             Ok(value) => {
                 txn.commit().await.map_err(storage_err)?;
@@ -100,7 +102,7 @@ impl RoundtableStore {
     }
 
     pub async fn close_phase(&self, input: CloseInput) -> RtResult<ClosingSetRef> {
-        let txn = self.connection().begin().await.map_err(storage_err)?;
+        let txn = self.write_transaction().await?;
         match self.close_in(&txn, &input).await {
             Ok(value) => {
                 txn.commit().await.map_err(storage_err)?;
@@ -114,7 +116,7 @@ impl RoundtableStore {
     }
 
     pub async fn publish(&self, input: PublishInput) -> RtResult<ProjectionRef> {
-        let txn = self.connection().begin().await.map_err(storage_err)?;
+        let txn = self.write_transaction().await?;
         match self.publish_in(&txn, &input).await {
             Ok(value) => {
                 txn.commit().await.map_err(storage_err)?;
@@ -302,7 +304,7 @@ impl RoundtableStore {
         {
             return Err(rt_error(ErrorCode::InvalidState, "fence_mismatch"));
         }
-        check_phase_fence(txn, &room_id, &phase_id, &input.fence).await?;
+        check_phase_fence(txn, &room_id, &phase_id, &input.fence, false).await?;
         let phase = phase_row(txn, &room_id, &phase_id).await?;
         if phase.status != "running" || phase.revision != i64_from(input.fence.phase_revision.0)? {
             return Err(rt_error(ErrorCode::InvalidState, "fence_mismatch"));
@@ -528,7 +530,7 @@ impl RoundtableStore {
     ) -> RtResult<ClosingSetRef> {
         let room_id = input.room_id.to_string();
         let phase_id = input.phase_id.to_string();
-        check_phase_fence(txn, &room_id, &phase_id, &input.fence).await?;
+        check_phase_fence(txn, &room_id, &phase_id, &input.fence, false).await?;
         let phase = phase_row(txn, &room_id, &phase_id).await?;
         if phase.revision != i64_from(input.fence.phase_revision.0)? {
             return Err(rt_error(ErrorCode::InvalidState, "fence_mismatch"));
@@ -728,12 +730,6 @@ impl RoundtableStore {
         let operation = Uuid::new_v4().to_string();
         exec(txn,"INSERT INTO rt_control_operations(room_id,operation_id,kind,target_phase_id,target_revision,requested_epoch,step,status) VALUES(?,?,'recover',?,?,?,'done','completed')",vec![text(room_id),text(&operation),text(&phase),num(i64_from(fence.phase_revision.0)?),num(i64_from(fence.run_epoch.0)?)]).await?;
         exec(txn,"UPDATE rt_closing_sets SET recovery_boot_epoch=?,recovery_operation_id=? WHERE room_id=? AND phase_id=?",vec![num(i64_from(fence.boot_epoch.0)?),text(&operation),text(room_id),text(&phase)]).await?;
-        exec(
-            txn,
-            "UPDATE rt_rooms SET status='running' WHERE room_id=?",
-            vec![text(room_id)],
-        )
-        .await?;
         self.publish_in(
             txn,
             &PublishInput {
@@ -758,7 +754,7 @@ impl RoundtableStore {
         }
         let room_id = input.room_id.to_string();
         let phase_id = input.phase_id.to_string();
-        check_phase_fence(txn, &room_id, &phase_id, &input.fence).await?;
+        check_phase_fence(txn, &room_id, &phase_id, &input.fence, true).await?;
         let phase = phase_row(txn, &room_id, &phase_id).await?;
         if phase.status != "closing" {
             return Err(rt_error(ErrorCode::InvalidState, "phase_not_closing"));
@@ -953,7 +949,9 @@ impl RoundtableStore {
         .max(0) as u64;
         let config: Option<roundtable_protocol::RoundtableConfigV1> =
             serde_json::from_str(&room.config_ref).ok();
-        let prepaid=query_i64(txn,"SELECT COALESCE(SUM(prepaid_ms),0) FROM rt_active_time_leases WHERE room_id=? AND boot_epoch=? AND run_epoch=?",vec![text(room_id),num(room.boot_epoch),num(room.run_epoch)]).await?.max(0) as u64;
+        // A control changes run_epoch before the old owner's cleanup settles.
+        // Its same-boot reservation is still unspent, not consumed active time.
+        let prepaid=query_i64(txn,"SELECT COALESCE(SUM(prepaid_ms),0) FROM rt_active_time_leases WHERE room_id=? AND boot_epoch=?",vec![text(room_id),num(room.boot_epoch)]).await?.max(0) as u64;
         let sampled = config
             .map(|config| {
                 config
@@ -1265,11 +1263,12 @@ async fn check_phase_fence(
     room: &str,
     phase: &str,
     fence: &Fence,
+    allow_recovery: bool,
 ) -> RtResult<()> {
     if phase != fence.phase_id.to_string() {
         return Err(rt_error(ErrorCode::InvalidState, "fence_mismatch"));
     }
-    let valid=query_i64(txn,"SELECT COUNT(*) FROM rt_rooms r JOIN rt_phases p ON p.room_id=r.room_id AND p.phase_id=r.current_phase_id JOIN rt_turns t ON t.room_id=p.room_id AND t.phase_id=p.phase_id JOIN rt_attempts a ON a.room_id=t.room_id AND a.turn_id=t.turn_id JOIN rt_bindings b ON b.room_id=a.room_id AND b.binding_id=a.binding_id WHERE r.room_id=? AND r.status='running' AND r.active_control_id IS NULL AND r.boot_epoch=? AND r.run_epoch=? AND p.phase_id=? AND p.revision=? AND a.attempt_id=? AND b.binding_id=? AND b.incarnation=? AND b.policy_ref=? AND a.delivery_hash=?",vec![text(room),num(i64_from(fence.boot_epoch.0)?),num(i64_from(fence.run_epoch.0)?),text(phase),num(i64_from(fence.phase_revision.0)?),text(&fence.attempt_id.to_string()),text(&fence.binding_id.to_string()),text(&fence.incarnation.to_string()),text(&fence.policy_hash.to_hex()),text(&fence.context_hash.to_hex())]).await?;
+    let valid=query_i64(txn,"SELECT COUNT(*) FROM rt_rooms r JOIN rt_phases p ON p.room_id=r.room_id AND p.phase_id=r.current_phase_id JOIN rt_turns t ON t.room_id=p.room_id AND t.phase_id=p.phase_id JOIN rt_attempts a ON a.room_id=t.room_id AND a.turn_id=t.turn_id JOIN rt_bindings b ON b.room_id=a.room_id AND b.binding_id=a.binding_id WHERE r.room_id=? AND (r.status='running' OR (?=1 AND r.status='paused' AND EXISTS(SELECT 1 FROM rt_closing_sets cs JOIN rt_control_operations co ON co.room_id=cs.room_id AND co.operation_id=cs.recovery_operation_id WHERE cs.room_id=r.room_id AND cs.phase_id=p.phase_id AND cs.recovery_boot_epoch=r.boot_epoch AND co.kind='recover' AND co.target_phase_id=p.phase_id AND co.target_revision=p.revision AND co.requested_epoch=r.run_epoch AND co.step='done' AND co.status='completed'))) AND r.active_control_id IS NULL AND r.boot_epoch=? AND r.run_epoch=? AND p.phase_id=? AND p.revision=? AND a.attempt_id=? AND b.binding_id=? AND b.incarnation=? AND b.policy_ref=? AND a.delivery_hash=?",vec![text(room),num(i64::from(allow_recovery)),num(i64_from(fence.boot_epoch.0)?),num(i64_from(fence.run_epoch.0)?),text(phase),num(i64_from(fence.phase_revision.0)?),text(&fence.attempt_id.to_string()),text(&fence.binding_id.to_string()),text(&fence.incarnation.to_string()),text(&fence.policy_hash.to_hex()),text(&fence.context_hash.to_hex())]).await?;
     if valid != 1 {
         return Err(rt_error(ErrorCode::InvalidState, "fence_mismatch"));
     }

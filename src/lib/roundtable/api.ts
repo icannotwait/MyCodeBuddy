@@ -3,6 +3,7 @@ import type {
   RoundtableMessage,
   RoundtableProjection,
   RoundtableEvidence,
+  RoundtableSourceEntry,
 } from "@/lib/roundtable/types"
 import { getTransport } from "@/lib/transport"
 
@@ -37,7 +38,15 @@ export async function roundtableCall<T>(
 }
 
 export function roundtableError(error: unknown): string {
-  if (error instanceof Error) return error.message
+  if (error && typeof error === "object" && "details" in error &&
+      error.details && typeof error.details === "object" && "reason" in error.details &&
+      error.details.reason === "provider_credential_missing") {
+    return "Provider credentials are missing. Update the provider settings, then retry."
+  }
+  if (error instanceof Error) {
+    if (error.message === "paid_outcome_unknown") return "The previous paid operation is still unconfirmed. Retry it to recover its acknowledgment before submitting another operation."
+    return error.message
+  }
   if (error && typeof error === "object" && "message" in error) {
     return String(error.message)
   }
@@ -303,4 +312,38 @@ export function roundtableBody(command: RoundtableCommand) {
 
 export function roundtableStatus(code: string) {
   return STATUS[code] ?? 400
+}
+
+/** Read immutable source objects only, checking the complete bounded byte stream. */
+export async function loadRoundtableSource(
+  roomId: string,
+  entry: RoundtableSourceEntry
+): Promise<string> {
+  if (!entry.text_admissible || entry.size > 1024 * 1024 || entry.size < 0 ||
+      entry.size !== entry.object.total_bytes ||
+      entry.content_hash !== entry.object.content_hash ||
+      entry.object.object_id !== entry.content_hash) throw new Error("source_reference")
+  const object = { ...entry.object, kind: "source_excerpt" }
+  let cursor: string | null = null
+  const seen = new Set<string>()
+  let text = ""
+  let length = 0
+  do {
+    const page: { object_ref: typeof object; offset: number; text: string; cursor: string | null } = await roundtableCall("roundtable_get", {
+      room_id: roomId,
+      read: { object: { object_ref: object, ...(cursor ? { cursor } : {}) } },
+    })
+    if (page.offset !== length || await roundtableHash(page.object_ref) !== await roundtableHash(object))
+      throw new Error("source_reference")
+    length += new TextEncoder().encode(page.text).length
+    if (length > entry.size) throw new Error("source_hash")
+    text += page.text
+    cursor = page.cursor
+    if (cursor !== null) {
+      if (typeof cursor !== "string" || seen.has(cursor) || page.text.length === 0) throw new Error("page_cursor")
+      seen.add(cursor)
+    }
+  } while (cursor !== null)
+  if (length !== entry.size || await roundtableTextHash(text) !== entry.content_hash) throw new Error("source_hash")
+  return text
 }

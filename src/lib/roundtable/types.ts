@@ -146,6 +146,28 @@ export interface RoundtableMessage {
   }
 }
 
+export interface RoundtableRecipient {
+  ordinal: number
+  provider_ref: string
+  model: string
+  origin: string
+  agent: string
+  effort: string | null
+}
+
+export interface RoundtableSourceEntry {
+  path: string
+  size: number
+  content_hash: string
+  text_admissible: boolean
+  object: { object_id: string; content_hash: string; total_bytes: number }
+}
+
+export interface RoundtableSourceManifest {
+  hash: string
+  manifest: { manifest_id: string; entries: RoundtableSourceEntry[] }
+}
+
 export interface RoundtablePreflight {
   enabled: boolean
   readiness: string
@@ -155,6 +177,8 @@ export interface RoundtablePreflight {
   network: string
   writes: string
   error: unknown
+  capability: { recipients: RoundtableRecipient[] } | null
+  source_manifests: RoundtableSourceManifest[]
 }
 
 export interface RoundtableEvidence {

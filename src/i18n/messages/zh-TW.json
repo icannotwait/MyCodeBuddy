@@ -7480,6 +7480,25 @@
     "attempts": "嘗試次數",
     "outputTokens": "已確認輸出權杖",
     "unknownUsage": "用量未知的嘗試",
-    "details": "結果詳情"
+    "details": "結果詳情",
+    "model": "Model",
+    "effort": "Effort",
+    "defaultEffort": "Provider default",
+    "unresolvedRecipients": "Recipients have not been resolved. Run preflight before confirming.",
+    "frozenSources": "Frozen source files",
+    "noSources": "Topic only. No workspace files will be sent.",
+    "captureOnCreate": "Creating the draft freezes only these selected files locally. Review their frozen contents and recipients again before starting.",
+    "snapshotHash": "Snapshot hash",
+    "bytes": "bytes",
+    "previewSource": "Preview frozen file",
+    "binarySource": "Binary file: unavailable to text tools.",
+    "selectedSourcePaths": "Selected source file paths",
+    "sourcePathsPlaceholder": "src/example.ts\nREADME.md",
+    "sourceSelectionHelp": "One workspace-relative file per line. Leave blank for topic-only discussion. Maximum 32 files, 1 MiB per file, 4 MiB total; metadata must fit the input budget. No folders or automatic project upload.",
+    "invalidSourceSelection": "Use up to 32 unique relative file paths, without parent traversal or absolute paths.",
+    "pendingPaidOperation": "The previous paid operation has an unknown outcome. Retry the original request to recover its acknowledgment before starting another operation.",
+    "retryPendingOperation": "Retry pending operation",
+    "sourceRetentionNotice": "Captured copies can remain on disk if the database commit fails. Automatic cleanup is not available.",
+    "pendingReloadBoundary": "Switching rooms keeps this retry information. Reloading the page or closing the tab clears it; recover the outcome first."
   }
 }

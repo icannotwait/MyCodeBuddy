@@ -35,7 +35,7 @@ fn check(name: &str) -> ProbeCheck {
         "model_credential_material_in_sandbox"
         | "model_credentials_visible_to_agent"
         | "native_read_boundary" => (None, Some(false)),
-        "actual_binary_match" | "ordered_turn_completion" => (None, Some(true)),
+        "actual_binary_match" | "ordered_turn_completion" | "submit_receipt_completion" => (None, Some(true)),
         _ => (None, None),
     };
     ProbeCheck {
@@ -73,6 +73,7 @@ fn passing(agent: &str, os_version: &str) -> ProbeFacts {
             "new_session",
             "roundtable_mcp",
             "ordered_turn_completion",
+            "submit_receipt_completion",
             "cancel_and_reap",
             "strict_isolation",
             "bounded_context_delivery",
@@ -290,7 +291,7 @@ fn live_container_spec_bind_mounts_the_slirp_resolver() {
     let script = fs::read_to_string(hook["path"].as_str().expect("hook path")).expect("script");
     assert_eq!(script, codeg_lib::roundtable::slirp_hook_script());
     assert!(script.contains("while kill -0"));
-    assert!(script.contains("!= \"1\""));
+    assert!(script.contains("ready_byte") && script.contains("\"1\""));
     let names = spec["linux"]["seccomp"]["syscalls"][0]["names"]
         .as_array()
         .expect("names");
@@ -359,9 +360,11 @@ fn slirp_hook_backgrounds_and_joins_the_user_namespace() {
     assert!(script.contains("--userns-path="));
     assert!(script.contains("--netns-type=path"));
     assert!(script.contains("--ready-fd"));
+    assert!(script.contains("--exit-fd=0"));
+    assert!(!script.contains("kill \"$slirp\""));
     assert!(!script.contains("exec \"$1\""));
     assert!(script.contains("ready_byte"));
-    assert!(script.contains("!= \"1\""));
+    assert!(script.contains("ready_byte") && script.contains("\"1\""));
     assert!(script.contains("while kill -0"));
     assert!(script.contains("sleep 0.2"));
     assert!(script.contains("exit 0"));
@@ -515,7 +518,7 @@ fn crun_version_on_the_key_ignores_the_state_directory_error() {
     assert_eq!(mixed.as_deref(), Some("crun version 1.21"));
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 #[test]
 fn acp_session_error_stops_slirp_and_deletes_the_container() {
     use std::os::unix::fs::PermissionsExt;
@@ -534,14 +537,13 @@ fn acp_session_error_stops_slirp_and_deletes_the_container() {
     let runtime_root = dir.join("runtime");
     fs::create_dir_all(runtime_root.join("slirp-pids")).expect("pids");
     let mut slirp = Command::new("sleep")
+        .env("CODEG_ROUNDTABLE_SLIRP_ROLE", "slirp")
+        .env("CODEG_ROUNDTABLE_SLIRP_OWNER", "cq-acp-9")
+        .env("CODEG_ROUNDTABLE_SLIRP_ROOT", &runtime_root)
         .arg("30")
         .spawn()
         .expect("stand-in slirp");
-    fs::write(
-        runtime_root.join("slirp-pids").join("cq-acp-9.pid"),
-        format!("{}\n", slirp.id()),
-    )
-    .expect("pidfile");
+    write_owned_helper_pin(&runtime_root, "cq-acp-9", slirp.id());
     let request = ProbeRequest {
         data_dir: dir.clone(),
         agent: "cursor".into(),
@@ -600,7 +602,8 @@ async fn live_rpc_allows_submit_rejects_terminal_and_keeps_float_frames() {
             {"optionId": "reject", "kind": "reject_once", "name": "Reject"}
         ]
     }));
-    assert_eq!(allow_always["result"]["outcome"]["optionId"], "always");
+    // Persistent permission scope is not qualified; reject rather than grant it.
+    assert_eq!(allow_always["result"]["outcome"]["optionId"], "reject");
     assert_eq!(allow_always["result"]["outcome"]["outcome"], "selected");
 
     let missing_reject = codeg_lib::roundtable::permission_reply_fixture(serde_json::json!({
@@ -709,7 +712,7 @@ async fn grok_use_tool_and_antigravity_submit_follow_the_schema() {
 
     let proposal =
         roundtable_protocol::submit_result_input_schema(roundtable_protocol::PhaseKind::Proposal);
-    let required = proposal["properties"]["result"]["oneOf"][0]["required"]
+    let required = proposal["properties"]["result"]["required"]
         .as_array()
         .expect("proposal required");
     assert!(required.iter().any(|field| field == "claims"));
@@ -766,7 +769,11 @@ fn reap_deletes_grok_auth_and_limits_old_run_directories() {
     symlink(&outside, runs.join("linked")).expect("symlink");
 
     let newest = format!("run-{:02}", keep + 1);
-    codeg_lib::roundtable::retire_attempt_files_fixture(&root, &newest).expect("retire");
+    // Only explicitly reaped attempts are retention candidates. Existing
+    // directories alone do not prove that another participant has stopped.
+    for index in 0..keep + 2 {
+        codeg_lib::roundtable::retire_attempt_files_fixture(&root, &format!("run-{index:02}")).expect("retire");
+    }
     let auth = runs.join(&newest).join("scratch/rt-home/.grok/auth.json");
     assert!(!auth.exists());
     assert!(!runs.join(&newest).join("scratch").exists());
@@ -831,4 +838,275 @@ fn cgroup_delegation_names_the_launcher_child_when_the_root_is_not_a_cgroup() {
         "{reason}"
     );
     let _ = fs::remove_dir_all(&dir);
+}
+
+
+#[cfg(unix)]
+#[test]
+fn retirement_pruning_preserves_other_unretired_attempts() {
+    use std::time::UNIX_EPOCH;
+    let root = scratch();
+    let runs = root.join("runs");
+    let active = runs.join("old-active/scratch/rt-home/.grok/auth.json");
+    fs::create_dir_all(active.parent().unwrap()).unwrap();
+    fs::write(&active, b"controlled-active-auth").unwrap();
+    fs::File::open(runs.join("old-active")).unwrap().set_modified(UNIX_EPOCH).unwrap();
+    // A different attempt may be preparing before its scratch is created.
+    fs::create_dir_all(runs.join("old-preparing")).unwrap();
+    fs::File::open(runs.join("old-preparing")).unwrap().set_modified(UNIX_EPOCH).unwrap();
+    // A stale retirement marker cannot authorize a newly live scratch tree.
+    fs::create_dir_all(runs.join("stale-marker/scratch")).unwrap();
+    codeg_lib::roundtable::retire_attempt_files_fixture(&root, "stale-marker").unwrap();
+    fs::create_dir_all(runs.join("stale-marker/scratch")).unwrap();
+    fs::write(runs.join("stale-marker/scratch/keep"), b"new active data").unwrap();
+    let keep = codeg_lib::roundtable::run_dir_retention_fixture();
+    for index in 0..keep + 3 {
+        let name = format!("retired-{index:02}");
+        fs::create_dir_all(runs.join(&name).join("scratch")).unwrap();
+        codeg_lib::roundtable::retire_attempt_files_fixture(&root, &name).unwrap();
+    }
+    assert_eq!(fs::read(&active).unwrap(), b"controlled-active-auth");
+    assert!(runs.join("old-preparing").is_dir());
+    assert_eq!(fs::read(runs.join("stale-marker/scratch/keep")).unwrap(), b"new active data");
+    let retired = fs::read_dir(&runs).unwrap().flatten().filter(|entry| entry.file_name().to_string_lossy().starts_with("retired-")).count();
+    assert_eq!(retired, keep, "retention bounds only proven retired attempts");
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn ordinary_acp_completion_without_a_submit_receipt_cannot_certify() {
+    let data = scratch();
+    let mut facts = passing("grok", "debian-13");
+    facts.checks.retain(|check| check.name != "submit_receipt_completion");
+    let outcome = assemble_probe_report_for_test(&data, facts);
+    assert!(!outcome.qualification_issued, "pong is not a submit receipt");
+    let report: serde_json::Value = serde_json::from_slice(&fs::read(outcome.report_path).unwrap()).unwrap();
+    assert_eq!(report["normal_completion_after_submit_receipt"], false);
+    let _ = fs::remove_dir_all(data);
+}
+
+#[test]
+fn a_later_failed_observation_dominates_an_earlier_pass() {
+    let data = scratch();
+    let mut facts = passing("grok", "debian-13");
+    let mut failure = check("model_credential_material_in_sandbox");
+    failure.status = "failed".into();
+    failure.flag = Some(true);
+    facts.checks.push(failure);
+    let outcome = assemble_probe_report_for_test(&data, facts);
+    assert!(!outcome.qualification_issued, "conflicting evidence cannot pass");
+    let report: serde_json::Value = serde_json::from_slice(&fs::read(outcome.report_path).unwrap()).unwrap();
+    assert_eq!(report["model_credential_material_in_sandbox"], true);
+    assert_eq!(report["credentials_unreachable"], "failed");
+    let _ = fs::remove_dir_all(data);
+}
+
+#[test]
+fn mounted_auth_material_cannot_be_reported_as_absent() {
+    let data = scratch();
+    let mut facts = passing("grok", "debian-13");
+    facts.oci.as_mut().unwrap().auth_mounts.push(serde_json::from_value(serde_json::json!({
+        "source": data.join("fake-auth.json"),
+        "destination": "/rt-home/.grok/auth.json",
+    })).unwrap());
+    let outcome = assemble_probe_report_for_test(&data, facts);
+    assert!(!outcome.qualification_issued, "read-only binds and writable copies both expose bytes");
+    let report: serde_json::Value = serde_json::from_slice(&fs::read(outcome.report_path).unwrap()).unwrap();
+    assert_eq!(report["model_credential_material_in_sandbox"], true);
+    assert_eq!(report["credentials_unreachable"], "failed");
+    let _ = fs::remove_dir_all(data);
+}
+
+#[test]
+fn qualification_source_semantics_are_bound_into_certificates() {
+    let data = scratch();
+    let outcome = assemble_probe_report_for_test(&data, passing("grok", "debian-13"));
+    let report: serde_json::Value = serde_json::from_slice(&fs::read(outcome.report_path).unwrap()).unwrap();
+    for name in ["qualification_linux", "qualification_probe", "qualification_profiles", "service_failure_classifier"] {
+        assert!(!report["shared_core_hashes"][name].is_null(), "{name}");
+    }
+    let _ = fs::remove_dir_all(data);
+}
+
+
+#[test]
+fn qualification_core_key_set_covers_admission_completion_cleanup_and_privacy() {
+    let data = scratch();
+    let outcome = assemble_probe_report_for_test(&data, passing("grok", "debian-13"));
+    let report: serde_json::Value = serde_json::from_slice(&fs::read(outcome.report_path).unwrap()).unwrap();
+    let hashes = report["shared_core_hashes"].as_object().unwrap();
+    let actual: std::collections::BTreeSet<_> = hashes.keys().map(String::as_str).collect();
+    let expected: std::collections::BTreeSet<_> = [
+        "acceptance",
+        "acp_connection",
+        "acp_host_tools_policy",
+        "acp_launch",
+        "acp_manager",
+        "actor",
+        "api",
+        "authorization",
+        "budget_ledger",
+        "canonical",
+        "capabilities",
+        "clock",
+        "companion",
+        "companion_entry",
+        "companion_transport",
+        "connection_purpose",
+        "control",
+        "conversation_discovery",
+        "delivery_encoder",
+        "diagnostics",
+        "events",
+        "feature_gate",
+        "gateway",
+        "ingress",
+        "installed_runtime",
+        "internal_sessions",
+        "linux_oci",
+        "live_gateway",
+        "live_runtime",
+        "maintenance",
+        "mcp",
+        "objects",
+        "owned_runtime",
+        "ownership",
+        "paging",
+        "product",
+        "protocol_admission",
+        "protocol_budget",
+        "protocol_completion",
+        "protocol_dto",
+        "protocol_lib",
+        "protocol_model",
+        "protocol_projection",
+        "protocol_strategy",
+        "protocol_usage",
+        "qualification",
+        "qualification_linux",
+        "qualification_probe",
+        "qualification_profiles",
+        "recovery",
+        "registry",
+        "relay",
+        "request_accounting",
+        "resources",
+        "rollout",
+        "roundtable_commands",
+        "roundtable_http",
+        "runtime",
+        "sandbox",
+        "schema",
+        "service",
+        "service_failure_classifier",
+        "snapshot",
+        "store",
+        "tool_core",
+        "usage",
+        "validator",
+        "web_event_bridge",
+    ].into_iter().collect();
+    assert_eq!(actual, expected, "security-relevant implementation sources must remain certificate-bound");
+    for (key, bytes) in [
+        ("mcp", include_bytes!("../../src/roundtable/mcp.rs").as_slice()),
+        ("resources", include_bytes!("../../src/roundtable/resources.rs").as_slice()),
+        ("acp_connection", include_bytes!("../../src/acp/connection.rs").as_slice()),
+        ("internal_sessions", include_bytes!("../../src/auto_title/internal_sessions.rs").as_slice()),
+        ("protocol_completion", include_bytes!("../../roundtable-protocol/src/completion.rs").as_slice()),
+    ] {
+        assert_eq!(hashes[key], serde_json::json!(Hash256::sha256(bytes)), "{key}");
+    }
+    let _ = fs::remove_dir_all(data);
+}
+
+#[test]
+fn successful_delete_with_leftover_state_is_not_cleanup_proof() {
+    assert!(codeg_lib::roundtable::probe_reap_classification(true, "", true, false).is_err());
+}
+
+#[test]
+fn unmeasured_credential_visibility_is_unknown_rather_than_a_synthetic_fact() {
+    let data = scratch();
+    let mut facts = passing("grok", "debian-13");
+    facts.checks.retain(|check| check.name != "model_credentials_visible_to_agent");
+    let outcome = assemble_probe_report_for_test(&data, facts);
+    assert!(!outcome.qualification_issued);
+    let report: serde_json::Value = serde_json::from_slice(&fs::read(outcome.report_path).unwrap()).unwrap();
+    assert!(report["model_credentials_visible_to_agent"].is_null());
+    assert_eq!(report["credentials_unreachable"], "not_tested");
+    let _ = fs::remove_dir_all(data);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn probe_cleanup_cannot_leave_a_slirp_helper_that_ignores_term() {
+    use std::os::unix::fs::PermissionsExt;
+    let root = tempfile::tempdir().unwrap();
+    let runtime_root = root.path().join("runtime");
+    fs::create_dir_all(runtime_root.join("slirp-pids")).unwrap();
+    let ready = root.path().join("helper-ready");
+    let mut helper = std::process::Command::new("sh")
+        .env("CODEG_ROUNDTABLE_SLIRP_ROLE", "slirp")
+        .env("CODEG_ROUNDTABLE_SLIRP_OWNER", "cq-acp-review")
+        .env("CODEG_ROUNDTABLE_SLIRP_ROOT", &runtime_root).arg("-c")
+        .arg(format!("trap '' TERM; touch '{}'; exec sleep 30", ready.display()))
+        .spawn().unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while !ready.exists() && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    write_owned_helper_pin(&runtime_root, "cq-acp-review", helper.id());
+    let crun = root.path().join("fake-crun");
+    fs::write(&crun, "#!/bin/sh\nexit 0\n").unwrap();
+    fs::set_permissions(&crun, fs::Permissions::from_mode(0o700)).unwrap();
+    let request = ProbeRequest {
+        data_dir: root.path().to_path_buf(), agent: "grok".into(), rootfs: root.path().join("rootfs"),
+        crun, cgroup_root: root.path().join("fake-cgroup"), runtime_root,
+        provider_bindings: root.path().join("bindings.json"), home: root.path().join("home"), profile_id: None,
+    };
+    assert!(codeg_lib::roundtable::probe_acp_exit_cleans_container(&request, "cq-acp-review").is_err());
+    let ended = helper.try_wait().unwrap().is_some();
+    let _ = helper.kill();
+    let _ = helper.wait();
+    assert!(ended, "cleanup reported completion while the network helper survived");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn stale_slirp_pidfile_cannot_signal_an_unrelated_process() {
+    use std::os::unix::fs::PermissionsExt;
+    let root = tempfile::tempdir().unwrap();
+    let runtime_root = root.path().join("runtime");
+    fs::create_dir_all(runtime_root.join("slirp-pids")).unwrap();
+    let mut unrelated = std::process::Command::new("sleep").arg("30").spawn().unwrap();
+    write_owned_helper_pin(&runtime_root, "cq-acp-stale", unrelated.id());
+    let crun = root.path().join("fake-crun");
+    fs::write(&crun, "#!/bin/sh\nexit 0\n").unwrap();
+    fs::set_permissions(&crun, fs::Permissions::from_mode(0o700)).unwrap();
+    let request = ProbeRequest {
+        data_dir: root.path().to_path_buf(), agent: "grok".into(), rootfs: root.path().join("rootfs"),
+        crun, cgroup_root: root.path().join("fake-cgroup"), runtime_root,
+        provider_bindings: root.path().join("bindings.json"), home: root.path().join("home"), profile_id: None,
+    };
+    assert!(codeg_lib::roundtable::probe_acp_exit_cleans_container(&request, "cq-acp-stale").is_err());
+    std::thread::sleep(std::time::Duration::from_millis(30));
+    let survived = unrelated.try_wait().unwrap().is_none();
+    let _ = unrelated.kill();
+    let _ = unrelated.wait();
+    assert!(survived, "an unowned stale PID was signaled");
+}
+
+#[cfg(target_os = "linux")]
+fn write_owned_helper_pin(runtime_root: &Path, id: &str, pid: u32) {
+    use std::os::unix::fs::PermissionsExt;
+    let stat = fs::read_to_string(format!("/proc/{pid}/stat")).unwrap();
+    let start = stat.rsplit_once(") ").unwrap().1.split_whitespace().nth(19).unwrap();
+    let path = runtime_root.join("slirp-pids").join(format!("{id}.pid"));
+    fs::write(&path, format!("slirp {pid} {start}\n")).unwrap();
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+    for (suffix, body) in [("pid.lock", ""), ("pid.state", "running\n")] {
+        let state = path.with_extension(suffix);
+        fs::write(&state, body).unwrap();
+        fs::set_permissions(state, fs::Permissions::from_mode(0o600)).unwrap();
+    }
 }

@@ -311,7 +311,90 @@ impl InstalledRuntime {
 }
 
 pub(crate) fn shared_core_hashes() -> Value {
-    json!({"canonical":Hash256::sha256(include_bytes!("../../roundtable-protocol/src/canonical.rs")),"delivery_encoder":Hash256::sha256(include_bytes!("../../roundtable-protocol/src/context.rs")),"validator":Hash256::sha256(include_bytes!("../../roundtable-protocol/src/validation.rs")),"tool_core":Hash256::sha256(include_bytes!("tool_core.rs")),"request_accounting":Hash256::sha256(include_bytes!("request_accounting.rs")),"ingress":Hash256::sha256(include_bytes!("ingress.rs")),"live_runtime":Hash256::sha256(include_bytes!("live_runtime.rs")),"live_gateway":Hash256::sha256(include_bytes!("live_gateway.rs")),"installed_runtime":Hash256::sha256(include_bytes!("installed_runtime.rs")),"owned_runtime":Hash256::sha256(include_bytes!("owned_runtime.rs")),"sandbox":Hash256::sha256(include_bytes!("sandbox.rs")),"linux_oci":Hash256::sha256(include_bytes!("sandbox/linux_oci.rs")),"companion":Hash256::sha256(include_bytes!("companion.rs")),"companion_transport":Hash256::sha256(include_bytes!("companion/transport.rs")),"companion_entry":Hash256::sha256(include_bytes!("../bin/codeg_mcp.rs")),"relay":Hash256::sha256(include_bytes!("relay.rs")),"capabilities":Hash256::sha256(include_bytes!("capabilities.rs")),"acp_launch":Hash256::sha256(include_bytes!("../acp/agent_process.rs"))})
+    let source = include_str!("../acp/connection.rs");
+    let classifier = source.find("\nfn air_session_failure(")
+        .and_then(|start| source[start..].find("\n/// Strict SemVer floor check:").map(|end| &source[start..start + end]))
+        // Moving or renaming a marker must broaden the binding, never omit it.
+        .unwrap_or(source);
+    // Bind the actual admission, durable completion/cleanup and privacy
+    // implementations, not only the profile and ACP transport adapters.
+    // Full external modules intentionally invalidate certificates on any
+    // source change: an unrelated edit is safer than an omitted privacy path.
+    let sources: &[(&str, &[u8])] = &[
+        ("acceptance", include_bytes!("acceptance.rs")),
+        ("acp_connection", include_bytes!("../acp/connection.rs")),
+        ("acp_host_tools_policy", include_bytes!("../acp/host_tools_policy.rs")),
+        ("acp_launch", include_bytes!("../acp/agent_process.rs")),
+        ("acp_manager", include_bytes!("../acp/manager.rs")),
+        ("actor", include_bytes!("actor.rs")),
+        ("api", include_bytes!("api.rs")),
+        ("authorization", include_bytes!("authorization.rs")),
+        ("budget_ledger", include_bytes!("budget_ledger.rs")),
+        ("canonical", include_bytes!("../../roundtable-protocol/src/canonical.rs")),
+        ("capabilities", include_bytes!("capabilities.rs")),
+        ("clock", include_bytes!("clock.rs")),
+        ("companion", include_bytes!("companion.rs")),
+        ("companion_entry", include_bytes!("../bin/codeg_mcp.rs")),
+        ("companion_transport", include_bytes!("companion/transport.rs")),
+        ("connection_purpose", include_bytes!("../auto_title/mod.rs")),
+        ("control", include_bytes!("control.rs")),
+        ("conversation_discovery", include_bytes!("../commands/conversations.rs")),
+        ("delivery_encoder", include_bytes!("../../roundtable-protocol/src/context.rs")),
+        ("diagnostics", include_bytes!("diagnostics.rs")),
+        ("events", include_bytes!("events.rs")),
+        ("feature_gate", include_bytes!("feature_gate.rs")),
+        ("gateway", include_bytes!("gateway.rs")),
+        ("ingress", include_bytes!("ingress.rs")),
+        ("installed_runtime", include_bytes!("installed_runtime.rs")),
+        ("internal_sessions", include_bytes!("../auto_title/internal_sessions.rs")),
+        ("linux_oci", include_bytes!("sandbox/linux_oci.rs")),
+        ("live_gateway", include_bytes!("live_gateway.rs")),
+        ("live_runtime", include_bytes!("live_runtime.rs")),
+        ("maintenance", include_bytes!("maintenance.rs")),
+        ("mcp", include_bytes!("mcp.rs")),
+        ("objects", include_bytes!("objects.rs")),
+        ("owned_runtime", include_bytes!("owned_runtime.rs")),
+        ("ownership", include_bytes!("ownership.rs")),
+        ("paging", include_bytes!("paging.rs")),
+        ("product", include_bytes!("product.rs")),
+        ("protocol_admission", include_bytes!("../../roundtable-protocol/src/admission.rs")),
+        ("protocol_budget", include_bytes!("../../roundtable-protocol/src/budget.rs")),
+        ("protocol_completion", include_bytes!("../../roundtable-protocol/src/completion.rs")),
+        ("protocol_dto", include_bytes!("../../roundtable-protocol/src/dto.rs")),
+        ("protocol_lib", include_bytes!("../../roundtable-protocol/src/lib.rs")),
+        ("protocol_model", include_bytes!("../../roundtable-protocol/src/model.rs")),
+        ("protocol_projection", include_bytes!("../../roundtable-protocol/src/projection.rs")),
+        ("protocol_strategy", include_bytes!("../../roundtable-protocol/src/strategy.rs")),
+        ("protocol_usage", include_bytes!("../../roundtable-protocol/src/usage.rs")),
+        ("qualification", include_bytes!("qualification.rs")),
+        ("qualification_linux", include_bytes!("qualification_linux.rs")),
+        ("qualification_probe", include_bytes!("qualification_probe.rs")),
+        ("qualification_profiles", include_bytes!("qualification_profiles.rs")),
+        ("recovery", include_bytes!("recovery.rs")),
+        ("registry", include_bytes!("registry.rs")),
+        ("relay", include_bytes!("relay.rs")),
+        ("request_accounting", include_bytes!("request_accounting.rs")),
+        ("resources", include_bytes!("resources.rs")),
+        ("rollout", include_bytes!("rollout.rs")),
+        ("roundtable_commands", include_bytes!("../commands/roundtable.rs")),
+        ("roundtable_http", include_bytes!("../web/handlers/roundtable.rs")),
+        ("runtime", include_bytes!("runtime.rs")),
+        ("sandbox", include_bytes!("sandbox.rs")),
+        ("schema", include_bytes!("schema.rs")),
+        ("service", include_bytes!("service.rs")),
+        ("snapshot", include_bytes!("snapshot.rs")),
+        ("store", include_bytes!("store.rs")),
+        ("tool_core", include_bytes!("tool_core.rs")),
+        ("usage", include_bytes!("usage.rs")),
+        ("validator", include_bytes!("../../roundtable-protocol/src/validation.rs")),
+        ("web_event_bridge", include_bytes!("../web/event_bridge.rs")),
+    ];
+    let mut hashes = serde_json::Map::new();
+    hashes.insert("service_failure_classifier".into(), json!(Hash256::sha256(classifier.as_bytes())));
+    for (name, bytes) in sources {
+        hashes.insert((*name).into(), json!(Hash256::sha256(bytes)));
+    }
+    Value::Object(hashes)
 }
 fn bounded_read(path: &Path, limit: u64) -> RtResult<Vec<u8>> {
     use std::io::Read;

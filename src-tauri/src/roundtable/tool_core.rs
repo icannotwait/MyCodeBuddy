@@ -24,7 +24,7 @@ pub const SERVICE_TOOL_NAMES: [&str; 3] = ["read_evidence", "search_evidence", "
 pub const SERVICE_TOOL_VERSION: &str = "roundtable_tools_v1";
 pub const SERVICE_RESULT_SCHEMA_ID: &str = "roundtable_result_v1";
 pub const SERVICE_TOOL_SCHEMA: &str = "read_evidence{file_alias,start_line,end_line};search_evidence{file_alias,query,limit};submit_result{submission_id,result}";
-pub const SERVICE_RESULT_SCHEMA: &str = "MemberResultV1|ModeratorResultV1";
+static SERVICE_RESULT_SCHEMA: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 
 const IDENTITY_KEYS: &[&str] = &[
     "speaker_id",
@@ -52,7 +52,7 @@ pub fn service_tool_schema() -> &'static str {
 }
 
 pub fn service_result_schema() -> &'static str {
-    SERVICE_RESULT_SCHEMA
+    SERVICE_RESULT_SCHEMA.get_or_init(|| roundtable_protocol::result_schema(None).to_string())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -66,7 +66,7 @@ pub const TABLES: &[&str] = &[
 
 const STATEMENTS: &[&str] = &[
     "CREATE TABLE IF NOT EXISTS rt_metric_counters(room_id TEXT NOT NULL,key TEXT NOT NULL,value INTEGER NOT NULL,PRIMARY KEY(room_id,key),FOREIGN KEY(room_id) REFERENCES rt_rooms(room_id))",
-    "CREATE TABLE IF NOT EXISTS rt_active_time_leases(room_id TEXT NOT NULL PRIMARY KEY, lease_id TEXT NOT NULL, boot_epoch INTEGER NOT NULL, run_epoch INTEGER NOT NULL, phase_id TEXT, prepaid_ms INTEGER NOT NULL CHECK(prepaid_ms>=0 AND prepaid_ms<=1000), last_sample_mono INTEGER NOT NULL, FOREIGN KEY(room_id) REFERENCES rt_rooms(room_id), FOREIGN KEY(room_id,phase_id) REFERENCES rt_phases(room_id,phase_id))",
+    "CREATE TABLE IF NOT EXISTS rt_active_time_leases(room_id TEXT NOT NULL PRIMARY KEY, lease_id TEXT NOT NULL, boot_epoch INTEGER NOT NULL, run_epoch INTEGER NOT NULL, phase_id TEXT, prepaid_ms INTEGER NOT NULL CHECK(prepaid_ms>=0 AND prepaid_ms<=1000), phase_prepaid_ms INTEGER NOT NULL DEFAULT 0 CHECK(phase_prepaid_ms>=0 AND phase_prepaid_ms<=1000), last_sample_mono INTEGER NOT NULL, FOREIGN KEY(room_id) REFERENCES rt_rooms(room_id), FOREIGN KEY(room_id,phase_id) REFERENCES rt_phases(room_id,phase_id))",
     "CREATE TABLE IF NOT EXISTS rt_closing_sets (room_id TEXT NOT NULL, phase_id TEXT NOT NULL, body_json TEXT NOT NULL, recovery_boot_epoch INTEGER, recovery_operation_id TEXT, PRIMARY KEY(room_id,phase_id), FOREIGN KEY(room_id,phase_id) REFERENCES rt_phases(room_id,phase_id), FOREIGN KEY(room_id,recovery_operation_id) REFERENCES rt_control_operations(room_id,operation_id))",
     "CREATE TABLE IF NOT EXISTS rt_phase_contexts (room_id TEXT NOT NULL, phase_id TEXT NOT NULL, snapshot_json TEXT NOT NULL, context_json TEXT NOT NULL, PRIMARY KEY(room_id,phase_id), FOREIGN KEY(room_id,phase_id) REFERENCES rt_phases(room_id,phase_id))",
     "CREATE TABLE IF NOT EXISTS rt_deliveries (room_id TEXT NOT NULL, attempt_id TEXT NOT NULL, body_json TEXT NOT NULL, prompt_utf8 TEXT NOT NULL, PRIMARY KEY(room_id,attempt_id), FOREIGN KEY(room_id,attempt_id) REFERENCES rt_attempts(room_id,attempt_id))",
@@ -540,6 +540,15 @@ pub fn roundtable_table_names() -> &'static [&'static str] {
 pub async fn apply_roundtable_schema(conn: &impl ConnectionTrait) -> Result<(), DbErr> {
     for statement in STATEMENTS {
         conn.execute_unprepared(statement).await?;
+    }
+    // Existing installations used one reservation for both clocks. Preserve
+    // that reservation exactly while separating room cleanup time from phase
+    // execution time. This helper also runs at normal database startup.
+    let columns = conn.query_all(sea_orm::Statement::from_string(
+        sea_orm::DatabaseBackend::Sqlite, "PRAGMA table_info(rt_active_time_leases)".to_owned())).await?;
+    if !columns.iter().any(|column| column.try_get_by_index::<String>(1).ok().as_deref() == Some("phase_prepaid_ms")) {
+        conn.execute_unprepared("ALTER TABLE rt_active_time_leases ADD COLUMN phase_prepaid_ms INTEGER NOT NULL DEFAULT 0 CHECK(phase_prepaid_ms>=0 AND phase_prepaid_ms<=1000)").await?;
+        conn.execute_unprepared("UPDATE rt_active_time_leases SET phase_prepaid_ms=CASE WHEN phase_id IS NULL THEN 0 ELSE prepaid_ms END").await?;
     }
     Ok(())
 }

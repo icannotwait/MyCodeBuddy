@@ -16,13 +16,13 @@ use codeg_lib::roundtable::{
     ExecutionGate, ExecutionScope, GateToolAuthority, InputEvidence, NewAttempt, NewBinding,
     NewManifest, NewPhase, NewRoom, NewSpeaker, NewTurn, ObjectStore, OsIdentity, QualificationKey,
     ReadEvidenceArgs, ReservationLedger, RoundtableToolCall, SearchEvidenceArgs, TokenBinding,
-    ToolAuthority, ToolSession, SERVICE_TOOL_VERSION,
+    ToolAuthority, ToolSession, ToolStore, SERVICE_TOOL_VERSION,
 };
 use roundtable_protocol::{
     canonical_bytes, AliasVisibility, AttemptId, BindingId, CandidateReceipt, CandidateState,
     DecisionKind, Epoch, ErrorCode, EvidenceId, EvidenceRef, Fence, FinishKind, Hash256, MonoMs,
     ObjectKind, ObjectRefV1, PhaseId, PhaseKind, PrincipalId, QualificationStatus,
-    QualifiedContextProfile, ResultScope, Revision, RoomId, SafeInt, ServiceOwner, SpeakerId,
+    QualifiedContextProfile, ResultScope, Revision, RoomId, RtResult, SafeInt, ServiceOwner, SpeakerId,
     SubmissionId, VisibleAliases,
 };
 use serde_json::{json, Value};
@@ -577,6 +577,361 @@ async fn runtime_fix_real_companion_round_trip_and_eof() {
         .request(json!({"jsonrpc":"2.0","id":4,"method":"ping"}))
         .await
         .is_err());
+}
+
+// These fixtures exercise the production socket/SQLite path, but never a
+// provider or qualification permit. A local transport test is not a certificate.
+fn socket_authority(harness: &Harness) -> Arc<GateToolAuthority> {
+    let admission = facts();
+    assert_eq!(admission.certificate, QualificationStatus::NotTested);
+    assert!(!ExecutionGate::open(harness._dir.path()).enabled());
+    Arc::new(GateToolAuthority::open(
+        harness._dir.path(),
+        ExecutionScope::Fake,
+        admission,
+        MonoMs(0),
+        MonoMs(1_000_000),
+        harness.authority.binding_of(&harness.token).unwrap(),
+    ))
+}
+
+async fn socket_broker(
+    root: &std::path::Path,
+    authority: Arc<GateToolAuthority>,
+    store: Arc<dyn ToolStore>,
+) -> (
+    codeg_lib::roundtable::ServiceBroker,
+    codeg_lib::roundtable::ServiceProcess,
+) {
+    use codeg_lib::roundtable::{bind_service_process, ServiceBroker, ATTEMPT_TOKEN_ENV};
+    let token = Arc::new(authority.issue());
+    let incarnation = authority
+        .binding_of(&token)
+        .unwrap()
+        .fence
+        .incarnation
+        .to_string();
+    #[cfg(windows)]
+    let path = {
+        let _ = root;
+        format!(r"\\.\pipe\codeg-rt-test-{}", uuid::Uuid::new_v4())
+    };
+    #[cfg(unix)]
+    let path = root.join("broker.sock").to_string_lossy().to_string();
+    let broker = ServiceBroker::bind(&path, &incarnation, token.clone(), authority, store)
+        .await
+        .unwrap();
+    let env = [(
+        ATTEMPT_TOKEN_ENV.to_string(),
+        token.reveal_for_same_sandbox().to_string(),
+    )]
+    .into_iter()
+    .collect();
+    let process = bind_service_process(&path, &incarnation, &env).unwrap();
+    (broker, process)
+}
+
+async fn socket_call(
+    connection: &mut codeg_lib::roundtable::ServiceConnection,
+    id: u64,
+    name: &str,
+    arguments: Value,
+) -> Value {
+    let reply = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        connection.request(json!({
+            "jsonrpc": "2.0", "id": id, "method": "tools/call",
+            "params": {"name": name, "arguments": arguments}
+        })),
+    )
+    .await
+    .expect("broker reply timeout")
+    .expect("broker reply transport");
+    assert_eq!(reply["id"], id);
+    reply["result"].clone()
+}
+
+fn socket_body(reply: &Value) -> Value {
+    serde_json::from_str(reply["content"][0]["text"].as_str().expect("tool body"))
+        .expect("tool body JSON")
+}
+
+enum PauseAt {
+    EvidenceRead,
+    CommittedSubmission,
+}
+
+// Scheduling-only fault injection: every storage operation still goes through
+// DurableToolStore. Notifications make the contested boundary deterministic.
+struct PausedDurableStore {
+    inner: Arc<DurableToolStore>,
+    pause_at: PauseAt,
+    entered: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+}
+
+impl PausedDurableStore {
+    fn new(inner: Arc<DurableToolStore>, pause_at: PauseAt) -> Self {
+        Self {
+            inner,
+            pause_at,
+            entered: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+        }
+    }
+
+    async fn wait_until_entered(&self) {
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            self.entered.notified(),
+        )
+        .await
+        .expect("admitted storage operation did not reach the pause");
+    }
+}
+
+#[async_trait::async_trait]
+impl ToolStore for PausedDurableStore {
+    async fn get_evidence(&self, object: &ObjectRefV1) -> RtResult<Vec<u8>> {
+        if matches!(self.pause_at, PauseAt::EvidenceRead) {
+            self.entered.notify_one();
+            self.release.notified().await;
+        }
+        self.inner.get_evidence(object).await
+    }
+
+    async fn submit(
+        &self,
+        submission_id: &SubmissionId,
+        validated: &roundtable_protocol::ValidatedResult,
+    ) -> RtResult<CandidateReceipt> {
+        self.inner.submit(submission_id, validated).await
+    }
+
+    async fn submit_canonical(
+        &self,
+        submission_id: &SubmissionId,
+        validated: &roundtable_protocol::ValidatedResult,
+        raw: &[u8],
+    ) -> RtResult<CandidateReceipt> {
+        let receipt = self
+            .inner
+            .submit_canonical(submission_id, validated, raw)
+            .await?;
+        if matches!(self.pause_at, PauseAt::CommittedSubmission) {
+            self.entered.notify_one();
+            self.release.notified().await;
+        }
+        Ok(receipt)
+    }
+
+    async fn note_field_errors(
+        &self,
+        submission_id: &SubmissionId,
+        raw: &[u8],
+        scope: &ResultScope,
+    ) -> RtResult<()> {
+        self.inner.note_field_errors(submission_id, raw, scope).await
+    }
+}
+
+#[tokio::test]
+async fn socket_receipt_survives_disconnect_after_durable_commit() {
+    use sea_orm::{ConnectionTrait, DatabaseBackend, Statement};
+    let harness = open_harness(21).await;
+    let authority = socket_authority(&harness);
+    let restarted_authority = socket_authority(&harness);
+    let store = Arc::new(harness.store);
+    let paused = Arc::new(PausedDurableStore::new(
+        store.clone(),
+        PauseAt::CommittedSubmission,
+    ));
+    let (broker, process) =
+        socket_broker(harness._dir.path(), authority.clone(), paused.clone()).await;
+    let mut connection = process.connect().await.unwrap();
+    let mut invalid_result = serde_json::from_slice::<Value>(&valid_raw("invalid")).unwrap();
+    invalid_result["claims"][0]["evidence_aliases"] = json!(["missing-alias"]);
+    let invalid = socket_call(
+        &mut connection,
+        1,
+        "submit_result",
+        json!({
+            "submission_id": "socket-invalid",
+            "result": invalid_result
+        }),
+    )
+    .await;
+    assert_eq!(invalid["isError"], false);
+    let invalid = socket_body(&invalid);
+    assert_eq!(invalid["kind"], "field_errors");
+    assert!(invalid["candidate_id"].is_null());
+    let audit = store.audit().await.unwrap();
+    assert_eq!(audit.invalid_count, 1);
+    assert_eq!(audit.sealed_count, 0);
+    assert_eq!(audit.accepted_count, 0);
+
+    let raw = valid_raw("socket result");
+    let arguments = json!({
+        "submission_id": "socket-seal",
+        "result": serde_json::from_slice::<Value>(&raw).unwrap()
+    });
+    let request_arguments = arguments.clone();
+    let request = tokio::spawn(async move {
+        socket_call(&mut connection, 2, "submit_result", request_arguments).await
+    });
+    paused.wait_until_entered().await;
+    assert_eq!(authority.pending_handlers(), 1);
+    let row = harness.conn.query_one(Statement::from_sql_and_values(
+        DatabaseBackend::Sqlite,
+        "SELECT receipt_json,candidate_ref FROM rt_submissions WHERE room_id=? AND attempt_id=? AND submission_id=? AND sealed=1",
+        vec![harness.room_id.to_string().into(), harness.attempt_id.to_string().into(), "socket-seal".into()],
+    )).await.unwrap().expect("database query observes the committed submission");
+    let receipt: CandidateReceipt =
+        serde_json::from_str(&row.try_get::<String>("", "receipt_json").unwrap()).unwrap();
+    assert_eq!(receipt.submission_id, sid("socket-seal"));
+    assert_eq!(receipt.state, CandidateState::Staged);
+    assert_eq!(receipt.payload_hash, Hash256::sha256(&raw));
+    assert_eq!(
+        row.try_get::<String>("", "candidate_ref").unwrap().as_bytes(),
+        raw.as_slice()
+    );
+
+    // Drop the client before the broker can return its committed receipt.
+    request.abort();
+    assert!(request.await.unwrap_err().is_cancelled());
+    // Cancel before the old token ledger records the seal, then start a new
+    // broker/authority. Replay must consult SQLite, not the old in-memory seal.
+    tokio::time::timeout(std::time::Duration::from_secs(10), broker.shutdown())
+        .await
+        .expect("broker shutdown hung after a committed submission");
+    assert_eq!(authority.pending_handlers(), 0);
+    let authority = restarted_authority;
+    let (broker, process) =
+        socket_broker(harness._dir.path(), authority.clone(), store.clone()).await;
+    let mut retry = process.connect().await.unwrap();
+    let repeated = socket_call(&mut retry, 3, "submit_result", arguments).await;
+    assert_eq!(repeated["isError"], false);
+    let repeated = socket_body(&repeated);
+    assert_eq!(repeated["kind"], "staged");
+    assert_eq!(repeated["candidate_id"], receipt.candidate_id);
+    assert_eq!(repeated["submission_id"], receipt.submission_id.to_string());
+    let conflict = socket_call(
+        &mut retry,
+        4,
+        "submit_result",
+        json!({
+            "submission_id": "socket-seal",
+            "result": serde_json::from_slice::<Value>(&valid_raw("changed payload")).unwrap()
+        }),
+    )
+    .await;
+    assert_eq!(conflict["isError"], false);
+    assert_eq!(socket_body(&conflict)["kind"], "result_already_sealed");
+    assert!(socket_body(&conflict)["candidate_id"].is_null());
+    let audit = store.audit().await.unwrap();
+    assert_eq!(audit.sealed_count, 1);
+    assert_eq!(audit.accepted_count, 0);
+    assert_ne!(audit.attempt_state, "accepted");
+    assert_eq!(authority.pending_handlers(), 0);
+    assert!(!authority.gate_enabled());
+    tokio::time::timeout(std::time::Duration::from_secs(10), broker.shutdown())
+        .await
+        .expect("broker shutdown hung after replay");
+}
+
+#[tokio::test]
+async fn socket_stop_waits_for_the_actual_admitted_handler() {
+    let harness = open_harness(22).await;
+    let authority = socket_authority(&harness);
+    let store = Arc::new(harness.store);
+    let paused = Arc::new(PausedDurableStore::new(
+        store.clone(),
+        PauseAt::EvidenceRead,
+    ));
+    let (broker, process) =
+        socket_broker(harness._dir.path(), authority.clone(), paused.clone()).await;
+    let mut connection = process.connect().await.unwrap();
+    let read = tokio::spawn(async move {
+        socket_call(
+            &mut connection,
+            1,
+            "read_evidence",
+            json!({"file_alias": "e0", "start_line": 1, "end_line": 1}),
+        )
+        .await
+    });
+    paused.wait_until_entered().await;
+    let barrier = authority.stop();
+    assert_eq!(barrier.pending_tools.len(), 1);
+    assert_eq!(authority.pending_handlers(), 1);
+    assert!(!authority.gate_held());
+    paused.release.notify_one();
+    let reply = read.await.unwrap();
+    assert_eq!(reply["isError"], false);
+    assert_eq!(socket_body(&reply)["excerpt"], "alpha");
+    assert_eq!(authority.pending_handlers(), 0);
+    let mut late = process.connect().await.unwrap();
+    let denied = socket_call(
+        &mut late,
+        2,
+        "submit_result",
+        json!({
+            "submission_id": "after-stop",
+            "result": serde_json::from_slice::<Value>(&valid_raw("late")).unwrap()
+        }),
+    )
+    .await;
+    assert_eq!(denied["isError"], true);
+    let error: roundtable_protocol::RtError = serde_json::from_value(socket_body(&denied)).unwrap();
+    assert_eq!(reason(&error), "attempt_closed");
+    assert_eq!(authority.pending_handlers(), 0);
+    assert_eq!(store.audit().await.unwrap().sealed_count, 0);
+    assert!(!authority.gate_enabled());
+    tokio::time::timeout(std::time::Duration::from_secs(10), broker.shutdown())
+        .await
+        .expect("broker shutdown hung after stop");
+    let eof = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        late.request(json!({"jsonrpc": "2.0", "id": 3, "method": "ping"})),
+    )
+    .await;
+    assert!(eof.expect("shutdown must close the existing socket").is_err());
+}
+
+#[tokio::test]
+async fn socket_shutdown_cancels_and_drains_a_blocked_handler() {
+    let harness = open_harness(23).await;
+    let authority = socket_authority(&harness);
+    let store = Arc::new(harness.store);
+    let paused = Arc::new(PausedDurableStore::new(
+        store.clone(),
+        PauseAt::EvidenceRead,
+    ));
+    let (broker, process) =
+        socket_broker(harness._dir.path(), authority.clone(), paused.clone()).await;
+    let mut connection = process.connect().await.unwrap();
+    let read = tokio::spawn(async move {
+        connection.request(json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{
+            "name":"read_evidence","arguments":{"file_alias":"e0","start_line":1,"end_line":1}
+        }})).await
+    });
+    paused.wait_until_entered().await;
+    assert_eq!(authority.stop().pending_tools.len(), 1);
+    // Never release the paused storage call. Broker shutdown must cancel it,
+    // join its task and let the production AdmittedHandler guard finish it.
+    tokio::time::timeout(std::time::Duration::from_secs(10), broker.shutdown())
+        .await
+        .expect("broker shutdown hung on an admitted call");
+    assert_eq!(authority.pending_handlers(), 0);
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_secs(10), read)
+            .await
+            .expect("client must observe EOF")
+            .unwrap()
+            .is_err()
+    );
+    assert_eq!(store.audit().await.unwrap().sealed_count, 0);
+    assert!(!authority.gate_enabled());
 }
 
 #[tokio::test]
@@ -1258,4 +1613,17 @@ async fn concurrent_invalid_third_fourth_close_once() {
     assert_eq!(after.sealed_count, 0);
     assert_eq!(after.accepted_count, 0);
     assert_ne!(after.attempt_state, "accepted");
+}
+
+
+#[tokio::test]
+async fn lifecycle_real_tool_admission_obeys_room_prepaid_expiry() {
+    let harness = open_harness(15).await;
+    let lease = Arc::new(codeg_lib::roundtable::ExecutionLease::issue(0, 1000));
+    let authority = harness.authority.with_execution_lease(Some(lease.clone()));
+    authority.advance_to(MonoMs(999));
+    assert!(authority.admit_tool(&harness.token).await.is_ok());
+    authority.advance_to(MonoMs(1000));
+    assert_eq!(authority.admit_tool(&harness.token).await.err().unwrap().details.reason.as_deref(), Some("prepaid_lease_expired"));
+    assert!(!lease.renew_until(1000, 2000), "late checkpoint cannot resurrect expired permission");
 }

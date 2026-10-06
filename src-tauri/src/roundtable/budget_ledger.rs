@@ -4,7 +4,7 @@ use super::store::{column, exec, num, one_row, optional_row, query_i64, text, Ro
 use roundtable_protocol::{
     DurationMs, Epoch, ErrorCode, MonoMs, RoomId, RtResult, Seq, TimeLedger,
 };
-use sea_orm::{ConnectionTrait, TransactionTrait};
+use sea_orm::ConnectionTrait;
 
 const SLICE_MS: u64 = 1000;
 
@@ -17,6 +17,7 @@ pub struct ActiveBudgetLease {
     boot: Epoch,
     run: Epoch,
     finished: bool,
+    prepaid_until: u64,
 }
 
 impl ActiveBudgetLease {
@@ -26,11 +27,7 @@ impl ActiveBudgetLease {
         boot: Epoch,
         run: Epoch,
     ) -> RtResult<Self> {
-        let txn = store
-            .connection()
-            .begin()
-            .await
-            .map_err(super::store::storage_err)?;
+        let txn = store.write_transaction().await?;
         let id = uuid::Uuid::new_v4().to_string();
         let result=async {
             let state=one_row(&txn,"SELECT status,boot_epoch,run_epoch,active_control_id FROM rt_rooms WHERE room_id=?",vec![text(&room.to_string())]).await?;
@@ -44,15 +41,15 @@ impl ActiveBudgetLease {
             exec(&txn,"INSERT INTO rt_active_time_leases(room_id,lease_id,boot_epoch,run_epoch,phase_id,prepaid_ms,last_sample_mono) VALUES(?,?,?,?,NULL,0,?)",vec![text(&room.to_string()),text(&id),num(as_i64(boot.0)?),num(as_i64(run.0)?),num(as_i64(now)?)]).await?;
             let ledger=tick_in(&txn,&store,&room,&id,boot,run,false).await?;
             if ledger.prepaid_until.0<=ledger.last_sample_mono.0 {return Err(rt_error(ErrorCode::InsufficientBudget,"active_budget_exhausted"));}
-            Ok::<(),roundtable_protocol::RtError>(())
+            Ok::<_,roundtable_protocol::RtError>(ledger.prepaid_until.0)
         }.await;
-        match result {
-            Ok(()) => txn.commit().await.map_err(super::store::storage_err)?,
+        let prepaid_until = match result {
+            Ok(until) => { txn.commit().await.map_err(super::store::storage_err)?; until },
             Err(error) => {
                 let _ = txn.rollback().await;
                 return Err(error);
             }
-        }
+        };
         Ok(Self {
             store,
             room,
@@ -60,8 +57,11 @@ impl ActiveBudgetLease {
             boot,
             run,
             finished: false,
+            prepaid_until,
         })
     }
+
+    pub fn prepaid_until(&self) -> u64 { self.prepaid_until }
 
     pub async fn checkpoint(&mut self) -> RtResult<TimeLedger> {
         self.tick(false).await
@@ -74,12 +74,7 @@ impl ActiveBudgetLease {
         if self.finished {
             return Err(rt_error(ErrorCode::InvalidState, "budget_lease_finished"));
         }
-        let txn = self
-            .store
-            .connection()
-            .begin()
-            .await
-            .map_err(super::store::storage_err)?;
+        let txn = self.store.write_transaction().await?;
         let result = tick_in(
             &txn,
             &self.store,
@@ -94,6 +89,7 @@ impl ActiveBudgetLease {
             Ok(ledger) => {
                 txn.commit().await.map_err(super::store::storage_err)?;
                 self.finished = finish;
+                self.prepaid_until = ledger.prepaid_until.0;
                 Ok(ledger)
             }
             Err(error) => {
@@ -102,6 +98,22 @@ impl ActiveBudgetLease {
             }
         }
     }
+}
+
+/// A control has already stopped the task and proved cleanup. Settle the
+/// persisted owner using this boot's monotonic clock before applying controls.
+/// Recovery deletes old-boot leases conservatively and never calls this path
+/// to refund an unknown crash remainder.
+pub(crate) async fn settle_room_in(
+    txn: &impl ConnectionTrait, store: &RoundtableStore, room: &RoomId,
+) -> RtResult<()> {
+    if let Some(row) = optional_row(txn,
+        "SELECT lease_id,boot_epoch,run_epoch FROM rt_active_time_leases WHERE room_id=?",
+        vec![text(&room.to_string())]).await? {
+        tick_in(txn, store, room, &column::<String>(&row, 0)?,
+            Epoch(nonnegative(column(&row, 1)?)?), Epoch(nonnegative(column(&row, 2)?)?), true).await?;
+    }
+    Ok(())
 }
 
 async fn tick_in(
@@ -114,7 +126,7 @@ async fn tick_in(
     finish: bool,
 ) -> RtResult<TimeLedger> {
     let room_text = room.to_string();
-    let lease=one_row(txn,"SELECT phase_id,prepaid_ms,last_sample_mono FROM rt_active_time_leases WHERE room_id=? AND lease_id=? AND boot_epoch=? AND run_epoch=?",vec![text(&room_text),text(id),num(as_i64(boot.0)?),num(as_i64(run.0)?)]).await?;
+    let lease=one_row(txn,"SELECT phase_id,prepaid_ms,last_sample_mono,phase_prepaid_ms FROM rt_active_time_leases WHERE room_id=? AND lease_id=? AND boot_epoch=? AND run_epoch=?",vec![text(&room_text),text(id),num(as_i64(boot.0)?),num(as_i64(run.0)?)]).await?;
     let state=one_row(txn,"SELECT remaining_active_ms,current_phase_id,status,boot_epoch,run_epoch,active_control_id,config_ref FROM rt_rooms WHERE room_id=?",vec![text(&room_text)]).await?;
     if nonnegative(column(&state, 3)?)? != boot.0 {
         return Err(rt_error(ErrorCode::InvalidState, "budget_fence"));
@@ -161,7 +173,7 @@ async fn tick_in(
         )
         .await?;
         let settled = nonnegative(phase_remaining)?
-            .saturating_add(prepaid)
+            .saturating_add(nonnegative(column(&lease, 3)?)?)
             .saturating_sub(elapsed);
         exec(
             txn,
@@ -182,11 +194,11 @@ async fn tick_in(
     } else {
         remaining
     };
-    let next = if finish {
-        0
-    } else {
-        SLICE_MS.min(remaining).min(phase_remaining)
-    };
+    // Phase expiry closes its attempts, but room time still pays for cleanup
+    // and publication. Reserve the clocks separately so a short phase cannot
+    // expire permission for the entire room or refund cleanup into that phase.
+    let next = if finish { 0 } else { SLICE_MS.min(remaining) };
+    let phase_next = if current.is_some() { next.min(phase_remaining) } else { 0 };
     // Zero is still committed: a exhausted lease cannot leave a stale positive budget.
     exec(
         txn,
@@ -202,7 +214,7 @@ async fn tick_in(
             txn,
             "UPDATE rt_phases SET remaining_ms=? WHERE room_id=? AND phase_id=?",
             vec![
-                num(as_i64(phase_remaining.saturating_sub(next))?),
+                num(as_i64(phase_remaining.saturating_sub(phase_next))?),
                 text(&room_text),
                 text(phase),
             ],
@@ -235,12 +247,12 @@ async fn tick_in(
         )
         .await?;
     } else {
-        exec(txn,"UPDATE rt_active_time_leases SET phase_id=?,prepaid_ms=?,last_sample_mono=? WHERE room_id=? AND lease_id=?",vec![super::store::opt(current.as_deref()),num(as_i64(next)?),num(as_i64(now)?),text(&room_text),text(id)]).await?;
+        exec(txn,"UPDATE rt_active_time_leases SET phase_id=?,prepaid_ms=?,last_sample_mono=?,phase_prepaid_ms=? WHERE room_id=? AND lease_id=?",vec![super::store::opt(current.as_deref()),num(as_i64(next)?),num(as_i64(now)?),num(as_i64(phase_next)?),text(&room_text),text(id)]).await?;
     }
     Ok(TimeLedger {
         ledger_seq: Seq(nonnegative(ledger_seq)?),
         remaining_room_ms: DurationMs(remaining.saturating_sub(next)),
-        remaining_phase_ms: DurationMs(phase_remaining.saturating_sub(next)),
+        remaining_phase_ms: DurationMs(phase_remaining.saturating_sub(phase_next)),
         prepaid_until: MonoMs(now.saturating_add(next)),
         last_sample_mono: MonoMs(now),
     })

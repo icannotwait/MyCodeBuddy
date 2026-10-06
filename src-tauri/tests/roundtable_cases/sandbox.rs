@@ -783,3 +783,39 @@ fn sandbox_scratch_cannot_use_a_symlink_to_a_forbidden_directory() {
     input.scratch = alias;
     assert!(build_sandbox_plan(&input).is_err());
 }
+
+#[test]
+fn qualified_default_home_scratch_reaches_the_certificate_check() {
+    let dir = tempdir().unwrap();
+    let mut input = scratch_review_input(dir.path());
+    let runtime_root = input.home.join(".codeg/roundtable/oci");
+    input.scratch = runtime_root.join("runs").join(input.incarnation.to_string()).join("scratch");
+    fs::create_dir_all(&input.scratch).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(input.scratch.parent().unwrap(), fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    let profile = codeg_lib::roundtable::QualifiedOciProfile {
+        runtime: input.certificate.binaries[0].clone(),
+        rootfs: dir.path().join("rootfs"),
+        rootfs_sha256: digest(2),
+        runtime_root,
+        cgroup_root: dir.path().join("unqualified-cgroup"),
+        cli_args: vec![],
+        service_socket: Some(dir.path().join("service.sock")),
+        gateway_socket: Some(dir.path().join("gateway.sock")),
+        auth_mounts: vec![],
+        container_env: BTreeMap::new(),
+    };
+    // Deliberately use a stale certificate: passing path validation does not
+    // authorize any runtime, socket, auth-file, or cgroup operation.
+    let error = codeg_lib::roundtable::build_qualified_sandbox_plan(&input, &profile).unwrap_err();
+    assert_eq!(error.details.reason.as_deref(), Some("qualification_plan_drift"));
+    for rejected in [input.home.clone(), profile.runtime_root.clone(), input.scratch.parent().unwrap().to_path_buf(), input.home.join(".ssh")] {
+        fs::create_dir_all(&rejected).unwrap();
+        input.scratch = rejected;
+        let error = codeg_lib::roundtable::build_qualified_sandbox_plan(&input, &profile).unwrap_err();
+        assert!(matches!(error.details.reason.as_deref(), Some("scratch_is_host_path" | "scratch_not_owned")));
+    }
+}

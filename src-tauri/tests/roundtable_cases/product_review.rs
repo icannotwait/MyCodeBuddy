@@ -705,3 +705,134 @@ async fn product_review_retry_synthesis_dispatches_without_an_extra_resume() {
     assert_eq!(runtime.configs.lock().unwrap().len(), 1);
     service.shutdown().await.unwrap();
 }
+
+#[tokio::test]
+async fn product_review_changed_concurrency_is_confirmable_and_exactly_bound() {
+    let runtime = Arc::new(RecordingRun::default());
+    let mut roomy = config();
+    roomy["budgets"] = json!({"room_budget":"1800000","phase_budget":"900000"});
+    let (_dir, conn, _store, service, room) = fixture_with_runtime(runtime.clone(), roomy.clone()).await;
+    execute_sql(&conn, "UPDATE rt_rooms SET status='paused' WHERE room_id=?", vec![room.to_string().into()]).await;
+    let mut prospective = roomy.clone();
+    prospective["concurrency"] = json!(1);
+    let confirmation = service.execute_fake_command(&actor(), "roundtable_preflight", json!({
+        "room_id":room,"revision":"1","config":prospective
+    })).await.unwrap();
+    assert!(confirmation["confirmed_preflight_id"].is_string());
+    let different = service.execute_fake_command(&actor(), "roundtable_resume", json!({
+        "room_id":room,"request_id":Uuid::new_v4(),"expected_revision":"1","concurrency":2,
+        "recovery_consent":true,"confirmed_preflight_id":confirmation["confirmed_preflight_id"]
+    })).await.unwrap_err();
+    assert_eq!(different.details.reason.as_deref(), Some("preflight_confirmation"));
+    assert_eq!(support::scalar_i64(&conn,"SELECT revision FROM rt_rooms").await,1);
+    assert!(runtime.configs.lock().unwrap().is_empty());
+    let mut forbidden = prospective;
+    forbidden["topic"] = json!("unapproved change");
+    let changed = service.execute_fake_command(&actor(), "roundtable_preflight", json!({
+        "room_id":room,"revision":"1","config":forbidden
+    })).await.unwrap_err();
+    assert_eq!(changed.details.reason.as_deref(), Some("config_changed"));
+    let request = json!({"room_id":room,"request_id":Uuid::new_v4(),"expected_revision":"1","concurrency":1,
+        "recovery_consent":true,"confirmed_preflight_id":confirmation["confirmed_preflight_id"]});
+    let ack = service.execute_fake_command(&actor(),"roundtable_resume",request.clone()).await.unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(1),runtime.entered.notified()).await.unwrap();
+    let replay = service.execute_fake_command(&actor(),"roundtable_resume",request).await.unwrap();
+    assert_eq!(replay,ack);
+    assert_eq!(runtime.configs.lock().unwrap().len(),1);
+    assert_eq!(runtime.configs.lock().unwrap()[0].concurrency,1);
+    let persisted: Value = serde_json::from_str(&support::scalar_text(&conn,"SELECT config_ref FROM rt_rooms").await).unwrap();
+    assert_eq!(persisted["concurrency"],1);
+    service.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn product_review_expired_confirmation_rejects_before_dispatch() {
+    let runtime=Arc::new(RecordingRun::default());
+    let (_dir,conn,store,service,room)=fixture_with_runtime(runtime.clone(),config()).await;
+    let clock=Arc::new(codeg_lib::roundtable::FakeClock::new(0));
+    store.set_clock(clock.clone());
+    let confirmation=service.execute_fake_command(&actor(),"roundtable_preflight",json!({"room_id":room,"revision":"1","config":config()})).await.unwrap();
+    clock.set(15*60*1000+1).unwrap();
+    let error=service.execute_fake_command(&actor(),"roundtable_start",json!({"room_id":room,"request_id":Uuid::new_v4(),"expected_revision":"1","confirmed_preflight_id":confirmation["confirmed_preflight_id"]})).await.unwrap_err();
+    assert_eq!(error.details.reason.as_deref(),Some("preflight_confirmation"));
+    assert!(runtime.configs.lock().unwrap().is_empty());
+    assert_eq!(support::scalar_i64(&conn,"SELECT run_epoch FROM rt_rooms").await,0);
+    service.shutdown().await.unwrap();
+}
+
+#[derive(Default)]
+struct ChangingCleanupCapability {
+    generation: std::sync::atomic::AtomicUsize,
+    cleanup_entered: tokio::sync::Notify,
+    cleanup_release: tokio::sync::Notify,
+    dispatched: std::sync::atomic::AtomicUsize,
+}
+#[async_trait]
+impl ParticipantRuntime for ChangingCleanupCapability {
+    async fn prepare(&self,_:RoundtableLaunch)->RtResult<PreparedRoundtableConnection>{panic!("no model launch")}
+    async fn preflight(&self,_:&RoundtableConfigV1)->RtResult<Value>{
+        Ok(json!({"qualification_keys":[self.generation.load(std::sync::atomic::Ordering::SeqCst)]}))
+    }
+    async fn cancel_and_reap(&self,identity:RuntimeIdentity)->RtResult<CleanupProof>{
+        self.cleanup_entered.notify_one();
+        self.cleanup_release.notified().await;
+        Ok(CleanupProof { process:roundtable_protocol::ProcessTreeProof {
+            instance_id:"controlled-cleanup".into(),incarnation:identity.incarnation,process_tree_empty:true,
+        },mailbox_empty:true,tools_drained:true,ingress_drained:true })
+    }
+    async fn run_room(&self,_:RoundtableStore,_:RoomId,_:RoundtableConfigV1)->RtResult<()>{
+        self.dispatched.fetch_add(1,std::sync::atomic::Ordering::SeqCst);
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn product_review_changed_certificate_during_cleanup_blocks_successor_dispatch() {
+    let runtime=Arc::new(ChangingCleanupCapability::default());
+    let (_dir,conn,_store,service,room)=pre_intent_fixture(runtime.clone()).await;
+    execute_sql(&conn,"UPDATE rt_rooms SET status='running',current_phase_id=(SELECT phase_id FROM rt_phases LIMIT 1) WHERE room_id=?",vec![room.to_string().into()]).await;
+    let confirmation=service.execute_fake_command(&actor(),"roundtable_preflight",json!({"room_id":room,"revision":"1","config":config()})).await.unwrap();
+    let task_service=service.clone();
+    let request=json!({"room_id":room,"request_id":Uuid::new_v4(),"expected_revision":"1","mode":"restart_current","text":"explicit restart","confirmed_preflight_id":confirmation["confirmed_preflight_id"]});
+    let operation=tokio::spawn(async move {task_service.execute_fake_command(&actor(),"roundtable_interject",request).await});
+    tokio::time::timeout(std::time::Duration::from_secs(1),runtime.cleanup_entered.notified()).await.unwrap();
+    runtime.generation.store(2,std::sync::atomic::Ordering::SeqCst);
+    runtime.cleanup_release.notify_one();
+    operation.await.unwrap().unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(1),async {
+        while support::scalar_text(&conn,"SELECT status FROM rt_control_operations").await != "blocked" {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }).await.unwrap();
+    assert_eq!(support::scalar_text(&conn,"SELECT blocked_reason FROM rt_control_operations").await,"preflight_confirmation");
+    assert_eq!(runtime.dispatched.load(std::sync::atomic::Ordering::SeqCst),0);
+    service.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn product_review_tiny_interjections_cannot_exceed_encoded_context_reservation() {
+    let mut small=config();small["quotas"]["interjection_byte_limit"]=json!(128);
+    let (_dir,conn,store,service,room)=fixture_with_runtime(Arc::new(NoModel),small).await;
+    let phase=Uuid::new_v4().to_string();
+    store.insert_phase(&NewPhase {
+        room_id:room.to_string(),phase_id:phase.clone(),phase_index:0,revision:1,status:"running".into(),snapshot_ref:"proposal".into(),snapshot_hash:"ab".repeat(32),expected:2,quorum:2,remaining_ms:450000,manifest_id:None,
+    }).await.unwrap();
+    execute_sql(&conn,"UPDATE rt_rooms SET status='running',current_phase_id=? WHERE room_id=?",vec![phase.into(),room.to_string().into()]).await;
+    let mut revision=1;
+    let mut accepted=0;
+    loop {
+        let result=service.execute_fake_command(&actor(),"roundtable_interject",json!({"room_id":room,"request_id":Uuid::new_v4(),"expected_revision":revision.to_string(),"text":"x","mode":"next_phase"})).await;
+        match result {
+            Ok(_) => { accepted+=1;revision+=1;assert!(accepted<128); }
+            Err(error) => {
+                assert_eq!(error.code,ErrorCode::ContextTooLarge);
+                assert_eq!(error.details.reason.as_deref(),Some("interjection_context_bytes"));
+                break;
+            }
+        }
+    }
+    assert!(accepted>0);
+    assert_eq!(support::scalar_i64(&conn,"SELECT COUNT(*) FROM rt_user_inputs").await,accepted);
+    assert_eq!(support::scalar_i64(&conn,"SELECT revision FROM rt_rooms").await,revision);
+    service.shutdown().await.unwrap();
+}

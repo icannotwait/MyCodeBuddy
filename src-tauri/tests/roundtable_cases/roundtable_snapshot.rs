@@ -936,3 +936,83 @@ async fn storage_fix_concurrent_stores_retain_shared_blob_on_rollback() {
     }
     assert!(ledger_a.used_bytes() >= first.accounted_bytes());
 }
+
+#[tokio::test]
+async fn capture_rejects_oversized_file_before_reading_or_invoking_hook() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("src");
+    std::fs::create_dir(&root).unwrap();
+    let file = std::fs::File::create(root.join("large.txt")).unwrap();
+    file.set_len(8 * 1024 * 1024).unwrap();
+    let (_, objects) = open_objects(dir.path(), 1_000_000);
+    let reads = Arc::new(AtomicUsize::new(0));
+    let observed = reads.clone();
+    let mut source = selection(root, ids(9), 1, None, vec![("large.txt", SourceClass::Untracked)]);
+    source.mutate_while_open = Some(Arc::new(move |_| { observed.fetch_add(1, Ordering::SeqCst); }));
+    let error = capture_snapshot(source, SnapshotLimits { estimated_bytes: 10, max_file_bytes: 10, max_total_bytes: 10, max_files: 1 }, &objects).await.unwrap_err();
+    assert_eq!(reason(&error), "source_limit");
+    assert_eq!(reads.load(Ordering::SeqCst), 0);
+    assert!(objects.remaining_files().is_empty());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn capture_rejects_a_symlink_in_workspace_ancestor() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("real").join("workspace");
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(root.join("selected.txt"), "outside redirected root").unwrap();
+    std::os::unix::fs::symlink(dir.path().join("real"), dir.path().join("redirect")).unwrap();
+    let (_, objects) = open_objects(dir.path(), 1_000_000);
+    let error = capture_snapshot(selection(dir.path().join("redirect/workspace"), ids(9), 1, None,
+        vec![("selected.txt", SourceClass::Untracked)]), limits(100), &objects).await.unwrap_err();
+    assert_eq!(reason(&error), "symlink");
+    assert!(objects.remaining_files().is_empty());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn capture_reads_pinned_file_when_parent_is_replaced_by_symlink() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("workspace");
+    let outside = dir.path().join("outside");
+    std::fs::create_dir_all(root.join("nested")).unwrap();
+    std::fs::create_dir(&outside).unwrap();
+    std::fs::write(root.join("nested/file.txt"), "selected bytes").unwrap();
+    std::fs::write(outside.join("file.txt"), "outside secret bytes must not be captured").unwrap();
+    let (_, objects) = open_objects(dir.path(), 1_000_000);
+    let mut source = selection(root.clone(), ids(9), 1, None, vec![("nested/file.txt", SourceClass::Selected)]);
+    let moved = Arc::new(AtomicUsize::new(0));
+    source.mutate_while_open = Some(Arc::new(move |_| {
+        if moved.fetch_add(1, Ordering::SeqCst) == 0 {
+            std::fs::rename(root.join("nested"), root.join("original")).unwrap();
+            std::os::unix::fs::symlink(&outside, root.join("nested")).unwrap();
+        }
+    }));
+    let manifest = capture_snapshot(source, limits(1000), &objects).await.unwrap();
+    assert_eq!(objects.get_verified(&manifest.entries[0].object).await.unwrap(), b"selected bytes");
+}
+
+#[cfg(unix)]
+#[test]
+fn capture_fifo_replacement_never_blocks_before_type_validation() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("workspace");
+    std::fs::create_dir(&root).unwrap();
+    std::fs::write(root.join("chosen"), "selected regular file").unwrap();
+    let source = selection(root.clone(), ids(9), 1, None, vec![("chosen", SourceClass::Selected)]);
+    // A local writer replaces the selected regular file before capture opens it.
+    std::fs::remove_file(root.join("chosen")).unwrap();
+    use std::os::unix::ffi::OsStrExt;
+    let name = std::ffi::CString::new(root.join("chosen").as_os_str().as_bytes()).unwrap();
+    // SAFETY: name is a live NUL-terminated fixture path.
+    assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+    let (_, objects) = open_objects(dir.path(), 1_000_000);
+    let (send, recv) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let result = runtime.block_on(capture_snapshot(source, limits(100), &objects));
+        let _ = send.send(result.map(|_| ()).map_err(|error| reason(&error).to_string()));
+    });
+    assert_eq!(recv.recv_timeout(Duration::from_secs(2)).expect("FIFO open must be nonblocking"), Err("not_regular".to_string()));
+}

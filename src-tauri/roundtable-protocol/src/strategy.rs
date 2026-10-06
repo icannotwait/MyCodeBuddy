@@ -81,13 +81,11 @@ impl PublishedMember {
 
 /// Slot classification for a published member. Empty claims stay invalid.
 pub fn classify_member(member: &PublishedMember) -> SlotOutcome {
-    if member.kind == MemberKind::Abstain || member.status == PublicationStatus::Abstained {
-        return SlotOutcome::Abstained;
-    }
     match member.status {
         PublicationStatus::Absent => SlotOutcome::Absent,
         PublicationStatus::Failed => SlotOutcome::Failed,
         PublicationStatus::Abstained => SlotOutcome::Abstained,
+        PublicationStatus::Accepted if member.kind == MemberKind::Abstain => SlotOutcome::Abstained,
         PublicationStatus::Accepted if member.counts_as_valid() => SlotOutcome::Valid,
         PublicationStatus::Accepted => SlotOutcome::Invalid,
     }
@@ -548,6 +546,7 @@ fn latest_counts(history: &PublishedHistory) -> (u32, u32, u32, u32) {
     let Some(latest) = history
         .phases
         .iter()
+        .filter(|phase| phase.kind != PhaseKind::Synthesis)
         .max_by_key(|phase| (phase.publication_seq, phase.phase_index))
     else {
         return (0, 0, 0, 0);
@@ -557,17 +556,11 @@ fn latest_counts(history: &PublishedHistory) -> (u32, u32, u32, u32) {
     let mut abstained = 0u32;
     let mut invalid = 0u32;
     for member in &latest.members {
-        if member.kind == MemberKind::Abstain || member.status == PublicationStatus::Abstained {
-            abstained = abstained.saturating_add(1);
-        } else if matches!(
-            member.status,
-            PublicationStatus::Absent | PublicationStatus::Failed
-        ) {
-            absent = absent.saturating_add(1);
-        } else if member.counts_as_valid() {
-            valid = valid.saturating_add(1);
-        } else {
-            invalid = invalid.saturating_add(1);
+        match classify_member(member) {
+            SlotOutcome::Valid => valid = valid.saturating_add(1),
+            SlotOutcome::Absent | SlotOutcome::Failed => absent = absent.saturating_add(1),
+            SlotOutcome::Abstained => abstained = abstained.saturating_add(1),
+            _ => invalid = invalid.saturating_add(1),
         }
     }
     (valid, absent, abstained, invalid)

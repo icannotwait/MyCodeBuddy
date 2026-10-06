@@ -224,6 +224,16 @@ impl ExecutionLease {
         self.admit(now_ms)
     }
 
+    /// Renew only to the deadline of an acknowledged durable reservation.
+    /// A slow checkpoint may never resurrect permission after its old slice.
+    pub fn renew_until(&self, now_ms: u64, prepaid_until: u64) -> bool {
+        if self.revoked() || now_ms >= self.prepaid_until() || prepaid_until <= now_ms {
+            return false;
+        }
+        let previous = self.prepaid_until();
+        self.prepaid_until.compare_exchange(previous, prepaid_until, Ordering::SeqCst, Ordering::SeqCst).is_ok()
+    }
+
     pub fn late_ack(&self, generation: u64, now_ms: u64) -> bool {
         if self.revoked() || generation != self.generation() || now_ms >= self.prepaid_until() {
             return false;
