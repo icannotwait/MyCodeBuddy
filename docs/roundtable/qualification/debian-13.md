@@ -83,12 +83,16 @@ file contains `nameserver 10.0.2.3`, which is slirp4netns's DNS proxy
 inside the container network namespace. The image digest does not change.
 `plan_hash` hashes the execution template, including the paths in it.
 The same live paths keep the same `plan_hash` when only the resolver
-file contents change. `core_hash` hashes the shared roundtable code.
-It changed between `2f57bcde4` (`c27b029c`) and `a8ee4042f`
-(`213eac47`), so keys issued before that commit do not match. Re-run
-`roundtable-qualify` and replace `execution-policy.json`. A probe that
-uses a different `--runtime-root` or rootfs path changes `plan_hash`
-only.
+file contents change. `core_hash` hashes the shared roundtable code,
+including the validator, the seat prompt, the MCP broker, and the live
+ACP client. It changes
+again whenever those files change. Keys issued for `15313e62d`
+(generation 3) do not match a later commit. Re-run `roundtable-qualify`
+and replace `execution-policy.json`. A probe that uses a different
+`--runtime-root` or rootfs path changes `plan_hash` only. The
+`submit_result` JSON Schema is answered by the codeg-server broker on
+`tools/list`. The `codeg-mcp` process in the rootfs only proxies that
+socket, so a schema-only broker change does not require a new rootfs.
 Without that mount the live container keeps the empty file, so
 `auth.x.ai` and `cli-chat-proxy.grok.com` fail with
 `dns error: failed to lookup address information` until the attempt
@@ -397,16 +401,42 @@ advertises `terminal: false` and filesystem read and write false.
 `/scratch` and mounts only the roundtable MCP server.
 
 `session/request_permission` selects an option from that request.
-`submit_result`, `read_evidence`, and `search_evidence`, including
-`roundtable/<tool>` and `mcp__roundtable__<tool>`, select `allow_once`,
-or `allow_always` when `allow_once` is absent. Every other tool,
-including `run_terminal_command`, selects `reject_once`, or
-`reject_always` when `reject_once` is absent. The reply is
+The match uses structured fields only: `toolCall.title`, `toolCall.name`,
+`toolCall.kind`, or `rawInput` keys `name`, `tool`, `toolName`, and
+`tool_name`. The value must be exactly `submit_result`, `read_evidence`,
+or `search_evidence`, or the same name prefixed with `roundtable/`,
+`mcp__roundtable__`, or `roundtable__`. Grok's `use_tool` wrapper is
+allowed when `tool_name` is `roundtable__search_evidence` (and the other
+two tools). A terminal command whose text contains `submit_result` is
+rejected. Free-text titles are rejected too. An allowed call selects
+`allow_once`, or `allow_always` when `allow_once` is absent. Every other
+tool selects `reject_once`, or `reject_always` when `reject_once` is
+absent. The reply is
 `{"outcome":{"outcome":"selected","optionId":"..."}}`. The client never
-sends `outcome: cancelled`, which ACP treats as cancelling the prompt
-turn. A rejected tool does not finish the attempt. The loop keeps
-reading until the prompt result has `stopReason` `end_turn`. A request
-with no usable option gets JSON-RPC `-32601`.
+sends `outcome: cancelled`. A rejected tool does not finish the attempt
+by itself. If Grok still ends the turn with `stopReason` `cancelled`
+after a rejection, the same session sends at most two follow-up prompts:
+`Only use roundtable__read_evidence, roundtable__search_evidence, and roundtable__submit_result. Call submit_result now.`
+Other stop reasons are not retried. A request with no usable option gets
+JSON-RPC `-32601`.
+
+`tools/list` publishes the full `submit_result` JSON Schema for the
+attempt's phase. Proposal and critique results are `oneOf` an active
+result (`kind`, `summary`, `claims` of `local_key`, `text`,
+`evidence_aliases`, `confidence`) and an abstain result. Synthesis omits
+`speaker_id` and `coverage`. The seat prompt includes one compact
+example, not the whole schema. A missing or invalid nested field is
+reported at its path, for example `$.claims[0].local_key`. Pure
+schema-shape mistakes stay open through 8 submissions and close on the
+9th. Alias and consensus failures still close on the 4th.
+
+Grok `session/new` sets `_meta.agentProfile.disallowedTools` to the
+native tool catalog (`run_terminal_command`, `read_file`, and the rest).
+`use_tool` and `search_tool` stay allowed, because that is how Grok calls
+MCP. `maxTurns` and `permissionMode` are not set. grok-cli 1.0.46's
+`--disallowed-tools` flag applies to headless mode only, and an empty
+`tools` list inherits every tool, so the ACP profile is the denylist
+this session uses. Antigravity and Cursor sessions omit that `_meta`.
 
 ACP transport frames use a bounded lenient JSON parser, at most 1 MiB.
 A float in a `session/update` does not fail the turn. The strict

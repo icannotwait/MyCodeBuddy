@@ -8,7 +8,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{json, Value};
 
 use crate::{
     canonical_bytes, parse_strict_json, v1_1, AgreementLevel, AliasKind, AliasRefV1,
@@ -18,8 +18,15 @@ use crate::{
     RtError, SpeakerId, Stance, SubmissionId,
 };
 
-/// Invalid submissions that remain repairable. The next one closes the attempt.
+/// Semantic invalid submissions that remain repairable. The next one closes
+/// the attempt. Schema-shape mistakes use [`MAX_REPAIRABLE_SHAPE_SUBMISSIONS`].
 pub const MAX_REPAIRABLE_INVALID_SUBMISSIONS: u32 = 3;
+
+/// Schema-shape mistakes (missing or unknown fields, invalid JSON, wrong
+/// kind, empty text, count limits) stay repairable up to this bound. The next
+/// one closes the attempt. Alias and consensus failures still use
+/// [`MAX_REPAIRABLE_INVALID_SUBMISSIONS`].
+pub const MAX_REPAIRABLE_SHAPE_SUBMISSIONS: u32 = 8;
 
 const IDENTITY_KEYS: &[&str] = &[
     "speaker_id",
@@ -125,6 +132,7 @@ pub struct ValidatedResult {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SubmissionState {
     pub invalid_count: u32,
+    pub shape_invalid_count: u32,
     pub closed: bool,
     pub sealed: Option<CandidateReceipt>,
     seen: BTreeMap<SubmissionId, SeenSubmission>,
@@ -140,6 +148,7 @@ impl SubmissionState {
     pub fn open() -> Self {
         Self {
             invalid_count: 0,
+            shape_invalid_count: 0,
             closed: false,
             sealed: None,
             seen: BTreeMap::new(),
@@ -310,6 +319,33 @@ impl FieldCode {
         }
     }
 
+    /// Shape mistakes are discoverable from the published JSON Schema.
+    /// Alias, consensus, and quota failures are not.
+    const fn is_schema_shape(self) -> bool {
+        matches!(
+            self,
+            Self::InvalidJson
+                | Self::DuplicateKey
+                | Self::UnknownField
+                | Self::MissingField
+                | Self::MaxDepth
+                | Self::TrailingData
+                | Self::IdentityNotSelectable
+                | Self::WrongPhaseKind
+                | Self::EmptySummary
+                | Self::ClaimCount
+                | Self::ResponseCount
+                | Self::OpenQuestionCount
+                | Self::PositionChangeCount
+                | Self::DuplicateLocalKey
+                | Self::EmptyText
+                | Self::AbstainReason
+                | Self::AbstainClaims
+                | Self::AbstainShape
+                | Self::CoverageRejected
+        )
+    }
+
     fn from_reason(reason: &str) -> Self {
         Self::ALL
             .iter()
@@ -401,8 +437,13 @@ pub fn submit_candidate(
         }
         Err(errors) => {
             let mut next = state.clone();
-            next.invalid_count = next.invalid_count.saturating_add(1);
-            let closes = next.invalid_count > MAX_REPAIRABLE_INVALID_SUBMISSIONS;
+            let closes = if shape_only(&errors) {
+                next.shape_invalid_count = next.shape_invalid_count.saturating_add(1);
+                next.shape_invalid_count > MAX_REPAIRABLE_SHAPE_SUBMISSIONS
+            } else {
+                next.invalid_count = next.invalid_count.saturating_add(1);
+                next.invalid_count > MAX_REPAIRABLE_INVALID_SUBMISSIONS
+            };
             next.closed = closes;
             next.seen.insert(
                 submission_id.clone(),
@@ -523,6 +564,10 @@ fn validate_member(
     scope: &ResultScope,
 ) -> Result<ValidatedResult, Vec<FieldError>> {
     reject_unknown(&document.value, MEMBER_FIELDS)?;
+    let shape = member_shape_errors(&document.value);
+    if !shape.is_empty() {
+        return Err(shape);
+    }
     let member: MemberResultV1 =
         serde_json::from_value(document.value.clone()).map_err(errors_from_serde)?;
     let mut errors = Vec::new();
@@ -549,6 +594,10 @@ fn validate_moderator(
     scope: &ResultScope,
 ) -> Result<ValidatedResult, Vec<FieldError>> {
     reject_unknown(&document.value, MODERATOR_FIELDS)?;
+    let shape = moderator_shape_errors(&document.value);
+    if !shape.is_empty() {
+        return Err(shape);
+    }
     let input: ModeratorInput =
         serde_json::from_value(document.value.clone()).map_err(errors_from_serde)?;
     let mut errors = Vec::new();
@@ -1127,4 +1176,521 @@ fn decision(
         next_state,
         closes_attempt,
     }
+}
+
+fn shape_only(errors: &[FieldError]) -> bool {
+    !errors.is_empty() && errors.iter().all(|error| error.code.is_schema_shape())
+}
+
+fn member_shape_errors(value: &Value) -> Vec<FieldError> {
+    let mut errors = Vec::new();
+    let Some(map) = value.as_object() else {
+        return vec![field("$", FieldCode::InvalidJson)];
+    };
+    expect_string(map, "$", "kind", &mut errors);
+    expect_string(map, "$", "summary", &mut errors);
+    if let Some(claims) = expect_array(map, "$", "claims", &mut errors) {
+        for (index, claim) in claims.iter().enumerate() {
+            claim_shape(claim, &format!("$.claims[{index}]"), &mut errors);
+        }
+    }
+    if let Some(responses) = optional_array(map, "$", "responses", &mut errors) {
+        for (index, response) in responses.iter().enumerate() {
+            response_shape(response, &format!("$.responses[{index}]"), &mut errors);
+        }
+    }
+    if let Some(questions) = optional_array(map, "$", "open_questions", &mut errors) {
+        for (index, question) in questions.iter().enumerate() {
+            if !question.is_string() {
+                errors.push(field(
+                    format!("$.open_questions[{index}]"),
+                    FieldCode::InvalidJson,
+                ));
+            }
+        }
+    }
+    if let Some(changes) = optional_array(map, "$", "position_changes", &mut errors) {
+        for (index, change) in changes.iter().enumerate() {
+            position_shape(change, &format!("$.position_changes[{index}]"), &mut errors);
+        }
+    }
+    if map.get("reason").is_some_and(|reason| !reason.is_string()) {
+        errors.push(field("$.reason", FieldCode::InvalidJson));
+    }
+    errors
+}
+
+fn moderator_shape_errors(value: &Value) -> Vec<FieldError> {
+    let mut errors = Vec::new();
+    let Some(map) = value.as_object() else {
+        return vec![field("$", FieldCode::InvalidJson)];
+    };
+    expect_string(map, "$", "kind", &mut errors);
+    match map.get("recommendation") {
+        None => errors.push(field("$.recommendation", FieldCode::MissingField)),
+        Some(item) => conclusion_shape(item, "$.recommendation", &mut errors),
+    }
+    for name in [
+        "alternatives",
+        "disagreements",
+        "risks",
+        "decision_requests",
+    ] {
+        if let Some(items) = expect_array(map, "$", name, &mut errors) {
+            for (index, item) in items.iter().enumerate() {
+                conclusion_shape(item, &format!("$.{name}[{index}]"), &mut errors);
+            }
+        }
+    }
+    if let Some(items) = expect_array(map, "$", "consensus_items", &mut errors) {
+        for (index, item) in items.iter().enumerate() {
+            consensus_shape(item, &format!("$.consensus_items[{index}]"), &mut errors);
+        }
+    }
+    errors
+}
+
+fn claim_shape(value: &Value, path: &str, errors: &mut Vec<FieldError>) {
+    let Some(map) = object_fields(
+        value,
+        path,
+        &["local_key", "text", "evidence_aliases", "confidence"],
+        errors,
+    ) else {
+        return;
+    };
+    expect_string(map, path, "local_key", errors);
+    expect_string(map, path, "text", errors);
+    expect_string_array(map, path, "evidence_aliases", errors);
+    expect_enum(map, path, "confidence", &["low", "medium", "high"], errors);
+}
+
+fn response_shape(value: &Value, path: &str, errors: &mut Vec<FieldError>) {
+    let Some(map) = object_fields(
+        value,
+        path,
+        &[
+            "target_claim_alias",
+            "target_response_alias",
+            "stance",
+            "priority",
+            "text",
+            "evidence_aliases",
+        ],
+        errors,
+    ) else {
+        return;
+    };
+    expect_optional_string(map, path, "target_claim_alias", errors);
+    expect_optional_string(map, path, "target_response_alias", errors);
+    expect_enum(
+        map,
+        path,
+        "stance",
+        &["support", "challenge", "clarify", "revise"],
+        errors,
+    );
+    expect_enum(map, path, "priority", &["normal", "critical"], errors);
+    expect_string(map, path, "text", errors);
+    expect_string_array(map, path, "evidence_aliases", errors);
+}
+
+fn position_shape(value: &Value, path: &str, errors: &mut Vec<FieldError>) {
+    let Some(map) = object_fields(
+        value,
+        path,
+        &[
+            "own_prior_claim_alias",
+            "new_local_claim_key",
+            "reason",
+            "trigger_response_aliases",
+        ],
+        errors,
+    ) else {
+        return;
+    };
+    expect_string(map, path, "own_prior_claim_alias", errors);
+    expect_string(map, path, "new_local_claim_key", errors);
+    expect_string(map, path, "reason", errors);
+    expect_string_array(map, path, "trigger_response_aliases", errors);
+}
+
+fn conclusion_shape(value: &Value, path: &str, errors: &mut Vec<FieldError>) {
+    let Some(map) = object_fields(value, path, &["text", "aliases", "inference"], errors) else {
+        return;
+    };
+    expect_string(map, path, "text", errors);
+    if let Some(aliases) = expect_array(map, path, "aliases", errors) {
+        for (index, alias) in aliases.iter().enumerate() {
+            alias_shape(alias, &format!("{path}.aliases[{index}]"), errors);
+        }
+    }
+    expect_bool(map, path, "inference", errors);
+}
+
+fn consensus_shape(value: &Value, path: &str, errors: &mut Vec<FieldError>) {
+    let Some(map) = object_fields(
+        value,
+        path,
+        &[
+            "text",
+            "agreement_level",
+            "aliases",
+            "supporter_aliases",
+            "support_response_aliases",
+            "inference",
+        ],
+        errors,
+    ) else {
+        return;
+    };
+    expect_string(map, path, "text", errors);
+    expect_enum(
+        map,
+        path,
+        "agreement_level",
+        &["explicit_agreement", "compatible_positions", "unresolved"],
+        errors,
+    );
+    if let Some(aliases) = expect_array(map, path, "aliases", errors) {
+        for (index, alias) in aliases.iter().enumerate() {
+            alias_shape(alias, &format!("{path}.aliases[{index}]"), errors);
+        }
+    }
+    expect_string_array(map, path, "supporter_aliases", errors);
+    expect_string_array(map, path, "support_response_aliases", errors);
+    expect_bool(map, path, "inference", errors);
+}
+
+fn alias_shape(value: &Value, path: &str, errors: &mut Vec<FieldError>) {
+    let Some(map) = object_fields(value, path, &["kind", "alias"], errors) else {
+        return;
+    };
+    expect_enum(map, path, "kind", &["message", "claim", "evidence"], errors);
+    expect_string(map, path, "alias", errors);
+}
+
+fn object_fields<'a>(
+    value: &'a Value,
+    path: &str,
+    allowed: &[&str],
+    errors: &mut Vec<FieldError>,
+) -> Option<&'a serde_json::Map<String, Value>> {
+    let Some(map) = value.as_object() else {
+        errors.push(field(path, FieldCode::InvalidJson));
+        return None;
+    };
+    for key in map.keys() {
+        if !allowed.contains(&key.as_str()) {
+            errors.push(field(format!("{path}.{key}"), FieldCode::UnknownField));
+        }
+    }
+    Some(map)
+}
+
+fn expect_string(
+    map: &serde_json::Map<String, Value>,
+    path: &str,
+    key: &str,
+    errors: &mut Vec<FieldError>,
+) {
+    match map.get(key) {
+        None => errors.push(field(format!("{path}.{key}"), FieldCode::MissingField)),
+        Some(Value::String(_)) => {}
+        Some(_) => errors.push(field(format!("{path}.{key}"), FieldCode::InvalidJson)),
+    }
+}
+
+fn expect_optional_string(
+    map: &serde_json::Map<String, Value>,
+    path: &str,
+    key: &str,
+    errors: &mut Vec<FieldError>,
+) {
+    if map.get(key).is_some_and(|value| !value.is_string()) {
+        errors.push(field(format!("{path}.{key}"), FieldCode::InvalidJson));
+    }
+}
+
+fn expect_bool(
+    map: &serde_json::Map<String, Value>,
+    path: &str,
+    key: &str,
+    errors: &mut Vec<FieldError>,
+) {
+    match map.get(key) {
+        None => errors.push(field(format!("{path}.{key}"), FieldCode::MissingField)),
+        Some(Value::Bool(_)) => {}
+        Some(_) => errors.push(field(format!("{path}.{key}"), FieldCode::InvalidJson)),
+    }
+}
+
+fn expect_enum(
+    map: &serde_json::Map<String, Value>,
+    path: &str,
+    key: &str,
+    allowed: &[&str],
+    errors: &mut Vec<FieldError>,
+) {
+    match map.get(key).and_then(Value::as_str) {
+        Some(value) if allowed.contains(&value) => {}
+        None if map.get(key).is_none() => {
+            errors.push(field(format!("{path}.{key}"), FieldCode::MissingField));
+        }
+        _ => errors.push(field(format!("{path}.{key}"), FieldCode::InvalidJson)),
+    }
+}
+
+fn expect_array<'a>(
+    map: &'a serde_json::Map<String, Value>,
+    path: &str,
+    key: &str,
+    errors: &mut Vec<FieldError>,
+) -> Option<&'a Vec<Value>> {
+    match map.get(key) {
+        Some(Value::Array(items)) => Some(items),
+        None => {
+            errors.push(field(format!("{path}.{key}"), FieldCode::MissingField));
+            None
+        }
+        Some(_) => {
+            errors.push(field(format!("{path}.{key}"), FieldCode::InvalidJson));
+            None
+        }
+    }
+}
+
+fn optional_array<'a>(
+    map: &'a serde_json::Map<String, Value>,
+    path: &str,
+    key: &str,
+    errors: &mut Vec<FieldError>,
+) -> Option<&'a Vec<Value>> {
+    match map.get(key) {
+        None => None,
+        Some(Value::Array(items)) => Some(items),
+        Some(_) => {
+            errors.push(field(format!("{path}.{key}"), FieldCode::InvalidJson));
+            None
+        }
+    }
+}
+
+fn expect_string_array(
+    map: &serde_json::Map<String, Value>,
+    path: &str,
+    key: &str,
+    errors: &mut Vec<FieldError>,
+) {
+    let Some(items) = expect_array(map, path, key, errors) else {
+        return;
+    };
+    for (index, item) in items.iter().enumerate() {
+        if !item.is_string() {
+            errors.push(field(
+                format!("{path}.{key}[{index}]"),
+                FieldCode::InvalidJson,
+            ));
+        }
+    }
+}
+
+/// JSON Schema for `submit_result` arguments. `result` matches the phase.
+/// Identity fields (`speaker_id`, `coverage`) are omitted.
+pub fn submit_result_input_schema(phase: PhaseKind) -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["submission_id", "result"],
+        "properties": {
+            "submission_id": {
+                "type": "string",
+                "minLength": 1,
+                "description": "New id for this body. Reuse an id only to retry the identical body."
+            },
+            "result": result_json_schema(phase)
+        }
+    })
+}
+
+/// Compact example embedded in the seat prompt. The MCP inputSchema carries
+/// the full schema.
+pub fn seat_schema_example(phase: PhaseKind) -> &'static str {
+    match phase {
+        PhaseKind::Proposal => "Use a new submission_id. Proposal example result: {\"kind\":\"proposal\",\"summary\":\"one sentence\",\"claims\":[{\"local_key\":\"c1\",\"text\":\"claim\",\"evidence_aliases\":[],\"confidence\":\"medium\"}]}. Abstain: {\"kind\":\"abstain\",\"summary\":\"why\",\"claims\":[],\"reason\":\"missing evidence\"}.",
+        PhaseKind::Critique => "Use a new submission_id. Critique example result: {\"kind\":\"critique\",\"summary\":\"one sentence\",\"claims\":[{\"local_key\":\"c1\",\"text\":\"claim\",\"evidence_aliases\":[],\"confidence\":\"medium\"}]}. Abstain: {\"kind\":\"abstain\",\"summary\":\"why\",\"claims\":[],\"reason\":\"missing evidence\"}.",
+        PhaseKind::Synthesis => "Use a new submission_id. Omit speaker_id and coverage. Synthesis example result: {\"kind\":\"synthesis\",\"recommendation\":{\"text\":\"one sentence\",\"aliases\":[],\"inference\":false},\"alternatives\":[],\"consensus_items\":[],\"disagreements\":[],\"risks\":[],\"decision_requests\":[]}.",
+    }
+}
+
+fn result_json_schema(phase: PhaseKind) -> Value {
+    match phase {
+        PhaseKind::Proposal => json!({
+            "description": "proposal requires 1 to 20 claims. abstain uses an empty claims array, a non-empty reason, and no responses or position_changes.",
+            "oneOf": [member_result_schema("proposal"), abstain_result_schema()]
+        }),
+        PhaseKind::Critique => json!({
+            "description": "critique requires 1 to 20 claims. abstain uses an empty claims array, a non-empty reason, and no responses or position_changes.",
+            "oneOf": [member_result_schema("critique"), abstain_result_schema()]
+        }),
+        PhaseKind::Synthesis => moderator_result_schema(),
+    }
+}
+
+fn member_result_schema(kind: &str) -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["kind", "summary", "claims"],
+        "properties": {
+            "kind": {"type": "string", "enum": [kind]},
+            "summary": {"type": "string", "minLength": 1},
+            "claims": {
+                "type": "array",
+                "minItems": 1,
+                "maxItems": v1_1::MAX_CLAIMS,
+                "items": claim_schema()
+            },
+            "responses": {
+                "type": "array",
+                "maxItems": v1_1::MAX_RESPONSES,
+                "items": response_schema()
+            },
+            "open_questions": {
+                "type": "array",
+                "maxItems": v1_1::MAX_OPEN_QUESTIONS,
+                "items": {"type": "string", "minLength": 1}
+            },
+            "position_changes": {
+                "type": "array",
+                "maxItems": v1_1::MAX_POSITION_CHANGES,
+                "items": position_schema()
+            },
+            "reason": {"type": "string"}
+        }
+    })
+}
+
+fn abstain_result_schema() -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["kind", "summary", "claims", "reason"],
+        "properties": {
+            "kind": {"type": "string", "enum": ["abstain"]},
+            "summary": {"type": "string", "minLength": 1},
+            "claims": {"type": "array", "maxItems": 0},
+            "reason": {"type": "string", "minLength": 1},
+            "responses": {"type": "array", "maxItems": 0},
+            "open_questions": {
+                "type": "array",
+                "maxItems": v1_1::MAX_OPEN_QUESTIONS,
+                "items": {"type": "string", "minLength": 1}
+            },
+            "position_changes": {"type": "array", "maxItems": 0}
+        }
+    })
+}
+
+fn claim_schema() -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["local_key", "text", "evidence_aliases", "confidence"],
+        "properties": {
+            "local_key": {"type": "string", "minLength": 1},
+            "text": {"type": "string", "minLength": 1},
+            "evidence_aliases": {"type": "array", "items": {"type": "string"}},
+            "confidence": {"type": "string", "enum": ["low", "medium", "high"]}
+        }
+    })
+}
+
+fn response_schema() -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["stance", "priority", "text", "evidence_aliases"],
+        "properties": {
+            "target_claim_alias": {"type": "string", "minLength": 1},
+            "target_response_alias": {"type": "string", "minLength": 1},
+            "stance": {"type": "string", "enum": ["support", "challenge", "clarify", "revise"]},
+            "priority": {"type": "string", "enum": ["normal", "critical"]},
+            "text": {"type": "string", "minLength": 1},
+            "evidence_aliases": {"type": "array", "items": {"type": "string"}}
+        }
+    })
+}
+
+fn position_schema() -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["own_prior_claim_alias", "new_local_claim_key", "reason", "trigger_response_aliases"],
+        "properties": {
+            "own_prior_claim_alias": {"type": "string", "minLength": 1},
+            "new_local_claim_key": {"type": "string", "minLength": 1},
+            "reason": {"type": "string", "minLength": 1},
+            "trigger_response_aliases": {"type": "array", "items": {"type": "string"}}
+        }
+    })
+}
+
+fn moderator_result_schema() -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "description": "Do not send speaker_id or coverage. The host assigns those.",
+        "required": ["kind", "recommendation", "alternatives", "consensus_items", "disagreements", "risks", "decision_requests"],
+        "properties": {
+            "kind": {"type": "string", "enum": ["synthesis"]},
+            "recommendation": conclusion_schema(),
+            "alternatives": {"type": "array", "items": conclusion_schema()},
+            "consensus_items": {"type": "array", "items": consensus_schema()},
+            "disagreements": {"type": "array", "items": conclusion_schema()},
+            "risks": {"type": "array", "items": conclusion_schema()},
+            "decision_requests": {"type": "array", "items": conclusion_schema()}
+        }
+    })
+}
+
+fn conclusion_schema() -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["text", "aliases", "inference"],
+        "properties": {
+            "text": {"type": "string", "minLength": 1},
+            "aliases": {"type": "array", "items": alias_schema()},
+            "inference": {"type": "boolean"}
+        }
+    })
+}
+
+fn alias_schema() -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["kind", "alias"],
+        "properties": {
+            "kind": {"type": "string", "enum": ["message", "claim", "evidence"]},
+            "alias": {"type": "string", "minLength": 1}
+        }
+    })
+}
+
+fn consensus_schema() -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["text", "agreement_level", "aliases", "supporter_aliases", "support_response_aliases", "inference"],
+        "properties": {
+            "text": {"type": "string", "minLength": 1},
+            "agreement_level": {"type": "string", "enum": ["explicit_agreement", "compatible_positions", "unresolved"]},
+            "aliases": {"type": "array", "items": alias_schema()},
+            "supporter_aliases": {"type": "array", "items": {"type": "string"}},
+            "support_response_aliases": {"type": "array", "items": {"type": "string"}},
+            "inference": {"type": "boolean"}
+        }
+    })
 }

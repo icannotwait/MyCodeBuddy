@@ -16,8 +16,8 @@ use roundtable_protocol::{
     canonical_bytes, charge_interjection, parse_strict_json, profile_suggestions, submit_candidate,
     v1_1, validate_result, AttemptId, CandidateReceipt, DecisionKind, ErrorCode, ErrorDetails,
     Fence, FieldError as WireFieldError, FinishKind, HandlerId, Hash256, InternalReason,
-    LimitsOrigin, MonoMs, ParseLimits, ResultScope, RoomId, RtError, RtResult, SubmissionId,
-    SubmissionState,
+    LimitsOrigin, MonoMs, ParseLimits, PhaseKind, ResultScope, RoomId, RtError, RtResult,
+    SubmissionId, SubmissionState,
 };
 use sea_orm::{
     ConnectionTrait, DatabaseBackend, DatabaseTransaction, DbErr, QueryResult, Statement,
@@ -207,6 +207,12 @@ impl GateToolAuthority {
 
     pub fn gate_enabled(&self) -> bool {
         ExecutionGate::open(&self.data_dir).enabled()
+    }
+
+    /// Phase pinned when this authority was opened. `tools/list` publishes
+    /// that phase's result schema.
+    pub fn pinned_phase_kind(&self) -> PhaseKind {
+        self.pinned.result_scope.phase_kind
     }
 
     /// Production authorities sample the host clock on every admission.

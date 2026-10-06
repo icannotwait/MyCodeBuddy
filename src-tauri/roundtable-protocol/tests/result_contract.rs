@@ -21,7 +21,7 @@ use roundtable_protocol::{
     PublicationStatus, PublishedClaim, PublishedHistory, PublishedMember, PublishedPhase,
     PublishedResponse, RequiredTarget, ResponseId, ResponseRef, ResultScope, Seq, SpeakerId,
     SpeakerOrdinal, Stance, SubmissionId, ValidatedResult, VisibleAliases,
-    MAX_REPAIRABLE_INVALID_SUBMISSIONS,
+    MAX_REPAIRABLE_INVALID_SUBMISSIONS, MAX_REPAIRABLE_SHAPE_SUBMISSIONS,
 };
 
 #[test]
@@ -38,38 +38,43 @@ fn submission_seals_once() {
         "claims": []
     }))
     .unwrap();
+    assert_eq!(
+        MAX_REPAIRABLE_SHAPE_SUBMISSIONS, 8,
+        "shape mistakes stay bounded"
+    );
     let mut state = roundtable_protocol::SubmissionState::open();
-    let mut third_invalid = None;
-    for index in 1..=3 {
+    let mut eighth_invalid = None;
+    for index in 1..=8 {
         let decision = submit(&state, &format!("bad-{index}"), &bad, &scope);
         assert!(
             matches!(decision.outcome, DecisionKind::FieldErrors(ref errors) if !errors.is_empty()),
             "invalid {index} returns field errors"
         );
-        assert!(!decision.closes_attempt);
+        assert!(!decision.closes_attempt, "shape {index} stays open");
         assert!(!decision.next_state.closed);
-        if index == 3 {
-            third_invalid = Some(decision);
+        if index == 8 {
+            eighth_invalid = Some(decision);
         } else {
             state = decision.next_state;
         }
     }
-    let third_invalid = third_invalid.expect("third invalid");
-    let fourth_invalid = submit(&third_invalid.next_state, "bad-4", &bad, &scope);
-    assert_eq!(third_invalid.next_state.invalid_count, 3);
-    assert!(!third_invalid.closes_attempt);
-    assert!(fourth_invalid.closes_attempt);
-    assert!(fourth_invalid.next_state.closed);
-    assert_eq!(fourth_invalid.next_state.invalid_count, 4);
+    let eighth_invalid = eighth_invalid.expect("eighth invalid");
+    let ninth_invalid = submit(&eighth_invalid.next_state, "bad-9", &bad, &scope);
+    assert_eq!(eighth_invalid.next_state.shape_invalid_count, 8);
+    assert_eq!(eighth_invalid.next_state.invalid_count, 0);
+    assert!(!eighth_invalid.closes_attempt);
+    assert!(ninth_invalid.closes_attempt);
+    assert!(ninth_invalid.next_state.closed);
+    assert_eq!(ninth_invalid.next_state.shape_invalid_count, 9);
     assert!(matches!(
-        fourth_invalid.outcome,
+        ninth_invalid.outcome,
         DecisionKind::FieldErrors(_)
     ));
-    let replay = submit(&third_invalid.next_state, "bad-1", &bad, &scope);
-    assert_eq!(replay.next_state.invalid_count, 3);
+    let replay = submit(&eighth_invalid.next_state, "bad-1", &bad, &scope);
+    assert_eq!(replay.next_state.shape_invalid_count, 8);
     assert!(!replay.closes_attempt);
     let conflict = submit(
-        &third_invalid.next_state,
+        &eighth_invalid.next_state,
         "bad-1",
         &canonical_bytes(&json!({
             "kind": "proposal",
@@ -80,7 +85,8 @@ fn submission_seals_once() {
         &scope,
     );
     assert!(matches!(conflict.outcome, DecisionKind::SubmissionConflict));
-    assert_eq!(conflict.next_state.invalid_count, 3);
+    assert_eq!(conflict.next_state.shape_invalid_count, 8);
+    assert_eq!(conflict.next_state.invalid_count, 0);
     assert!(!conflict.closes_attempt);
 
     let mut repair = roundtable_protocol::SubmissionState::open();
@@ -93,7 +99,8 @@ fn submission_seals_once() {
     assert_eq!(receipt.state, CandidateState::Staged);
     assert!(!sealed.closes_attempt);
     assert!(!sealed.next_state.closed);
-    assert_eq!(sealed.next_state.invalid_count, 3);
+    assert_eq!(sealed.next_state.shape_invalid_count, 3);
+    assert_eq!(sealed.next_state.invalid_count, 0);
     assert!(sealed.next_state.sealed.is_some());
     let again = submit(&sealed.next_state, "seal-after-3", &good, &scope);
     assert_eq!(staged(&again), receipt);
@@ -132,11 +139,101 @@ fn submission_seals_once() {
     let rendered = format!("{sealed:?}{receipt:?}");
     assert!(!rendered.contains("Accepted"));
     assert!(!rendered.contains("normal_finish"));
-    let closed = submit(&fourth_invalid.next_state, "late", &good, &scope);
+    let semantic = canonical_bytes(&json!({
+        "kind": "proposal",
+        "summary": "alias",
+        "claims": [{
+            "local_key": "c0",
+            "text": "claim",
+            "evidence_aliases": ["missing-alias"],
+            "confidence": "low"
+        }]
+    }))
+    .unwrap();
+    let mut semantic_state = roundtable_protocol::SubmissionState::open();
+    for index in 1..=3 {
+        let decision = submit(&semantic_state, &format!("sem-{index}"), &semantic, &scope);
+        assert!(!decision.closes_attempt, "semantic {index} stays open");
+        semantic_state = decision.next_state;
+    }
+    assert_eq!(semantic_state.invalid_count, 3);
+    assert_eq!(semantic_state.shape_invalid_count, 0);
+    let fourth_semantic = submit(&semantic_state, "sem-4", &semantic, &scope);
+    assert!(fourth_semantic.closes_attempt);
+    assert_eq!(fourth_semantic.next_state.invalid_count, 4);
+    assert!(matches!(
+        fourth_semantic.outcome,
+        DecisionKind::FieldErrors(_)
+    ));
+    let closed = submit(&fourth_semantic.next_state, "late", &good, &scope);
     assert!(matches!(closed.outcome, DecisionKind::AttemptClosed));
     assert!(!closed.closes_attempt);
     assert_eq!(closed.next_state.invalid_count, 4);
     assert!(closed.next_state.sealed.is_none());
+}
+
+#[test]
+fn nested_missing_claim_field_names_its_path() {
+    let scope = result_scope(PhaseKind::Proposal, 8 * 1024);
+    let raw = canonical_bytes(&json!({
+        "kind": "proposal",
+        "summary": "partial",
+        "claims": [{}]
+    }))
+    .unwrap();
+    let errors = validate_result(&raw, &scope).unwrap_err();
+    for path in [
+        "$.claims[0].local_key",
+        "$.claims[0].text",
+        "$.claims[0].evidence_aliases",
+        "$.claims[0].confidence",
+    ] {
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.path == path && error.code == FieldCode::MissingField),
+            "missing {path} in {errors:?}"
+        );
+    }
+    let bad_confidence = canonical_bytes(&json!({
+        "kind": "proposal",
+        "summary": "partial",
+        "claims": [{
+            "local_key": "c1",
+            "text": "claim",
+            "evidence_aliases": [],
+            "confidence": "huge"
+        }]
+    }))
+    .unwrap();
+    assert_code(
+        &bad_confidence,
+        &scope,
+        "$.claims[0].confidence",
+        FieldCode::InvalidJson,
+    );
+    let schema = roundtable_protocol::submit_result_input_schema(PhaseKind::Proposal);
+    let required = schema["properties"]["result"]["oneOf"][0]["required"]
+        .as_array()
+        .expect("proposal required");
+    assert!(required.iter().any(|field| field == "kind"));
+    assert!(required.iter().any(|field| field == "summary"));
+    assert!(required.iter().any(|field| field == "claims"));
+    let claim_required = schema["properties"]["result"]["oneOf"][0]["properties"]["claims"]
+        ["items"]["required"]
+        .as_array()
+        .expect("claim required");
+    assert!(claim_required.iter().any(|field| field == "local_key"));
+    let synthesis = roundtable_protocol::submit_result_input_schema(PhaseKind::Synthesis);
+    let properties = synthesis["properties"]["result"]["properties"]
+        .as_object()
+        .expect("synthesis properties");
+    assert!(properties.contains_key("consensus_items"));
+    assert!(!properties.contains_key("speaker_id"));
+    assert!(!properties.contains_key("coverage"));
+    let example = roundtable_protocol::seat_schema_example(PhaseKind::Proposal);
+    assert!(example.contains("\"kind\":\"proposal\""));
+    assert!(example.contains("local_key"));
 }
 
 #[test]

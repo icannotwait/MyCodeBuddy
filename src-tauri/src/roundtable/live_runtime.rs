@@ -14,6 +14,7 @@ use super::{
 use async_trait::async_trait;
 use roundtable_protocol::*;
 use serde_json::{json, Value};
+use std::cell::Cell;
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -789,21 +790,24 @@ async fn drive_acp(
         &mut stdout,
         2,
         "session/new",
-        roundtable_session_params(&json!([{
-            "name": "roundtable",
-            "command": mcp,
-            "args": [
-                "--service-roundtable",
-                "--socket-path",
-                "/run/codeg/roundtable.sock",
-                "--incarnation",
-                request.fence.incarnation.to_string()
-            ],
-            "env": [
-                {"name": super::ATTEMPT_TOKEN_ENV, "value": token},
-                {"name": "CODEG_RT_MODEL_SOCKET", "value": "/run/codeg/gateway.sock"}
-            ]
-        }])),
+        roundtable_session_params_for(
+            agent,
+            &json!([{
+                "name": "roundtable",
+                "command": mcp,
+                "args": [
+                    "--service-roundtable",
+                    "--socket-path",
+                    "/run/codeg/roundtable.sock",
+                    "--incarnation",
+                    request.fence.incarnation.to_string()
+                ],
+                "env": [
+                    {"name": super::ATTEMPT_TOKEN_ENV, "value": token},
+                    {"name": "CODEG_RT_MODEL_SOCKET", "value": "/run/codeg/gateway.sock"}
+                ]
+            }]),
+        ),
         &mut seq,
         active,
     )
@@ -866,13 +870,18 @@ async fn drive_acp(
         verify_confirmed_option(&selected, "model", requested_model)?;
         verify_confirmed_option(&selected, "reasoning_effort", effort)?;
     }
-    let result=rpc(&mut stdin,&mut stdout,5,"session/prompt",json!({"sessionId":session_id,"prompt":[{"type":"text","text":std::str::from_utf8(&request.prompt).map_err(|_|rt_error(ErrorCode::InvalidArgument,"prompt_encoding"))?}]}),&mut seq,active).await?;
-    if result["stopReason"] != "end_turn" {
-        return Err(rt_error(
-            ErrorCode::RuntimeUnavailable,
-            "acp_abnormal_finish",
-        ));
-    }
+    let prompt = std::str::from_utf8(&request.prompt)
+        .map_err(|_| rt_error(ErrorCode::InvalidArgument, "prompt_encoding"))?;
+    finish_seat_prompt(
+        &mut stdin,
+        &mut stdout,
+        session_id,
+        prompt,
+        &mut seq,
+        Some(&active.assistant),
+        None,
+    )
+    .await?;
     Ok(seq)
 }
 /// ACP client parameters shared by live seats and the qualification probe.
@@ -896,6 +905,141 @@ pub(crate) fn roundtable_session_params(mcp_servers: &Value) -> Value {
     })
 }
 
+/// Grok `agent stdio` has no ACP flag that drops native tools. An empty
+/// `tools` allowlist inherits every tool. `_meta.agentProfile.disallowedTools`
+/// on `session/new` is the denylist that applies to this session. `use_tool`
+/// and `search_tool` stay available because Grok calls MCP through them.
+/// `maxTurns` and `permissionMode` stay unset.
+pub(crate) fn roundtable_session_params_for(
+    agent: crate::models::AgentType,
+    mcp_servers: &Value,
+) -> Value {
+    let mut params = roundtable_session_params(mcp_servers);
+    if agent == crate::models::AgentType::Grok {
+        params["_meta"] = grok_roundtable_session_meta();
+    }
+    params
+}
+
+/// Native Grok tools. Copied from the hidden-generation catalog minus the MCP
+/// meta-tools `search_tool` and `use_tool`. CLI `--disallowed-tools` is
+/// headless-only and does not apply to `grok agent stdio`.
+const GROK_ROUNDTABLE_DISALLOWED_TOOLS: &[&str] = &[
+    "run_terminal_cmd",
+    "run_terminal_command",
+    "read_file",
+    "search_replace",
+    "write",
+    "grep",
+    "list_dir",
+    "web_search",
+    "x_search",
+    "web_fetch",
+    "image_gen",
+    "image_edit",
+    "image_to_video",
+    "reference_to_video",
+    "todo_write",
+    "task",
+    "get_task_output",
+    "kill_task",
+    "wait_tasks",
+    "monitor",
+    "update_goal",
+    "enter_plan_mode",
+    "exit_plan_mode",
+    "ask_user_question",
+    "Agent",
+    "spawn_subagent",
+    "send_subagent_message",
+    "get_command_or_subagent_output",
+    "kill_command_or_subagent",
+    "workflow",
+    "memory_search",
+    "memory_get",
+    "scheduler_create",
+    "scheduler_list",
+    "scheduler_delete",
+    "lsp",
+    "get_terminal_command_output",
+    "kill_terminal_command",
+];
+
+fn grok_roundtable_session_meta() -> Value {
+    let disallowed: Vec<Value> = GROK_ROUNDTABLE_DISALLOWED_TOOLS
+        .iter()
+        .map(|name| Value::String((*name).to_string()))
+        .collect();
+    json!({
+        "agentProfile": {
+            "name": "codeg-roundtable",
+            "description": "Roundtable seat. Call only the roundtable MCP tools.",
+            "disallowedTools": disallowed,
+            "agentsMd": false,
+            "discoverSkills": false
+        }
+    })
+}
+
+/// Follow-up prompts after Grok cancels a turn on a rejected native tool.
+const MAX_PERMISSION_CANCEL_REPAIRS: u8 = 2;
+const PERMISSION_REPAIR_PROMPT: &str = "Only use roundtable__read_evidence, roundtable__search_evidence, and roundtable__submit_result. Call submit_result now.";
+
+async fn finish_seat_prompt<W, R>(
+    stdin: &mut W,
+    stdout: &mut BufReader<R>,
+    session_id: &str,
+    prompt: &str,
+    seq: &mut u64,
+    assistant: Option<&Mutex<Option<super::DiagnosticCapture>>>,
+    deadline: Option<Duration>,
+) -> RtResult<Value>
+where
+    W: AsyncWrite + Unpin,
+    R: AsyncRead + Unpin,
+{
+    let rejected = Cell::new(false);
+    let mut prompt_id = 5u64;
+    let mut text = prompt.to_owned();
+    let mut repairs = 0u8;
+    loop {
+        rejected.set(false);
+        let result = acp_exchange(
+            stdin,
+            stdout,
+            &mut AcpExchange {
+                id: prompt_id,
+                method: "session/prompt",
+                params: json!({
+                    "sessionId": session_id,
+                    "prompt": [{"type": "text", "text": text}]
+                }),
+                seq,
+                assistant,
+                deadline,
+                rejected_permission: &rejected,
+            },
+        )
+        .await?;
+        if result["stopReason"] == "end_turn" {
+            return Ok(result);
+        }
+        if result["stopReason"] == "cancelled"
+            && rejected.get()
+            && repairs < MAX_PERMISSION_CANCEL_REPAIRS
+        {
+            repairs = repairs.saturating_add(1);
+            prompt_id = prompt_id.saturating_add(1);
+            text = PERMISSION_REPAIR_PROMPT.to_owned();
+            continue;
+        }
+        return Err(rt_error(
+            ErrorCode::RuntimeUnavailable,
+            "acp_abnormal_finish",
+        ));
+    }
+}
+
 pub(crate) struct AcpExchange<'a> {
     pub(crate) id: u64,
     pub(crate) method: &'a str,
@@ -904,6 +1048,9 @@ pub(crate) struct AcpExchange<'a> {
     pub(crate) assistant: Option<&'a Mutex<Option<super::DiagnosticCapture>>>,
     /// Overall budget and per-read budget. Live seats pass `None`.
     pub(crate) deadline: Option<Duration>,
+    /// Set when this exchange rejects a tool. A later `cancelled` stop can
+    /// be retried by [`finish_seat_prompt`].
+    pub(crate) rejected_permission: &'a Cell<bool>,
 }
 
 async fn rpc(
@@ -915,6 +1062,7 @@ async fn rpc(
     seq: &mut u64,
     active: &Active,
 ) -> RtResult<Value> {
+    let rejected = Cell::new(false);
     acp_exchange(
         stdin,
         stdout,
@@ -925,6 +1073,7 @@ async fn rpc(
             seq,
             assistant: Some(&active.assistant),
             deadline: None,
+            rejected_permission: &rejected,
         },
     )
     .await
@@ -995,6 +1144,9 @@ where
         if message.get("method").is_some() {
             if let Some(request_id) = message.get("id").cloned() {
                 let response = if message["method"] == "session/request_permission" {
+                    if !tool_call_is_roundtable(&message["params"]) {
+                        exchange.rejected_permission.set(true);
+                    }
                     permission_reply(&message["params"], &request_id)
                 } else {
                     json!({
@@ -1084,68 +1236,41 @@ fn selected_option(params: &Value, allow: bool) -> Option<String> {
     None
 }
 
+/// Structured identity only. A free-text command such as `echo submit_result`
+/// does not match. Grok's `use_tool` wrapper matches `rawInput.tool_name`
+/// when it is exactly `roundtable__<tool>`.
 fn tool_call_is_roundtable(params: &Value) -> bool {
     let call = params.get("toolCall").cloned().unwrap_or(Value::Null);
-    field_names_tool(call.get("title"))
-        || field_names_tool(call.get("name"))
+    exact_tool_field(call.get("title"))
+        || exact_tool_field(call.get("name"))
+        || exact_tool_field(call.get("kind"))
         || raw_input_names_tool(call.get("rawInput"))
-        || content_names_tool(call.get("content"))
-        || value_names_tool(call.get("_meta"))
-        || value_names_tool(params.get("_meta"))
 }
 
-fn content_names_tool(value: Option<&Value>) -> bool {
-    let Some(items) = value.and_then(Value::as_array) else {
-        return false;
-    };
-    items.iter().any(|item| {
-        field_names_tool(item.get("title"))
-            || field_names_tool(item.get("name"))
-            || value_names_tool(item.get("_meta"))
-    })
-}
-
-fn field_names_tool(value: Option<&Value>) -> bool {
+fn exact_tool_field(value: Option<&Value>) -> bool {
     value
         .and_then(Value::as_str)
-        .is_some_and(text_names_roundtable_tool)
+        .is_some_and(exact_roundtable_tool)
 }
 
 fn raw_input_names_tool(value: Option<&Value>) -> bool {
-    match value {
-        Some(Value::String(text)) => text_names_roundtable_tool(text),
-        Some(Value::Object(map)) => ["name", "tool", "toolName", "tool_name"].iter().any(|key| {
-            map.get(*key)
-                .and_then(Value::as_str)
-                .is_some_and(text_names_roundtable_tool)
-        }),
-        _ => false,
-    }
+    let Some(Value::Object(map)) = value else {
+        return false;
+    };
+    ["name", "tool", "toolName", "tool_name"].iter().any(|key| {
+        map.get(*key)
+            .and_then(Value::as_str)
+            .is_some_and(exact_roundtable_tool)
+    })
 }
 
-fn value_names_tool(value: Option<&Value>) -> bool {
-    match value {
-        Some(Value::String(text)) => text_names_roundtable_tool(text),
-        Some(Value::Array(items)) => items.iter().any(|item| value_names_tool(Some(item))),
-        Some(Value::Object(map)) => map.values().any(|item| value_names_tool(Some(item))),
-        _ => false,
-    }
-}
-
-fn text_names_roundtable_tool(text: &str) -> bool {
-    text.split(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '_' || ch == '/'))
-        .filter(|token| !token.is_empty())
-        .any(|token| {
-            ROUNDTABLE_TOOL_NAMES.contains(&token)
-                || ROUNDTABLE_TOOL_NAMES.iter().any(|name| {
-                    token
-                        .strip_prefix("roundtable/")
-                        .is_some_and(|rest| rest == *name)
-                        || token
-                            .strip_prefix("mcp__roundtable__")
-                            .is_some_and(|rest| rest == *name)
-                })
-        })
+fn exact_roundtable_tool(token: &str) -> bool {
+    let name = token
+        .strip_prefix("mcp__roundtable__")
+        .or_else(|| token.strip_prefix("roundtable__"))
+        .or_else(|| token.strip_prefix("roundtable/"))
+        .unwrap_or(token);
+    ROUNDTABLE_TOOL_NAMES.contains(&name)
 }
 
 async fn write_rpc<W: AsyncWrite + Unpin>(stdin: &mut W, value: &Value) -> RtResult<()> {
@@ -1546,6 +1671,7 @@ pub async fn exercise_live_acp_rpc() -> RtResult<LiveAcpRpcObservation> {
     let mut client_read = BufReader::new(client_read);
     let adapter = tokio::spawn(async move { fake_acp_adapter(adapter_read, adapter_write).await });
     let capture = Mutex::new(Some(super::DiagnosticCapture::new(Vec::new())));
+    let rejected = Cell::new(false);
     let mut seq = 0u64;
     let exchanged = async {
         let initialize = acp_exchange(
@@ -1558,6 +1684,7 @@ pub async fn exercise_live_acp_rpc() -> RtResult<LiveAcpRpcObservation> {
                 seq: &mut seq,
                 assistant: Some(&capture),
                 deadline: Some(Duration::from_secs(5)),
+                rejected_permission: &rejected,
             },
         )
         .await?;
@@ -1574,6 +1701,7 @@ pub async fn exercise_live_acp_rpc() -> RtResult<LiveAcpRpcObservation> {
                 seq: &mut seq,
                 assistant: Some(&capture),
                 deadline: Some(Duration::from_secs(5)),
+                rejected_permission: &rejected,
             },
         )
         .await
@@ -1758,4 +1886,289 @@ pub fn redact_untrusted_excerpt_fixture(bytes: &[u8]) -> String {
 #[cfg(any(test, feature = "test-utils"))]
 pub fn run_dir_retention_fixture() -> usize {
     RUN_DIR_RETENTION
+}
+
+#[cfg(any(test, feature = "test-utils"))]
+pub fn session_params_fixture(agent: crate::models::AgentType, servers: &Value) -> Value {
+    roundtable_session_params_for(agent, servers)
+}
+
+#[cfg(any(test, feature = "test-utils"))]
+pub struct SchemaSeatObservation {
+    pub search_option_id: String,
+    pub grok_submit_option_id: String,
+    pub antigravity_option_id: String,
+    pub terminal_option_id: String,
+    pub saw_cancelled_outcome: bool,
+    pub repair_prompt: String,
+    pub stop_reason: String,
+    pub grok_disallows_terminal: bool,
+    pub grok_keeps_use_tool: bool,
+}
+
+#[cfg(any(test, feature = "test-utils"))]
+pub async fn exercise_schema_seat_rpc() -> RtResult<SchemaSeatObservation> {
+    let (client_io, adapter_io) = tokio::io::duplex(256 * 1024);
+    let (client_read, mut client_write) = tokio::io::split(client_io);
+    let (adapter_read, adapter_write) = tokio::io::split(adapter_io);
+    let mut client_read = BufReader::new(client_read);
+    let adapter =
+        tokio::spawn(async move { schema_seat_adapter(adapter_read, adapter_write).await });
+    let capture = Mutex::new(Some(super::DiagnosticCapture::new(Vec::new())));
+    let rejected = Cell::new(false);
+    let mut seq = 0u64;
+    let exchanged = async {
+        let initialize = acp_exchange(
+            &mut client_write,
+            &mut client_read,
+            &mut AcpExchange {
+                id: 1,
+                method: "initialize",
+                params: roundtable_initialize_params("codeg-roundtable"),
+                seq: &mut seq,
+                assistant: Some(&capture),
+                deadline: Some(Duration::from_secs(5)),
+                rejected_permission: &rejected,
+            },
+        )
+        .await?;
+        if initialize["protocolVersion"] != 1 {
+            return Err(rt_error(ErrorCode::CapabilityUnqualified, "acp_version"));
+        }
+        let session_params =
+            roundtable_session_params_for(crate::models::AgentType::Grok, &json!([]));
+        acp_exchange(
+            &mut client_write,
+            &mut client_read,
+            &mut AcpExchange {
+                id: 2,
+                method: "session/new",
+                params: session_params,
+                seq: &mut seq,
+                assistant: Some(&capture),
+                deadline: Some(Duration::from_secs(5)),
+                rejected_permission: &rejected,
+            },
+        )
+        .await?;
+        finish_seat_prompt(
+            &mut client_write,
+            &mut client_read,
+            "s",
+            "submit the proposal",
+            &mut seq,
+            Some(&capture),
+            Some(Duration::from_secs(5)),
+        )
+        .await
+    }
+    .await;
+    let result = match exchanged {
+        Ok(result) => result,
+        Err(error) => {
+            adapter.abort();
+            return Err(error);
+        }
+    };
+    let seen = adapter
+        .await
+        .map_err(|_| rt_error(ErrorCode::RuntimeUnavailable, "acp_frame"))?
+        .map_err(|_| rt_error(ErrorCode::RuntimeUnavailable, "acp_frame"))?;
+    let bodies = format!(
+        "{}{}{}{}",
+        seen.search, seen.grok_submit, seen.antigravity, seen.terminal
+    );
+    Ok(SchemaSeatObservation {
+        search_option_id: seen.search["result"]["outcome"]["optionId"]
+            .as_str()
+            .unwrap_or_default()
+            .to_owned(),
+        grok_submit_option_id: seen.grok_submit["result"]["outcome"]["optionId"]
+            .as_str()
+            .unwrap_or_default()
+            .to_owned(),
+        antigravity_option_id: seen.antigravity["result"]["outcome"]["optionId"]
+            .as_str()
+            .unwrap_or_default()
+            .to_owned(),
+        terminal_option_id: seen.terminal["result"]["outcome"]["optionId"]
+            .as_str()
+            .unwrap_or_default()
+            .to_owned(),
+        saw_cancelled_outcome: bodies.contains("cancelled"),
+        repair_prompt: seen.repair_prompt,
+        stop_reason: result["stopReason"].as_str().unwrap_or_default().to_owned(),
+        grok_disallows_terminal: seen.session["_meta"]["agentProfile"]["disallowedTools"]
+            .as_array()
+            .is_some_and(|tools| tools.iter().any(|tool| tool == "run_terminal_command")),
+        grok_keeps_use_tool: seen.session["_meta"]["agentProfile"]["disallowedTools"]
+            .as_array()
+            .is_some_and(|tools| {
+                tools
+                    .iter()
+                    .all(|tool| tool != "use_tool" && tool != "search_tool")
+            }),
+    })
+}
+
+#[cfg(any(test, feature = "test-utils"))]
+struct SchemaAdapterSeen {
+    session: Value,
+    search: Value,
+    grok_submit: Value,
+    antigravity: Value,
+    terminal: Value,
+    repair_prompt: String,
+}
+
+#[cfg(any(test, feature = "test-utils"))]
+async fn schema_seat_adapter<R, W>(read: R, mut write: W) -> Result<SchemaAdapterSeen, ()>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    let mut read = BufReader::new(read);
+    let _initialize = read_adapter_frame(&mut read).await?;
+    write_lenient(
+        &mut write,
+        &json!({"jsonrpc":"2.0","id":1,"result":{"protocolVersion":1}}),
+    )
+    .await?;
+    let session = read_adapter_frame(&mut read).await?;
+    write_lenient(
+        &mut write,
+        &json!({"jsonrpc":"2.0","id":2,"result":{"sessionId":"s"}}),
+    )
+    .await?;
+    let _prompt = read_adapter_frame(&mut read).await?;
+    write_lenient(
+        &mut write,
+        &structured_permission(
+            11,
+            "use_tool",
+            json!({
+                "tool_name": "roundtable__search_evidence",
+                "tool_input": {"file_alias": "e0", "query": "alpha", "limit": 5}
+            }),
+            "allow-search",
+            "reject-search",
+        ),
+    )
+    .await?;
+    let search = read_adapter_frame(&mut read).await?;
+    write_lenient(
+        &mut write,
+        &structured_permission(
+            12,
+            "use_tool",
+            json!({
+                "tool_name": "roundtable__submit_result",
+                "tool_input": {
+                    "submission_id": "s1",
+                    "result": {
+                        "kind": "proposal",
+                        "summary": "one sentence",
+                        "claims": [{
+                            "local_key": "c1",
+                            "text": "claim",
+                            "evidence_aliases": [],
+                            "confidence": "medium"
+                        }]
+                    }
+                }
+            }),
+            "allow-grok-submit",
+            "reject-grok-submit",
+        ),
+    )
+    .await?;
+    let grok_submit = read_adapter_frame(&mut read).await?;
+    write_lenient(
+        &mut write,
+        &structured_permission(
+            13,
+            "roundtable/submit_result",
+            json!({
+                "submission_id": "s2",
+                "result": {
+                    "kind": "proposal",
+                    "summary": "echo submit_result is not a tool name",
+                    "claims": [{
+                        "local_key": "c1",
+                        "text": "claim",
+                        "evidence_aliases": [],
+                        "confidence": "medium"
+                    }]
+                }
+            }),
+            "allow-antigravity",
+            "reject-antigravity",
+        ),
+    )
+    .await?;
+    let antigravity = read_adapter_frame(&mut read).await?;
+    write_lenient(
+        &mut write,
+        &structured_permission(
+            14,
+            "run_terminal_command",
+            json!({"command": "echo submit_result"}),
+            "allow-terminal",
+            "reject-terminal",
+        ),
+    )
+    .await?;
+    let terminal = read_adapter_frame(&mut read).await?;
+    write_lenient(
+        &mut write,
+        &json!({"jsonrpc":"2.0","id":5,"result":{"stopReason":"cancelled"}}),
+    )
+    .await?;
+    let repair = read_adapter_frame(&mut read).await?;
+    let repair_prompt = repair["params"]["prompt"][0]["text"]
+        .as_str()
+        .unwrap_or_default()
+        .to_owned();
+    write_lenient(
+        &mut write,
+        &json!({"jsonrpc":"2.0","id": repair["id"],"result":{"stopReason":"end_turn"}}),
+    )
+    .await?;
+    Ok(SchemaAdapterSeen {
+        session: session["params"].clone(),
+        search,
+        grok_submit,
+        antigravity,
+        terminal,
+        repair_prompt,
+    })
+}
+
+#[cfg(any(test, feature = "test-utils"))]
+fn structured_permission(
+    id: u64,
+    title: &str,
+    raw_input: Value,
+    allow: &str,
+    reject: &str,
+) -> Value {
+    json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "method": "session/request_permission",
+        "params": {
+            "sessionId": "s",
+            "toolCall": {
+                "toolCallId": format!("call-{id}"),
+                "title": title,
+                "kind": "other",
+                "status": "pending",
+                "rawInput": raw_input
+            },
+            "options": [
+                {"optionId": allow, "name": "Allow once", "kind": "allow_once"},
+                {"optionId": reject, "name": "Reject once", "kind": "reject_once"}
+            ]
+        }
+    })
 }

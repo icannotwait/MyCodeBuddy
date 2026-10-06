@@ -884,7 +884,26 @@ async fn prepare_turn(
     let attempt_id: AttemptId = fresh()?;
     let incarnation: IncarnationId = fresh()?;
     let participant = &speaker.1;
-    let role=RoleSnapshot{role:participant.role.clone(),model:participant.model.clone().unwrap_or_else(||"default".into()),effort:participant.effort.clone().unwrap_or_default(),provider_ref:participant.provider_ref.clone(),prompt_version:"roundtable.v1".into(),template_version:"roundtable.v1".into(),schema_id:if phase.kind==PhaseKind::Synthesis {"moderator"} else {"member"}.into(),schema_text:if phase.kind==PhaseKind::Synthesis {"Submit a moderator result using submit_result; cite visible aliases and published support."} else {"Submit a member result using submit_result; address every mandatory target and cite visible aliases."}.into(),tool_version:super::tool_core::SERVICE_TOOL_VERSION.into(),tool_text:"read_evidence, search_evidence, submit_result".into()};
+    let role = RoleSnapshot {
+        role: participant.role.clone(),
+        model: participant
+            .model
+            .clone()
+            .unwrap_or_else(|| "default".into()),
+        effort: participant.effort.clone().unwrap_or_default(),
+        provider_ref: participant.provider_ref.clone(),
+        prompt_version: "roundtable.v1".into(),
+        template_version: "roundtable.v1".into(),
+        schema_id: if phase.kind == PhaseKind::Synthesis {
+            "moderator"
+        } else {
+            "member"
+        }
+        .into(),
+        schema_text: seat_schema_example(phase.kind).to_string(),
+        tool_version: super::tool_core::SERVICE_TOOL_VERSION.into(),
+        tool_text: "read_evidence, search_evidence, submit_result".into(),
+    };
     let delivery = DeliveryEncoder::encode_with_context(
         phase,
         &role,

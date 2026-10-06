@@ -834,7 +834,10 @@ async fn run_acp_session(
         &mut reader,
         2,
         "session/new",
-        super::live_runtime::roundtable_session_params(&serde_json::json!([{
+        super::live_runtime::roundtable_session_params_for(
+            crate::models::AgentType::from_wire(&request.agent)
+                .unwrap_or(crate::models::AgentType::Cursor),
+            &serde_json::json!([{
             "name": "roundtable",
             "command": "/usr/local/bin/codeg-mcp",
             "args": ["--service-roundtable", "--socket-path", "/run/codeg/roundtable.sock", "--incarnation", "qualify"],
@@ -876,6 +879,7 @@ async fn rpc(
     params: serde_json::Value,
 ) -> Result<serde_json::Value, String> {
     let mut seq = 0;
+    let rejected = std::cell::Cell::new(false);
     super::live_runtime::acp_exchange(
         stdin,
         stdout,
@@ -886,6 +890,7 @@ async fn rpc(
             seq: &mut seq,
             assistant: None,
             deadline: Some(Duration::from_secs(90)),
+            rejected_permission: &rejected,
         },
     )
     .await

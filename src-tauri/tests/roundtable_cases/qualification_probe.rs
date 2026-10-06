@@ -618,6 +618,112 @@ async fn live_rpc_allows_submit_rejects_terminal_and_keeps_float_frames() {
         ]
     }));
     assert_eq!(search["result"]["outcome"]["optionId"], "allow-search");
+
+    let grok_search = codeg_lib::roundtable::permission_reply_fixture(serde_json::json!({
+        "toolCall": {
+            "title": "use_tool",
+            "kind": "other",
+            "rawInput": {
+                "tool_name": "roundtable__search_evidence",
+                "tool_input": {"file_alias": "e0", "query": "alpha", "limit": 5}
+            }
+        },
+        "options": [
+            {"optionId": "allow-grok", "kind": "allow_once", "name": "Allow"},
+            {"optionId": "reject-grok", "kind": "reject_once", "name": "Reject"}
+        ]
+    }));
+    assert_eq!(grok_search["result"]["outcome"]["optionId"], "allow-grok");
+    assert!(!grok_search.to_string().contains("cancelled"));
+
+    let terminal_text = codeg_lib::roundtable::permission_reply_fixture(serde_json::json!({
+        "toolCall": {
+            "title": "run_terminal_command",
+            "kind": "execute",
+            "rawInput": {"command": "echo submit_result"}
+        },
+        "options": [
+            {"optionId": "allow-term", "kind": "allow_once", "name": "Allow"},
+            {"optionId": "reject-term", "kind": "reject_once", "name": "Reject"}
+        ]
+    }));
+    assert_eq!(
+        terminal_text["result"]["outcome"]["optionId"],
+        "reject-term"
+    );
+    assert!(!terminal_text.to_string().contains("cancelled"));
+
+    let sentence = codeg_lib::roundtable::permission_reply_fixture(serde_json::json!({
+        "toolCall": {
+            "title": "please call submit_result now",
+            "rawInput": {"command": "echo submit_result && echo read_evidence"}
+        },
+        "options": [
+            {"optionId": "allow-sentence", "kind": "allow_once", "name": "Allow"},
+            {"optionId": "reject-sentence", "kind": "reject_once", "name": "Reject"}
+        ]
+    }));
+    assert_eq!(sentence["result"]["outcome"]["optionId"], "reject-sentence");
+}
+
+#[tokio::test]
+async fn grok_use_tool_and_antigravity_submit_follow_the_schema() {
+    let seen = codeg_lib::roundtable::exercise_schema_seat_rpc()
+        .await
+        .expect("schema seat");
+    assert_eq!(seen.search_option_id, "allow-search");
+    assert_eq!(seen.grok_submit_option_id, "allow-grok-submit");
+    assert_eq!(seen.antigravity_option_id, "allow-antigravity");
+    assert_eq!(seen.terminal_option_id, "reject-terminal");
+    assert!(!seen.saw_cancelled_outcome);
+    assert_eq!(seen.stop_reason, "end_turn");
+    assert!(
+        seen.repair_prompt.contains("roundtable__submit_result"),
+        "{}",
+        seen.repair_prompt
+    );
+    assert!(seen.grok_disallows_terminal);
+    assert!(seen.grok_keeps_use_tool);
+
+    let grok = codeg_lib::roundtable::session_params_fixture(
+        codeg_lib::models::AgentType::Grok,
+        &serde_json::json!([]),
+    );
+    let denied = grok["_meta"]["agentProfile"]["disallowedTools"]
+        .as_array()
+        .expect("denylist");
+    assert!(denied.iter().any(|tool| tool == "run_terminal_command"));
+    assert!(denied.iter().any(|tool| tool == "read_file"));
+    assert!(denied
+        .iter()
+        .all(|tool| tool != "use_tool" && tool != "search_tool"));
+    assert!(grok["_meta"]["agentProfile"].get("maxTurns").is_none());
+    assert!(grok["_meta"]["agentProfile"]
+        .get("permissionMode")
+        .is_none());
+    let antigravity = codeg_lib::roundtable::session_params_fixture(
+        codeg_lib::models::AgentType::Antigravity,
+        &serde_json::json!([]),
+    );
+    assert!(antigravity.get("_meta").is_none());
+
+    let proposal =
+        roundtable_protocol::submit_result_input_schema(roundtable_protocol::PhaseKind::Proposal);
+    let required = proposal["properties"]["result"]["oneOf"][0]["required"]
+        .as_array()
+        .expect("proposal required");
+    assert!(required.iter().any(|field| field == "claims"));
+    let example =
+        roundtable_protocol::seat_schema_example(roundtable_protocol::PhaseKind::Proposal);
+    assert!(example.contains("local_key"));
+    let synthesis =
+        roundtable_protocol::submit_result_input_schema(roundtable_protocol::PhaseKind::Synthesis);
+    let properties = synthesis["properties"]["result"]["properties"]
+        .as_object()
+        .expect("synthesis properties");
+    assert!(properties.contains_key("recommendation"));
+    assert!(!properties.contains_key("speaker_id"));
+    assert!(!properties.contains_key("coverage"));
 }
 
 #[test]

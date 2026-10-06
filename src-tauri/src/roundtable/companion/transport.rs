@@ -251,11 +251,15 @@ async fn dispatch(
             json!({"protocolVersion":"2024-11-05","capabilities":{"tools":{}},"serverInfo":{"name":"codeg-roundtable","version":"1"}})
         }
         Some("ping") => json!({}),
-        Some("tools/list") => json!({"tools":[
-            {"name":"read_evidence","description":"Read frozen evidence lines","inputSchema":{"type":"object","additionalProperties":false,"required":["file_alias","start_line","end_line"],"properties":{"file_alias":{"type":"string"},"start_line":{"type":"integer","minimum":1},"end_line":{"type":"integer","minimum":1}}}},
-            {"name":"search_evidence","description":"Search frozen evidence literally","inputSchema":{"type":"object","additionalProperties":false,"required":["file_alias","query","limit"],"properties":{"file_alias":{"type":"string"},"query":{"type":"string","maxLength":256},"limit":{"type":"integer","minimum":1,"maximum":20}}}},
-            {"name":"submit_result","description":"Submit a structured roundtable result","inputSchema":{"type":"object","additionalProperties":false,"required":["submission_id","result"],"properties":{"submission_id":{"type":"string"},"result":{"type":"object"}}}}
-        ]}),
+        Some("tools/list") => {
+            let submit_schema =
+                roundtable_protocol::submit_result_input_schema(authority.pinned_phase_kind());
+            json!({"tools":[
+                {"name":"read_evidence","description":"Read frozen evidence lines","inputSchema":{"type":"object","additionalProperties":false,"required":["file_alias","start_line","end_line"],"properties":{"file_alias":{"type":"string"},"start_line":{"type":"integer","minimum":1},"end_line":{"type":"integer","minimum":1}}}},
+                {"name":"search_evidence","description":"Search frozen evidence literally","inputSchema":{"type":"object","additionalProperties":false,"required":["file_alias","query","limit"],"properties":{"file_alias":{"type":"string"},"query":{"type":"string","maxLength":256},"limit":{"type":"integer","minimum":1,"maximum":20}}}},
+                {"name":"submit_result","description":"Submit one phase result. result must match inputSchema for this phase. Use a new submission_id for each distinct body.","inputSchema": submit_schema}
+            ]})
+        }
         Some("tools/call") => {
             let params = &request["params"];
             let call = RoundtableToolCall {
