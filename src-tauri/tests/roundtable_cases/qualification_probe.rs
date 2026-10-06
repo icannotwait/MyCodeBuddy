@@ -265,7 +265,12 @@ fn slirp_hook_backgrounds_and_joins_the_user_namespace() {
     assert!(script.contains("--netns-type=path"));
     assert!(script.contains("--ready-fd"));
     assert!(!script.contains("exec \"$1\""));
+    assert!(script.contains("ready_byte"));
+    assert!(script.contains("!= \"1\""));
+    assert!(script.contains("while kill -0"));
+    assert!(script.contains("sleep 0.2"));
     assert!(script.contains("exit 0"));
+    assert_eq!(codeg_lib::roundtable::slirp_hook_phase(), "poststart");
 }
 
 #[test]
@@ -281,6 +286,10 @@ fn syscall_allowlist_covers_adapter_startup_and_still_denies_mount() {
         "inotify_init1",
         "inotify_add_watch",
         "membarrier",
+        "sendmmsg",
+        "recvmmsg",
+        "getitimer",
+        "setitimer",
     ] {
         assert!(names.contains(&required), "{required}");
     }
@@ -320,6 +329,79 @@ fn advertised_models_must_include_the_binding() {
     let empty =
         codeg_lib::roundtable::advertised_probe_models(&serde_json::json!({"sessionId": "s"}));
     assert!(empty.is_empty());
+}
+
+#[test]
+fn model_check_uses_the_provider_for_the_agent() {
+    let providers = vec![
+        ProviderBinding {
+            provider_ref: "provider:grok".into(),
+            model: "grok-4.6".into(),
+            origin: "https://api.x.ai".into(),
+            credential_env: "XAI_API_KEY".into(),
+            supported_efforts: vec!["low".into()],
+        },
+        ProviderBinding {
+            provider_ref: "provider:antigravity".into(),
+            model: "gemini-3.8-flash-high".into(),
+            origin: "https://cloudcode-pa.googleapis.com".into(),
+            credential_env: "GEMINI_API_KEY".into(),
+            supported_efforts: vec!["low".into()],
+        },
+    ];
+    let session = serde_json::json!({
+        "currentModelId": "gemini-3.8-flash-high",
+        "models": [{"modelId": "gemini-3.8-flash-high"}]
+    });
+    let matched =
+        codeg_lib::roundtable::probe_model_binding_error("antigravity", &session, &providers);
+    assert!(matched.is_none(), "{matched:?}");
+    let mismatch = codeg_lib::roundtable::probe_model_binding_error("grok", &session, &providers)
+        .expect("grok model is not advertised");
+    assert!(mismatch.contains("grok-4.6"), "{mismatch}");
+}
+
+#[test]
+fn reap_treats_a_missing_container_as_reaped_only_when_the_cgroup_is_gone() {
+    let gone =
+        "cannot open directory '/var/lib/codeg/state/cq-isolation': No such file or directory";
+    assert!(codeg_lib::roundtable::probe_reap_classification(false, gone, false, false).is_ok());
+    let still_there = codeg_lib::roundtable::probe_reap_classification(false, gone, false, true)
+        .expect_err("cgroup remains");
+    assert!(still_there.contains("cgroup"), "{still_there}");
+    let state_remains = codeg_lib::roundtable::probe_reap_classification(false, gone, true, false)
+        .expect_err("state remains");
+    assert!(!state_remains.is_empty());
+    let other =
+        codeg_lib::roundtable::probe_reap_classification(false, "permission denied", false, false)
+            .expect_err("unrelated delete failure");
+    assert!(other.contains("permission denied"), "{other}");
+    assert!(codeg_lib::roundtable::probe_reap_classification(true, "", false, false).is_ok());
+    let leftover = codeg_lib::roundtable::probe_reap_classification(true, "", false, true)
+        .expect_err("successful delete left a cgroup");
+    assert!(leftover.contains("cgroup"), "{leftover}");
+}
+
+#[test]
+fn scratch_home_is_per_adapter_and_per_run_and_removed() {
+    let root = scratch();
+    let grok = codeg_lib::roundtable::probe_scratch_home(&root, "grok", "cq-egress");
+    let again = codeg_lib::roundtable::probe_scratch_home(&root, "grok", "cq-egress");
+    let cursor = codeg_lib::roundtable::probe_scratch_home(&root, "cursor", "cq-egress");
+    assert_ne!(grok, again);
+    assert!(grok.starts_with(root.join("home-upper").join("grok")));
+    assert!(cursor.starts_with(root.join("home-upper").join("cursor")));
+    assert!(grok
+        .file_name()
+        .unwrap()
+        .to_string_lossy()
+        .starts_with("cq-egress-"));
+    assert!(!grok.ends_with("cq-egress"));
+    fs::create_dir_all(&grok).expect("home");
+    fs::write(grok.join("marker"), b"x").expect("marker");
+    codeg_lib::roundtable::remove_probe_scratch_home(&grok);
+    assert!(!grok.exists());
+    let _ = fs::remove_dir_all(&root);
 }
 
 #[test]

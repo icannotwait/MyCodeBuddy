@@ -185,6 +185,10 @@ pub(crate) fn linux_slirp_hook_script() -> &'static str {
     linux_oci::SLIRP_HOOK_SCRIPT
 }
 
+pub(crate) fn linux_slirp_hook_phase() -> &'static str {
+    linux_oci::SLIRP_HOOK_PHASE
+}
+
 pub(crate) fn linux_slirp_binary() -> Option<PathBuf> {
     linux_oci::slirp_binary()
 }
@@ -205,6 +209,11 @@ pub fn syscall_allowlist() -> &'static [&'static str] {
 #[cfg(any(test, feature = "test-utils"))]
 pub fn slirp_hook_script() -> &'static str {
     linux_oci::SLIRP_HOOK_SCRIPT
+}
+
+#[cfg(any(test, feature = "test-utils"))]
+pub fn slirp_hook_phase() -> &'static str {
+    linux_oci::SLIRP_HOOK_PHASE
 }
 
 #[cfg(any(test, feature = "test-utils"))]

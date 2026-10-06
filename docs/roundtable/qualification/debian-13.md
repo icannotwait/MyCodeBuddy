@@ -67,6 +67,20 @@ container's slirp path is general egress: the probe checks that the
 provider origin answers on port 443 and records whether `1.1.1.1:443`
 also answers. It does not claim an origin-only filter.
 
+The slirp helper is an OCI `poststart` hook. `createRuntime` runs while
+container init is still non-dumpable, so `/proc/<pid>/ns/user` does not
+exist and slirp exits before it writes the ready byte. The hook reads
+that byte and fails unless it is `1`. It then leaves a watcher,
+`( while kill -0 $pid; do sleep 0.2; done; kill $slirp ) &`, because
+crun adopts the orphaned slirp process and `crun run` would otherwise
+wait on it forever.
+
+`crun run` deletes a container that exits on its own. The probe's later
+`crun delete` then fails with `cannot open directory …/state/<id>`.
+That still counts as reaped when the container state directory is gone
+and its cgroup directory is gone. A delete error while the cgroup
+directory remains is not `REAPED`.
+
 ## Rootfs
 
 One rootfs directory can hold every adapter. Do not put credentials,
@@ -115,7 +129,10 @@ auth placeholders are empty regular files. The probe mounts a tmpfs on
 `/dev` (with `/dev/pts` and `/dev/shm`) so rootless crun does not create
 device nodes in the image and change the digest. `/sys` is mounted
 read-only. `/tmp` is a writable tmpfs. `/rt-home` is a writable scratch
-directory; each auth file is then bind-mounted read-only on top of it.
+directory for that adapter and that container run
+(`home-upper/<agent>/<container-id>-<run>`), with each auth file
+bind-mounted read-only on top of it. The probe removes the scratch
+directory after the container is reaped, including when the run fails.
 The image root stays read-only. `/dev/mem` and `/dev/sda` are still
 denied.
 
@@ -197,6 +214,11 @@ they exist and are not inside the rootfs:
   `CURSOR_CONFIG_DIR`. At least one of those two files must exist.
   `session/new` also needs the slirp path to the Cursor origin; a
   visible token with no network still returns `Authentication required`.
+  On the Debian 13 host those files were still not enough: `cursor-agent
+  acp` returned `Authentication required` against the real home as well,
+  while `cursor-agent status` was logged in. ACP `session/new` succeeded
+  on the host only with `CURSOR_API_KEY` (desktop
+  `CURSOR_AUTH_MODE=custom`). This probe does not inject that key.
 - `$HOME/.gemini/antigravity-acp/settings.json` and
   `$HOME/.gemini/antigravity-acp/acp_token.json`
   (`acp_business_token.json` is mounted when it exists)
@@ -220,14 +242,14 @@ cat > "$HOME/roundtable-providers.json" <<'EOF'
   },
   {
     "provider_ref": "provider:cursor",
-    "model": "composer-2.5",
+    "model": "composer-2.5[fast=true]",
     "origin": "https://api2.cursor.sh",
     "credential_env": "CURSOR_API_KEY",
     "supported_efforts": ["low", "high"]
   },
   {
     "provider_ref": "provider:antigravity",
-    "model": "gemini-2.5-pro",
+    "model": "gemini-3.8-flash-high",
     "origin": "https://cloudcode-pa.googleapis.com",
     "credential_env": "GEMINI_API_KEY",
     "supported_efforts": ["low", "high"]
@@ -236,13 +258,18 @@ cat > "$HOME/roundtable-providers.json" <<'EOF'
 EOF
 ```
 
-Use the same `provider_ref` and `model` the room will send. Grok
-1.0.46's `session/new` advertises `grok-4.6` as its default. The probe
-reads the model ids from that response (`currentModelId`, `models`, and
-`configOptions` whose id contains `model`) and fails
-`endpoint_compatibility` when the binding is missing from that list or
-when the adapter advertises no model. Do not invent an id the adapter
-did not report. Origins must be `https` with no user, path, or query.
+Use the same `provider_ref` and `model` the room will send. The probe
+selects the row whose `provider_ref` is `provider:<agent>` (the same
+lookup as the origin check). It does not use the first row for every
+adapter. Grok 1.0.46's `session/new` advertises `grok-4.6`. Antigravity
+1.3.0 advertises `gemini-3.8-flash-high`. Cursor
+2026.09.28-64d2043 advertises `composer-2.5[fast=true]` once ACP
+authentication succeeds. The probe reads ids from that response
+(`currentModelId`, `models`, and `configOptions` whose id contains
+`model`) and fails `endpoint_compatibility` when the selected binding
+is missing from that list or when the adapter advertises no model. Do
+not invent an id the adapter did not report. Origins must be `https`
+with no user, path, or query.
 File-auth adapters (Grok, Cursor, Antigravity) are admitted when the
 mounted auth files exist even if that environment variable is unset.
 Codex still uses the named variable as the host-side gateway

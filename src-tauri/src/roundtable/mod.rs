@@ -142,7 +142,10 @@ pub use qualification::{
 };
 pub use qualification_harness::QualificationHarness;
 #[cfg(any(test, feature = "test-utils"))]
-pub use qualification_linux::{advertised_probe_models, isolation_probe_script};
+pub use qualification_linux::{
+    advertised_probe_models, isolation_probe_script, probe_model_binding_error,
+    probe_reap_classification, probe_scratch_home, remove_probe_scratch_home,
+};
 #[cfg(any(test, feature = "test-utils"))]
 pub use qualification_probe::{assemble_probe_report_for_test, verify_installed_report_for_test};
 pub use qualification_probe::{
@@ -182,7 +185,9 @@ pub use sandbox::{
     QualifiedOciProfile, SandboxInput, SandboxInstance, SandboxPlan,
 };
 #[cfg(any(test, feature = "test-utils"))]
-pub use sandbox::{cgroup_delegation_failure, slirp_hook_script, syscall_allowlist};
+pub use sandbox::{
+    cgroup_delegation_failure, slirp_hook_phase, slirp_hook_script, syscall_allowlist,
+};
 pub use schema::{
     apply_roundtable_schema, drop_roundtable_schema, roundtable_table_names, DurabilityProfile,
     LOGICAL_MODEL, RECORDED_DURABILITY,

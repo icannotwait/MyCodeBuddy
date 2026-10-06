@@ -356,7 +356,7 @@ pub async fn measure_host(request: &ProbeRequest) -> ProbeFacts {
             facts
                 .checks
                 .push(pass("new_session", "ACP initialize and session/new"));
-            match model_binding_error(&turn.session, &facts.providers) {
+            match model_binding_error(&request.agent, &turn.session, &facts.providers) {
                 None => facts.checks.push(pass(
                     "endpoint_compatibility",
                     &format!("protocolVersion 1; {}", turn.egress_note),
@@ -654,13 +654,13 @@ async fn run_mcp(request: &ProbeRequest, token: &str) -> Result<(), String> {
             "--incarnation".into(),
             "qualify".into(),
         ];
-        let (bundle, id) = prepare_bundle(request, &argv, &mounts, None, false, Some(token))?;
+        let prepared = prepare_bundle(request, &argv, &mounts, None, false, Some(token))?;
         let mut child = Command::new(&request.crun)
             .args(crun_prefix(request))
             .arg("run")
             .arg("--bundle")
-            .arg(&bundle)
-            .arg(&id)
+            .arg(&prepared.bundle)
+            .arg(&prepared.id)
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .kill_on_drop(true)
@@ -681,7 +681,7 @@ async fn run_mcp(request: &ProbeRequest, token: &str) -> Result<(), String> {
         };
         let _ = child.start_kill();
         let _ = child.wait().await;
-        let reaped = reap(request, &id).await.is_ok();
+        let reaped = reap(request, &prepared.id).await.is_ok();
         if connected && reaped {
             Ok(())
         } else {
@@ -765,13 +765,13 @@ async fn run_acp_session(
     token: &str,
     egress_note: String,
 ) -> Result<TurnOutcome, String> {
-    let (bundle, id) = prepare_bundle(request, argv, mounts, None, true, None)?;
+    let prepared = prepare_bundle(request, argv, mounts, None, true, None)?;
     let mut child = Command::new(&request.crun)
         .args(crun_prefix(request))
         .arg("run")
         .arg("--bundle")
-        .arg(&bundle)
-        .arg(&id)
+        .arg(&prepared.bundle)
+        .arg(&prepared.id)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -788,7 +788,7 @@ async fn run_acp_session(
     }))
     .await?;
     if init["protocolVersion"] != 1 {
-        let _ = reap(request, &id).await;
+        let _ = reap(request, &prepared.id).await;
         return Err("acp protocol version".into());
     }
     let session = rpc(
@@ -827,7 +827,7 @@ async fn run_acp_session(
     )
     .await;
     let _ = child.start_kill();
-    let _ = reap(request, &id).await;
+    let _ = reap(request, &prepared.id).await;
     let result = result?;
     Ok(TurnOutcome {
         completed: result["stopReason"] == "end_turn",
@@ -908,15 +908,15 @@ async fn run_container(
     slirp: bool,
     token: Option<&str>,
 ) -> Result<String, String> {
-    let (bundle, id) = prepare_bundle(request, argv, mounts, secret, slirp, token)?;
+    let prepared = prepare_bundle(request, argv, mounts, secret, slirp, token)?;
     let output = tokio::time::timeout(
         timeout,
         Command::new(&request.crun)
             .args(crun_prefix(request))
             .arg("run")
             .arg("--bundle")
-            .arg(&bundle)
-            .arg(&id)
+            .arg(&prepared.bundle)
+            .arg(&prepared.id)
             .output(),
     )
     .await
@@ -924,7 +924,7 @@ async fn run_container(
     .map_err(|error| error.to_string())?;
     let mut text = String::from_utf8_lossy(&output.stdout).into_owned();
     text.push_str(&String::from_utf8_lossy(&output.stderr));
-    if reap(request, &id).await.is_ok() {
+    if reap(request, &prepared.id).await.is_ok() {
         text.push_str("\nREAPED\n");
     }
     if !output.status.success() && !text.contains("ISOLATION_OK") {
@@ -942,6 +942,41 @@ fn crun_prefix(request: &ProbeRequest) -> Vec<String> {
     ]
 }
 
+struct PreparedBundle {
+    bundle: PathBuf,
+    id: String,
+    home: PathBuf,
+}
+
+impl Drop for PreparedBundle {
+    fn drop(&mut self) {
+        remove_scratch_home(&self.home);
+    }
+}
+
+/// Removes `path` if `prepare_bundle` returns before the bundle is live.
+struct RemoveOnDrop {
+    path: Option<PathBuf>,
+}
+
+impl RemoveOnDrop {
+    fn arm(path: PathBuf) -> Self {
+        Self { path: Some(path) }
+    }
+
+    fn disarm(mut self) -> PathBuf {
+        self.path.take().unwrap_or_default()
+    }
+}
+
+impl Drop for RemoveOnDrop {
+    fn drop(&mut self) {
+        if let Some(path) = self.path.take() {
+            remove_scratch_home(&path);
+        }
+    }
+}
+
 fn prepare_bundle(
     request: &ProbeRequest,
     argv: &[String],
@@ -949,7 +984,7 @@ fn prepare_bundle(
     secret: Option<&Path>,
     slirp: bool,
     token: Option<&str>,
-) -> Result<(PathBuf, String), String> {
+) -> Result<PreparedBundle, String> {
     let _ = fs::create_dir_all(request.runtime_root.join("state"));
     let id = if argv.iter().any(|arg| arg.contains("codeg-mcp")) {
         "cq-mcp".to_string()
@@ -980,8 +1015,9 @@ fn prepare_bundle(
             "options": options
         }));
     }
-    let upper = request.runtime_root.join("home-upper").join(&id);
+    let upper = scratch_home_dir(&request.runtime_root, &request.agent, &id);
     fs::create_dir_all(&upper).map_err(|error| error.to_string())?;
+    let home_guard = RemoveOnDrop::arm(upper.clone());
     for (_, destination, _) in &auth_mounts {
         let relative = destination
             .strip_prefix("/rt-home/")
@@ -1054,13 +1090,16 @@ fn prepare_bundle(
         let pid_dir = request.runtime_root.join("slirp-pids");
         fs::create_dir_all(&pid_dir).map_err(|error| error.to_string())?;
         let pidfile = pid_dir.join(format!("{id}.pid"));
-        hooks = serde_json::json!({
-            "createRuntime": [{
+        let mut hook_set = serde_json::Map::new();
+        hook_set.insert(
+            super::sandbox::linux_slirp_hook_phase().to_string(),
+            serde_json::json!([{
                 "path": hook,
                 "args": ["slirp-hook.sh", slirp_bin, pidfile],
                 "env": []
-            }]
-        });
+            }]),
+        );
+        hooks = serde_json::Value::Object(hook_set);
         let resolv = request.runtime_root.join("slirp-resolv.conf");
         fs::write(&resolv, b"nameserver 10.0.2.3\n").map_err(|error| error.to_string())?;
         oci_mounts.push(serde_json::json!({
@@ -1125,7 +1164,11 @@ fn prepare_bundle(
         serde_json::to_vec_pretty(&spec).map_err(|error| error.to_string())?,
     )
     .map_err(|error| error.to_string())?;
-    Ok((bundle, id))
+    Ok(PreparedBundle {
+        bundle,
+        id,
+        home: home_guard.disarm(),
+    })
 }
 
 fn current_uid() -> u32 {
@@ -1262,18 +1305,23 @@ fn request_origin_host(request: &ProbeRequest) -> Result<String, String> {
         .map_err(|_| "provider bindings file missing".to_string())?;
     let providers: Vec<super::installed_runtime::ProviderBinding> =
         serde_json::from_slice(&bytes).map_err(|_| "provider bindings unreadable".to_string())?;
-    let origin = providers
-        .iter()
-        .find(|provider| {
-            provider.provider_ref == format!("provider:{}", request.agent)
-                || provider
-                    .provider_ref
-                    .ends_with(&format!(":{}", request.agent))
-        })
-        .or_else(|| providers.first())
+    let origin = provider_for_agent(&providers, &request.agent)
         .map(|provider| provider.origin.clone())
         .ok_or_else(|| "provider bindings missing".to_string())?;
     origin_host(&origin).ok_or_else(|| format!("provider origin is not an https host: {origin}"))
+}
+
+fn provider_for_agent<'a>(
+    providers: &'a [ProviderBinding],
+    agent: &str,
+) -> Option<&'a ProviderBinding> {
+    providers
+        .iter()
+        .find(|provider| {
+            provider.provider_ref == format!("provider:{agent}")
+                || provider.provider_ref.ends_with(&format!(":{agent}"))
+        })
+        .or_else(|| providers.first())
 }
 
 fn advertised_model_ids(session: &serde_json::Value) -> std::collections::BTreeSet<String> {
@@ -1329,14 +1377,15 @@ fn advertised_model_ids(session: &serde_json::Value) -> std::collections::BTreeS
 }
 
 fn model_binding_error(
+    agent: &str,
     session: &serde_json::Value,
-    providers: &[super::installed_runtime::ProviderBinding],
+    providers: &[ProviderBinding],
 ) -> Option<String> {
     let advertised = advertised_model_ids(session);
     if advertised.is_empty() {
         return Some("session/new did not advertise a model id".to_string());
     }
-    let Some(provider) = providers.first() else {
+    let Some(provider) = provider_for_agent(providers, agent) else {
         return Some("provider bindings missing".to_string());
     };
     if advertised.contains(&provider.model) {
@@ -1348,6 +1397,82 @@ fn model_binding_error(
             advertised.into_iter().collect::<Vec<_>>().join(",")
         ))
     }
+}
+
+fn scratch_home_dir(runtime_root: &Path, agent: &str, container_id: &str) -> PathBuf {
+    let agent: String = agent
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let agent = if agent.is_empty() {
+        "adapter".to_string()
+    } else {
+        agent
+    };
+    let nonce = uuid::Uuid::new_v4().simple().to_string();
+    runtime_root
+        .join("home-upper")
+        .join(agent)
+        .join(format!("{container_id}-{nonce}"))
+}
+
+fn remove_scratch_home(path: &Path) {
+    if path.as_os_str().is_empty() {
+        return;
+    }
+    let _ = fs::remove_dir_all(path);
+    if let Some(parent) = path.parent() {
+        let _ = fs::remove_dir(parent);
+    }
+}
+
+/// `crun run` deletes a container that exits on its own. A later `crun delete`
+/// then fails because the state directory is already gone. That is reaped
+/// only when the container cgroup directory is gone too. A delete failure
+/// while the state directory or the cgroup directory remains is not reaped.
+fn classify_container_reap(
+    delete_succeeded: bool,
+    delete_stderr: &str,
+    state_dir_exists: bool,
+    cgroup_dir_exists: bool,
+) -> Result<(), String> {
+    let already_gone = !state_dir_exists && delete_reports_missing_container(delete_stderr);
+    if !delete_succeeded && !already_gone {
+        return Err(if delete_stderr.is_empty() {
+            "crun delete failed".to_string()
+        } else {
+            delete_stderr.to_string()
+        });
+    }
+    if cgroup_dir_exists {
+        return Err("container cgroup directory still exists".to_string());
+    }
+    Ok(())
+}
+
+fn delete_reports_missing_container(stderr: &str) -> bool {
+    let lower = stderr.to_ascii_lowercase();
+    lower.contains("cannot open directory")
+        || lower.contains("no such file")
+        || lower.contains("no such container")
+        || lower.contains("container does not exist")
+        || lower.contains("does not exist")
+}
+
+async fn cgroup_dir_released(path: &Path) -> bool {
+    for _ in 0..25 {
+        if !path.exists() {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(40)).await;
+    }
+    !path.exists()
 }
 
 async fn reap(request: &ProbeRequest, id: &str) -> Result<(), String> {
@@ -1366,11 +1491,16 @@ async fn reap(request: &ProbeRequest, id: &str) -> Result<(), String> {
         .output()
         .await
         .map_err(|error| error.to_string())?;
-    if output.status.success() {
-        Ok(())
-    } else {
-        Err(String::from_utf8_lossy(&output.stderr).into_owned())
-    }
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    let state_dir = request.runtime_root.join("state").join(id);
+    let cgroup_dir = request.cgroup_root.join(id);
+    let cgroup_exists = !cgroup_dir_released(&cgroup_dir).await;
+    classify_container_reap(
+        output.status.success(),
+        &stderr,
+        state_dir.exists(),
+        cgroup_exists,
+    )
 }
 
 fn redact_keep(input: &str) -> String {
@@ -1392,6 +1522,40 @@ pub fn isolation_probe_script() -> &'static str {
 #[cfg(any(test, feature = "test-utils"))]
 pub fn advertised_probe_models(session: &serde_json::Value) -> std::collections::BTreeSet<String> {
     advertised_model_ids(session)
+}
+
+#[cfg(any(test, feature = "test-utils"))]
+pub fn probe_model_binding_error(
+    agent: &str,
+    session: &serde_json::Value,
+    providers: &[ProviderBinding],
+) -> Option<String> {
+    model_binding_error(agent, session, providers)
+}
+
+#[cfg(any(test, feature = "test-utils"))]
+pub fn probe_reap_classification(
+    delete_succeeded: bool,
+    delete_stderr: &str,
+    state_dir_exists: bool,
+    cgroup_dir_exists: bool,
+) -> Result<(), String> {
+    classify_container_reap(
+        delete_succeeded,
+        delete_stderr,
+        state_dir_exists,
+        cgroup_dir_exists,
+    )
+}
+
+#[cfg(any(test, feature = "test-utils"))]
+pub fn probe_scratch_home(runtime_root: &Path, agent: &str, container_id: &str) -> PathBuf {
+    scratch_home_dir(runtime_root, agent, container_id)
+}
+
+#[cfg(any(test, feature = "test-utils"))]
+pub fn remove_probe_scratch_home(path: &Path) {
+    remove_scratch_home(path);
 }
 
 const ISOLATION_SCRIPT: &str = r#"#!/bin/sh

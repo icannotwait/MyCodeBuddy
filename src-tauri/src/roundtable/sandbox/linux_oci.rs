@@ -422,6 +422,10 @@ pub(crate) const SYSCALLS: &[&str] = &[
     "recvfrom",
     "sendmsg",
     "recvmsg",
+    // glibc and Node resolve AF_UNSPEC with these. Without them DNS
+    // returns EAI_AGAIN even when the slirp resolver is up.
+    "sendmmsg",
+    "recvmmsg",
     "shutdown",
     "clone",
     "clone3",
@@ -461,6 +465,9 @@ pub(crate) const SYSCALLS: &[&str] = &[
     "getpgid",
     "setpgid",
     "setsid",
+    // Antigravity 1.3.0 aborts in its runtime when interval timers are denied.
+    "getitimer",
+    "setitimer",
     "timerfd_create",
     "timerfd_settime",
     "timerfd_gettime",
@@ -866,12 +873,18 @@ fn install_home_upper(plan: &mut SandboxPlan, profile: &QualifiedOciProfile) -> 
     Ok(())
 }
 
+/// OCI hook phase. `createRuntime` runs while container init is still
+/// non-dumpable, so `/proc/<pid>/ns/user` does not exist yet. `poststart`
+/// runs after the user process is executed and the namespace path is visible.
+pub(crate) const SLIRP_HOOK_PHASE: &str = "poststart";
+
 pub(crate) const SLIRP_HOOK_SCRIPT: &str = r#"#!/bin/sh
 state=$(cat)
 pid=$(printf '%s' "$state" | sed -n 's/.*"pid"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' | head -n 1)
 [ -n "$pid" ] || exit 1
-# Do not exec slirp in the foreground: crun waits for this hook. Join the
-# container user namespace before its netns; rootless setns otherwise is EACCES.
+# poststart: the user namespace exists. A closed ready fifo is EOF, not the
+# ready byte, so require "1". Do not exec slirp: crun is a child subreaper
+# and waits on that orphan, so `crun run` would never return.
 ready="${TMPDIR:-/tmp}/codeg-slirp-ready-$$"
 rm -f "$ready"
 mkfifo "$ready" || exit 1
@@ -881,12 +894,16 @@ mkfifo "$ready" || exit 1
   --ready-fd 3 \
   "/proc/$pid/ns/net" \
   tap0 >/dev/null 2>&1 3>"$ready" </dev/null &
-echo $! > "$2"
-if ! timeout 8 cat "$ready" >/dev/null 2>&1; then
-  rm -f "$ready"
+slirp=$!
+echo "$slirp" > "$2"
+ready_byte=$(timeout 8 dd bs=1 count=1 <"$ready" 2>/dev/null || true)
+rm -f "$ready"
+if [ "$ready_byte" != "1" ]; then
+  kill "$slirp" 2>/dev/null || true
   exit 1
 fi
-rm -f "$ready"
+# Kill slirp when the container pid exits so crun can finish waiting.
+( while kill -0 "$pid"; do sleep 0.2; done; kill "$slirp" ) &
 exit 0
 "#;
 
@@ -912,7 +929,7 @@ fn install_slirp_hook(
     plan.oci["annotations"]["io.codeg.roundtable.network"] =
         json!("slirp-egress-not-origin-filtered");
     plan.oci["hooks"] = json!({
-        "createRuntime": [{
+        SLIRP_HOOK_PHASE: [{
             "path": hook,
             "args": ["slirp-hook.sh", slirp, pidfile],
             "env": []
