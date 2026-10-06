@@ -19,8 +19,13 @@ measured. A Debian 12 certificate does not verify on Debian 13.
 | --- | --- | --- | --- | --- |
 | Codex | `linux-codex-2.1.1` | `/usr/local/bin/codex-acp` | `2.1.1` | `.codex/auth.json` |
 | Grok | `linux-grok-1.0.46` | `/usr/local/bin/grok` with args `--no-auto-update agent stdio` | `1.0.46` | `.grok/auth.json` |
-| Cursor | `linux-cursor-acp-2026.09.28-64d2043` | `/usr/local/bin/cursor-agent` with arg `acp` | `2026.09.28-64d2043` | `.cursor/cli-config.json` and `.config/cursor/auth.json` |
-| Antigravity | `linux-antigravity-acp-1.2.1` | `/usr/local/bin/agy_acp_server.par` with arg `--uid=` | `1.2.1` | `.gemini/antigravity-acp/settings.json` |
+| Cursor | `linux-cursor-acp-2026.09.28-64d2043` | `/usr/local/bin/cursor-agent` with arg `acp` | `2026.09.28-64d2043` | `.cursor/cli-config.json`, plus one of `.config/cursor/auth.json` (XDG) or `.cursor/auth.json` |
+| Antigravity | `linux-antigravity-acp-1.3.0` (default) | `/usr/local/bin/agy_acp_server.par` with arg `--uid=` | `1.3.0` | `.gemini/antigravity-acp/settings.json` and `acp_token.json` |
+| Antigravity | `linux-antigravity-acp-1.2.1` | same binary and arg | `1.2.1` | same files |
+
+`--agent antigravity` selects `linux-antigravity-acp-1.3.0`. Pass
+`--profile linux-antigravity-acp-1.2.1` when the image still has 1.2.1.
+Do not combine `--profile` with `--agent all`.
 
 Every profile also requires `/usr/local/bin/codeg-mcp` and an ACP
 initialize, `session/new`, and prompt inside the isolator. Grok needs
@@ -34,18 +39,33 @@ directory trees: keep each entry's sibling files beside it
 ```bash
 sudo apt-get update
 sudo apt-get install -y crun slirp4netns debootstrap
-echo '+memory +pids +cpu' | sudo tee /sys/fs/cgroup/cgroup.subtree_control
-sudo mkdir -p /sys/fs/cgroup/codeg-roundtable
-sudo chown "$USER:$USER" /sys/fs/cgroup/codeg-roundtable
+sudo mkdir -p /sys/fs/cgroup/codeg-roundtable/launcher
+# Controllers can be enabled only while this directory contains no processes.
+echo '+memory +pids +cpu' | sudo tee /sys/fs/cgroup/codeg-roundtable/cgroup.subtree_control
+sudo chown -R "$USER:$USER" /sys/fs/cgroup/codeg-roundtable
+# crun moves the container into a sibling of launcher. The probe and the
+# live server must already be inside a child, or that move returns EPERM.
+echo $$ | sudo tee /sys/fs/cgroup/codeg-roundtable/launcher/cgroup.procs
 ```
 
+Start `codeg-server` from that same shell, or from a systemd unit whose
+`Delegate=yes` slice puts the process in
+`/sys/fs/cgroup/codeg-roundtable/launcher` before it launches crun. The
+probe tries the same move and fails with the command above when the
+kernel refuses it. A parent cgroup that still contains the launcher
+process is not enough.
+
 `crun` must be executable at the path you pass (default `/usr/bin/crun`).
-The cgroup directory must contain `cgroup.controllers` and
-`cgroup.events`, and this user must be able to create children.
-Unprivileged user namespaces must already be allowed
+The cgroup directory must contain `cgroup.controllers`,
+`cgroup.events`, and `cgroup.subtree_control` listing `memory`, `pids`,
+and `cpu`. Unprivileged user namespaces must already be allowed
 (`/proc/sys/kernel/unprivileged_userns_clone` is not `0`).
-`slirp4netns` is the egress hook for the ACP turn. If it is missing, the
-turn fails and no certificate is issued.
+`slirp4netns` (1.2.x) is the egress helper for the ACP turn. If it is
+missing, the turn fails and no certificate is issued. The isolation
+container does not start slirp, so it still has only `lo`. The ACP
+container's slirp path is general egress: the probe checks that the
+provider origin answers on port 443 and records whether `1.1.1.1:443`
+also answers. It does not claim an origin-only filter.
 
 ## Rootfs
 
@@ -60,20 +80,44 @@ sudo debootstrap --variant=minbase trixie "$ROOTFS" http://deb.debian.org/debian
 sudo chroot "$ROOTFS" apt-get update
 sudo chroot "$ROOTFS" apt-get install -y nodejs ca-certificates
 sudo mkdir -p "$ROOTFS/usr/local/bin" "$ROOTFS/proc" "$ROOTFS/scratch" \
+  "$ROOTFS/dev/pts" "$ROOTFS/dev/shm" "$ROOTFS/sys" "$ROOTFS/tmp" \
   "$ROOTFS/run/codeg" \
   "$ROOTFS/rt-home/.codex" "$ROOTFS/rt-home/.grok" \
   "$ROOTFS/rt-home/.cursor" "$ROOTFS/rt-home/.config/cursor" \
   "$ROOTFS/rt-home/.gemini/antigravity-acp"
 sudo touch "$ROOTFS/run/codeg/roundtable.sock" "$ROOTFS/run/codeg/gateway.sock"
+# ACP binds the slirp resolver here. A symlink (systemd-resolved) is rejected.
+sudo rm -f "$ROOTFS/etc/resolv.conf"
+sudo touch "$ROOTFS/etc/resolv.conf"
 for rel in .codex/auth.json .grok/auth.json .cursor/cli-config.json \
-  .config/cursor/auth.json .gemini/antigravity-acp/settings.json
+  .cursor/auth.json .config/cursor/auth.json \
+  .gemini/antigravity-acp/settings.json \
+  .gemini/antigravity-acp/acp_token.json \
+  .gemini/antigravity-acp/acp_business_token.json
 do
   sudo touch "$ROOTFS/rt-home/$rel"
 done
+# The digest reads every regular file. chown keeps mode bits, so the
+# digest does not change when only the owner changes. chmod a+rX also
+# makes the tree readable, but it changes modes and therefore the digest.
+sudo chown -R "$USER:$USER" "$ROOTFS"
 ```
 
-`/proc` and `/scratch` are directories. The socket paths and auth
-placeholders are empty regular files.
+The digest (`codeg-rootfs-v2`) hashes symlink text without following it,
+including absolute `/etc/alternatives` links and dangling targets. Device
+nodes, fifos, and sockets contribute type and device numbers; they are
+not opened. A file the probing user cannot read fails the probe and
+names the path.
+
+`/proc`, `/dev`, `/dev/pts`, `/dev/shm`, `/sys`, `/tmp`, `/scratch`, and
+`/rt-home` are directories. The socket paths, `/etc/resolv.conf`, and
+auth placeholders are empty regular files. The probe mounts a tmpfs on
+`/dev` (with `/dev/pts` and `/dev/shm`) so rootless crun does not create
+device nodes in the image and change the digest. `/sys` is mounted
+read-only. `/tmp` is a writable tmpfs. `/rt-home` is a writable scratch
+directory; each auth file is then bind-mounted read-only on top of it.
+The image root stays read-only. `/dev/mem` and `/dev/sda` are still
+denied.
 
 Build `codeg-mcp` and copy that binary only:
 
@@ -122,8 +166,11 @@ Antigravity (both files must sit in the same directory):
 sudo cp agy_acp_server.par localharness_external "$ROOTFS/usr/local/bin/"
 sudo chmod 755 "$ROOTFS/usr/local/bin/agy_acp_server.par" \
   "$ROOTFS/usr/local/bin/localharness_external"
-sudo chroot "$ROOTFS" /usr/local/bin/agy_acp_server.par --version | grep 1.2.1
+sudo chroot "$ROOTFS" /usr/local/bin/agy_acp_server.par --version | grep -E '1\.3\.0|1\.2\.1'
 ```
+
+Use `--profile linux-antigravity-acp-1.3.0` (the default) or
+`--profile linux-antigravity-acp-1.2.1` to match that text.
 
 Codex, when you still want it:
 
@@ -132,12 +179,27 @@ npm install -g @agentclientprotocol/codex-acp@2.1.1
 sudo cp "$(command -v codex-acp)" "$ROOTFS/usr/local/bin/codex-acp"
 ```
 
+After the last `sudo cp` into the image, give the probing user read
+access without changing modes:
+
+```bash
+sudo chown -R "$USER:$USER" "$ROOTFS"
+```
+
 Auth stays on the host. The probe mounts these files read-only when
 they exist and are not inside the rootfs:
 
 - `$HOME/.grok/auth.json`
-- `$HOME/.cursor/cli-config.json` and `$HOME/.config/cursor/auth.json`
-- `$HOME/.gemini/antigravity-acp/settings.json`
+- `$HOME/.cursor/cli-config.json`
+- Cursor's token: `$HOME/.config/cursor/auth.json` (what the Linux CLI
+  reads under `XDG_CONFIG_HOME`, set to `/rt-home/.config`) or
+  `$HOME/.cursor/auth.json` when that build stores it beside
+  `CURSOR_CONFIG_DIR`. At least one of those two files must exist.
+  `session/new` also needs the slirp path to the Cursor origin; a
+  visible token with no network still returns `Authentication required`.
+- `$HOME/.gemini/antigravity-acp/settings.json` and
+  `$HOME/.gemini/antigravity-acp/acp_token.json`
+  (`acp_business_token.json` is mounted when it exists)
 - `$HOME/.codex/auth.json` for Codex
 
 ## Provider bindings
@@ -151,7 +213,7 @@ cat > "$HOME/roundtable-providers.json" <<'EOF'
 [
   {
     "provider_ref": "provider:grok",
-    "model": "grok-4",
+    "model": "grok-4.6",
     "origin": "https://api.x.ai",
     "credential_env": "XAI_API_KEY",
     "supported_efforts": ["low", "high"]
@@ -174,12 +236,17 @@ cat > "$HOME/roundtable-providers.json" <<'EOF'
 EOF
 ```
 
-Use the same `provider_ref` and `model` the room will send. Origins must
-be `https` with no user, path, or query. File-auth adapters (Grok,
-Cursor, Antigravity) are admitted when the mounted auth files exist
-even if that environment variable is unset. Codex still uses the named
-variable as the host-side gateway credential. The value is never copied
-into the image.
+Use the same `provider_ref` and `model` the room will send. Grok
+1.0.46's `session/new` advertises `grok-4.6` as its default. The probe
+reads the model ids from that response (`currentModelId`, `models`, and
+`configOptions` whose id contains `model`) and fails
+`endpoint_compatibility` when the binding is missing from that list or
+when the adapter advertises no model. Do not invent an id the adapter
+did not report. Origins must be `https` with no user, path, or query.
+File-auth adapters (Grok, Cursor, Antigravity) are admitted when the
+mounted auth files exist even if that environment variable is unset.
+Codex still uses the named variable as the host-side gateway
+credential. The value is never copied into the image.
 
 ## Probe
 
@@ -201,7 +268,9 @@ export CODEG_DATA_DIR="${CODEG_DATA_DIR:-$HOME/.codeg}"
   --home "$HOME"
 ```
 
-`--agent` is `grok`, `cursor`, `antigravity`, `codex`, or `all`.
+Add `--profile linux-antigravity-acp-1.2.1` only when that exact build
+is the one in the rootfs. `--agent` is `grok`, `cursor`, `antigravity`,
+`codex`, or `all`.
 Exit 0 means every requested adapter passed. Exit 1 means at least one
 adapter failed. Exit 2 is a usage error.
 
@@ -262,7 +331,7 @@ curl -sS -X POST "$CODEG_ORIGIN/api/roundtable_preflight" \
   "workspace_id": "1",
   "source_refs": [],
   "participants": [
-    {"ordinal": 0, "role": "proposer", "provider_ref": "provider:grok", "model": "grok-4", "agent": "grok"},
+    {"ordinal": 0, "role": "proposer", "provider_ref": "provider:grok", "model": "grok-4.6", "agent": "grok"},
     {"ordinal": 1, "role": "critic", "provider_ref": "provider:cursor", "model": "composer-2.5", "agent": "cursor"},
     {"ordinal": 2, "role": "critic", "provider_ref": "provider:antigravity", "model": "gemini-2.5-pro", "agent": "antigravity"}
   ],

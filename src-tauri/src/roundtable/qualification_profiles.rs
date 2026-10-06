@@ -18,6 +18,8 @@ pub struct AuthFile {
     pub home_relative: &'static str,
     /// Absolute path inside the container.
     pub destination: &'static str,
+    /// Missing optional files are skipped. A required file that is absent fails.
+    pub required: bool,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -33,6 +35,9 @@ pub struct AdapterProfile {
     pub container_mcp: &'static str,
     pub auth_files: &'static [AuthFile],
     pub container_env: &'static [(&'static str, &'static str)],
+    /// When set, at least one existing auth file must use this filename.
+    /// Cursor accepts either XDG `auth.json` or `~/.cursor/auth.json`.
+    pub require_one_filename: Option<&'static str>,
     /// The probe must complete an ACP initialize, session/new, and prompt
     /// inside the isolator. A missing adapter or a failed turn is a failure.
     pub requires_acp_turn: bool,
@@ -55,11 +60,15 @@ const COMMON_ENV: &[(&str, &str)] = &[
 ];
 
 pub fn adapter_profiles() -> &'static [AdapterProfile] {
-    &PROFILES
+    PROFILES
 }
 
 pub fn profile_for_agent(agent: &str) -> Option<&'static AdapterProfile> {
     PROFILES.iter().find(|profile| profile.agent == agent)
+}
+
+pub fn profile_by_id(exact_id: &str) -> Option<&'static AdapterProfile> {
+    PROFILES.iter().find(|profile| profile.exact_id == exact_id)
 }
 
 pub fn os_accepted(profile: &AdapterProfile, name: &str, version: &str) -> bool {
@@ -83,8 +92,10 @@ const PROFILES: &[AdapterProfile] = &[
         auth_files: &[AuthFile {
             home_relative: ".codex/auth.json",
             destination: "/rt-home/.codex/auth.json",
+            required: true,
         }],
         container_env: COMMON_ENV,
+        require_one_filename: None,
         requires_acp_turn: true,
     },
     AdapterProfile {
@@ -100,8 +111,10 @@ const PROFILES: &[AdapterProfile] = &[
         auth_files: &[AuthFile {
             home_relative: ".grok/auth.json",
             destination: "/rt-home/.grok/auth.json",
+            required: true,
         }],
         container_env: COMMON_ENV,
+        require_one_filename: None,
         requires_acp_turn: true,
     },
     AdapterProfile {
@@ -118,17 +131,41 @@ const PROFILES: &[AdapterProfile] = &[
             AuthFile {
                 home_relative: ".cursor/cli-config.json",
                 destination: "/rt-home/.cursor/cli-config.json",
+                required: true,
             },
             AuthFile {
                 home_relative: ".config/cursor/auth.json",
                 destination: "/rt-home/.config/cursor/auth.json",
+                required: false,
+            },
+            AuthFile {
+                home_relative: ".cursor/auth.json",
+                destination: "/rt-home/.cursor/auth.json",
+                required: false,
             },
         ],
         container_env: &[
             ("HOME", "/rt-home"),
             ("PATH", "/usr/local/bin:/usr/bin:/bin"),
             ("CURSOR_CONFIG_DIR", "/rt-home/.cursor"),
+            ("XDG_CONFIG_HOME", "/rt-home/.config"),
         ],
+        require_one_filename: Some("auth.json"),
+        requires_acp_turn: true,
+    },
+    AdapterProfile {
+        exact_id: "linux-antigravity-acp-1.3.0",
+        agent: "antigravity",
+        adapter_version: "antigravity-acp@1.3.0",
+        version_needle: "1.3.0",
+        isolator_version: "linux-oci",
+        accepted_os: DEBIAN,
+        container_cli: "/usr/local/bin/agy_acp_server.par",
+        cli_args: &["--uid="],
+        container_mcp: "/usr/local/bin/codeg-mcp",
+        auth_files: ANTIGRAVITY_AUTH,
+        container_env: ANTIGRAVITY_ENV,
+        require_one_filename: None,
         requires_acp_turn: true,
     },
     AdapterProfile {
@@ -141,15 +178,33 @@ const PROFILES: &[AdapterProfile] = &[
         container_cli: "/usr/local/bin/agy_acp_server.par",
         cli_args: &["--uid="],
         container_mcp: "/usr/local/bin/codeg-mcp",
-        auth_files: &[AuthFile {
-            home_relative: ".gemini/antigravity-acp/settings.json",
-            destination: "/rt-home/.gemini/antigravity-acp/settings.json",
-        }],
-        container_env: &[
-            ("HOME", "/rt-home"),
-            ("PATH", "/usr/local/bin:/usr/bin:/bin"),
-            ("GEMINI_HOME", "/rt-home/.gemini"),
-        ],
+        auth_files: ANTIGRAVITY_AUTH,
+        container_env: ANTIGRAVITY_ENV,
+        require_one_filename: None,
         requires_acp_turn: true,
+    },
+];
+
+const ANTIGRAVITY_ENV: &[(&str, &str)] = &[
+    ("HOME", "/rt-home"),
+    ("PATH", "/usr/local/bin:/usr/bin:/bin"),
+    ("GEMINI_HOME", "/rt-home/.gemini"),
+];
+
+const ANTIGRAVITY_AUTH: &[AuthFile] = &[
+    AuthFile {
+        home_relative: ".gemini/antigravity-acp/settings.json",
+        destination: "/rt-home/.gemini/antigravity-acp/settings.json",
+        required: true,
+    },
+    AuthFile {
+        home_relative: ".gemini/antigravity-acp/acp_token.json",
+        destination: "/rt-home/.gemini/antigravity-acp/acp_token.json",
+        required: true,
+    },
+    AuthFile {
+        home_relative: ".gemini/antigravity-acp/acp_business_token.json",
+        destination: "/rt-home/.gemini/antigravity-acp/acp_business_token.json",
+        required: false,
     },
 ];

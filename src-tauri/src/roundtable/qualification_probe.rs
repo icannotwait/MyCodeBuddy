@@ -14,7 +14,9 @@ use serde_json::{json, Value};
 use super::installed_runtime::{shared_core_hashes, InstalledRuntime, ProviderBinding};
 use super::qualification::{CertifiedBinary, OsIdentity, QualificationKey};
 use super::qualification_linux::measure_host;
-use super::qualification_profiles::{os_accepted, profile_for_agent, AdapterProfile};
+use super::qualification_profiles::{
+    os_accepted, profile_by_id, profile_for_agent, AdapterProfile,
+};
 use super::rt_error;
 use super::sandbox::QualifiedOciProfile;
 use roundtable_protocol::ErrorCode;
@@ -42,6 +44,7 @@ pub struct ProbeCheck {
 #[derive(Clone, Debug)]
 pub struct ProbeFacts {
     pub agent: String,
+    pub profile_id: String,
     pub os_name: String,
     pub os_version: String,
     pub kernel: String,
@@ -70,6 +73,8 @@ pub struct ProbeRequest {
     pub runtime_root: PathBuf,
     pub provider_bindings: PathBuf,
     pub home: PathBuf,
+    /// Exact profile id. Empty selects the default profile for `agent`.
+    pub profile_id: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -125,6 +130,7 @@ pub fn qualify_cli(args: &[String]) -> Result<Vec<ProbeOutcome>, String> {
     let mut runtime_root = None;
     let mut bindings = None;
     let mut home = std::env::var_os("HOME").map(PathBuf::from);
+    let mut profile_id = None;
     let mut index = 0;
     while index < args.len() {
         let arg = &args[index];
@@ -171,6 +177,10 @@ pub fn qualify_cli(args: &[String]) -> Result<Vec<ProbeOutcome>, String> {
                 home = Some(PathBuf::from(value()?));
                 index += 2;
             }
+            "--profile" => {
+                profile_id = Some(value()?);
+                index += 2;
+            }
             other => return Err(format!("unknown argument {other}")),
         }
     }
@@ -183,6 +193,9 @@ pub fn qualify_cli(args: &[String]) -> Result<Vec<ProbeOutcome>, String> {
     let cgroup_root =
         cgroup_root.unwrap_or_else(|| PathBuf::from("/sys/fs/cgroup/codeg-roundtable"));
     let runtime_root = runtime_root.unwrap_or_else(|| data_dir.join("roundtable/oci"));
+    if agent == "all" && profile_id.is_some() {
+        return Err("--profile cannot be combined with --agent all".into());
+    }
     let agents: Vec<String> = if agent == "all" {
         ["grok", "cursor", "antigravity", "codex"]
             .into_iter()
@@ -207,6 +220,7 @@ pub fn qualify_cli(args: &[String]) -> Result<Vec<ProbeOutcome>, String> {
                 runtime_root: runtime_root.clone(),
                 provider_bindings: bindings.clone(),
                 home: home.clone(),
+                profile_id: profile_id.clone(),
             };
             outcomes.push(qualify_adapter_on_host(request).await);
         }
@@ -217,7 +231,7 @@ pub fn qualify_cli(args: &[String]) -> Result<Vec<ProbeOutcome>, String> {
 fn help_text() -> String {
     "codeg-server roundtable-qualify --agent grok|cursor|antigravity|codex|all \
 --data-dir DIR --rootfs DIR --provider-bindings FILE [--crun PATH] \
-[--cgroup-root PATH] [--runtime-root PATH] [--home PATH]\n\
+[--cgroup-root PATH] [--runtime-root PATH] [--home PATH] [--profile ID]\n\
 Writes roundtable/qualification/<profile>/report.json. Writes \
 roundtable/qualified-runtime.json only when the verdict is passed."
         .to_string()
@@ -263,7 +277,11 @@ fn revoke_passed_report(path: &Path) {
 }
 
 pub(crate) fn write_outcome(data_dir: &Path, facts: ProbeFacts) -> ProbeOutcome {
-    let profile = profile_for_agent(&facts.agent);
+    let profile = if facts.profile_id.is_empty() {
+        profile_for_agent(&facts.agent)
+    } else {
+        profile_by_id(&facts.profile_id)
+    };
     let mut reasons = facts.anomalies.clone();
     let decision = decide(profile, &facts, &mut reasons);
     let exact_id = profile
@@ -519,7 +537,7 @@ fn render_report(
                 .find(|check| check.name == *name)
                 .map(|check| check.status.as_str())
                 .unwrap_or("not_tested");
-            json!({"name": name, "status": if passed { status } else { status }})
+            json!({"name": name, "status": status})
         })
         .collect();
     let field = |name: &str| {

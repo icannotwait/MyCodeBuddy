@@ -151,6 +151,10 @@ pub fn qualified_rootfs_digest(rootfs: &Path) -> RtResult<Hash256> {
     linux_oci::rootfs_digest(rootfs)
 }
 
+pub fn qualified_rootfs_digest_detail(rootfs: &Path) -> Result<Hash256, String> {
+    linux_oci::rootfs_digest_detail(rootfs)
+}
+
 /// Stable execution template to bind to QualificationKey.plan_hash. Per-attempt
 /// scratch paths, socket sources and incarnation labels are excluded.
 pub fn qualified_oci_profile_hash(
@@ -171,6 +175,41 @@ pub fn verify_qualified_oci_profile(
 
 pub(crate) fn linux_oci_syscalls() -> &'static [&'static str] {
     linux_oci::SYSCALLS
+}
+
+pub(crate) fn linux_runtime_mounts_json() -> Vec<serde_json::Value> {
+    linux_oci::runtime_mount_json()
+}
+
+pub(crate) fn linux_slirp_hook_script() -> &'static str {
+    linux_oci::SLIRP_HOOK_SCRIPT
+}
+
+pub(crate) fn linux_slirp_binary() -> Option<PathBuf> {
+    linux_oci::slirp_binary()
+}
+
+pub(crate) fn linux_stop_slirp(runtime_root: &Path, id: &str) {
+    linux_oci::stop_slirp(runtime_root, id)
+}
+
+pub(crate) fn linux_cgroup_delegation_error(path: &Path) -> Option<String> {
+    linux_oci::cgroup_delegation_error(path)
+}
+
+#[cfg(any(test, feature = "test-utils"))]
+pub fn syscall_allowlist() -> &'static [&'static str] {
+    linux_oci::SYSCALLS
+}
+
+#[cfg(any(test, feature = "test-utils"))]
+pub fn slirp_hook_script() -> &'static str {
+    linux_oci::SLIRP_HOOK_SCRIPT
+}
+
+#[cfg(any(test, feature = "test-utils"))]
+pub fn cgroup_delegation_failure(path: &Path) -> Option<String> {
+    linux_oci::cgroup_delegation_error(path)
 }
 
 pub fn build_qualified_sandbox_plan(

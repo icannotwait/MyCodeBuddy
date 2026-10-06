@@ -13,18 +13,20 @@ use sha2::{Digest, Sha256};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
 
+use super::companion::ATTEMPT_TOKEN_ENV;
 use super::installed_runtime::ProviderBinding;
 use super::qualification::CertifiedBinary;
 use super::qualification_probe::{ProbeCheck, ProbeFacts, ProbeRequest};
-use super::qualification_profiles::profile_for_agent;
+use super::qualification_profiles::{profile_by_id, profile_for_agent};
 use super::sandbox::{AuthMount, QualifiedOciProfile};
 
 pub async fn measure_host(request: &ProbeRequest) -> ProbeFacts {
     let mut facts = empty_facts(&request.agent);
-    let Some(profile) = profile_for_agent(&request.agent) else {
+    let Some(profile) = select_profile(request) else {
         facts.anomalies.push("unknown_adapter".into());
         return facts;
     };
+    facts.profile_id = profile.exact_id.to_string();
     if !cfg!(target_os = "linux") {
         facts.platform_blocked = true;
         facts.anomalies.push("platform_blocked".into());
@@ -68,11 +70,8 @@ pub async fn measure_host(request: &ProbeRequest) -> ProbeFacts {
             return facts;
         }
     };
-    if !cgroup_ready(&request.cgroup_root) {
-        failures.push(fail(
-            "strict_isolation",
-            "cgroup v2 root is missing or not writable",
-        ));
+    if let Some(reason) = super::sandbox::linux_cgroup_delegation_error(&request.cgroup_root) {
+        failures.push(fail("strict_isolation", &reason));
     }
     if !userns_available() {
         failures.push(fail(
@@ -81,12 +80,19 @@ pub async fn measure_host(request: &ProbeRequest) -> ProbeFacts {
         ));
     }
 
-    let image_hash = super::sandbox::qualified_rootfs_digest(&request.rootfs).ok();
-    let Some(image_hash) = image_hash else {
-        failures.push(fail("strict_isolation", "rootfs digest unreadable"));
+    let image_hash = match super::sandbox::qualified_rootfs_digest_detail(&request.rootfs) {
+        Ok(hash) => hash,
+        Err(reason) => {
+            failures.push(fail("strict_isolation", &reason));
+            stamp_failures(&mut facts, &failures);
+            return facts;
+        }
+    };
+    if let Some(reason) = rootfs_layout_error(&request.rootfs) {
+        failures.push(fail("strict_isolation", &reason));
         stamp_failures(&mut facts, &failures);
         return facts;
-    };
+    }
     facts.image_digest = format!("sha256:{}", image_hash.to_hex());
 
     let cli_path = request
@@ -111,10 +117,12 @@ pub async fn measure_host(request: &ProbeRequest) -> ProbeFacts {
     for file in profile.auth_files {
         let source = request.home.join(file.home_relative);
         if !source.is_file() {
-            failures.push(fail(
-                "api_credential_scope",
-                &format!("auth file missing: {}", file.home_relative),
-            ));
+            if file.required {
+                failures.push(fail(
+                    "api_credential_scope",
+                    &format!("auth file missing: {}", file.home_relative),
+                ));
+            }
             continue;
         }
         if path_inside(&source, &request.rootfs) {
@@ -137,6 +145,17 @@ pub async fn measure_host(request: &ProbeRequest) -> ProbeFacts {
             source,
             destination: file.destination.to_string(),
         });
+    }
+    if let Some(filename) = profile.require_one_filename {
+        if !auth_mounts
+            .iter()
+            .any(|mount| mount.destination.rsplit('/').next() == Some(filename))
+        {
+            failures.push(fail(
+                "api_credential_scope",
+                &format!("auth file missing: need one {filename} from the profile"),
+            ));
+        }
     }
 
     let version_text = command_text(
@@ -306,7 +325,8 @@ pub async fn measure_host(request: &ProbeRequest) -> ProbeFacts {
         }
     }
 
-    match run_mcp(request).await {
+    let probe_token = mint_probe_token();
+    match run_mcp(request, &probe_token).await {
         Ok(()) => {
             facts.checks.push(pass(
                 "roundtable_mcp",
@@ -328,6 +348,7 @@ pub async fn measure_host(request: &ProbeRequest) -> ProbeFacts {
         profile.container_cli,
         profile.cli_args,
         &auth_mounts,
+        &probe_token,
     )
     .await
     {
@@ -335,13 +356,20 @@ pub async fn measure_host(request: &ProbeRequest) -> ProbeFacts {
             facts
                 .checks
                 .push(pass("new_session", "ACP initialize and session/new"));
-            facts
-                .checks
-                .push(pass("endpoint_compatibility", "protocolVersion 1"));
+            match model_binding_error(&turn.session, &facts.providers) {
+                None => facts.checks.push(pass(
+                    "endpoint_compatibility",
+                    &format!("protocolVersion 1; {}", turn.egress_note),
+                )),
+                Some(reason) => facts.checks.push(fail(
+                    "endpoint_compatibility",
+                    &format!("{reason}; {}", turn.egress_note),
+                )),
+            }
             facts.checks.push(pass_flag(
                 "ordered_turn_completion",
                 "session/prompt stopReason=end_turn",
-                turn,
+                turn.completed,
             ));
             facts.checks.push(pass(
                 "bounded_context_delivery",
@@ -368,10 +396,15 @@ pub async fn measure_host(request: &ProbeRequest) -> ProbeFacts {
                 count: Some(0),
                 flag: None,
             });
-            facts.checks.push(pass(
-                "api_credential_scope",
-                "container env did not receive the provider credential",
-            ));
+            if !failures
+                .iter()
+                .any(|check| check.name == "api_credential_scope")
+            {
+                facts.checks.push(pass(
+                    "api_credential_scope",
+                    "container env did not receive the provider credential",
+                ));
+            }
         }
         Err(reason) => {
             facts.checks.push(fail("new_session", &reason));
@@ -389,6 +422,7 @@ pub async fn measure_host(request: &ProbeRequest) -> ProbeFacts {
 fn empty_facts(agent: &str) -> ProbeFacts {
     ProbeFacts {
         agent: agent.to_string(),
+        profile_id: String::new(),
         os_name: String::new(),
         os_version: String::new(),
         kernel: String::new(),
@@ -471,10 +505,6 @@ fn read_os() -> Option<(String, String)> {
     Some(("linux".into(), format!("{id}-{version}")))
 }
 
-fn cgroup_ready(path: &Path) -> bool {
-    path.join("cgroup.controllers").is_file() && path.join("cgroup.events").is_file()
-}
-
 fn userns_available() -> bool {
     if let Ok(value) = fs::read_to_string("/proc/sys/kernel/unprivileged_userns_clone") {
         return value.trim() == "1";
@@ -531,9 +561,17 @@ async fn command_text(bin: &Path, args: &[&str]) -> Option<String> {
 async fn version_inside(request: &ProbeRequest, cli: &str, args: &[&str]) -> Option<String> {
     let mut full = vec![cli.to_string()];
     full.extend(args.iter().map(|arg| (*arg).to_string()));
-    run_container(request, &full, &[], None, Duration::from_secs(20))
-        .await
-        .ok()
+    run_container(
+        request,
+        &full,
+        &[],
+        None,
+        Duration::from_secs(20),
+        false,
+        None,
+    )
+    .await
+    .ok()
 }
 
 fn read_providers(path: &Path) -> Result<Vec<ProviderBinding>, String> {
@@ -579,13 +617,15 @@ async fn run_isolation(
         &mounts,
         Some(&secret),
         Duration::from_secs(60),
+        false,
+        None,
     )
     .await?;
     let _ = fs::remove_file(&secret);
     Ok(output)
 }
 
-async fn run_mcp(request: &ProbeRequest) -> Result<(), String> {
+async fn run_mcp(request: &ProbeRequest, token: &str) -> Result<(), String> {
     #[cfg(unix)]
     {
         use std::os::unix::net::UnixListener;
@@ -614,7 +654,7 @@ async fn run_mcp(request: &ProbeRequest) -> Result<(), String> {
             "--incarnation".into(),
             "qualify".into(),
         ];
-        let (bundle, id) = prepare_bundle(request, &argv, &mounts, None, false)?;
+        let (bundle, id) = prepare_bundle(request, &argv, &mounts, None, false, Some(token))?;
         let mut child = Command::new(&request.crun)
             .args(crun_prefix(request))
             .arg("run")
@@ -650,9 +690,15 @@ async fn run_mcp(request: &ProbeRequest) -> Result<(), String> {
     }
     #[cfg(not(unix))]
     {
-        let _ = request;
+        let _ = (request, token);
         Err("mcp socket requires unix".into())
     }
+}
+
+struct TurnOutcome {
+    completed: bool,
+    session: serde_json::Value,
+    egress_note: String,
 }
 
 async fn run_acp(
@@ -660,7 +706,8 @@ async fn run_acp(
     cli: &str,
     args: &[&str],
     auth_mounts: &[AuthMount],
-) -> Result<bool, String> {
+    token: &str,
+) -> Result<TurnOutcome, String> {
     let mut argv = vec![cli.to_string()];
     argv.extend(args.iter().map(|arg| (*arg).to_string()));
     let scratch = request.runtime_root.join("probe-scratch");
@@ -701,7 +748,11 @@ async fn run_acp(
             drop(held);
         })
     };
-    let output = run_acp_session(request, &argv, &mounts).await;
+    let egress_note = match run_egress(request, &mounts).await {
+        Ok(note) => note,
+        Err(reason) => return Err(reason),
+    };
+    let output = run_acp_session(request, &argv, &mounts, token, egress_note).await;
     #[cfg(unix)]
     accept.abort();
     output
@@ -711,8 +762,10 @@ async fn run_acp_session(
     request: &ProbeRequest,
     argv: &[String],
     mounts: &[(PathBuf, String, bool)],
-) -> Result<bool, String> {
-    let (bundle, id) = prepare_bundle(request, argv, mounts, None, true)?;
+    token: &str,
+    egress_note: String,
+) -> Result<TurnOutcome, String> {
+    let (bundle, id) = prepare_bundle(request, argv, mounts, None, true, None)?;
     let mut child = Command::new(&request.crun)
         .args(crun_prefix(request))
         .arg("run")
@@ -749,7 +802,7 @@ async fn run_acp_session(
                 "name": "roundtable",
                 "command": "/usr/local/bin/codeg-mcp",
                 "args": ["--service-roundtable", "--socket-path", "/run/codeg/roundtable.sock", "--incarnation", "qualify"],
-                "env": []
+                "env": [{"name": ATTEMPT_TOKEN_ENV, "value": token}]
             }]
         }),
     )
@@ -776,7 +829,11 @@ async fn run_acp_session(
     let _ = child.start_kill();
     let _ = reap(request, &id).await;
     let result = result?;
-    Ok(result["stopReason"] == "end_turn")
+    Ok(TurnOutcome {
+        completed: result["stopReason"] == "end_turn",
+        session,
+        egress_note,
+    })
 }
 
 async fn rpc(
@@ -848,8 +905,10 @@ async fn run_container(
     mounts: &[(PathBuf, String, bool)],
     secret: Option<&Path>,
     timeout: Duration,
+    slirp: bool,
+    token: Option<&str>,
 ) -> Result<String, String> {
-    let (bundle, id) = prepare_bundle(request, argv, mounts, secret, false)?;
+    let (bundle, id) = prepare_bundle(request, argv, mounts, secret, slirp, token)?;
     let output = tokio::time::timeout(
         timeout,
         Command::new(&request.crun)
@@ -889,26 +948,60 @@ fn prepare_bundle(
     mounts: &[(PathBuf, String, bool)],
     secret: Option<&Path>,
     slirp: bool,
+    token: Option<&str>,
 ) -> Result<(PathBuf, String), String> {
     let _ = fs::create_dir_all(request.runtime_root.join("state"));
     let id = if argv.iter().any(|arg| arg.contains("codeg-mcp")) {
         "cq-mcp".to_string()
     } else if argv.iter().any(|arg| arg.ends_with("probe.sh")) {
         "cq-isolation".to_string()
+    } else if argv.iter().any(|arg| arg.ends_with("egress.sh")) {
+        "cq-egress".to_string()
+    } else if argv.iter().any(|arg| arg == "--version") {
+        "cq-version".to_string()
     } else {
         format!("cq-acp-{}", std::process::id())
     };
     let bundle = request.runtime_root.join("bundles").join(&id);
     let _ = fs::remove_dir_all(&bundle);
     fs::create_dir_all(&bundle).map_err(|error| error.to_string())?;
-    let mut oci_mounts = vec![serde_json::json!({
-        "destination": "/proc",
-        "type": "proc",
-        "source": "proc",
-        "options": ["nosuid", "noexec", "nodev"]
-    })];
-    for (source, destination, read_only) in mounts {
+    let mut oci_mounts = super::sandbox::linux_runtime_mounts_json();
+    let (host_mounts, auth_mounts): (Vec<_>, Vec<_>) = mounts
+        .iter()
+        .cloned()
+        .partition(|(_, destination, _)| !destination.starts_with("/rt-home/"));
+    for (source, destination, read_only) in &host_mounts {
         let mut options = vec!["bind", "nosuid", "nodev"];
+        options.push(if *read_only { "ro" } else { "rw" });
+        oci_mounts.push(serde_json::json!({
+            "destination": destination,
+            "type": "bind",
+            "source": source,
+            "options": options
+        }));
+    }
+    let upper = request.runtime_root.join("home-upper").join(&id);
+    fs::create_dir_all(&upper).map_err(|error| error.to_string())?;
+    for (_, destination, _) in &auth_mounts {
+        let relative = destination
+            .strip_prefix("/rt-home/")
+            .unwrap_or(destination.as_str());
+        let path = upper.join(relative);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+        }
+        if !path.exists() {
+            fs::write(&path, b"").map_err(|error| error.to_string())?;
+        }
+    }
+    oci_mounts.push(serde_json::json!({
+        "destination": "/rt-home",
+        "type": "bind",
+        "source": upper,
+        "options": ["bind", "rw", "nosuid", "nodev"]
+    }));
+    for (source, destination, read_only) in &auth_mounts {
+        let mut options = vec!["bind", "nosuid", "nodev", "nosymfollow"];
         options.push(if *read_only { "ro" } else { "rw" });
         oci_mounts.push(serde_json::json!({
             "destination": destination,
@@ -927,7 +1020,13 @@ fn prepare_bundle(
         format!("HOST_SECRET_PATH={secret_note}"),
         format!("HOST_HOME={}", request.home.display()),
     ];
-    if let Some(profile) = profile_for_agent(&request.agent) {
+    if let Some(token) = token {
+        if token.is_empty() {
+            return Err("missing_attempt_token".into());
+        }
+        env.push(format!("{ATTEMPT_TOKEN_ENV}={token}"));
+    }
+    if let Some(profile) = select_profile(request) {
         for (key, value) in profile.container_env {
             if *key != "PATH" && *key != "HOME" {
                 env.push(format!("{key}={value}"));
@@ -940,23 +1039,37 @@ fn prepare_bundle(
         .map_err(|_| "cgroup root must be under /sys/fs/cgroup".to_string())?;
     let cgroup_path = Path::new("/").join(relative).join(&id);
     let mut hooks = serde_json::json!({});
+    let mut network = "isolated-deny-egress";
     if slirp {
-        if let Some(slirp_bin) = which("slirp4netns") {
-            let hook = bundle.join("slirp-hook.sh");
-            fs::write(&hook, SLIRP_HOOK).map_err(|error| error.to_string())?;
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                let _ = fs::set_permissions(&hook, fs::Permissions::from_mode(0o755));
-            }
-            hooks = serde_json::json!({
-                "createRuntime": [{
-                    "path": hook,
-                    "args": ["slirp-hook.sh", slirp_bin],
-                    "env": []
-                }]
-            });
+        let slirp_bin = super::sandbox::linux_slirp_binary()
+            .ok_or_else(|| "slirp4netns is not installed".to_string())?;
+        let hook = bundle.join("slirp-hook.sh");
+        fs::write(&hook, super::sandbox::linux_slirp_hook_script())
+            .map_err(|error| error.to_string())?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = fs::set_permissions(&hook, fs::Permissions::from_mode(0o755));
         }
+        let pid_dir = request.runtime_root.join("slirp-pids");
+        fs::create_dir_all(&pid_dir).map_err(|error| error.to_string())?;
+        let pidfile = pid_dir.join(format!("{id}.pid"));
+        hooks = serde_json::json!({
+            "createRuntime": [{
+                "path": hook,
+                "args": ["slirp-hook.sh", slirp_bin, pidfile],
+                "env": []
+            }]
+        });
+        let resolv = request.runtime_root.join("slirp-resolv.conf");
+        fs::write(&resolv, b"nameserver 10.0.2.3\n").map_err(|error| error.to_string())?;
+        oci_mounts.push(serde_json::json!({
+            "destination": "/etc/resolv.conf",
+            "type": "bind",
+            "source": resolv,
+            "options": ["bind", "ro", "nosuid", "nodev", "noexec"]
+        }));
+        network = "slirp-egress-not-origin-filtered";
     }
     let spec = serde_json::json!({
         "ociVersion": "1.0.2",
@@ -978,6 +1091,7 @@ fn prepare_bundle(
         "root": {"path": request.rootfs, "readonly": true},
         "mounts": oci_mounts,
         "hooks": hooks,
+        "annotations": {"io.codeg.roundtable.network": network},
         "linux": {
             "namespaces": [
                 {"type": "user"},
@@ -1036,16 +1150,208 @@ fn current_gid() -> u32 {
     }
 }
 
-fn which(name: &str) -> Option<String> {
-    std::env::var_os("PATH").and_then(|path| {
-        std::env::split_paths(&path).find_map(|dir| {
-            let candidate = dir.join(name);
-            candidate.is_file().then(|| candidate.display().to_string())
+fn select_profile(
+    request: &ProbeRequest,
+) -> Option<&'static super::qualification_profiles::AdapterProfile> {
+    if let Some(id) = request.profile_id.as_deref() {
+        return profile_by_id(id).filter(|profile| profile.agent == request.agent);
+    }
+    profile_for_agent(&request.agent)
+}
+
+fn mint_probe_token() -> String {
+    format!(
+        "{}{}",
+        uuid::Uuid::new_v4().simple(),
+        uuid::Uuid::new_v4().simple()
+    )
+}
+
+fn rootfs_layout_error(rootfs: &Path) -> Option<String> {
+    for relative in [
+        "dev", "dev/pts", "dev/shm", "sys", "tmp", "proc", "scratch", "rt-home",
+    ] {
+        let path = rootfs.join(relative);
+        match fs::symlink_metadata(&path) {
+            Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {}
+            _ => {
+                return Some(format!(
+                    "rootfs is missing directory {relative}; create it before the probe so crun does not write it into the image"
+                ));
+            }
+        }
+    }
+    let resolv = rootfs.join("etc/resolv.conf");
+    match fs::symlink_metadata(&resolv) {
+        Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => None,
+        _ => Some(
+            "rootfs etc/resolv.conf must be an empty regular file, not a symlink, so the ACP turn can bind the slirp resolver over it"
+                .to_string(),
+        ),
+    }
+}
+
+fn origin_host(origin: &str) -> Option<String> {
+    let rest = origin.strip_prefix("https://")?;
+    let host = rest.split(['/', '?', '#']).next().unwrap_or("");
+    let host = host.split('@').next_back().unwrap_or("");
+    let host = host.split(':').next().unwrap_or("");
+    if host.is_empty() {
+        None
+    } else {
+        Some(host.to_string())
+    }
+}
+
+async fn run_egress(
+    request: &ProbeRequest,
+    mounts: &[(PathBuf, String, bool)],
+) -> Result<String, String> {
+    let origin = request_origin_host(request)?;
+    let scratch = request.runtime_root.join("probe-scratch");
+    fs::create_dir_all(&scratch).map_err(|error| error.to_string())?;
+    let script = scratch.join("egress.sh");
+    fs::write(&script, EGRESS_SCRIPT).map_err(|error| error.to_string())?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = fs::set_permissions(&script, fs::Permissions::from_mode(0o755));
+    }
+    let mut egress_mounts = mounts.to_vec();
+    if !egress_mounts
+        .iter()
+        .any(|(_, destination, _)| destination == "/scratch")
+    {
+        egress_mounts.insert(0, (scratch, "/scratch".into(), false));
+    }
+    let output = run_container(
+        request,
+        &[
+            "/bin/bash".into(),
+            "/scratch/egress.sh".into(),
+            origin.clone(),
+        ],
+        &egress_mounts,
+        None,
+        Duration::from_secs(40),
+        true,
+        None,
+    )
+    .await?;
+    let origin_ok = output.lines().any(|line| line == format!("REACH {origin}"));
+    let other_open = output.lines().any(|line| line == "REACH 1.1.1.1");
+    if !origin_ok {
+        return Err(format!(
+            "provider origin {origin}:443 was not reachable inside slirp; {output}"
+        ));
+    }
+    let note = if other_open {
+        format!(
+            "slirp reached {origin}:443 and also 1.1.1.1:443; egress is not limited to the provider origin"
+        )
+    } else {
+        format!(
+            "slirp reached {origin}:443; 1.1.1.1:443 was blocked on this host. The probe does not claim an origin-only filter"
+        )
+    };
+    Ok(note)
+}
+
+fn request_origin_host(request: &ProbeRequest) -> Result<String, String> {
+    let bytes = fs::read(&request.provider_bindings)
+        .map_err(|_| "provider bindings file missing".to_string())?;
+    let providers: Vec<super::installed_runtime::ProviderBinding> =
+        serde_json::from_slice(&bytes).map_err(|_| "provider bindings unreadable".to_string())?;
+    let origin = providers
+        .iter()
+        .find(|provider| {
+            provider.provider_ref == format!("provider:{}", request.agent)
+                || provider
+                    .provider_ref
+                    .ends_with(&format!(":{}", request.agent))
         })
-    })
+        .or_else(|| providers.first())
+        .map(|provider| provider.origin.clone())
+        .ok_or_else(|| "provider bindings missing".to_string())?;
+    origin_host(&origin).ok_or_else(|| format!("provider origin is not an https host: {origin}"))
+}
+
+fn advertised_model_ids(session: &serde_json::Value) -> std::collections::BTreeSet<String> {
+    let mut ids = std::collections::BTreeSet::new();
+    if let Some(id) = session
+        .get("currentModelId")
+        .and_then(|value| value.as_str())
+    {
+        if !id.is_empty() {
+            ids.insert(id.to_string());
+        }
+    }
+    if let Some(models) = session.get("models").and_then(|value| value.as_array()) {
+        for model in models {
+            for key in ["modelId", "id", "value"] {
+                if let Some(id) = model.get(key).and_then(|value| value.as_str()) {
+                    if !id.is_empty() {
+                        ids.insert(id.to_string());
+                    }
+                }
+            }
+        }
+    }
+    if let Some(options) = session
+        .get("configOptions")
+        .and_then(|value| value.as_array())
+    {
+        for option in options {
+            let id = option
+                .get("id")
+                .and_then(|value| value.as_str())
+                .unwrap_or("");
+            if !id.to_ascii_lowercase().contains("model") {
+                continue;
+            }
+            if let Some(current) = option.get("currentValue").and_then(|value| value.as_str()) {
+                if !current.is_empty() {
+                    ids.insert(current.to_string());
+                }
+            }
+            if let Some(values) = option.get("options").and_then(|value| value.as_array()) {
+                for value in values {
+                    if let Some(id) = value.get("value").and_then(|item| item.as_str()) {
+                        if !id.is_empty() {
+                            ids.insert(id.to_string());
+                        }
+                    }
+                }
+            }
+        }
+    }
+    ids
+}
+
+fn model_binding_error(
+    session: &serde_json::Value,
+    providers: &[super::installed_runtime::ProviderBinding],
+) -> Option<String> {
+    let advertised = advertised_model_ids(session);
+    if advertised.is_empty() {
+        return Some("session/new did not advertise a model id".to_string());
+    }
+    let Some(provider) = providers.first() else {
+        return Some("provider bindings missing".to_string());
+    };
+    if advertised.contains(&provider.model) {
+        None
+    } else {
+        Some(format!(
+            "binding model {} is not advertised ({})",
+            provider.model,
+            advertised.into_iter().collect::<Vec<_>>().join(",")
+        ))
+    }
 }
 
 async fn reap(request: &ProbeRequest, id: &str) -> Result<(), String> {
+    super::sandbox::linux_stop_slirp(&request.runtime_root, id);
     let _ = Command::new(&request.crun)
         .args(crun_prefix(request))
         .arg("kill")
@@ -1078,6 +1384,16 @@ fn redact_keep(input: &str) -> String {
         .join("\n")
 }
 
+#[cfg(any(test, feature = "test-utils"))]
+pub fn isolation_probe_script() -> &'static str {
+    ISOLATION_SCRIPT
+}
+
+#[cfg(any(test, feature = "test-utils"))]
+pub fn advertised_probe_models(session: &serde_json::Value) -> std::collections::BTreeSet<String> {
+    advertised_model_ids(session)
+}
+
 const ISOLATION_SCRIPT: &str = r#"#!/bin/sh
 fail() { echo "FAIL $1"; exit 1; }
 if [ -r "$HOST_SECRET_PATH" ]; then fail host_secret; else echo "DENIED host_secret"; fi
@@ -1088,8 +1404,19 @@ case "$cmd" in
   *systemd*|*init*) fail proc_host ;;
   *) echo "PID1_OK"; echo "DENIED proc_host" ;;
 esac
-if [ -r /proc/kcore ]; then fail proc_kcore; fi
-nets=$(ls /sys/class/net 2>/dev/null || true)
+# crun masks /proc/kcore by bind-mounting /dev/null over it, so [ -r ] is true.
+# A masked kcore is a char device 1:3 or a read that returns no bytes.
+if [ -e /proc/kcore ]; then
+  if [ -c /proc/kcore ]; then
+    majmin=$(stat -c '%t:%T' /proc/kcore 2>/dev/null || true)
+    [ "$majmin" = "1:3" ] || fail proc_kcore
+  elif [ -r /proc/kcore ]; then
+    bytes=$(dd if=/proc/kcore bs=1 count=1 2>/dev/null | wc -c | tr -d ' ')
+    [ "$bytes" = "0" ] || fail proc_kcore
+  fi
+fi
+if [ ! -d /sys/class/net ]; then fail network; fi
+nets=$(ls -1 /sys/class/net 2>/dev/null || true)
 case "$nets" in
   lo|lo\ *) echo "DENIED network" ;;
   *) fail network ;;
@@ -1099,9 +1426,24 @@ echo canary > /scratch/canary || fail scratch
 echo "ISOLATION_OK"
 "#;
 
-const SLIRP_HOOK: &str = r#"#!/bin/sh
-state=$(cat)
-pid=$(printf '%s' "$state" | sed -n 's/.*"pid"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' | head -n 1)
-[ -n "$pid" ] || exit 1
-exec "$1" --configure --disable-host-loopback --mtu=65520 "$pid" tap0
+const EGRESS_SCRIPT: &str = r#"#!/bin/bash
+origin="$1"
+other="1.1.1.1"
+try() {
+  host="$1"
+  i=0
+  while [ "$i" -lt 20 ]; do
+    if bash -c "echo >/dev/tcp/${host}/443" 2>/dev/null; then
+      echo "REACH ${host}"
+      return 0
+    fi
+    i=$((i + 1))
+    sleep 0.5
+  done
+  echo "BLOCK ${host}"
+  return 1
+}
+try "$origin" || true
+try "$other" || true
+exit 0
 "#;

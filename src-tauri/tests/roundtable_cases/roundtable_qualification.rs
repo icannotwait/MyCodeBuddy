@@ -1493,6 +1493,7 @@ async fn live_probe_fails_closed_without_an_isolator() {
             runtime_root: root.join("oci"),
             provider_bindings: bindings,
             home: root.join("home"),
+            profile_id: None,
         })
         .await;
     assert!(!outcome.qualification_issued);

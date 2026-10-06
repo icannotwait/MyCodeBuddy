@@ -142,12 +142,14 @@ pub use qualification::{
 };
 pub use qualification_harness::QualificationHarness;
 #[cfg(any(test, feature = "test-utils"))]
+pub use qualification_linux::{advertised_probe_models, isolation_probe_script};
+#[cfg(any(test, feature = "test-utils"))]
 pub use qualification_probe::{assemble_probe_report_for_test, verify_installed_report_for_test};
 pub use qualification_probe::{
     qualify_adapter_on_host, roundtable_qualify_requested, run_roundtable_qualify, ProbeCheck,
     ProbeFacts, ProbeOutcome, ProbeRequest,
 };
-pub use qualification_profiles::{adapter_profiles, os_accepted, profile_for_agent};
+pub use qualification_profiles::{adapter_profiles, os_accepted, profile_by_id, profile_for_agent};
 pub use recovery::{recover_service, RecoveryReport};
 #[cfg(any(test, feature = "test-utils"))]
 pub use recovery::{recovery_action, RecoveryAction, RecoveryState};
@@ -174,11 +176,13 @@ pub use runtime::{
 };
 pub use sandbox::{
     attempt_live_escapes, build_qualified_sandbox_plan, build_sandbox_plan,
-    qualified_oci_profile_hash, qualified_rootfs_digest, verify_qualified_oci_profile, DbIdentity,
-    EscapeReport, IsolationProvider, JournalLaunchIntentStore, LaunchIntent, LaunchIntentStore,
-    LinuxOciIsolator, PreparedSandbox, QualifiedOciProfile, SandboxInput, SandboxInstance,
-    SandboxPlan,
+    qualified_oci_profile_hash, qualified_rootfs_digest, qualified_rootfs_digest_detail,
+    verify_qualified_oci_profile, DbIdentity, EscapeReport, IsolationProvider,
+    JournalLaunchIntentStore, LaunchIntent, LaunchIntentStore, LinuxOciIsolator, PreparedSandbox,
+    QualifiedOciProfile, SandboxInput, SandboxInstance, SandboxPlan,
 };
+#[cfg(any(test, feature = "test-utils"))]
+pub use sandbox::{cgroup_delegation_failure, slirp_hook_script, syscall_allowlist};
 pub use schema::{
     apply_roundtable_schema, drop_roundtable_schema, roundtable_table_names, DurabilityProfile,
     LOGICAL_MODEL, RECORDED_DURABILITY,

@@ -63,6 +63,7 @@ fn passing(agent: &str, os_version: &str) -> ProbeFacts {
     };
     ProbeFacts {
         agent: agent.into(),
+        profile_id: String::new(),
         os_name: "linux".into(),
         os_version: os_version.into(),
         kernel: "6.12.0-test".into(),
@@ -213,4 +214,121 @@ fn catalog_keeps_a_passed_adapter_when_another_fails() {
         .collect();
     assert_eq!(agents, vec!["grok"]);
     let _ = fs::remove_dir_all(&data);
+}
+
+#[test]
+fn antigravity_default_profile_is_1_3_0_and_mounts_the_token_file() {
+    let profile = profile_for_agent("antigravity").expect("default");
+    assert_eq!(profile.exact_id, "linux-antigravity-acp-1.3.0");
+    assert!(profile.auth_files.iter().any(|file| {
+        file.home_relative == ".gemini/antigravity-acp/acp_token.json" && file.required
+    }));
+    let pinned =
+        codeg_lib::roundtable::profile_by_id("linux-antigravity-acp-1.2.1").expect("1.2.1");
+    assert_eq!(pinned.agent, "antigravity");
+    assert_eq!(pinned.version_needle, "1.2.1");
+    assert!(os_accepted(pinned, "linux", "debian-13"));
+}
+
+#[test]
+fn cursor_accepts_either_auth_json_and_pins_xdg() {
+    let profile = profile_for_agent("cursor").expect("cursor");
+    assert_eq!(profile.require_one_filename, Some("auth.json"));
+    assert!(profile
+        .container_env
+        .iter()
+        .any(|(key, value)| *key == "XDG_CONFIG_HOME" && *value == "/rt-home/.config"));
+    assert!(profile
+        .auth_files
+        .iter()
+        .any(|file| { file.home_relative == ".cursor/auth.json" && !file.required }));
+    assert!(profile
+        .auth_files
+        .iter()
+        .any(|file| { file.home_relative == ".config/cursor/auth.json" && !file.required }));
+}
+
+#[test]
+fn isolation_script_treats_masked_kcore_as_denied_and_requires_sysfs() {
+    let script = codeg_lib::roundtable::isolation_probe_script();
+    assert!(script.contains("1:3"));
+    assert!(!script.contains("if [ -r /proc/kcore ]; then fail"));
+    assert!(script.contains("[ ! -d /sys/class/net ]"));
+    assert!(script.contains("DENIED device"));
+    assert!(script.contains("/dev/mem"));
+}
+
+#[test]
+fn slirp_hook_backgrounds_and_joins_the_user_namespace() {
+    let script = codeg_lib::roundtable::slirp_hook_script();
+    assert!(script.contains("--userns-path="));
+    assert!(script.contains("--netns-type=path"));
+    assert!(script.contains("--ready-fd"));
+    assert!(!script.contains("exec \"$1\""));
+    assert!(script.contains("exit 0"));
+}
+
+#[test]
+fn syscall_allowlist_covers_adapter_startup_and_still_denies_mount() {
+    let names = codeg_lib::roundtable::syscall_allowlist();
+    for required in [
+        "getpgrp",
+        "setpgid",
+        "timerfd_create",
+        "memfd_create",
+        "statfs",
+        "fstatfs",
+        "inotify_init1",
+        "inotify_add_watch",
+        "membarrier",
+    ] {
+        assert!(names.contains(&required), "{required}");
+    }
+    for denied in [
+        "mount",
+        "umount2",
+        "pivot_root",
+        "unshare",
+        "setns",
+        "ptrace",
+        "bpf",
+        "perf_event_open",
+        "init_module",
+        "kexec_load",
+    ] {
+        assert!(!names.contains(&denied), "{denied}");
+    }
+}
+
+#[test]
+fn advertised_models_must_include_the_binding() {
+    let session = serde_json::json!({
+        "sessionId": "s",
+        "currentModelId": "grok-4.6",
+        "configOptions": [{
+            "id": "model",
+            "currentValue": "grok-4.6",
+            "options": [
+                {"value": "grok-4.6", "name": "Grok 4.6"},
+                {"value": "grok-4", "name": "Grok 4"}
+            ]
+        }]
+    });
+    let ids = codeg_lib::roundtable::advertised_probe_models(&session);
+    assert!(ids.contains("grok-4.6"));
+    assert!(ids.contains("grok-4"));
+    let empty =
+        codeg_lib::roundtable::advertised_probe_models(&serde_json::json!({"sessionId": "s"}));
+    assert!(empty.is_empty());
+}
+
+#[test]
+fn cgroup_delegation_names_the_launcher_child_when_the_root_is_not_a_cgroup() {
+    let dir = scratch();
+    let reason = codeg_lib::roundtable::cgroup_delegation_failure(&dir).expect("not a cgroup");
+    assert!(
+        reason.contains("launcher") || reason.contains("cgroup.controllers"),
+        "{reason}"
+    );
+    let _ = fs::remove_dir_all(&dir);
 }

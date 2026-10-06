@@ -40,24 +40,13 @@ pub(super) fn build_plan(input: &SandboxInput) -> RtResult<SandboxPlan> {
     let scratch = reject_host_path(&input.scratch, input)?;
     let env = clear_then_allow(&input.inherited_env, &input.env_allowlist)?;
     let label = owner_label(&input.db, input.boot_epoch, &input.incarnation);
-    let mounts = vec![
-        PlanMount {
-            source: PathBuf::from("proc"),
-            destination: "/proc".to_string(),
-            read_only: true,
-        },
-        PlanMount {
-            source: scratch.clone(),
-            destination: "/scratch".to_string(),
-            read_only: false,
-        },
-    ];
+    let mounts = standard_plan_mounts(&scratch);
     let cgroup = CgroupLimits {
         memory_max_bytes: MEMORY_MAX_BYTES,
         pids_max: PIDS_MAX,
         cpu_quota_us: CPU_QUOTA_US,
     };
-    let oci = oci_document(input, &scratch, cli, &env, &label, &cgroup);
+    let oci = oci_document(input, &mounts, cli, &env, &label, &cgroup);
     let plan_hash = Hash256::sha256(
         &serde_json::to_vec(&oci)
             .map_err(|_| rt_error(ErrorCode::InvalidArgument, "oci_encode"))?,
@@ -181,9 +170,101 @@ fn forbidden_env(key: &str) -> bool {
     ) || key.starts_with("MCP_")
 }
 
+fn standard_plan_mounts(scratch: &Path) -> Vec<PlanMount> {
+    vec![
+        PlanMount {
+            source: PathBuf::from("proc"),
+            destination: "/proc".to_string(),
+            read_only: true,
+        },
+        PlanMount {
+            source: PathBuf::from("tmpfs"),
+            destination: "/dev".to_string(),
+            read_only: false,
+        },
+        PlanMount {
+            source: PathBuf::from("devpts"),
+            destination: "/dev/pts".to_string(),
+            read_only: false,
+        },
+        PlanMount {
+            source: PathBuf::from("shm"),
+            destination: "/dev/shm".to_string(),
+            read_only: false,
+        },
+        PlanMount {
+            source: PathBuf::from("sysfs"),
+            destination: "/sys".to_string(),
+            read_only: true,
+        },
+        PlanMount {
+            source: PathBuf::from("tmpfs"),
+            destination: "/tmp".to_string(),
+            read_only: false,
+        },
+        PlanMount {
+            source: scratch.to_path_buf(),
+            destination: "/scratch".to_string(),
+            read_only: false,
+        },
+    ]
+}
+
+fn mount_json(mount: &PlanMount) -> Value {
+    let (kind, options): (&str, &[&str]) = match mount.destination.as_str() {
+        "/proc" => ("proc", &["nosuid", "noexec", "nodev"]),
+        "/dev" => (
+            "tmpfs",
+            &["nosuid", "strictatime", "mode=755", "size=65536k", "rw"],
+        ),
+        "/dev/pts" => (
+            "devpts",
+            &[
+                "nosuid",
+                "noexec",
+                "newinstance",
+                "ptmxmode=0666",
+                "mode=0620",
+                "rw",
+            ],
+        ),
+        "/dev/shm" => (
+            "tmpfs",
+            &[
+                "nosuid",
+                "noexec",
+                "nodev",
+                "mode=1777",
+                "size=67108864",
+                "rw",
+            ],
+        ),
+        "/sys" => ("sysfs", &["nosuid", "noexec", "nodev", "ro"]),
+        "/tmp" => (
+            "tmpfs",
+            &["nosuid", "nodev", "mode=1777", "size=268435456", "rw"],
+        ),
+        _ => ("bind", &["rbind", "rw", "nosuid", "nodev", "nosymfollow"]),
+    };
+    json!({
+        "destination": mount.destination,
+        "type": kind,
+        "source": mount.source,
+        "options": options,
+    })
+}
+
+pub(crate) fn runtime_mount_json() -> Vec<Value> {
+    standard_plan_mounts(Path::new("/unused"))
+        .into_iter()
+        .filter(|mount| mount.destination != "/scratch")
+        .map(|mount| mount_json(&mount))
+        .collect()
+}
+
 fn oci_document(
     input: &SandboxInput,
-    scratch: &Path,
+    mounts: &[PlanMount],
     cli: &CertifiedBinary,
     env: &BTreeMap<String, String>,
     label: &str,
@@ -211,20 +292,7 @@ fn oci_document(
             }
         },
         "root": {"path": "rootfs", "readonly": true},
-        "mounts": [
-            {
-                "destination": "/proc",
-                "type": "proc",
-                "source": "proc",
-                "options": ["nosuid", "noexec", "nodev"]
-            },
-            {
-                "destination": "/scratch",
-                "type": "bind",
-                "source": scratch,
-                "options": ["rbind", "rw", "nosuid", "nodev", "nosymfollow"]
-            }
-        ],
+        "mounts": mounts.iter().map(mount_json).collect::<Vec<_>>(),
         "linux": {
             "namespaces": [
                 {"type": "user"},
@@ -387,6 +455,23 @@ pub(crate) const SYSCALLS: &[&str] = &[
     "getresuid",
     "getresgid",
     "prctl",
+    // bash, Node, and Go adapters issue these while starting. They do not
+    // grant mount, ptrace, namespace, or kernel-module control.
+    "getpgrp",
+    "getpgid",
+    "setpgid",
+    "setsid",
+    "timerfd_create",
+    "timerfd_settime",
+    "timerfd_gettime",
+    "memfd_create",
+    "statfs",
+    "fstatfs",
+    "inotify_init1",
+    "inotify_add_watch",
+    "inotify_rm_watch",
+    "membarrier",
+    "copy_file_range",
 ];
 
 fn document_hash(oci: &Value) -> RtResult<Hash256> {
@@ -542,7 +627,9 @@ pub(super) fn build_qualified_plan(
                 .push(json!({"source":source,"destination":destination,"type":"bind","options":["bind","ro","nosuid","nodev","noexec"]}));
         }
     }
+    install_home_upper(&mut plan, profile)?;
     apply_auth_mounts(&mut plan, profile)?;
+    install_slirp_hook(&mut plan, profile, &id)?;
     plan.plan_hash = document_hash(&plan.oci)?;
     verify_profile(&plan, profile)?;
     Ok(plan)
@@ -565,39 +652,59 @@ fn file_hash(path: &Path) -> RtResult<Hash256> {
     Ok(Hash256::from_bytes(hash.finalize().into()))
 }
 
-/// Deterministic expanded-rootfs digest. Symlink targets are hashed, never
-/// followed during traversal; special files and links escaping rootfs fail.
+/// Deterministic expanded-rootfs digest (`codeg-rootfs-v2`).
+///
+/// Symlink targets are hashed as text and are not followed or required to
+/// exist inside the image. Device nodes, fifos, and sockets contribute type
+/// and device identity, not a read of the node. A regular file the probing
+/// user cannot read fails with the path; `chown` the tree to that user so
+/// mode bits, and therefore the digest, stay stable.
 pub(super) fn rootfs_digest(root: &Path) -> RtResult<Hash256> {
+    rootfs_digest_detail(root)
+        .map_err(|_| rt_error(ErrorCode::CapabilityUnqualified, "rootfs_unreadable"))
+}
+
+pub(super) fn rootfs_digest_detail(root: &Path) -> Result<Hash256, String> {
     let root = root
         .canonicalize()
-        .map_err(|_| rt_error(ErrorCode::CapabilityUnqualified, "rootfs_unreadable"))?;
+        .map_err(|error| format!("rootfs_unreadable: {}: {error}", root.display()))?;
     if !root.is_dir() {
-        return Err(rt_error(
-            ErrorCode::CapabilityUnqualified,
-            "rootfs_unreadable",
+        return Err(format!(
+            "rootfs_unreadable: {} is not a directory",
+            root.display()
         ));
     }
-    let mut entries = walkdir::WalkDir::new(&root)
-        .follow_links(false)
-        .into_iter()
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|_| rt_error(ErrorCode::CapabilityUnqualified, "rootfs_unreadable"))?;
+    let mut entries = Vec::new();
+    for item in walkdir::WalkDir::new(&root).follow_links(false) {
+        match item {
+            Ok(entry) => entries.push(entry),
+            Err(error) => {
+                let path = error
+                    .path()
+                    .map(|path| path.display().to_string())
+                    .unwrap_or_else(|| root.display().to_string());
+                return Err(format!(
+                    "rootfs_unreadable: {path} ({error}). chown -R the rootfs to the probing user so root-only files and directories can be read without changing mode bits"
+                ));
+            }
+        }
+    }
     entries.sort_by(|a, b| a.path().cmp(b.path()));
     let mut hash = Sha256::new();
-    hash.update(b"codeg-rootfs-v1\0");
+    hash.update(b"codeg-rootfs-v2\0");
     for entry in entries {
         let relative = entry
             .path()
             .strip_prefix(&root)
-            .map_err(|_| rt_error(ErrorCode::CapabilityUnqualified, "rootfs_path"))?;
+            .map_err(|_| format!("rootfs_path: {}", entry.path().display()))?;
         let path = relative
             .to_str()
-            .ok_or_else(|| rt_error(ErrorCode::CapabilityUnqualified, "rootfs_path"))?
+            .ok_or_else(|| format!("rootfs_path: {}", entry.path().display()))?
             .replace('\\', "/");
         hash.update((path.len() as u64).to_le_bytes());
         hash.update(path.as_bytes());
         let metadata = fs::symlink_metadata(entry.path())
-            .map_err(|_| rt_error(ErrorCode::CapabilityUnqualified, "rootfs_unreadable"))?;
+            .map_err(|error| format!("rootfs_unreadable: {}: {error}", entry.path().display()))?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::MetadataExt;
@@ -607,40 +714,51 @@ pub(super) fn rootfs_digest(root: &Path) -> RtResult<Hash256> {
             hash.update(b"d");
         } else if metadata.is_file() {
             hash.update(b"f");
-            hash.update(file_hash(entry.path())?.to_hex().as_bytes());
+            let digest = file_hash(entry.path()).map_err(|_| {
+                format!(
+                    "rootfs_unreadable: {}. chown -R the rootfs to the probing user; chmod a+rX also works but changes mode bits and the digest",
+                    entry.path().display()
+                )
+            })?;
+            hash.update(digest.to_hex().as_bytes());
         } else if metadata.file_type().is_symlink() {
             let target = fs::read_link(entry.path())
-                .map_err(|_| rt_error(ErrorCode::CapabilityUnqualified, "rootfs_path"))?;
-            let resolved = if target.is_absolute() {
-                root.join(
-                    target
-                        .to_str()
-                        .ok_or_else(|| rt_error(ErrorCode::CapabilityUnqualified, "rootfs_path"))?
-                        .trim_start_matches('/'),
-                )
-            } else {
-                entry.path().parent().unwrap_or(&root).join(&target)
-            };
-            if !resolved
-                .canonicalize()
-                .map_err(|_| rt_error(ErrorCode::CapabilityUnqualified, "rootfs_path"))?
-                .starts_with(&root)
-            {
-                return Err(rt_error(
-                    ErrorCode::CapabilityUnqualified,
-                    "rootfs_symlink_escape",
-                ));
-            }
+                .map_err(|error| format!("rootfs_path: {}: {error}", entry.path().display()))?;
+            let text = target.to_string_lossy();
             hash.update(b"l");
-            hash.update(target.to_string_lossy().as_bytes());
+            hash.update((text.len() as u64).to_le_bytes());
+            hash.update(text.as_bytes());
         } else {
-            return Err(rt_error(
-                ErrorCode::CapabilityUnqualified,
-                "rootfs_special_file",
-            ));
+            hash_special(&mut hash, entry.path(), &metadata)?;
         }
     }
     Ok(Hash256::from_bytes(hash.finalize().into()))
+}
+
+fn hash_special(hash: &mut Sha256, path: &Path, metadata: &fs::Metadata) -> Result<(), String> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{FileTypeExt, MetadataExt};
+        let kind = if metadata.file_type().is_char_device() {
+            b'c'
+        } else if metadata.file_type().is_block_device() {
+            b'b'
+        } else if metadata.file_type().is_fifo() {
+            b'p'
+        } else if metadata.file_type().is_socket() {
+            b's'
+        } else {
+            return Err(format!("rootfs_special_file: {}", path.display()));
+        };
+        hash.update([kind]);
+        hash.update(metadata.rdev().to_le_bytes());
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (hash, metadata);
+        Err(format!("rootfs_special_file: {}", path.display()))
+    }
 }
 
 fn apply_auth_mounts(plan: &mut SandboxPlan, profile: &QualifiedOciProfile) -> RtResult<()> {
@@ -693,12 +811,224 @@ fn apply_auth_mounts(plan: &mut SandboxPlan, profile: &QualifiedOciProfile) -> R
     Ok(())
 }
 
+fn home_upper_allowed(plan: &SandboxPlan, mount: &PlanMount) -> bool {
+    if mount.read_only || !mount.source.is_absolute() {
+        return false;
+    }
+    let Some(scratch) = plan
+        .mounts
+        .iter()
+        .find(|item| item.destination == "/scratch")
+    else {
+        return false;
+    };
+    mount.source.starts_with(&scratch.source) && mount.source != scratch.source
+}
+
+fn install_home_upper(plan: &mut SandboxPlan, profile: &QualifiedOciProfile) -> RtResult<()> {
+    let scratch = plan
+        .mounts
+        .iter()
+        .find(|item| item.destination == "/scratch")
+        .map(|item| item.source.clone())
+        .ok_or_else(|| rt_error(ErrorCode::InvalidArgument, "home_upper"))?;
+    let upper = scratch.join("rt-home");
+    fs::create_dir_all(&upper)
+        .map_err(|_| rt_error(ErrorCode::StorageUnavailable, "home_upper"))?;
+    for mount in &profile.auth_mounts {
+        let Some(relative) = mount.destination.strip_prefix("/rt-home/") else {
+            return Err(rt_error(ErrorCode::InvalidArgument, "auth_mount"));
+        };
+        let path = upper.join(relative);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)
+                .map_err(|_| rt_error(ErrorCode::StorageUnavailable, "home_upper"))?;
+        }
+        if !path.exists() {
+            fs::write(&path, b"")
+                .map_err(|_| rt_error(ErrorCode::StorageUnavailable, "home_upper"))?;
+        }
+    }
+    plan.mounts.push(PlanMount {
+        source: upper.clone(),
+        destination: "/rt-home".to_string(),
+        read_only: false,
+    });
+    plan.oci["mounts"]
+        .as_array_mut()
+        .ok_or_else(|| rt_error(ErrorCode::InvalidArgument, "oci_mounts"))?
+        .push(json!({
+            "source": upper,
+            "destination": "/rt-home",
+            "type": "bind",
+            "options": ["bind", "rw", "nosuid", "nodev"]
+        }));
+    Ok(())
+}
+
+pub(crate) const SLIRP_HOOK_SCRIPT: &str = r#"#!/bin/sh
+state=$(cat)
+pid=$(printf '%s' "$state" | sed -n 's/.*"pid"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' | head -n 1)
+[ -n "$pid" ] || exit 1
+# Do not exec slirp in the foreground: crun waits for this hook. Join the
+# container user namespace before its netns; rootless setns otherwise is EACCES.
+ready="${TMPDIR:-/tmp}/codeg-slirp-ready-$$"
+rm -f "$ready"
+mkfifo "$ready" || exit 1
+"$1" --configure --disable-host-loopback --mtu=65520 \
+  --userns-path="/proc/$pid/ns/user" \
+  --netns-type=path \
+  --ready-fd 3 \
+  "/proc/$pid/ns/net" \
+  tap0 >/dev/null 2>&1 3>"$ready" </dev/null &
+echo $! > "$2"
+if ! timeout 8 cat "$ready" >/dev/null 2>&1; then
+  rm -f "$ready"
+  exit 1
+fi
+rm -f "$ready"
+exit 0
+"#;
+
+fn install_slirp_hook(
+    plan: &mut SandboxPlan,
+    profile: &QualifiedOciProfile,
+    id: &str,
+) -> RtResult<()> {
+    let slirp = slirp_binary()
+        .ok_or_else(|| rt_error(ErrorCode::PolicyUnenforceable, "slirp4netns_missing"))?;
+    let dir = profile.runtime_root.join("slirp-pids");
+    fs::create_dir_all(&dir).map_err(|_| rt_error(ErrorCode::StorageUnavailable, "slirp_hook"))?;
+    let hook = profile.runtime_root.join("slirp-hook.sh");
+    fs::write(&hook, SLIRP_HOOK_SCRIPT)
+        .map_err(|_| rt_error(ErrorCode::StorageUnavailable, "slirp_hook"))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&hook, fs::Permissions::from_mode(0o755))
+            .map_err(|_| rt_error(ErrorCode::StorageUnavailable, "slirp_hook"))?;
+    }
+    let pidfile = dir.join(format!("{id}.pid"));
+    plan.oci["annotations"]["io.codeg.roundtable.network"] =
+        json!("slirp-egress-not-origin-filtered");
+    plan.oci["hooks"] = json!({
+        "createRuntime": [{
+            "path": hook,
+            "args": ["slirp-hook.sh", slirp, pidfile],
+            "env": []
+        }]
+    });
+    Ok(())
+}
+
+pub(crate) fn slirp_binary() -> Option<PathBuf> {
+    if let Some(path) = std::env::var_os("PATH").and_then(|path| {
+        std::env::split_paths(&path).find_map(|dir| {
+            let candidate = dir.join("slirp4netns");
+            candidate.is_file().then_some(candidate)
+        })
+    }) {
+        return Some(path);
+    }
+    let fallback = PathBuf::from("/usr/bin/slirp4netns");
+    fallback.is_file().then_some(fallback)
+}
+
+pub(super) fn stop_slirp(runtime_root: &Path, id: &str) {
+    let pidfile = runtime_root.join("slirp-pids").join(format!("{id}.pid"));
+    if let Ok(text) = fs::read_to_string(&pidfile) {
+        if let Ok(pid) = text.trim().parse::<i32>() {
+            #[cfg(unix)]
+            unsafe {
+                libc::kill(pid, libc::SIGTERM);
+            }
+            let _ = pid;
+        }
+    }
+    let _ = fs::remove_file(&pidfile);
+}
+
+pub(super) fn cgroup_delegation_error(cgroup_root: &Path) -> Option<String> {
+    if !cgroup_root.join("cgroup.controllers").is_file()
+        || !cgroup_root.join("cgroup.events").is_file()
+    {
+        return Some(format!(
+            "cgroup v2 root {} is missing cgroup.controllers or cgroup.events",
+            cgroup_root.display()
+        ));
+    }
+    let subtree =
+        fs::read_to_string(cgroup_root.join("cgroup.subtree_control")).unwrap_or_default();
+    let enabled: Vec<&str> = subtree.split_whitespace().collect();
+    for controller in ["memory", "pids", "cpu"] {
+        if !enabled.contains(&controller) {
+            return Some(format!(
+                "cgroup {} subtree_control lacks {controller}. With no processes in that directory, run: echo '+memory +pids +cpu' | sudo tee {}/cgroup.subtree_control && sudo mkdir -p {}/launcher && sudo chown -R \"$USER:$USER\" {} && echo $$ | sudo tee {}/launcher/cgroup.procs",
+                cgroup_root.display(),
+                cgroup_root.display(),
+                cgroup_root.display(),
+                cgroup_root.display(),
+                cgroup_root.display()
+            ));
+        }
+    }
+    let relative = fs::read_to_string("/proc/self/cgroup")
+        .ok()
+        .and_then(|text| {
+            text.lines()
+                .find_map(|line| line.strip_prefix("0::").map(str::to_string))
+        });
+    let Some(relative) = relative else {
+        return Some("could not read /proc/self/cgroup".to_string());
+    };
+    let Ok(root_rel) = cgroup_root.strip_prefix("/sys/fs/cgroup") else {
+        return Some("cgroup root must be under /sys/fs/cgroup".to_string());
+    };
+    let expected = format!("/{}", root_rel.to_string_lossy()).replace("//", "/");
+    let expected = expected.trim_end_matches('/');
+    if relative.starts_with(&format!("{expected}/")) {
+        return None;
+    }
+    let launcher = cgroup_root.join("launcher");
+    if fs::create_dir_all(&launcher).is_err() {
+        return Some(cgroup_move_hint(cgroup_root));
+    }
+    let pid = std::process::id().to_string();
+    if fs::write(launcher.join("cgroup.procs"), &pid).is_err() {
+        return Some(cgroup_move_hint(cgroup_root));
+    }
+    let moved = fs::read_to_string("/proc/self/cgroup")
+        .ok()
+        .is_some_and(|text| {
+            text.lines().any(|line| {
+                line.strip_prefix("0::")
+                    .is_some_and(|path| path.starts_with(&format!("{expected}/")))
+            })
+        });
+    if moved {
+        None
+    } else {
+        Some(cgroup_move_hint(cgroup_root))
+    }
+}
+
+fn cgroup_move_hint(cgroup_root: &Path) -> String {
+    format!(
+        "crun cannot create a container cgroup unless this process already lives in a child of {} (for example {}/launcher). Run: sudo mkdir -p {}/launcher && echo $$ | sudo tee {}/launcher/cgroup.procs",
+        cgroup_root.display(),
+        cgroup_root.display(),
+        cgroup_root.display(),
+        cgroup_root.display()
+    )
+}
+
 fn container_env_allowed(key: &str, value: &str) -> bool {
     match key {
         "HOME" => value == "/rt-home",
         "PATH" => value == "/usr/local/bin:/usr/bin:/bin",
         "GEMINI_HOME" => value == "/rt-home/.gemini",
         "CURSOR_CONFIG_DIR" => value == "/rt-home/.cursor",
+        "XDG_CONFIG_HOME" => value == "/rt-home/.config",
         _ => false,
     }
 }
@@ -772,7 +1102,13 @@ pub(super) fn verify_profile(plan: &SandboxPlan, profile: &QualifiedOciProfile) 
     for mount in &plan.mounts {
         let allowed = match mount.destination.as_str() {
             "/proc" => mount.source == Path::new("proc") && mount.read_only,
+            "/dev" => mount.source == Path::new("tmpfs") && !mount.read_only,
+            "/dev/pts" => mount.source == Path::new("devpts") && !mount.read_only,
+            "/dev/shm" => mount.source == Path::new("shm") && !mount.read_only,
+            "/sys" => mount.source == Path::new("sysfs") && mount.read_only,
+            "/tmp" => mount.source == Path::new("tmpfs") && !mount.read_only,
             "/scratch" => !mount.read_only && mount.source.is_absolute(),
+            "/rt-home" => home_upper_allowed(plan, mount),
             "/run/codeg/roundtable.sock" => {
                 profile.service_socket.as_ref() == Some(&mount.source) && mount.read_only
             }
@@ -820,6 +1156,20 @@ pub(super) fn verify_profile(plan: &SandboxPlan, profile: &QualifiedOciProfile) 
         }
         if mount.destination.starts_with("/rt-home/") {
             reject_baked_credential(profile, mount)?;
+        }
+    }
+    for required in [
+        "/proc", "/dev", "/dev/pts", "/dev/shm", "/sys", "/tmp", "/scratch", "/rt-home",
+    ] {
+        if !plan
+            .mounts
+            .iter()
+            .any(|mount| mount.destination == required)
+        {
+            return Err(rt_error(
+                ErrorCode::CapabilityUnqualified,
+                "qualification_mount_drift",
+            ));
         }
     }
     for (key, value) in &profile.container_env {
@@ -1097,6 +1447,13 @@ pub(super) async fn spawn_attached(
     profile: &QualifiedOciProfile,
 ) -> RtResult<(SandboxInstance, tokio::process::Child)> {
     verify_runtime(profile)?;
+    if let Some(reason) = cgroup_delegation_error(&profile.cgroup_root) {
+        tracing::warn!(%reason, "roundtable cgroup delegation");
+        return Err(rt_error(
+            ErrorCode::PolicyUnenforceable,
+            "cgroup_delegation",
+        ));
+    }
     // IsolationProvider::prepare just checked current binary/rootfs pins on
     // the blocking pool. This step only launches the already verified plan.
     let instance = instance(plan, profile);
@@ -1399,6 +1756,7 @@ pub(super) async fn reap(
     }
     verify_runtime(profile)?;
     verify_instance(profile, instance)?;
+    stop_slirp(&profile.runtime_root, &instance.runtime_id);
     let exists = list(profile)
         .await?
         .iter()

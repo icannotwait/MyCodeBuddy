@@ -651,6 +651,41 @@ fn qualified_rootfs_digest_detects_frozen_file_changes() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn qualified_rootfs_digest_hashes_symlink_text_and_special_files() {
+    let dir = tempdir().unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::os::unix::fs::symlink("/usr/bin/mawk", dir.path().join("awk-link")).unwrap();
+    std::os::unix::fs::symlink("missing-target", dir.path().join("dangling")).unwrap();
+    let fifo = dir.path().join("pipe");
+    assert!(std::process::Command::new("mkfifo")
+        .arg(&fifo)
+        .status()
+        .expect("mkfifo")
+        .success());
+    let first = codeg_lib::roundtable::qualified_rootfs_digest_detail(dir.path()).expect("digest");
+    std::fs::remove_file(dir.path().join("awk-link")).unwrap();
+    std::os::unix::fs::symlink("/usr/bin/gawk", dir.path().join("awk-link")).unwrap();
+    let changed =
+        codeg_lib::roundtable::qualified_rootfs_digest_detail(dir.path()).expect("digest");
+    assert_ne!(first, changed);
+    let status = fs::read_to_string("/proc/self/status").unwrap_or_default();
+    let root = status
+        .lines()
+        .any(|line| line.starts_with("Uid:") && line.split_whitespace().nth(1) == Some("0"));
+    if !root {
+        let hidden = dir.path().join("root-only");
+        fs::write(&hidden, b"shadow").unwrap();
+        fs::set_permissions(&hidden, fs::Permissions::from_mode(0o000)).unwrap();
+        let error = codeg_lib::roundtable::qualified_rootfs_digest_detail(dir.path())
+            .expect_err("unreadable file");
+        assert!(error.contains("root-only"), "{error}");
+        assert!(error.contains("chown"), "{error}");
+        let _ = fs::set_permissions(&hidden, fs::Permissions::from_mode(0o644));
+    }
+}
+
 #[test]
 fn qualified_profile_hash_binds_execution_template_without_attempt_socket_names() {
     let dir = tempdir().unwrap();
