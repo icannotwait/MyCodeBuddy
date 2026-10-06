@@ -564,6 +564,158 @@ fn acp_session_error_stops_slirp_and_deletes_the_container() {
     let _ = fs::remove_dir_all(&dir);
 }
 
+#[tokio::test]
+async fn live_rpc_allows_submit_rejects_terminal_and_keeps_float_frames() {
+    let seen = codeg_lib::roundtable::exercise_live_acp_rpc()
+        .await
+        .expect("live rpc");
+    assert!(seen.terminal_disabled);
+    assert!(seen.fs_read_disabled);
+    assert!(seen.fs_write_disabled);
+    assert!(seen.session_omits_capabilities);
+    assert_eq!(seen.allow_option_id, "allow-submit");
+    assert_eq!(seen.reject_option_id, "reject-terminal");
+    assert!(!seen.saw_cancelled);
+    assert_eq!(seen.stop_reason, "end_turn");
+    assert!(
+        seen.assistant_text.contains("partial answer"),
+        "{}",
+        seen.assistant_text
+    );
+
+    let frame = br#"{"jsonrpc":"2.0","method":"session/update","params":{"score":0.5}}"#;
+    assert!(codeg_lib::roundtable::acp_frame_fixture(frame).is_ok());
+    assert!(roundtable_protocol::parse_strict_json(
+        frame,
+        &roundtable_protocol::ParseLimits::suggested_profile(),
+    )
+    .is_err());
+    let rejected = codeg_lib::roundtable::acp_frame_fixture(b"{").expect_err("truncated frame");
+    assert_eq!(rejected.details.reason.as_deref(), Some("acp_frame"));
+
+    let allow_always = codeg_lib::roundtable::permission_reply_fixture(serde_json::json!({
+        "toolCall": {"title": "mcp__roundtable__read_evidence"},
+        "options": [
+            {"optionId": "always", "kind": "allow_always", "name": "Always"},
+            {"optionId": "reject", "kind": "reject_once", "name": "Reject"}
+        ]
+    }));
+    assert_eq!(allow_always["result"]["outcome"]["optionId"], "always");
+    assert_eq!(allow_always["result"]["outcome"]["outcome"], "selected");
+
+    let missing_reject = codeg_lib::roundtable::permission_reply_fixture(serde_json::json!({
+        "toolCall": {"title": "run_terminal_command", "rawInput": {"command": "echo submit_result"}},
+        "options": [{"optionId": "once", "kind": "allow_once", "name": "Allow"}]
+    }));
+    assert_eq!(missing_reject["error"]["code"], -32601);
+    assert!(!missing_reject.to_string().contains("cancelled"));
+
+    let search = codeg_lib::roundtable::permission_reply_fixture(serde_json::json!({
+        "toolCall": {"name": "roundtable/search_evidence"},
+        "options": [
+            {"optionId": "allow-search", "kind": "allow_once", "name": "Allow"},
+            {"optionId": "reject-search", "kind": "reject_once", "name": "Reject"}
+        ]
+    }));
+    assert_eq!(search["result"]["outcome"]["optionId"], "allow-search");
+}
+
+#[test]
+fn rejected_frame_excerpt_drops_token_values() {
+    let raw = br#"{"refresh_token":"super-secret-token-value-1234567890","access_token":"another-secret-value","score":1.5}"#;
+    let excerpt = codeg_lib::roundtable::redact_untrusted_excerpt_fixture(raw);
+    assert!(!excerpt.contains("super-secret"));
+    assert!(!excerpt.contains("another-secret"));
+    assert!(excerpt.contains("[redacted]"));
+    assert!(excerpt.chars().count() <= 200);
+}
+
+#[cfg(unix)]
+#[test]
+fn reap_deletes_grok_auth_and_limits_old_run_directories() {
+    use std::os::unix::fs::{symlink, PermissionsExt};
+    use std::time::{Duration, UNIX_EPOCH};
+
+    let root = scratch();
+    let runs = root.join("runs");
+    let keep = codeg_lib::roundtable::run_dir_retention_fixture();
+    for index in 0..keep + 2 {
+        let dir = runs.join(format!("run-{index:02}"));
+        let auth = dir.join("scratch/rt-home/.grok/auth.json");
+        fs::create_dir_all(auth.parent().expect("auth parent")).expect("run");
+        fs::write(&auth, b"refresh-token-secret").expect("auth");
+        fs::set_permissions(&auth, fs::Permissions::from_mode(0o600)).expect("mode");
+        assert_eq!(
+            fs::metadata(&auth).expect("meta").permissions().mode() & 0o777,
+            0o600
+        );
+        fs::File::open(&dir)
+            .expect("dir")
+            .set_modified(UNIX_EPOCH + Duration::from_secs(index as u64))
+            .expect("mtime");
+    }
+    let outside = root.join("outside");
+    fs::create_dir_all(&outside).expect("outside");
+    fs::write(outside.join("marker"), b"keep").expect("marker");
+    symlink(&outside, runs.join("linked")).expect("symlink");
+
+    let newest = format!("run-{:02}", keep + 1);
+    codeg_lib::roundtable::retire_attempt_files_fixture(&root, &newest).expect("retire");
+    let auth = runs.join(&newest).join("scratch/rt-home/.grok/auth.json");
+    assert!(!auth.exists());
+    assert!(!runs.join(&newest).join("scratch").exists());
+    assert!(runs.join(&newest).is_dir());
+    let remaining = fs::read_dir(&runs)
+        .expect("runs")
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| entry.file_type().ok().is_some_and(|kind| kind.is_dir()))
+        .count();
+    assert_eq!(remaining, keep);
+    assert!(!runs.join("run-00").exists());
+    assert!(!runs.join("run-01").exists());
+    assert_eq!(fs::read(outside.join("marker")).expect("marker"), b"keep");
+    assert!(runs
+        .join("linked")
+        .symlink_metadata()
+        .expect("link")
+        .file_type()
+        .is_symlink());
+    codeg_lib::roundtable::retire_attempt_files_fixture(&root, &newest).expect("idempotent");
+
+    let host = root.join("host-auth.json");
+    fs::write(&host, b"host-secret").expect("host");
+    let linked_auth = runs
+        .join("symlink-auth")
+        .join("scratch/rt-home/.grok/auth.json");
+    fs::create_dir_all(linked_auth.parent().expect("parent")).expect("home");
+    symlink(&host, &linked_auth).expect("auth link");
+    codeg_lib::roundtable::retire_attempt_files_fixture(&root, "symlink-auth").expect("unlink");
+    assert_eq!(fs::read(&host).expect("host remains"), b"host-secret");
+    assert!(!linked_auth.exists());
+
+    let host_home = root.join("host-home/.grok");
+    fs::create_dir_all(&host_home).expect("host home");
+    fs::write(host_home.join("auth.json"), b"real-host").expect("real");
+    let scratch = runs.join("mid-link").join("scratch");
+    fs::create_dir_all(&scratch).expect("scratch");
+    symlink(root.join("host-home"), scratch.join("rt-home")).expect("home link");
+    assert!(codeg_lib::roundtable::retire_attempt_files_fixture(&root, "mid-link").is_err());
+    assert_eq!(
+        fs::read(host_home.join("auth.json")).expect("host auth"),
+        b"real-host"
+    );
+
+    let escaped = root.join("escaped");
+    fs::create_dir_all(&escaped).expect("escaped");
+    fs::write(escaped.join("marker"), b"stay").expect("stay");
+    let bad = runs.join("bad-incarnation");
+    fs::create_dir_all(&bad).expect("bad");
+    symlink(&escaped, bad.join("scratch")).expect("scratch link");
+    assert!(codeg_lib::roundtable::retire_attempt_files_fixture(&root, "bad-incarnation").is_err());
+    assert_eq!(fs::read(escaped.join("marker")).expect("escaped"), b"stay");
+    let _ = fs::remove_dir_all(&root);
+}
+
 #[test]
 fn cgroup_delegation_names_the_launcher_child_when_the_root_is_not_a_cgroup() {
     let dir = scratch();

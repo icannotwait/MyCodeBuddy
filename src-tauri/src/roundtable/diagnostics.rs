@@ -139,3 +139,130 @@ impl DiagnosticCapture {
         Ok((excerpt, Hash256::from_bytes(digest)))
     }
 }
+
+/// One log line for an untrusted ACP frame or submit payload.
+/// Token-like values are removed before the excerpt is clipped.
+pub(crate) fn redact_untrusted_excerpt(bytes: &[u8]) -> String {
+    const LIMIT: usize = 200;
+    let text = String::from_utf8_lossy(bytes);
+    let scrubbed = scrub_long_runs(&scrub_secret_values(&text));
+    let mut excerpt = String::new();
+    for ch in scrubbed.chars() {
+        excerpt.push(if ch.is_control() { ' ' } else { ch });
+        if excerpt.chars().count() >= LIMIT {
+            break;
+        }
+    }
+    while !excerpt.is_char_boundary(excerpt.len()) {
+        excerpt.pop();
+    }
+    excerpt
+}
+
+fn is_sensitive_key(key: &str) -> bool {
+    let key = key.trim().to_ascii_lowercase();
+    if key.is_empty() {
+        return false;
+    }
+    matches!(
+        key.as_str(),
+        "token"
+            | "secret"
+            | "authorization"
+            | "refresh_token"
+            | "access_token"
+            | "api_key"
+            | "password"
+            | "id_token"
+            | "credential"
+    ) || key.contains("token")
+        || key.contains("secret")
+        || key.contains("password")
+        || key.contains("authorization")
+}
+
+fn scrub_secret_values(input: &str) -> String {
+    let chars: Vec<char> = input.chars().collect();
+    let mut out = String::with_capacity(input.len().min(240));
+    let mut index = 0;
+    while index < chars.len() {
+        if chars[index] != '"' {
+            out.push(chars[index]);
+            index += 1;
+            continue;
+        }
+        let start = index;
+        index += 1;
+        let mut key = String::new();
+        while index < chars.len() && chars[index] != '"' {
+            if chars[index] == '\\' && index + 1 < chars.len() {
+                key.push(chars[index]);
+                index += 1;
+            }
+            key.push(chars[index]);
+            index += 1;
+        }
+        if index < chars.len() && chars[index] == '"' {
+            index += 1;
+        }
+        let mut cursor = index;
+        while cursor < chars.len() && chars[cursor].is_whitespace() {
+            cursor += 1;
+        }
+        if !is_sensitive_key(&key) || cursor >= chars.len() || chars[cursor] != ':' {
+            for ch in &chars[start..index] {
+                out.push(*ch);
+            }
+            continue;
+        }
+        cursor += 1;
+        while cursor < chars.len() && chars[cursor].is_whitespace() {
+            cursor += 1;
+        }
+        if cursor >= chars.len() || chars[cursor] != '"' {
+            for ch in &chars[start..index] {
+                out.push(*ch);
+            }
+            continue;
+        }
+        cursor += 1;
+        while cursor < chars.len() && chars[cursor] != '"' {
+            if chars[cursor] == '\\' && cursor + 1 < chars.len() {
+                cursor += 2;
+                continue;
+            }
+            cursor += 1;
+        }
+        if cursor < chars.len() {
+            cursor += 1;
+        }
+        out.push('"');
+        out.push_str(&key);
+        out.push_str("\":\"[redacted]\"");
+        index = cursor;
+    }
+    out
+}
+
+fn scrub_long_runs(input: &str) -> String {
+    let mut out = String::new();
+    let mut run = String::new();
+    let flush = |run: &mut String, out: &mut String| {
+        if run.chars().count() >= 24 {
+            out.push_str("[redacted]");
+        } else {
+            out.push_str(run);
+        }
+        run.clear();
+    };
+    for ch in input.chars() {
+        if ch.is_ascii_alphanumeric() || matches!(ch, '+' | '/' | '=' | '_' | '-') {
+            run.push(ch);
+        } else {
+            flush(&mut run, &mut out);
+            out.push(ch);
+        }
+    }
+    flush(&mut run, &mut out);
+    out
+}

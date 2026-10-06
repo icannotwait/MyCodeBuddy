@@ -1132,8 +1132,13 @@ fn canonical_submission(raw: &[u8]) -> RtResult<Vec<u8>> {
         max_bytes: v1_1::MAX_RESULT_BYTES as usize,
         max_depth: profile_suggestions::MAX_JSON_DEPTH,
     };
-    let value = parse_strict_json(raw, &limits)
-        .map_err(|_| rt_error(ErrorCode::InvalidState, "validator_disagreement"))?;
+    let value = parse_strict_json(raw, &limits).map_err(|_| {
+        tracing::warn!(
+            excerpt = %super::diagnostics::redact_untrusted_excerpt(raw),
+            "rejected submit_result payload"
+        );
+        rt_error(ErrorCode::InvalidState, "validator_disagreement")
+    })?;
     canonical_bytes(&value).map_err(|_| rt_error(ErrorCode::InvalidState, "validator_disagreement"))
 }
 

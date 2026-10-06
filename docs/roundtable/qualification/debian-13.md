@@ -81,8 +81,14 @@ image's `/etc/resolv.conf` stays an empty regular file. Both paths
 bind-mount `<runtime-root>/slirp-resolv.conf` read-only over it. That
 file contains `nameserver 10.0.2.3`, which is slirp4netns's DNS proxy
 inside the container network namespace. The image digest does not change.
-The resolver path is not part of the qualification key hash, so keys
-already issued for Grok and Antigravity stay valid.
+`plan_hash` hashes the execution template, including the paths in it.
+The same live paths keep the same `plan_hash` when only the resolver
+file contents change. `core_hash` hashes the shared roundtable code.
+It changed between `2f57bcde4` (`c27b029c`) and `a8ee4042f`
+(`213eac47`), so keys issued before that commit do not match. Re-run
+`roundtable-qualify` and replace `execution-policy.json`. A probe that
+uses a different `--runtime-root` or rootfs path changes `plan_hash`
+only.
 Without that mount the live container keeps the empty file, so
 `auth.x.ai` and `cli-chat-proxy.grok.com` fail with
 `dns error: failed to lookup address information` until the attempt
@@ -156,7 +162,16 @@ directory for that adapter and that container run
 auth files are bind-mounted read-only on top of it. Grok's `auth.json`
 is a regular file in that directory, not a second mount. The probe
 removes the scratch directory after the container is reaped, including
-when the run fails.
+when the run fails. A live reap removes
+`oci/runs/<incarnation>/scratch`, including
+`rt-home/.grok/auth.json`, before the attempt is marked confirmed. It
+then keeps the eight newest real run directories under `oci/runs/` and
+does not follow a symlink out of that directory. A scratch path or an
+intermediate home path that is a symlink fails the reap instead of
+deleting the link target. Pruning an older directory that cannot be
+removed is logged and does not block the attempt whose scratch was
+just deleted.
+
 The image root stays read-only. `/dev/mem` and `/dev/sda` are still
 denied.
 
@@ -240,7 +255,9 @@ not inside the rootfs:
   `O_NOFOLLOW`. The host file is never opened for write, and the
   refreshed token is never copied back. If the issuer rotates the
   refresh token, the new token dies with the attempt scratch and
-  `grok login` on the host is required again. Cursor's files stay
+  `grok login` on the host is required again. The copy is deleted when
+  the attempt is reaped; it is not written back to the host. Cursor's
+  files stay
   read-only binds. This path does not read or write them differently
   and does not inject `CURSOR_API_KEY`.
 - `$HOME/.cursor/cli-config.json`
@@ -371,6 +388,31 @@ Replace `allowed_qualification_keys` with the key objects from each
 `execution-policy.example.json` you intend to run. `enabled` must be
 true. `generation` must match the file the server reads. A key that is
 not in this list cannot start a turn.
+
+## Seat ACP client
+
+Live seats and the qualification probe share one ACP loop. `initialize`
+advertises `terminal: false` and filesystem read and write false.
+`session/new` does not send a capabilities object. It sets `cwd` to
+`/scratch` and mounts only the roundtable MCP server.
+
+`session/request_permission` selects an option from that request.
+`submit_result`, `read_evidence`, and `search_evidence`, including
+`roundtable/<tool>` and `mcp__roundtable__<tool>`, select `allow_once`,
+or `allow_always` when `allow_once` is absent. Every other tool,
+including `run_terminal_command`, selects `reject_once`, or
+`reject_always` when `reject_once` is absent. The reply is
+`{"outcome":{"outcome":"selected","optionId":"..."}}`. The client never
+sends `outcome: cancelled`, which ACP treats as cancelling the prompt
+turn. A rejected tool does not finish the attempt. The loop keeps
+reading until the prompt result has `stopReason` `end_turn`. A request
+with no usable option gets JSON-RPC `-32601`.
+
+ACP transport frames use a bounded lenient JSON parser, at most 1 MiB.
+A float in a `session/update` does not fail the turn. The strict
+no-float parser still applies only to the `submit_result` payload. A
+frame or payload that is rejected is logged as a truncated excerpt with
+token-like values removed.
 
 ## Three-member room
 

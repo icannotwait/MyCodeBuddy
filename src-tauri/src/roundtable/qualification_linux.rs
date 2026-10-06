@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use roundtable_protocol::Hash256;
 use sha2::{Digest, Sha256};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::BufReader;
 use tokio::process::Command;
 
 use super::companion::ATTEMPT_TOKEN_ENV;
@@ -818,11 +818,13 @@ async fn run_acp_session(
     let mut stdin = child.stdin.take().ok_or("acp stdin")?;
     let stdout = child.stdout.take().ok_or("acp stdout")?;
     let mut reader = BufReader::new(stdout);
-    let init = rpc(&mut stdin, &mut reader, 1, "initialize", serde_json::json!({
-        "protocolVersion": 1,
-        "clientCapabilities": {"fs": {"readTextFile": false, "writeTextFile": false}, "terminal": false},
-        "clientInfo": {"name": "codeg-roundtable-qualify", "version": "1"}
-    }))
+    let init = rpc(
+        &mut stdin,
+        &mut reader,
+        1,
+        "initialize",
+        super::live_runtime::roundtable_initialize_params("codeg-roundtable-qualify"),
+    )
     .await?;
     if init["protocolVersion"] != 1 {
         return Err("acp protocol version".into());
@@ -832,15 +834,12 @@ async fn run_acp_session(
         &mut reader,
         2,
         "session/new",
-        serde_json::json!({
-            "cwd": "/scratch",
-            "mcpServers": [{
-                "name": "roundtable",
-                "command": "/usr/local/bin/codeg-mcp",
-                "args": ["--service-roundtable", "--socket-path", "/run/codeg/roundtable.sock", "--incarnation", "qualify"],
-                "env": [{"name": ATTEMPT_TOKEN_ENV, "value": token}]
-            }]
-        }),
+        super::live_runtime::roundtable_session_params(&serde_json::json!([{
+            "name": "roundtable",
+            "command": "/usr/local/bin/codeg-mcp",
+            "args": ["--service-roundtable", "--socket-path", "/run/codeg/roundtable.sock", "--incarnation", "qualify"],
+            "env": [{"name": ATTEMPT_TOKEN_ENV, "value": token}]
+        }])),
     )
     .await?;
     let session_id = session["sessionId"]
@@ -876,60 +875,28 @@ async fn rpc(
     method: &str,
     params: serde_json::Value,
 ) -> Result<serde_json::Value, String> {
-    let mut line = serde_json::to_vec(&serde_json::json!({
-        "jsonrpc": "2.0",
-        "id": id,
-        "method": method,
-        "params": params
-    }))
-    .map_err(|error| error.to_string())?;
-    line.push(b'\n');
-    stdin
-        .write_all(&line)
-        .await
-        .map_err(|error| error.to_string())?;
-    stdin.flush().await.map_err(|error| error.to_string())?;
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(90);
-    loop {
-        if tokio::time::Instant::now() > deadline {
-            return Err(format!("{method} timed out"));
-        }
-        let mut buf = String::new();
-        let count = tokio::time::timeout(Duration::from_secs(90), stdout.read_line(&mut buf))
-            .await
-            .map_err(|_| format!("{method} timed out"))?
-            .map_err(|error| error.to_string())?;
-        if count == 0 {
-            return Err(format!("{method} closed"));
-        }
-        let message: serde_json::Value =
-            serde_json::from_str(&buf).map_err(|error| error.to_string())?;
-        if message.get("method").is_some() {
-            if let Some(request_id) = message.get("id") {
-                let response = serde_json::json!({
-                    "jsonrpc": "2.0",
-                    "id": request_id,
-                    "error": {"code": -32601, "message": "Capability not available"}
-                });
-                let mut bytes = serde_json::to_vec(&response).map_err(|error| error.to_string())?;
-                bytes.push(b'\n');
-                stdin
-                    .write_all(&bytes)
-                    .await
-                    .map_err(|error| error.to_string())?;
-            }
-            continue;
-        }
-        if message["id"] == id {
-            if message.get("error").is_some() {
-                return Err(format!("{method} rejected"));
-            }
-            return message
-                .get("result")
-                .cloned()
-                .ok_or_else(|| format!("{method} response"));
-        }
-    }
+    let mut seq = 0;
+    super::live_runtime::acp_exchange(
+        stdin,
+        stdout,
+        &mut super::live_runtime::AcpExchange {
+            id,
+            method,
+            params,
+            seq: &mut seq,
+            assistant: None,
+            deadline: Some(Duration::from_secs(90)),
+        },
+    )
+    .await
+    .map_err(|error| match error.details.reason.as_deref() {
+        Some("acp_timeout") => format!("{method} timed out"),
+        Some("acp_closed") => format!("{method} closed"),
+        Some("acp_rejected") => format!("{method} rejected"),
+        Some("acp_response") => format!("{method} response"),
+        Some(reason) => format!("{method} {reason}"),
+        None => method.to_string(),
+    })
 }
 
 async fn run_container(

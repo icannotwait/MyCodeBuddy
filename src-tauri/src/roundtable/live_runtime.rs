@@ -15,9 +15,10 @@ use async_trait::async_trait;
 use roundtable_protocol::*;
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, HashMap};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+use std::time::Duration;
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 
 struct Active {
     store: RoundtableStore,
@@ -135,6 +136,14 @@ impl LiveParticipantExecutor {
     fn isolator_for(&self, agent: &str) -> RtResult<LinuxOciIsolator> {
         Ok(self.isolator.for_profile(self.adapter(agent)?.oci))
     }
+
+    fn retire_incarnation(&self, incarnation: IncarnationId) -> RtResult<()> {
+        let name = incarnation.to_string();
+        for installed in self.adapters.values() {
+            retire_attempt_files(&installed.oci.runtime_root, &name)?;
+        }
+        Ok(())
+    }
     pub(crate) fn discovery(&self) -> Arc<dyn IsolationProvider + Send + Sync> {
         self.isolator.clone()
     }
@@ -209,6 +218,7 @@ impl LiveParticipantExecutor {
                     .lock()
                     .expect("launch lifecycle")
                     .remove(&incarnation);
+                self.retire_incarnation(incarnation)?;
                 return Ok(CleanupProof {
                     process: ProcessTreeProof {
                         instance_id: format!("not-spawned-{incarnation}"),
@@ -227,6 +237,7 @@ impl LiveParticipantExecutor {
                     rt_error(ErrorCode::RuntimeUnavailable, "cleanup_identity_unknown")
                 })?;
             let process = self.isolator.reap(&instance).await?;
+            self.retire_incarnation(incarnation)?;
             return Ok(CleanupProof {
                 process,
                 mailbox_empty: true,
@@ -258,6 +269,7 @@ impl LiveParticipantExecutor {
             let _ = task.await;
         }
         if !active.launched.load(std::sync::atomic::Ordering::Acquire) {
+            self.retire_incarnation(incarnation)?;
             let proof = CleanupProof {
                 process: ProcessTreeProof {
                     instance_id: format!("not-spawned-{incarnation}"),
@@ -301,6 +313,7 @@ impl LiveParticipantExecutor {
         if !proof.process.process_tree_empty || !proof.tools_drained {
             return Err(rt_error(ErrorCode::RuntimeUnavailable, "cleanup_unproven"));
         }
+        self.retire_incarnation(incarnation)?;
         persist_diagnostic(&active).await?;
         active.store.mark_launch_reaped(incarnation).await?;
         exec(active.store.connection(),"UPDATE rt_attempts SET cleanup_state='confirmed',residual_remote_work=? WHERE room_id=? AND attempt_id=?",vec![num(if active.gateway.remote_work_uncertain(){1}else{0}),text(&active.room.to_string()),text(&active.attempt.to_string())]).await?;
@@ -747,7 +760,16 @@ async fn drive_acp(
 ) -> RtResult<u64> {
     let mut stdout = BufReader::new(stdout);
     let mut seq = 0;
-    let initialize=rpc(&mut stdin,&mut stdout,1,"initialize",json!({"protocolVersion":1,"clientCapabilities":{"fs":{"readTextFile":false,"writeTextFile":false},"terminal":false},"clientInfo":{"name":"codeg-roundtable","version":"1"}}),&mut seq,active).await?;
+    let initialize = rpc(
+        &mut stdin,
+        &mut stdout,
+        1,
+        "initialize",
+        roundtable_initialize_params("codeg-roundtable"),
+        &mut seq,
+        active,
+    )
+    .await?;
     if initialize["protocolVersion"] != 1 {
         return Err(rt_error(ErrorCode::CapabilityUnqualified, "acp_version"));
     }
@@ -762,7 +784,30 @@ async fn drive_acp(
         let discovery = registry.begin_discovery(agent).await;
         (registry, root, discovery)
     };
-    let session=rpc(&mut stdin,&mut stdout,2,"session/new",json!({"cwd":"/scratch","mcpServers":[{"name":"roundtable","command":mcp,"args":["--service-roundtable","--socket-path","/run/codeg/roundtable.sock","--incarnation",request.fence.incarnation.to_string()],"env":[{"name":super::ATTEMPT_TOKEN_ENV,"value":token},{"name":"CODEG_RT_MODEL_SOCKET","value":"/run/codeg/gateway.sock"}]}]}),&mut seq,active).await?;
+    let session = rpc(
+        &mut stdin,
+        &mut stdout,
+        2,
+        "session/new",
+        roundtable_session_params(&json!([{
+            "name": "roundtable",
+            "command": mcp,
+            "args": [
+                "--service-roundtable",
+                "--socket-path",
+                "/run/codeg/roundtable.sock",
+                "--incarnation",
+                request.fence.incarnation.to_string()
+            ],
+            "env": [
+                {"name": super::ATTEMPT_TOKEN_ENV, "value": token},
+                {"name": "CODEG_RT_MODEL_SOCKET", "value": "/run/codeg/gateway.sock"}
+            ]
+        }])),
+        &mut seq,
+        active,
+    )
+    .await?;
     let session_id = session["sessionId"]
         .as_str()
         .ok_or_else(|| rt_error(ErrorCode::RuntimeUnavailable, "acp_session"))?;
@@ -830,6 +875,37 @@ async fn drive_acp(
     }
     Ok(seq)
 }
+/// ACP client parameters shared by live seats and the qualification probe.
+/// Terminal and filesystem edit/read capabilities stay off. `session/new`
+/// has no capabilities field in ACP, so that request omits them.
+pub(crate) fn roundtable_initialize_params(client_name: &str) -> Value {
+    json!({
+        "protocolVersion": 1,
+        "clientCapabilities": {
+            "fs": {"readTextFile": false, "writeTextFile": false},
+            "terminal": false
+        },
+        "clientInfo": {"name": client_name, "version": "1"}
+    })
+}
+
+pub(crate) fn roundtable_session_params(mcp_servers: &Value) -> Value {
+    json!({
+        "cwd": "/scratch",
+        "mcpServers": mcp_servers
+    })
+}
+
+pub(crate) struct AcpExchange<'a> {
+    pub(crate) id: u64,
+    pub(crate) method: &'a str,
+    pub(crate) params: Value,
+    pub(crate) seq: &'a mut u64,
+    pub(crate) assistant: Option<&'a Mutex<Option<super::DiagnosticCapture>>>,
+    /// Overall budget and per-read budget. Live seats pass `None`.
+    pub(crate) deadline: Option<Duration>,
+}
+
 async fn rpc(
     stdin: &mut tokio::process::ChildStdin,
     stdout: &mut BufReader<tokio::process::ChildStdout>,
@@ -839,50 +915,111 @@ async fn rpc(
     seq: &mut u64,
     active: &Active,
 ) -> RtResult<Value> {
+    acp_exchange(
+        stdin,
+        stdout,
+        &mut AcpExchange {
+            id,
+            method,
+            params,
+            seq,
+            assistant: Some(&active.assistant),
+            deadline: None,
+        },
+    )
+    .await
+}
+
+/// Live and probe ACP loop. Transport frames are lenient JSON. A rejected
+/// tool stays inside this loop; only the prompt's `stopReason` ends the turn.
+pub(crate) async fn acp_exchange<W, R>(
+    stdin: &mut W,
+    stdout: &mut BufReader<R>,
+    exchange: &mut AcpExchange<'_>,
+) -> RtResult<Value>
+where
+    W: AsyncWrite + Unpin,
+    R: AsyncRead + Unpin,
+{
     write_rpc(
         stdin,
-        &json!({"jsonrpc":"2.0","id":id,"method":method,"params":params}),
+        &json!({
+            "jsonrpc": "2.0",
+            "id": exchange.id,
+            "method": exchange.method,
+            "params": exchange.params
+        }),
     )
     .await?;
+    let started = tokio::time::Instant::now();
     loop {
+        if let Some(limit) = exchange.deadline {
+            if started.elapsed() > limit {
+                return Err(rt_error(ErrorCode::RuntimeUnavailable, "acp_timeout"));
+            }
+        }
         let mut line = Vec::new();
-        let count = (&mut *stdout)
-            .take(1_048_577)
-            .read_until(b'\n', &mut line)
+        let count = if let Some(limit) = exchange.deadline {
+            match tokio::time::timeout(
+                limit,
+                (&mut *stdout).take(1_048_577).read_until(b'\n', &mut line),
+            )
             .await
-            .map_err(|_| rt_error(ErrorCode::RuntimeUnavailable, "acp_read"))?;
-        if count == 0 || line.len() > 1_048_576 {
+            {
+                Err(_) => return Err(rt_error(ErrorCode::RuntimeUnavailable, "acp_timeout")),
+                Ok(Err(_)) => return Err(rt_error(ErrorCode::RuntimeUnavailable, "acp_read")),
+                Ok(Ok(count)) => count,
+            }
+        } else {
+            (&mut *stdout)
+                .take(1_048_577)
+                .read_until(b'\n', &mut line)
+                .await
+                .map_err(|_| rt_error(ErrorCode::RuntimeUnavailable, "acp_read"))?
+        };
+        if count == 0 {
+            return Err(rt_error(ErrorCode::RuntimeUnavailable, "acp_closed"));
+        }
+        if line.len() > 1_048_576 {
+            tracing::warn!(
+                excerpt = %super::diagnostics::redact_untrusted_excerpt(&line),
+                "rejected ACP frame"
+            );
             return Err(rt_error(ErrorCode::RuntimeUnavailable, "acp_frame"));
         }
-        let message = parse_strict_json(&line, &ParseLimits::suggested_profile())?;
-        *seq = seq
+        let message = parse_acp_frame(&line)?;
+        *exchange.seq = exchange
+            .seq
             .checked_add(1)
             .ok_or_else(|| rt_error(ErrorCode::InvalidState, "ingress_overflow"))?;
         if message.get("method").is_some() {
-            if let Some(request_id) = message.get("id") {
+            if let Some(request_id) = message.get("id").cloned() {
                 let response = if message["method"] == "session/request_permission" {
-                    json!({"jsonrpc":"2.0","id":request_id,"result":{"outcome":{"outcome":"cancelled"}}})
+                    permission_reply(&message["params"], &request_id)
                 } else {
-                    json!({"jsonrpc":"2.0","id":request_id,"error":{"code":-32601,"message":"Capability not available"}})
+                    json!({
+                        "jsonrpc": "2.0",
+                        "id": request_id,
+                        "error": {"code": -32601, "message": "Capability not available"}
+                    })
                 };
                 write_rpc(stdin, &response).await?;
             } else if message["method"] == "session/update"
                 && message["params"]["update"]["sessionUpdate"] == "agent_message_chunk"
             {
                 if let Some(text) = message["params"]["update"]["content"]["text"].as_str() {
-                    if let Some(capture) = active
-                        .assistant
-                        .lock()
-                        .expect("assistant diagnostic")
-                        .as_mut()
-                    {
-                        capture.push(text);
+                    if let Some(assistant) = exchange.assistant {
+                        if let Some(capture) =
+                            assistant.lock().expect("assistant diagnostic").as_mut()
+                        {
+                            capture.push(text);
+                        }
                     }
                 }
             }
             continue;
         }
-        if message["id"] == id {
+        if message["id"] == exchange.id {
             if message.get("error").is_some() {
                 return Err(rt_error(ErrorCode::RuntimeUnavailable, "acp_rejected"));
             }
@@ -893,7 +1030,125 @@ async fn rpc(
         }
     }
 }
-async fn write_rpc(stdin: &mut tokio::process::ChildStdin, value: &Value) -> RtResult<()> {
+
+fn parse_acp_frame(line: &[u8]) -> RtResult<Value> {
+    let line = line.strip_suffix(b"\n").unwrap_or(line);
+    let line = line.strip_suffix(b"\r").unwrap_or(line);
+    match serde_json::from_slice::<Value>(line) {
+        Ok(value) if value.is_object() => Ok(value),
+        _ => {
+            tracing::warn!(
+                excerpt = %super::diagnostics::redact_untrusted_excerpt(line),
+                "rejected ACP frame"
+            );
+            Err(rt_error(ErrorCode::RuntimeUnavailable, "acp_frame"))
+        }
+    }
+}
+
+const ROUNDTABLE_TOOL_NAMES: [&str; 3] = ["submit_result", "read_evidence", "search_evidence"];
+
+fn permission_reply(params: &Value, request_id: &Value) -> Value {
+    let allow = tool_call_is_roundtable(params);
+    match selected_option(params, allow) {
+        Some(option_id) => json!({
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "result": {"outcome": {"outcome": "selected", "optionId": option_id}}
+        }),
+        None => json!({
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "error": {"code": -32601, "message": "Capability not available"}
+        }),
+    }
+}
+
+fn selected_option(params: &Value, allow: bool) -> Option<String> {
+    let options = params.get("options")?.as_array()?;
+    let kinds: &[&str] = if allow {
+        &["allow_once", "allow_always"]
+    } else {
+        &["reject_once", "reject_always"]
+    };
+    for kind in kinds {
+        if let Some(id) = options.iter().find_map(|option| {
+            (option.get("kind").and_then(Value::as_str) == Some(*kind))
+                .then(|| option.get("optionId").and_then(Value::as_str))
+                .flatten()
+                .map(str::to_owned)
+        }) {
+            return Some(id);
+        }
+    }
+    None
+}
+
+fn tool_call_is_roundtable(params: &Value) -> bool {
+    let call = params.get("toolCall").cloned().unwrap_or(Value::Null);
+    field_names_tool(call.get("title"))
+        || field_names_tool(call.get("name"))
+        || raw_input_names_tool(call.get("rawInput"))
+        || content_names_tool(call.get("content"))
+        || value_names_tool(call.get("_meta"))
+        || value_names_tool(params.get("_meta"))
+}
+
+fn content_names_tool(value: Option<&Value>) -> bool {
+    let Some(items) = value.and_then(Value::as_array) else {
+        return false;
+    };
+    items.iter().any(|item| {
+        field_names_tool(item.get("title"))
+            || field_names_tool(item.get("name"))
+            || value_names_tool(item.get("_meta"))
+    })
+}
+
+fn field_names_tool(value: Option<&Value>) -> bool {
+    value
+        .and_then(Value::as_str)
+        .is_some_and(text_names_roundtable_tool)
+}
+
+fn raw_input_names_tool(value: Option<&Value>) -> bool {
+    match value {
+        Some(Value::String(text)) => text_names_roundtable_tool(text),
+        Some(Value::Object(map)) => ["name", "tool", "toolName", "tool_name"].iter().any(|key| {
+            map.get(*key)
+                .and_then(Value::as_str)
+                .is_some_and(text_names_roundtable_tool)
+        }),
+        _ => false,
+    }
+}
+
+fn value_names_tool(value: Option<&Value>) -> bool {
+    match value {
+        Some(Value::String(text)) => text_names_roundtable_tool(text),
+        Some(Value::Array(items)) => items.iter().any(|item| value_names_tool(Some(item))),
+        Some(Value::Object(map)) => map.values().any(|item| value_names_tool(Some(item))),
+        _ => false,
+    }
+}
+
+fn text_names_roundtable_tool(text: &str) -> bool {
+    text.split(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '_' || ch == '/'))
+        .filter(|token| !token.is_empty())
+        .any(|token| {
+            ROUNDTABLE_TOOL_NAMES.contains(&token)
+                || ROUNDTABLE_TOOL_NAMES.iter().any(|name| {
+                    token
+                        .strip_prefix("roundtable/")
+                        .is_some_and(|rest| rest == *name)
+                        || token
+                            .strip_prefix("mcp__roundtable__")
+                            .is_some_and(|rest| rest == *name)
+                })
+        })
+}
+
+async fn write_rpc<W: AsyncWrite + Unpin>(stdin: &mut W, value: &Value) -> RtResult<()> {
     let mut bytes = canonical_bytes(value)?;
     bytes.push(b'\n');
     stdin
@@ -904,6 +1159,163 @@ async fn write_rpc(stdin: &mut tokio::process::ChildStdin, value: &Value) -> RtR
         .flush()
         .await
         .map_err(|_| rt_error(ErrorCode::RuntimeUnavailable, "acp_write"))
+}
+
+/// Newest run directories kept under `oci/runs/` after an attempt is reaped.
+const RUN_DIR_RETENTION: usize = 8;
+
+fn retire_attempt_files(runtime_root: &Path, incarnation: &str) -> RtResult<()> {
+    let Some(runs) = anchored_runs(runtime_root)? else {
+        return Ok(());
+    };
+    if !incarnation_name_is_safe(incarnation) {
+        return Err(rt_error(ErrorCode::StorageUnavailable, "runtime_directory"));
+    }
+    delete_attempt_scratch(&runs, &runs.join(incarnation))?;
+    prune_run_dirs(&runs, RUN_DIR_RETENTION, incarnation);
+    Ok(())
+}
+
+fn incarnation_name_is_safe(name: &str) -> bool {
+    !name.is_empty()
+        && name != "."
+        && name != ".."
+        && !name.contains('/')
+        && !name.contains('\\')
+        && !name.contains('\0')
+}
+
+fn anchored_runs(runtime_root: &Path) -> RtResult<Option<PathBuf>> {
+    let runs = runtime_root.join("runs");
+    match std::fs::symlink_metadata(&runs) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(_) => return Err(rt_error(ErrorCode::StorageUnavailable, "runtime_directory")),
+        Ok(meta) if meta.file_type().is_symlink() || !meta.is_dir() => {
+            return Err(rt_error(ErrorCode::StorageUnavailable, "runtime_directory"));
+        }
+        Ok(_) => {}
+    }
+    let runs = runs
+        .canonicalize()
+        .map_err(|_| rt_error(ErrorCode::StorageUnavailable, "runtime_directory"))?;
+    let root = runtime_root
+        .canonicalize()
+        .map_err(|_| rt_error(ErrorCode::StorageUnavailable, "runtime_directory"))?;
+    if runs.parent() != Some(root.as_path()) {
+        return Err(rt_error(ErrorCode::StorageUnavailable, "runtime_directory"));
+    }
+    Ok(Some(runs))
+}
+
+fn delete_attempt_scratch(runs: &Path, run_dir: &Path) -> RtResult<()> {
+    match std::fs::symlink_metadata(run_dir) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(_) => return Err(rt_error(ErrorCode::StorageUnavailable, "runtime_directory")),
+        Ok(meta) if meta.file_type().is_symlink() || !meta.is_dir() => {
+            return Err(rt_error(ErrorCode::StorageUnavailable, "runtime_directory"));
+        }
+        Ok(_) => {}
+    }
+    let run_dir = contained_directory(runs, run_dir)?;
+    let scratch = run_dir.join("scratch");
+    match std::fs::symlink_metadata(&scratch) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(_) => return Err(rt_error(ErrorCode::StorageUnavailable, "runtime_directory")),
+        Ok(meta) if meta.file_type().is_symlink() || !meta.is_dir() => {
+            return Err(rt_error(ErrorCode::StorageUnavailable, "runtime_directory"));
+        }
+        Ok(_) => {}
+    }
+    let scratch = contained_directory(&run_dir, &scratch)?;
+    remove_auth_copy(&scratch)?;
+    std::fs::remove_dir_all(&scratch)
+        .map_err(|_| rt_error(ErrorCode::StorageUnavailable, "runtime_directory"))?;
+    Ok(())
+}
+
+/// Deletes `scratch/rt-home/.grok/auth.json` without following a symlink.
+/// An intermediate symlink fails the reap so a host credential is not removed.
+fn remove_auth_copy(scratch: &Path) -> RtResult<()> {
+    let mut current = scratch.to_path_buf();
+    let parts = ["rt-home", ".grok", "auth.json"];
+    for (index, part) in parts.iter().enumerate() {
+        let next = current.join(part);
+        let last = index + 1 == parts.len();
+        match std::fs::symlink_metadata(&next) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(_) => return Err(rt_error(ErrorCode::StorageUnavailable, "auth_copy")),
+            Ok(meta) if meta.file_type().is_symlink() && last => {
+                return std::fs::remove_file(&next)
+                    .map_err(|_| rt_error(ErrorCode::StorageUnavailable, "auth_copy"));
+            }
+            Ok(meta) if meta.file_type().is_symlink() => {
+                return Err(rt_error(ErrorCode::StorageUnavailable, "runtime_directory"));
+            }
+            Ok(_) if last => {
+                return std::fs::remove_file(&next)
+                    .map_err(|_| rt_error(ErrorCode::StorageUnavailable, "auth_copy"));
+            }
+            Ok(meta) if !meta.is_dir() => {
+                return Err(rt_error(ErrorCode::StorageUnavailable, "runtime_directory"));
+            }
+            Ok(_) => current = next,
+        }
+    }
+    Ok(())
+}
+
+fn contained_directory(parent: &Path, candidate: &Path) -> RtResult<PathBuf> {
+    let canonical = candidate
+        .canonicalize()
+        .map_err(|_| rt_error(ErrorCode::StorageUnavailable, "runtime_directory"))?;
+    if !canonical.starts_with(parent) || canonical == parent {
+        return Err(rt_error(ErrorCode::StorageUnavailable, "runtime_directory"));
+    }
+    Ok(canonical)
+}
+
+fn prune_run_dirs(runs: &Path, keep: usize, protect: &str) {
+    let Ok(entries) = std::fs::read_dir(runs) else {
+        tracing::warn!("roundtable run retention unreadable");
+        return;
+    };
+    let mut dirs = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Ok(meta) = std::fs::symlink_metadata(&path) else {
+            continue;
+        };
+        if meta.file_type().is_symlink() || !meta.is_dir() {
+            continue;
+        }
+        let Ok(canonical) = path.canonicalize() else {
+            continue;
+        };
+        if !canonical.starts_with(runs) || canonical == *runs {
+            continue;
+        }
+        if canonical.file_name().and_then(|name| name.to_str()) == Some(protect) {
+            continue;
+        }
+        let modified = meta.modified().unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+        dirs.push((modified, canonical));
+    }
+    dirs.sort_by(|left, right| right.0.cmp(&left.0).then_with(|| right.1.cmp(&left.1)));
+    let protected = usize::from(
+        std::fs::symlink_metadata(runs.join(protect))
+            .ok()
+            .is_some_and(|meta| meta.is_dir() && !meta.file_type().is_symlink()),
+    );
+    let drop_after = keep.saturating_sub(protected);
+    for (_, path) in dirs.into_iter().skip(drop_after) {
+        if let Err(error) = std::fs::remove_dir_all(&path) {
+            tracing::warn!(
+                path = %path.display(),
+                %error,
+                "roundtable run retention"
+            );
+        }
+    }
 }
 async fn persist_diagnostic(active: &Active) -> RtResult<()> {
     let reason = active
@@ -1107,4 +1519,243 @@ fn verify_confirmed_option(response: &Value, id: &str, value: &str) -> RtResult<
 #[cfg(any(test, feature = "test-utils"))]
 pub fn verify_confirmed_option_fixture(response: &Value, id: &str, value: &str) -> RtResult<()> {
     verify_confirmed_option(response, id, value)
+}
+
+#[cfg(any(test, feature = "test-utils"))]
+pub struct LiveAcpRpcObservation {
+    pub terminal_disabled: bool,
+    pub fs_write_disabled: bool,
+    pub fs_read_disabled: bool,
+    pub session_omits_capabilities: bool,
+    pub allow_option_id: String,
+    pub reject_option_id: String,
+    pub saw_cancelled: bool,
+    pub stop_reason: String,
+    pub assistant_text: String,
+}
+
+#[cfg(any(test, feature = "test-utils"))]
+pub async fn exercise_live_acp_rpc() -> RtResult<LiveAcpRpcObservation> {
+    let session = roundtable_session_params(&json!([]));
+    let session_omits_capabilities = session.get("clientCapabilities").is_none()
+        && session.get("terminal").is_none()
+        && session["cwd"] == "/scratch";
+    let (client_io, adapter_io) = tokio::io::duplex(256 * 1024);
+    let (client_read, mut client_write) = tokio::io::split(client_io);
+    let (adapter_read, adapter_write) = tokio::io::split(adapter_io);
+    let mut client_read = BufReader::new(client_read);
+    let adapter = tokio::spawn(async move { fake_acp_adapter(adapter_read, adapter_write).await });
+    let capture = Mutex::new(Some(super::DiagnosticCapture::new(Vec::new())));
+    let mut seq = 0u64;
+    let exchanged = async {
+        let initialize = acp_exchange(
+            &mut client_write,
+            &mut client_read,
+            &mut AcpExchange {
+                id: 1,
+                method: "initialize",
+                params: roundtable_initialize_params("codeg-roundtable"),
+                seq: &mut seq,
+                assistant: Some(&capture),
+                deadline: Some(Duration::from_secs(5)),
+            },
+        )
+        .await?;
+        if initialize["protocolVersion"] != 1 {
+            return Err(rt_error(ErrorCode::CapabilityUnqualified, "acp_version"));
+        }
+        acp_exchange(
+            &mut client_write,
+            &mut client_read,
+            &mut AcpExchange {
+                id: 5,
+                method: "session/prompt",
+                params: json!({"sessionId": "s", "prompt": [{"type": "text", "text": "submit"}]}),
+                seq: &mut seq,
+                assistant: Some(&capture),
+                deadline: Some(Duration::from_secs(5)),
+            },
+        )
+        .await
+    }
+    .await;
+    let result = match exchanged {
+        Ok(result) => result,
+        Err(error) => {
+            adapter.abort();
+            return Err(error);
+        }
+    };
+    let seen = adapter
+        .await
+        .map_err(|_| rt_error(ErrorCode::RuntimeUnavailable, "acp_frame"))?
+        .map_err(|_| rt_error(ErrorCode::RuntimeUnavailable, "acp_frame"))?;
+    let assistant = capture
+        .lock()
+        .expect("assistant diagnostic")
+        .clone()
+        .ok_or_else(|| rt_error(ErrorCode::RuntimeUnavailable, "acp_frame"))?;
+    let (excerpt, _) = assistant.finish().await?;
+    let allow_body = seen.allow.to_string();
+    let reject_body = seen.reject.to_string();
+    Ok(LiveAcpRpcObservation {
+        terminal_disabled: seen.initialize["clientCapabilities"]["terminal"] == false,
+        fs_write_disabled: seen.initialize["clientCapabilities"]["fs"]["writeTextFile"] == false,
+        fs_read_disabled: seen.initialize["clientCapabilities"]["fs"]["readTextFile"] == false,
+        session_omits_capabilities,
+        allow_option_id: seen.allow["result"]["outcome"]["optionId"]
+            .as_str()
+            .unwrap_or_default()
+            .to_owned(),
+        reject_option_id: seen.reject["result"]["outcome"]["optionId"]
+            .as_str()
+            .unwrap_or_default()
+            .to_owned(),
+        saw_cancelled: allow_body.contains("cancelled") || reject_body.contains("cancelled"),
+        stop_reason: result["stopReason"].as_str().unwrap_or_default().to_owned(),
+        assistant_text: excerpt.text,
+    })
+}
+
+#[cfg(any(test, feature = "test-utils"))]
+struct AdapterSeen {
+    initialize: Value,
+    allow: Value,
+    reject: Value,
+}
+
+#[cfg(any(test, feature = "test-utils"))]
+async fn fake_acp_adapter<R, W>(read: R, mut write: W) -> Result<AdapterSeen, ()>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    let mut read = BufReader::new(read);
+    let initialize = read_adapter_frame(&mut read).await?;
+    write_lenient(
+        &mut write,
+        &json!({
+            "jsonrpc": "2.0",
+            "id": initialize["id"],
+            "result": {"protocolVersion": 1}
+        }),
+    )
+    .await?;
+    let _prompt = read_adapter_frame(&mut read).await?;
+    write_lenient(
+        &mut write,
+        &json!({
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": {
+                "update": {
+                    "sessionUpdate": "agent_message_chunk",
+                    "content": {"type": "text", "text": "partial answer", "score": 0.25}
+                }
+            }
+        }),
+    )
+    .await?;
+    write_lenient(
+        &mut write,
+        &permission_request(
+            11,
+            "roundtable/submit_result",
+            "allow-submit",
+            "reject-submit",
+        ),
+    )
+    .await?;
+    let allow = read_adapter_frame(&mut read).await?;
+    write_lenient(
+        &mut write,
+        &permission_request(
+            12,
+            "run_terminal_command",
+            "allow-terminal",
+            "reject-terminal",
+        ),
+    )
+    .await?;
+    let reject = read_adapter_frame(&mut read).await?;
+    write_lenient(
+        &mut write,
+        &json!({"jsonrpc": "2.0", "id": 5, "result": {"stopReason": "end_turn"}}),
+    )
+    .await?;
+    Ok(AdapterSeen {
+        initialize: initialize["params"].clone(),
+        allow,
+        reject,
+    })
+}
+
+#[cfg(any(test, feature = "test-utils"))]
+fn permission_request(id: u64, title: &str, allow: &str, reject: &str) -> Value {
+    json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "method": "session/request_permission",
+        "params": {
+            "sessionId": "s",
+            "toolCall": {
+                "toolCallId": format!("call-{id}"),
+                "title": title,
+                "kind": "other",
+                "status": "pending",
+                "rawInput": {"command": "echo submit_result"}
+            },
+            "options": [
+                {"optionId": allow, "name": "Allow once", "kind": "allow_once"},
+                {"optionId": format!("always-{allow}"), "name": "Allow always", "kind": "allow_always"},
+                {"optionId": reject, "name": "Reject once", "kind": "reject_once"}
+            ]
+        }
+    })
+}
+
+#[cfg(any(test, feature = "test-utils"))]
+async fn read_adapter_frame<R: AsyncRead + Unpin>(read: &mut BufReader<R>) -> Result<Value, ()> {
+    let mut line = String::new();
+    let count = tokio::time::timeout(Duration::from_secs(5), read.read_line(&mut line))
+        .await
+        .map_err(|_| ())?
+        .map_err(|_| ())?;
+    if count == 0 {
+        return Err(());
+    }
+    serde_json::from_str(&line).map_err(|_| ())
+}
+
+#[cfg(any(test, feature = "test-utils"))]
+async fn write_lenient<W: AsyncWrite + Unpin>(write: &mut W, value: &Value) -> Result<(), ()> {
+    let mut bytes = serde_json::to_vec(value).map_err(|_| ())?;
+    bytes.push(b'\n');
+    write.write_all(&bytes).await.map_err(|_| ())?;
+    write.flush().await.map_err(|_| ())
+}
+
+#[cfg(any(test, feature = "test-utils"))]
+pub fn permission_reply_fixture(params: Value) -> Value {
+    permission_reply(&params, &json!(7))
+}
+
+#[cfg(any(test, feature = "test-utils"))]
+pub fn acp_frame_fixture(bytes: &[u8]) -> RtResult<Value> {
+    parse_acp_frame(bytes)
+}
+
+#[cfg(any(test, feature = "test-utils"))]
+pub fn retire_attempt_files_fixture(runtime_root: &Path, incarnation: &str) -> RtResult<()> {
+    retire_attempt_files(runtime_root, incarnation)
+}
+
+#[cfg(any(test, feature = "test-utils"))]
+pub fn redact_untrusted_excerpt_fixture(bytes: &[u8]) -> String {
+    super::diagnostics::redact_untrusted_excerpt(bytes)
+}
+
+#[cfg(any(test, feature = "test-utils"))]
+pub fn run_dir_retention_fixture() -> usize {
+    RUN_DIR_RETENTION
 }
