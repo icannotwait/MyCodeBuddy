@@ -78,11 +78,12 @@ fn attempt_id() -> AttemptId {
 
 async fn prepared_sandbox() -> PreparedSandbox {
     let dir = tempdir().expect("temp");
-    let scratch = dir.path().join("scratch");
-    let project = dir.path().join("project");
-    let home = dir.path().join("home");
-    let other = dir.path().join("other");
-    let decoy = dir.path().join("decoy");
+    let root = dir.path().canonicalize().expect("canonical temp root");
+    let scratch = root.join("scratch");
+    let project = root.join("project");
+    let home = root.join("home");
+    let other = root.join("other");
+    let decoy = root.join("decoy");
     for path in [&scratch, &project, &home, &other, &decoy] {
         std::fs::create_dir_all(path).expect("dir");
     }
@@ -139,7 +140,7 @@ async fn prepared_sandbox() -> PreparedSandbox {
         global_mcp: false,
     };
     let plan = build_sandbox_plan(&input).expect("plan");
-    let journal = JournalLaunchIntentStore::open(&dir.path().join("journal")).expect("journal");
+    let journal = JournalLaunchIntentStore::open(&root.join("journal")).expect("journal");
     let isolator = LinuxOciIsolator::new(journal);
     let prepared = isolator.prepare(&plan).await.expect("prepared sandbox");
     drop(isolator);
