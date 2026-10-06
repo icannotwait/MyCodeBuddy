@@ -779,6 +779,13 @@ impl Drop for AbortOnDrop {
     }
 }
 
+#[cfg(any(test, feature = "test-utils"))]
+std::thread_local! {
+    // The synchronous Drop fixture observes the real cleanup result without
+    // replacing its cancellation path or trying cleanup again afterward.
+    static PROBE_DROP_CLEANUP: std::cell::RefCell<Option<Result<(), String>>> = const { std::cell::RefCell::new(None) };
+}
+
 /// Stops the ACP `crun run` process, its slirp helper, and the container
 /// when dropped. initialize and session/new return before the normal reap,
 /// and those paths must not leave `cq-acp-*` running.
@@ -828,9 +835,12 @@ impl Drop for ProbeContainer<'_> {
         let _ = pid;
         // Reap the launcher before the final helper sweep: it cannot create
         // another poststart hook after this point.
-        if let Err(reason) = reap_blocking(self.request, &self.id, self.slirp_expected) {
+        let cleanup = reap_blocking(self.request, &self.id, self.slirp_expected);
+        if let Err(reason) = &cleanup {
             tracing::warn!(container = %self.id, %reason, "qualification cleanup unproven");
         }
+        #[cfg(any(test, feature = "test-utils"))]
+        PROBE_DROP_CLEANUP.with(|result| *result.borrow_mut() = Some(cleanup));
     }
 }
 
@@ -1723,14 +1733,21 @@ pub fn probe_recorded_crun_version(text: &str) -> Option<String> {
 /// stops slirp and deletes the container.
 #[cfg(any(test, feature = "test-utils"))]
 pub fn probe_acp_exit_cleans_container(request: &ProbeRequest, id: &str) -> Result<(), String> {
-    let _container = ProbeContainer {
+    PROBE_DROP_CLEANUP.with(|result| *result.borrow_mut() = None);
+    drop(ProbeContainer {
         request,
         id: id.to_string(),
         child: None,
         reaped: false,
         slirp_expected: true,
+    });
+    let cleanup = PROBE_DROP_CLEANUP.with(|result| result.borrow_mut().take());
+    let reason = match cleanup {
+        Some(Ok(())) => "session/new rejected".into(),
+        Some(Err(reason)) => format!("session/new rejected; cleanup: {reason}"),
+        None => "session/new rejected; cleanup result missing".into(),
     };
-    Err("session/new rejected".into())
+    Err(reason)
 }
 
 const ISOLATION_SCRIPT: &str = r#"#!/bin/sh

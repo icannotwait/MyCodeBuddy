@@ -114,3 +114,23 @@ Result: 114 passed, 4 failed, 1 ignored. Two failures were in the lifecycle cont
 The five-second bounds and all 600 ms usage/settlement assertions remain unchanged. Assertions additionally verify terminal control state and that no active-time lease remains. No production behavior or permission checks changed.
 
 Validation of this correction: `git diff --check` passed. Local Rust tests and formatting remain unavailable because the environment has no Rust toolchain; this correction still requires execution by the existing CI gate. The failures above are actual CI observations, not local test results.
+
+
+## Terminal checkpoint race
+
+The runtime CI gate at `247106d` reported 115 passed, 3 failed and 1 ignored. Pause and Stop fixture corrections passed. The new lifecycle failure occurred in the successful-control iteration of `staged_candidate_then_actual_gateway_http_error_cannot_be_accepted`: `run_room` intermittently returned `InvalidState/budget_fence` after successful synthesis publication. The gateway-failure branch's zero-accepted-result invariant was not weakened.
+
+Root cause: final publication commits `rt_rooms.status='completed'` before the scheduler finishes its publication/history awaits. A concurrently polled active-budget checkpoint correctly refuses to renew a non-running room, but the owner previously treated that normal terminal transition as an execution failure.
+
+The monitor now recognizes completion only after verifying `completed` status, the same boot epoch, the same run epoch, and no active control. It revokes paid permission and awaits the scheduler's actual result. It does not manufacture success or discard a final scheduler/storage error. Changed epochs, control transitions, storage failures and prepaid expiry retain their failure handling. The terminal-state read remains inside the checkpoint's existing bounded timeout.
+
+Deterministic production-path regressions use a test-only gate after final publication commits:
+
+- `lifecycle_checkpoint_observes_durable_completion_before_scheduler_returns` holds the scheduler until the monitor has revoked paid permission, then requires the run to succeed
+- `lifecycle_completed_room_with_changed_epoch_keeps_budget_fence` changes the epoch while held and requires the original fence error
+- `lifecycle_durable_completion_does_not_hide_final_history_error` introduces an invalid persisted message after the monitor observes completion and requires the scheduler's `StorageUnavailable/runtime_snapshot` error
+
+The existing staged-candidate/gateway-failure assertions remain unchanged. Verification of this correction: `git diff --check` passed. Local Rust compilation, formatting and tests are unavailable because no toolchain is installed; the new regressions and fix require the existing CI gate. The `247106d` result above is an observed CI failure, not a passing result for this correction.
+
+
+The changed-epoch regression also orders the monitor's terminal-state observation explicitly: a test-only one-shot gate pauses only after `budget_fence`, before the completion-state read. The fixture waits for publication and that observation gate, changes the epoch, then releases the read. This prevents the monitor from legitimately recognizing completion before the fixture changes the epoch. Normal checkpoints and renewal are not gated. `git diff --check` passed; local Rust execution remains unavailable.

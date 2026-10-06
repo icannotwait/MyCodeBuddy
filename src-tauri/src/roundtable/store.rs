@@ -741,6 +741,34 @@ impl RoundtableStore {
         self.faults.lock().expect("faults").writer_gate.take()
     }
 
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn arm_completed_run_gate(&self) -> Arc<LockGate> {
+        let gate = LockGate::new();
+        self.faults.lock().expect("faults").completed_run_gate = Some(gate.clone());
+        gate
+    }
+
+    #[cfg(any(test, feature = "test-utils"))]
+    pub(crate) fn take_completed_run_gate(&self) -> Option<Arc<LockGate>> {
+        self.faults.lock().expect("faults").completed_run_gate.take()
+    }
+
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn arm_completion_observation_gate(&self) -> Arc<LockGate> {
+        let gate = LockGate::new();
+        self.faults.lock().expect("faults").completion_observation_gate = Some(gate.clone());
+        gate
+    }
+
+    #[cfg(any(test, feature = "test-utils"))]
+    pub(crate) fn take_completion_observation_gate(&self) -> Option<Arc<LockGate>> {
+        self.faults
+            .lock()
+            .expect("faults")
+            .completion_observation_gate
+            .take()
+    }
+
     pub(crate) fn clock_sample(&self) -> (u64, String) {
         let clock = Arc::clone(&self.clock.lock().expect("clock"));
         (clock.now_ms(), clock.utc())

@@ -95,6 +95,44 @@ the next CI run identifies or clears the early failure. No test result from
 this checkpoint is a pass for a later commit, and the ignored host test does
 not qualify a live adapter.
 
+### Follow-up executable checkpoint: `247106d`
+
+The existing [CI run for `247106d`](https://github.com/icannotwait/MyCodeBuddy/actions/runs/37431018229)
+provided these additional results:
+
+- Protocol job passed: formatting, all 45 tests and Clippy
+- Frontend job passed again: lint, browser bundle/type checks, 688 Vitest files
+  with 11,192 tests passed and 15 skipped, release-script tests and static export
+- Runtime gate executed: 115 passed, 3 failed, 1 live-host test ignored
+- Linux server library executed: 7,754 passed, 5 failed, 1 ignored
+- Linux desktop library executed: 8,065 passed, the same 5 helper failures,
+  1 ignored
+- Application formatting reported one remaining hunk
+- Windows server tests and Clippy passed. Windows desktop compiled its test
+  targets without running them, then Clippy reported a Linux-only fixture type
+  imported on Windows; the import now has the same Linux target guard
+
+The remaining runtime failures are two helper cleanup proof failures and a
+successful-completion race with the active-budget monitor. The Linux server
+failures identify `slirp_proc_environment_denied`: the exhaustive same-UID
+process scan fails before signaling already verified helpers. These failures
+are not evidence that helper termination or durable cleanup proof succeeded.
+Fixes must preserve quarantine for unknown live processes, without blanket
+permission-error suppression or broader host privileges. Other matrix jobs
+were still running at this checkpoint. Later source changes require their own
+CI evidence.
+
+The following correction batch uses pidfds acquired before process-environment
+reads to distinguish exited zombies from unreadable live processes. A local
+owned-child reproduction confirmed that an unreaped exited child can return
+`EACCES` for `environ` while its pidfd reports exit. Unknown live processes still
+invalidate the proof, but no longer prevent bounded termination of independently
+verified helpers. The completion correction only stops budget renewal for the
+same boot/run epoch with durable completed state and no active control; it then
+awaits the scheduler's actual result. Deterministic regressions retain changed-
+epoch rejection and final storage errors. These changes still require CI on
+their final commit.
+
 ## Capability boundaries retained
 
 The false-success and unsafe-admission defects are addressed by fail-closed guards, but the corresponding live capabilities in F02, F03 and F14 remain unimplemented. They are not closed feature-delivery items. Rerunning the current host probe cannot produce a usable certificate or supply the missing measurements.

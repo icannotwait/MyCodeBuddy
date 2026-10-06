@@ -5,10 +5,12 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+#[cfg(target_os = "linux")]
+use codeg_lib::roundtable::ProbeRequest;
 use codeg_lib::roundtable::{
     assemble_probe_report_for_test, os_accepted, profile_for_agent,
-    verify_installed_report_for_test, CertifiedBinary, ProbeCheck, ProbeFacts, ProbeRequest,
-    ProviderBinding, QualifiedOciProfile,
+    verify_installed_report_for_test, CertifiedBinary, ProbeCheck, ProbeFacts, ProviderBinding,
+    QualifiedOciProfile,
 };
 use roundtable_protocol::Hash256;
 
@@ -576,7 +578,7 @@ fn acp_session_error_stops_slirp_and_deletes_the_container() {
     let text = fs::read_to_string(&log).expect("crun log");
     assert!(text.contains("kill cq-acp-9 KILL"), "{text}");
     assert!(text.contains("delete cq-acp-9"), "{text}");
-    assert_eq!(phase.unwrap(), "cleanup-proven-started\n");
+    assert_eq!(phase.unwrap(), "cleanup-proven-started\n", "{error}");
     assert!(
         slirp_status.is_some_and(|status| !status.success()),
         "slirp was not terminated"
@@ -586,6 +588,31 @@ fn acp_session_error_stops_slirp_and_deletes_the_container() {
         "watcher was not terminated"
     );
     let _ = fs::remove_dir_all(&dir);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn acp_drop_reports_the_first_helper_cleanup_failure() {
+    use std::os::unix::fs::PermissionsExt;
+    let root = tempfile::tempdir().unwrap();
+    let crun = root.path().join("fake-crun");
+    fs::write(&crun, "#!/bin/sh\nexit 0\n").unwrap();
+    fs::set_permissions(&crun, fs::Permissions::from_mode(0o700)).unwrap();
+    let request = ProbeRequest {
+        data_dir: root.path().to_path_buf(),
+        agent: "grok".into(),
+        rootfs: root.path().join("rootfs"),
+        crun,
+        cgroup_root: root.path().join("fake-cgroup"),
+        runtime_root: root.path().join("runtime"),
+        provider_bindings: root.path().join("bindings.json"),
+        home: root.path().join("home"),
+        profile_id: None,
+    };
+    let error = codeg_lib::roundtable::probe_acp_exit_cleans_container(&request, "cq-missing")
+        .expect_err("session/new and missing configured-helper evidence");
+    assert!(error.contains("session/new"), "{error}");
+    assert!(error.contains("slirp_evidence_file_unreadable"), "{error}");
 }
 
 #[tokio::test]
@@ -1172,13 +1199,17 @@ fn probe_cleanup_cannot_leave_a_slirp_helper_that_ignores_term() {
     let result = codeg_lib::roundtable::probe_acp_exit_cleans_container(&request, "cq-acp-review");
     let status = helper.try_wait().unwrap();
     let watcher_status = watcher.try_wait().unwrap();
-    let phase = fs::read_to_string(request.runtime_root.join("slirp-pids/cq-acp-review.pid.state"));
+    let phase = fs::read_to_string(
+        request
+            .runtime_root
+            .join("slirp-pids/cq-acp-review.pid.state"),
+    );
     let _ = helper.kill();
     let _ = watcher.kill();
     let _ = helper.wait();
     let _ = watcher.wait();
-    assert!(result.is_err(), "the simulated ACP session must still fail");
-    assert_eq!(phase.unwrap(), "cleanup-proven-started\n");
+    let error = result.expect_err("the simulated ACP session must still fail");
+    assert_eq!(phase.unwrap(), "cleanup-proven-started\n", "{error}");
     assert!(
         status.is_some_and(|exit| exit.signal() == Some(libc::SIGKILL)),
         "TERM-ignoring helper was not reaped after KILL"

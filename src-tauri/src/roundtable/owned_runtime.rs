@@ -339,11 +339,13 @@ impl ParticipantRuntime for OwnedParticipantRuntime {
             vec![text(&room.to_string())],
         )
         .await?;
+        let boot_epoch = Epoch(nonnegative(column(&row, 0)?)?);
+        let run_epoch = Epoch(nonnegative(column(&row, 1)?)?);
         let mut lease = super::budget_ledger::ActiveBudgetLease::begin(
             store.clone(),
             room,
-            Epoch(nonnegative(column(&row, 0)?)?),
-            Epoch(nonnegative(column(&row, 1)?)?),
+            boot_epoch,
+            run_epoch,
         )
         .await?;
         let now = store.clock_sample().0;
@@ -376,15 +378,38 @@ impl ParticipantRuntime for OwnedParticipantRuntime {
                     let remaining = permission
                         .prepaid_until()
                         .saturating_sub(store.clock_sample().0);
+                    let checkpoint = async {
+                        match lease.checkpoint().await {
+                            Ok(ledger) => Ok(Some(ledger)),
+                            Err(error) => {
+                                // Publication can commit completed before the
+                                // scheduler's final reads return. That ends
+                                // paid execution only for this exact owner.
+                                if error.code == ErrorCode::InvalidState
+                                    && error.details.reason.as_deref() == Some("budget_fence")
+                                    && completed_for_epoch(&store, &room, boot_epoch, run_epoch)
+                                        .await?
+                                {
+                                    Ok(None)
+                                } else {
+                                    Err(error)
+                                }
+                            }
+                        }
+                    };
                     let sampled = tokio::time::timeout(
                         std::time::Duration::from_millis(remaining),
-                        lease.checkpoint(),
+                        checkpoint,
                     )
                     .await;
                     match sampled {
-                        Ok(Ok(ledger))
+                        Ok(Ok(Some(ledger)))
                             if permission
                                 .renew_until(store.clock_sample().0, ledger.prepaid_until.0) => {}
+                        Ok(Ok(None)) => {
+                            permission.revoke_local();
+                            return Ok(());
+                        }
                         Ok(Err(error)) => return Err(error),
                         _ => {
                             return Err(rt_error(
@@ -398,7 +423,12 @@ impl ParticipantRuntime for OwnedParticipantRuntime {
             tokio::pin!(run, monitor);
             tokio::select! {
                 result = &mut run => result,
-                result = &mut monitor => result,
+                result = &mut monitor => match result {
+                    // Durable completion stops renewal, but it cannot replace
+                    // the scheduler's result or hide its final storage error.
+                    Ok(()) => (&mut run).await,
+                    Err(error) => Err(error),
+                },
             }
         }; // Drop all turn futures before local cleanup, regardless of SQLite.
         permission.revoke_local();
@@ -802,6 +832,12 @@ async fn run_room(
                 cleanup_confirmed: true,
             })
             .await?;
+        #[cfg(any(test, feature = "test-utils"))]
+        if kind == PhaseKind::Synthesis {
+            if let Some(gate) = store.take_completed_run_gate() {
+                gate.wait().await;
+            }
+        }
         published = load_history(&store, &room).await?;
     }
     Ok(())
@@ -829,6 +865,28 @@ async fn existing_fence(
         })
     })
     .transpose()
+}
+
+async fn completed_for_epoch(
+    store: &RoundtableStore,
+    room: &RoomId,
+    boot: Epoch,
+    run: Epoch,
+) -> RtResult<bool> {
+    #[cfg(any(test, feature = "test-utils"))]
+    if let Some(gate) = store.take_completion_observation_gate() {
+        gate.wait().await;
+    }
+    let row = one_row(
+        store.connection(),
+        "SELECT status,boot_epoch,run_epoch,active_control_id FROM rt_rooms WHERE room_id=?",
+        vec![text(&room.to_string())],
+    )
+    .await?;
+    Ok(column::<String>(&row, 0)? == "completed"
+        && nonnegative(column(&row, 1)?)? == boot.0
+        && nonnegative(column(&row, 2)?)? == run.0
+        && column::<Option<String>>(&row, 3)?.is_none())
 }
 
 async fn require_running(

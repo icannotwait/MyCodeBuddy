@@ -1153,9 +1153,9 @@ fn copy_regular_nofollow(source: &Path, dest: &Path, limit: u64) -> RtResult<()>
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
-        let mut input = fs::OpenOptions::new()
+        let input = fs::OpenOptions::new()
             .read(true)
-            .custom_flags(libc::O_NOFOLLOW)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
             .open(source)
             .map_err(|_| rt_error(ErrorCode::CapabilityUnqualified, "auth_copy"))?;
         let meta = input
@@ -1164,8 +1164,11 @@ fn copy_regular_nofollow(source: &Path, dest: &Path, limit: u64) -> RtResult<()>
         if !meta.is_file() || meta.len() > limit {
             return Err(rt_error(ErrorCode::CapabilityUnqualified, "auth_copy"));
         }
+        #[cfg(test)]
+        control_tests::before_auth_read(&input);
         let mut bytes = Vec::new();
         input
+            .take(limit.saturating_add(1))
             .read_to_end(&mut bytes)
             .map_err(|_| rt_error(ErrorCode::CapabilityUnqualified, "auth_copy"))?;
         if bytes.len() as u64 > limit {
@@ -1260,6 +1263,38 @@ fn process_disappeared(error: &std::io::Error) -> bool {
     error.kind() == std::io::ErrorKind::NotFound || error.raw_os_error() == Some(libc::ESRCH)
 }
 
+#[cfg(target_os = "linux")]
+fn helper_process_exited(fd: &std::os::fd::OwnedFd) -> bool {
+    use std::os::fd::AsRawFd;
+    let mut poll = libc::pollfd {
+        fd: fd.as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    (unsafe { libc::poll(&mut poll, 1, 0) }) > 0 && poll.revents & libc::POLLIN != 0
+}
+
+#[cfg(target_os = "linux")]
+fn resolve_helper_environment(
+    fd: &std::os::fd::OwnedFd,
+    result: std::io::Result<Vec<u8>>,
+) -> RtResult<Option<Vec<u8>>> {
+    match result {
+        Ok(environment) => Ok(Some(environment)),
+        Err(error) if process_disappeared(&error) || helper_process_exited(fd) => Ok(None),
+        Err(error) => {
+            // A zombie can deny environ even when its proc directory remains.
+            // Only the identity pinned before this read can prove it exited.
+            let reason = if error.kind() == std::io::ErrorKind::PermissionDenied {
+                "slirp_proc_environment_denied_live"
+            } else {
+                "slirp_proc_environment_unreadable_live"
+            };
+            Err(rt_error(ErrorCode::PolicyUnenforceable, reason))
+        }
+    }
+}
+
 pub(super) fn stop_slirp(runtime_root: &Path, id: &str, expected: bool) -> RtResult<()> {
     if !expected {
         return Ok(());
@@ -1317,14 +1352,6 @@ pub(super) fn stop_slirp(runtime_root: &Path, id: &str, expected: bool) -> RtRes
                 Err(unproven())
             }
         }
-        fn exited(fd: &OwnedFd) -> bool {
-            let mut poll = libc::pollfd {
-                fd: fd.as_raw_fd(),
-                events: libc::POLLIN,
-                revents: 0,
-            };
-            (unsafe { libc::poll(&mut poll, 1, 0) }) > 0 && poll.revents & libc::POLLIN != 0
-        }
         fn marked(env: &[u8], runtime_root: &Path, id: &str, role: Option<&str>) -> bool {
             let owner = format!("CODEG_ROUNDTABLE_SLIRP_OWNER={id}");
             let root = format!("CODEG_ROUNDTABLE_SLIRP_ROOT={}", runtime_root.display());
@@ -1349,7 +1376,7 @@ pub(super) fn stop_slirp(runtime_root: &Path, id: &str, expected: bool) -> RtRes
             id: &str,
             role: Option<&str>,
         ) -> RtResult<()> {
-            if exited(fd) {
+            if helper_process_exited(fd) {
                 return Ok(());
             }
             let inspect = || {
@@ -1371,57 +1398,81 @@ pub(super) fn stop_slirp(runtime_root: &Path, id: &str, expected: bool) -> RtRes
                 Ok(())
             };
             match inspect() {
-                Err(_) if exited(fd) => Ok(()),
+                Err(_) if helper_process_exited(fd) => Ok(()),
                 result => result,
             }
         }
-        fn owned_helpers(runtime_root: &Path, id: &str) -> RtResult<Vec<(i32, OwnedFd)>> {
+        fn owned_helpers(
+            runtime_root: &Path,
+            id: &str,
+        ) -> (Vec<(i32, OwnedFd)>, RtResult<()>) {
             let mut found = Vec::new();
-            let entries = fs::read_dir("/proc")
-                .map_err(|_| unproven_at("slirp_proc_enumeration_unavailable"))?;
+            let mut first_error = None;
+            let entries = match fs::read_dir("/proc") {
+                Ok(entries) => entries,
+                Err(_) => {
+                    return (
+                        found,
+                        Err(unproven_at("slirp_proc_enumeration_unavailable")),
+                    );
+                }
+            };
             for entry in entries {
-                let entry = entry.map_err(|_| unproven_at("slirp_proc_entry_unreadable"))?;
-                let Some(pid) = entry
-                    .file_name()
-                    .to_str()
-                    .and_then(|name| name.parse::<i32>().ok())
-                else {
-                    continue;
-                };
-                let metadata = match entry.metadata() {
-                    Ok(metadata) => metadata,
-                    Err(error) if process_disappeared(&error) => continue,
-                    Err(_) => return Err(unproven_at("slirp_proc_metadata_unreadable")),
-                };
-                if metadata.uid() != unsafe { libc::geteuid() } {
-                    continue;
-                }
-                let env = match fs::read(entry.path().join("environ")) {
-                    Ok(env) => env,
-                    Err(error) if process_disappeared(&error) => continue,
-                    Err(error) => {
-                        let reason = if error.kind() == std::io::ErrorKind::PermissionDenied {
-                            "slirp_proc_environment_denied"
-                        } else {
-                            "slirp_proc_environment_unreadable"
-                        };
-                        return Err(unproven_at(reason));
+                let inspect = || -> RtResult<Option<(i32, OwnedFd)>> {
+                    let entry = entry.map_err(|_| unproven_at("slirp_proc_entry_unreadable"))?;
+                    let Some(pid) = entry
+                        .file_name()
+                        .to_str()
+                        .and_then(|name| name.parse::<i32>().ok())
+                        // Host helpers are descendants of the launcher, never
+                        // this proc namespace's init. PID 1 is never signalable.
+                        .filter(|pid| *pid > 1)
+                    else {
+                        return Ok(None);
+                    };
+                    let metadata = match entry.metadata() {
+                        Ok(metadata) => metadata,
+                        Err(error) if process_disappeared(&error) => return Ok(None),
+                        Err(_) => return Err(unproven_at("slirp_proc_metadata_unreadable")),
+                    };
+                    if metadata.uid() != unsafe { libc::geteuid() } {
+                        return Ok(None);
                     }
-                };
-                if !marked(&env, runtime_root, id, None) {
-                    continue;
-                }
-                if let Some(fd) = pidfd(pid)? {
+                    // Pin before reading environ, including for unreadable
+                    // candidates. Numeric PID reuse cannot prove this read's
+                    // identity exited or authorize signaling its replacement.
+                    let Some(fd) = pidfd(pid)? else {
+                        return Ok(None);
+                    };
+                    let environment = fs::read(entry.path().join("environ"));
+                    #[cfg(test)]
+                    let environment = control_tests::helper_environment(pid, environment);
+                    let Some(environment) = resolve_helper_environment(&fd, environment)? else {
+                        return Ok(None);
+                    };
+                    if !marked(&environment, runtime_root, id, None) {
+                        return Ok(None);
+                    }
                     verify(&fd, pid, None, runtime_root, id, None)?;
-                    if !exited(&fd) {
+                    Ok((!helper_process_exited(&fd)).then_some((pid, fd)))
+                };
+                match inspect() {
+                    Ok(Some(identity)) => {
                         if found.len() >= 1024 {
-                            return Err(unproven());
+                            first_error.get_or_insert_with(unproven);
+                            break;
                         }
-                        found.push((pid, fd));
+                        found.push(identity);
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        // Keep independently verified identities even if an
+                        // unrelated process prevents a complete proof.
+                        first_error.get_or_insert(error);
                     }
                 }
             }
-            Ok(found)
+            (found, first_error.map_or(Ok(()), Err))
         }
         fn verify_pins(
             pidfile: &Path,
@@ -1529,10 +1580,15 @@ pub(super) fn stop_slirp(runtime_root: &Path, id: &str, expected: bool) -> RtRes
         let began = std::time::Instant::now();
         let mut empty_observations = 0;
         let mut retained: BTreeMap<i32, OwnedFd> = BTreeMap::new();
+        let mut discovery_error = None;
         loop {
             #[cfg(test)]
             control_tests::before_cleanup_sweep()?;
-            for (pid, fd) in owned_helpers(runtime_root, id)? {
+            let (found, discovery) = owned_helpers(runtime_root, id);
+            if let Err(error) = discovery {
+                discovery_error.get_or_insert(error);
+            }
+            for (pid, fd) in found {
                 match retained.entry(pid) {
                     std::collections::btree_map::Entry::Vacant(entry) => {
                         entry.insert(fd);
@@ -1540,24 +1596,29 @@ pub(super) fn stop_slirp(runtime_root: &Path, id: &str, expected: bool) -> RtRes
                     std::collections::btree_map::Entry::Occupied(mut entry) => {
                         // A PID can be reused only after the old pinned
                         // process exits. Never replace a still-live identity.
-                        if exited(entry.get()) {
+                        if helper_process_exited(entry.get()) {
                             entry.insert(fd);
                         }
                     }
                 }
             }
-            retained.retain(|_, fd| !exited(fd));
+            retained.retain(|_, fd| !helper_process_exited(fd));
             // Bound handles by distinct live processes, not sweep count.
             if retained.len() > 1024 {
                 return Err(unproven());
             }
             let roots_exited = pin_proof
                 .as_ref()
-                .map(|roots| roots.iter().all(exited))
+                .map(|roots| roots.iter().all(helper_process_exited))
                 .unwrap_or(true);
             if retained.is_empty() && roots_exited {
                 empty_observations += 1;
                 if empty_observations >= 2 {
+                    // Known children being gone cannot discharge a failed
+                    // discovery interval. Keep its durable quarantine.
+                    if let Some(error) = discovery_error {
+                        return Err(error);
+                    }
                     drop(pin_proof?);
                     persist_phase(
                         &mut state,
@@ -1599,7 +1660,7 @@ pub(super) fn stop_slirp(runtime_root: &Path, id: &str, expected: bool) -> RtRes
                 }
             }
             if began.elapsed() > Duration::from_secs(3) {
-                return Err(unproven());
+                return Err(discovery_error.unwrap_or_else(unproven));
             }
             std::thread::sleep(Duration::from_millis(20));
         }
@@ -2572,6 +2633,102 @@ mod control_tests {
     }
 
     #[cfg(target_os = "linux")]
+    #[test]
+    fn denied_environment_is_gone_only_after_pidfd_proves_exit() {
+        use std::os::fd::FromRawFd;
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let raw = unsafe { libc::syscall(libc::SYS_pidfd_open, child.id() as i32, 0) };
+        assert!(raw >= 0);
+        let fd = unsafe { std::os::fd::OwnedFd::from_raw_fd(raw as i32) };
+        let denied = || Err(std::io::Error::from_raw_os_error(libc::EACCES));
+        let live = super::resolve_helper_environment(&fd, denied());
+        let was_alive = child.try_wait().unwrap().is_none();
+        child.kill().unwrap();
+        // Keep the child unreaped: a zombie's numeric PID still exists.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let dead = loop {
+            let observed = super::resolve_helper_environment(&fd, denied());
+            if observed.is_ok() || std::time::Instant::now() >= deadline {
+                break observed;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        };
+        child.wait().unwrap();
+        assert!(was_alive);
+        assert_eq!(
+            live.unwrap_err().details.reason.as_deref(),
+            Some("slirp_proc_environment_denied_live")
+        );
+        assert_eq!(dead.unwrap(), None);
+    }
+
+    #[cfg(target_os = "linux")]
+    std::thread_local! {
+        static DENIED_ENVIRONMENT_PID: std::cell::Cell<Option<i32>> = const { std::cell::Cell::new(None) };
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(super) fn helper_environment(
+        pid: i32,
+        result: std::io::Result<Vec<u8>>,
+    ) -> std::io::Result<Vec<u8>> {
+        if DENIED_ENVIRONMENT_PID.with(|denied| denied.get() == Some(pid)) {
+            Err(std::io::Error::from_raw_os_error(libc::EACCES))
+        } else {
+            result
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn unreadable_live_process_quarantines_proof_but_does_not_prevent_owned_termination() {
+        let root = tempfile::tempdir().unwrap();
+        let id = "fake-denied-discovery";
+        let pin = helper_fixture(root.path(), id, "running\n");
+        let mut helper = fake_helper(root.path(), id, "slirp");
+        let mut watcher = fake_helper(root.path(), id, "watcher");
+        let mut descendant = fake_helper(root.path(), id, "watcher");
+        let mut foreign = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        write_pins(
+            &pin,
+            &(pin_line("slirp", helper.id()) + &pin_line("watcher", watcher.id())),
+        );
+        DENIED_ENVIRONMENT_PID.with(|denied| denied.set(Some(foreign.id() as i32)));
+        let result = super::stop_slirp(root.path(), id, true);
+        DENIED_ENVIRONMENT_PID.with(|denied| denied.set(None));
+        let owned_ended = [&mut helper, &mut watcher, &mut descendant]
+            .into_iter()
+            .all(|child| child.try_wait().unwrap().is_some());
+        let foreign_survived = foreign.try_wait().unwrap().is_none();
+        let phase = std::fs::read_to_string(pin.with_extension("pid.state")).unwrap();
+        let retry = super::stop_slirp(root.path(), id, true);
+        for child in [&mut helper, &mut watcher, &mut descendant, &mut foreign] {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        assert_eq!(
+            result.unwrap_err().details.reason.as_deref(),
+            Some("slirp_proc_environment_denied_live")
+        );
+        assert!(owned_ended, "verified helpers must still be terminated");
+        assert!(
+            foreign_survived,
+            "unreadable identity cannot authorize a signal"
+        );
+        assert_eq!(phase, "cleanup-in-progress-started\n");
+        assert_eq!(
+            retry.unwrap_err().details.reason.as_deref(),
+            Some("slirp_cleanup_interrupted")
+        );
+    }
+
+    #[cfg(target_os = "linux")]
     fn helper_fixture(root: &std::path::Path, id: &str, phase: &str) -> std::path::PathBuf {
         use std::os::unix::fs::PermissionsExt;
         let dir = root.join("slirp-pids");
@@ -2883,6 +3040,109 @@ mod control_tests {
             assert!(result.is_err(), "{kind}");
             assert!(survived, "{kind} pin signaled a foreign process");
         }
+    }
+
+    #[cfg(unix)]
+    type AuthReadObserver = Box<dyn FnOnce(&std::fs::File)>;
+
+    #[cfg(unix)]
+    std::thread_local! {
+        static AUTH_READ_OBSERVER: std::cell::RefCell<Option<AuthReadObserver>> = const { std::cell::RefCell::new(None) };
+    }
+
+    #[cfg(unix)]
+    pub(super) fn before_auth_read(input: &std::fs::File) {
+        AUTH_READ_OBSERVER.with(|observer| {
+            if let Some(callback) = observer.borrow_mut().take() {
+                callback(input);
+            }
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn auth_copy_rejects_fifo_without_waiting_for_a_writer() {
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::fs::OpenOptionsExt;
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("controlled-fifo");
+        let destination = root.path().join("attempt-copy");
+        let path = std::ffi::CString::new(source.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
+        let (send, receive) = std::sync::mpsc::channel();
+        let copy_source = source.clone();
+        let copy_destination = destination.clone();
+        let copy = std::thread::spawn(move || {
+            let _ = send.send(super::copy_regular_nofollow(
+                &copy_source,
+                &copy_destination,
+                4,
+            ));
+        });
+        let result = receive.recv_timeout(std::time::Duration::from_secs(2));
+        // Rescue the old blocking open so a red test never strands a thread.
+        let rescue = if result.is_err() {
+            Some(
+                std::fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .custom_flags(libc::O_NONBLOCK)
+                    .open(&source)
+                    .unwrap(),
+            )
+        } else {
+            None
+        };
+        copy.join().unwrap();
+        drop(rescue);
+        assert!(
+            result.is_ok(),
+            "FIFO source blocked before metadata validation"
+        );
+        assert_eq!(
+            result.unwrap().unwrap_err().details.reason.as_deref(),
+            Some("auth_copy")
+        );
+        assert!(!destination.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn auth_copy_bounds_reads_when_regular_source_grows_after_metadata() {
+        use std::io::Seek;
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("controlled-source");
+        let destination = root.path().join("attempt-copy");
+        std::fs::write(&source, b"ok").unwrap();
+        let shared_input = std::rc::Rc::new(std::cell::RefCell::new(None));
+        let observed_input = shared_input.clone();
+        let growing_source = source.clone();
+        AUTH_READ_OBSERVER.with(|observer| {
+            *observer.borrow_mut() = Some(Box::new(move |input| {
+                // Metadata accepted two bytes. Grow the same regular inode
+                // before its first read and retain its shared file offset.
+                std::fs::OpenOptions::new()
+                    .write(true)
+                    .open(&growing_source)
+                    .unwrap()
+                    .set_len(4096)
+                    .unwrap();
+                *observed_input.borrow_mut() = Some(input.try_clone().unwrap());
+            }));
+        });
+        let result = super::copy_regular_nofollow(&source, &destination, 4);
+        AUTH_READ_OBSERVER.with(|observer| *observer.borrow_mut() = None);
+        assert_eq!(
+            result.unwrap_err().details.reason.as_deref(),
+            Some("auth_copy")
+        );
+        let mut input = shared_input
+            .borrow_mut()
+            .take()
+            .expect("post-metadata observer");
+        assert_eq!(input.stream_position().unwrap(), 5, "read exceeds limit+1");
+        assert_eq!(std::fs::metadata(&source).unwrap().len(), 4096);
+        assert!(!destination.exists());
     }
 
     #[tokio::test]

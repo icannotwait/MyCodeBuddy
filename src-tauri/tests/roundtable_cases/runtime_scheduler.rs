@@ -213,15 +213,39 @@ impl RoundtableTurnExecutor for ControlledExecutor {
 
 #[tokio::test]
 async fn runtime_fix_scheduler_publishes_members_then_moderator() {
-    exercise_scheduler_writer_gate(false).await;
+    exercise_scheduler_gate(SchedulerGate::None).await;
 }
 
 #[tokio::test]
 async fn lifecycle_checkpoint_keeps_polling_scheduler_that_owns_writer() {
-    exercise_scheduler_writer_gate(true).await;
+    exercise_scheduler_gate(SchedulerGate::AcceptWriter).await;
 }
 
-async fn exercise_scheduler_writer_gate(block_accept: bool) {
+#[tokio::test]
+async fn lifecycle_checkpoint_observes_durable_completion_before_scheduler_returns() {
+    exercise_scheduler_gate(SchedulerGate::Completed).await;
+}
+
+#[tokio::test]
+async fn lifecycle_completed_room_with_changed_epoch_keeps_budget_fence() {
+    exercise_scheduler_gate(SchedulerGate::StaleCompleted).await;
+}
+
+#[tokio::test]
+async fn lifecycle_durable_completion_does_not_hide_final_history_error() {
+    exercise_scheduler_gate(SchedulerGate::CompletedReadFailure).await;
+}
+
+#[derive(Clone, Copy)]
+enum SchedulerGate {
+    None,
+    AcceptWriter,
+    Completed,
+    StaleCompleted,
+    CompletedReadFailure,
+}
+
+async fn exercise_scheduler_gate(scenario: SchedulerGate) {
     let (dir, conn) = support::open_pool(5).await;
     migrate_roundtable(&conn).await.unwrap();
     let store = open_roundtable_store(conn.clone()).await.unwrap();
@@ -268,28 +292,85 @@ async fn exercise_scheduler_writer_gate(block_accept: bool) {
     conn.execute_unprepared("UPDATE rt_rooms SET status='running'")
         .await
         .unwrap();
-    let release = if block_accept {
-        let gate = store.arm_accept_writer_gate();
-        Some(tokio::spawn(async move {
+    let gate = match scenario {
+        SchedulerGate::None => None,
+        SchedulerGate::AcceptWriter => Some(store.arm_accept_writer_gate()),
+        SchedulerGate::Completed
+        | SchedulerGate::StaleCompleted
+        | SchedulerGate::CompletedReadFailure => Some(store.arm_completed_run_gate()),
+    };
+    let completion_observation = matches!(scenario, SchedulerGate::StaleCompleted)
+        .then(|| store.arm_completion_observation_gate());
+    let release = gate.map(|gate| {
+        let conn = conn.clone();
+        let executor = executor.clone();
+        tokio::spawn(async move {
             while !gate.is_waiting() {
                 tokio::task::yield_now().await;
             }
-            tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+            if let Some(observation) = completion_observation {
+                // The monitor has observed budget_fence, but has not read the
+                // terminal state yet. Order the epoch change before that read.
+                while !observation.is_waiting() {
+                    tokio::task::yield_now().await;
+                }
+                conn.execute_unprepared("UPDATE rt_rooms SET run_epoch=run_epoch+1")
+                    .await
+                    .unwrap();
+                observation.release();
+            }
+            if matches!(scenario, SchedulerGate::AcceptWriter) {
+                // Span a checkpoint while this scheduler owns the writer.
+                tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+            } else {
+                let permission = executor
+                    .requests
+                    .lock()
+                    .unwrap()
+                    .last()
+                    .unwrap()
+                    .execution_lease
+                    .clone()
+                    .unwrap();
+                // Hold the scheduler until the monitor has actually observed
+                // terminal state, rather than hoping a timer interleaves.
+                tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                    while !permission.revoked() {
+                        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                    }
+                })
+                .await
+                .expect("the terminal-state checkpoint must revoke paid permission");
+                if matches!(scenario, SchedulerGate::CompletedReadFailure) {
+                    conn.execute_unprepared("UPDATE rt_messages SET body_json='invalid-json'")
+                        .await
+                        .unwrap();
+                }
+            }
             gate.release();
-        }))
-    } else {
-        None
-    };
-    tokio::time::timeout(
+        })
+    });
+    let result = tokio::time::timeout(
         std::time::Duration::from_secs(5),
         runtime.run_room(store, room, serde_json::from_value(config).unwrap()),
     )
     .await
-    .unwrap()
-    .expect("own writer must progress while checkpoint is waiting");
+    .unwrap();
     if let Some(release) = release {
         release.await.unwrap();
     }
+    if matches!(scenario, SchedulerGate::StaleCompleted) {
+        let error = result.expect_err("a different run epoch must remain fenced");
+        assert_eq!(error.details.reason.as_deref(), Some("budget_fence"));
+        return;
+    }
+    if matches!(scenario, SchedulerGate::CompletedReadFailure) {
+        let error = result.expect_err("terminal observation cannot replace the scheduler result");
+        assert_eq!(error.code, ErrorCode::StorageUnavailable);
+        assert_eq!(error.details.reason.as_deref(), Some("runtime_snapshot"));
+        return;
+    }
+    result.expect("a healthy scheduler must finish across the checkpoint boundary");
     assert_eq!(
         support::scalar_i64(
             &conn,
