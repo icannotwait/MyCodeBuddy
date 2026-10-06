@@ -879,7 +879,7 @@ async fn rpc(
     params: serde_json::Value,
 ) -> Result<serde_json::Value, String> {
     let mut seq = 0;
-    let rejected = std::cell::Cell::new(false);
+    let rejected = std::sync::atomic::AtomicBool::new(false);
     super::live_runtime::acp_exchange(
         stdin,
         stdout,

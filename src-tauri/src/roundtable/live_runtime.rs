@@ -14,9 +14,9 @@ use super::{
 use async_trait::async_trait;
 use roundtable_protocol::*;
 use serde_json::{json, Value};
-use std::cell::Cell;
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
@@ -998,12 +998,12 @@ where
     W: AsyncWrite + Unpin,
     R: AsyncRead + Unpin,
 {
-    let rejected = Cell::new(false);
+    let rejected = AtomicBool::new(false);
     let mut prompt_id = 5u64;
     let mut text = prompt.to_owned();
     let mut repairs = 0u8;
     loop {
-        rejected.set(false);
+        rejected.store(false, Ordering::Relaxed);
         let result = acp_exchange(
             stdin,
             stdout,
@@ -1025,7 +1025,7 @@ where
             return Ok(result);
         }
         if result["stopReason"] == "cancelled"
-            && rejected.get()
+            && rejected.load(Ordering::Relaxed)
             && repairs < MAX_PERMISSION_CANCEL_REPAIRS
         {
             repairs = repairs.saturating_add(1);
@@ -1050,7 +1050,7 @@ pub(crate) struct AcpExchange<'a> {
     pub(crate) deadline: Option<Duration>,
     /// Set when this exchange rejects a tool. A later `cancelled` stop can
     /// be retried by [`finish_seat_prompt`].
-    pub(crate) rejected_permission: &'a Cell<bool>,
+    pub(crate) rejected_permission: &'a AtomicBool,
 }
 
 async fn rpc(
@@ -1062,7 +1062,7 @@ async fn rpc(
     seq: &mut u64,
     active: &Active,
 ) -> RtResult<Value> {
-    let rejected = Cell::new(false);
+    let rejected = AtomicBool::new(false);
     acp_exchange(
         stdin,
         stdout,
@@ -1145,7 +1145,7 @@ where
             if let Some(request_id) = message.get("id").cloned() {
                 let response = if message["method"] == "session/request_permission" {
                     if !tool_call_is_roundtable(&message["params"]) {
-                        exchange.rejected_permission.set(true);
+                        exchange.rejected_permission.store(true, Ordering::Relaxed);
                     }
                     permission_reply(&message["params"], &request_id)
                 } else {
@@ -1671,7 +1671,7 @@ pub async fn exercise_live_acp_rpc() -> RtResult<LiveAcpRpcObservation> {
     let mut client_read = BufReader::new(client_read);
     let adapter = tokio::spawn(async move { fake_acp_adapter(adapter_read, adapter_write).await });
     let capture = Mutex::new(Some(super::DiagnosticCapture::new(Vec::new())));
-    let rejected = Cell::new(false);
+    let rejected = AtomicBool::new(false);
     let mut seq = 0u64;
     let exchanged = async {
         let initialize = acp_exchange(
@@ -1915,7 +1915,7 @@ pub async fn exercise_schema_seat_rpc() -> RtResult<SchemaSeatObservation> {
     let adapter =
         tokio::spawn(async move { schema_seat_adapter(adapter_read, adapter_write).await });
     let capture = Mutex::new(Some(super::DiagnosticCapture::new(Vec::new())));
-    let rejected = Cell::new(false);
+    let rejected = AtomicBool::new(false);
     let mut seq = 0u64;
     let exchanged = async {
         let initialize = acp_exchange(
