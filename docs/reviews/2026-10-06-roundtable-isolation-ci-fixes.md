@@ -400,3 +400,41 @@ The native aggregate remains 96/98 with missing rustc/Cargo prerequisites.
 Rust test attempts exit 127, so local Rust tests, the mutation control and
 rustfmt remain UNRUN. Existing CI must compile and run this exact patch before
 any new Rust GREEN or full-matrix claim.
+
+## Run 236: retain the exact remaining cleanup failure branch
+
+Observed at `1b71372`: the runtime target passed 121 tests, failed
+`acp_session_error_stops_slirp_and_deletes_the_container`, and ignored the one
+live probe. The failed assertion reported `session/new rejected; cleanup:
+slirp_cleanup_unproven` and durable `cleanup-in-progress-started`. Both fake
+container kill/delete assertions had already passed. The low-memory Cargo
+configuration forces one test thread; the preceding test completed at
+16:37:14.6084668 UTC and this test completed at 16:37:14.7142038 UTC (about
+106 ms later), excluding the three-second cleanup-loop deadline for this run.
+The child statuses were sampled before fixture rescue cleanup but were not
+printed, so their exit state cannot be inferred from this failure log.
+
+The reason does not identify the earlier, specifically labeled live environment
+read denial. Possible remaining branches include pin validation, pinned-process
+verification, pidfd operations, or limits. Linux
+[`pidfd_open`/`pidfd_create` in v5.15](https://github.com/torvalds/linux/blob/v5.15/kernel/pid.c#L524-L573)
+and [`pidfd_prepare` in v6.8](https://github.com/torvalds/linux/blob/v6.8/kernel/fork.c#L2053-L2057)
+show that losing the thread-group task between PID lookup and pidfd preparation
+can produce `EINVAL`. That is a source-supported race candidate, not an observed
+attribution of this CI failure. `EINVAL` remains a rejection.
+
+This diagnostic-only delta replaces the remaining generic Linux branches with
+fixed operation labels. Failed pidfd opens distinguish durable-pin verification
+from the host census; pinned-process metadata/stat/environment failures also
+retain that caller distinction. Syscall failures append the immediately captured
+numeric errno (or `unknown`), and filesystem failures use their returned
+`io::Error` errno without a new OS read. No PID, environment, path, command, or raw
+proc content is included. The existing failing assertion now also prints its
+already-sampled child exit statuses, still only after rescue cleanup.
+
+Success/failure predicates, ESRCH handling, read/poll/signal order, signal values,
+limits, retry/deadline behavior, host inventory, and durable phase writes are
+unchanged. This does not add an inventory override, ignore an error, skip a test,
+or retry until green. No new local process/socket probe was attempted; Rust and
+rustfmt remain unavailable locally. The next existing CI run must establish the
+actual failing operation and errno before any behavioral correction is justified.

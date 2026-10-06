@@ -579,7 +579,11 @@ fn acp_session_error_stops_slirp_and_deletes_the_container() {
     let text = fs::read_to_string(&log).expect("crun log");
     assert!(text.contains("kill cq-acp-9 KILL"), "{text}");
     assert!(text.contains("delete cq-acp-9"), "{text}");
-    assert_eq!(phase.unwrap(), "cleanup-proven-started\n", "{error}");
+    assert_eq!(
+        phase.unwrap(),
+        "cleanup-proven-started\n",
+        "{error}; sampled child statuses: slirp={slirp_status:?}, watcher={watcher_status:?}"
+    );
     assert!(
         slirp_status.is_some_and(|status| !status.success()),
         "slirp was not terminated"

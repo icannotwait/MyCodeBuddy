@@ -1588,8 +1588,18 @@ pub(super) fn stop_slirp(runtime_root: &Path, id: &str, expected: bool) -> RtRes
         fn unproven_at(reason: &'static str) -> roundtable_protocol::RtError {
             rt_error(ErrorCode::PolicyUnenforceable, reason)
         }
-        fn unproven() -> roundtable_protocol::RtError {
-            unproven_at("slirp_cleanup_unproven")
+        fn unproven_syscall(
+            operation: &'static str,
+            errno: Option<i32>,
+        ) -> roundtable_protocol::RtError {
+            // Call sites supply fixed operation labels; only a numeric errno
+            // is added, never a PID, path, environment, or syscall error text.
+            let mut error = unproven_at(operation);
+            error.details.reason = Some(match errno {
+                Some(errno) => format!("{operation}_errno_{errno}"),
+                None => format!("{operation}_errno_unknown"),
+            });
+            error
         }
         fn private_file(path: &Path, writable: bool) -> RtResult<fs::File> {
             let file = fs::OpenOptions::new()
@@ -1618,18 +1628,19 @@ pub(super) fn stop_slirp(runtime_root: &Path, id: &str, expected: bool) -> RtRes
                 .and_then(|()| file.sync_all())
                 .map_err(|_| unproven_at("slirp_lifecycle_state_write"))
         }
-        fn pidfd(pid: i32) -> RtResult<Option<OwnedFd>> {
+        fn pidfd(pid: i32, operation: &'static str) -> RtResult<Option<OwnedFd>> {
             if pid <= 1 {
-                return Err(unproven());
+                return Err(unproven_at("slirp_pidfd_invalid_pid"));
             }
             let raw = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
             if raw >= 0 {
                 return Ok(Some(unsafe { OwnedFd::from_raw_fd(raw as i32) }));
             }
-            if std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) {
+            let errno = std::io::Error::last_os_error().raw_os_error();
+            if errno == Some(libc::ESRCH) {
                 Ok(None)
             } else {
-                Err(unproven())
+                Err(unproven_syscall(operation, errno))
             }
         }
         fn marked(env: &[u8], runtime_root: &Path, id: &str, role: Option<&str>) -> bool {
@@ -1659,21 +1670,62 @@ pub(super) fn stop_slirp(runtime_root: &Path, id: &str, expected: bool) -> RtRes
             if helper_process_exited(fd) {
                 return Ok(());
             }
+            let stage = |pin: &'static str, census: &'static str| {
+                if role.is_some() {
+                    pin
+                } else {
+                    census
+                }
+            };
             let inspect = || {
-                let metadata = fs::metadata(format!("/proc/{pid}")).map_err(|_| unproven())?;
-                let stat =
-                    fs::read_to_string(format!("/proc/{pid}/stat")).map_err(|_| unproven())?;
+                let metadata = fs::metadata(format!("/proc/{pid}")).map_err(|error| {
+                    unproven_syscall(
+                        stage("slirp_pin_verify_metadata", "slirp_census_verify_metadata"),
+                        error.raw_os_error(),
+                    )
+                })?;
+                let stat = fs::read_to_string(format!("/proc/{pid}/stat")).map_err(|error| {
+                    unproven_syscall(
+                        stage("slirp_pin_verify_stat", "slirp_census_verify_stat"),
+                        error.raw_os_error(),
+                    )
+                })?;
                 let observed = stat
                     .rsplit_once(") ")
                     .and_then(|(_, rest)| rest.split_whitespace().nth(19))
                     .and_then(|value| value.parse::<u64>().ok());
-                let env = fs::read(format!("/proc/{pid}/environ")).map_err(|_| unproven())?;
-                if metadata.uid() != unsafe { libc::geteuid() }
-                    || observed.is_none()
-                    || start.is_some_and(|expected| observed != Some(expected))
-                    || !marked(&env, runtime_root, id, role)
-                {
-                    return Err(unproven());
+                let env = fs::read(format!("/proc/{pid}/environ")).map_err(|error| {
+                    unproven_syscall(
+                        stage(
+                            "slirp_pin_verify_environment",
+                            "slirp_census_verify_environment",
+                        ),
+                        error.raw_os_error(),
+                    )
+                })?;
+                if metadata.uid() != unsafe { libc::geteuid() } {
+                    return Err(unproven_at(stage(
+                        "slirp_pin_verify_uid_mismatch",
+                        "slirp_census_verify_uid_mismatch",
+                    )));
+                }
+                if observed.is_none() {
+                    return Err(unproven_at(stage(
+                        "slirp_pin_verify_start_invalid",
+                        "slirp_census_verify_start_invalid",
+                    )));
+                }
+                if start.is_some_and(|expected| observed != Some(expected)) {
+                    return Err(unproven_at(stage(
+                        "slirp_pin_verify_start_mismatch",
+                        "slirp_census_verify_start_mismatch",
+                    )));
+                }
+                if !marked(&env, runtime_root, id, role) {
+                    return Err(unproven_at(stage(
+                        "slirp_pin_verify_marker_mismatch",
+                        "slirp_census_verify_marker_mismatch",
+                    )));
                 }
                 Ok(())
             };
@@ -1736,7 +1788,7 @@ pub(super) fn stop_slirp(runtime_root: &Path, id: &str, expected: bool) -> RtRes
                     // Pin before reading environ, including for unreadable
                     // candidates. Numeric PID reuse cannot prove this read's
                     // identity exited or authorize signaling its replacement.
-                    let Some(fd) = pidfd(pid)? else {
+                    let Some(fd) = pidfd(pid, "slirp_census_pidfd_open")? else {
                         return Ok(None);
                     };
                     if let Some(birth) = birth.filter(|birth| birth.zero_boottime_offset) {
@@ -1795,7 +1847,8 @@ pub(super) fn stop_slirp(runtime_root: &Path, id: &str, expected: bool) -> RtRes
                 match inspect() {
                     Ok(Some(identity)) => {
                         if found.len() >= 1024 {
-                            first_error.get_or_insert_with(unproven);
+                            first_error
+                                .get_or_insert_with(|| unproven_at("slirp_discovery_limit"));
                             break;
                         }
                         found.push(identity);
@@ -1816,20 +1869,23 @@ pub(super) fn stop_slirp(runtime_root: &Path, id: &str, expected: bool) -> RtRes
             id: &str,
             never_started: bool,
         ) -> RtResult<Vec<OwnedFd>> {
-            if !pidfile.try_exists().map_err(|_| unproven())? {
+            if !pidfile
+                .try_exists()
+                .map_err(|_| unproven_at("slirp_pin_presence_unreadable"))?
+            {
                 return if never_started {
                     Ok(Vec::new())
                 } else {
-                    Err(unproven())
+                    Err(unproven_at("slirp_pin_missing"))
                 };
             }
             let mut body = String::new();
             private_file(pidfile, false)?
                 .take(1025)
                 .read_to_string(&mut body)
-                .map_err(|_| unproven())?;
+                .map_err(|_| unproven_at("slirp_pin_body_unreadable"))?;
             if body.len() > 1024 {
-                return Err(unproven());
+                return Err(unproven_at("slirp_pin_body_oversized"));
             }
             let mut roles = std::collections::BTreeSet::new();
             let mut roots = Vec::new();
@@ -1839,20 +1895,27 @@ pub(super) fn stop_slirp(runtime_root: &Path, id: &str, expected: bool) -> RtRes
                     || !matches!(fields[0], "slirp" | "watcher")
                     || !roles.insert(fields[0])
                 {
-                    return Err(unproven());
+                    return Err(unproven_at("slirp_pin_fields_invalid"));
                 }
-                let pid = fields[1].parse::<i32>().map_err(|_| unproven())?;
-                let start = fields[2].parse::<u64>().map_err(|_| unproven())?;
+                let pid = fields[1]
+                    .parse::<i32>()
+                    .map_err(|_| unproven_at("slirp_pin_pid_invalid"))?;
+                let start = fields[2]
+                    .parse::<u64>()
+                    .map_err(|_| unproven_at("slirp_pin_start_invalid"))?;
                 if start == 0 {
-                    return Err(unproven());
+                    return Err(unproven_at("slirp_pin_start_zero"));
                 }
-                if let Some(fd) = pidfd(pid)? {
+                if let Some(fd) = pidfd(pid, "slirp_pin_pidfd_open")? {
                     verify(&fd, pid, Some(start), runtime_root, id, Some(fields[0]))?;
                     roots.push(fd);
                 }
             }
-            if never_started || roles.len() != 2 {
-                return Err(unproven());
+            if never_started {
+                return Err(unproven_at("slirp_pin_phase_mismatch"));
+            }
+            if roles.len() != 2 {
+                return Err(unproven_at("slirp_pin_roles_incomplete"));
             }
             Ok(roots)
         }
@@ -1970,7 +2033,7 @@ pub(super) fn stop_slirp(runtime_root: &Path, id: &str, expected: bool) -> RtRes
             retained.retain(|_, fd| !helper_process_exited(fd));
             // Bound handles by distinct live processes, not sweep count.
             if retained.len() > 1024 {
-                return Err(unproven());
+                return Err(unproven_at("slirp_retained_limit"));
             }
             let roots_exited = pin_proof
                 .as_ref()
@@ -2017,15 +2080,18 @@ pub(super) fn stop_slirp(runtime_root: &Path, id: &str, expected: bool) -> RtRes
                             0,
                         )
                     };
-                    if result < 0
-                        && std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
-                    {
-                        return Err(unproven());
+                    if result < 0 {
+                        let errno = std::io::Error::last_os_error().raw_os_error();
+                        if errno != Some(libc::ESRCH) {
+                            return Err(unproven_syscall("slirp_pidfd_send_signal", errno));
+                        }
                     }
                 }
             }
             if began.elapsed() > Duration::from_secs(3) {
-                return Err(discovery_error.unwrap_or_else(unproven));
+                return Err(
+                    discovery_error.unwrap_or_else(|| unproven_at("slirp_cleanup_deadline")),
+                );
             }
             std::thread::sleep(Duration::from_millis(20));
         }
