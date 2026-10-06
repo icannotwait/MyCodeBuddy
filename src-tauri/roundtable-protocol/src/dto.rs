@@ -157,7 +157,11 @@ pub struct ResumeRequest {
     pub concurrency: Option<u32>,
     pub recovery_consent: bool,
     /// Bind each paid restart to the recipients and evidence just disclosed.
-    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "de_optional")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "de_optional"
+    )]
     pub confirmed_preflight_id: Option<String>,
 }
 
@@ -187,7 +191,11 @@ pub struct InterjectRequest {
     pub text: String,
     pub mode: InterjectMode,
     /// Bind each paid restart to the recipients and evidence just disclosed.
-    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "de_optional")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "de_optional"
+    )]
     pub confirmed_preflight_id: Option<String>,
 }
 
@@ -198,7 +206,11 @@ pub struct RetrySynthesisRequest {
     pub request_id: RequestId,
     pub expected_revision: Revision,
     /// Bind each paid restart to the recipients and evidence just disclosed.
-    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "de_optional")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "de_optional"
+    )]
     pub confirmed_preflight_id: Option<String>,
 }
 

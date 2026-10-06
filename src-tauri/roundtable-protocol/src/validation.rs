@@ -74,40 +74,60 @@ pub fn result_schema(phase: Option<PhaseKind>) -> Value {
     fn object(required: &[&str], properties: Value) -> Value {
         json!({"type":"object","additionalProperties":false,"required":required,"properties":properties})
     }
-    fn array(items: Value) -> Value { json!({"type":"array","items":items}) }
-    fn enumeration(values: impl Serialize) -> Value { json!({"type":"string","enum":values}) }
+    fn array(items: Value) -> Value {
+        json!({"type":"array","items":items})
+    }
+    fn enumeration(values: impl Serialize) -> Value {
+        json!({"type":"string","enum":values})
+    }
     let text = json!({"type":"string","minLength":1,"pattern":"\\S"});
     let aliases = array(json!({"type":"string","minLength":1}));
-    let alias = object(&["kind","alias"], json!({
-        "kind":enumeration([AliasKind::Message, AliasKind::Claim, AliasKind::Evidence]),
-        "alias":{"type":"string","minLength":1}
-    }));
-    let conclusion = object(&["text","aliases","inference"], json!({"text":text,"aliases":array(alias.clone()),"inference":{"type":"boolean"}}));
-    let mut member = object(&["kind","summary","claims"], json!({
-        "kind": enumeration(match phase { Some(PhaseKind::Proposal) => vec![MemberKind::Proposal,MemberKind::Abstain], Some(PhaseKind::Critique) => vec![MemberKind::Critique,MemberKind::Abstain], _ => vec![MemberKind::Proposal,MemberKind::Critique,MemberKind::Abstain] }),
-        "summary":text,
-        "claims":{"type":"array","maxItems":v1_1::MAX_CLAIMS,"items":object(&["local_key","text","evidence_aliases","confidence"],json!({
-            "local_key":{"type":"string","minLength":1},"text":text,"evidence_aliases":aliases,
-            "confidence":enumeration([crate::Confidence::Low,crate::Confidence::Medium,crate::Confidence::High])
-        }))},
-        "responses":{"type":"array","maxItems":v1_1::MAX_RESPONSES,"items":{
-            "type":"object","additionalProperties":false,"required":["stance","priority","text","evidence_aliases"],
-            "oneOf":[{"required":["target_claim_alias"],"not":{"required":["target_response_alias"]}},{"required":["target_response_alias"],"not":{"required":["target_claim_alias"]}}],
-            "properties":{"target_claim_alias":{"type":"string","minLength":1},"target_response_alias":{"type":"string","minLength":1},"stance":enumeration([Stance::Support,Stance::Challenge,Stance::Clarify,Stance::Revise]),"priority":enumeration([crate::Priority::Normal,crate::Priority::Critical]),"text":text,"evidence_aliases":aliases}
-        }},
-        "open_questions":{"type":"array","maxItems":v1_1::MAX_OPEN_QUESTIONS,"items":text},
-        "position_changes":{"type":"array","maxItems":v1_1::MAX_POSITION_CHANGES,"items":object(&["own_prior_claim_alias","new_local_claim_key","reason","trigger_response_aliases"],json!({"own_prior_claim_alias":{"type":"string"},"new_local_claim_key":{"type":"string"},"reason":text,"trigger_response_aliases":aliases}))},
-        "reason":{"type":"string"}
-    }));
+    let alias = object(
+        &["kind", "alias"],
+        json!({
+            "kind":enumeration([AliasKind::Message, AliasKind::Claim, AliasKind::Evidence]),
+            "alias":{"type":"string","minLength":1}
+        }),
+    );
+    let conclusion = object(
+        &["text", "aliases", "inference"],
+        json!({"text":text,"aliases":array(alias.clone()),"inference":{"type":"boolean"}}),
+    );
+    let mut member = object(
+        &["kind", "summary", "claims"],
+        json!({
+            "kind": enumeration(match phase { Some(PhaseKind::Proposal) => vec![MemberKind::Proposal,MemberKind::Abstain], Some(PhaseKind::Critique) => vec![MemberKind::Critique,MemberKind::Abstain], _ => vec![MemberKind::Proposal,MemberKind::Critique,MemberKind::Abstain] }),
+            "summary":text,
+            "claims":{"type":"array","maxItems":v1_1::MAX_CLAIMS,"items":object(&["local_key","text","evidence_aliases","confidence"],json!({
+                "local_key":{"type":"string","minLength":1},"text":text,"evidence_aliases":aliases,
+                "confidence":enumeration([crate::Confidence::Low,crate::Confidence::Medium,crate::Confidence::High])
+            }))},
+            "responses":{"type":"array","maxItems":v1_1::MAX_RESPONSES,"items":{
+                "type":"object","additionalProperties":false,"required":["stance","priority","text","evidence_aliases"],
+                "oneOf":[{"required":["target_claim_alias"],"not":{"required":["target_response_alias"]}},{"required":["target_response_alias"],"not":{"required":["target_claim_alias"]}}],
+                "properties":{"target_claim_alias":{"type":"string","minLength":1},"target_response_alias":{"type":"string","minLength":1},"stance":enumeration([Stance::Support,Stance::Challenge,Stance::Clarify,Stance::Revise]),"priority":enumeration([crate::Priority::Normal,crate::Priority::Critical]),"text":text,"evidence_aliases":aliases}
+            }},
+            "open_questions":{"type":"array","maxItems":v1_1::MAX_OPEN_QUESTIONS,"items":text},
+            "position_changes":{"type":"array","maxItems":v1_1::MAX_POSITION_CHANGES,"items":object(&["own_prior_claim_alias","new_local_claim_key","reason","trigger_response_aliases"],json!({"own_prior_claim_alias":{"type":"string"},"new_local_claim_key":{"type":"string"},"reason":text,"trigger_response_aliases":aliases}))},
+            "reason":{"type":"string"}
+        }),
+    );
     member["allOf"] = json!([{"if":{"properties":{"kind":{"const":"abstain"}}},"then":{"required":["reason"],"properties":{"reason":text,"claims":{"maxItems":0},"responses":{"maxItems":0},"position_changes":{"maxItems":0}}},"else":{"properties":{"claims":{"minItems":1}}}}]);
     member["examples"] = json!([{"kind":if phase==Some(PhaseKind::Critique){"critique"}else{"proposal"},"summary":"A reasoned position","claims":[{"local_key":"a","text":"An explicitly stated claim","evidence_aliases":[],"confidence":"low"}],"responses":[],"open_questions":[],"position_changes":[]}]);
-    let mut moderator = object(MODERATOR_FIELDS, json!({
-        "kind":enumeration([ModeratorKind::Synthesis]),"recommendation":conclusion,
-        "alternatives":array(conclusion.clone()),"disagreements":array(conclusion.clone()),"risks":array(conclusion.clone()),"decision_requests":array(conclusion),
-        "consensus_items":array(object(&["text","agreement_level","aliases","supporter_aliases","support_response_aliases","inference"],json!({"text":text,"agreement_level":enumeration([AgreementLevel::ExplicitAgreement,AgreementLevel::CompatiblePositions,AgreementLevel::Unresolved]),"aliases":array(alias),"supporter_aliases":aliases,"support_response_aliases":aliases,"inference":{"type":"boolean"}})))
-    }));
+    let mut moderator = object(
+        MODERATOR_FIELDS,
+        json!({
+            "kind":enumeration([ModeratorKind::Synthesis]),"recommendation":conclusion,
+            "alternatives":array(conclusion.clone()),"disagreements":array(conclusion.clone()),"risks":array(conclusion.clone()),"decision_requests":array(conclusion),
+            "consensus_items":array(object(&["text","agreement_level","aliases","supporter_aliases","support_response_aliases","inference"],json!({"text":text,"agreement_level":enumeration([AgreementLevel::ExplicitAgreement,AgreementLevel::CompatiblePositions,AgreementLevel::Unresolved]),"aliases":array(alias),"supporter_aliases":aliases,"support_response_aliases":aliases,"inference":{"type":"boolean"}})))
+        }),
+    );
     moderator["examples"] = json!([{"kind":"synthesis","recommendation":{"text":"This recommendation is an inference","aliases":[],"inference":true},"alternatives":[],"consensus_items":[],"disagreements":[],"risks":[],"decision_requests":[]}]);
-    let mut schema = match phase { Some(PhaseKind::Synthesis) => moderator, Some(_) => member, None => json!({"oneOf":[member,moderator]}) };
+    let mut schema = match phase {
+        Some(PhaseKind::Synthesis) => moderator,
+        Some(_) => member,
+        None => json!({"oneOf":[member,moderator]}),
+    };
     schema["$schema"] = json!("http://json-schema.org/draft-07/schema#");
     schema["$id"] = json!("roundtable_result_v1");
     schema["description"] = json!("Submit only this result object through submit_result with a fresh UUID submission_id. Do not submit identity fields or coverage. Optional fields must be omitted, never null. Use only visible aliases supplied in context.aliases and context.alias_catalog; IDs are not aliases. Claim local_key values must be unique within your result. Cite evidence aliases only after reading the frozen evidence. A non-abstaining member must answer every metadata.mandatory_targets entry with exactly one target_claim_alias or target_response_alias per response. Support cannot target your own claims. Position changes must refer to your published prior claim, a local claim key in this result and published response aliases. Moderator conclusions require visible message/claim/evidence aliases or inference=true. Explicit agreement requires at least two published support responses from distinct other speakers on the same claim, with matching supporter aliases. Stay within metadata.phase.output_byte_limit canonical UTF-8 bytes. An abstention requires a non-empty reason and no claims, responses or position changes. A staged receipt is not turn acceptance; finish the ACP turn normally after receiving the receipt.");
@@ -1234,11 +1254,19 @@ mod schema_parity_tests {
 
     #[test]
     fn model_schema_property_names_match_validator_allowlists() {
-        for (kind, allowed) in [(PhaseKind::Proposal, MEMBER_FIELDS), (PhaseKind::Synthesis, MODERATOR_FIELDS)] {
+        for (kind, allowed) in [
+            (PhaseKind::Proposal, MEMBER_FIELDS),
+            (PhaseKind::Synthesis, MODERATOR_FIELDS),
+        ] {
             let schema = result_schema(Some(kind));
-            let actual: BTreeSet<_> = schema["properties"].as_object().unwrap().keys().map(String::as_str).collect();
+            let actual: BTreeSet<_> = schema["properties"]
+                .as_object()
+                .unwrap()
+                .keys()
+                .map(String::as_str)
+                .collect();
             let expected: BTreeSet<_> = allowed.iter().copied().collect();
-            assert_eq!(actual,expected);
+            assert_eq!(actual, expected);
         }
     }
 }
@@ -1581,8 +1609,12 @@ pub fn submit_result_input_schema(phase: PhaseKind) -> Value {
 /// Compact example from the exact same contract as the prompt and MCP schema.
 /// Dynamic mandatory targets still require the corresponding covering responses.
 pub fn seat_schema_example(phase: PhaseKind) -> &'static str {
-    static EXAMPLES: std::sync::OnceLock<[String;3]> = std::sync::OnceLock::new();
+    static EXAMPLES: std::sync::OnceLock<[String; 3]> = std::sync::OnceLock::new();
     let examples=EXAMPLES.get_or_init(|| [PhaseKind::Proposal,PhaseKind::Critique,PhaseKind::Synthesis]
         .map(|phase|format!("Use a new submission_id and address every mandatory target. Omit identity and coverage. Example result: {}",result_schema(Some(phase))["examples"][0])));
-    &examples[match phase { PhaseKind::Proposal=>0,PhaseKind::Critique=>1,PhaseKind::Synthesis=>2 }]
+    &examples[match phase {
+        PhaseKind::Proposal => 0,
+        PhaseKind::Critique => 1,
+        PhaseKind::Synthesis => 2,
+    }]
 }

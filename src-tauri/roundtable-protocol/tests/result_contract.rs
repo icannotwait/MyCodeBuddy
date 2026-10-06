@@ -219,8 +219,8 @@ fn nested_missing_claim_field_names_its_path() {
     assert!(required.iter().any(|field| field == "kind"));
     assert!(required.iter().any(|field| field == "summary"));
     assert!(required.iter().any(|field| field == "claims"));
-    let claim_required = schema["properties"]["result"]["properties"]["claims"]
-        ["items"]["required"]
+    let claim_required = schema["properties"]["result"]["properties"]["claims"]["items"]
+        ["required"]
         .as_array()
         .expect("claim required");
     assert!(claim_required.iter().any(|field| field == "local_key"));
@@ -1121,7 +1121,11 @@ impl FixtureCase {
 
 #[test]
 fn delivered_schemas_have_complete_nested_contract_and_valid_examples() {
-    for kind in [PhaseKind::Proposal, PhaseKind::Critique, PhaseKind::Synthesis] {
+    for kind in [
+        PhaseKind::Proposal,
+        PhaseKind::Critique,
+        PhaseKind::Synthesis,
+    ] {
         let schema = roundtable_protocol::result_schema(Some(kind));
         assert_eq!(schema["$id"], "roundtable_result_v1");
         assert_eq!(schema["additionalProperties"], false);
@@ -1132,11 +1136,24 @@ fn delivered_schemas_have_complete_nested_contract_and_valid_examples() {
             validate_result(&canonical_bytes(example).unwrap(), &scope).unwrap();
         }
         if kind != PhaseKind::Synthesis {
-            assert_eq!(schema["properties"]["claims"]["items"]["required"], json!(["local_key","text","evidence_aliases","confidence"]));
-            assert_eq!(schema["properties"]["responses"]["items"]["properties"]["stance"]["enum"], json!(["support","challenge","clarify","revise"]));
+            assert_eq!(
+                schema["properties"]["claims"]["items"]["required"],
+                json!(["local_key", "text", "evidence_aliases", "confidence"])
+            );
+            assert_eq!(
+                schema["properties"]["responses"]["items"]["properties"]["stance"]["enum"],
+                json!(["support", "challenge", "clarify", "revise"])
+            );
         } else {
-            assert_eq!(schema["properties"]["recommendation"]["required"], json!(["text","aliases","inference"]));
-            assert!(schema["properties"]["consensus_items"]["items"]["properties"]["support_response_aliases"].is_object());
+            assert_eq!(
+                schema["properties"]["recommendation"]["required"],
+                json!(["text", "aliases", "inference"])
+            );
+            assert!(
+                schema["properties"]["consensus_items"]["items"]["properties"]
+                    ["support_response_aliases"]
+                    .is_object()
+            );
             assert!(schema["properties"].get("speaker_id").is_none());
             assert!(schema["properties"].get("coverage").is_none());
         }
@@ -1146,41 +1163,123 @@ fn delivered_schemas_have_complete_nested_contract_and_valid_examples() {
 // Small independent evaluator for the complete subset emitted by result_schema.
 // It consumes the published schema, never the production validation functions.
 fn schema_accepts(schema: &Value, value: &Value) -> bool {
-    if schema.get("const").is_some_and(|expected| expected != value) { return false; }
-    if schema.get("enum").and_then(Value::as_array).is_some_and(|values| !values.contains(value)) { return false; }
-    if schema.get("not").is_some_and(|other| schema_accepts(other, value)) { return false; }
-    if schema.get("allOf").and_then(Value::as_array).is_some_and(|rules| !rules.iter().all(|rule| schema_accepts(rule,value))) { return false; }
-    if schema.get("oneOf").and_then(Value::as_array).is_some_and(|rules| rules.iter().filter(|rule| schema_accepts(rule,value)).count() != 1) { return false; }
+    if schema
+        .get("const")
+        .is_some_and(|expected| expected != value)
+    {
+        return false;
+    }
+    if schema
+        .get("enum")
+        .and_then(Value::as_array)
+        .is_some_and(|values| !values.contains(value))
+    {
+        return false;
+    }
+    if schema
+        .get("not")
+        .is_some_and(|other| schema_accepts(other, value))
+    {
+        return false;
+    }
+    if schema
+        .get("allOf")
+        .and_then(Value::as_array)
+        .is_some_and(|rules| !rules.iter().all(|rule| schema_accepts(rule, value)))
+    {
+        return false;
+    }
+    if schema
+        .get("oneOf")
+        .and_then(Value::as_array)
+        .is_some_and(|rules| {
+            rules
+                .iter()
+                .filter(|rule| schema_accepts(rule, value))
+                .count()
+                != 1
+        })
+    {
+        return false;
+    }
     if let Some(condition) = schema.get("if") {
-        let branch = if schema_accepts(condition,value) { "then" } else { "else" };
-        if schema.get(branch).is_some_and(|rule| !schema_accepts(rule,value)) { return false; }
+        let branch = if schema_accepts(condition, value) {
+            "then"
+        } else {
+            "else"
+        };
+        if schema
+            .get(branch)
+            .is_some_and(|rule| !schema_accepts(rule, value))
+        {
+            return false;
+        }
     }
     if let Some(kind) = schema.get("type").and_then(Value::as_str) {
-        let matches = match kind { "object"=>value.is_object(),"array"=>value.is_array(),"string"=>value.is_string(),"boolean"=>value.is_boolean(),_=>panic!("unsupported schema type {kind}") };
-        if !matches { return false; }
+        let matches = match kind {
+            "object" => value.is_object(),
+            "array" => value.is_array(),
+            "string" => value.is_string(),
+            "boolean" => value.is_boolean(),
+            _ => panic!("unsupported schema type {kind}"),
+        };
+        if !matches {
+            return false;
+        }
     }
     if let Some(object) = value.as_object() {
-        if schema.get("required").and_then(Value::as_array).is_some_and(|keys| keys.iter().any(|key| !object.contains_key(key.as_str().unwrap()))) { return false; }
+        if schema
+            .get("required")
+            .and_then(Value::as_array)
+            .is_some_and(|keys| {
+                keys.iter()
+                    .any(|key| !object.contains_key(key.as_str().unwrap()))
+            })
+        {
+            return false;
+        }
         if let Some(properties) = schema.get("properties").and_then(Value::as_object) {
-            for (key,item) in object {
+            for (key, item) in object {
                 match properties.get(key) {
-                    Some(rule) if !schema_accepts(rule,item) => return false,
+                    Some(rule) if !schema_accepts(rule, item) => return false,
                     None if schema["additionalProperties"] == false => return false,
-                    _=>{}
+                    _ => {}
                 }
             }
         }
     }
     if let Some(items) = value.as_array() {
-        if schema.get("minItems").and_then(Value::as_u64).is_some_and(|min| items.len() < min as usize)
-            || schema.get("maxItems").and_then(Value::as_u64).is_some_and(|max| items.len() > max as usize) { return false; }
-        if schema.get("items").is_some_and(|rule| !items.iter().all(|item| schema_accepts(rule,item))) { return false; }
+        if schema
+            .get("minItems")
+            .and_then(Value::as_u64)
+            .is_some_and(|min| items.len() < min as usize)
+            || schema
+                .get("maxItems")
+                .and_then(Value::as_u64)
+                .is_some_and(|max| items.len() > max as usize)
+        {
+            return false;
+        }
+        if schema
+            .get("items")
+            .is_some_and(|rule| !items.iter().all(|item| schema_accepts(rule, item)))
+        {
+            return false;
+        }
     }
     if let Some(text) = value.as_str() {
-        if schema.get("minLength").and_then(Value::as_u64).is_some_and(|min| text.chars().count() < min as usize) { return false; }
+        if schema
+            .get("minLength")
+            .and_then(Value::as_u64)
+            .is_some_and(|min| text.chars().count() < min as usize)
+        {
+            return false;
+        }
         if let Some(pattern) = schema.get("pattern").and_then(Value::as_str) {
-            assert_eq!(pattern,"\\S","unsupported schema pattern");
-            if text.trim().is_empty() { return false; }
+            assert_eq!(pattern, "\\S", "unsupported schema pattern");
+            if text.trim().is_empty() {
+                return false;
+            }
         }
     }
     true
@@ -1192,66 +1291,105 @@ fn delivered_schema_matches_validator_fixture_corpus_and_optional_null_rules() {
         let phase = phase_kind(&case.phase_kind);
         let schema = roundtable_protocol::result_schema(Some(phase));
         let raw = case.raw_bytes();
-        let Ok(value) = serde_json::from_slice::<Value>(&raw) else { continue; };
-        let structural = schema_accepts(&schema,&value);
-        let accepted = validate_result(&raw,&result_scope(phase,65_536)).is_ok();
-        if accepted { assert!(structural,"schema rejected validator fixture {}",case.name); }
-        if matches!(case.code.as_deref(),Some("claim_count"|"empty_summary"|"abstain_reason"|"abstain_claims"|"ambiguous_target"|"missing_target"|"identity_not_selectable"|"coverage_rejected"|"wrong_phase_kind")) {
-            assert!(!structural,"schema accepted invalid shape {}",case.name);
+        let Ok(value) = serde_json::from_slice::<Value>(&raw) else {
+            continue;
+        };
+        let structural = schema_accepts(&schema, &value);
+        let accepted = validate_result(&raw, &result_scope(phase, 65_536)).is_ok();
+        if accepted {
+            assert!(
+                structural,
+                "schema rejected validator fixture {}",
+                case.name
+            );
+        }
+        if matches!(
+            case.code.as_deref(),
+            Some(
+                "claim_count"
+                    | "empty_summary"
+                    | "abstain_reason"
+                    | "abstain_claims"
+                    | "ambiguous_target"
+                    | "missing_target"
+                    | "identity_not_selectable"
+                    | "coverage_rejected"
+                    | "wrong_phase_kind"
+            )
+        ) {
+            assert!(!structural, "schema accepted invalid shape {}", case.name);
         }
     }
     let schema = roundtable_protocol::result_schema(Some(PhaseKind::Proposal));
-    let scope = scope_with_alias(PhaseKind::Proposal,65_536);
-    let original:Value = serde_json::from_slice(&minimal_proposal()).unwrap();
-    for field in ["responses","open_questions","position_changes","reason"] {
-        let mut omitted = original.clone(); omitted.as_object_mut().unwrap().remove(field);
-        assert!(schema_accepts(&schema,&omitted));
-        assert!(validate_result(&json_bytes(&omitted),&scope).is_ok());
+    let scope = scope_with_alias(PhaseKind::Proposal, 65_536);
+    let original: Value = serde_json::from_slice(&minimal_proposal()).unwrap();
+    for field in ["responses", "open_questions", "position_changes", "reason"] {
+        let mut omitted = original.clone();
+        omitted.as_object_mut().unwrap().remove(field);
+        assert!(schema_accepts(&schema, &omitted));
+        assert!(validate_result(&json_bytes(&omitted), &scope).is_ok());
         omitted[field] = Value::Null;
-        assert!(!schema_accepts(&schema,&omitted),"null {field}");
-        assert!(validate_result(&json_bytes(&omitted),&scope).is_err());
+        assert!(!schema_accepts(&schema, &omitted), "null {field}");
+        assert!(validate_result(&json_bytes(&omitted), &scope).is_err());
     }
     let mut proposal = original;
     // reason is semantically required only for abstention.
     proposal["reason"] = json!("");
-    assert!(validate_result(&json_bytes(&proposal),&scope).is_ok());
-    assert!(schema_accepts(&schema,&proposal));
-    for confidence in ["low","medium","high"] {
+    assert!(validate_result(&json_bytes(&proposal), &scope).is_ok());
+    assert!(schema_accepts(&schema, &proposal));
+    for confidence in ["low", "medium", "high"] {
         proposal["claims"][0]["confidence"] = json!(confidence);
-        for stance in ["support","challenge","clarify","revise"] {
-            for priority in ["normal","critical"] {
+        for stance in ["support", "challenge", "clarify", "revise"] {
+            for priority in ["normal", "critical"] {
                 proposal["responses"] = json!([{"target_claim_alias":"c-pub","stance":stance,"priority":priority,"text":"Response","evidence_aliases":[]}]);
-                assert!(schema_accepts(&schema,&proposal));
-                assert!(validate_result(&json_bytes(&proposal),&scope).is_ok());
-                let mut nulled = proposal.clone(); nulled["responses"][0]["target_response_alias"] = Value::Null;
-                assert!(!schema_accepts(&schema,&nulled));
-                assert!(validate_result(&json_bytes(&nulled),&scope).is_err());
+                assert!(schema_accepts(&schema, &proposal));
+                assert!(validate_result(&json_bytes(&proposal), &scope).is_ok());
+                let mut nulled = proposal.clone();
+                nulled["responses"][0]["target_response_alias"] = Value::Null;
+                assert!(!schema_accepts(&schema, &nulled));
+                assert!(validate_result(&json_bytes(&nulled), &scope).is_err());
             }
         }
     }
     let moderator = roundtable_protocol::result_schema(Some(PhaseKind::Synthesis));
     let mut result = moderator["examples"][0].clone();
     for field in moderator["required"].as_array().unwrap() {
-        let mut omitted = result.clone(); omitted.as_object_mut().unwrap().remove(field.as_str().unwrap());
-        assert!(!schema_accepts(&moderator,&omitted));
-        assert!(validate_result(&json_bytes(&omitted),&result_scope(PhaseKind::Synthesis,65_536)).is_err());
+        let mut omitted = result.clone();
+        omitted
+            .as_object_mut()
+            .unwrap()
+            .remove(field.as_str().unwrap());
+        assert!(!schema_accepts(&moderator, &omitted));
+        assert!(validate_result(
+            &json_bytes(&omitted),
+            &result_scope(PhaseKind::Synthesis, 65_536)
+        )
+        .is_err());
     }
-    for agreement in ["compatible_positions","unresolved"] {
+    for agreement in ["compatible_positions", "unresolved"] {
         result["consensus_items"] = json!([{"text":"An inference","agreement_level":agreement,"aliases":[],"supporter_aliases":[],"support_response_aliases":[],"inference":true}]);
-        assert!(schema_accepts(&moderator,&result));
-        assert!(validate_result(&json_bytes(&result),&result_scope(PhaseKind::Synthesis,65_536)).is_ok());
+        assert!(schema_accepts(&moderator, &result));
+        assert!(validate_result(
+            &json_bytes(&result),
+            &result_scope(PhaseKind::Synthesis, 65_536)
+        )
+        .is_ok());
     }
 }
 
 #[test]
 fn phase_pinned_mcp_prompt_and_examples_share_one_result_contract() {
-    for phase in [PhaseKind::Proposal,PhaseKind::Critique,PhaseKind::Synthesis] {
-        let schema=roundtable_protocol::result_schema(Some(phase));
-        let tool=roundtable_protocol::submit_result_input_schema(phase);
-        assert_eq!(tool["properties"]["result"],schema);
-        let text=roundtable_protocol::seat_schema_example(phase);
-        let example:Value=serde_json::from_str(text.split_once("result: ").unwrap().1).unwrap();
-        assert_eq!(example,schema["examples"][0]);
-        validate_result(&json_bytes(&example),&result_scope(phase,65_536)).unwrap();
+    for phase in [
+        PhaseKind::Proposal,
+        PhaseKind::Critique,
+        PhaseKind::Synthesis,
+    ] {
+        let schema = roundtable_protocol::result_schema(Some(phase));
+        let tool = roundtable_protocol::submit_result_input_schema(phase);
+        assert_eq!(tool["properties"]["result"], schema);
+        let text = roundtable_protocol::seat_schema_example(phase);
+        let example: Value = serde_json::from_str(text.split_once("result: ").unwrap().1).unwrap();
+        assert_eq!(example, schema["examples"][0]);
+        validate_result(&json_bytes(&example), &result_scope(phase, 65_536)).unwrap();
     }
 }

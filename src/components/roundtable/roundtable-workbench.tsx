@@ -17,7 +17,13 @@ import {
   verifyRoundtableReplay,
 } from "@/lib/roundtable/api"
 import type { RoundtableCommandName } from "@/lib/roundtable/api"
-import { prepareRoundtableMutation, isDefinitiveRoundtableRejection, pendingPaidMutation, rememberPendingPaidMutation, clearPendingPaidMutation } from "@/lib/roundtable/mutation"
+import {
+  prepareRoundtableMutation,
+  isDefinitiveRoundtableRejection,
+  pendingPaidMutation,
+  rememberPendingPaidMutation,
+  clearPendingPaidMutation,
+} from "@/lib/roundtable/mutation"
 import type { PendingRoundtableMutation } from "@/lib/roundtable/mutation"
 import type { ModelProviderInfo } from "@/lib/types"
 import type {
@@ -54,7 +60,9 @@ export function RoundtableWorkbench({
   const [loaded, setLoaded] = useState<LoadedRoom | null>(null)
   const [topic, setTopic] = useState("")
   const [selectedSourcePaths, setSelectedSourcePaths] = useState("")
-  const [sourcePreviews, setSourcePreviews] = useState<Record<string, string>>({})
+  const [sourcePreviews, setSourcePreviews] = useState<Record<string, string>>(
+    {}
+  )
   const [roles, setRoles] = useState(["", "", ""])
   const [agents, setAgents] = useState<string[]>([
     "grok",
@@ -83,9 +91,12 @@ export function RoundtableWorkbench({
   const [usage, setUsage] = useState<RoundtableUsage | null>(null)
   const [previews, setPreviews] = useState<Record<string, RoundtableView>>({})
   const mutationScope = JSON.stringify([workspaceId, roomId])
-  const mutation = useRef<PendingRoundtableMutation | null>(pendingPaidMutation(mutationScope))
-  const [uncertainPaid, setUncertainPaid] = useState(() => !!pendingPaidMutation(mutationScope))
-
+  const mutation = useRef<PendingRoundtableMutation | null>(
+    pendingPaidMutation(mutationScope)
+  )
+  const [uncertainPaid, setUncertainPaid] = useState(
+    () => !!pendingPaidMutation(mutationScope)
+  )
 
   const run = useCallback(async (action: () => Promise<void>) => {
     setBusy(true)
@@ -270,15 +281,25 @@ export function RoundtableWorkbench({
         role: role.trim() || `${t("member")} ${ordinal + 1}`,
         provider_ref: `provider:${providerIds[ordinal] || providers[0]?.id || ""}`,
         agent: agents[ordinal] || "codex",
-        ...(original?.participants.find((member) => member.ordinal === ordinal)?.model &&
-        original.participants.find((member) => member.ordinal === ordinal)?.provider_ref ===
-          `provider:${providerIds[ordinal]}`
-          ? { model: original.participants.find((member) => member.ordinal === ordinal)?.model }
+        ...(original?.participants.find((member) => member.ordinal === ordinal)
+          ?.model &&
+        original.participants.find((member) => member.ordinal === ordinal)
+          ?.provider_ref === `provider:${providerIds[ordinal]}`
+          ? {
+              model: original.participants.find(
+                (member) => member.ordinal === ordinal
+              )?.model,
+            }
           : {}),
-        ...(original?.participants.find((member) => member.ordinal === ordinal)?.effort &&
-        original.participants.find((member) => member.ordinal === ordinal)?.provider_ref ===
-          `provider:${providerIds[ordinal]}`
-          ? { effort: original.participants.find((member) => member.ordinal === ordinal)?.effort }
+        ...(original?.participants.find((member) => member.ordinal === ordinal)
+          ?.effort &&
+        original.participants.find((member) => member.ordinal === ordinal)
+          ?.provider_ref === `provider:${providerIds[ordinal]}`
+          ? {
+              effort: original.participants.find(
+                (member) => member.ordinal === ordinal
+              )?.effort,
+            }
           : {}),
       })),
       moderator_ordinal: moderator,
@@ -307,11 +328,30 @@ export function RoundtableWorkbench({
   const config = editingDraft
     ? formConfig()
     : (loaded?.projection.body.replay.config ?? formConfig())
-  const selectedPaths = roomId ? [] : selectedSourcePaths.split(/\r?\n/).map((path) => path.trim()).filter(Boolean)
-  const sourceSelectionValid = selectedPaths.length <= 32 && selectedPaths.every((path) =>
-    path.length <= 4096 && !/^(?:[\\/]|[a-zA-Z]:)/.test(path) &&
-    !path.split(/[\\/]/).includes("..") && !path.includes("\0")
-  ) && new Set(selectedPaths.map((path) => path.replaceAll("\\", "/").split("/").filter((part) => part && part !== ".").join("/"))).size === selectedPaths.length
+  const selectedPaths = roomId
+    ? []
+    : selectedSourcePaths
+        .split(/\r?\n/)
+        .map((path) => path.trim())
+        .filter(Boolean)
+  const sourceSelectionValid =
+    selectedPaths.length <= 32 &&
+    selectedPaths.every(
+      (path) =>
+        path.length <= 4096 &&
+        !/^(?:[\\/]|[a-zA-Z]:)/.test(path) &&
+        !path.split(/[\\/]/).includes("..") &&
+        !path.includes("\0")
+    ) &&
+    new Set(
+      selectedPaths.map((path) =>
+        path
+          .replaceAll("\\", "/")
+          .split("/")
+          .filter((part) => part && part !== ".")
+          .join("/")
+      )
+    ).size === selectedPaths.length
   const configKey = JSON.stringify([
     roomId,
     loaded?.projection.body.revision,
@@ -350,15 +390,21 @@ export function RoundtableWorkbench({
     extra: Record<string, unknown> = {}
   ) =>
     run(async () => {
-      const cancellation = command === "roundtable_pause" || command === "roundtable_stop"
+      const cancellation =
+        command === "roundtable_pause" || command === "roundtable_stop"
       // Cancellation has its own retry body; the unresolved paid body stays in
       // the room registry until its own acknowledgment/rejection is recovered.
-      const previous = cancellation && mutation.current?.command === command
-        ? mutation.current
-        : pendingPaidMutation(mutationScope) ?? mutation.current
+      const previous =
+        cancellation && mutation.current?.command === command
+          ? mutation.current
+          : (pendingPaidMutation(mutationScope) ?? mutation.current)
       mutation.current = prepareRoundtableMutation(
-        previous, command, roomId, loaded?.projection.body.revision,
-        extra, () => crypto.randomUUID()
+        previous,
+        command,
+        roomId,
+        loaded?.projection.body.revision,
+        extra,
+        () => crypto.randomUUID()
       )
       const sent = mutation.current
       rememberPendingPaidMutation(mutationScope, sent)
@@ -366,7 +412,8 @@ export function RoundtableWorkbench({
         room_id: string
         operation_id: string | null
       }>(command, sent.request).catch((error: unknown) => {
-        const current = mutation.current?.request.request_id === sent.request.request_id
+        const current =
+          mutation.current?.request.request_id === sent.request.request_id
         if (isDefinitiveRoundtableRejection(error)) {
           clearPendingPaidMutation(mutationScope, sent.request.request_id)
           if (current) {
@@ -381,7 +428,8 @@ export function RoundtableWorkbench({
         throw error
       })
       clearPendingPaidMutation(mutationScope, sent.request.request_id)
-      if (mutation.current?.request.request_id !== sent.request.request_id) return
+      if (mutation.current?.request.request_id !== sent.request.request_id)
+        return
       mutation.current = pendingPaidMutation(mutationScope)
       setUncertainPaid(!!mutation.current)
       invalidate()
@@ -408,10 +456,16 @@ export function RoundtableWorkbench({
     sourceSelectionValid &&
     (!roomId || !!preflight.confirmed_preflight_id) &&
     preflight.capability?.recipients?.length === config.participants.length &&
-    config.participants.every((participant) => preflight.capability?.recipients.some((recipient) =>
-      recipient.ordinal === participant.ordinal && recipient.provider_ref === participant.provider_ref &&
-      !!recipient.origin && !!recipient.model && !!recipient.agent
-    )) &&
+    config.participants.every((participant) =>
+      preflight.capability?.recipients.some(
+        (recipient) =>
+          recipient.ordinal === participant.ordinal &&
+          recipient.provider_ref === participant.provider_ref &&
+          !!recipient.origin &&
+          !!recipient.model &&
+          !!recipient.agent
+      )
+    ) &&
     confirmed &&
     preflightKey === configKey &&
     !editingDraft
@@ -419,13 +473,13 @@ export function RoundtableWorkbench({
   const status = projection?.body.status
   const buttonClass = "justify-start"
   const editDraft = () => {
-    const members = [...config.participants].sort((left, right) => left.ordinal - right.ordinal)
+    const members = [...config.participants].sort(
+      (left, right) => left.ordinal - right.ordinal
+    )
     setTopic(config.topic)
     setRoles(members.map((member) => member.role))
     setProviderIds(
-      members.map((member) =>
-        member.provider_ref.replace(/^provider:/, "")
-      )
+      members.map((member) => member.provider_ref.replace(/^provider:/, ""))
     )
     setAgents(members.map((member) => member.agent || "codex"))
     setRounds(config.strategy.critique_rounds)
@@ -447,14 +501,21 @@ export function RoundtableWorkbench({
         </p>
       ) : null}
       {!workspaceId ? <p role="alert">{t("workspaceRequired")}</p> : null}
-      {uncertainPaid ? <section aria-label={t("pendingPaidOperation")}>
-        <p role="status">{t("pendingPaidOperation")}</p>
-        <p>{t("pendingReloadBoundary")}</p>
-        <Button disabled={busy} onClick={() => {
-          const pending = pendingPaidMutation(mutationScope)
-          if (pending) void mutate(pending.command, pending.extra)
-        }}>{t("retryPendingOperation")}</Button>
-      </section> : null}
+      {uncertainPaid ? (
+        <section aria-label={t("pendingPaidOperation")}>
+          <p role="status">{t("pendingPaidOperation")}</p>
+          <p>{t("pendingReloadBoundary")}</p>
+          <Button
+            disabled={busy}
+            onClick={() => {
+              const pending = pendingPaidMutation(mutationScope)
+              if (pending) void mutate(pending.command, pending.extra)
+            }}
+          >
+            {t("retryPendingOperation")}
+          </Button>
+        </section>
+      ) : null}
       <div className="grid gap-6 md:grid-cols-[15rem_1fr]">
         <aside className="flex flex-col gap-2">
           <Link
@@ -502,18 +563,29 @@ export function RoundtableWorkbench({
                   }}
                 />
               </label>
-              {!roomId ? <label>
-                {t("selectedSourcePaths")}
-                <Textarea
-                  aria-label={t("selectedSourcePaths")}
-                  value={selectedSourcePaths}
-                  placeholder={t("sourcePathsPlaceholder")}
-                  onChange={(event) => { setSelectedSourcePaths(event.target.value); invalidate() }}
-                />
-                <p className="text-sm text-muted-foreground">{t("sourceSelectionHelp")}</p>
-                <p className="text-sm text-muted-foreground">{t("sourceRetentionNotice")}</p>
-                {!sourceSelectionValid ? <p role="alert">{t("invalidSourceSelection")}</p> : null}
-              </label> : null}
+              {!roomId ? (
+                <label>
+                  {t("selectedSourcePaths")}
+                  <Textarea
+                    aria-label={t("selectedSourcePaths")}
+                    value={selectedSourcePaths}
+                    placeholder={t("sourcePathsPlaceholder")}
+                    onChange={(event) => {
+                      setSelectedSourcePaths(event.target.value)
+                      invalidate()
+                    }}
+                  />
+                  <p className="text-sm text-muted-foreground">
+                    {t("sourceSelectionHelp")}
+                  </p>
+                  <p className="text-sm text-muted-foreground">
+                    {t("sourceRetentionNotice")}
+                  </p>
+                  {!sourceSelectionValid ? (
+                    <p role="alert">{t("invalidSourceSelection")}</p>
+                  ) : null}
+                </label>
+              ) : null}
               {roles.map((role, index) => (
                 <fieldset
                   key={index}
@@ -809,10 +881,18 @@ export function RoundtableWorkbench({
                 sourceManifests={preflight.source_manifests ?? []}
                 selectedPaths={selectedPaths}
                 sourcePreviews={sourcePreviews}
-                onPreview={roomId ? (entry) => void run(async () => {
-                  const text = await loadRoundtableSource(roomId, entry)
-                  setSourcePreviews((previous) => ({ ...previous, [entry.content_hash]: text }))
-                }) : undefined}
+                onPreview={
+                  roomId
+                    ? (entry) =>
+                        void run(async () => {
+                          const text = await loadRoundtableSource(roomId, entry)
+                          setSourcePreviews((previous) => ({
+                            ...previous,
+                            [entry.content_hash]: text,
+                          }))
+                        })
+                    : undefined
+                }
                 tools={preflight.tools}
                 network={preflight.network}
                 writes={preflight.writes}
@@ -832,7 +912,12 @@ export function RoundtableWorkbench({
             {!roomId ? (
               <Button
                 disabled={busy || !canRun}
-                onClick={() => void mutate("roundtable_create", { config, selected_source_paths: selectedPaths })}
+                onClick={() =>
+                  void mutate("roundtable_create", {
+                    config,
+                    selected_source_paths: selectedPaths,
+                  })
+                }
               >
                 {t("create")}
               </Button>
@@ -911,7 +996,8 @@ export function RoundtableWorkbench({
                       onClick={() =>
                         void mutate("roundtable_resume", {
                           recovery_consent: recoveryConsent,
-                          confirmed_preflight_id: preflight?.confirmed_preflight_id ?? undefined,
+                          confirmed_preflight_id:
+                            preflight?.confirmed_preflight_id ?? undefined,
                         })
                       }
                     >
@@ -922,7 +1008,12 @@ export function RoundtableWorkbench({
                 {projection?.body.blocked_reason === "synthesis_failed" ? (
                   <Button
                     disabled={busy || !canRun}
-                    onClick={() => void mutate("roundtable_retry_synthesis", { confirmed_preflight_id: preflight?.confirmed_preflight_id ?? undefined })}
+                    onClick={() =>
+                      void mutate("roundtable_retry_synthesis", {
+                        confirmed_preflight_id:
+                          preflight?.confirmed_preflight_id ?? undefined,
+                      })
+                    }
                   >
                     {t("retry")}
                   </Button>
@@ -988,12 +1079,22 @@ export function RoundtableWorkbench({
                 <option value="restart_current">{t("restart")}</option>
               </select>
               <Button
-                disabled={busy || uncertainPaid || !interjection.trim() || (interjectMode === "restart_current" && !canRun)}
+                disabled={
+                  busy ||
+                  uncertainPaid ||
+                  !interjection.trim() ||
+                  (interjectMode === "restart_current" && !canRun)
+                }
                 onClick={() =>
                   void mutate("roundtable_interject", {
                     text: interjection,
                     mode: interjectMode,
-                    ...(interjectMode === "restart_current" ? { confirmed_preflight_id: preflight?.confirmed_preflight_id ?? undefined } : {}),
+                    ...(interjectMode === "restart_current"
+                      ? {
+                          confirmed_preflight_id:
+                            preflight?.confirmed_preflight_id ?? undefined,
+                        }
+                      : {}),
                   })
                 }
               >

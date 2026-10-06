@@ -968,17 +968,59 @@ fn quorum_waits_for_terminal_slots() {
 
 #[test]
 fn final_coverage_preserves_latest_discussion_and_failed_seat_status() {
-    let failed = member(1, MemberKind::Abstain, PublicationStatus::Failed, "", vec![], vec![]);
-    let absent = member(2, MemberKind::Abstain, PublicationStatus::Absent, "", vec![], vec![]);
+    let failed = member(
+        1,
+        MemberKind::Abstain,
+        PublicationStatus::Failed,
+        "",
+        vec![],
+        vec![],
+    );
+    let absent = member(
+        2,
+        MemberKind::Abstain,
+        PublicationStatus::Absent,
+        "",
+        vec![],
+        vec![],
+    );
     assert_eq!(classify_member(&failed), SlotOutcome::Failed);
     assert_eq!(classify_member(&absent), SlotOutcome::Absent);
-    let mut published = history(vec![phase("discussion", 1, 5, PhaseKind::Critique, vec![
-        accepted(0, MemberKind::Critique, 1, vec![]), failed, absent,
-        member(3, MemberKind::Abstain, PublicationStatus::Abstained, "No position", vec![], vec![]),
-    ])]);
+    let mut published = history(vec![phase(
+        "discussion",
+        1,
+        5,
+        PhaseKind::Critique,
+        vec![
+            accepted(0, MemberKind::Critique, 1, vec![]),
+            failed,
+            absent,
+            member(
+                3,
+                MemberKind::Abstain,
+                PublicationStatus::Abstained,
+                "No position",
+                vec![],
+                vec![],
+            ),
+        ],
+    )]);
     let before = coverage(&published, &[]);
-    assert_eq!((before.valid, before.absent, before.abstained, before.invalid), (1, 2, 1, 0));
-    published.phases.push(phase("synthesis", 2, 9, PhaseKind::Synthesis, vec![]));
+    assert_eq!(
+        (
+            before.valid,
+            before.absent,
+            before.abstained,
+            before.invalid
+        ),
+        (1, 2, 1, 0)
+    );
+    published
+        .phases
+        .push(phase("synthesis", 2, 9, PhaseKind::Synthesis, vec![]));
     let after = coverage(&published, &[]);
-    assert_eq!((after.valid, after.absent, after.abstained, after.invalid), (1, 2, 1, 0));
+    assert_eq!(
+        (after.valid, after.absent, after.abstained, after.invalid),
+        (1, 2, 1, 0)
+    );
 }

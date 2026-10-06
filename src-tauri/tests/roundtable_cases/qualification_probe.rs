@@ -35,7 +35,9 @@ fn check(name: &str) -> ProbeCheck {
         "model_credential_material_in_sandbox"
         | "model_credentials_visible_to_agent"
         | "native_read_boundary" => (None, Some(false)),
-        "actual_binary_match" | "ordered_turn_completion" | "submit_receipt_completion" => (None, Some(true)),
+        "actual_binary_match" | "ordered_turn_completion" | "submit_receipt_completion" => {
+            (None, Some(true))
+        }
         _ => (None, None),
     };
     ProbeCheck {
@@ -772,7 +774,8 @@ fn reap_deletes_grok_auth_and_limits_old_run_directories() {
     // Only explicitly reaped attempts are retention candidates. Existing
     // directories alone do not prove that another participant has stopped.
     for index in 0..keep + 2 {
-        codeg_lib::roundtable::retire_attempt_files_fixture(&root, &format!("run-{index:02}")).expect("retire");
+        codeg_lib::roundtable::retire_attempt_files_fixture(&root, &format!("run-{index:02}"))
+            .expect("retire");
     }
     let auth = runs.join(&newest).join("scratch/rt-home/.grok/auth.json");
     assert!(!auth.exists());
@@ -840,7 +843,6 @@ fn cgroup_delegation_names_the_launcher_child_when_the_root_is_not_a_cgroup() {
     let _ = fs::remove_dir_all(&dir);
 }
 
-
 #[cfg(unix)]
 #[test]
 fn retirement_pruning_preserves_other_unretired_attempts() {
@@ -850,10 +852,16 @@ fn retirement_pruning_preserves_other_unretired_attempts() {
     let active = runs.join("old-active/scratch/rt-home/.grok/auth.json");
     fs::create_dir_all(active.parent().unwrap()).unwrap();
     fs::write(&active, b"controlled-active-auth").unwrap();
-    fs::File::open(runs.join("old-active")).unwrap().set_modified(UNIX_EPOCH).unwrap();
+    fs::File::open(runs.join("old-active"))
+        .unwrap()
+        .set_modified(UNIX_EPOCH)
+        .unwrap();
     // A different attempt may be preparing before its scratch is created.
     fs::create_dir_all(runs.join("old-preparing")).unwrap();
-    fs::File::open(runs.join("old-preparing")).unwrap().set_modified(UNIX_EPOCH).unwrap();
+    fs::File::open(runs.join("old-preparing"))
+        .unwrap()
+        .set_modified(UNIX_EPOCH)
+        .unwrap();
     // A stale retirement marker cannot authorize a newly live scratch tree.
     fs::create_dir_all(runs.join("stale-marker/scratch")).unwrap();
     codeg_lib::roundtable::retire_attempt_files_fixture(&root, "stale-marker").unwrap();
@@ -867,9 +875,19 @@ fn retirement_pruning_preserves_other_unretired_attempts() {
     }
     assert_eq!(fs::read(&active).unwrap(), b"controlled-active-auth");
     assert!(runs.join("old-preparing").is_dir());
-    assert_eq!(fs::read(runs.join("stale-marker/scratch/keep")).unwrap(), b"new active data");
-    let retired = fs::read_dir(&runs).unwrap().flatten().filter(|entry| entry.file_name().to_string_lossy().starts_with("retired-")).count();
-    assert_eq!(retired, keep, "retention bounds only proven retired attempts");
+    assert_eq!(
+        fs::read(runs.join("stale-marker/scratch/keep")).unwrap(),
+        b"new active data"
+    );
+    let retired = fs::read_dir(&runs)
+        .unwrap()
+        .flatten()
+        .filter(|entry| entry.file_name().to_string_lossy().starts_with("retired-"))
+        .count();
+    assert_eq!(
+        retired, keep,
+        "retention bounds only proven retired attempts"
+    );
     fs::remove_dir_all(root).unwrap();
 }
 
@@ -877,10 +895,16 @@ fn retirement_pruning_preserves_other_unretired_attempts() {
 fn ordinary_acp_completion_without_a_submit_receipt_cannot_certify() {
     let data = scratch();
     let mut facts = passing("grok", "debian-13");
-    facts.checks.retain(|check| check.name != "submit_receipt_completion");
+    facts
+        .checks
+        .retain(|check| check.name != "submit_receipt_completion");
     let outcome = assemble_probe_report_for_test(&data, facts);
-    assert!(!outcome.qualification_issued, "pong is not a submit receipt");
-    let report: serde_json::Value = serde_json::from_slice(&fs::read(outcome.report_path).unwrap()).unwrap();
+    assert!(
+        !outcome.qualification_issued,
+        "pong is not a submit receipt"
+    );
+    let report: serde_json::Value =
+        serde_json::from_slice(&fs::read(outcome.report_path).unwrap()).unwrap();
     assert_eq!(report["normal_completion_after_submit_receipt"], false);
     let _ = fs::remove_dir_all(data);
 }
@@ -894,8 +918,12 @@ fn a_later_failed_observation_dominates_an_earlier_pass() {
     failure.flag = Some(true);
     facts.checks.push(failure);
     let outcome = assemble_probe_report_for_test(&data, facts);
-    assert!(!outcome.qualification_issued, "conflicting evidence cannot pass");
-    let report: serde_json::Value = serde_json::from_slice(&fs::read(outcome.report_path).unwrap()).unwrap();
+    assert!(
+        !outcome.qualification_issued,
+        "conflicting evidence cannot pass"
+    );
+    let report: serde_json::Value =
+        serde_json::from_slice(&fs::read(outcome.report_path).unwrap()).unwrap();
     assert_eq!(report["model_credential_material_in_sandbox"], true);
     assert_eq!(report["credentials_unreachable"], "failed");
     let _ = fs::remove_dir_all(data);
@@ -905,13 +933,20 @@ fn a_later_failed_observation_dominates_an_earlier_pass() {
 fn mounted_auth_material_cannot_be_reported_as_absent() {
     let data = scratch();
     let mut facts = passing("grok", "debian-13");
-    facts.oci.as_mut().unwrap().auth_mounts.push(serde_json::from_value(serde_json::json!({
-        "source": data.join("fake-auth.json"),
-        "destination": "/rt-home/.grok/auth.json",
-    })).unwrap());
+    facts.oci.as_mut().unwrap().auth_mounts.push(
+        serde_json::from_value(serde_json::json!({
+            "source": data.join("fake-auth.json"),
+            "destination": "/rt-home/.grok/auth.json",
+        }))
+        .unwrap(),
+    );
     let outcome = assemble_probe_report_for_test(&data, facts);
-    assert!(!outcome.qualification_issued, "read-only binds and writable copies both expose bytes");
-    let report: serde_json::Value = serde_json::from_slice(&fs::read(outcome.report_path).unwrap()).unwrap();
+    assert!(
+        !outcome.qualification_issued,
+        "read-only binds and writable copies both expose bytes"
+    );
+    let report: serde_json::Value =
+        serde_json::from_slice(&fs::read(outcome.report_path).unwrap()).unwrap();
     assert_eq!(report["model_credential_material_in_sandbox"], true);
     assert_eq!(report["credentials_unreachable"], "failed");
     let _ = fs::remove_dir_all(data);
@@ -921,19 +956,25 @@ fn mounted_auth_material_cannot_be_reported_as_absent() {
 fn qualification_source_semantics_are_bound_into_certificates() {
     let data = scratch();
     let outcome = assemble_probe_report_for_test(&data, passing("grok", "debian-13"));
-    let report: serde_json::Value = serde_json::from_slice(&fs::read(outcome.report_path).unwrap()).unwrap();
-    for name in ["qualification_linux", "qualification_probe", "qualification_profiles", "service_failure_classifier"] {
+    let report: serde_json::Value =
+        serde_json::from_slice(&fs::read(outcome.report_path).unwrap()).unwrap();
+    for name in [
+        "qualification_linux",
+        "qualification_probe",
+        "qualification_profiles",
+        "service_failure_classifier",
+    ] {
         assert!(!report["shared_core_hashes"][name].is_null(), "{name}");
     }
     let _ = fs::remove_dir_all(data);
 }
 
-
 #[test]
 fn qualification_core_key_set_covers_admission_completion_cleanup_and_privacy() {
     let data = scratch();
     let outcome = assemble_probe_report_for_test(&data, passing("grok", "debian-13"));
-    let report: serde_json::Value = serde_json::from_slice(&fs::read(outcome.report_path).unwrap()).unwrap();
+    let report: serde_json::Value =
+        serde_json::from_slice(&fs::read(outcome.report_path).unwrap()).unwrap();
     let hashes = report["shared_core_hashes"].as_object().unwrap();
     let actual: std::collections::BTreeSet<_> = hashes.keys().map(String::as_str).collect();
     let expected: std::collections::BTreeSet<_> = [
@@ -1005,16 +1046,40 @@ fn qualification_core_key_set_covers_admission_completion_cleanup_and_privacy() 
         "usage",
         "validator",
         "web_event_bridge",
-    ].into_iter().collect();
-    assert_eq!(actual, expected, "security-relevant implementation sources must remain certificate-bound");
+    ]
+    .into_iter()
+    .collect();
+    assert_eq!(
+        actual, expected,
+        "security-relevant implementation sources must remain certificate-bound"
+    );
     for (key, bytes) in [
-        ("mcp", include_bytes!("../../src/roundtable/mcp.rs").as_slice()),
-        ("resources", include_bytes!("../../src/roundtable/resources.rs").as_slice()),
-        ("acp_connection", include_bytes!("../../src/acp/connection.rs").as_slice()),
-        ("internal_sessions", include_bytes!("../../src/auto_title/internal_sessions.rs").as_slice()),
-        ("protocol_completion", include_bytes!("../../roundtable-protocol/src/completion.rs").as_slice()),
+        (
+            "mcp",
+            include_bytes!("../../src/roundtable/mcp.rs").as_slice(),
+        ),
+        (
+            "resources",
+            include_bytes!("../../src/roundtable/resources.rs").as_slice(),
+        ),
+        (
+            "acp_connection",
+            include_bytes!("../../src/acp/connection.rs").as_slice(),
+        ),
+        (
+            "internal_sessions",
+            include_bytes!("../../src/auto_title/internal_sessions.rs").as_slice(),
+        ),
+        (
+            "protocol_completion",
+            include_bytes!("../../roundtable-protocol/src/completion.rs").as_slice(),
+        ),
     ] {
-        assert_eq!(hashes[key], serde_json::json!(Hash256::sha256(bytes)), "{key}");
+        assert_eq!(
+            hashes[key],
+            serde_json::json!(Hash256::sha256(bytes)),
+            "{key}"
+        );
     }
     let _ = fs::remove_dir_all(data);
 }
@@ -1028,10 +1093,13 @@ fn successful_delete_with_leftover_state_is_not_cleanup_proof() {
 fn unmeasured_credential_visibility_is_unknown_rather_than_a_synthetic_fact() {
     let data = scratch();
     let mut facts = passing("grok", "debian-13");
-    facts.checks.retain(|check| check.name != "model_credentials_visible_to_agent");
+    facts
+        .checks
+        .retain(|check| check.name != "model_credentials_visible_to_agent");
     let outcome = assemble_probe_report_for_test(&data, facts);
     assert!(!outcome.qualification_issued);
-    let report: serde_json::Value = serde_json::from_slice(&fs::read(outcome.report_path).unwrap()).unwrap();
+    let report: serde_json::Value =
+        serde_json::from_slice(&fs::read(outcome.report_path).unwrap()).unwrap();
     assert!(report["model_credentials_visible_to_agent"].is_null());
     assert_eq!(report["credentials_unreachable"], "not_tested");
     let _ = fs::remove_dir_all(data);
@@ -1048,9 +1116,14 @@ fn probe_cleanup_cannot_leave_a_slirp_helper_that_ignores_term() {
     let mut helper = std::process::Command::new("sh")
         .env("CODEG_ROUNDTABLE_SLIRP_ROLE", "slirp")
         .env("CODEG_ROUNDTABLE_SLIRP_OWNER", "cq-acp-review")
-        .env("CODEG_ROUNDTABLE_SLIRP_ROOT", &runtime_root).arg("-c")
-        .arg(format!("trap '' TERM; touch '{}'; exec sleep 30", ready.display()))
-        .spawn().unwrap();
+        .env("CODEG_ROUNDTABLE_SLIRP_ROOT", &runtime_root)
+        .arg("-c")
+        .arg(format!(
+            "trap '' TERM; touch '{}'; exec sleep 30",
+            ready.display()
+        ))
+        .spawn()
+        .unwrap();
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
     while !ready.exists() && std::time::Instant::now() < deadline {
         std::thread::sleep(std::time::Duration::from_millis(5));
@@ -1060,15 +1133,26 @@ fn probe_cleanup_cannot_leave_a_slirp_helper_that_ignores_term() {
     fs::write(&crun, "#!/bin/sh\nexit 0\n").unwrap();
     fs::set_permissions(&crun, fs::Permissions::from_mode(0o700)).unwrap();
     let request = ProbeRequest {
-        data_dir: root.path().to_path_buf(), agent: "grok".into(), rootfs: root.path().join("rootfs"),
-        crun, cgroup_root: root.path().join("fake-cgroup"), runtime_root,
-        provider_bindings: root.path().join("bindings.json"), home: root.path().join("home"), profile_id: None,
+        data_dir: root.path().to_path_buf(),
+        agent: "grok".into(),
+        rootfs: root.path().join("rootfs"),
+        crun,
+        cgroup_root: root.path().join("fake-cgroup"),
+        runtime_root,
+        provider_bindings: root.path().join("bindings.json"),
+        home: root.path().join("home"),
+        profile_id: None,
     };
-    assert!(codeg_lib::roundtable::probe_acp_exit_cleans_container(&request, "cq-acp-review").is_err());
+    assert!(
+        codeg_lib::roundtable::probe_acp_exit_cleans_container(&request, "cq-acp-review").is_err()
+    );
     let ended = helper.try_wait().unwrap().is_some();
     let _ = helper.kill();
     let _ = helper.wait();
-    assert!(ended, "cleanup reported completion while the network helper survived");
+    assert!(
+        ended,
+        "cleanup reported completion while the network helper survived"
+    );
 }
 
 #[cfg(target_os = "linux")]
@@ -1078,17 +1162,28 @@ fn stale_slirp_pidfile_cannot_signal_an_unrelated_process() {
     let root = tempfile::tempdir().unwrap();
     let runtime_root = root.path().join("runtime");
     fs::create_dir_all(runtime_root.join("slirp-pids")).unwrap();
-    let mut unrelated = std::process::Command::new("sleep").arg("30").spawn().unwrap();
+    let mut unrelated = std::process::Command::new("sleep")
+        .arg("30")
+        .spawn()
+        .unwrap();
     write_owned_helper_pin(&runtime_root, "cq-acp-stale", unrelated.id());
     let crun = root.path().join("fake-crun");
     fs::write(&crun, "#!/bin/sh\nexit 0\n").unwrap();
     fs::set_permissions(&crun, fs::Permissions::from_mode(0o700)).unwrap();
     let request = ProbeRequest {
-        data_dir: root.path().to_path_buf(), agent: "grok".into(), rootfs: root.path().join("rootfs"),
-        crun, cgroup_root: root.path().join("fake-cgroup"), runtime_root,
-        provider_bindings: root.path().join("bindings.json"), home: root.path().join("home"), profile_id: None,
+        data_dir: root.path().to_path_buf(),
+        agent: "grok".into(),
+        rootfs: root.path().join("rootfs"),
+        crun,
+        cgroup_root: root.path().join("fake-cgroup"),
+        runtime_root,
+        provider_bindings: root.path().join("bindings.json"),
+        home: root.path().join("home"),
+        profile_id: None,
     };
-    assert!(codeg_lib::roundtable::probe_acp_exit_cleans_container(&request, "cq-acp-stale").is_err());
+    assert!(
+        codeg_lib::roundtable::probe_acp_exit_cleans_container(&request, "cq-acp-stale").is_err()
+    );
     std::thread::sleep(std::time::Duration::from_millis(30));
     let survived = unrelated.try_wait().unwrap().is_none();
     let _ = unrelated.kill();
@@ -1100,7 +1195,13 @@ fn stale_slirp_pidfile_cannot_signal_an_unrelated_process() {
 fn write_owned_helper_pin(runtime_root: &Path, id: &str, pid: u32) {
     use std::os::unix::fs::PermissionsExt;
     let stat = fs::read_to_string(format!("/proc/{pid}/stat")).unwrap();
-    let start = stat.rsplit_once(") ").unwrap().1.split_whitespace().nth(19).unwrap();
+    let start = stat
+        .rsplit_once(") ")
+        .unwrap()
+        .1
+        .split_whitespace()
+        .nth(19)
+        .unwrap();
     let path = runtime_root.join("slirp-pids").join(format!("{id}.pid"));
     fs::write(&path, format!("slirp {pid} {start}\n")).unwrap();
     fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();

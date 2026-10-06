@@ -255,18 +255,39 @@ it("loads selected frozen source pages and rejects a mismatched content hash", a
   vi.stubGlobal("crypto", webcrypto)
   const text = "frozen source\n"
   const hash = await roundtableTextHash(text)
-  const entry = { path: "src/a.ts", size: text.length, content_hash: hash, text_admissible: true,
-    object: { object_id: hash, content_hash: hash, total_bytes: text.length } }
+  const entry = {
+    path: "src/a.ts",
+    size: text.length,
+    content_hash: hash,
+    text_admissible: true,
+    object: { object_id: hash, content_hash: hash, total_bytes: text.length },
+  }
   call.mockImplementation(async (_command, args) => ({
-    object_ref: args.request.read.object.object_ref, offset: 0, text, cursor: null,
+    object_ref: args.request.read.object.object_ref,
+    offset: 0,
+    text,
+    cursor: null,
   }))
   expect(await loadRoundtableSource("room", entry)).toBe(text)
   call.mockImplementation(async (_command, args) => ({
-    object_ref: args.request.read.object.object_ref, offset: 0, text: "changed source", cursor: null,
+    object_ref: args.request.read.object.object_ref,
+    offset: 0,
+    text: "changed source",
+    cursor: null,
   }))
-  await expect(loadRoundtableSource("room", entry)).rejects.toThrow("source_hash")
+  await expect(loadRoundtableSource("room", entry)).rejects.toThrow(
+    "source_hash"
+  )
 })
 
 it("explains provider credentials separately from application login", () => {
-  expect(roundtableError({ code: "capability_unqualified", message: "The capability is not qualified.", details: { reason: "provider_credential_missing" } })).toBe("Provider credentials are missing. Update the provider settings, then retry.")
+  expect(
+    roundtableError({
+      code: "capability_unqualified",
+      message: "The capability is not qualified.",
+      details: { reason: "provider_credential_missing" },
+    })
+  ).toBe(
+    "Provider credentials are missing. Update the provider settings, then retry."
+  )
 })

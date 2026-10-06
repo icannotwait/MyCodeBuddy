@@ -22,8 +22,8 @@ use roundtable_protocol::{
     canonical_bytes, AliasVisibility, AttemptId, BindingId, CandidateReceipt, CandidateState,
     DecisionKind, Epoch, ErrorCode, EvidenceId, EvidenceRef, Fence, FinishKind, Hash256, MonoMs,
     ObjectKind, ObjectRefV1, PhaseId, PhaseKind, PrincipalId, QualificationStatus,
-    QualifiedContextProfile, ResultScope, Revision, RoomId, RtResult, SafeInt, ServiceOwner, SpeakerId,
-    SubmissionId, VisibleAliases,
+    QualifiedContextProfile, ResultScope, Revision, RoomId, RtResult, SafeInt, ServiceOwner,
+    SpeakerId, SubmissionId, VisibleAliases,
 };
 use serde_json::{json, Value};
 
@@ -681,12 +681,9 @@ impl PausedDurableStore {
     }
 
     async fn wait_until_entered(&self) {
-        tokio::time::timeout(
-            std::time::Duration::from_secs(10),
-            self.entered.notified(),
-        )
-        .await
-        .expect("admitted storage operation did not reach the pause");
+        tokio::time::timeout(std::time::Duration::from_secs(10), self.entered.notified())
+            .await
+            .expect("admitted storage operation did not reach the pause");
     }
 }
 
@@ -731,7 +728,9 @@ impl ToolStore for PausedDurableStore {
         raw: &[u8],
         scope: &ResultScope,
     ) -> RtResult<()> {
-        self.inner.note_field_errors(submission_id, raw, scope).await
+        self.inner
+            .note_field_errors(submission_id, raw, scope)
+            .await
     }
 }
 
@@ -792,7 +791,9 @@ async fn socket_receipt_survives_disconnect_after_durable_commit() {
     assert_eq!(receipt.state, CandidateState::Staged);
     assert_eq!(receipt.payload_hash, Hash256::sha256(&raw));
     assert_eq!(
-        row.try_get::<String>("", "candidate_ref").unwrap().as_bytes(),
+        row.try_get::<String>("", "candidate_ref")
+            .unwrap()
+            .as_bytes(),
         raw.as_slice()
     );
 
@@ -895,7 +896,9 @@ async fn socket_stop_waits_for_the_actual_admitted_handler() {
         late.request(json!({"jsonrpc": "2.0", "id": 3, "method": "ping"})),
     )
     .await;
-    assert!(eof.expect("shutdown must close the existing socket").is_err());
+    assert!(eof
+        .expect("shutdown must close the existing socket")
+        .is_err());
 }
 
 #[tokio::test]
@@ -1615,7 +1618,6 @@ async fn concurrent_invalid_third_fourth_close_once() {
     assert_ne!(after.attempt_state, "accepted");
 }
 
-
 #[tokio::test]
 async fn lifecycle_real_tool_admission_obeys_room_prepaid_expiry() {
     let harness = open_harness(15).await;
@@ -1624,6 +1626,19 @@ async fn lifecycle_real_tool_admission_obeys_room_prepaid_expiry() {
     authority.advance_to(MonoMs(999));
     assert!(authority.admit_tool(&harness.token).await.is_ok());
     authority.advance_to(MonoMs(1000));
-    assert_eq!(authority.admit_tool(&harness.token).await.err().unwrap().details.reason.as_deref(), Some("prepaid_lease_expired"));
-    assert!(!lease.renew_until(1000, 2000), "late checkpoint cannot resurrect expired permission");
+    assert_eq!(
+        authority
+            .admit_tool(&harness.token)
+            .await
+            .err()
+            .unwrap()
+            .details
+            .reason
+            .as_deref(),
+        Some("prepaid_lease_expired")
+    );
+    assert!(
+        !lease.renew_until(1000, 2000),
+        "late checkpoint cannot resurrect expired permission"
+    );
 }

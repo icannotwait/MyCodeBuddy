@@ -2220,6 +2220,7 @@ mod completion_contract_tests {
         }
         assert!(drive_prompt_frames_fixture(&[json!({"id":5,"error":{"code":-32000,"data":{"httpStatus":429}}})]).await.is_err());
     }
+}
 
 #[cfg(any(test, feature = "test-utils"))]
 pub fn session_params_fixture(agent: crate::models::AgentType, servers: &Value) -> Value {

@@ -66,7 +66,12 @@ async fn ready(
 }
 
 async fn ready_with_pool(
-    salt: u32, seats: &[(&str, i64, &str)], expected: i64, quorum: i64, start_ms: u64, connections: u32,
+    salt: u32,
+    seats: &[(&str, i64, &str)],
+    expected: i64,
+    quorum: i64,
+    start_ms: u64,
+    connections: u32,
 ) -> Ready {
     let (dir, conn) = open_pool(connections).await;
     migrate_roundtable(&conn).await.expect("migrate");
@@ -1016,10 +1021,29 @@ async fn storage_fix_recovery_publishes_frozen_set_once_without_new_attempts() {
         .unwrap();
     let original = scalar_text(&ready.conn, "SELECT body_json FROM rt_closing_sets").await;
     ready.store.recover_durable(2).await.unwrap();
-    assert_eq!(scalar_text(&ready.conn, "SELECT status FROM rt_rooms").await, "paused");
-    assert_eq!(scalar_text(&ready.conn, "SELECT blocked_reason FROM rt_rooms").await, "recovery_required");
-    assert_eq!(ready.store.projection(&ready.room, None).await.unwrap().body.status, RoomState::Paused);
-    ready.store.validate_resume_for_test(&ready.room, &resume_config()).await.expect("explicit resume may schedule the next phase");
+    assert_eq!(
+        scalar_text(&ready.conn, "SELECT status FROM rt_rooms").await,
+        "paused"
+    );
+    assert_eq!(
+        scalar_text(&ready.conn, "SELECT blocked_reason FROM rt_rooms").await,
+        "recovery_required"
+    );
+    assert_eq!(
+        ready
+            .store
+            .projection(&ready.room, None)
+            .await
+            .unwrap()
+            .body
+            .status,
+        RoomState::Paused
+    );
+    ready
+        .store
+        .validate_resume_for_test(&ready.room, &resume_config())
+        .await
+        .expect("explicit resume may schedule the next phase");
     assert_eq!(scalar_i64(&ready.conn, "SELECT COUNT(*) FROM rt_rooms WHERE status IN ('running','pausing','stopping','recovering')").await, 0);
     assert_eq!(
         scalar_text(&ready.conn, "SELECT status FROM rt_phases").await,
@@ -1795,49 +1819,141 @@ async fn storage_fix_control_epoch_can_settle_its_own_proven_unused_slice() {
 #[tokio::test]
 async fn lifecycle_two_accepts_wait_for_sqlite_writer_without_snapshot_upgrade() {
     use sea_orm::TransactionTrait;
-    let ready = ready_with_pool(11000, &[("member", 0, "validating"), ("member", 1, "validating")], 2, 2, 10, 5).await;
+    let ready = ready_with_pool(
+        11000,
+        &[("member", 0, "validating"), ("member", 1, "validating")],
+        2,
+        2,
+        10,
+        5,
+    )
+    .await;
     let writer = ready.conn.begin().await.unwrap();
-    writer.execute_unprepared("UPDATE rt_rooms SET remaining_active_ms=remaining_active_ms").await.unwrap();
+    writer
+        .execute_unprepared("UPDATE rt_rooms SET remaining_active_ms=remaining_active_ms")
+        .await
+        .unwrap();
     let barrier = Arc::new(tokio::sync::Barrier::new(3));
     let mut tasks = Vec::new();
     for seat in &ready.seats {
         let store = ready.store.clone();
         let accept = input(&ready, seat, 1000);
         let barrier = barrier.clone();
-        tasks.push(tokio::spawn(async move { barrier.wait().await; store.accept(accept).await }));
+        tasks.push(tokio::spawn(async move {
+            barrier.wait().await;
+            store.accept(accept).await
+        }));
     }
     barrier.wait().await;
     // Both consumers start while another WAL writer owns the lock. Deferred
     // read-first transactions establish stale snapshots and fail to upgrade.
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     writer.commit().await.unwrap();
-    for task in tasks { task.await.unwrap().expect("both accepted without model retry"); }
-    assert_eq!(scalar_i64(&ready.conn, "SELECT COUNT(*) FROM rt_attempts WHERE state='accepted'").await, 2);
-    assert_eq!(scalar_i64(&ready.conn, "SELECT COUNT(*) FROM rt_messages").await, 2);
+    for task in tasks {
+        task.await
+            .unwrap()
+            .expect("both accepted without model retry");
+    }
+    assert_eq!(
+        scalar_i64(
+            &ready.conn,
+            "SELECT COUNT(*) FROM rt_attempts WHERE state='accepted'"
+        )
+        .await,
+        2
+    );
+    assert_eq!(
+        scalar_i64(&ready.conn, "SELECT COUNT(*) FROM rt_messages").await,
+        2
+    );
 }
 
 #[tokio::test]
 async fn lifecycle_controls_preserve_lease_through_real_cleanup() {
     use codeg_lib::roundtable::{ActiveBudgetLease, ControlRequest};
-    use roundtable_protocol::{ActorContext, ClientIdentity, ClientKind, ControlKind, OperatorScope};
-    for kind in [ControlKind::Pause, ControlKind::Stop, ControlKind::RestartCurrent] {
-    let ready = ready(11200, &[("member", 0, "active")], 1, 1, 10).await;
-    let mut config = resume_config();
-    config.budgets.room_budget = roundtable_protocol::DurationMs(1_800_000);
-    ready.conn.execute(Statement::from_sql_and_values(DatabaseBackend::Sqlite, "UPDATE rt_rooms SET config_ref=?", vec![serde_json::to_string(&config).unwrap().into()])).await.unwrap();
-    let _lease = ActiveBudgetLease::begin(ready.store.clone(), ready.room, Epoch(1), Epoch(1)).await.unwrap();
-    ready.clock.set(260).unwrap();
-    let actor = ActorContext::from_trusted_entry(typed(11203), OperatorScope::SingleOperator, ClientIdentity { kind: ClientKind::Web, session_ref: "lease-control".into() });
-    let request = ControlRequest { room_id: ready.room, request_id: typed(11290), expected_revision: Revision(1), kind, input: json!({"text":"Reconsider the current phase"}), force_latest: false };
-    let ack = ready.store.request_control(&actor, &request).await.unwrap();
-    assert_eq!(scalar_i64(&ready.conn, "SELECT COUNT(*) FROM rt_active_time_leases").await, 1);
-    assert!(ready.store.advance_durable_control(&actor, ready.room, ack.operation_id.unwrap(), false).await.is_err());
-    ready.clock.set(610).unwrap();
-    ready.store.advance_durable_control(&actor, ready.room, ack.operation_id.unwrap(), true).await.unwrap();
-    assert_eq!(scalar_i64(&ready.conn, "SELECT remaining_active_ms FROM rt_rooms").await, 1_799_400);
-    assert_eq!(scalar_i64(&ready.conn, "SELECT COUNT(*) FROM rt_active_time_leases").await, 0);
-    assert_eq!(scalar_i64(&ready.conn, "SELECT MAX(sampled_active_ms) FROM rt_measurements WHERE kind='active'").await, 600);
-    assert_eq!(ready.store.projection(&ready.room, None).await.unwrap().body.sampled_active_ms.0, 600);
+    use roundtable_protocol::{
+        ActorContext, ClientIdentity, ClientKind, ControlKind, OperatorScope,
+    };
+    for kind in [
+        ControlKind::Pause,
+        ControlKind::Stop,
+        ControlKind::RestartCurrent,
+    ] {
+        let ready = ready(11200, &[("member", 0, "active")], 1, 1, 10).await;
+        let mut config = resume_config();
+        config.budgets.room_budget = roundtable_protocol::DurationMs(1_800_000);
+        ready
+            .conn
+            .execute(Statement::from_sql_and_values(
+                DatabaseBackend::Sqlite,
+                "UPDATE rt_rooms SET config_ref=?",
+                vec![serde_json::to_string(&config).unwrap().into()],
+            ))
+            .await
+            .unwrap();
+        let _lease = ActiveBudgetLease::begin(ready.store.clone(), ready.room, Epoch(1), Epoch(1))
+            .await
+            .unwrap();
+        ready.clock.set(260).unwrap();
+        let actor = ActorContext::from_trusted_entry(
+            typed(11203),
+            OperatorScope::SingleOperator,
+            ClientIdentity {
+                kind: ClientKind::Web,
+                session_ref: "lease-control".into(),
+            },
+        );
+        let request = ControlRequest {
+            room_id: ready.room,
+            request_id: typed(11290),
+            expected_revision: Revision(1),
+            kind,
+            input: json!({"text":"Reconsider the current phase"}),
+            force_latest: false,
+        };
+        let ack = ready.store.request_control(&actor, &request).await.unwrap();
+        assert_eq!(
+            scalar_i64(&ready.conn, "SELECT COUNT(*) FROM rt_active_time_leases").await,
+            1
+        );
+        assert!(ready
+            .store
+            .advance_durable_control(&actor, ready.room, ack.operation_id.unwrap(), false)
+            .await
+            .is_err());
+        ready.clock.set(610).unwrap();
+        ready
+            .store
+            .advance_durable_control(&actor, ready.room, ack.operation_id.unwrap(), true)
+            .await
+            .unwrap();
+        assert_eq!(
+            scalar_i64(&ready.conn, "SELECT remaining_active_ms FROM rt_rooms").await,
+            1_799_400
+        );
+        assert_eq!(
+            scalar_i64(&ready.conn, "SELECT COUNT(*) FROM rt_active_time_leases").await,
+            0
+        );
+        assert_eq!(
+            scalar_i64(
+                &ready.conn,
+                "SELECT MAX(sampled_active_ms) FROM rt_measurements WHERE kind='active'"
+            )
+            .await,
+            600
+        );
+        assert_eq!(
+            ready
+                .store
+                .projection(&ready.room, None)
+                .await
+                .unwrap()
+                .body
+                .sampled_active_ms
+                .0,
+            600
+        );
     }
 }
 
@@ -1845,33 +1961,75 @@ async fn lifecycle_controls_preserve_lease_through_real_cleanup() {
 async fn lifecycle_phase_budget_expiry_preserves_paid_room_cleanup_time() {
     use codeg_lib::roundtable::ActiveBudgetLease;
     let ready = ready(11400, &[("member", 0, "active")], 1, 1, 10).await;
-    ready.conn.execute_unprepared("UPDATE rt_phases SET remaining_ms=250").await.unwrap();
-    let mut lease = ActiveBudgetLease::begin(ready.store.clone(), ready.room, Epoch(1), Epoch(1)).await.unwrap();
+    ready
+        .conn
+        .execute_unprepared("UPDATE rt_phases SET remaining_ms=250")
+        .await
+        .unwrap();
+    let mut lease = ActiveBudgetLease::begin(ready.store.clone(), ready.room, Epoch(1), Epoch(1))
+        .await
+        .unwrap();
     ready.clock.set(260).unwrap();
     let ledger = lease.checkpoint().await.unwrap();
     assert_eq!(ledger.remaining_phase_ms.0, 0);
-    assert!(ledger.prepaid_until.0 > ledger.last_sample_mono.0, "phase expiry is a close signal, not room exhaustion");
+    assert!(
+        ledger.prepaid_until.0 > ledger.last_sample_mono.0,
+        "phase expiry is a close signal, not room exhaustion"
+    );
     ready.clock.set(360).unwrap();
     lease.finish().await.unwrap();
-    assert_eq!(scalar_i64(&ready.conn, "SELECT remaining_ms FROM rt_phases").await, 0);
-    assert_eq!(scalar_i64(&ready.conn, "SELECT remaining_active_ms FROM rt_rooms").await, 1_799_650);
+    assert_eq!(
+        scalar_i64(&ready.conn, "SELECT remaining_ms FROM rt_phases").await,
+        0
+    );
+    assert_eq!(
+        scalar_i64(&ready.conn, "SELECT remaining_active_ms FROM rt_rooms").await,
+        1_799_650
+    );
 }
-
 
 #[tokio::test]
 async fn lifecycle_legacy_prepaid_upgrade_preserves_charge_and_phase_reservation() {
     use codeg_lib::roundtable::ActiveBudgetLease;
     let ready = ready(11600, &[("member", 0, "active")], 1, 1, 10).await;
-    let mut lease = ActiveBudgetLease::begin(ready.store.clone(), ready.room, Epoch(1), Epoch(1)).await.unwrap();
-    ready.conn.execute_unprepared("ALTER TABLE rt_active_time_leases DROP COLUMN phase_prepaid_ms").await.unwrap();
+    let mut lease = ActiveBudgetLease::begin(ready.store.clone(), ready.room, Epoch(1), Epoch(1))
+        .await
+        .unwrap();
+    ready
+        .conn
+        .execute_unprepared("ALTER TABLE rt_active_time_leases DROP COLUMN phase_prepaid_ms")
+        .await
+        .unwrap();
     migrate_roundtable(&ready.conn).await.unwrap();
     migrate_roundtable(&ready.conn).await.unwrap();
-    assert_eq!(scalar_i64(&ready.conn, "SELECT prepaid_ms FROM rt_active_time_leases").await, 1000);
-    assert_eq!(scalar_i64(&ready.conn, "SELECT phase_prepaid_ms FROM rt_active_time_leases").await, 1000);
-    assert_eq!(scalar_i64(&ready.conn, "SELECT remaining_active_ms FROM rt_rooms").await, 1_799_000);
-    assert_eq!(scalar_i64(&ready.conn, "SELECT remaining_ms FROM rt_phases").await, 1_799_000);
+    assert_eq!(
+        scalar_i64(&ready.conn, "SELECT prepaid_ms FROM rt_active_time_leases").await,
+        1000
+    );
+    assert_eq!(
+        scalar_i64(
+            &ready.conn,
+            "SELECT phase_prepaid_ms FROM rt_active_time_leases"
+        )
+        .await,
+        1000
+    );
+    assert_eq!(
+        scalar_i64(&ready.conn, "SELECT remaining_active_ms FROM rt_rooms").await,
+        1_799_000
+    );
+    assert_eq!(
+        scalar_i64(&ready.conn, "SELECT remaining_ms FROM rt_phases").await,
+        1_799_000
+    );
     ready.clock.set(260).unwrap();
     lease.finish().await.unwrap();
-    assert_eq!(scalar_i64(&ready.conn, "SELECT remaining_active_ms FROM rt_rooms").await, 1_799_750);
-    assert_eq!(scalar_i64(&ready.conn, "SELECT remaining_ms FROM rt_phases").await, 1_799_750);
+    assert_eq!(
+        scalar_i64(&ready.conn, "SELECT remaining_active_ms FROM rt_rooms").await,
+        1_799_750
+    );
+    assert_eq!(
+        scalar_i64(&ready.conn, "SELECT remaining_ms FROM rt_phases").await,
+        1_799_750
+    );
 }

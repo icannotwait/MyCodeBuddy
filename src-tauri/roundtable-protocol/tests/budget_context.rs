@@ -1100,34 +1100,106 @@ fn checkpoint_budget_fits_event_and_storage_limits() {
 
 #[test]
 fn scoped_delivery_identifies_same_role_seat_and_only_its_required_aliases() {
-    use roundtable_protocol::{MandatoryTargetV1, RequiredTarget, ResultScope, SpeakerOrdinal, VisibleAliases, PublishedHistory};
+    use roundtable_protocol::{
+        MandatoryTargetV1, PublishedHistory, RequiredTarget, ResultScope, SpeakerOrdinal,
+        VisibleAliases,
+    };
     let mut phase = phase_snapshot();
     phase.kind = PhaseKind::Critique;
-    let first = SpeakerOrdinal { speaker_id:support::id("first"), ordinal:0 };
-    let second = SpeakerOrdinal { speaker_id:support::id("second"), ordinal:1 };
+    let first = SpeakerOrdinal {
+        speaker_id: support::id("first"),
+        ordinal: 0,
+    };
+    let second = SpeakerOrdinal {
+        speaker_id: support::id("second"),
+        ordinal: 1,
+    };
     let claim = support::id("target-claim");
     phase.mandatory_targets = vec![
-        MandatoryTargetV1 { speaker_id:first.speaker_id, claim_id:claim, response_id:None },
-        MandatoryTargetV1 { speaker_id:second.speaker_id, claim_id:support::id("other-claim"), response_id:None },
+        MandatoryTargetV1 {
+            speaker_id: first.speaker_id,
+            claim_id: claim,
+            response_id: None,
+        },
+        MandatoryTargetV1 {
+            speaker_id: second.speaker_id,
+            claim_id: support::id("other-claim"),
+            response_id: None,
+        },
     ];
-    let scope = ResultScope { phase_kind:PhaseKind::Critique, speaker_id:first.speaker_id, aliases:VisibleAliases::default(), mandatory_targets:vec![RequiredTarget { claim_alias:"c0".into(),claim_id:claim,response_alias:None,response_id:None }], published:PublishedHistory::default(),quota_bytes:8192 };
+    let scope = ResultScope {
+        phase_kind: PhaseKind::Critique,
+        speaker_id: first.speaker_id,
+        aliases: VisibleAliases::default(),
+        mandatory_targets: vec![RequiredTarget {
+            claim_alias: "c0".into(),
+            claim_id: claim,
+            response_alias: None,
+            response_id: None,
+        }],
+        published: PublishedHistory::default(),
+        quota_bytes: 8192,
+    };
     let mut role = role_snapshot();
     role.schema_text = roundtable_protocol::result_schema(Some(PhaseKind::Critique)).to_string();
-    let bytes = DeliveryEncoder::prompt_for_speaker(&phase,&role,&support::id("binding"),&first,&scope,&serde_json::json!({"speaker_id":second.speaker_id})).unwrap();
-    let prompt:serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-    assert_eq!(prompt["metadata"]["speaker_id"],first.speaker_id.to_string());
-    assert_eq!(prompt["metadata"]["speaker_ordinal"],0);
-    assert_eq!(prompt["metadata"]["mandatory_targets"].as_array().unwrap().len(),1);
-    assert_eq!(prompt["metadata"]["mandatory_targets"][0]["claim_alias"],"c0");
-    let manifest = DeliveryEncoder::encode_prompt(&phase,&role,&support::id("binding"),&FakeTokens { capacity:Some(10_000_000) },&profile(10_000_000),&bytes).unwrap();
-    assert_eq!(manifest.prompt_hash,Hash256::sha256(&bytes));
-    assert!(DeliveryEncoder::prompt_for_speaker(&phase,&role,&support::id("binding"),&second,&scope,&serde_json::json!({})).is_err());
+    let bytes = DeliveryEncoder::prompt_for_speaker(
+        &phase,
+        &role,
+        &support::id("binding"),
+        &first,
+        &scope,
+        &serde_json::json!({"speaker_id":second.speaker_id}),
+    )
+    .unwrap();
+    let prompt: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(
+        prompt["metadata"]["speaker_id"],
+        first.speaker_id.to_string()
+    );
+    assert_eq!(prompt["metadata"]["speaker_ordinal"], 0);
+    assert_eq!(
+        prompt["metadata"]["mandatory_targets"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(
+        prompt["metadata"]["mandatory_targets"][0]["claim_alias"],
+        "c0"
+    );
+    let manifest = DeliveryEncoder::encode_prompt(
+        &phase,
+        &role,
+        &support::id("binding"),
+        &FakeTokens {
+            capacity: Some(10_000_000),
+        },
+        &profile(10_000_000),
+        &bytes,
+    )
+    .unwrap();
+    assert_eq!(manifest.prompt_hash, Hash256::sha256(&bytes));
+    assert!(DeliveryEncoder::prompt_for_speaker(
+        &phase,
+        &role,
+        &support::id("binding"),
+        &second,
+        &scope,
+        &serde_json::json!({})
+    )
+    .is_err());
 }
 
 #[test]
 fn untrusted_plan_quotas_cannot_request_unbounded_token_witness_allocation() {
-    let tokens = FakeTokens { capacity:Some(u64::MAX) };
-    assert_eq!(tokens.upper_bound_for_length(1 << 40).unwrap_err().code, ErrorCode::CapacityUnknown);
+    let tokens = FakeTokens {
+        capacity: Some(u64::MAX),
+    };
+    assert_eq!(
+        tokens.upper_bound_for_length(1 << 40).unwrap_err().code,
+        ErrorCode::CapacityUnknown
+    );
 }
 
 #[test]
@@ -1140,17 +1212,25 @@ fn interjection_encoding_has_a_separate_shared_ceiling_without_truncation() {
         let input = serde_json::json!([{"input_id":id,"text":text}]);
         let before = input.clone();
         assert!(validate_interjection_context(&input, quota).is_ok());
-        assert_eq!(input,before);
+        assert_eq!(input, before);
     }
     let tiny = serde_json::json!({"input_id":id,"text":"x"});
     let entry_bytes = canonical_bytes(&tiny).unwrap().len() as u64 + 1;
     let count = (interjection_context_limit(quota).unwrap() - 1) / entry_bytes;
-    let boundary = serde_json::Value::Array(vec![tiny.clone();count as usize]);
-    assert!(validate_interjection_context(&boundary,quota).is_ok());
-    let too_many = serde_json::Value::Array(vec![tiny;count as usize + 1]);
-    assert!((count + 1) < quota,"raw text quota alone still permits this input");
-    assert_eq!(validate_interjection_context(&too_many,quota).unwrap_err().code,ErrorCode::ContextTooLarge);
-    assert_eq!(too_many.as_array().unwrap().len(),count as usize + 1);
+    let boundary = serde_json::Value::Array(vec![tiny.clone(); count as usize]);
+    assert!(validate_interjection_context(&boundary, quota).is_ok());
+    let too_many = serde_json::Value::Array(vec![tiny; count as usize + 1]);
+    assert!(
+        (count + 1) < quota,
+        "raw text quota alone still permits this input"
+    );
+    assert_eq!(
+        validate_interjection_context(&too_many, quota)
+            .unwrap_err()
+            .code,
+        ErrorCode::ContextTooLarge
+    );
+    assert_eq!(too_many.as_array().unwrap().len(), count as usize + 1);
 }
 
 #[test]
@@ -1160,15 +1240,49 @@ fn shared_delivery_admission_rejects_small_profile_before_encoding_and_keeps_def
     phase.tool_quota.per_attempt_bytes = SafeInt(32_768);
     let role = role_snapshot();
     let binding = support::id("reserve-binding");
-    let prompt = DeliveryEncoder::prompt_utf8(&phase,&role,&binding).unwrap();
+    let prompt = DeliveryEncoder::prompt_utf8(&phase, &role, &binding).unwrap();
     let mut small = profile(204_800);
     small.max_request_body_bytes = 196_608;
-    let tokens = FakeTokens {capacity:Some(204_800)};
-    assert_eq!(6*(8_192+32_768)+small.generation_reserve_tokens,253_952);
-    assert_eq!(roundtable_protocol::admit_qualified_delivery(tokens.upper_bound(&prompt).unwrap(),8_192,32_768,&tokens,&small).unwrap_err().code,ErrorCode::ContextTooLarge);
-    assert_eq!(DeliveryEncoder::encode_prompt(&phase,&role,&binding,&tokens,&small,&prompt).unwrap_err().code,ErrorCode::ContextTooLarge);
+    let tokens = FakeTokens {
+        capacity: Some(204_800),
+    };
+    assert_eq!(
+        6 * (8_192 + 32_768) + small.generation_reserve_tokens,
+        253_952
+    );
+    assert_eq!(
+        roundtable_protocol::admit_qualified_delivery(
+            tokens.upper_bound(&prompt).unwrap(),
+            8_192,
+            32_768,
+            &tokens,
+            &small
+        )
+        .unwrap_err()
+        .code,
+        ErrorCode::ContextTooLarge
+    );
+    assert_eq!(
+        DeliveryEncoder::encode_prompt(&phase, &role, &binding, &tokens, &small, &prompt)
+            .unwrap_err()
+            .code,
+        ErrorCode::ContextTooLarge
+    );
     let normal = profile(2_000_000);
-    let normal_tokens = FakeTokens {capacity:Some(2_000_000)};
-    assert_eq!(roundtable_protocol::admit_qualified_delivery(normal_tokens.upper_bound(&prompt).unwrap(),8_192,32_768,&normal_tokens,&normal).unwrap(),1_056_768);
-    DeliveryEncoder::encode_prompt(&phase,&role,&binding,&normal_tokens,&normal,&prompt).unwrap();
+    let normal_tokens = FakeTokens {
+        capacity: Some(2_000_000),
+    };
+    assert_eq!(
+        roundtable_protocol::admit_qualified_delivery(
+            normal_tokens.upper_bound(&prompt).unwrap(),
+            8_192,
+            32_768,
+            &normal_tokens,
+            &normal
+        )
+        .unwrap(),
+        1_056_768
+    );
+    DeliveryEncoder::encode_prompt(&phase, &role, &binding, &normal_tokens, &normal, &prompt)
+        .unwrap();
 }

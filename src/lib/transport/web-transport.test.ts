@@ -924,9 +924,19 @@ describe("WebTransport completion context capture/replay", () => {
 describe("roundtable provider authentication", () => {
   it("retains a healthy application session on provider capability failure", async () => {
     const { t, ws } = connectReady()
-    const error = { code: "capability_unqualified", message: "Provider credentials are missing", details: { reason: "provider_credential_missing" } }
-    fetchMock.mockResolvedValue({ status: 422, ok: false, json: async () => error })
-    await expect(t.call("roundtable_resume", { request: {} })).rejects.toEqual(error)
+    const error = {
+      code: "capability_unqualified",
+      message: "Provider credentials are missing",
+      details: { reason: "provider_credential_missing" },
+    }
+    fetchMock.mockResolvedValue({
+      status: 422,
+      ok: false,
+      json: async () => error,
+    })
+    await expect(t.call("roundtable_resume", { request: {} })).rejects.toEqual(
+      error
+    )
     expect(t.getConnectionSnapshot()).toBe("connected")
     expect(localStorage.getItem("codeg_token")).toBe("tok")
     expect(ws.readyState).toBe(MockWebSocket.OPEN)
