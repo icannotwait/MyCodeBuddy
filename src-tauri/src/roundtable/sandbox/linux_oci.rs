@@ -2945,9 +2945,7 @@ mod control_tests {
                 Some("slirp_proc_namespace_domain")
             );
         }
-        assert!(
-            super::validate_proc_namespace_status("NStgid: 0\nNSpid: 0\n", 0, 0).is_err()
-        );
+        assert!(super::validate_proc_namespace_status("NStgid: 0\nNSpid: 0\n", 0, 0).is_err());
         let oversized = format!("{valid}{}", "x".repeat(4097));
         assert!(super::validate_proc_namespace_status(&oversized, 500, 501).is_err());
     }
