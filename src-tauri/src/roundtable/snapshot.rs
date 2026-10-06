@@ -4,9 +4,9 @@
 //! delivery prompt is `DeliveryEncoder`; this module does not encode a second
 //! prompt. `base_commit` is stored and is not part of `manifest_hash`.
 
-use std::fs::{self, File};
 #[cfg(windows)]
 use std::fs::OpenOptions;
+use std::fs::{self, File};
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
@@ -393,7 +393,16 @@ pub(crate) async fn capture_snapshot_validated(
     let planned = plan_selection(&selection, &limits)?;
     let lease = objects.reserve_estimated(limits.estimated_bytes)?;
     let mut created = Vec::new();
-    match read_and_store(&selection, &limits, objects, &planned, &mut created, &validate).await {
+    match read_and_store(
+        &selection,
+        &limits,
+        objects,
+        &planned,
+        &mut created,
+        &validate,
+    )
+    .await
+    {
         Ok(manifest) => {
             lease.commit_as_used(manifest.accounted_bytes());
             Ok(manifest)
@@ -563,7 +572,8 @@ async fn read_and_store(
         // Bound the read itself, including growth after the metadata sample.
         let remaining = limits.max_total_bytes.saturating_sub(total);
         let maximum = limits.max_file_bytes.min(remaining);
-        let (bytes, meta) = read_stable(handle, &path, maximum, selection.mutate_while_open.as_ref())?;
+        let (bytes, meta) =
+            read_stable(handle, &path, maximum, selection.mutate_while_open.as_ref())?;
         let mode = file_mode(&meta);
         let size = u64::try_from(bytes.len())
             .map_err(|_| rt_error(ErrorCode::InvalidArgument, "overflow"))?;
@@ -585,7 +595,9 @@ async fn read_and_store(
     for (file, mode, bytes, size) in &copied {
         let content_hash = Hash256::sha256(bytes);
         let object = ObjectRef {
-            object_id: content_hash.to_hex(), content_hash, total_bytes: *size,
+            object_id: content_hash.to_hex(),
+            content_hash,
+            total_bytes: *size,
         };
         let (encoding, line_offsets, text_admissible) = match line_start_offsets(bytes) {
             Some(offsets) => (SnapshotEncoding::Utf8, offsets, true),
@@ -680,19 +692,27 @@ fn open_source(root: &Path, canonical: &str) -> RtResult<File> {
     use std::os::unix::ffi::OsStrExt;
     let path = root.join(canonical);
     let start = if path.is_absolute() { "/" } else { "." };
-    let mut directory = File::open(start)
-        .map_err(|_| rt_error(ErrorCode::StorageUnavailable, "source_root"))?;
-    let parts: Vec<_> = path.components().filter_map(|part| match part {
-        Component::Normal(name) => Some(Ok(name)),
-        Component::ParentDir => Some(Err(rt_error(ErrorCode::InvalidArgument, "parent_escape"))),
-        Component::RootDir | Component::CurDir => None,
-        _ => Some(Err(rt_error(ErrorCode::InvalidArgument, "invalid_path"))),
-    }).collect::<RtResult<_>>()?;
+    let mut directory =
+        File::open(start).map_err(|_| rt_error(ErrorCode::StorageUnavailable, "source_root"))?;
+    let parts: Vec<_> = path
+        .components()
+        .filter_map(|part| match part {
+            Component::Normal(name) => Some(Ok(name)),
+            Component::ParentDir => {
+                Some(Err(rt_error(ErrorCode::InvalidArgument, "parent_escape")))
+            }
+            Component::RootDir | Component::CurDir => None,
+            _ => Some(Err(rt_error(ErrorCode::InvalidArgument, "invalid_path"))),
+        })
+        .collect::<RtResult<_>>()?;
     for (index, part) in parts.iter().enumerate() {
         let name = CString::new(part.as_bytes())
             .map_err(|_| rt_error(ErrorCode::InvalidArgument, "invalid_path"))?;
         let last = index + 1 == parts.len();
-        let flags = libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK
+        let flags = libc::O_RDONLY
+            | libc::O_CLOEXEC
+            | libc::O_NOFOLLOW
+            | libc::O_NONBLOCK
             | if last { 0 } else { libc::O_DIRECTORY };
         // SAFETY: directory and name are live handles/strings; no ownership is
         // transferred unless openat returns a fresh descriptor.
@@ -734,15 +754,25 @@ fn open_source(root: &Path, canonical: &str) -> RtResult<File> {
     let mut parents = Vec::new();
     for part in path.components() {
         match part {
-            Component::Prefix(_) | Component::RootDir => { cursor.push(part.as_os_str()); continue; }
+            Component::Prefix(_) | Component::RootDir => {
+                cursor.push(part.as_os_str());
+                continue;
+            }
             Component::CurDir => continue,
-            Component::ParentDir => return Err(rt_error(ErrorCode::InvalidArgument, "parent_escape")),
+            Component::ParentDir => {
+                return Err(rt_error(ErrorCode::InvalidArgument, "parent_escape"))
+            }
             Component::Normal(_) => cursor.push(part.as_os_str()),
         }
-        let file = OpenOptions::new().read(true).share_mode(0x1 | 0x2)
-            .custom_flags(OPEN_REPARSE_POINT | BACKUP_SEMANTICS).open(&cursor)
+        let file = OpenOptions::new()
+            .read(true)
+            .share_mode(0x1 | 0x2)
+            .custom_flags(OPEN_REPARSE_POINT | BACKUP_SEMANTICS)
+            .open(&cursor)
             .map_err(|_| rt_error(ErrorCode::InvalidArgument, "source_missing"))?;
-        let meta = file.metadata().map_err(|_| rt_error(ErrorCode::StorageUnavailable, "source_stat"))?;
+        let meta = file
+            .metadata()
+            .map_err(|_| rt_error(ErrorCode::StorageUnavailable, "source_stat"))?;
         if meta.file_attributes() & REPARSE_POINT != 0 {
             return Err(rt_error(ErrorCode::InvalidArgument, "symlink"));
         }
@@ -759,7 +789,9 @@ fn open_source(root: &Path, canonical: &str) -> RtResult<File> {
 }
 
 fn ensure_regular_handle(file: &File) -> RtResult<fs::Metadata> {
-    let meta = file.metadata().map_err(|_| rt_error(ErrorCode::StorageUnavailable, "source_stat"))?;
+    let meta = file
+        .metadata()
+        .map_err(|_| rt_error(ErrorCode::StorageUnavailable, "source_stat"))?;
     if !meta.is_file() {
         return Err(rt_error(ErrorCode::InvalidArgument, "not_regular"));
     }
@@ -769,17 +801,26 @@ fn ensure_regular_handle(file: &File) -> RtResult<fs::Metadata> {
     Ok(meta)
 }
 
-fn read_stable(mut file: File, path: &Path, maximum: u64, hook: Option<&SnapshotReadHook>) -> RtResult<(Vec<u8>, fs::Metadata)> {
+fn read_stable(
+    mut file: File,
+    path: &Path,
+    maximum: u64,
+    hook: Option<&SnapshotReadHook>,
+) -> RtResult<(Vec<u8>, fs::Metadata)> {
     for _ in 0..MAX_SNAPSHOT_READS {
         let before = ensure_regular_handle(&file)?;
         if before.len() > maximum {
             return Err(rt_error(ErrorCode::InvalidArgument, "source_limit"));
         }
-        if let Some(hook) = hook { (hook.as_ref())(path); }
+        if let Some(hook) = hook {
+            (hook.as_ref())(path);
+        }
         file.seek(SeekFrom::Start(0))
             .map_err(|_| rt_error(ErrorCode::StorageUnavailable, "source_read"))?;
         let mut bytes = Vec::new();
-        (&mut file).take(maximum.saturating_add(1)).read_to_end(&mut bytes)
+        (&mut file)
+            .take(maximum.saturating_add(1))
+            .read_to_end(&mut bytes)
             .map_err(|_| rt_error(ErrorCode::StorageUnavailable, "source_read"))?;
         let read_len = u64::try_from(bytes.len())
             .map_err(|_| rt_error(ErrorCode::InvalidArgument, "overflow"))?;
@@ -787,7 +828,9 @@ fn read_stable(mut file: File, path: &Path, maximum: u64, hook: Option<&Snapshot
             return Err(rt_error(ErrorCode::InvalidArgument, "source_limit"));
         }
         let after = ensure_regular_handle(&file)?;
-        if sample_stable(&before, &after, read_len) { return Ok((bytes, after)); }
+        if sample_stable(&before, &after, read_len) {
+            return Ok((bytes, after));
+        }
     }
     Err(RtError::from_reason(InternalReason::SnapshotUnstable))
 }
@@ -801,8 +844,10 @@ fn sample_stable(before: &fs::Metadata, after: &fs::Metadata, read_len: u64) -> 
     #[cfg(unix)]
     let identity_ok = {
         use std::os::unix::fs::MetadataExt;
-        before.dev() == after.dev() && before.ino() == after.ino()
-            && before.ctime() == after.ctime() && before.ctime_nsec() == after.ctime_nsec()
+        before.dev() == after.dev()
+            && before.ino() == after.ino()
+            && before.ctime() == after.ctime()
+            && before.ctime_nsec() == after.ctime_nsec()
     };
     #[cfg(windows)]
     let identity_ok = true; // Both samples come from the same pinned file handle.
@@ -815,12 +860,18 @@ fn link_count(file: &File, meta: &fs::Metadata) -> RtResult<u64> {
         use std::mem::MaybeUninit;
         use std::os::windows::io::AsRawHandle;
         use windows_sys::Win32::Foundation::HANDLE;
-        use windows_sys::Win32::Storage::FileSystem::{GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION};
+        use windows_sys::Win32::Storage::FileSystem::{
+            GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION,
+        };
         let _ = meta;
         let mut info = MaybeUninit::<BY_HANDLE_FILE_INFORMATION>::zeroed();
         // SAFETY: file owns a live handle and info is writable.
-        let result = unsafe { GetFileInformationByHandle(file.as_raw_handle() as HANDLE, info.as_mut_ptr()) };
-        if result == 0 { return Err(rt_error(ErrorCode::StorageUnavailable, "source_stat")); }
+        let result = unsafe {
+            GetFileInformationByHandle(file.as_raw_handle() as HANDLE, info.as_mut_ptr())
+        };
+        if result == 0 {
+            return Err(rt_error(ErrorCode::StorageUnavailable, "source_stat"));
+        }
         // SAFETY: a successful call initialized the structure.
         Ok(u64::from(unsafe { info.assume_init() }.nNumberOfLinks))
     }

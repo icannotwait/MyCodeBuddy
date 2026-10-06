@@ -72,6 +72,29 @@ Run the repository's existing CI against the final repair commit, including:
 
 Focused regression commands and implementation limits are recorded in the [build report](2026-10-06-roundtable-build-fixes.md), [product report](2026-10-06-roundtable-product-fixes.md), [lifecycle report](2026-10-06-roundtable-lifecycle-fixes.md), [contract report](2026-10-06-roundtable-contract-fixes.md), and [qualification/isolation report](2026-10-06-roundtable-isolation-fixes.md). The [qualification completion memo](2026-10-06-roundtable-qualification-completion.md) separates component regressions from unimplemented live guarantees.
 
+## Executable CI checkpoint
+
+The initial state above records implementation and local checks. The existing
+[CI run for `1606ca3`](https://github.com/icannotwait/MyCodeBuddy/actions/runs/37426722278)
+subsequently established the following results:
+
+- Frontend job passed: lint, 688 Vitest files with 11,192 tests passed and 15
+  skipped, all 103 release-script tests, and the static export build
+- Protocol formatting and all 45 protocol tests passed; Clippy reported a test
+  module before later implementation items
+- Runtime gate executed: 114 passed, 4 failed, 1 live-host test ignored
+- Linux server library executed: 7,752 passed, 6 failed, 1 ignored
+- Windows desktop compiled its test targets; Clippy identified three private
+  helpers with eight arguments and test-module ordering issues
+
+The next repair batch addresses formatting and module ordering, bundles related
+private arguments, corrects malformed-input/control-completion fixtures, and
+adds faithful helper fixtures plus bounded disappearance handling and precise
+cleanup diagnostics. The broader helper cleanup failures remain unproven until
+the next CI run identifies or clears the early failure. No test result from
+this checkpoint is a pass for a later commit, and the ignored host test does
+not qualify a live adapter.
+
 ## Capability boundaries retained
 
 The false-success and unsafe-admission defects are addressed by fail-closed guards, but the corresponding live capabilities in F02, F03 and F14 remain unimplemented. They are not closed feature-delivery items. Rerunning the current host probe cannot produce a usable certificate or supply the missing measurements.

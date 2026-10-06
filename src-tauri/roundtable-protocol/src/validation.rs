@@ -1248,29 +1248,6 @@ fn decision(
     }
 }
 
-#[cfg(test)]
-mod schema_parity_tests {
-    use super::*;
-
-    #[test]
-    fn model_schema_property_names_match_validator_allowlists() {
-        for (kind, allowed) in [
-            (PhaseKind::Proposal, MEMBER_FIELDS),
-            (PhaseKind::Synthesis, MODERATOR_FIELDS),
-        ] {
-            let schema = result_schema(Some(kind));
-            let actual: BTreeSet<_> = schema["properties"]
-                .as_object()
-                .unwrap()
-                .keys()
-                .map(String::as_str)
-                .collect();
-            let expected: BTreeSet<_> = allowed.iter().copied().collect();
-            assert_eq!(actual, expected);
-        }
-    }
-}
-
 fn shape_only(errors: &[FieldError]) -> bool {
     !errors.is_empty() && errors.iter().all(|error| error.code.is_schema_shape())
 }
@@ -1617,4 +1594,27 @@ pub fn seat_schema_example(phase: PhaseKind) -> &'static str {
         PhaseKind::Critique => 1,
         PhaseKind::Synthesis => 2,
     }]
+}
+
+#[cfg(test)]
+mod schema_parity_tests {
+    use super::*;
+
+    #[test]
+    fn model_schema_property_names_match_validator_allowlists() {
+        for (kind, allowed) in [
+            (PhaseKind::Proposal, MEMBER_FIELDS),
+            (PhaseKind::Synthesis, MODERATOR_FIELDS),
+        ] {
+            let schema = result_schema(Some(kind));
+            let actual: BTreeSet<_> = schema["properties"]
+                .as_object()
+                .unwrap()
+                .keys()
+                .map(String::as_str)
+                .collect();
+            let expected: BTreeSet<_> = allowed.iter().copied().collect();
+            assert_eq!(actual, expected);
+        }
+    }
 }

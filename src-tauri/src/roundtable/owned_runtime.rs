@@ -69,13 +69,22 @@ pub trait RoundtableTurnExecutor: Send + Sync {
     async fn capability(&self, config: &RoundtableConfigV1) -> RtResult<RuntimeCapability>;
     fn token_bound(&self) -> &(dyn TokenBound + Send + Sync);
     /// A qualified adapter may have a different context limit for each seat.
-    fn context_profile(&self, _participant: &ParticipantV1) -> Option<QualifiedContextProfile> { None }
+    fn context_profile(&self, _participant: &ParticipantV1) -> Option<QualifiedContextProfile> {
+        None
+    }
     /// Byte-unit proof for the complete request envelope outside prompt text.
     /// Missing qualification is unknown, never an assumed zero-byte envelope.
-    fn request_envelope_bound_bytes(&self, _participant: &ParticipantV1) -> RtResult<Option<u64>> { Ok(None) }
+    fn request_envelope_bound_bytes(&self, _participant: &ParticipantV1) -> RtResult<Option<u64>> {
+        Ok(None)
+    }
     /// Hash of the verified evidence/report. Test executors may use an explicit
     /// fake encoder without claiming a production qualification report.
-    fn request_envelope_proof_hash(&self, _participant: &ParticipantV1) -> RtResult<Option<Hash256>> { Ok(None) }
+    fn request_envelope_proof_hash(
+        &self,
+        _participant: &ParticipantV1,
+    ) -> RtResult<Option<Hash256>> {
+        Ok(None)
+    }
     async fn execute_turn(&self, request: RoundtableTurnRequest)
         -> RtResult<RoundtableTurnOutcome>;
     async fn cancel_and_reap(&self, identity: RuntimeIdentity) -> RtResult<CleanupProof>;
@@ -99,13 +108,26 @@ impl LeasedExecutor {
         })
     }
     async fn cleanup_room(&self, room: RoomId) -> RtResult<()> {
-        let incarnations: Vec<_> = self.rooms.lock().expect("runtime rooms").iter()
-            .filter_map(|(id, owner)| (*owner == room).then_some(*id)).collect();
+        let incarnations: Vec<_> = self
+            .rooms
+            .lock()
+            .expect("runtime rooms")
+            .iter()
+            .filter_map(|(id, owner)| (*owner == room).then_some(*id))
+            .collect();
         // One failed proof must not prevent revoking/reaping every other owner.
         let mut error = None;
-        for result in futures::future::join_all(incarnations.into_iter().map(|incarnation|
-            self.cancel_and_reap(RuntimeIdentity { incarnation, pid: 0 }))).await {
-            if let Err(failure) = result { error = Some(failure); }
+        for result in futures::future::join_all(incarnations.into_iter().map(|incarnation| {
+            self.cancel_and_reap(RuntimeIdentity {
+                incarnation,
+                pid: 0,
+            })
+        }))
+        .await
+        {
+            if let Err(failure) = result {
+                error = Some(failure);
+            }
         }
         error.map_or(Ok(()), Err)
     }
@@ -137,7 +159,10 @@ impl LeasedExecutor {
             }
         }
         proofs.insert(proof.process.incarnation, proof.clone());
-        self.rooms.lock().expect("runtime rooms").remove(&proof.process.incarnation);
+        self.rooms
+            .lock()
+            .expect("runtime rooms")
+            .remove(&proof.process.incarnation);
         debug_assert!(proofs.len() <= 1024);
         Ok(())
     }
@@ -156,7 +181,10 @@ impl RoundtableTurnExecutor for LeasedExecutor {
     fn request_envelope_bound_bytes(&self, participant: &ParticipantV1) -> RtResult<Option<u64>> {
         self.inner.request_envelope_bound_bytes(participant)
     }
-    fn request_envelope_proof_hash(&self, participant: &ParticipantV1) -> RtResult<Option<Hash256>> {
+    fn request_envelope_proof_hash(
+        &self,
+        participant: &ParticipantV1,
+    ) -> RtResult<Option<Hash256>> {
         self.inner.request_envelope_proof_hash(participant)
     }
     async fn execute_turn(
@@ -164,8 +192,15 @@ impl RoundtableTurnExecutor for LeasedExecutor {
         request: RoundtableTurnRequest,
     ) -> RtResult<RoundtableTurnOutcome> {
         let incarnation = request.fence.incarnation;
-        if request.execution_lease.as_ref().is_some_and(|lease| lease.admit_enqueue(request.store.clock_sample().0) == 0) {
-            return Err(rt_error(ErrorCode::InsufficientBudget, "prepaid_lease_expired"));
+        if request
+            .execution_lease
+            .as_ref()
+            .is_some_and(|lease| lease.admit_enqueue(request.store.clock_sample().0) == 0)
+        {
+            return Err(rt_error(
+                ErrorCode::InsufficientBudget,
+                "prepaid_lease_expired",
+            ));
         }
         let lease = self
             .allocator
@@ -174,7 +209,10 @@ impl RoundtableTurnExecutor for LeasedExecutor {
             .lock()
             .expect("runtime leases")
             .insert(incarnation, lease);
-        self.rooms.lock().expect("runtime rooms").insert(incarnation, request.room_id);
+        self.rooms
+            .lock()
+            .expect("runtime rooms")
+            .insert(incarnation, request.room_id);
         let result = self.inner.execute_turn(request).await;
         if let Ok(outcome) = &result {
             if outcome.cleanup.process.incarnation != incarnation {
@@ -256,9 +294,20 @@ impl ParticipantRuntime for OwnedParticipantRuntime {
         let executor = self.executor.as_ref().ok_or_else(|| self.unavailable())?;
         let capability = executor.capability(config).await?;
         validate_plan_context(config, executor.as_ref(), &capability)?;
-        let profiles: Vec<_> = config.participants.iter().map(|participant| {
-            Ok((participant.ordinal, executor.context_profile(participant).unwrap_or_else(|| capability.profile.clone()), executor.request_envelope_bound_bytes(participant)?, executor.request_envelope_proof_hash(participant)?))
-        }).collect::<RtResult<Vec<_>>>()?;
+        let profiles: Vec<_> = config
+            .participants
+            .iter()
+            .map(|participant| {
+                Ok((
+                    participant.ordinal,
+                    executor
+                        .context_profile(participant)
+                        .unwrap_or_else(|| capability.profile.clone()),
+                    executor.request_envelope_bound_bytes(participant)?,
+                    executor.request_envelope_proof_hash(participant)?,
+                ))
+            })
+            .collect::<RtResult<Vec<_>>>()?;
         Ok(
             json!({"recipients":capability.recipients,"qualification_keys":capability.qualification_keys,
             "policy_hash":capability.policy_hash,"limits_hash":canonical_hash(&profiles)?}),
@@ -298,8 +347,14 @@ impl ParticipantRuntime for OwnedParticipantRuntime {
         )
         .await?;
         let now = store.clock_sample().0;
-        let permission = Arc::new(super::resources::ExecutionLease::issue(now, lease.prepaid_until().saturating_sub(now)));
-        self.permissions.lock().expect("room permissions").insert(room, permission.clone());
+        let permission = Arc::new(super::resources::ExecutionLease::issue(
+            now,
+            lease.prepaid_until().saturating_sub(now),
+        ));
+        self.permissions
+            .lock()
+            .expect("room permissions")
+            .insert(room, permission.clone());
         let _revoke_on_drop = RevokeOnDrop(permission.clone());
         let result = {
             let executor: Arc<dyn RoundtableTurnExecutor> = executor.clone();
@@ -308,15 +363,35 @@ impl ParticipantRuntime for OwnedParticipantRuntime {
             // transaction that a checkpoint is waiting to acquire.
             let monitor = async {
                 loop {
-                    let remaining = permission.prepaid_until().saturating_sub(store.clock_sample().0);
-                    if remaining == 0 { return Err(rt_error(ErrorCode::InsufficientBudget, "prepaid_lease_expired")); }
+                    let remaining = permission
+                        .prepaid_until()
+                        .saturating_sub(store.clock_sample().0);
+                    if remaining == 0 {
+                        return Err(rt_error(
+                            ErrorCode::InsufficientBudget,
+                            "prepaid_lease_expired",
+                        ));
+                    }
                     tokio::time::sleep(std::time::Duration::from_millis(remaining.min(250))).await;
-                    let remaining = permission.prepaid_until().saturating_sub(store.clock_sample().0);
-                    let sampled = tokio::time::timeout(std::time::Duration::from_millis(remaining), lease.checkpoint()).await;
+                    let remaining = permission
+                        .prepaid_until()
+                        .saturating_sub(store.clock_sample().0);
+                    let sampled = tokio::time::timeout(
+                        std::time::Duration::from_millis(remaining),
+                        lease.checkpoint(),
+                    )
+                    .await;
                     match sampled {
-                        Ok(Ok(ledger)) if permission.renew_until(store.clock_sample().0, ledger.prepaid_until.0) => {},
+                        Ok(Ok(ledger))
+                            if permission
+                                .renew_until(store.clock_sample().0, ledger.prepaid_until.0) => {}
                         Ok(Err(error)) => return Err(error),
-                        _ => return Err(rt_error(ErrorCode::InsufficientBudget, "prepaid_lease_expired")),
+                        _ => {
+                            return Err(rt_error(
+                                ErrorCode::InsufficientBudget,
+                                "prepaid_lease_expired",
+                            ))
+                        }
                     }
                 }
             };
@@ -329,34 +404,63 @@ impl ParticipantRuntime for OwnedParticipantRuntime {
         permission.revoke_local();
         self.cleanup_local_room(room).await?;
         lease.finish().await?;
-        self.permissions.lock().expect("room permissions").remove(&room);
+        self.permissions
+            .lock()
+            .expect("room permissions")
+            .remove(&room);
         result
     }
 
     async fn cleanup_local_room(&self, room: RoomId) -> RtResult<()> {
-        if let Some(permission) = self.permissions.lock().expect("room permissions").remove(&room) {
+        if let Some(permission) = self
+            .permissions
+            .lock()
+            .expect("room permissions")
+            .remove(&room)
+        {
             permission.revoke_local();
         }
-        if let Some(executor) = &self.executor { executor.cleanup_room(room).await?; }
+        if let Some(executor) = &self.executor {
+            executor.cleanup_room(room).await?;
+        }
         Ok(())
     }
     async fn cleanup_all_local(&self) -> RtResult<()> {
-        let mut rooms: std::collections::HashSet<_> = self.permissions.lock().expect("room permissions").keys().copied().collect();
+        let mut rooms: std::collections::HashSet<_> = self
+            .permissions
+            .lock()
+            .expect("room permissions")
+            .keys()
+            .copied()
+            .collect();
         if let Some(executor) = &self.executor {
-            rooms.extend(executor.rooms.lock().expect("runtime rooms").values().copied());
+            rooms.extend(
+                executor
+                    .rooms
+                    .lock()
+                    .expect("runtime rooms")
+                    .values()
+                    .copied(),
+            );
         }
         let mut error = None;
-        for result in futures::future::join_all(rooms.into_iter().map(|room| self.cleanup_local_room(room))).await {
-            if let Err(failure) = result { error = Some(failure); }
+        for result in
+            futures::future::join_all(rooms.into_iter().map(|room| self.cleanup_local_room(room)))
+                .await
+        {
+            if let Err(failure) = result {
+                error = Some(failure);
+            }
         }
         error.map_or(Ok(()), Err)
     }
-
 }
 
 struct RevokeOnDrop(Arc<super::resources::ExecutionLease>);
 impl Drop for RevokeOnDrop {
-    fn drop(&mut self) { self.0.revoke_local(); }
+    fn drop(&mut self) {
+        self.0.revoke_local();
+    }
 }
 
 fn parse<T: FromStr>(value: &str) -> RtResult<T> {
@@ -418,12 +522,25 @@ async fn run_room(
                 .as_array()
                 .into_iter()
                 .flatten()
-                .find(|recipient| recipient["ordinal"] == participant.ordinal || (recipient.get("ordinal").is_none() && recipient["provider_ref"] == participant.provider_ref))
+                .find(|recipient| {
+                    recipient["ordinal"] == participant.ordinal
+                        || (recipient.get("ordinal").is_none()
+                            && recipient["provider_ref"] == participant.provider_ref)
+                })
                 .and_then(|recipient| recipient["model"].as_str())
                 .map(str::to_owned);
         }
         if let Some(model) = &participant.model {
-            exec(store.connection(), "UPDATE rt_speakers SET model_id=? WHERE room_id=? AND speaker_id=?", vec![text(model),text(&room_text),text(&speaker.speaker_id.to_string())]).await?;
+            exec(
+                store.connection(),
+                "UPDATE rt_speakers SET model_id=? WHERE room_id=? AND speaker_id=?",
+                vec![
+                    text(model),
+                    text(&room_text),
+                    text(&speaker.speaker_id.to_string()),
+                ],
+            )
+            .await?;
         }
     }
     let moderator = speakers
@@ -560,7 +677,9 @@ async fn run_room(
             existing_fence(&store, &room, phase_id, boot_epoch, run_epoch).await?;
         // Every first launch runs once before any retry. A wave cannot exceed C.
         for retry in [false, true] {
-            if store.clock_sample().0 >= phase_deadline { break; }
+            if store.clock_sample().0 >= phase_deadline {
+                break;
+            }
             if retry {
                 for slot in &mut slots {
                     if matches!(slot.outcome, SlotOutcome::Failed | SlotOutcome::Invalid) {
@@ -588,12 +707,19 @@ async fn run_room(
             })?;
             // next_intents may propose a successor once this phase expires.
             // The scheduler publishes this phase before scheduling a successor.
-            let intents: Vec<_> = intents.into_iter().filter(|intent| intent.phase_id == phase_id).collect();
+            let intents: Vec<_> = intents
+                .into_iter()
+                .filter(|intent| intent.phase_id == phase_id)
+                .collect();
             for wave in intents.chunks(config.concurrency as usize) {
-                if store.clock_sample().0 >= phase_deadline { break; }
+                if store.clock_sample().0 >= phase_deadline {
+                    break;
+                }
                 let mut pending = Vec::new();
                 for intent in wave {
-                    if store.clock_sample().0 >= phase_deadline { break; }
+                    if store.clock_sample().0 >= phase_deadline {
+                        break;
+                    }
                     let local = phase_speakers
                         .iter()
                         .position(|(speaker, _)| speaker.speaker_id == intent.speaker_id)
@@ -767,19 +893,37 @@ async fn freeze_phase(
         }
     }
     for (speaker, _) in speakers {
-        aliases.speakers.insert(format!("s{}", speaker.ordinal), speaker.speaker_id);
+        aliases
+            .speakers
+            .insert(format!("s{}", speaker.ordinal), speaker.speaker_id);
     }
     let mut claim_catalog = Vec::new();
     let mut response_catalog = Vec::new();
     for published in &history.phases {
         for member in &published.members {
             for claim in &member.claims {
-                let alias = aliases.claims.iter().find(|(_, reference)| reference.claim_id == claim.claim_id).map(|(alias, _)| alias);
+                let alias = aliases
+                    .claims
+                    .iter()
+                    .find(|(_, reference)| reference.claim_id == claim.claim_id)
+                    .map(|(alias, _)| alias);
                 claim_catalog.push(json!({"alias":alias,"text":claim.text,"speaker_alias":format!("s{}",member.speaker.ordinal)}));
             }
             for response in &member.responses {
-                let alias = aliases.responses.iter().find(|(_, reference)| reference.response_id == response.response_id).map(|(alias, _)| alias);
-                let detail = one_row(store.connection(), "SELECT body_json FROM rt_response_details WHERE room_id=? AND response_id=?", vec![text(&room.to_string()),text(&response.response_id.to_string())]).await?;
+                let alias = aliases
+                    .responses
+                    .iter()
+                    .find(|(_, reference)| reference.response_id == response.response_id)
+                    .map(|(alias, _)| alias);
+                let detail = one_row(
+                    store.connection(),
+                    "SELECT body_json FROM rt_response_details WHERE room_id=? AND response_id=?",
+                    vec![
+                        text(&room.to_string()),
+                        text(&response.response_id.to_string()),
+                    ],
+                )
+                .await?;
                 let body: Value = from_json(&column::<String>(&detail, 0)?)?;
                 response_catalog.push(json!({"alias":alias,"speaker_alias":format!("s{}",member.speaker.ordinal),"body":body}));
             }
@@ -898,8 +1042,14 @@ async fn freeze_phase(
         );
         evidence.push(json!({"alias":alias,"evidence_id":evidence_id,"path":entry.path,"object":ObjectRefV1{object_id:entry.object.object_id.clone(),kind:ObjectKind::SourceExcerpt,content_hash:entry.object.content_hash,total_bytes:SafeInt(entry.object.total_bytes)}}));
     }
-    if canonical_bytes(&json!({"topic":config.topic,"sources":sources,"evidence":evidence}))?.len() as u64 > config.quotas.input_byte_limit.0 {
-        return Err(rt_error(ErrorCode::ContextTooLarge, "initial_context_bytes"));
+    if canonical_bytes(&json!({"topic":config.topic,"sources":sources,"evidence":evidence}))?.len()
+        as u64
+        > config.quotas.input_byte_limit.0
+    {
+        return Err(rt_error(
+            ErrorCode::ContextTooLarge,
+            "initial_context_bytes",
+        ));
     }
     let snapshot = PhaseSnapshotV1 {
         schema_version: 1,
@@ -978,72 +1128,137 @@ struct SeatTokenBound<'a> {
     capacity: Option<u64>,
 }
 impl TokenBound for SeatTokenBound<'_> {
-    fn upper_bound(&self, bytes: &[u8]) -> RtResult<u64> { self.inner.upper_bound(bytes) }
-    fn capacity_tokens(&self) -> Option<u64> { self.capacity }
-    fn upper_bound_for_length(&self, len: u64) -> RtResult<u64> { self.inner.upper_bound_for_length(len) }
+    fn upper_bound(&self, bytes: &[u8]) -> RtResult<u64> {
+        self.inner.upper_bound(bytes)
+    }
+    fn capacity_tokens(&self) -> Option<u64> {
+        self.capacity
+    }
+    fn upper_bound_for_length(&self, len: u64) -> RtResult<u64> {
+        self.inner.upper_bound_for_length(len)
+    }
 }
 
 fn required_future_context_bytes(config: &RoundtableConfigV1) -> RtResult<u64> {
-    let results = member_result_body_bytes(config.participants.len() as u32, config.strategy.critique_rounds, config.quotas.output_byte_limit.0)?;
-    let count = (config.participants.len() as u64).checked_mul(u64::from(config.strategy.critique_rounds) + 1)
+    let results = member_result_body_bytes(
+        config.participants.len() as u32,
+        config.strategy.critique_rounds,
+        config.quotas.output_byte_limit.0,
+    )?;
+    let count = (config.participants.len() as u64)
+        .checked_mul(u64::from(config.strategy.critique_rounds) + 1)
         .ok_or_else(|| rt_error(ErrorCode::ContextTooLarge, "context_too_large"))?;
     // Result quotas already measure canonical JSON; history is embedded as
     // objects. The catalog duplicates disjoint claim text/response bodies once.
     // ASCII UUID/alias wrappers are bounded independently, without re-escaping.
-    let wrappers = count.checked_mul((v1_1::MAX_CLAIMS as u64 + v1_1::MAX_RESPONSES as u64) * 192 + 1024);
-    results.checked_mul(2).and_then(|v| v.checked_add(wrappers?))
+    let wrappers =
+        count.checked_mul((v1_1::MAX_CLAIMS as u64 + v1_1::MAX_RESPONSES as u64) * 192 + 1024);
+    results
+        .checked_mul(2)
+        .and_then(|v| v.checked_add(wrappers?))
         .and_then(|v| v.checked_add(config.quotas.input_byte_limit.0.checked_mul(4)?))
-        .and_then(|v| v.checked_add(interjection_context_limit(config.quotas.interjection_byte_limit.0).ok()?))
+        .and_then(|v| {
+            v.checked_add(interjection_context_limit(config.quotas.interjection_byte_limit.0).ok()?)
+        })
         .and_then(|v| v.checked_add(4096 + 512 * config.participants.len() as u64))
         .ok_or_else(|| rt_error(ErrorCode::ContextTooLarge, "context_too_large"))
 }
 
 /// Admission reserves the whole immutable history, not only the first prompt.
 /// This uses each selected adapter's qualified profile, including the moderator.
-fn validate_plan_context(config: &RoundtableConfigV1, executor: &dyn RoundtableTurnExecutor, capability: &RuntimeCapability) -> RtResult<()> {
+fn validate_plan_context(
+    config: &RoundtableConfigV1,
+    executor: &dyn RoundtableTurnExecutor,
+    capability: &RuntimeCapability,
+) -> RtResult<()> {
     let mut resolved = config.clone();
     for participant in &mut resolved.participants {
         if participant.model.is_none() {
-            participant.model = capability.recipients.as_array().into_iter().flatten()
-                .find(|recipient| recipient["ordinal"] == participant.ordinal || (recipient.get("ordinal").is_none() && recipient["provider_ref"] == participant.provider_ref))
-                .and_then(|recipient| recipient["model"].as_str()).map(str::to_owned);
+            participant.model = capability
+                .recipients
+                .as_array()
+                .into_iter()
+                .flatten()
+                .find(|recipient| {
+                    recipient["ordinal"] == participant.ordinal
+                        || (recipient.get("ordinal").is_none()
+                            && recipient["provider_ref"] == participant.provider_ref)
+                })
+                .and_then(|recipient| recipient["model"].as_str())
+                .map(str::to_owned);
         }
     }
     let config = &resolved;
     let required_future = required_future_context_bytes(config)?;
     for participant in &config.participants {
         let selected = executor.context_profile(participant);
-        let capacity = selected.as_ref().map(|profile| profile.model_capacity_tokens).or_else(|| executor.token_bound().capacity_tokens());
+        let capacity = selected
+            .as_ref()
+            .map(|profile| profile.model_capacity_tokens)
+            .or_else(|| executor.token_bound().capacity_tokens());
         let profile = selected.unwrap_or_else(|| capability.profile.clone());
-        let tokens = SeatTokenBound { inner:executor.token_bound(), capacity };
+        let tokens = SeatTokenBound {
+            inner: executor.token_bound(),
+            capacity,
+        };
         // Every member sees critique history; the moderator sees every result.
-        let phases = if participant.ordinal == config.moderator_ordinal { vec![PhaseKind::Proposal, PhaseKind::Critique, PhaseKind::Synthesis] } else { vec![PhaseKind::Proposal, PhaseKind::Critique] };
+        let phases = if participant.ordinal == config.moderator_ordinal {
+            vec![
+                PhaseKind::Proposal,
+                PhaseKind::Critique,
+                PhaseKind::Synthesis,
+            ]
+        } else {
+            vec![PhaseKind::Proposal, PhaseKind::Critique]
+        };
         for phase in phases {
             let role = result_role(participant, phase);
-            let input = EncodedInputBounds { question:config.topic.clone(), role:role.role, interjection:String::new(), evidence:String::new(), schema:role.schema_text, tools:role.tool_text, embedded:serde_json::to_string(config).map_err(|_|rt_error(ErrorCode::InvalidArgument,"config"))? };
+            let input = EncodedInputBounds {
+                question: config.topic.clone(),
+                role: role.role,
+                interjection: String::new(),
+                evidence: String::new(),
+                schema: role.schema_text,
+                tools: role.tool_text,
+                embedded: serde_json::to_string(config)
+                    .map_err(|_| rt_error(ErrorCode::InvalidArgument, "config"))?,
+            };
             let known = preflight_exact_prompt(config, &input)?.len() as u64;
-            let required_prompt = known.checked_add(required_future)
+            let required_prompt = known
+                .checked_add(required_future)
                 .ok_or_else(|| rt_error(ErrorCode::ContextTooLarge, "context_too_large"))?;
             // ACP carries the canonical prompt as JSON text (at most a
             // twofold quotes/backslashes escape). Everything outside that
             // text needs a separately qualified bound expressed in bytes.
-            let envelope = executor.request_envelope_bound_bytes(participant)?
-                .ok_or_else(|| rt_error(ErrorCode::CapacityUnknown, "request_envelope_unqualified"))?;
+            let envelope = executor
+                .request_envelope_bound_bytes(participant)?
+                .ok_or_else(|| {
+                    rt_error(ErrorCode::CapacityUnknown, "request_envelope_unqualified")
+                })?;
             if envelope > profile.max_request_body_bytes {
-                return Err(rt_error(ErrorCode::CapacityUnknown, "request_envelope_unqualified"));
+                return Err(rt_error(
+                    ErrorCode::CapacityUnknown,
+                    "request_envelope_unqualified",
+                ));
             }
-            let required_request = required_prompt.checked_mul(2)
+            let required_request = required_prompt
+                .checked_mul(2)
                 .and_then(|v| v.checked_add(envelope))
                 .ok_or_else(|| rt_error(ErrorCode::ContextTooLarge, "context_too_large"))?;
             if required_request > profile.max_request_body_bytes {
-                return Err(rt_error(ErrorCode::ContextTooLarge, "required_request_body_limit"));
+                return Err(rt_error(
+                    ErrorCode::ContextTooLarge,
+                    "required_request_body_limit",
+                ));
             }
             // Use exactly the same qualified reserve contract as the later
             // DeliveryEncoder, with a bound on every required future prompt.
             admit_qualified_delivery(
                 tokens.upper_bound_for_length(required_prompt)?,
-                config.quotas.output_byte_limit.0, EVIDENCE_ATTEMPT_BYTES,
-                &tokens, &profile,
+                config.quotas.output_byte_limit.0,
+                EVIDENCE_ATTEMPT_BYTES,
+                &tokens,
+                &profile,
             )?;
         }
     }
@@ -1052,11 +1267,19 @@ fn validate_plan_context(config: &RoundtableConfigV1, executor: &dyn RoundtableT
 
 fn result_role(participant: &ParticipantV1, kind: PhaseKind) -> RoleSnapshot {
     RoleSnapshot {
-        role: participant.role.clone(), model: participant.model.clone().unwrap_or_else(|| "default".into()),
-        effort: participant.effort.clone().unwrap_or_default(), provider_ref: participant.provider_ref.clone(),
-        prompt_version: "roundtable.v1".into(), template_version: "roundtable.v1".into(),
-        schema_id: super::SERVICE_RESULT_SCHEMA_ID.into(), schema_text: result_schema(Some(kind)).to_string(),
-        tool_version: super::SERVICE_TOOL_VERSION.into(), tool_text: super::service_tool_schema().into(),
+        role: participant.role.clone(),
+        model: participant
+            .model
+            .clone()
+            .unwrap_or_else(|| "default".into()),
+        effort: participant.effort.clone().unwrap_or_default(),
+        provider_ref: participant.provider_ref.clone(),
+        prompt_version: "roundtable.v1".into(),
+        template_version: "roundtable.v1".into(),
+        schema_id: super::SERVICE_RESULT_SCHEMA_ID.into(),
+        schema_text: result_schema(Some(kind)).to_string(),
+        tool_version: super::SERVICE_TOOL_VERSION.into(),
+        tool_text: super::service_tool_schema().into(),
     }
 }
 
@@ -1117,16 +1340,36 @@ async fn prepare_turn(
             .map_err(|_| rt_error(ErrorCode::InvalidArgument, "output_quota"))?,
     };
     let selected = executor.context_profile(participant);
-    let capacity = selected.as_ref().map(|profile| profile.model_capacity_tokens).or_else(|| executor.token_bound().capacity_tokens());
+    let capacity = selected
+        .as_ref()
+        .map(|profile| profile.model_capacity_tokens)
+        .or_else(|| executor.token_bound().capacity_tokens());
     let profile = selected.unwrap_or_else(|| capability.profile.clone());
-    let tokens = SeatTokenBound { inner: executor.token_bound(), capacity };
+    let tokens = SeatTokenBound {
+        inner: executor.token_bound(),
+        capacity,
+    };
     let role = result_role(participant, phase.kind);
-    let prompt = DeliveryEncoder::prompt_for_speaker(phase, &role, &binding_id, &speaker.0, &scope, context)?;
-    let delivery = DeliveryEncoder::encode_prompt(phase, &role, &binding_id, &tokens, &profile, &prompt)?;
+    let prompt = DeliveryEncoder::prompt_for_speaker(
+        phase,
+        &role,
+        &binding_id,
+        &speaker.0,
+        &scope,
+        context,
+    )?;
+    let delivery =
+        DeliveryEncoder::encode_prompt(phase, &role, &binding_id, &tokens, &profile, &prompt)?;
     let fence = Fence {
-        boot_epoch: boot, run_epoch: run, phase_id: phase.phase_id,
-        phase_revision: phase.revision, attempt_id, binding_id, incarnation,
-        context_hash: canonical_hash(&delivery)?, policy_hash: capability.policy_hash,
+        boot_epoch: boot,
+        run_epoch: run,
+        phase_id: phase.phase_id,
+        phase_revision: phase.revision,
+        attempt_id,
+        binding_id,
+        incarnation,
+        context_hash: canonical_hash(&delivery)?,
+        policy_hash: capability.policy_hash,
     };
     let room_text = room.to_string();
     let generation = super::store::query_i64(
@@ -1362,8 +1605,12 @@ mod plan_context_contract_tests {
 
     struct DefaultByteBound;
     impl TokenBound for DefaultByteBound {
-        fn upper_bound(&self, bytes: &[u8]) -> RtResult<u64> { Ok(bytes.len() as u64) }
-        fn capacity_tokens(&self) -> Option<u64> { Some(2_000_000) }
+        fn upper_bound(&self, bytes: &[u8]) -> RtResult<u64> {
+            Ok(bytes.len() as u64)
+        }
+        fn capacity_tokens(&self) -> Option<u64> {
+            Some(2_000_000)
+        }
     }
 
     #[test]
@@ -1371,25 +1618,58 @@ mod plan_context_contract_tests {
         let config:RoundtableConfigV1=serde_json::from_value(json!({"schema_version":1,"topic":"Review the implementation","workspace_id":"fixture","source_refs":[],"participants":[{"ordinal":0,"role":"reviewer","provider_ref":"fixture","model":"fixture-model-0"},{"ordinal":1,"role":"critic","provider_ref":"fixture","model":"fixture-model-1"},{"ordinal":2,"role":"reviewer","provider_ref":"fixture","model":"fixture-model-2"}],"moderator_ordinal":0,"strategy":{"type":"phased_rounds","version":1,"critique_rounds":1},"concurrency":1,"strict_snapshot_v1":true,"budgets":{"room_budget":"1800000","phase_budget":"450000"},"timeouts":{"attempt_timeout":"225000"},"quotas":{"output_byte_limit":8192,"input_byte_limit":16384,"interjection_byte_limit":16384}})).unwrap();
         // 98,304 result/catalog bytes + 63,744 ID wrappers + 65,536 initial
         // source/clone bytes + 98,368 admitted input bytes + 5,632 phase bytes.
-        assert_eq!(required_future_context_bytes(&config).unwrap(),331_584);
-        for kind in [PhaseKind::Proposal,PhaseKind::Critique,PhaseKind::Synthesis] {
-            let role=result_role(&config.participants[0],kind);
-            let input=EncodedInputBounds {question:config.topic.clone(),role:role.role,interjection:String::new(),evidence:String::new(),schema:role.schema_text,tools:role.tool_text,embedded:serde_json::to_string(&config).unwrap()};
-            let known=preflight_exact_prompt(&config,&input).unwrap().len() as u64;
+        assert_eq!(required_future_context_bytes(&config).unwrap(), 331_584);
+        for kind in [
+            PhaseKind::Proposal,
+            PhaseKind::Critique,
+            PhaseKind::Synthesis,
+        ] {
+            let role = result_role(&config.participants[0], kind);
+            let input = EncodedInputBounds {
+                question: config.topic.clone(),
+                role: role.role,
+                interjection: String::new(),
+                evidence: String::new(),
+                schema: role.schema_text,
+                tools: role.tool_text,
+                embedded: serde_json::to_string(&config).unwrap(),
+            };
+            let known = preflight_exact_prompt(&config, &input).unwrap().len() as u64;
             // The fixture below has an explicitly encoded envelope. This is
             // not an assumption about a real adapter's hidden instructions.
             let envelope=canonical_bytes(&json!({"model":"fixture-model-0","store":false,"max_output_tokens":8192,"input":[{"role":"user","content":[{"type":"input_text","text":""}]}],"tools":[{"type":"function","name":"submit_result","parameters":result_schema(None)}]})).unwrap().len() as u64;
-            let request=2*(known+331_584)+envelope;
-            eprintln!("default {kind:?}: known={known}, envelope={envelope}, required_request={request}");
-            assert!(request<=1_048_576,"required default request must fit the unchanged 1MiB profile");
-            let profile=QualifiedContextProfile::proposed("explicit-test-byte-bound",Hash256::sha256(b"fake byte proof"),2_000_000,0,"test-only");
-            assert_eq!(admit_qualified_delivery(known+331_584,8_192,EVIDENCE_ATTEMPT_BYTES,&DefaultByteBound,&profile).unwrap(),1_056_768);
+            let request = 2 * (known + 331_584) + envelope;
+            eprintln!(
+                "default {kind:?}: known={known}, envelope={envelope}, required_request={request}"
+            );
+            assert!(
+                request <= 1_048_576,
+                "required default request must fit the unchanged 1MiB profile"
+            );
+            let profile = QualifiedContextProfile::proposed(
+                "explicit-test-byte-bound",
+                Hash256::sha256(b"fake byte proof"),
+                2_000_000,
+                0,
+                "test-only",
+            );
+            assert_eq!(
+                admit_qualified_delivery(
+                    known + 331_584,
+                    8_192,
+                    EVIDENCE_ATTEMPT_BYTES,
+                    &DefaultByteBound,
+                    &profile
+                )
+                .unwrap(),
+                1_056_768
+            );
         }
-        let mut small=config;
+        let mut small = config;
         small.participants.truncate(2);
-        small.strategy.critique_rounds=0;
-        small.quotas.input_byte_limit=SafeInt(2_048);
-        small.quotas.interjection_byte_limit=SafeInt(1);
-        assert_eq!(required_future_context_bytes(&small).unwrap(),67_398);
+        small.strategy.critique_rounds = 0;
+        small.quotas.input_byte_limit = SafeInt(2_048);
+        small.quotas.interjection_byte_limit = SafeInt(1);
+        assert_eq!(required_future_context_bytes(&small).unwrap(), 67_398);
     }
 }

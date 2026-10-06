@@ -231,7 +231,9 @@ impl ExecutionLease {
             return false;
         }
         let previous = self.prepaid_until();
-        self.prepaid_until.compare_exchange(previous, prepaid_until, Ordering::SeqCst, Ordering::SeqCst).is_ok()
+        self.prepaid_until
+            .compare_exchange(previous, prepaid_until, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
     }
 
     pub fn late_ack(&self, generation: u64, now_ms: u64) -> bool {

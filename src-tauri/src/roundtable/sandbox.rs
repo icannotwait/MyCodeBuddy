@@ -346,8 +346,14 @@ pub trait LaunchIntentStore {
 #[serde(tag = "op", rename_all = "snake_case")]
 enum JournalOp {
     /// Only this record proves the new implementation has never entered exec.
-    PreExec { v: u8, intent: LaunchIntent },
-    ExecPending { v: u8, incarnation: IncarnationId },
+    PreExec {
+        v: u8,
+        intent: LaunchIntent,
+    },
+    ExecPending {
+        v: u8,
+        incarnation: IncarnationId,
+    },
     Record {
         v: u8,
         intent: LaunchIntent,
@@ -398,7 +404,11 @@ impl JournalLaunchIntentStore {
         Ok(Self {
             dir: dir.to_path_buf(),
             _lock: lock,
-            inner: Mutex::new(JournalInner { file, intents, pre_exec }),
+            inner: Mutex::new(JournalInner {
+                file,
+                intents,
+                pre_exec,
+            }),
         })
     }
 }
@@ -492,10 +502,21 @@ impl JournalLaunchIntentStore {
     fn begin_launch(&self, intent: &LaunchIntent) -> RtResult<()> {
         let mut inner = self.inner();
         // Never reinterpret an old/lost-ack record as proof of no process.
-        if inner.intents.iter().any(|known| known.incarnation == intent.incarnation) {
+        if inner
+            .intents
+            .iter()
+            .any(|known| known.incarnation == intent.incarnation)
+        {
             return Err(rt_error(ErrorCode::InvalidState, "incarnation_reused"));
         }
-        append_op(&mut inner.file, &self.dir, &JournalOp::PreExec { v: 1, intent: intent.clone() })?;
+        append_op(
+            &mut inner.file,
+            &self.dir,
+            &JournalOp::PreExec {
+                v: 1,
+                intent: intent.clone(),
+            },
+        )?;
         inner.intents.push(intent.clone());
         inner.pre_exec.insert(intent.incarnation);
         Ok(())
@@ -504,11 +525,17 @@ impl JournalLaunchIntentStore {
     fn mark_exec_pending(&self, incarnation: IncarnationId) -> RtResult<()> {
         let mut inner = self.inner();
         if !inner.pre_exec.contains(&incarnation)
-            || !inner.intents.iter().any(|intent| intent.incarnation == incarnation && !intent.reaped && intent.spawned.is_none())
+            || !inner.intents.iter().any(|intent| {
+                intent.incarnation == incarnation && !intent.reaped && intent.spawned.is_none()
+            })
         {
             return Err(rt_error(ErrorCode::InvalidState, "launch_retired"));
         }
-        append_op(&mut inner.file, &self.dir, &JournalOp::ExecPending { v: 1, incarnation })?;
+        append_op(
+            &mut inner.file,
+            &self.dir,
+            &JournalOp::ExecPending { v: 1, incarnation },
+        )?;
         inner.pre_exec.remove(&incarnation);
         Ok(())
     }
@@ -520,10 +547,17 @@ impl JournalLaunchIntentStore {
         if !inner.pre_exec.contains(&incarnation) {
             return Ok(false);
         }
-        let index = inner.intents.iter().position(|intent| intent.incarnation == incarnation && intent.spawned.is_none())
+        let index = inner
+            .intents
+            .iter()
+            .position(|intent| intent.incarnation == incarnation && intent.spawned.is_none())
             .ok_or_else(|| rt_error(ErrorCode::InvalidArgument, "journal_corrupt"))?;
         if !inner.intents[index].reaped {
-            append_op(&mut inner.file, &self.dir, &JournalOp::Reaped { v: 1, incarnation })?;
+            append_op(
+                &mut inner.file,
+                &self.dir,
+                &JournalOp::Reaped { v: 1, incarnation },
+            )?;
             inner.intents[index].reaped = true;
         }
         Ok(true)
@@ -579,11 +613,20 @@ fn replay(bytes: &[u8]) -> RtResult<(Vec<LaunchIntent>, BTreeSet<IncarnationId>)
     Ok((intents, pre_exec))
 }
 
-fn apply(intents: &mut Vec<LaunchIntent>, pre_exec: &mut BTreeSet<IncarnationId>, op: JournalOp) -> RtResult<()> {
+fn apply(
+    intents: &mut Vec<LaunchIntent>,
+    pre_exec: &mut BTreeSet<IncarnationId>,
+    op: JournalOp,
+) -> RtResult<()> {
     match op {
         JournalOp::PreExec { v, intent } => {
-            if v != 1 || intent.reaped || intent.spawned.is_some()
-                || intents.iter().any(|known| known.incarnation == intent.incarnation) {
+            if v != 1
+                || intent.reaped
+                || intent.spawned.is_some()
+                || intents
+                    .iter()
+                    .any(|known| known.incarnation == intent.incarnation)
+            {
                 return Err(rt_error(ErrorCode::InvalidArgument, "journal_corrupt"));
             }
             pre_exec.insert(intent.incarnation);
@@ -591,8 +634,12 @@ fn apply(intents: &mut Vec<LaunchIntent>, pre_exec: &mut BTreeSet<IncarnationId>
             Ok(())
         }
         JournalOp::ExecPending { v, incarnation } => {
-            if v != 1 || !pre_exec.remove(&incarnation)
-                || !intents.iter().any(|intent| intent.incarnation == incarnation && !intent.reaped && intent.spawned.is_none()) {
+            if v != 1
+                || !pre_exec.remove(&incarnation)
+                || !intents.iter().any(|intent| {
+                    intent.incarnation == incarnation && !intent.reaped && intent.spawned.is_none()
+                })
+            {
                 return Err(rt_error(ErrorCode::InvalidArgument, "journal_corrupt"));
             }
             Ok(())
@@ -779,7 +826,9 @@ impl LinuxOciIsolator {
             existing => {
                 // A legacy/foreign artifact is uncertain, never no-exec.
                 self.intents.record(intent)?;
-                return Err(existing.err().unwrap_or_else(|| rt_error(ErrorCode::InvalidState, "incarnation_reused")));
+                return Err(existing
+                    .err()
+                    .unwrap_or_else(|| rt_error(ErrorCode::InvalidState, "incarnation_reused")));
             }
         }
         let prepared = self.prepare(&prepared.plan).await?;
@@ -934,7 +983,8 @@ impl IsolationProvider for LinuxOciIsolator {
         linux_oci::verify_intent_instance(&intent, instance)?;
         if self.intents.reap_before_exec(instance.incarnation)? {
             return Ok(ProcessTreeProof {
-                instance_id: instance.runtime_id.clone(), incarnation: instance.incarnation,
+                instance_id: instance.runtime_id.clone(),
+                incarnation: instance.incarnation,
                 process_tree_empty: true,
             });
         }
@@ -1034,8 +1084,19 @@ mod shared_journal_tests {
             fs::create_dir_all(dir.path().join(name)).unwrap();
         }
         let key = QualificationKey {
-            os: super::super::qualification::OsIdentity { name: "linux".into(), version: "test".into() },
-            binaries: vec![profile.runtime.clone(), CertifiedBinary { role: "cli".into(), absolute_path: dir.path().join("cli").display().to_string(), version: "fake".into(), sha256: Hash256::from_bytes([8; 32]) }],
+            os: super::super::qualification::OsIdentity {
+                name: "linux".into(),
+                version: "test".into(),
+            },
+            binaries: vec![
+                profile.runtime.clone(),
+                CertifiedBinary {
+                    role: "cli".into(),
+                    absolute_path: dir.path().join("cli").display().to_string(),
+                    version: "fake".into(),
+                    sha256: Hash256::from_bytes([8; 32]),
+                },
+            ],
             image_digest: "sha256:pre-exec".into(),
             policy_hash: Hash256::from_bytes([1; 32]),
             tool_contract_hash: Hash256::from_bytes([2; 32]),
@@ -1045,25 +1106,54 @@ mod shared_journal_tests {
             plan_hash: Hash256::from_bytes([4; 32]),
         };
         let plan = build_sandbox_plan(&SandboxInput {
-            certificate: key, db: DbIdentity::new("pre-exec-review").unwrap(), boot_epoch: Epoch(1),
+            certificate: key,
+            db: DbIdentity::new("pre-exec-review").unwrap(),
+            boot_epoch: Epoch(1),
             incarnation: "00000000-0000-4000-8000-000000000011".parse().unwrap(),
-            scratch: dir.path().join("scratch"), project: dir.path().join("project"), home: dir.path().join("home"),
-            other_scratches: vec![], decoy_paths: vec![], inherited_env: BTreeMap::new(), env_allowlist: BTreeMap::new(), global_mcp: false,
-        }).unwrap();
+            scratch: dir.path().join("scratch"),
+            project: dir.path().join("project"),
+            home: dir.path().join("home"),
+            other_scratches: vec![],
+            decoy_paths: vec![],
+            inherited_env: BTreeMap::new(),
+            env_allowlist: BTreeMap::new(),
+            global_mcp: false,
+        })
+        .unwrap();
         let intent = LaunchIntent::from_plan(&plan);
         let prepared = PreparedSandbox { plan };
-        let isolator = LinuxOciIsolator::with_profile(JournalLaunchIntentStore::open(&journal_dir).unwrap(), profile.clone());
+        let isolator = LinuxOciIsolator::with_profile(
+            JournalLaunchIntentStore::open(&journal_dir).unwrap(),
+            profile.clone(),
+        );
         assert!(isolator.spawn_attached(&prepared, &intent).await.is_err());
-        let instance = isolator.recorded_instance(&intent.db, intent.incarnation).unwrap().unwrap();
-        assert!(!profile.runtime_root.join("bundles").join(&instance.runtime_id).join("config.json").exists());
-        let proof = isolator.reap(&instance).await.expect("no process was ever spawned");
+        let instance = isolator
+            .recorded_instance(&intent.db, intent.incarnation)
+            .unwrap()
+            .unwrap();
+        assert!(!profile
+            .runtime_root
+            .join("bundles")
+            .join(&instance.runtime_id)
+            .join("config.json")
+            .exists());
+        let proof = isolator
+            .reap(&instance)
+            .await
+            .expect("no process was ever spawned");
         assert!(proof.process_tree_empty);
         // Retrying a failed DB acknowledgement after restart retains this
         // specific no-exec proof; a generic retired marker is not sufficient.
         drop(isolator);
-        let isolator = LinuxOciIsolator::with_profile(JournalLaunchIntentStore::open(&journal_dir).unwrap(), profile);
+        let isolator = LinuxOciIsolator::with_profile(
+            JournalLaunchIntentStore::open(&journal_dir).unwrap(),
+            profile,
+        );
         assert!(isolator.reap(&instance).await.unwrap().process_tree_empty);
-        assert!(isolator.spawn_attached(&prepared, &intent).await.is_err(), "incarnations cannot be relaunched");
+        assert!(
+            isolator.spawn_attached(&prepared, &intent).await.is_err(),
+            "incarnations cannot be relaunched"
+        );
     }
 
     #[test]
@@ -1087,7 +1177,10 @@ mod shared_journal_tests {
         journal.mark_exec_pending(intent.incarnation).unwrap();
         assert!(!journal.reap_before_exec(intent.incarnation).unwrap());
         drop(journal);
-        let isolator = LinuxOciIsolator::with_profile(JournalLaunchIntentStore::open(&journal_dir).unwrap(), profile);
+        let isolator = LinuxOciIsolator::with_profile(
+            JournalLaunchIntentStore::open(&journal_dir).unwrap(),
+            profile,
+        );
         assert!(isolator.reap(&instance).await.is_err());
         assert_eq!(isolator.list_unreaped().unwrap().len(), 1);
     }

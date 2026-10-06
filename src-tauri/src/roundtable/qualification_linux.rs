@@ -298,7 +298,6 @@ pub async fn measure_host(request: &ProbeRequest) -> ProbeFacts {
             });
             // This shell probe measures host-path isolation only. It does not
             // exercise the adapter's native tools or its authentication files.
-
         }
         Err(reason) => {
             facts.checks.push(fail("strict_isolation", &reason));
@@ -430,7 +429,11 @@ fn empty_facts(agent: &str) -> ProbeFacts {
 
 fn stamp_failures(facts: &mut ProbeFacts, failures: &[ProbeCheck]) {
     for failure in failures {
-        if let Some(existing) = facts.checks.iter_mut().find(|check| check.name == failure.name) {
+        if let Some(existing) = facts
+            .checks
+            .iter_mut()
+            .find(|check| check.name == failure.name)
+        {
             if existing.status != "failed" || failure.status == "failed" {
                 *existing = failure.clone();
             }
@@ -541,9 +544,18 @@ fn recorded_crun_version(text: &str) -> Option<String> {
 }
 
 async fn command_text(bin: &Path, args: &[&str]) -> Option<String> {
-    let output = tokio::time::timeout(Duration::from_secs(10), Command::new(bin)
-        .args(args).stdout(Stdio::piped()).stderr(Stdio::piped()).kill_on_drop(true).output())
-        .await.ok()?.ok()?;
+    let output = tokio::time::timeout(
+        Duration::from_secs(10),
+        Command::new(bin)
+            .args(args)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .output(),
+    )
+    .await
+    .ok()?
+    .ok()?;
     let mut text = String::from_utf8_lossy(&output.stdout).into_owned();
     if text.trim().is_empty() {
         text = String::from_utf8_lossy(&output.stderr).into_owned();
@@ -648,18 +660,26 @@ async fn run_mcp(request: &ProbeRequest, token: &str) -> Result<(), String> {
             "qualify".into(),
         ];
         let prepared = prepare_bundle(request, &argv, &mounts, None, false, Some(token))?;
-        let mut container = ProbeContainer { request, id: prepared.id.clone(), child: None, reaped: false, slirp_expected: false };
-        container.child = Some(Command::new(&request.crun)
-            .args(crun_prefix(request))
-            .arg("run")
-            .arg("--bundle")
-            .arg(&prepared.bundle)
-            .arg(&prepared.id)
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .kill_on_drop(true)
-            .spawn()
-            .map_err(|error| error.to_string())?);
+        let mut container = ProbeContainer {
+            request,
+            id: prepared.id.clone(),
+            child: None,
+            reaped: false,
+            slirp_expected: false,
+        };
+        container.child = Some(
+            Command::new(&request.crun)
+                .args(crun_prefix(request))
+                .arg("run")
+                .arg("--bundle")
+                .arg(&prepared.bundle)
+                .arg(&prepared.id)
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .kill_on_drop(true)
+                .spawn()
+                .map_err(|error| error.to_string())?,
+        );
         let start = std::time::Instant::now();
         let connected = loop {
             match listener.accept() {
@@ -944,26 +964,55 @@ async fn run_container(
     token: Option<&str>,
 ) -> Result<String, String> {
     let prepared = prepare_bundle(request, argv, mounts, secret, slirp, token)?;
-    let mut container = ProbeContainer { request, id: prepared.id.clone(), child: None, reaped: false, slirp_expected: slirp };
-    container.child = Some(Command::new(&request.crun)
-        .args(crun_prefix(request)).arg("run").arg("--bundle").arg(&prepared.bundle).arg(&prepared.id)
-        .stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).kill_on_drop(true)
-        .spawn().map_err(|error| error.to_string())?);
+    let mut container = ProbeContainer {
+        request,
+        id: prepared.id.clone(),
+        child: None,
+        reaped: false,
+        slirp_expected: slirp,
+    };
+    container.child = Some(
+        Command::new(&request.crun)
+            .args(crun_prefix(request))
+            .arg("run")
+            .arg("--bundle")
+            .arg(&prepared.bundle)
+            .arg(&prepared.id)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .map_err(|error| error.to_string())?,
+    );
     let child = container.child.as_mut().ok_or("container child")?;
     let stdout = child.stdout.take().ok_or("container stdout")?;
     let stderr = child.stderr.take().ok_or("container stderr")?;
     let result = tokio::time::timeout(timeout, async {
         let (stdout, stderr, status) = tokio::try_join!(
-            bounded_probe_output(stdout), bounded_probe_output(stderr),
+            bounded_probe_output(stdout),
+            bounded_probe_output(stderr),
             async { child.wait().await.map_err(|error| error.to_string()) }
         )?;
-        Ok::<_, String>(std::process::Output { status, stdout, stderr })
-    }).await.map_err(|_| "container timed out".to_string()).and_then(|result| result);
+        Ok::<_, String>(std::process::Output {
+            status,
+            stdout,
+            stderr,
+        })
+    })
+    .await
+    .map_err(|_| "container timed out".to_string())
+    .and_then(|result| result);
     let cleanup = container.finish().await;
     let output = match (result, cleanup) {
         (Ok(output), Ok(())) => output,
         (Err(reason), Ok(())) => return Err(reason),
-        (result, Err(cleanup)) => return Err(format!("{}; cleanup unproven: {cleanup}", result.err().unwrap_or_else(|| "container completed".into()))),
+        (result, Err(cleanup)) => {
+            return Err(format!(
+                "{}; cleanup unproven: {cleanup}",
+                result.err().unwrap_or_else(|| "container completed".into())
+            ))
+        }
     };
     let mut text = String::from_utf8_lossy(&output.stdout).into_owned();
     text.push_str(&String::from_utf8_lossy(&output.stderr));
@@ -974,11 +1023,19 @@ async fn run_container(
     Ok(text)
 }
 
-async fn bounded_probe_output(reader: impl tokio::io::AsyncRead + Unpin) -> Result<Vec<u8>, String> {
+async fn bounded_probe_output(
+    reader: impl tokio::io::AsyncRead + Unpin,
+) -> Result<Vec<u8>, String> {
     use tokio::io::AsyncReadExt;
     let mut bytes = Vec::new();
-    reader.take(1024 * 1024 + 1).read_to_end(&mut bytes).await.map_err(|error| error.to_string())?;
-    if bytes.len() > 1024 * 1024 { return Err("container output limit".into()); }
+    reader
+        .take(1024 * 1024 + 1)
+        .read_to_end(&mut bytes)
+        .await
+        .map_err(|error| error.to_string())?;
+    if bytes.len() > 1024 * 1024 {
+        return Err("container output limit".into());
+    }
     Ok(bytes)
 }
 
@@ -1048,7 +1105,14 @@ fn prepare_bundle(
     };
     // Concurrent probes must never reap one another's deterministic names.
     let id = format!("{id}-{}", uuid::Uuid::new_v4().simple());
-    for path in [request.runtime_root.join("state").join(&id), request.cgroup_root.join(&id), request.runtime_root.join("slirp-pids").join(format!("{id}.pid"))] {
+    for path in [
+        request.runtime_root.join("state").join(&id),
+        request.cgroup_root.join(&id),
+        request
+            .runtime_root
+            .join("slirp-pids")
+            .join(format!("{id}.pid")),
+    ] {
         if path.try_exists().map_err(|error| error.to_string())? {
             return Err("previous probe cleanup unproven".into());
         }
@@ -1516,33 +1580,58 @@ fn cgroup_dir_released(path: &Path) -> Result<bool, String> {
     Ok(!path.try_exists().map_err(|error| error.to_string())?)
 }
 
-fn bounded_reap_command(request: &ProbeRequest, tail: &[&str]) -> Result<(std::process::ExitStatus, String), String> {
+fn bounded_reap_command(
+    request: &ProbeRequest,
+    tail: &[&str],
+) -> Result<(std::process::ExitStatus, String), String> {
     use std::io::{Seek, SeekFrom};
     let mut stderr = tempfile::tempfile().map_err(|error| error.to_string())?;
-    let mut child = std::process::Command::new(&request.crun).args(crun_prefix(request)).args(tail)
-        .stdin(Stdio::null()).stdout(Stdio::null()).stderr(stderr.try_clone().map_err(|error| error.to_string())?)
-        .spawn().map_err(|error| error.to_string())?;
+    let mut child = std::process::Command::new(&request.crun)
+        .args(crun_prefix(request))
+        .args(tail)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(stderr.try_clone().map_err(|error| error.to_string())?)
+        .spawn()
+        .map_err(|error| error.to_string())?;
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
     let status = loop {
         match child.try_wait() {
             Ok(Some(status)) => break status,
-            Ok(None) if std::time::Instant::now() < deadline => std::thread::sleep(Duration::from_millis(10)),
+            Ok(None) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(10))
+            }
             result => {
                 let _ = child.kill();
                 let _ = child.wait();
-                return Err(result.err().map(|error| error.to_string()).unwrap_or_else(|| "container cleanup command timed out".into()));
+                return Err(result
+                    .err()
+                    .map(|error| error.to_string())
+                    .unwrap_or_else(|| "container cleanup command timed out".into()));
             }
         }
     };
-    stderr.seek(SeekFrom::Start(0)).map_err(|error| error.to_string())?;
+    stderr
+        .seek(SeekFrom::Start(0))
+        .map_err(|error| error.to_string())?;
     let mut text = String::new();
-    stderr.take(64 * 1024).read_to_string(&mut text).map_err(|error| error.to_string())?;
+    stderr
+        .take(64 * 1024)
+        .read_to_string(&mut text)
+        .map_err(|error| error.to_string())?;
     Ok((status, text))
 }
 
 fn reap_blocking(request: &ProbeRequest, id: &str, slirp_expected: bool) -> Result<(), String> {
-    let _ = super::sandbox::linux_stop_slirp(&request.runtime_root, id, slirp_expected)
-        .map_err(|error| error.details.reason.unwrap_or_else(|| "slirp cleanup unproven".into()));
+    let initial_helper_cleanup =
+        super::sandbox::linux_stop_slirp(&request.runtime_root, id, slirp_expected).map_err(
+            |error| {
+                error
+                    .details
+                    .reason
+                    .unwrap_or_else(|| "slirp cleanup unproven".into())
+            },
+        );
     let _ = bounded_reap_command(request, &["kill", id, "KILL"]);
     let (status, stderr) = bounded_reap_command(request, &["delete", id])?;
     let state_dir = request.runtime_root.join("state").join(id);
@@ -1550,8 +1639,16 @@ fn reap_blocking(request: &ProbeRequest, id: &str, slirp_expected: bool) -> Resu
     let cgroup_exists = !cgroup_dir_released(&cgroup_dir)?;
     let state_exists = state_dir.try_exists().map_err(|error| error.to_string())?;
     classify_container_reap(status.success(), &stderr, state_exists, cgroup_exists)?;
-    super::sandbox::linux_stop_slirp(&request.runtime_root, id, slirp_expected)
-        .map_err(|error| error.details.reason.unwrap_or_else(|| "slirp cleanup unproven".into()))
+    let final_helper_cleanup =
+        super::sandbox::linux_stop_slirp(&request.runtime_root, id, slirp_expected).map_err(
+            |error| {
+                error
+                    .details
+                    .reason
+                    .unwrap_or_else(|| "slirp cleanup unproven".into())
+            },
+        );
+    initial_helper_cleanup.and(final_helper_cleanup)
 }
 
 async fn reap(request: &ProbeRequest, id: &str, slirp_expected: bool) -> Result<(), String> {
@@ -1711,12 +1808,19 @@ mod cleanup_regressions {
             )).unwrap();
             fs::set_permissions(&crun, fs::Permissions::from_mode(0o700)).unwrap();
             let request = ProbeRequest {
-                data_dir: root.path().to_path_buf(), agent: "grok".into(),
-                rootfs: root.path().join("rootfs"), crun,
+                data_dir: root.path().to_path_buf(),
+                agent: "grok".into(),
+                rootfs: root.path().join("rootfs"),
+                crun,
                 // Only joined/read by the fake runner; never creates a cgroup.
-                cgroup_root: PathBuf::from(format!("/sys/fs/cgroup/codeg-fake-{}", uuid::Uuid::new_v4())),
+                cgroup_root: PathBuf::from(format!(
+                    "/sys/fs/cgroup/codeg-fake-{}",
+                    uuid::Uuid::new_v4()
+                )),
                 runtime_root: root.path().join("runtime"),
-                provider_bindings: root.path().join("bindings.json"), home: root.path().join("home"), profile_id: None,
+                provider_bindings: root.path().join("bindings.json"),
+                home: root.path().join("home"),
+                profile_id: None,
             };
             Self { root, request }
         }
@@ -1728,17 +1832,30 @@ mod cleanup_regressions {
                 while !self.root.path().join("pid").is_file() {
                     tokio::time::sleep(Duration::from_millis(5)).await;
                 }
-            }).await.unwrap();
+            })
+            .await
+            .unwrap();
         }
         fn assert_cleaned(&self, prefix: &str) {
             let calls = self.calls();
-            let id = calls.lines().find(|line| line.contains(" run --bundle "))
-                .and_then(|line| line.split_whitespace().last()).expect("owned run id");
+            let id = calls
+                .lines()
+                .find(|line| line.contains(" run --bundle "))
+                .and_then(|line| line.split_whitespace().last())
+                .expect("owned run id");
             assert!(id.starts_with(&format!("{prefix}-")), "{id}");
             assert!(calls.contains(&format!("kill {id} KILL")), "{calls}");
             assert!(calls.contains(&format!("delete {id}")), "{calls}");
-            let pid = fs::read_to_string(self.root.path().join("pid")).unwrap().trim().parse::<i32>().unwrap();
-            assert_eq!(unsafe { libc::kill(pid, 0) }, -1, "launcher remains alive or unreaped");
+            let pid = fs::read_to_string(self.root.path().join("pid"))
+                .unwrap()
+                .trim()
+                .parse::<i32>()
+                .unwrap();
+            assert_eq!(
+                unsafe { libc::kill(pid, 0) },
+                -1,
+                "launcher remains alive or unreaped"
+            );
         }
     }
     impl Drop for FakeRuntime {
@@ -1746,7 +1863,9 @@ mod cleanup_regressions {
             // The red test must not leak its stand-in even on assertion failure.
             if let Ok(pid) = fs::read_to_string(self.root.path().join("pid")) {
                 if let Ok(pid) = pid.trim().parse::<i32>() {
-                    unsafe { libc::kill(pid, libc::SIGKILL); }
+                    unsafe {
+                        libc::kill(pid, libc::SIGKILL);
+                    }
                 }
             }
         }
@@ -1754,9 +1873,23 @@ mod cleanup_regressions {
 
     #[tokio::test]
     async fn version_isolation_and_egress_timeouts_reap_the_owned_container() {
-        for (arg, id) in [("--version", "cq-version"), ("/scratch/probe.sh", "cq-isolation"), ("/scratch/egress.sh", "cq-egress")] {
+        for (arg, id) in [
+            ("--version", "cq-version"),
+            ("/scratch/probe.sh", "cq-isolation"),
+            ("/scratch/egress.sh", "cq-egress"),
+        ] {
             let fake = FakeRuntime::new();
-            let error = run_container(&fake.request, &[arg.into()], &[], None, Duration::from_millis(50), false, None).await.unwrap_err();
+            let error = run_container(
+                &fake.request,
+                &[arg.into()],
+                &[],
+                None,
+                Duration::from_millis(50),
+                false,
+                None,
+            )
+            .await
+            .unwrap_err();
             assert!(error.contains("timed out"), "{error}");
             fake.assert_cleaned(id);
         }
@@ -1767,7 +1900,16 @@ mod cleanup_regressions {
         let fake = FakeRuntime::new();
         let request = fake.request.clone();
         let task = tokio::spawn(async move {
-            run_container(&request, &["--version".into()], &[], None, Duration::from_secs(30), false, None).await
+            run_container(
+                &request,
+                &["--version".into()],
+                &[],
+                None,
+                Duration::from_secs(30),
+                false,
+                None,
+            )
+            .await
         });
         fake.wait_for_run().await;
         task.abort();
@@ -1789,11 +1931,30 @@ mod cleanup_regressions {
     #[test]
     fn measured_failures_replace_unrelated_pass_observations() {
         let mut facts = empty_facts("grok");
-        facts.checks.push(pass_flag("model_credential_material_in_sandbox", "placeholder", false));
-        stamp_failures(&mut facts, &[fail("model_credential_material_in_sandbox", "nonempty placeholder")]);
+        facts.checks.push(pass_flag(
+            "model_credential_material_in_sandbox",
+            "placeholder",
+            false,
+        ));
+        stamp_failures(
+            &mut facts,
+            &[fail(
+                "model_credential_material_in_sandbox",
+                "nonempty placeholder",
+            )],
+        );
         assert_eq!(facts.checks.len(), 1);
         assert_eq!(facts.checks[0].status, "failed");
-        stamp_failures(&mut facts, &[not_tested("model_credential_material_in_sandbox", "later missing probe")]);
-        assert_eq!(facts.checks[0].status, "failed", "unknown cannot replace a measured failure");
+        stamp_failures(
+            &mut facts,
+            &[not_tested(
+                "model_credential_material_in_sandbox",
+                "later missing probe",
+            )],
+        );
+        assert_eq!(
+            facts.checks[0].status, "failed",
+            "unknown cannot replace a measured failure"
+        );
     }
 }

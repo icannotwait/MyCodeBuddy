@@ -141,11 +141,14 @@ pub trait ParticipantRuntime: Send + Sync {
     }
 
     /// Revoke and reap known process-local owners before any database access.
-    async fn cleanup_local_room(&self, _room: RoomId) -> RtResult<()> { Ok(()) }
+    async fn cleanup_local_room(&self, _room: RoomId) -> RtResult<()> {
+        Ok(())
+    }
 
     /// Snapshot and clean every process-local owner without querying storage.
-    async fn cleanup_all_local(&self) -> RtResult<()> { Ok(()) }
-
+    async fn cleanup_all_local(&self) -> RtResult<()> {
+        Ok(())
+    }
 
     async fn run_room(
         &self,
@@ -484,21 +487,33 @@ impl RoundtableService {
                 pid: 0,
             })
             .collect();
-        let quarantined: std::collections::HashSet<_> = identities.iter().map(|identity| identity.incarnation).collect();
+        let quarantined: std::collections::HashSet<_> = identities
+            .iter()
+            .map(|identity| identity.incarnation)
+            .collect();
         let mut proven = Vec::new();
         for identity in identities.drain(..) {
             let incarnation = identity.incarnation;
             match self.runtime.cancel_and_reap(identity).await {
-                Ok(proof) if proof.process.incarnation == incarnation && proof.process.process_tree_empty && proof.mailbox_empty && proof.tools_drained && proof.ingress_drained => proven.push(incarnation),
+                Ok(proof)
+                    if proof.process.incarnation == incarnation
+                        && proof.process.process_tree_empty
+                        && proof.mailbox_empty
+                        && proof.tools_drained
+                        && proof.ingress_drained =>
+                {
+                    proven.push(incarnation)
+                }
                 _ => cleanup_ok = false,
             }
         }
         if self.writable() {
             let store = self.command_store()?;
             for intent in store.list_unreaped_launches().await? {
-                if !quarantined.contains(&intent.incarnation) && !identities
-                    .iter()
-                    .any(|identity| identity.incarnation == intent.incarnation)
+                if !quarantined.contains(&intent.incarnation)
+                    && !identities
+                        .iter()
+                        .any(|identity| identity.incarnation == intent.incarnation)
                 {
                     identities.push(RuntimeIdentity {
                         incarnation: intent.incarnation,
@@ -535,7 +550,9 @@ impl RoundtableService {
         }
         // All known owners have now been attempted; a persistence failure can
         // no longer prevent local reaping of a later owner.
-        for incarnation in proven { self.confirm_runtime_cleanup(incarnation).await?; }
+        for incarnation in proven {
+            self.confirm_runtime_cleanup(incarnation).await?;
+        }
         if self.writable() {
             let store = self.command_store()?;
             let txn = store.write_transaction().await?;
@@ -548,7 +565,9 @@ impl RoundtableService {
                     "SELECT (SELECT COUNT(*) FROM rt_attempts WHERE room_id=? AND cleanup_state<>'confirmed')+(SELECT COUNT(*) FROM rt_bindings b JOIN rt_launch_intents l ON l.incarnation=b.incarnation WHERE b.room_id=? AND l.reaped=0)",
                     vec![super::store::text(&room), super::store::text(&room)]).await?;
                 if pending == 0 {
-                    let room_id = room.parse().map_err(|_| rt_error(ErrorCode::StorageUnavailable, "room_id"))?;
+                    let room_id = room
+                        .parse()
+                        .map_err(|_| rt_error(ErrorCode::StorageUnavailable, "room_id"))?;
                     super::budget_ledger::settle_room_in(&txn, &store, &room_id).await?;
                 }
                 store.emit_current_in(&txn, &room, "recovery").await?;

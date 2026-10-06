@@ -532,7 +532,7 @@ fn acp_session_error_stops_slirp_and_deletes_the_container() {
     let log_quoted = format!("'{}'", log.display().to_string().replace('\'', "'\\''"));
     fs::write(
         &crun,
-        format!("#!/bin/sh\nprintf '%s\\n' \"$*\" >> {log_quoted}\nexit 1\n"),
+        format!("#!/bin/sh\nprintf '%s\\n' \"$*\" >> {log_quoted}\nexit 0\n"),
     )
     .expect("crun script");
     fs::set_permissions(&crun, fs::Permissions::from_mode(0o755)).expect("chmod");
@@ -545,7 +545,12 @@ fn acp_session_error_stops_slirp_and_deletes_the_container() {
         .arg("30")
         .spawn()
         .expect("stand-in slirp");
-    write_owned_helper_pin(&runtime_root, "cq-acp-9", slirp.id());
+    let mut watcher = spawn_owned_watcher(&runtime_root, "cq-acp-9");
+    write_helper_lifecycle_pins(
+        &runtime_root,
+        "cq-acp-9",
+        &[("slirp", slirp.id()), ("watcher", watcher.id())],
+    );
     let request = ProbeRequest {
         data_dir: dir.clone(),
         agent: "cursor".into(),
@@ -557,14 +562,29 @@ fn acp_session_error_stops_slirp_and_deletes_the_container() {
         home: dir.join("home"),
         profile_id: None,
     };
-    let error = codeg_lib::roundtable::probe_acp_exit_cleans_container(&request, "cq-acp-9")
-        .expect_err("session/new");
+    let result = codeg_lib::roundtable::probe_acp_exit_cleans_container(&request, "cq-acp-9");
+    let slirp_status = slirp.try_wait().expect("slirp status");
+    let watcher_status = watcher.try_wait().expect("watcher status");
+    let phase = fs::read_to_string(request.runtime_root.join("slirp-pids/cq-acp-9.pid.state"));
+    // Always clean the test's children, including when the assertion fails.
+    let _ = slirp.kill();
+    let _ = watcher.kill();
+    let _ = slirp.wait();
+    let _ = watcher.wait();
+    let error = result.expect_err("session/new");
     assert!(error.contains("session/new"), "{error}");
     let text = fs::read_to_string(&log).expect("crun log");
     assert!(text.contains("kill cq-acp-9 KILL"), "{text}");
     assert!(text.contains("delete cq-acp-9"), "{text}");
-    let status = slirp.wait().expect("slirp wait");
-    assert!(!status.success(), "slirp still running: {status}");
+    assert_eq!(phase.unwrap(), "cleanup-proven-started\n");
+    assert!(
+        slirp_status.is_some_and(|status| !status.success()),
+        "slirp was not terminated"
+    );
+    assert!(
+        watcher_status.is_some_and(|status| !status.success()),
+        "watcher was not terminated"
+    );
     let _ = fs::remove_dir_all(&dir);
 }
 
@@ -1109,6 +1129,7 @@ fn unmeasured_credential_visibility_is_unknown_rather_than_a_synthetic_fact() {
 #[test]
 fn probe_cleanup_cannot_leave_a_slirp_helper_that_ignores_term() {
     use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::process::ExitStatusExt;
     let root = tempfile::tempdir().unwrap();
     let runtime_root = root.path().join("runtime");
     fs::create_dir_all(runtime_root.join("slirp-pids")).unwrap();
@@ -1128,7 +1149,12 @@ fn probe_cleanup_cannot_leave_a_slirp_helper_that_ignores_term() {
     while !ready.exists() && std::time::Instant::now() < deadline {
         std::thread::sleep(std::time::Duration::from_millis(5));
     }
-    write_owned_helper_pin(&runtime_root, "cq-acp-review", helper.id());
+    let mut watcher = spawn_owned_watcher(&runtime_root, "cq-acp-review");
+    write_helper_lifecycle_pins(
+        &runtime_root,
+        "cq-acp-review",
+        &[("slirp", helper.id()), ("watcher", watcher.id())],
+    );
     let crun = root.path().join("fake-crun");
     fs::write(&crun, "#!/bin/sh\nexit 0\n").unwrap();
     fs::set_permissions(&crun, fs::Permissions::from_mode(0o700)).unwrap();
@@ -1143,15 +1169,23 @@ fn probe_cleanup_cannot_leave_a_slirp_helper_that_ignores_term() {
         home: root.path().join("home"),
         profile_id: None,
     };
-    assert!(
-        codeg_lib::roundtable::probe_acp_exit_cleans_container(&request, "cq-acp-review").is_err()
-    );
-    let ended = helper.try_wait().unwrap().is_some();
+    let result = codeg_lib::roundtable::probe_acp_exit_cleans_container(&request, "cq-acp-review");
+    let status = helper.try_wait().unwrap();
+    let watcher_status = watcher.try_wait().unwrap();
+    let phase = fs::read_to_string(request.runtime_root.join("slirp-pids/cq-acp-review.pid.state"));
     let _ = helper.kill();
+    let _ = watcher.kill();
     let _ = helper.wait();
+    let _ = watcher.wait();
+    assert!(result.is_err(), "the simulated ACP session must still fail");
+    assert_eq!(phase.unwrap(), "cleanup-proven-started\n");
     assert!(
-        ended,
-        "cleanup reported completion while the network helper survived"
+        status.is_some_and(|exit| exit.signal() == Some(libc::SIGKILL)),
+        "TERM-ignoring helper was not reaped after KILL"
+    );
+    assert!(
+        watcher_status.is_some_and(|exit| !exit.success()),
+        "watcher survived cleanup"
     );
 }
 
@@ -1166,7 +1200,11 @@ fn stale_slirp_pidfile_cannot_signal_an_unrelated_process() {
         .arg("30")
         .spawn()
         .unwrap();
-    write_owned_helper_pin(&runtime_root, "cq-acp-stale", unrelated.id());
+    write_helper_lifecycle_pins(
+        &runtime_root,
+        "cq-acp-stale",
+        &[("slirp", unrelated.id()), ("watcher", unrelated.id())],
+    );
     let crun = root.path().join("fake-crun");
     fs::write(&crun, "#!/bin/sh\nexit 0\n").unwrap();
     fs::set_permissions(&crun, fs::Permissions::from_mode(0o700)).unwrap();
@@ -1192,18 +1230,33 @@ fn stale_slirp_pidfile_cannot_signal_an_unrelated_process() {
 }
 
 #[cfg(target_os = "linux")]
-fn write_owned_helper_pin(runtime_root: &Path, id: &str, pid: u32) {
+fn spawn_owned_watcher(runtime_root: &Path, id: &str) -> std::process::Child {
+    std::process::Command::new("sleep")
+        .arg("30")
+        .env("CODEG_ROUNDTABLE_SLIRP_ROLE", "watcher")
+        .env("CODEG_ROUNDTABLE_SLIRP_OWNER", id)
+        .env("CODEG_ROUNDTABLE_SLIRP_ROOT", runtime_root)
+        .spawn()
+        .expect("stand-in watcher")
+}
+
+#[cfg(target_os = "linux")]
+fn write_helper_lifecycle_pins(runtime_root: &Path, id: &str, pins: &[(&str, u32)]) {
     use std::os::unix::fs::PermissionsExt;
-    let stat = fs::read_to_string(format!("/proc/{pid}/stat")).unwrap();
-    let start = stat
-        .rsplit_once(") ")
-        .unwrap()
-        .1
-        .split_whitespace()
-        .nth(19)
-        .unwrap();
+    let mut body = String::new();
+    for (role, pid) in pins {
+        let stat = fs::read_to_string(format!("/proc/{pid}/stat")).unwrap();
+        let start = stat
+            .rsplit_once(") ")
+            .unwrap()
+            .1
+            .split_whitespace()
+            .nth(19)
+            .unwrap();
+        body.push_str(&format!("{role} {pid} {start}\n"));
+    }
     let path = runtime_root.join("slirp-pids").join(format!("{id}.pid"));
-    fs::write(&path, format!("slirp {pid} {start}\n")).unwrap();
+    fs::write(&path, body).unwrap();
     fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
     for (suffix, body) in [("pid.lock", ""), ("pid.state", "running\n")] {
         let state = path.with_extension(suffix);

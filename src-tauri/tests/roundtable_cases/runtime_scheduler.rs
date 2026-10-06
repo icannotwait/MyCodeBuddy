@@ -646,13 +646,16 @@ async fn exercise_storage_failure(mode: u8) {
         let paused_service = service.clone();
         let read_actor = actor.clone();
         let read_room = room.clone();
-        let paused = tokio::spawn(async move {
+        let mut paused = tokio::spawn(async move {
             let command = match mode {
                 5 => "roundtable_stop",
                 6 => "roundtable_interject",
                 _ => "roundtable_pause",
             };
             let mut request = json!({"room_id":room,"request_id":uuid::Uuid::new_v4().to_string(),"expected_revision":revision});
+            if mode == 3 {
+                request["reason"] = json!("Verify cleanup settlement");
+            }
             if mode == 6 {
                 request["mode"] = json!("restart_current");
                 request["text"] = json!("Reconsider this phase");
@@ -661,10 +664,14 @@ async fn exercise_storage_failure(mode: u8) {
                 .execute_fake_command(&actor, command, request)
                 .await
         });
-        tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            executor.cleanup_entered.notified(),
-        )
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            tokio::select! {
+                _ = executor.cleanup_entered.notified() => {},
+                finished = &mut paused => {
+                    panic!("control returned before the held cleanup boundary: {finished:?}");
+                }
+            }
+        })
         .await
         .unwrap();
         assert_eq!(
@@ -673,7 +680,9 @@ async fn exercise_storage_failure(mode: u8) {
         );
         clock.set(610).unwrap();
         executor.cleanup_release.notify_one();
-        paused.await.unwrap().unwrap();
+        let ack = paused.await.unwrap().unwrap();
+        let operation: OperationId = serde_json::from_value(ack["operation_id"].clone())
+            .expect("accepted control must identify its durable operation");
         if mode == 6 {
             tokio::time::timeout(
                 std::time::Duration::from_secs(5),
@@ -683,15 +692,27 @@ async fn exercise_storage_failure(mode: u8) {
             .unwrap();
             service.shutdown().await.unwrap();
         }
+        // The command acknowledges acceptance. Cleanup settles its lease in
+        // an earlier transaction than the final control status/projection, so
+        // lease disappearance is not a completion barrier.
+        let completed = format!(
+            "SELECT COUNT(*) FROM rt_control_operations co JOIN rt_rooms r ON r.room_id=co.room_id WHERE co.operation_id='{operation}' AND co.step='done' AND co.status='completed' AND r.active_control_id IS NULL"
+        );
         tokio::time::timeout(std::time::Duration::from_secs(5), async {
-            while support::scalar_i64(&conn, "SELECT COUNT(*) FROM rt_active_time_leases").await
-                != 0
-            {
+            while support::scalar_i64(&conn, &completed).await != 1 {
                 tokio::time::sleep(std::time::Duration::from_millis(10)).await;
             }
         })
         .await
-        .unwrap();
+        .expect("the acknowledged control must finish and publish its projection");
+        assert_eq!(
+            support::scalar_i64(&conn, "SELECT COUNT(*) FROM rt_active_time_leases").await,
+            0
+        );
+        assert_eq!(
+            support::scalar_text(&conn, "SELECT status FROM rt_rooms").await,
+            if mode == 5 { "stopped" } else { "paused" }
+        );
         assert_eq!(
             support::scalar_i64(&conn, "SELECT remaining_active_ms FROM rt_rooms").await,
             899_400

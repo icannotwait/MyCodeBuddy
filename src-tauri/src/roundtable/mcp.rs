@@ -223,7 +223,10 @@ impl GateToolAuthority {
         self
     }
 
-    pub fn with_execution_lease(mut self, lease: Option<Arc<super::resources::ExecutionLease>>) -> Self {
+    pub fn with_execution_lease(
+        mut self,
+        lease: Option<Arc<super::resources::ExecutionLease>>,
+    ) -> Self {
         self.execution_lease = lease;
         self
     }
@@ -344,8 +347,15 @@ impl GateToolAuthority {
             .get(secret)
             .cloned()
             .ok_or_else(|| rt_error(ErrorCode::Unauthenticated, "token_unknown"))?;
-        if self.execution_lease.as_ref().is_some_and(|lease| lease.admit_tool(now.0) == 0) {
-            return Err(rt_error(ErrorCode::Unauthenticated, "prepaid_lease_expired"));
+        if self
+            .execution_lease
+            .as_ref()
+            .is_some_and(|lease| lease.admit_tool(now.0) == 0)
+        {
+            return Err(rt_error(
+                ErrorCode::Unauthenticated,
+                "prepaid_lease_expired",
+            ));
         }
         if now.0 >= issued.expires_at.0 {
             return Err(rt_error(ErrorCode::Unauthenticated, "token_expired"));

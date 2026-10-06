@@ -280,11 +280,17 @@ fn revoke_passed_report(path: &Path) {
 pub(crate) fn write_outcome(data_dir: &Path, mut facts: ProbeFacts) -> ProbeOutcome {
     // A report contains one conservative observation per name. A later pass
     // can never erase measured failure or incomplete/conflicting evidence.
-    if facts.oci.as_ref().is_some_and(|oci| !oci.auth_mounts.is_empty()) {
+    if facts
+        .oci
+        .as_ref()
+        .is_some_and(|oci| !oci.auth_mounts.is_empty())
+    {
         facts.checks.push(ProbeCheck {
             name: "model_credential_material_in_sandbox".into(),
             status: "failed".into(),
-            evidence: "native auth files are readable inside the sandbox, including attempt-local copies".into(),
+            evidence:
+                "native auth files are readable inside the sandbox, including attempt-local copies"
+                    .into(),
             input: b"configured-auth-mounts".to_vec(),
             output: b"credential-material-present".to_vec(),
             count: None,
@@ -519,7 +525,9 @@ fn check_accepted(check: &ProbeCheck) -> bool {
         "model_credential_material_in_sandbox"
         | "model_credentials_visible_to_agent"
         | "native_read_boundary" => check.flag == Some(false),
-        "actual_binary_match" | "ordered_turn_completion" | "submit_receipt_completion" => check.flag == Some(true),
+        "actual_binary_match" | "ordered_turn_completion" | "submit_receipt_completion" => {
+            check.flag == Some(true)
+        }
         _ => true,
     }
 }

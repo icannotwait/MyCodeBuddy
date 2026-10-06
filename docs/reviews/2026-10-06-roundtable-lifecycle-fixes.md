@@ -96,3 +96,21 @@ Regression updates:
 - Controlled live-cleanup fixtures now create a real fixture auth copy under the runtime scratch path and assert its directory is removed before successful cleanup, including the mandatory-database-write retry case
 
 Verification: `git diff --check` passed; `git merge-base --is-ancestor 15313e6 HEAD` returned 0. Rust compilation, tests and formatting remain unrun because the toolchain is unavailable. No live adapter, provider, credential or qualification certificate was used.
+
+
+## CI-driven fixture corrections
+
+The `Roundtable runtime gate` at `1606ca3` ran:
+
+```sh
+cargo --config .cargo/low-memory.toml test --locked --manifest-path src-tauri/Cargo.toml --no-default-features --features test-utils --test roundtable_runtime
+```
+
+Result: 114 passed, 4 failed, 1 ignored. Two failures were in the lifecycle control fixture; the other two were qualification-helper cleanup tests outside this correction.
+
+- `lifecycle_pause_command_settles_only_after_local_cleanup_finishes` timed out before entering cleanup. Its command omitted the required `PauseRequest.reason` field, so request normalization rejected it before any lifecycle mutation. The fixture now supplies that field and reports an early command error immediately instead of hiding it behind a notification timeout.
+- `lifecycle_stop_command_usage_excludes_unused_prepaid_slice` passed the exact balance and persisted usage checks, then observed an earlier projection with a 0 ms sample. The fixture used lease deletion as a completion barrier, but `cleanup_room` commits lease settlement before `advance_durable_control` commits the final status and projection. The fixture now waits for the specific acknowledged operation to be `done/completed` with no active control before asserting final state, projection, and usage.
+
+The five-second bounds and all 600 ms usage/settlement assertions remain unchanged. Assertions additionally verify terminal control state and that no active-time lease remains. No production behavior or permission checks changed.
+
+Validation of this correction: `git diff --check` passed. Local Rust tests and formatting remain unavailable because the environment has no Rust toolchain; this correction still requires execution by the existing CI gate. The failures above are actual CI observations, not local test results.

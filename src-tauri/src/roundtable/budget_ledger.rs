@@ -44,7 +44,10 @@ impl ActiveBudgetLease {
             Ok::<_,roundtable_protocol::RtError>(ledger.prepaid_until.0)
         }.await;
         let prepaid_until = match result {
-            Ok(until) => { txn.commit().await.map_err(super::store::storage_err)?; until },
+            Ok(until) => {
+                txn.commit().await.map_err(super::store::storage_err)?;
+                until
+            }
             Err(error) => {
                 let _ = txn.rollback().await;
                 return Err(error);
@@ -61,7 +64,9 @@ impl ActiveBudgetLease {
         })
     }
 
-    pub fn prepaid_until(&self) -> u64 { self.prepaid_until }
+    pub fn prepaid_until(&self) -> u64 {
+        self.prepaid_until
+    }
 
     pub async fn checkpoint(&mut self) -> RtResult<TimeLedger> {
         self.tick(false).await
@@ -105,13 +110,27 @@ impl ActiveBudgetLease {
 /// Recovery deletes old-boot leases conservatively and never calls this path
 /// to refund an unknown crash remainder.
 pub(crate) async fn settle_room_in(
-    txn: &impl ConnectionTrait, store: &RoundtableStore, room: &RoomId,
+    txn: &impl ConnectionTrait,
+    store: &RoundtableStore,
+    room: &RoomId,
 ) -> RtResult<()> {
-    if let Some(row) = optional_row(txn,
+    if let Some(row) = optional_row(
+        txn,
         "SELECT lease_id,boot_epoch,run_epoch FROM rt_active_time_leases WHERE room_id=?",
-        vec![text(&room.to_string())]).await? {
-        tick_in(txn, store, room, &column::<String>(&row, 0)?,
-            Epoch(nonnegative(column(&row, 1)?)?), Epoch(nonnegative(column(&row, 2)?)?), true).await?;
+        vec![text(&room.to_string())],
+    )
+    .await?
+    {
+        tick_in(
+            txn,
+            store,
+            room,
+            &column::<String>(&row, 0)?,
+            Epoch(nonnegative(column(&row, 1)?)?),
+            Epoch(nonnegative(column(&row, 2)?)?),
+            true,
+        )
+        .await?;
     }
     Ok(())
 }
@@ -198,7 +217,11 @@ async fn tick_in(
     // and publication. Reserve the clocks separately so a short phase cannot
     // expire permission for the entire room or refund cleanup into that phase.
     let next = if finish { 0 } else { SLICE_MS.min(remaining) };
-    let phase_next = if current.is_some() { next.min(phase_remaining) } else { 0 };
+    let phase_next = if current.is_some() {
+        next.min(phase_remaining)
+    } else {
+        0
+    };
     // Zero is still committed: a exhausted lease cannot leave a stale positive budget.
     exec(
         txn,

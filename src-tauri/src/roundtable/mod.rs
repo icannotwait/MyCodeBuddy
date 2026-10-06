@@ -109,16 +109,17 @@ pub use installed_runtime::verify_runtime_contract_fixture;
 pub use installed_runtime::ProviderBinding;
 #[cfg(any(test, feature = "test-utils"))]
 pub use live_gateway::{
-    exercise_gateway_http_failure_fixture, exercise_gateway_shutdown_fixture, exercise_live_gateway_fixture,
-    exercise_queued_gateway_fixture, GatewayFixtureObservation,
+    exercise_gateway_http_failure_fixture, exercise_gateway_shutdown_fixture,
+    exercise_live_gateway_fixture, exercise_queued_gateway_fixture, GatewayFixtureObservation,
 };
 #[cfg(any(test, feature = "test-utils"))]
 pub use live_runtime::{
-    drive_permission_repair_frames_fixture, drive_prompt_frames_fixture, prepared_live_cleanup_fixture, acp_frame_fixture, exercise_live_acp_rpc, exercise_schema_seat_rpc, permission_reply_fixture,
-    persist_runtime_diagnostic_fixture, redact_untrusted_excerpt_fixture,
-    rejected_live_executor_fixture, retire_attempt_files_fixture, retired_live_executor_fixture,
-    run_dir_retention_fixture, session_params_fixture, verify_confirmed_option_fixture,
-    LiveAcpRpcObservation, SchemaSeatObservation,
+    acp_frame_fixture, drive_permission_repair_frames_fixture, drive_prompt_frames_fixture,
+    exercise_live_acp_rpc, exercise_schema_seat_rpc, permission_reply_fixture,
+    persist_runtime_diagnostic_fixture, prepared_live_cleanup_fixture,
+    redact_untrusted_excerpt_fixture, rejected_live_executor_fixture, retire_attempt_files_fixture,
+    retired_live_executor_fixture, run_dir_retention_fixture, session_params_fixture,
+    verify_confirmed_option_fixture, LiveAcpRpcObservation, SchemaSeatObservation,
 };
 pub use maintenance::{
     backup_roundtable, gc_unreferenced, restore_roundtable, BackupManifest, GcReport,

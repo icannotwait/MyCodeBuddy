@@ -544,9 +544,15 @@ pub async fn apply_roundtable_schema(conn: &impl ConnectionTrait) -> Result<(), 
     // Existing installations used one reservation for both clocks. Preserve
     // that reservation exactly while separating room cleanup time from phase
     // execution time. This helper also runs at normal database startup.
-    let columns = conn.query_all(sea_orm::Statement::from_string(
-        sea_orm::DatabaseBackend::Sqlite, "PRAGMA table_info(rt_active_time_leases)".to_owned())).await?;
-    if !columns.iter().any(|column| column.try_get_by_index::<String>(1).ok().as_deref() == Some("phase_prepaid_ms")) {
+    let columns = conn
+        .query_all(sea_orm::Statement::from_string(
+            sea_orm::DatabaseBackend::Sqlite,
+            "PRAGMA table_info(rt_active_time_leases)".to_owned(),
+        ))
+        .await?;
+    if !columns.iter().any(|column| {
+        column.try_get_by_index::<String>(1).ok().as_deref() == Some("phase_prepaid_ms")
+    }) {
         conn.execute_unprepared("ALTER TABLE rt_active_time_leases ADD COLUMN phase_prepaid_ms INTEGER NOT NULL DEFAULT 0 CHECK(phase_prepaid_ms>=0 AND phase_prepaid_ms<=1000)").await?;
         conn.execute_unprepared("UPDATE rt_active_time_leases SET phase_prepaid_ms=CASE WHEN phase_id IS NULL THEN 0 ELSE prepaid_ms END").await?;
     }

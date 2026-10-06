@@ -212,7 +212,13 @@ impl RoundtableStore {
     /// write takes that reservation with the pool's bounded busy timeout.
     pub(crate) async fn write_transaction(&self) -> RtResult<DatabaseTransaction> {
         let txn = self.conn.begin().await.map_err(storage_err)?;
-        if let Err(error) = exec(&txn, "UPDATE rt_rooms SET revision=revision WHERE 0", vec![]).await {
+        if let Err(error) = exec(
+            &txn,
+            "UPDATE rt_rooms SET revision=revision WHERE 0",
+            vec![],
+        )
+        .await
+        {
             let _ = txn.rollback().await;
             return Err(error);
         }

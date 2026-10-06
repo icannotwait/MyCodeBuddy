@@ -88,7 +88,9 @@ impl RoundtableStore {
         }
         let txn = self.write_transaction().await?;
         #[cfg(any(test, feature = "test-utils"))]
-        if let Some(gate) = self.take_accept_writer_gate() { gate.wait().await; }
+        if let Some(gate) = self.take_accept_writer_gate() {
+            gate.wait().await;
+        }
         match self.accept_in(&txn, &input).await {
             Ok(value) => {
                 txn.commit().await.map_err(storage_err)?;

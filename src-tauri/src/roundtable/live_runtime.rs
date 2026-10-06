@@ -65,20 +65,48 @@ fn auth_denylist(installed: &InstalledRuntime, seeds: &[String]) -> RtResult<Vec
 /// prevents a changed file from supplying a different envelope proof afterward.
 fn verified_request_envelope_bound(installed: &InstalledRuntime) -> RtResult<Option<u64>> {
     use std::io::Read;
-    let invalid = || rt_error(ErrorCode::CapabilityUnqualified, "request_envelope_unqualified");
+    let invalid = || {
+        rt_error(
+            ErrorCode::CapabilityUnqualified,
+            "request_envelope_unqualified",
+        )
+    };
     let mut bytes = Vec::new();
-    std::fs::File::open(&installed.report_path).map_err(|_| invalid())?
-        .take(1_048_577).read_to_end(&mut bytes).map_err(|_| invalid())?;
+    std::fs::File::open(&installed.report_path)
+        .map_err(|_| invalid())?
+        .take(1_048_577)
+        .read_to_end(&mut bytes)
+        .map_err(|_| invalid())?;
     if bytes.len() > 1_048_576 || Hash256::sha256(&bytes) != installed.report_sha256 {
-        return Err(rt_error(ErrorCode::CapabilityUnqualified, "qualification_report_changed"));
+        return Err(rt_error(
+            ErrorCode::CapabilityUnqualified,
+            "qualification_report_changed",
+        ));
     }
-    let report = parse_strict_json(&bytes, &ParseLimits { origin:LimitsOrigin::Custom,max_bytes:1_048_576,max_depth:32 })?;
+    let report = parse_strict_json(
+        &bytes,
+        &ParseLimits {
+            origin: LimitsOrigin::Custom,
+            max_bytes: 1_048_576,
+            max_depth: 32,
+        },
+    )?;
     let proof = &report["request_envelope"];
-    if proof.is_null() || proof["status"] == "not_tested" { return Ok(None); }
-    if proof["status"] != "passed" { return Err(invalid()); }
-    let bound = proof["max_bytes"].as_u64().filter(|bound| *bound <= installed.context_profile.max_request_body_bytes).ok_or_else(invalid)?;
-    let evidence: Hash256 = serde_json::from_value(proof["evidence_hash"].clone()).map_err(|_| invalid())?;
-    if evidence == Hash256::from_bytes([0;32]) { return Err(invalid()); }
+    if proof.is_null() || proof["status"] == "not_tested" {
+        return Ok(None);
+    }
+    if proof["status"] != "passed" {
+        return Err(invalid());
+    }
+    let bound = proof["max_bytes"]
+        .as_u64()
+        .filter(|bound| *bound <= installed.context_profile.max_request_body_bytes)
+        .ok_or_else(invalid)?;
+    let evidence: Hash256 =
+        serde_json::from_value(proof["evidence_hash"].clone()).map_err(|_| invalid())?;
+    if evidence == Hash256::from_bytes([0; 32]) {
+        return Err(invalid());
+    }
     Ok(Some(bound))
 }
 
@@ -114,9 +142,15 @@ fn credential_ready(
     std::env::var_os(&binding.credential_env).is_some() || file_auth_ready(installed)
 }
 
-fn require_provider_credential(installed: &InstalledRuntime, binding: &super::installed_runtime::ProviderBinding) -> RtResult<()> {
+fn require_provider_credential(
+    installed: &InstalledRuntime,
+    binding: &super::installed_runtime::ProviderBinding,
+) -> RtResult<()> {
     if !credential_ready(installed, binding) {
-        return Err(rt_error(ErrorCode::CapabilityUnqualified, "provider_credential_missing"));
+        return Err(rt_error(
+            ErrorCode::CapabilityUnqualified,
+            "provider_credential_missing",
+        ));
     }
     Ok(())
 }
@@ -223,7 +257,13 @@ impl LiveParticipantExecutor {
     }
 
     async fn reap_active(&self, incarnation: IncarnationId) -> RtResult<CleanupProof> {
-        if let Some(proof) = self.completed_cleanup.lock().expect("completed cleanup").get(&incarnation).cloned() {
+        if let Some(proof) = self
+            .completed_cleanup
+            .lock()
+            .expect("completed cleanup")
+            .get(&incarnation)
+            .cloned()
+        {
             return Ok(proof);
         }
         let active = self
@@ -308,7 +348,9 @@ impl LiveParticipantExecutor {
                 tools_drained: active.authority.pending_handlers() == 0,
                 ingress_drained: true,
             };
-            if !proof.tools_drained { return Err(rt_error(ErrorCode::RuntimeUnavailable, "cleanup_unproven")); }
+            if !proof.tools_drained {
+                return Err(rt_error(ErrorCode::RuntimeUnavailable, "cleanup_unproven"));
+            }
             *cached = Some(proof.clone());
             return self.persist_reaped(&active, &proof).await;
         }
@@ -340,7 +382,11 @@ impl LiveParticipantExecutor {
         self.persist_reaped(&active, &proof).await
     }
 
-    async fn persist_reaped(&self, active: &Arc<Active>, proof: &CleanupProof) -> RtResult<CleanupProof> {
+    async fn persist_reaped(
+        &self,
+        active: &Arc<Active>,
+        proof: &CleanupProof,
+    ) -> RtResult<CleanupProof> {
         let incarnation = proof.process.incarnation;
         self.retire_incarnation(incarnation)?;
         // Mandatory cleanup facts commit atomically. Optional diagnostics may
@@ -352,7 +398,14 @@ impl LiveParticipantExecutor {
             txn.commit().await.map_err(super::store::storage_err)?;
             Ok::<(), roundtable_protocol::RtError>(())
         }).await.map_err(|_| rt_error(ErrorCode::StorageUnavailable, "cleanup_persistence_pending"))??;
-        if !matches!(tokio::time::timeout(std::time::Duration::from_millis(100), persist_diagnostic(active)).await, Ok(Ok(()))) {
+        if !matches!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(100),
+                persist_diagnostic(active)
+            )
+            .await,
+            Ok(Ok(()))
+        ) {
             tracing::warn!(%incarnation, "roundtable optional diagnostic persistence failed");
         }
         // A control may cancel the driver after cleanup but before its final
@@ -360,18 +413,27 @@ impl LiveParticipantExecutor {
         // proof so that cancellation cannot lose cleanup ownership in that gap.
         let mut completed = self.completed_cleanup.lock().expect("completed cleanup");
         if completed.len() >= 1024 {
-            if let Some(expired) = completed.keys().next().copied() { completed.remove(&expired); }
+            if let Some(expired) = completed.keys().next().copied() {
+                completed.remove(&expired);
+            }
         }
         completed.insert(incarnation, proof.clone());
-        self.active.lock().expect("active runtimes").remove(&incarnation);
-        self.launches.lock().expect("launch lifecycle").remove(&incarnation);
+        self.active
+            .lock()
+            .expect("active runtimes")
+            .remove(&incarnation);
+        self.launches
+            .lock()
+            .expect("launch lifecycle")
+            .remove(&incarnation);
         Ok(proof.clone())
     }
-
 }
 
 impl TokenBound for LiveParticipantExecutor {
-    fn upper_bound_for_length(&self, len: u64) -> RtResult<u64> { Ok(len) }
+    fn upper_bound_for_length(&self, len: u64) -> RtResult<u64> {
+        Ok(len)
+    }
     fn upper_bound(&self, bytes: &[u8]) -> RtResult<u64> {
         Ok(bytes.len() as u64)
     }
@@ -441,12 +503,17 @@ impl RoundtableTurnExecutor for LiveParticipantExecutor {
         self
     }
     fn context_profile(&self, participant: &ParticipantV1) -> Option<QualifiedContextProfile> {
-        self.adapters.get(participant.agent.as_deref().unwrap_or("codex")).map(|installed| installed.context_profile.clone())
+        self.adapters
+            .get(participant.agent.as_deref().unwrap_or("codex"))
+            .map(|installed| installed.context_profile.clone())
     }
     fn request_envelope_bound_bytes(&self, participant: &ParticipantV1) -> RtResult<Option<u64>> {
         verified_request_envelope_bound(&self.adapter(&participant_agent(participant)?)?)
     }
-    fn request_envelope_proof_hash(&self, participant: &ParticipantV1) -> RtResult<Option<Hash256>> {
+    fn request_envelope_proof_hash(
+        &self,
+        participant: &ParticipantV1,
+    ) -> RtResult<Option<Hash256>> {
         let installed = self.adapter(&participant_agent(participant)?)?;
         Ok(verified_request_envelope_bound(&installed)?.map(|_| installed.report_sha256))
     }
@@ -478,7 +545,10 @@ impl RoundtableTurnExecutor for LiveParticipantExecutor {
             .cloned()
             .ok_or_else(|| rt_error(ErrorCode::CapabilityUnqualified, "provider_unqualified"))?;
         require_provider_credential(&installed, &provider)?;
-        let mut diagnostic_secrets = auth_denylist(&installed, &[std::env::var(&provider.credential_env).unwrap_or_default()])?;
+        let mut diagnostic_secrets = auth_denylist(
+            &installed,
+            &[std::env::var(&provider.credential_env).unwrap_or_default()],
+        )?;
         let (execution, facts) = self.policy(&installed, &provider.model)?;
         let directory = installed
             .oci
@@ -521,24 +591,30 @@ impl RoundtableTurnExecutor for LiveParticipantExecutor {
         );
         let token = Arc::new(authority.issue());
         let provider_token = uuid::Uuid::new_v4().to_string();
-        diagnostic_secrets.extend([provider_token.clone(), token.reveal_for_same_sandbox().to_owned()]);
-        let store_clock = request.store.clone();
-        let gateway = Arc::new(LiveModelGateway::new(
-            self.data_dir.clone(),
-            (
-                super::ApprovedOrigin::parse(&provider.origin)?,
-                super::HostCredential::injected(
-                    std::env::var(&provider.credential_env).unwrap_or_default(),
-                ),
-                provider.model.clone(),
-                request.participant.effort.clone(),
-            ),
+        diagnostic_secrets.extend([
             provider_token.clone(),
-            (execution, facts),
-            MonoMs(request.deadline_mono),
-            Arc::new(move || MonoMs(store_clock.clock_sample().0)),
-            installed.context_profile.clone(),
-        )?.with_execution_lease(request.execution_lease.clone()));
+            token.reveal_for_same_sandbox().to_owned(),
+        ]);
+        let store_clock = request.store.clone();
+        let gateway = Arc::new(
+            LiveModelGateway::new(
+                self.data_dir.clone(),
+                (
+                    super::ApprovedOrigin::parse(&provider.origin)?,
+                    super::HostCredential::injected(
+                        std::env::var(&provider.credential_env).unwrap_or_default(),
+                    ),
+                    provider.model.clone(),
+                    request.participant.effort.clone(),
+                ),
+                provider_token.clone(),
+                (execution, facts),
+                MonoMs(request.deadline_mono),
+                Arc::new(move || MonoMs(store_clock.clock_sample().0)),
+                installed.context_profile.clone(),
+            )?
+            .with_execution_lease(request.execution_lease.clone()),
+        );
         let principal_row = one_row(
             request.store.connection(),
             "SELECT principal_id FROM rt_rooms WHERE room_id=?",
@@ -711,8 +787,7 @@ impl RoundtableTurnExecutor for LiveParticipantExecutor {
                 rt_error(ErrorCode::CapabilityUnqualified, "companion_binary_missing")
             })?;
         let result = drive_acp(
-            stdin,
-            stdout,
+            (stdin, stdout),
             &request,
             &mcp.absolute_path,
             token.reveal_for_same_sandbox(),
@@ -786,8 +861,7 @@ fn evidence_objects(prompt: &[u8]) -> RtResult<BTreeMap<String, roundtable_proto
 }
 
 async fn drive_acp(
-    mut stdin: tokio::process::ChildStdin,
-    stdout: tokio::process::ChildStdout,
+    (mut stdin, stdout): (tokio::process::ChildStdin, tokio::process::ChildStdout),
     request: &RoundtableTurnRequest,
     mcp: &str,
     token: &str,
@@ -914,7 +988,11 @@ async fn drive_acp(
         session_id,
         prompt,
         &mut seq,
-        SeatPromptControl { assistant:Some(&active.assistant), deadline:None, gateway:Some(&active.gateway) },
+        SeatPromptControl {
+            assistant: Some(&active.assistant),
+            deadline: None,
+            gateway: Some(&active.gateway),
+        },
     )
     .await?;
     Ok(seq)
@@ -1029,7 +1107,9 @@ struct SeatPromptControl<'a> {
 }
 impl SeatPromptControl<'_> {
     fn check_completion(&self) -> RtResult<()> {
-        if let Some(error)=self.gateway.and_then(LiveModelGateway::completion_error) { return Err(error); }
+        if let Some(error) = self.gateway.and_then(LiveModelGateway::completion_error) {
+            return Err(error);
+        }
         Ok(())
     }
 }
@@ -1064,8 +1144,8 @@ where
                     "prompt": [{"type": "text", "text": text}]
                 }),
                 seq,
-                assistant:control.assistant,
-                deadline:control.deadline,
+                assistant: control.assistant,
+                deadline: control.deadline,
                 rejected_permission: &rejected,
             },
         )
@@ -1231,13 +1311,21 @@ where
             if message.get("error").is_some() {
                 return Err(rt_error(ErrorCode::RuntimeUnavailable, "acp_rejected"));
             }
-            let result = message.get("result").cloned()
+            let result = message
+                .get("result")
+                .cloned()
                 .ok_or_else(|| rt_error(ErrorCode::RuntimeUnavailable, "acp_response"))?;
             check_failure_metadata(&result, super::FailureSource::Response)?;
             check_failure_metadata(&message, super::FailureSource::Response)?;
-            if exchange.method == "session/prompt" && result["stopReason"] != "end_turn"
-                && !(result["stopReason"] == "cancelled" && exchange.rejected_permission.load(Ordering::Relaxed)) {
-                return Err(rt_error(ErrorCode::RuntimeUnavailable, "acp_abnormal_finish"));
+            if exchange.method == "session/prompt"
+                && result["stopReason"] != "end_turn"
+                && !(result["stopReason"] == "cancelled"
+                    && exchange.rejected_permission.load(Ordering::Relaxed))
+            {
+                return Err(rt_error(
+                    ErrorCode::RuntimeUnavailable,
+                    "acp_abnormal_finish",
+                ));
             }
             return Ok(result);
         }
@@ -1250,14 +1338,20 @@ fn check_failure_metadata(carrier: &Value, source: super::FailureSource) -> RtRe
     // that a declared sessionFailure is classified or marked incompatible.
     let classification = super::classify_service_failure(meta, source, None, None);
     if classification.incompatible {
-        return Err(rt_error(ErrorCode::CapabilityUnqualified, "adapter_incompatible"));
+        return Err(rt_error(
+            ErrorCode::CapabilityUnqualified,
+            "adapter_incompatible",
+        ));
     }
-    if classification.records.iter().any(|record| record.severity != "warning") {
+    if classification
+        .records
+        .iter()
+        .any(|record| record.severity != "warning")
+    {
         return Err(rt_error(ErrorCode::RuntimeUnavailable, "session_failure"));
     }
     Ok(())
 }
-
 
 fn parse_acp_frame(line: &[u8]) -> RtResult<Value> {
     let line = line.strip_suffix(b"\n").unwrap_or(line);
@@ -1281,7 +1375,11 @@ fn permission_reply(params: &Value, request_id: &Value) -> Value {
     // ACP does not prove that allow_always is confined to this sealed attempt.
     // If one-shot consent is unavailable, select a rejection instead.
     let selected = selected_option(params, allow).or_else(|| {
-        if allow { selected_option(params, false) } else { None }
+        if allow {
+            selected_option(params, false)
+        } else {
+            None
+        }
     });
     match selected {
         Some(option_id) => json!({
@@ -1322,26 +1420,46 @@ fn selected_option(params: &Value, allow: bool) -> Option<String> {
 /// when it is exactly `roundtable__<tool>`.
 fn tool_call_is_roundtable(params: &Value) -> bool {
     let call = &params["toolCall"];
-    if matches!(call.get("kind").and_then(Value::as_str), Some("execute" | "edit" | "delete" | "move" | "switch_mode")) {
+    if matches!(
+        call.get("kind").and_then(Value::as_str),
+        Some("execute" | "edit" | "delete" | "move" | "switch_mode")
+    ) {
         return false;
     }
     // A machine name wins over display text. Only the explicit Grok use_tool
     // wrapper may route through its arguments, and only to a scoped MCP name.
-    let Some(identity)=call.get("name").or_else(||call.get("title")).and_then(Value::as_str) else { return false; };
+    let Some(identity) = call
+        .get("name")
+        .or_else(|| call.get("title"))
+        .and_then(Value::as_str)
+    else {
+        return false;
+    };
     if identity == "use_tool" {
-        let Some(input)=call.get("rawInput").and_then(Value::as_object) else { return false; };
-        if input.keys().any(|key| !matches!(key.as_str(),"tool_name"|"tool_input"))
-            || !input.get("tool_input").is_some_and(Value::is_object) { return false; }
-        return input.get("tool_name").and_then(Value::as_str)
-            .and_then(scoped_roundtable_tool).is_some();
+        let Some(input) = call.get("rawInput").and_then(Value::as_object) else {
+            return false;
+        };
+        if input
+            .keys()
+            .any(|key| !matches!(key.as_str(), "tool_name" | "tool_input"))
+            || !input.get("tool_input").is_some_and(Value::is_object)
+        {
+            return false;
+        }
+        return input
+            .get("tool_name")
+            .and_then(Value::as_str)
+            .and_then(scoped_roundtable_tool)
+            .is_some();
     }
     text_names_roundtable_tool(identity)
 }
 
 fn scoped_roundtable_tool(text: &str) -> Option<&str> {
-    let name=text.strip_prefix("roundtable__")
-        .or_else(||text.strip_prefix("roundtable/"))
-        .or_else(||text.strip_prefix("mcp__roundtable__"))?;
+    let name = text
+        .strip_prefix("roundtable__")
+        .or_else(|| text.strip_prefix("roundtable/"))
+        .or_else(|| text.strip_prefix("mcp__roundtable__"))?;
     ROUNDTABLE_TOOL_NAMES.contains(&name).then_some(name)
 }
 fn text_names_roundtable_tool(text: &str) -> bool {
@@ -1378,21 +1496,26 @@ fn retire_attempt_files(runtime_root: &Path, incarnation: &str) -> RtResult<()> 
     match std::fs::symlink_metadata(&run_dir) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(_) => return Err(rt_error(ErrorCode::StorageUnavailable, "runtime_directory")),
-        Ok(meta) if meta.file_type().is_symlink() || !meta.is_dir() => return Err(rt_error(ErrorCode::StorageUnavailable, "runtime_directory")),
-        Ok(_) => {},
+        Ok(meta) if meta.file_type().is_symlink() || !meta.is_dir() => {
+            return Err(rt_error(ErrorCode::StorageUnavailable, "runtime_directory"))
+        }
+        Ok(_) => {}
     }
     let run_dir = contained_directory(&runs, &run_dir)?;
     // Only the host reaper writes this marker, after proof and scratch removal.
     let marker = run_dir.join(RETIREMENT_MARKER);
     match std::fs::symlink_metadata(&marker) {
-        Ok(_) if retirement_record_matches(&run_dir) => {},
+        Ok(_) if retirement_record_matches(&run_dir) => {}
         Ok(_) => return Err(rt_error(ErrorCode::StorageUnavailable, "retirement_marker")),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             // Publish only complete records. A failed write must not leave an
             // incomplete marker that makes later cleanup retries impossible.
             let temporary = run_dir.join(format!("{RETIREMENT_MARKER}.{}", uuid::Uuid::new_v4()));
             let written = (|| -> std::io::Result<()> {
-                let mut file = std::fs::OpenOptions::new().write(true).create_new(true).open(&temporary)?;
+                let mut file = std::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(&temporary)?;
                 std::io::Write::write_all(&mut file, retirement_record(incarnation).as_bytes())?;
                 file.sync_all()?;
                 drop(file);
@@ -1402,7 +1525,7 @@ fn retire_attempt_files(runtime_root: &Path, incarnation: &str) -> RtResult<()> 
                 let _ = std::fs::remove_file(&temporary);
                 return Err(rt_error(ErrorCode::StorageUnavailable, "retirement_marker"));
             }
-        },
+        }
         Err(_) => return Err(rt_error(ErrorCode::StorageUnavailable, "retirement_marker")),
     }
     prune_run_dirs(&runs, RUN_DIR_RETENTION, incarnation);
@@ -1414,13 +1537,22 @@ fn retirement_record(incarnation: &str) -> String {
 }
 
 fn retirement_record_matches(run_dir: &Path) -> bool {
-    let Some(name) = run_dir.file_name().and_then(|name| name.to_str()) else { return false; };
+    let Some(name) = run_dir.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
     // Even a stale marker cannot authorize removing newly created scratch.
-    if !matches!(std::fs::symlink_metadata(run_dir.join("scratch")), Err(error) if error.kind() == std::io::ErrorKind::NotFound) { return false; }
+    if !matches!(std::fs::symlink_metadata(run_dir.join("scratch")), Err(error) if error.kind() == std::io::ErrorKind::NotFound)
+    {
+        return false;
+    }
     let marker = run_dir.join(RETIREMENT_MARKER);
     let expected = retirement_record(name);
-    let Ok(meta) = std::fs::symlink_metadata(&marker) else { return false; };
-    if meta.file_type().is_symlink() || !meta.is_file() || meta.len() != expected.len() as u64 { return false; }
+    let Ok(meta) = std::fs::symlink_metadata(&marker) else {
+        return false;
+    };
+    if meta.file_type().is_symlink() || !meta.is_file() || meta.len() != expected.len() as u64 {
+        return false;
+    }
     std::fs::read(marker).is_ok_and(|bytes| bytes == expected.as_bytes())
 }
 
@@ -1559,7 +1691,9 @@ fn prune_run_dirs(runs: &Path, keep: usize, protect: &str) {
     let drop_after = keep.saturating_sub(protected);
     for (_, path) in dirs.into_iter().skip(drop_after) {
         // Recheck immediately before deletion in case scratch was recreated.
-        if !retirement_record_matches(&path) { continue; }
+        if !retirement_record_matches(&path) {
+            continue;
+        }
         if let Err(error) = std::fs::remove_dir_all(&path) {
             tracing::warn!(
                 path = %path.display(),
@@ -1571,19 +1705,24 @@ fn prune_run_dirs(runs: &Path, keep: usize, protect: &str) {
 }
 /// This gate runs after gateway handlers are drained and before reading the
 /// sealed candidate. A normal ACP end_turn cannot erase a gateway failure.
-pub(crate) fn complete_after_gateway_drain(result: RtResult<u64>, gateway: &LiveModelGateway) -> RtResult<u64> {
+pub(crate) fn complete_after_gateway_drain(
+    result: RtResult<u64>,
+    gateway: &LiveModelGateway,
+) -> RtResult<u64> {
     let watermark = result?;
-    if let Some(error) = gateway.completion_error() { return Err(error); }
+    if let Some(error) = gateway.completion_error() {
+        return Err(error);
+    }
     Ok(watermark)
 }
 
 async fn persist_diagnostic(active: &Active) -> RtResult<()> {
-    let gateway_reason = active.gateway.completion_error().and_then(|error| error.details.reason);
-    let reason = gateway_reason.or_else(|| active
-        .finish_reason
-        .lock()
-        .expect("finish reason")
-        .clone())
+    let gateway_reason = active
+        .gateway
+        .completion_error()
+        .and_then(|error| error.details.reason);
+    let reason = gateway_reason
+        .or_else(|| active.finish_reason.lock().expect("finish reason").clone())
         .unwrap_or_else(|| "cancelled".into());
     persist_capture(
         &active.store,
@@ -2028,31 +2167,96 @@ pub fn run_dir_retention_fixture() -> usize {
 /// mandatory cleanup persistence path. No subprocess, provider or certificate
 /// is run. The gateway carries explicit simulated remote uncertainty.
 #[cfg(any(test, feature = "test-utils"))]
-pub async fn prepared_live_cleanup_fixture(root: PathBuf, request: RoundtableTurnRequest) -> RtResult<Arc<dyn RoundtableTurnExecutor>> {
+pub async fn prepared_live_cleanup_fixture(
+    root: PathBuf,
+    request: RoundtableTurnRequest,
+) -> RtResult<Arc<dyn RoundtableTurnExecutor>> {
     let executor = unqualified_live_fixture(root.clone(), None)?;
     let installed = executor.adapters.values().next().expect("fixture adapter");
     let binding = TokenBinding {
-        attempt_id: request.fence.attempt_id, room_id: request.room_id, fence: request.fence.clone(),
-        speaker_id: request.speaker_id, tool_version: super::SERVICE_TOOL_VERSION.into(),
-        aliases: request.scope.aliases.clone(), result_scope: request.scope.clone(), evidence: Default::default(), profile: installed.context_profile.clone(),
+        attempt_id: request.fence.attempt_id,
+        room_id: request.room_id,
+        fence: request.fence.clone(),
+        speaker_id: request.speaker_id,
+        tool_version: super::SERVICE_TOOL_VERSION.into(),
+        aliases: request.scope.aliases.clone(),
+        result_scope: request.scope.clone(),
+        evidence: Default::default(),
+        profile: installed.context_profile.clone(),
     };
-    let facts = AdmissionFacts { certificate: QualificationStatus::NotTested, presented_key: installed.qualification_key.clone(), qualification_attempts_used: 0, qualification_spend_used: 0, fixture_hash: Hash256::from_bytes([0;32]), recipient: "fixture-model".into() };
-    let authority = Arc::new(GateToolAuthority::open(&root, ExecutionScope::Fake, facts, MonoMs(0), MonoMs(u64::MAX), binding));
-    let gateway = Arc::new(super::live_gateway::uncertain_gateway_for_cleanup_fixture(&root, installed.context_profile.clone())?);
+    let facts = AdmissionFacts {
+        certificate: QualificationStatus::NotTested,
+        presented_key: installed.qualification_key.clone(),
+        qualification_attempts_used: 0,
+        qualification_spend_used: 0,
+        fixture_hash: Hash256::from_bytes([0; 32]),
+        recipient: "fixture-model".into(),
+    };
+    let authority = Arc::new(GateToolAuthority::open(
+        &root,
+        ExecutionScope::Fake,
+        facts,
+        MonoMs(0),
+        MonoMs(u64::MAX),
+        binding,
+    ));
+    let gateway = Arc::new(super::live_gateway::uncertain_gateway_for_cleanup_fixture(
+        &root,
+        installed.context_profile.clone(),
+    )?);
     let mut diagnostic = super::DiagnosticCapture::new(Vec::new());
     diagnostic.push("controlled cleanup diagnostic");
     let incarnation = request.fence.incarnation;
-    let scratch = installed.oci.runtime_root.join("runs").join(incarnation.to_string()).join("scratch");
+    let scratch = installed
+        .oci
+        .runtime_root
+        .join("runs")
+        .join(incarnation.to_string())
+        .join("scratch");
     let auth = scratch.join("rt-home/.grok/auth.json");
     std::fs::create_dir_all(auth.parent().expect("fixture auth parent"))
         .and_then(|_| std::fs::write(&auth, b"controlled-fixture-auth"))
         .map_err(|_| rt_error(ErrorCode::StorageUnavailable, "fixture_scratch"))?;
-    request.store.record_launch(LaunchIntent { owner_label: super::sandbox::owner_label(&executor.db_identity, request.fence.boot_epoch, &incarnation), db: executor.db_identity.clone(), boot_epoch: request.fence.boot_epoch, incarnation, image_digest: String::new(), plan_hash: Hash256::from_bytes([0;32]), spawned: None, reaped: false }).await?;
+    request
+        .store
+        .record_launch(LaunchIntent {
+            owner_label: super::sandbox::owner_label(
+                &executor.db_identity,
+                request.fence.boot_epoch,
+                &incarnation,
+            ),
+            db: executor.db_identity.clone(),
+            boot_epoch: request.fence.boot_epoch,
+            incarnation,
+            image_digest: String::new(),
+            plan_hash: Hash256::from_bytes([0; 32]),
+            spawned: None,
+            reaped: false,
+        })
+        .await?;
     let active = Arc::new(Active {
-        store: request.store, room: request.room_id, attempt: request.fence.attempt_id, scratch,
-        launched: std::sync::atomic::AtomicBool::new(false), instance: Mutex::new(None), child: tokio::sync::Mutex::new(None), broker: tokio::sync::Mutex::new(None), gateway_server: tokio::sync::Mutex::new(None), gateway, authority, agent: "codex".into(), cleanup: tokio::sync::Mutex::new(None), stderr: tokio::sync::Mutex::new(None), assistant: Mutex::new(Some(diagnostic)), finish_reason: Mutex::new(Some("completed".into())),
+        store: request.store,
+        room: request.room_id,
+        attempt: request.fence.attempt_id,
+        scratch,
+        launched: std::sync::atomic::AtomicBool::new(false),
+        instance: Mutex::new(None),
+        child: tokio::sync::Mutex::new(None),
+        broker: tokio::sync::Mutex::new(None),
+        gateway_server: tokio::sync::Mutex::new(None),
+        gateway,
+        authority,
+        agent: "codex".into(),
+        cleanup: tokio::sync::Mutex::new(None),
+        stderr: tokio::sync::Mutex::new(None),
+        assistant: Mutex::new(Some(diagnostic)),
+        finish_reason: Mutex::new(Some("completed".into())),
     });
-    executor.active.lock().expect("active runtimes").insert(incarnation, active);
+    executor
+        .active
+        .lock()
+        .expect("active runtimes")
+        .insert(incarnation, active);
     Ok(executor)
 }
 
@@ -2062,164 +2266,31 @@ pub async fn prepared_live_cleanup_fixture(root: PathBuf, request: RoundtableTur
 pub async fn drive_prompt_frames_fixture(frames: &[Value]) -> RtResult<u64> {
     let mut bytes = Vec::new();
     for frame in frames {
-        bytes.extend(serde_json::to_vec(frame).map_err(|_|rt_error(ErrorCode::InvalidArgument,"fixture_frame"))?);
+        bytes.extend(
+            serde_json::to_vec(frame)
+                .map_err(|_| rt_error(ErrorCode::InvalidArgument, "fixture_frame"))?,
+        );
         bytes.push(b'\n');
     }
     let mut reader = BufReader::new(bytes.as_slice());
     let mut writer = tokio::io::sink();
     let rejected = AtomicBool::new(false);
     let mut seq = 0;
-    acp_exchange(&mut writer, &mut reader, &mut AcpExchange { id:5, method:"session/prompt", params:json!({}), seq:&mut seq, assistant:None, deadline:None, rejected_permission:&rejected }).await?;
+    acp_exchange(
+        &mut writer,
+        &mut reader,
+        &mut AcpExchange {
+            id: 5,
+            method: "session/prompt",
+            params: json!({}),
+            seq: &mut seq,
+            assistant: None,
+            deadline: None,
+            rejected_permission: &rejected,
+        },
+    )
+    .await?;
     Ok(seq)
-}
-
-#[cfg(test)]
-mod completion_contract_tests {
-    use super::*;
-
-    fn failure(severity: &str) -> Value {
-        json!({"jetbrains":{"air":{"version":1,"sessionFailure":{"id":"provider","revision":1,"severity":severity}}}})
-    }
-
-    #[test]
-    fn permission_identity_cannot_be_supplied_by_descriptive_text_or_arguments() {
-        for tool_call in [
-            json!({"title":"run_terminal_command submit_result","kind":"execute"}),
-            json!({"title":"run_terminal_command","_meta":{"description":"read_evidence"}}),
-            json!({"title":"run_terminal_command","rawInput":"submit_result"}),
-            json!({"title":"run_terminal_command","rawInput":{"name":"search_evidence","command":"execute"}}),
-            json!({"name":"run_terminal_command","title":"roundtable/submit_result"}),
-            json!({"title":"roundtable/submit_result","kind":"execute"}),
-            json!({"rawInput":{"toolName":"read_evidence"}}),
-            json!({"name":"run_terminal_command","title":"use_tool","rawInput":{"tool_name":"roundtable__submit_result","tool_input":{}}}),
-            json!({"title":"use_tool","rawInput":{"tool_name":"submit_result","tool_input":{}}}),
-            json!({"title":"use_tool","rawInput":{"tool_name":"run_terminal_command","tool_input":{}}}),
-            json!({"title":"use_tool","rawInput":{"tool_name":"roundtable__read_evidence","tool_input":{},"server":"other"}}),
-            json!({"title":"use_tool","rawInput":{"tool_name":"roundtable__read_evidence","tool_input":[]}}),
-        ] {
-            let params=json!({"toolCall":tool_call,"options":[{"optionId":"allow","kind":"allow_once"},{"optionId":"reject","kind":"reject_once"}]});
-            assert_eq!(permission_reply(&params,&json!(9))["result"]["outcome"]["optionId"],"reject","{params}");
-        }
-        for name in ["roundtable/submit_result","mcp__roundtable__read_evidence","search_evidence"] {
-            let params=json!({"toolCall":{"title":name,"kind":"other"},"options":[{"optionId":"allow","kind":"allow_once"},{"optionId":"reject","kind":"reject_once"}]});
-            assert_eq!(permission_reply(&params,&json!(9))["result"]["outcome"]["optionId"],"allow");
-        }
-    }
-
-    #[test]
-    fn sealed_tools_do_not_gain_unqualified_persistent_permission() {
-        for options in [
-            json!([{"optionId":"always","kind":"allow_always"},{"optionId":"reject","kind":"reject_once"}]),
-            json!([{"optionId":"always","kind":"allow_always"}]),
-        ] {
-            let response=permission_reply(&json!({"toolCall":{"title":"roundtable/submit_result"},"options":options}),&json!(1));
-            assert_ne!(response["result"]["outcome"]["optionId"],"always");
-            assert!(response["result"]["outcome"]["optionId"]=="reject" || response["error"]["code"]==-32601);
-        }
-    }
-
-    #[test]
-    fn request_envelope_proof_is_missing_bounded_and_hash_verified() {
-        let dir = tempfile::tempdir().unwrap();
-        rejected_live_executor_fixture(dir.path().into()).unwrap();
-        let mut installed = InstalledRuntime::load(dir.path()).unwrap();
-        let save = |installed: &mut InstalledRuntime, report:Value| {
-            let bytes = canonical_bytes(&report).unwrap();
-            std::fs::write(&installed.report_path,&bytes).unwrap();
-            installed.report_sha256 = Hash256::sha256(&bytes);
-        };
-        save(&mut installed,json!({}));
-        assert_eq!(verified_request_envelope_bound(&installed).unwrap(),None);
-        save(&mut installed,json!({"request_envelope":{"status":"not_tested","max_bytes":null,"evidence_hash":null}}));
-        assert_eq!(verified_request_envelope_bound(&installed).unwrap(),None);
-        for bytes in [json!(-1),json!(1.5),json!(1_048_577),Value::Null] {
-            save(&mut installed,json!({"request_envelope":{"status":"passed","max_bytes":bytes,"evidence_hash":Hash256::sha256(b"fixture envelope measurement")}}));
-            assert!(verified_request_envelope_bound(&installed).is_err());
-        }
-        save(&mut installed,json!({"request_envelope":{"status":"passed","max_bytes":4096,"evidence_hash":Hash256::sha256(b"fixture envelope measurement")}}));
-        assert_eq!(verified_request_envelope_bound(&installed).unwrap(),Some(4096));
-        std::fs::write(&installed.report_path,b"{}").unwrap();
-        assert_eq!(verified_request_envelope_bound(&installed).unwrap_err().details.reason.as_deref(),Some("qualification_report_changed"));
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn runtime_auth_denylist_redacts_mounted_json_value_without_environment_seed() {
-        let dir = tempfile::tempdir().unwrap();
-        rejected_live_executor_fixture(dir.path().into()).unwrap();
-        let mut installed = InstalledRuntime::load(dir.path()).unwrap();
-        let path = dir.path().join("auth.json");
-        std::fs::write(&path, r#"{"tokens":{"access_token":"fixture-mount-secret"}}"#).unwrap();
-        installed.oci.auth_mounts.push(AuthMount { source:path, destination:"/rt-home/auth.json".into() });
-        let mut capture = super::super::DiagnosticCapture::new(auth_denylist(&installed, &[]).unwrap());
-        capture.push("token: fixture-mount-"); capture.push("secret");
-        let (excerpt, _) = capture.finish().await.unwrap();
-        assert_eq!(excerpt.text, "token: [redacted]");
-    }
-
-    #[test]
-    fn missing_provider_credential_is_a_capability_error_not_app_authentication() {
-        let dir = tempfile::tempdir().unwrap();
-        rejected_live_executor_fixture(dir.path().into()).unwrap();
-        let installed = InstalledRuntime::load(dir.path()).unwrap();
-        let mut provider = installed.providers[0].clone();
-        provider.credential_env = format!("ABSENT_FIXTURE_{}", uuid::Uuid::new_v4().simple());
-        let error = require_provider_credential(&installed, &provider).unwrap_err();
-        assert_eq!(error.code, ErrorCode::CapabilityUnqualified);
-        assert_eq!(error.details.reason.as_deref(), Some("provider_credential_missing"));
-    }
-
-    #[tokio::test]
-    async fn actual_prompt_rpc_rejects_update_or_response_failure_before_end_turn() {
-        for frames in [
-            vec![json!({"method":"session/update","params":{"update":{"sessionUpdate":"session_info_update","_meta":failure("error")}}}), json!({"id":5,"result":{"stopReason":"end_turn"}})],
-            vec![json!({"id":5,"result":{"stopReason":"end_turn","_meta":failure("error")}})],
-        ] {
-            assert!(drive_prompt_frames_fixture(&frames).await.is_err());
-        }
-        assert!(drive_prompt_frames_fixture(&[json!({"id":5,"result":{"stopReason":"end_turn","_meta":failure("warning")}})]).await.is_ok());
-    }
-
-    #[tokio::test]
-    async fn permission_cancel_repairs_are_bounded_and_cannot_hide_terminal_failure() {
-        let denied=|id| permission_request(id,"run_terminal_command","allow","reject");
-        let cancelled=|id| json!({"id":id,"result":{"stopReason":"cancelled"}});
-        let ended=|id| json!({"id":id,"result":{"stopReason":"end_turn"}});
-        let (clean,prompts)=drive_permission_repair_frames_fixture(&[denied(11),cancelled(5),denied(12),cancelled(6),ended(7)]).await;
-        assert!(clean.is_ok());assert_eq!(prompts,3);
-        let (exhausted,prompts)=drive_permission_repair_frames_fixture(&[denied(11),cancelled(5),denied(12),cancelled(6),denied(13),cancelled(7),ended(8)]).await;
-        assert!(exhausted.is_err());assert_eq!(prompts,3);
-        let (failed,prompts)=drive_permission_repair_frames_fixture(&[denied(11),json!({"id":5,"result":{"stopReason":"cancelled","_meta":failure("error")}}),ended(6)]).await;
-        assert_eq!(failed.unwrap_err().details.reason.as_deref(),Some("session_failure"));assert_eq!(prompts,1);
-        let (warning,prompts)=drive_permission_repair_frames_fixture(&[denied(11),json!({"id":5,"result":{"stopReason":"cancelled","_meta":failure("warning")}}),ended(6)]).await;
-        assert!(warning.is_ok());assert_eq!(prompts,2);
-    }
-
-    #[tokio::test]
-    async fn unsigned_out_of_parser_domain_failure_version_never_completes() {
-        let mut declared = failure("error");
-        declared["jetbrains"]["air"]["version"] = json!(9_223_372_036_854_775_808u64);
-        for frames in [
-            vec![json!({"method":"session/update","params":{"update":{"sessionUpdate":"session_info_update","_meta":declared}}}),json!({"id":5,"result":{"stopReason":"end_turn"}})],
-            vec![json!({"id":5,"result":{"stopReason":"end_turn","_meta":declared}})],
-        ] {
-            let error=drive_prompt_frames_fixture(&frames).await.unwrap_err();
-            assert_eq!(error.details.reason.as_deref(),Some("adapter_incompatible"));
-        }
-        assert!(drive_prompt_frames_fixture(&[json!({"id":5,"result":{"stopReason":"end_turn","_meta":failure("warning")}})]).await.is_ok());
-    }
-
-    #[tokio::test]
-    async fn actual_prompt_rpc_fails_closed_on_malformed_failure_http_and_abnormal_stop() {
-        for response in [
-            json!({"stopReason":"end_turn","_meta":{"jetbrains":{"air":{"version":1,"sessionFailure":{}}}}}),
-            json!({"stopReason":"end_turn","_meta":{"jetbrains":{"air":{"sessionFailure":{}}}}}),
-            json!({"stopReason":"max_tokens"}),
-        ] {
-            assert!(drive_prompt_frames_fixture(&[json!({"id":5,"result":response})]).await.is_err());
-        }
-        assert!(drive_prompt_frames_fixture(&[json!({"id":5,"error":{"code":-32000,"data":{"httpStatus":429}}})]).await.is_err());
-    }
 }
 
 #[cfg(any(test, feature = "test-utils"))]
@@ -2291,7 +2362,11 @@ pub async fn exercise_schema_seat_rpc() -> RtResult<SchemaSeatObservation> {
             "s",
             "submit the proposal",
             &mut seq,
-            SeatPromptControl {assistant:Some(&capture),deadline:Some(Duration::from_secs(5)),gateway:None},
+            SeatPromptControl {
+                assistant: Some(&capture),
+                deadline: Some(Duration::from_secs(5)),
+                gateway: None,
+            },
         )
         .await
     }
@@ -2510,25 +2585,323 @@ fn structured_permission(
 struct PromptFrameWriter(Vec<u8>);
 #[cfg(any(test, feature = "test-utils"))]
 impl AsyncWrite for PromptFrameWriter {
-    fn poll_write(mut self: std::pin::Pin<&mut Self>, _: &mut std::task::Context<'_>, bytes: &[u8]) -> std::task::Poll<std::io::Result<usize>> {
-        self.0.extend_from_slice(bytes); std::task::Poll::Ready(Ok(bytes.len()))
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        _: &mut std::task::Context<'_>,
+        bytes: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        self.0.extend_from_slice(bytes);
+        std::task::Poll::Ready(Ok(bytes.len()))
     }
-    fn poll_flush(self: std::pin::Pin<&mut Self>, _: &mut std::task::Context<'_>) -> std::task::Poll<std::io::Result<()>> { std::task::Poll::Ready(Ok(())) }
-    fn poll_shutdown(self: std::pin::Pin<&mut Self>, _: &mut std::task::Context<'_>) -> std::task::Poll<std::io::Result<()>> { std::task::Poll::Ready(Ok(())) }
+    fn poll_flush(
+        self: std::pin::Pin<&mut Self>,
+        _: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::task::Poll::Ready(Ok(()))
+    }
+    fn poll_shutdown(
+        self: std::pin::Pin<&mut Self>,
+        _: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::task::Poll::Ready(Ok(()))
+    }
 }
 
 #[cfg(any(test, feature = "test-utils"))]
-pub(crate) async fn permission_repair_frames_fixture(frames:&[Value], gateway:Option<&LiveModelGateway>) -> (RtResult<u64>,usize) {
-    let mut bytes=Vec::new();
-    for frame in frames { bytes.extend(serde_json::to_vec(frame).expect("fixture JSON"));bytes.push(b'\n'); }
-    let mut reader=BufReader::new(bytes.as_slice());
-    let mut writer=PromptFrameWriter(Vec::new());
-    let mut seq=0;
-    let result=finish_seat_prompt(&mut writer,&mut reader,"fixture-session","fixture prompt",&mut seq,SeatPromptControl {assistant:None,deadline:None,gateway}).await.map(|_|seq);
-    let prompts=writer.0.split(|byte|*byte==b'\n').filter(|line| !line.is_empty()).filter(|line|serde_json::from_slice::<Value>(line).is_ok_and(|value|value["method"]=="session/prompt")).count();
-    (result,prompts)
+pub(crate) async fn permission_repair_frames_fixture(
+    frames: &[Value],
+    gateway: Option<&LiveModelGateway>,
+) -> (RtResult<u64>, usize) {
+    let mut bytes = Vec::new();
+    for frame in frames {
+        bytes.extend(serde_json::to_vec(frame).expect("fixture JSON"));
+        bytes.push(b'\n');
+    }
+    let mut reader = BufReader::new(bytes.as_slice());
+    let mut writer = PromptFrameWriter(Vec::new());
+    let mut seq = 0;
+    let result = finish_seat_prompt(
+        &mut writer,
+        &mut reader,
+        "fixture-session",
+        "fixture prompt",
+        &mut seq,
+        SeatPromptControl {
+            assistant: None,
+            deadline: None,
+            gateway,
+        },
+    )
+    .await
+    .map(|_| seq);
+    let prompts = writer
+        .0
+        .split(|byte| *byte == b'\n')
+        .filter(|line| !line.is_empty())
+        .filter(|line| {
+            serde_json::from_slice::<Value>(line)
+                .is_ok_and(|value| value["method"] == "session/prompt")
+        })
+        .count();
+    (result, prompts)
 }
 #[cfg(any(test, feature = "test-utils"))]
-pub async fn drive_permission_repair_frames_fixture(frames:&[Value]) -> (RtResult<u64>,usize) {
-    permission_repair_frames_fixture(frames,None).await
+pub async fn drive_permission_repair_frames_fixture(frames: &[Value]) -> (RtResult<u64>, usize) {
+    permission_repair_frames_fixture(frames, None).await
+}
+
+#[cfg(test)]
+mod completion_contract_tests {
+    use super::*;
+
+    fn failure(severity: &str) -> Value {
+        json!({"jetbrains":{"air":{"version":1,"sessionFailure":{"id":"provider","revision":1,"severity":severity}}}})
+    }
+
+    #[test]
+    fn permission_identity_cannot_be_supplied_by_descriptive_text_or_arguments() {
+        for tool_call in [
+            json!({"title":"run_terminal_command submit_result","kind":"execute"}),
+            json!({"title":"run_terminal_command","_meta":{"description":"read_evidence"}}),
+            json!({"title":"run_terminal_command","rawInput":"submit_result"}),
+            json!({"title":"run_terminal_command","rawInput":{"name":"search_evidence","command":"execute"}}),
+            json!({"name":"run_terminal_command","title":"roundtable/submit_result"}),
+            json!({"title":"roundtable/submit_result","kind":"execute"}),
+            json!({"rawInput":{"toolName":"read_evidence"}}),
+            json!({"name":"run_terminal_command","title":"use_tool","rawInput":{"tool_name":"roundtable__submit_result","tool_input":{}}}),
+            json!({"title":"use_tool","rawInput":{"tool_name":"submit_result","tool_input":{}}}),
+            json!({"title":"use_tool","rawInput":{"tool_name":"run_terminal_command","tool_input":{}}}),
+            json!({"title":"use_tool","rawInput":{"tool_name":"roundtable__read_evidence","tool_input":{},"server":"other"}}),
+            json!({"title":"use_tool","rawInput":{"tool_name":"roundtable__read_evidence","tool_input":[]}}),
+        ] {
+            let params = json!({"toolCall":tool_call,"options":[{"optionId":"allow","kind":"allow_once"},{"optionId":"reject","kind":"reject_once"}]});
+            assert_eq!(
+                permission_reply(&params, &json!(9))["result"]["outcome"]["optionId"],
+                "reject",
+                "{params}"
+            );
+        }
+        for name in [
+            "roundtable/submit_result",
+            "mcp__roundtable__read_evidence",
+            "search_evidence",
+        ] {
+            let params = json!({"toolCall":{"title":name,"kind":"other"},"options":[{"optionId":"allow","kind":"allow_once"},{"optionId":"reject","kind":"reject_once"}]});
+            assert_eq!(
+                permission_reply(&params, &json!(9))["result"]["outcome"]["optionId"],
+                "allow"
+            );
+        }
+    }
+
+    #[test]
+    fn sealed_tools_do_not_gain_unqualified_persistent_permission() {
+        for options in [
+            json!([{"optionId":"always","kind":"allow_always"},{"optionId":"reject","kind":"reject_once"}]),
+            json!([{"optionId":"always","kind":"allow_always"}]),
+        ] {
+            let response = permission_reply(
+                &json!({"toolCall":{"title":"roundtable/submit_result"},"options":options}),
+                &json!(1),
+            );
+            assert_ne!(response["result"]["outcome"]["optionId"], "always");
+            assert!(
+                response["result"]["outcome"]["optionId"] == "reject"
+                    || response["error"]["code"] == -32601
+            );
+        }
+    }
+
+    #[test]
+    fn request_envelope_proof_is_missing_bounded_and_hash_verified() {
+        let dir = tempfile::tempdir().unwrap();
+        rejected_live_executor_fixture(dir.path().into()).unwrap();
+        let mut installed = InstalledRuntime::load(dir.path()).unwrap();
+        let save = |installed: &mut InstalledRuntime, report: Value| {
+            // Invalid protocol values must reach the production report reader.
+            let bytes = serde_json::to_vec(&report).unwrap();
+            std::fs::write(&installed.report_path, &bytes).unwrap();
+            installed.report_sha256 = Hash256::sha256(&bytes);
+        };
+        save(&mut installed, json!({}));
+        assert_eq!(verified_request_envelope_bound(&installed).unwrap(), None);
+        save(
+            &mut installed,
+            json!({"request_envelope":{"status":"not_tested","max_bytes":null,"evidence_hash":null}}),
+        );
+        assert_eq!(verified_request_envelope_bound(&installed).unwrap(), None);
+        for bytes in [json!(-1), json!(1.5), json!(1_048_577), Value::Null] {
+            save(
+                &mut installed,
+                json!({"request_envelope":{"status":"passed","max_bytes":bytes,"evidence_hash":Hash256::sha256(b"fixture envelope measurement")}}),
+            );
+            assert!(verified_request_envelope_bound(&installed).is_err());
+        }
+        save(
+            &mut installed,
+            json!({"request_envelope":{"status":"passed","max_bytes":4096,"evidence_hash":Hash256::sha256(b"fixture envelope measurement")}}),
+        );
+        assert_eq!(
+            verified_request_envelope_bound(&installed).unwrap(),
+            Some(4096)
+        );
+        std::fs::write(&installed.report_path, b"{}").unwrap();
+        assert_eq!(
+            verified_request_envelope_bound(&installed)
+                .unwrap_err()
+                .details
+                .reason
+                .as_deref(),
+            Some("qualification_report_changed")
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn runtime_auth_denylist_redacts_mounted_json_value_without_environment_seed() {
+        let dir = tempfile::tempdir().unwrap();
+        rejected_live_executor_fixture(dir.path().into()).unwrap();
+        let mut installed = InstalledRuntime::load(dir.path()).unwrap();
+        let path = dir.path().join("auth.json");
+        std::fs::write(
+            &path,
+            r#"{"tokens":{"access_token":"fixture-mount-secret"}}"#,
+        )
+        .unwrap();
+        installed.oci.auth_mounts.push(AuthMount {
+            source: path,
+            destination: "/rt-home/auth.json".into(),
+        });
+        let mut capture =
+            super::super::DiagnosticCapture::new(auth_denylist(&installed, &[]).unwrap());
+        capture.push("token: fixture-mount-");
+        capture.push("secret");
+        let (excerpt, _) = capture.finish().await.unwrap();
+        assert_eq!(excerpt.text, "token: [redacted]");
+    }
+
+    #[test]
+    fn missing_provider_credential_is_a_capability_error_not_app_authentication() {
+        let dir = tempfile::tempdir().unwrap();
+        rejected_live_executor_fixture(dir.path().into()).unwrap();
+        let installed = InstalledRuntime::load(dir.path()).unwrap();
+        let mut provider = installed.providers[0].clone();
+        provider.credential_env = format!("ABSENT_FIXTURE_{}", uuid::Uuid::new_v4().simple());
+        let error = require_provider_credential(&installed, &provider).unwrap_err();
+        assert_eq!(error.code, ErrorCode::CapabilityUnqualified);
+        assert_eq!(
+            error.details.reason.as_deref(),
+            Some("provider_credential_missing")
+        );
+    }
+
+    #[tokio::test]
+    async fn actual_prompt_rpc_rejects_update_or_response_failure_before_end_turn() {
+        for frames in [
+            vec![
+                json!({"method":"session/update","params":{"update":{"sessionUpdate":"session_info_update","_meta":failure("error")}}}),
+                json!({"id":5,"result":{"stopReason":"end_turn"}}),
+            ],
+            vec![json!({"id":5,"result":{"stopReason":"end_turn","_meta":failure("error")}})],
+        ] {
+            assert!(drive_prompt_frames_fixture(&frames).await.is_err());
+        }
+        assert!(drive_prompt_frames_fixture(&[
+            json!({"id":5,"result":{"stopReason":"end_turn","_meta":failure("warning")}})
+        ])
+        .await
+        .is_ok());
+    }
+
+    #[tokio::test]
+    async fn permission_cancel_repairs_are_bounded_and_cannot_hide_terminal_failure() {
+        let denied = |id| permission_request(id, "run_terminal_command", "allow", "reject");
+        let cancelled = |id| json!({"id":id,"result":{"stopReason":"cancelled"}});
+        let ended = |id| json!({"id":id,"result":{"stopReason":"end_turn"}});
+        let (clean, prompts) = drive_permission_repair_frames_fixture(&[
+            denied(11),
+            cancelled(5),
+            denied(12),
+            cancelled(6),
+            ended(7),
+        ])
+        .await;
+        assert!(clean.is_ok());
+        assert_eq!(prompts, 3);
+        let (exhausted, prompts) = drive_permission_repair_frames_fixture(&[
+            denied(11),
+            cancelled(5),
+            denied(12),
+            cancelled(6),
+            denied(13),
+            cancelled(7),
+            ended(8),
+        ])
+        .await;
+        assert!(exhausted.is_err());
+        assert_eq!(prompts, 3);
+        let (failed, prompts) = drive_permission_repair_frames_fixture(&[
+            denied(11),
+            json!({"id":5,"result":{"stopReason":"cancelled","_meta":failure("error")}}),
+            ended(6),
+        ])
+        .await;
+        assert_eq!(
+            failed.unwrap_err().details.reason.as_deref(),
+            Some("session_failure")
+        );
+        assert_eq!(prompts, 1);
+        let (warning, prompts) = drive_permission_repair_frames_fixture(&[
+            denied(11),
+            json!({"id":5,"result":{"stopReason":"cancelled","_meta":failure("warning")}}),
+            ended(6),
+        ])
+        .await;
+        assert!(warning.is_ok());
+        assert_eq!(prompts, 2);
+    }
+
+    #[tokio::test]
+    async fn unsigned_out_of_parser_domain_failure_version_never_completes() {
+        let mut declared = failure("error");
+        declared["jetbrains"]["air"]["version"] = json!(9_223_372_036_854_775_808u64);
+        for frames in [
+            vec![
+                json!({"method":"session/update","params":{"update":{"sessionUpdate":"session_info_update","_meta":declared}}}),
+                json!({"id":5,"result":{"stopReason":"end_turn"}}),
+            ],
+            vec![json!({"id":5,"result":{"stopReason":"end_turn","_meta":declared}})],
+        ] {
+            let error = drive_prompt_frames_fixture(&frames).await.unwrap_err();
+            assert_eq!(
+                error.details.reason.as_deref(),
+                Some("adapter_incompatible")
+            );
+        }
+        assert!(drive_prompt_frames_fixture(&[
+            json!({"id":5,"result":{"stopReason":"end_turn","_meta":failure("warning")}})
+        ])
+        .await
+        .is_ok());
+    }
+
+    #[tokio::test]
+    async fn actual_prompt_rpc_fails_closed_on_malformed_failure_http_and_abnormal_stop() {
+        for response in [
+            json!({"stopReason":"end_turn","_meta":{"jetbrains":{"air":{"version":1,"sessionFailure":{}}}}}),
+            json!({"stopReason":"end_turn","_meta":{"jetbrains":{"air":{"sessionFailure":{}}}}}),
+            json!({"stopReason":"max_tokens"}),
+        ] {
+            assert!(
+                drive_prompt_frames_fixture(&[json!({"id":5,"result":response})])
+                    .await
+                    .is_err()
+            );
+        }
+        assert!(drive_prompt_frames_fixture(&[
+            json!({"id":5,"error":{"code":-32000,"data":{"httpStatus":429}}})
+        ])
+        .await
+        .is_err());
+    }
 }
