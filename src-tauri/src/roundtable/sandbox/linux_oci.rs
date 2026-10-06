@@ -1345,7 +1345,7 @@ impl HelperBirthContext {
             return Err(unavailable());
         }
         let thread_link = fs::read_link("/proc/thread-self").map_err(|_| unavailable())?;
-        if thread_link != PathBuf::from(format!("{}/task/{tid}", std::process::id())) {
+        if thread_link.as_path() != Path::new(&format!("{}/task/{tid}", std::process::id())) {
             return Err(unavailable());
         }
         let namespace = |name: &str| -> RtResult<Option<String>> {
@@ -1516,6 +1516,22 @@ fn helper_process_exited(fd: &std::os::fd::OwnedFd) -> bool {
 }
 
 #[cfg(target_os = "linux")]
+fn retained_helper_is_live(retained: &BTreeMap<i32, std::os::fd::OwnedFd>, pid: i32) -> bool {
+    use std::os::fd::AsRawFd;
+    let Some(fd) = retained.get(&pid) else {
+        return false;
+    };
+    let mut poll = libc::pollfd {
+        fd: fd.as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    // Only a successful no-readiness poll proves this original identity is
+    // still live. An exited, invalid or inconclusive fd cannot exempt a PID.
+    (unsafe { libc::poll(&mut poll, 1, 0) }) == 0
+}
+
+#[cfg(target_os = "linux")]
 fn resolve_helper_environment(
     fd: &std::os::fd::OwnedFd,
     result: std::io::Result<Vec<u8>>,
@@ -1652,6 +1668,7 @@ pub(super) fn stop_slirp(runtime_root: &Path, id: &str, expected: bool) -> RtRes
             runtime_root: &Path,
             id: &str,
             birth: Option<&HelperBirthContext>,
+            retained: &BTreeMap<i32, OwnedFd>,
         ) -> (Vec<(i32, OwnedFd)>, RtResult<()>) {
             let mut found = Vec::new();
             let mut first_error = None;
@@ -1677,6 +1694,12 @@ pub(super) fn stop_slirp(runtime_root: &Path, id: &str, expected: bool) -> RtRes
                     else {
                         return Ok(None);
                     };
+                    if retained_helper_is_live(retained, pid) {
+                        // Ownership is already pinned. Exec may hide or clear
+                        // environ, but cannot replace this live identity. Its
+                        // original fd remains the signal and exit authority.
+                        return Ok(None);
+                    }
                     let metadata = match entry.metadata() {
                         Ok(metadata) => metadata,
                         Err(error) if process_disappeared(&error) => return Ok(None),
@@ -1879,7 +1902,7 @@ pub(super) fn stop_slirp(runtime_root: &Path, id: &str, expected: bool) -> RtRes
         loop {
             #[cfg(test)]
             control_tests::before_cleanup_sweep()?;
-            let (found, discovery) = owned_helpers(runtime_root, id, birth.as_ref());
+            let (found, discovery) = owned_helpers(runtime_root, id, birth.as_ref(), &retained);
             if let Err(error) = discovery {
                 discovery_error.get_or_insert(error);
             }
@@ -3457,6 +3480,115 @@ mod control_tests {
         );
         // Retained pins and the closed startup gate support safe retries.
         super::stop_slirp(root.path(), id, true).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn retained_live_identity_survives_unreadable_environment_on_later_sweeps() {
+        use std::os::unix::process::ExitStatusExt;
+        let root = tempfile::tempdir().unwrap();
+        let id = "fake-retained-unreadable";
+        let pin = helper_fixture(root.path(), id, "running\n");
+        let mut helper = fake_helper(root.path(), id, "slirp");
+        let mut watcher = fake_helper(root.path(), id, "watcher");
+        let ready_path = root.path().join("retained-ready");
+        let mut descendant = std::process::Command::new("sh")
+            .args([
+                "-c",
+                "trap '' TERM; : > \"$1\"; while :; do :; done",
+                "retained-helper",
+            ])
+            .arg(&ready_path)
+            .env("CODEG_ROUNDTABLE_SLIRP_OWNER", id)
+            .env("CODEG_ROUNDTABLE_SLIRP_ROOT", root.path())
+            .env("CODEG_ROUNDTABLE_SLIRP_ROLE", "watcher")
+            .spawn()
+            .unwrap();
+        let pid = descendant.id() as i32;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let ready = loop {
+            let ready = ready_path.exists();
+            if ready || std::time::Instant::now() >= deadline {
+                break ready;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        };
+        write_pins(
+            &pin,
+            &(pin_line("slirp", helper.id()) + &pin_line("watcher", watcher.id())),
+        );
+        let sweeps = std::rc::Rc::new(std::cell::Cell::new(0));
+        let observed = sweeps.clone();
+        SWEEP_OBSERVER.with(|observer| {
+            *observer.borrow_mut() = Some(Box::new(move || {
+                observed.set(observed.get() + 1);
+                if observed.get() >= 2 {
+                    // First sweep verified and retained this marked identity.
+                    // A subsequent proc read denial must not discard ownership.
+                    DENIED_ENVIRONMENT_PID.with(|denied| denied.set(Some(pid)));
+                }
+                Ok(())
+            }));
+        });
+        let observer = SweepObserverGuard;
+        let result = super::stop_slirp(root.path(), id, true);
+        drop(observer);
+        DENIED_ENVIRONMENT_PID.with(|denied| denied.set(None));
+        let ended = descendant.try_wait().unwrap();
+        for child in [&mut helper, &mut watcher, &mut descendant] {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        assert!(
+            ready,
+            "TERM-ignore must be installed before cleanup starts"
+        );
+        assert!(
+            sweeps.get() >= 2,
+            "the denial must follow initial retention"
+        );
+        result.unwrap();
+        assert!(ended.is_some_and(|status| status.signal() == Some(libc::SIGKILL)));
+        assert_eq!(
+            std::fs::read_to_string(pin.with_extension("pid.state")).unwrap(),
+            "cleanup-proven-started\n"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn exited_retained_pidfd_cannot_exempt_a_reused_numeric_pid() {
+        use std::os::fd::FromRawFd;
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let pid = child.id() as i32;
+        let raw = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
+        assert!(raw >= 0);
+        let mut retained = std::collections::BTreeMap::new();
+        let fd = unsafe { std::os::fd::OwnedFd::from_raw_fd(raw as i32) };
+        retained.insert(pid, fd);
+        let live = super::retained_helper_is_live(&retained, pid);
+        let unknown = super::retained_helper_is_live(&retained, -1);
+        child.kill().unwrap();
+        child.wait().unwrap();
+        let exited = super::retained_helper_is_live(&retained, pid);
+        let mut foreign = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        // Model PID reuse without changing host PID allocation: the saved
+        // identity is dead even if its numeric map key names a new process.
+        let old = retained.remove(&pid).unwrap();
+        retained.insert(foreign.id() as i32, old);
+        let reused = super::retained_helper_is_live(&retained, foreign.id() as i32);
+        let survived = foreign.try_wait().unwrap().is_none();
+        let _ = foreign.kill();
+        let _ = foreign.wait();
+        assert!(live);
+        assert!(!unknown && !exited && !reused);
+        assert!(survived);
     }
 
     #[cfg(target_os = "linux")]

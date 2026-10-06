@@ -245,3 +245,40 @@ that is OS-interface evidence, not execution of the Rust implementation.
 Fake hook tests pass 3/3 and the native aggregate remains 96/98 with the same
 two missing Rust prerequisites. Local Rust tests and rustfmt remain UNRUN;
 existing CI must verify the final patch.
+
+## Retained identity continuity after c1dc084
+
+Linux server CI at `c1dc084` reports 7768 passed, 1 failed, 1 ignored. The
+remaining failure is
+`verified_descendant_remains_owned_after_term_clears_its_environment`, with
+`slirp_proc_environment_denied_within_scope`. The runtime suite passes
+122 tests with one live test ignored. The server error does not identify the
+denied process, so attribution to the marker-clearing descendant remains
+an inference pending the next CI run.
+
+Code inspection establishes a separate concrete continuity defect: every
+sweep reread proc ownership data even for identities already verified and
+retained by pidfd. A subsequent denied environment read became a sticky
+unknown-discovery failure despite the existing ownership proof.
+
+Discovery now skips reclassification only when the original retained pidfd
+positively reports live through a successful zero-readiness poll. An exited,
+invalid or inconclusive handle cannot exempt a numeric PID. The same retained
+fd remains responsible for signaling and proving exit. Unknown live processes
+continue through the complete birth, environment and identity checks; their
+read failures still quarantine cleanup. No initial root verification,
+interrupted-cleanup quarantine or termination assertion is relaxed.
+
+A deterministic regression allows the first sweep to verify a marked,
+TERM-ignoring descendant, then arms an environment denial on subsequent
+sweeps. Cleanup must still reach SIGKILL and durable successful proof. Its
+shell uses only builtins after readiness, avoiding incidental newly spawned
+processes in this controlled case. A second regression checks that an exited
+retained fd under a reused numeric map key cannot exempt a live foreign child.
+The existing unknown-denial and real marker-clearing regressions remain.
+
+The controlled shell readiness and TERM-ignore behavior were checked locally;
+fake hook tests pass 3/3. Native aggregate remains 96/98 with missing rustc and
+Cargo prerequisites. Rust test commands exit 127; local Rust tests and rustfmt
+remain UNRUN. Existing CI must verify the patch and whether it resolves the
+reported failure; genuine unknown live unreadable processes remain unproven.

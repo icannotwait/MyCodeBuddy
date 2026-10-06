@@ -78,7 +78,7 @@ impl LoopbackRelay {
             stream
                 .write_all(bytes)
                 .map_err(|_| rt_error(ErrorCode::RuntimeUnavailable, "relay_write"))?;
-            return Ok(());
+            Ok(())
         }
         #[cfg(not(target_os = "linux"))]
         {
@@ -94,12 +94,12 @@ impl LoopbackRelay {
 pub fn probe_instance_socket() -> SocketProbe {
     #[cfg(target_os = "linux")]
     {
-        return match mount_private_socket() {
+        match mount_private_socket() {
             Ok(socket) => SocketProbe::Mounted(socket),
             Err(_) => SocketProbe::NotTested {
                 reason: "socket_unmounted",
             },
-        };
+        }
     }
     #[cfg(not(target_os = "linux"))]
     {
@@ -121,10 +121,10 @@ pub fn relay_from_helper(probe: &SocketProbe) -> RtResult<LoopbackRelay> {
             #[cfg(target_os = "linux")]
             {
                 let _keepalive = &socket.listener;
-                return Ok(LoopbackRelay {
+                Ok(LoopbackRelay {
                     endpoint: SANDBOX_ENDPOINT,
                     path: socket.path.clone(),
-                });
+                })
             }
             #[cfg(not(target_os = "linux"))]
             {

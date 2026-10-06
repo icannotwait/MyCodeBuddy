@@ -172,6 +172,28 @@ distinct multi-level vectors, malformed fields and duplicates. The formatter
 diagnostics from this run are applied separately. The final commit still
 requires its own complete CI result.
 
+### Retained identity checkpoint: `c1dc084`
+
+The [CI run for `c1dc084`](https://github.com/icannotwait/MyCodeBuddy/actions/runs/37442323659)
+passed formatting, protocol, runtime and frontend jobs. Windows server and
+Windows desktop passed. Linux desktop completed its full test step (8,080
+library tests passed, plus every integration target), then Clippy reported
+three Linux-only tail returns and one unnecessary owned path comparison.
+Those lint-only corrections retain the non-Linux branches and path semantics.
+Linux server reported 7,768 passed, 1 failed and 1 ignored:
+the retained-descendant environment-clear regression returned
+`slirp_proc_environment_denied_within_scope`.
+
+Discovery was re-reading environment for identities it already owned through
+retained pidfds. The correction bypasses reclassification only when that
+original verified pidfd positively polls live. Exited, inconclusive and
+unknown identities receive no exemption, and the original fd remains the
+signal and exit-proof authority. Deterministic later-read-denial and stale-
+handle/reused-key regressions preserve all cleanup and quarantine assertions.
+The CI log did not identify the denied PID; attribution of that observed
+failure to the descendant's exec transition remains an inference until
+subsequent execution verifies the correction.
+
 ## Capability boundaries retained
 
 The false-success and unsafe-admission defects are addressed by fail-closed guards, but the corresponding live capabilities in F02, F03 and F14 remain unimplemented. They are not closed feature-delivery items. Rerunning the current host probe cannot produce a usable certificate or supply the missing measurements.
