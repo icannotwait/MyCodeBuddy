@@ -187,7 +187,8 @@ pub use sandbox::{
 };
 #[cfg(any(test, feature = "test-utils"))]
 pub use sandbox::{
-    cgroup_delegation_failure, slirp_hook_phase, slirp_hook_script, syscall_allowlist,
+    cgroup_delegation_failure, live_slirp_document, slirp_hook_phase, slirp_hook_script,
+    stage_attempt_auth, syscall_allowlist,
 };
 pub use schema::{
     apply_roundtable_schema, drop_roundtable_schema, roundtable_table_names, DurabilityProfile,

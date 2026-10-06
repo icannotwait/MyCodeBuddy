@@ -1051,16 +1051,17 @@ fn prepare_bundle(
     let upper = scratch_home_dir(&request.runtime_root, &request.agent, &id);
     fs::create_dir_all(&upper).map_err(|error| error.to_string())?;
     let home_guard = RemoveOnDrop::arm(upper.clone());
-    for (_, destination, _) in &auth_mounts {
-        let relative = destination
-            .strip_prefix("/rt-home/")
-            .unwrap_or(destination.as_str());
-        let path = upper.join(relative);
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent).map_err(|error| error.to_string())?;
-        }
-        if !path.exists() {
-            fs::write(&path, b"").map_err(|error| error.to_string())?;
+    let mut readonly_binds = Vec::new();
+    for (source, destination, read_only) in &auth_mounts {
+        let bind = super::sandbox::linux_prepare_attempt_auth(&upper, source, destination)
+            .map_err(|error| {
+                error
+                    .details
+                    .reason
+                    .unwrap_or_else(|| "auth_copy".to_string())
+            })?;
+        if bind {
+            readonly_binds.push((source.clone(), destination.clone(), *read_only));
         }
     }
     oci_mounts.push(serde_json::json!({
@@ -1069,7 +1070,7 @@ fn prepare_bundle(
         "source": upper,
         "options": ["bind", "rw", "nosuid", "nodev"]
     }));
-    for (source, destination, read_only) in &auth_mounts {
+    for (source, destination, read_only) in &readonly_binds {
         let mut options = vec!["bind", "nosuid", "nodev", "nosymfollow"];
         options.push(if *read_only { "ro" } else { "rw" });
         oci_mounts.push(serde_json::json!({
@@ -1112,36 +1113,21 @@ fn prepare_bundle(
     if slirp {
         let slirp_bin = super::sandbox::linux_slirp_binary()
             .ok_or_else(|| "slirp4netns is not installed".to_string())?;
-        let hook = bundle.join("slirp-hook.sh");
-        fs::write(&hook, super::sandbox::linux_slirp_hook_script())
-            .map_err(|error| error.to_string())?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = fs::set_permissions(&hook, fs::Permissions::from_mode(0o755));
-        }
-        let pid_dir = request.runtime_root.join("slirp-pids");
-        fs::create_dir_all(&pid_dir).map_err(|error| error.to_string())?;
-        let pidfile = pid_dir.join(format!("{id}.pid"));
-        let mut hook_set = serde_json::Map::new();
-        hook_set.insert(
-            super::sandbox::linux_slirp_hook_phase().to_string(),
-            serde_json::json!([{
-                "path": hook,
-                "args": ["slirp-hook.sh", slirp_bin, pidfile],
-                "env": []
-            }]),
-        );
-        hooks = serde_json::Value::Object(hook_set);
-        let resolv = request.runtime_root.join("slirp-resolv.conf");
-        fs::write(&resolv, b"nameserver 10.0.2.3\n").map_err(|error| error.to_string())?;
-        oci_mounts.push(serde_json::json!({
-            "destination": "/etc/resolv.conf",
-            "type": "bind",
-            "source": resolv,
-            "options": ["bind", "ro", "nosuid", "nodev", "noexec"]
-        }));
-        network = "slirp-egress-not-origin-filtered";
+        let attached = super::sandbox::linux_attach_slirp(
+            &request.runtime_root,
+            &bundle.join("slirp-hook.sh"),
+            &id,
+            &slirp_bin,
+        )
+        .map_err(|error| {
+            error
+                .details
+                .reason
+                .unwrap_or_else(|| "slirp_hook".to_string())
+        })?;
+        hooks = attached.hooks;
+        oci_mounts.push(attached.resolv_mount);
+        network = attached.network;
     }
     let spec = serde_json::json!({
         "ociVersion": "1.0.2",
@@ -1179,11 +1165,7 @@ fn prepare_bundle(
             "maskedPaths": ["/proc/acpi", "/proc/kcore", "/proc/keys"],
             "readonlyPaths": ["/proc/sys"],
             "cgroupsPath": cgroup_path,
-            "seccomp": {
-                "defaultAction": "SCMP_ACT_ERRNO",
-                "architectures": [if cfg!(target_arch = "aarch64") { "SCMP_ARCH_AARCH64" } else { "SCMP_ARCH_X86_64" }],
-                "syscalls": [{"names": super::sandbox::linux_oci_syscalls(), "action": "SCMP_ACT_ALLOW"}]
-            },
+            "seccomp": super::sandbox::linux_seccomp_json(),
             "resources": {
                 "memory": {"limit": 512 * 1024 * 1024},
                 "pids": {"limit": 64},

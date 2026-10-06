@@ -75,6 +75,19 @@ that byte and fails unless it is `1`. It then leaves a watcher,
 crun adopts the orphaned slirp process and `crun run` would otherwise
 wait on it forever.
 
+The qualification probe and the live room write that hook, the watcher,
+the seccomp allowlist, and the resolver through one shared path. The
+image's `/etc/resolv.conf` stays an empty regular file. Both paths
+bind-mount `<runtime-root>/slirp-resolv.conf` read-only over it. That
+file contains `nameserver 10.0.2.3`, which is slirp4netns's DNS proxy
+inside the container network namespace. The image digest does not change.
+The resolver path is not part of the qualification key hash, so keys
+already issued for Grok and Antigravity stay valid.
+Without that mount the live container keeps the empty file, so
+`auth.x.ai` and `cli-chat-proxy.grok.com` fail with
+`dns error: failed to lookup address information` until the attempt
+timeout.
+
 `crun run` deletes a container that exits on its own. The probe's later
 `crun delete` then fails with `cannot open directory …/state/<id>`.
 That still counts as reaped when the container state directory is gone
@@ -92,8 +105,9 @@ The qualification key stores the first `crun version …` line from
 
 One rootfs directory can hold every adapter. Do not put credentials,
 tokens, or `auth.json` contents in the image or in git. The probe
-bind-mounts the host auth files read-only and rejects a placeholder that
-is missing, non-empty, or a symlink.
+rejects a placeholder that is missing, non-empty, or a symlink. Cursor,
+Codex, and Antigravity auth files are bind-mounted read-only. Grok's
+`auth.json` is copied into the attempt home instead; see below.
 
 ```bash
 export ROOTFS=/var/lib/codeg/roundtable-rootfs
@@ -137,9 +151,12 @@ auth placeholders are empty regular files. The probe mounts a tmpfs on
 device nodes in the image and change the digest. `/sys` is mounted
 read-only. `/tmp` is a writable tmpfs. `/rt-home` is a writable scratch
 directory for that adapter and that container run
-(`home-upper/<agent>/<container-id>-<run>`), with each auth file
-bind-mounted read-only on top of it. The probe removes the scratch
-directory after the container is reaped, including when the run fails.
+(`home-upper/<agent>/<container-id>-<run>` on the probe,
+`scratch/rt-home` on a live attempt). Cursor, Codex, and Antigravity
+auth files are bind-mounted read-only on top of it. Grok's `auth.json`
+is a regular file in that directory, not a second mount. The probe
+removes the scratch directory after the container is reaped, including
+when the run fails.
 The image root stays read-only. `/dev/mem` and `/dev/sda` are still
 denied.
 
@@ -210,10 +227,22 @@ access without changing modes:
 sudo chown -R "$USER:$USER" "$ROOTFS"
 ```
 
-Auth stays on the host. The probe mounts these files read-only when
-they exist and are not inside the rootfs:
+Auth stays on the host. These files are used when they exist and are
+not inside the rootfs:
 
-- `$HOME/.grok/auth.json`
+- `$HOME/.grok/auth.json` is copied into the per-attempt home at
+  `/rt-home/.grok/auth.json` and is not bind-mounted. Grok 1.0.46
+  refreshes the OIDC login in that file (the issuer stored in the file;
+  on this host that is `auth.x.ai`) and replaces it with a temporary
+  sibling plus `auth.json.lock`. A read-only bind rejects that replace,
+  so the container would keep an expired access token even after DNS
+  works. The copy is a regular file of at most 64 KiB, opened with
+  `O_NOFOLLOW`. The host file is never opened for write, and the
+  refreshed token is never copied back. If the issuer rotates the
+  refresh token, the new token dies with the attempt scratch and
+  `grok login` on the host is required again. Cursor's files stay
+  read-only binds. This path does not read or write them differently
+  and does not inject `CURSOR_API_KEY`.
 - `$HOME/.cursor/cli-config.json`
 - Cursor's token: `$HOME/.config/cursor/auth.json` (what the Linux CLI
   reads under `XDG_CONFIG_HOME`, set to `/rt-home/.config`) or
@@ -366,8 +395,8 @@ curl -sS -X POST "$CODEG_ORIGIN/api/roundtable_preflight" \
   "source_refs": [],
   "participants": [
     {"ordinal": 0, "role": "proposer", "provider_ref": "provider:grok", "model": "grok-4.6", "agent": "grok"},
-    {"ordinal": 1, "role": "critic", "provider_ref": "provider:cursor", "model": "composer-2.5", "agent": "cursor"},
-    {"ordinal": 2, "role": "critic", "provider_ref": "provider:antigravity", "model": "gemini-2.5-pro", "agent": "antigravity"}
+    {"ordinal": 1, "role": "critic", "provider_ref": "provider:cursor", "model": "composer-2.5[fast=true]", "agent": "cursor"},
+    {"ordinal": 2, "role": "critic", "provider_ref": "provider:antigravity", "model": "gemini-3.8-flash-high", "agent": "antigravity"}
   ],
   "moderator_ordinal": 0,
   "strategy": {"type": "phased_rounds", "version": 1, "critique_rounds": 1},
@@ -381,7 +410,23 @@ EOF
 ```
 
 `moderator_ordinal: 0` makes the Grok seat the moderator. Use `2` for
-Antigravity. Create and start use the same `config`:
+Antigravity. `workspace_id` is the Codeg folder id. Each `provider_ref`
+and `model` must be on that adapter's certificate, and that
+certificate's key must be in the execution policy. An omitted `agent`
+still means Codex.
+
+Start needs four calls. The first preflight has no room, so its
+`confirmed_preflight_id` is JSON `null` and cannot start the room. A
+confirmation is stored only when `room_id` is present, the runtime
+preflight succeeds, the execution gate is enabled, and readiness is
+`ready`. Omit optional fields. JSON `null` is rejected. `revision` and
+`expected_revision` are decimal strings (`"1"`), not numbers. `room_id`
+is a UUID string.
+
+1. Preflight the config only (the curl above). Read `config_hash`.
+   `confirmed_preflight_id` is `null`.
+2. Create the draft with the same `config`. The response `revision` is
+   `"1"` and `status` is `draft`.
 
 ```bash
 curl -sS -X POST "$CODEG_ORIGIN/api/roundtable_create" \
@@ -390,8 +435,29 @@ curl -sS -X POST "$CODEG_ORIGIN/api/roundtable_create" \
   -d '{"request":{"request_id":"11111111-1111-4111-8111-111111111111","config": { ... }}}'
 ```
 
-Then `POST /api/roundtable_start` with `room_id`, `request_id`, and
-`expected_revision` from the create response. `workspace_id` is the
-Codeg folder id. Each `provider_ref` and `model` must be on that
-adapter's certificate, and that certificate's key must be in the
-execution policy. An omitted `agent` still means Codex.
+3. Preflight again with `room_id`, `revision`, and the same `config`.
+   This is the call that returns `confirmed_preflight_id`. The record
+   expires in 15 minutes and must match the principal, room, revision,
+   config hash, capability hash, and source hash. A config that no
+   longer matches the stored room is `config_changed`. `room_id`
+   without `revision` is `revision`. `revision` without `room_id` is
+   `room_revision`.
+
+```bash
+curl -sS -X POST "$CODEG_ORIGIN/api/roundtable_preflight" \
+  -H "content-type: application/json" \
+  -H "authorization: Bearer $CODEG_TOKEN" \
+  -d '{"request":{"room_id":"<room_id from create>","revision":"1","config": { ... same config ... }}}'
+```
+
+4. Start with `room_id`, a new `request_id`, `expected_revision` (not
+   `revision`), and `confirmed_preflight_id`. The room must still be
+   `draft` or `ready`. Start without that confirmation is
+   `preflight_confirmation`.
+
+```bash
+curl -sS -X POST "$CODEG_ORIGIN/api/roundtable_start" \
+  -H "content-type: application/json" \
+  -H "authorization: Bearer $CODEG_TOKEN" \
+  -d '{"request":{"room_id":"<room_id>","request_id":"22222222-2222-4222-8222-222222222222","expected_revision":"1","confirmed_preflight_id":"<id from the second preflight>"}}'
+```

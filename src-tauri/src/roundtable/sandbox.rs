@@ -131,7 +131,9 @@ pub struct QualifiedOciProfile {
     pub service_socket: Option<PathBuf>,
     #[serde(default)]
     pub gateway_socket: Option<PathBuf>,
-    /// Read-only bind mounts of specific auth files. Never a home directory.
+    /// Host credential files named by the certificate. Never a home directory.
+    /// `/rt-home/.grok/auth.json` is copied into the attempt home at launch.
+    /// Every other destination is a read-only bind. The certificate fields are unchanged.
     #[serde(default)]
     pub auth_mounts: Vec<AuthMount>,
     /// Fixed in-container environment. Host `HOME` and `PATH` are not copied.
@@ -173,24 +175,44 @@ pub fn verify_qualified_oci_profile(
     linux_oci::verify_installed_profile(profile, certificate)
 }
 
-pub(crate) fn linux_oci_syscalls() -> &'static [&'static str] {
-    linux_oci::SYSCALLS
-}
-
 pub(crate) fn linux_runtime_mounts_json() -> Vec<serde_json::Value> {
     linux_oci::runtime_mount_json()
 }
 
-pub(crate) fn linux_slirp_hook_script() -> &'static str {
-    linux_oci::SLIRP_HOOK_SCRIPT
-}
-
-pub(crate) fn linux_slirp_hook_phase() -> &'static str {
-    linux_oci::SLIRP_HOOK_PHASE
-}
-
 pub(crate) fn linux_slirp_binary() -> Option<PathBuf> {
     linux_oci::slirp_binary()
+}
+
+pub(crate) fn linux_seccomp_json() -> serde_json::Value {
+    linux_oci::seccomp_json()
+}
+
+pub(crate) struct AttachedSlirp {
+    pub hooks: Value,
+    pub resolv_mount: Value,
+    pub network: &'static str,
+}
+
+pub(crate) fn linux_attach_slirp(
+    runtime_root: &Path,
+    hook_path: &Path,
+    id: &str,
+    slirp_bin: &Path,
+) -> RtResult<AttachedSlirp> {
+    let attached = linux_oci::attach_slirp(runtime_root, hook_path, id, slirp_bin)?;
+    Ok(AttachedSlirp {
+        hooks: attached.hooks,
+        resolv_mount: attached.resolv_mount,
+        network: attached.network,
+    })
+}
+
+pub(crate) fn linux_prepare_attempt_auth(
+    upper: &Path,
+    source: &Path,
+    destination: &str,
+) -> RtResult<bool> {
+    linux_oci::prepare_attempt_auth(upper, source, destination)
 }
 
 pub(crate) fn linux_stop_slirp(runtime_root: &Path, id: &str) {
@@ -219,6 +241,30 @@ pub fn slirp_hook_phase() -> &'static str {
 #[cfg(any(test, feature = "test-utils"))]
 pub fn cgroup_delegation_failure(path: &Path) -> Option<String> {
     linux_oci::cgroup_delegation_error(path)
+}
+
+#[cfg(any(test, feature = "test-utils"))]
+pub fn live_slirp_document(
+    runtime_root: &Path,
+    id: &str,
+    slirp_bin: &Path,
+) -> Result<serde_json::Value, String> {
+    linux_oci::live_slirp_document(runtime_root, id, slirp_bin).map_err(|error| {
+        error
+            .details
+            .reason
+            .unwrap_or_else(|| "slirp_hook".to_string())
+    })
+}
+
+#[cfg(any(test, feature = "test-utils"))]
+pub fn stage_attempt_auth(upper: &Path, source: &Path, destination: &str) -> Result<bool, String> {
+    linux_oci::prepare_attempt_auth(upper, source, destination).map_err(|error| {
+        error
+            .details
+            .reason
+            .unwrap_or_else(|| "auth_copy".to_string())
+    })
 }
 
 pub fn build_qualified_sandbox_plan(

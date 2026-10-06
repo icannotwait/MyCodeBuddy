@@ -259,6 +259,101 @@ fn isolation_script_treats_masked_kcore_as_denied_and_requires_sysfs() {
 }
 
 #[test]
+fn live_container_spec_bind_mounts_the_slirp_resolver() {
+    let root = scratch();
+    let bin = root.join("slirp4netns");
+    fs::write(&bin, b"not-executed").expect("fake slirp");
+    let spec = codeg_lib::roundtable::live_slirp_document(&root, "attempt-1", &bin).expect("spec");
+    let mounts = spec["mounts"].as_array().expect("mounts");
+    let resolv = mounts
+        .iter()
+        .find(|mount| mount["destination"] == "/etc/resolv.conf")
+        .expect("resolv mount");
+    assert_eq!(resolv["type"], "bind");
+    assert_eq!(
+        resolv["options"],
+        serde_json::json!(["bind", "ro", "nosuid", "nodev", "noexec"])
+    );
+    let source = resolv["source"].as_str().expect("source");
+    assert_eq!(
+        fs::read(source).expect("resolv bytes"),
+        b"nameserver 10.0.2.3\n"
+    );
+    assert_eq!(
+        spec["annotations"]["io.codeg.roundtable.network"],
+        "slirp-egress-not-origin-filtered"
+    );
+    assert!(spec["hooks"].get("createRuntime").is_none());
+    let hook = &spec["hooks"]["poststart"][0];
+    assert_eq!(hook["args"][0], "slirp-hook.sh");
+    assert_eq!(hook["args"][1], bin.to_string_lossy().as_ref());
+    let script = fs::read_to_string(hook["path"].as_str().expect("hook path")).expect("script");
+    assert_eq!(script, codeg_lib::roundtable::slirp_hook_script());
+    assert!(script.contains("while kill -0"));
+    assert!(script.contains("!= \"1\""));
+    let names = spec["linux"]["seccomp"]["syscalls"][0]["names"]
+        .as_array()
+        .expect("names");
+    for required in ["sendmmsg", "recvmmsg", "getitimer", "setitimer"] {
+        assert!(names.iter().any(|name| name == required), "{required}");
+    }
+    let arch = if cfg!(target_arch = "aarch64") {
+        "SCMP_ARCH_AARCH64"
+    } else {
+        "SCMP_ARCH_X86_64"
+    };
+    assert_eq!(spec["linux"]["seccomp"]["architectures"][0], arch);
+    assert_eq!(spec["linux"]["seccomp"]["defaultAction"], "SCMP_ACT_ERRNO");
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn grok_auth_refresh_stays_in_the_attempt_copy() {
+    let root = scratch();
+    let host = root.join("host");
+    let attempt = root.join("attempt");
+    fs::create_dir_all(host.join(".grok")).expect("grok home");
+    let host_auth = host.join(".grok/auth.json");
+    let original = br#"{"refresh_token":"host-token","access_token":"old"}"#;
+    fs::write(&host_auth, original).expect("host auth");
+    let copied =
+        codeg_lib::roundtable::stage_attempt_auth(&attempt, &host_auth, "/rt-home/.grok/auth.json")
+            .expect("copy");
+    assert!(!copied, "grok auth is not a read-only bind");
+    let scratch_auth = attempt.join(".grok/auth.json");
+    assert_eq!(fs::read(&scratch_auth).expect("scratch"), original);
+    fs::write(&scratch_auth, br#"{"refresh_token":"rotated"}"#).expect("refresh");
+    assert_eq!(fs::read(&host_auth).expect("host unchanged"), original);
+
+    let cursor = host.join(".cursor/auth.json");
+    fs::create_dir_all(cursor.parent().expect("parent")).expect("cursor home");
+    fs::write(&cursor, b"cursor-token").expect("cursor auth");
+    let bind =
+        codeg_lib::roundtable::stage_attempt_auth(&attempt, &cursor, "/rt-home/.cursor/auth.json")
+            .expect("cursor bind");
+    assert!(bind, "cursor auth stays a read-only bind");
+    assert_eq!(
+        fs::read(attempt.join(".cursor/auth.json")).expect("placeholder"),
+        b""
+    );
+    assert_eq!(fs::read(&cursor).expect("cursor host"), b"cursor-token");
+
+    #[cfg(unix)]
+    {
+        let link = root.join("link.json");
+        std::os::unix::fs::symlink(&host_auth, &link).expect("symlink");
+        assert!(codeg_lib::roundtable::stage_attempt_auth(
+            &attempt,
+            &link,
+            "/rt-home/.grok/auth.json",
+        )
+        .is_err());
+        assert_eq!(fs::read(&host_auth).expect("host after symlink"), original);
+    }
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
 fn slirp_hook_backgrounds_and_joins_the_user_namespace() {
     let script = codeg_lib::roundtable::slirp_hook_script();
     assert!(script.contains("--userns-path="));

@@ -6,7 +6,7 @@
 
 use std::collections::BTreeMap;
 use std::fs;
-use std::io::Read;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -244,6 +244,10 @@ fn mount_json(mount: &PlanMount) -> Value {
             "tmpfs",
             &["nosuid", "nodev", "mode=1777", "size=268435456", "rw"],
         ),
+        // Live `/scratch` stays stricter than the probe's scratch bind
+        // (`bind` without `nosymfollow`). The attempt workspace must not
+        // follow a symlink out of that directory. Resolver, hook, seccomp,
+        // and auth staging below are the shared path.
         _ => ("bind", &["rbind", "rw", "nosuid", "nodev", "nosymfollow"]),
     };
     json!({
@@ -305,10 +309,7 @@ fn oci_document(
             ],
             "maskedPaths": ["/proc/acpi", "/proc/kcore", "/proc/keys"],
             "readonlyPaths": ["/proc/sys"],
-            "seccomp": {
-                "defaultAction": "SCMP_ACT_ERRNO",
-                "architectures": ["SCMP_ARCH_X86_64"]
-            },
+            "seccomp": seccomp_json(),
             "resources": {
                 "memory": {"limit": cgroup.memory_max_bytes},
                 "pids": {"limit": cgroup.pids_max},
@@ -481,6 +482,25 @@ pub(crate) const SYSCALLS: &[&str] = &[
     "copy_file_range",
 ];
 
+pub(crate) fn seccomp_arch() -> &'static str {
+    if cfg!(target_arch = "aarch64") {
+        "SCMP_ARCH_AARCH64"
+    } else {
+        "SCMP_ARCH_X86_64"
+    }
+}
+
+/// Deny-by-default seccomp document shared by the qualification probe and the
+/// live plan. Architecture and the syscall allowlist cannot be edited on only
+/// one of those paths.
+pub(crate) fn seccomp_json() -> Value {
+    json!({
+        "defaultAction": "SCMP_ACT_ERRNO",
+        "architectures": [seccomp_arch()],
+        "syscalls": [{"names": SYSCALLS, "action": "SCMP_ACT_ALLOW"}]
+    })
+}
+
 fn document_hash(oci: &Value) -> RtResult<Hash256> {
     Ok(Hash256::sha256(&serde_json::to_vec(oci).map_err(|_| {
         rt_error(ErrorCode::InvalidArgument, "oci_encode")
@@ -607,8 +627,7 @@ pub(super) fn build_qualified_plan(
     args.extend(profile.cli_args.clone());
     plan.oci["process"]["args"] = json!(args);
     plan.oci["linux"]["cgroupsPath"] = json!(oci_cgroup_path(profile, &id)?);
-    plan.oci["linux"]["seccomp"]["syscalls"] =
-        json!([{"names":SYSCALLS,"action":"SCMP_ACT_ALLOW"}]);
+    plan.oci["linux"]["seccomp"] = seccomp_json();
     #[cfg(target_os = "linux")]
     {
         // The qualified rootless container maps only the launching operator.
@@ -634,7 +653,7 @@ pub(super) fn build_qualified_plan(
                 .push(json!({"source":source,"destination":destination,"type":"bind","options":["bind","ro","nosuid","nodev","noexec"]}));
         }
     }
-    install_home_upper(&mut plan, profile)?;
+    install_home_upper(&mut plan)?;
     apply_auth_mounts(&mut plan, profile)?;
     install_slirp_hook(&mut plan, profile, &id)?;
     plan.plan_hash = document_hash(&plan.oci)?;
@@ -781,6 +800,12 @@ fn apply_auth_mounts(plan: &mut SandboxPlan, profile: &QualifiedOciProfile) -> R
         .map(|(key, value)| format!("{key}={value}"))
         .collect();
     plan.oci["process"]["env"] = json!(env_list);
+    let upper = plan
+        .mounts
+        .iter()
+        .find(|item| item.destination == "/rt-home")
+        .map(|item| item.source.clone())
+        .ok_or_else(|| rt_error(ErrorCode::InvalidArgument, "home_upper"))?;
     for mount in &profile.auth_mounts {
         if !auth_destination_allowed(&mount.destination) || !mount.source.is_absolute() {
             return Err(rt_error(ErrorCode::InvalidArgument, "auth_mount"));
@@ -798,6 +823,12 @@ fn apply_auth_mounts(plan: &mut SandboxPlan, profile: &QualifiedOciProfile) -> R
                 ErrorCode::CapabilityUnqualified,
                 "credential_baked_into_image",
             ));
+        }
+        // Grok refreshes `auth.json` in place. That destination is a writable
+        // copy in the attempt home. Every other file, including Cursor, stays
+        // a read-only bind and is never copied.
+        if !prepare_attempt_auth(&upper, &mount.source, &mount.destination)? {
+            continue;
         }
         plan.mounts.push(PlanMount {
             source: mount.source.clone(),
@@ -832,7 +863,7 @@ fn home_upper_allowed(plan: &SandboxPlan, mount: &PlanMount) -> bool {
     mount.source.starts_with(&scratch.source) && mount.source != scratch.source
 }
 
-fn install_home_upper(plan: &mut SandboxPlan, profile: &QualifiedOciProfile) -> RtResult<()> {
+fn install_home_upper(plan: &mut SandboxPlan) -> RtResult<()> {
     let scratch = plan
         .mounts
         .iter()
@@ -842,20 +873,6 @@ fn install_home_upper(plan: &mut SandboxPlan, profile: &QualifiedOciProfile) -> 
     let upper = scratch.join("rt-home");
     fs::create_dir_all(&upper)
         .map_err(|_| rt_error(ErrorCode::StorageUnavailable, "home_upper"))?;
-    for mount in &profile.auth_mounts {
-        let Some(relative) = mount.destination.strip_prefix("/rt-home/") else {
-            return Err(rt_error(ErrorCode::InvalidArgument, "auth_mount"));
-        };
-        let path = upper.join(relative);
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)
-                .map_err(|_| rt_error(ErrorCode::StorageUnavailable, "home_upper"))?;
-        }
-        if !path.exists() {
-            fs::write(&path, b"")
-                .map_err(|_| rt_error(ErrorCode::StorageUnavailable, "home_upper"))?;
-        }
-    }
     plan.mounts.push(PlanMount {
         source: upper.clone(),
         destination: "/rt-home".to_string(),
@@ -914,28 +931,14 @@ fn install_slirp_hook(
 ) -> RtResult<()> {
     let slirp = slirp_binary()
         .ok_or_else(|| rt_error(ErrorCode::PolicyUnenforceable, "slirp4netns_missing"))?;
-    let dir = profile.runtime_root.join("slirp-pids");
-    fs::create_dir_all(&dir).map_err(|_| rt_error(ErrorCode::StorageUnavailable, "slirp_hook"))?;
-    let hook = profile.runtime_root.join("slirp-hook.sh");
-    fs::write(&hook, SLIRP_HOOK_SCRIPT)
-        .map_err(|_| rt_error(ErrorCode::StorageUnavailable, "slirp_hook"))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(&hook, fs::Permissions::from_mode(0o755))
-            .map_err(|_| rt_error(ErrorCode::StorageUnavailable, "slirp_hook"))?;
-    }
-    let pidfile = dir.join(format!("{id}.pid"));
-    plan.oci["annotations"]["io.codeg.roundtable.network"] =
-        json!("slirp-egress-not-origin-filtered");
-    plan.oci["hooks"] = json!({
-        SLIRP_HOOK_PHASE: [{
-            "path": hook,
-            "args": ["slirp-hook.sh", slirp, pidfile],
-            "env": []
-        }]
-    });
-    Ok(())
+    apply_slirp_edits(
+        &mut plan.oci,
+        &mut plan.mounts,
+        &profile.runtime_root,
+        &profile.runtime_root.join("slirp-hook.sh"),
+        id,
+        &slirp,
+    )
 }
 
 pub(crate) fn slirp_binary() -> Option<PathBuf> {
@@ -949,6 +952,196 @@ pub(crate) fn slirp_binary() -> Option<PathBuf> {
     }
     let fallback = PathBuf::from("/usr/bin/slirp4netns");
     fallback.is_file().then_some(fallback)
+}
+
+pub(crate) const SLIRP_RESOLV_BODY: &[u8] = b"nameserver 10.0.2.3\n";
+pub(crate) const SLIRP_NETWORK: &str = "slirp-egress-not-origin-filtered";
+/// Grok replaces this file when it refreshes the OIDC login. Keyed by
+/// destination so the certificate schema, and therefore `plan_hash`, stays put.
+pub(crate) const GROK_AUTH_DESTINATION: &str = "/rt-home/.grok/auth.json";
+const ATTEMPT_AUTH_COPY_LIMIT: u64 = 64 * 1024;
+
+pub(crate) struct SlirpAttachment {
+    pub hooks: Value,
+    pub resolv_mount: Value,
+    pub resolv_source: PathBuf,
+    pub network: &'static str,
+}
+
+pub(crate) fn slirp_resolv_path(runtime_root: &Path) -> PathBuf {
+    runtime_root.join("slirp-resolv.conf")
+}
+
+/// Writes the poststart hook, its watcher script, and the slirp resolver file.
+/// The probe and `install_slirp_hook` both call only this function.
+pub(crate) fn attach_slirp(
+    runtime_root: &Path,
+    hook_path: &Path,
+    id: &str,
+    slirp_bin: &Path,
+) -> RtResult<SlirpAttachment> {
+    if let Some(parent) = hook_path.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|_| rt_error(ErrorCode::StorageUnavailable, "slirp_hook"))?;
+    }
+    fs::write(hook_path, SLIRP_HOOK_SCRIPT)
+        .map_err(|_| rt_error(ErrorCode::StorageUnavailable, "slirp_hook"))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(hook_path, fs::Permissions::from_mode(0o755))
+            .map_err(|_| rt_error(ErrorCode::StorageUnavailable, "slirp_hook"))?;
+    }
+    let dir = runtime_root.join("slirp-pids");
+    fs::create_dir_all(&dir).map_err(|_| rt_error(ErrorCode::StorageUnavailable, "slirp_hook"))?;
+    let pidfile = dir.join(format!("{id}.pid"));
+    let resolv = slirp_resolv_path(runtime_root);
+    fs::write(&resolv, SLIRP_RESOLV_BODY)
+        .map_err(|_| rt_error(ErrorCode::StorageUnavailable, "slirp_resolv"))?;
+    Ok(SlirpAttachment {
+        hooks: json!({
+            SLIRP_HOOK_PHASE: [{
+                "path": hook_path,
+                "args": ["slirp-hook.sh", slirp_bin, pidfile],
+                "env": []
+            }]
+        }),
+        resolv_mount: json!({
+            "destination": "/etc/resolv.conf",
+            "type": "bind",
+            "source": &resolv,
+            "options": ["bind", "ro", "nosuid", "nodev", "noexec"]
+        }),
+        resolv_source: resolv,
+        network: SLIRP_NETWORK,
+    })
+}
+
+fn apply_slirp_edits(
+    oci: &mut Value,
+    mounts: &mut Vec<PlanMount>,
+    runtime_root: &Path,
+    hook_path: &Path,
+    id: &str,
+    slirp_bin: &Path,
+) -> RtResult<()> {
+    let attachment = attach_slirp(runtime_root, hook_path, id, slirp_bin)?;
+    oci["annotations"]["io.codeg.roundtable.network"] = json!(attachment.network);
+    oci["hooks"] = attachment.hooks;
+    mounts.push(PlanMount {
+        source: attachment.resolv_source,
+        destination: "/etc/resolv.conf".to_string(),
+        read_only: true,
+    });
+    oci["mounts"]
+        .as_array_mut()
+        .ok_or_else(|| rt_error(ErrorCode::InvalidArgument, "oci_mounts"))?
+        .push(attachment.resolv_mount);
+    Ok(())
+}
+
+/// `true` means the caller must bind `source` read-only at `destination`.
+/// Grok's auth file returns `false`: the bytes live only in the attempt home.
+pub(crate) fn prepare_attempt_auth(
+    upper: &Path,
+    source: &Path,
+    destination: &str,
+) -> RtResult<bool> {
+    let relative = destination
+        .strip_prefix("/rt-home/")
+        .filter(|relative| {
+            !relative.is_empty() && !relative.contains("..") && !relative.ends_with('/')
+        })
+        .ok_or_else(|| rt_error(ErrorCode::InvalidArgument, "auth_mount"))?;
+    let path = upper.join(relative);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|_| rt_error(ErrorCode::StorageUnavailable, "auth_copy"))?;
+    }
+    if destination == GROK_AUTH_DESTINATION {
+        copy_regular_nofollow(source, &path, ATTEMPT_AUTH_COPY_LIMIT)?;
+        Ok(false)
+    } else {
+        if !path.exists() {
+            fs::write(&path, b"")
+                .map_err(|_| rt_error(ErrorCode::StorageUnavailable, "auth_copy"))?;
+        }
+        Ok(true)
+    }
+}
+
+fn copy_regular_nofollow(source: &Path, dest: &Path, limit: u64) -> RtResult<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut input = fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(source)
+            .map_err(|_| rt_error(ErrorCode::CapabilityUnqualified, "auth_copy"))?;
+        let meta = input
+            .metadata()
+            .map_err(|_| rt_error(ErrorCode::CapabilityUnqualified, "auth_copy"))?;
+        if !meta.is_file() || meta.len() > limit {
+            return Err(rt_error(ErrorCode::CapabilityUnqualified, "auth_copy"));
+        }
+        let mut bytes = Vec::new();
+        input
+            .read_to_end(&mut bytes)
+            .map_err(|_| rt_error(ErrorCode::CapabilityUnqualified, "auth_copy"))?;
+        if bytes.len() as u64 > limit {
+            return Err(rt_error(ErrorCode::CapabilityUnqualified, "auth_copy"));
+        }
+        let tmp_name = format!(
+            ".{}.codeg-attempt",
+            dest.file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("auth")
+        );
+        let tmp = dest.with_file_name(tmp_name);
+        let _ = fs::remove_file(&tmp);
+        {
+            let mut output = fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .custom_flags(libc::O_NOFOLLOW)
+                .open(&tmp)
+                .map_err(|_| rt_error(ErrorCode::StorageUnavailable, "auth_copy"))?;
+            output
+                .write_all(&bytes)
+                .map_err(|_| rt_error(ErrorCode::StorageUnavailable, "auth_copy"))?;
+        }
+        fs::rename(&tmp, dest).map_err(|_| rt_error(ErrorCode::StorageUnavailable, "auth_copy"))?;
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (source, dest, limit);
+        Err(rt_error(ErrorCode::PolicyUnenforceable, "auth_copy"))
+    }
+}
+
+#[cfg(any(test, feature = "test-utils"))]
+pub fn live_slirp_document(runtime_root: &Path, id: &str, slirp_bin: &Path) -> RtResult<Value> {
+    let mut oci = json!({
+        "mounts": [],
+        "annotations": {"io.codeg.roundtable.network": "isolated-deny-egress"},
+        "linux": {"seccomp": seccomp_json()}
+    });
+    let mut mounts = Vec::new();
+    apply_slirp_edits(
+        &mut oci,
+        &mut mounts,
+        runtime_root,
+        &runtime_root.join("slirp-hook.sh"),
+        id,
+        slirp_bin,
+    )?;
+    if mounts.len() != 1 || mounts[0].destination != "/etc/resolv.conf" || !mounts[0].read_only {
+        return Err(rt_error(ErrorCode::InvalidArgument, "slirp_resolv"));
+    }
+    Ok(oci)
 }
 
 pub(super) fn stop_slirp(runtime_root: &Path, id: &str) {
@@ -1108,8 +1301,11 @@ pub(super) fn verify_profile(plan: &SandboxPlan, profile: &QualifiedOciProfile) 
     let id = runtime_id(&plan.db, plan.boot_epoch.0, &plan.incarnation.to_string());
     if plan.oci["process"]["args"] != json!(args)
         || plan.oci["linux"]["cgroupsPath"] != json!(oci_cgroup_path(profile, &id)?)
-        || plan.oci["linux"]["seccomp"]["syscalls"]
-            != json!([{"names":SYSCALLS,"action":"SCMP_ACT_ALLOW"}])
+        || plan.oci["linux"]["seccomp"] != seccomp_json()
+        || plan.oci["annotations"]["io.codeg.roundtable.network"] != SLIRP_NETWORK
+        || plan.oci["hooks"][SLIRP_HOOK_PHASE]
+            .as_array()
+            .is_none_or(|hooks| hooks.is_empty())
     {
         return Err(rt_error(
             ErrorCode::CapabilityUnqualified,
@@ -1131,6 +1327,11 @@ pub(super) fn verify_profile(plan: &SandboxPlan, profile: &QualifiedOciProfile) 
             }
             "/run/codeg/gateway.sock" => {
                 profile.gateway_socket.as_ref() == Some(&mount.source) && mount.read_only
+            }
+            "/etc/resolv.conf" => {
+                mount.read_only
+                    && mount.source == slirp_resolv_path(&profile.runtime_root)
+                    && fs::read(&mount.source).ok().as_deref() == Some(SLIRP_RESOLV_BODY)
             }
             destination if destination.starts_with("/rt-home/") => {
                 mount.read_only
@@ -1161,7 +1362,8 @@ pub(super) fn verify_profile(plan: &SandboxPlan, profile: &QualifiedOciProfile) 
         let metadata = fs::symlink_metadata(&target)
             .map_err(|_| rt_error(ErrorCode::CapabilityUnqualified, "rootfs_mount_target"))?;
         let file_mount = mount.destination.starts_with("/run/codeg/")
-            || mount.destination.starts_with("/rt-home/");
+            || mount.destination.starts_with("/rt-home/")
+            || mount.destination == "/etc/resolv.conf";
         if metadata.file_type().is_symlink()
             || (file_mount && !metadata.is_file())
             || (!file_mount && !metadata.is_dir())
@@ -1176,7 +1378,15 @@ pub(super) fn verify_profile(plan: &SandboxPlan, profile: &QualifiedOciProfile) 
         }
     }
     for required in [
-        "/proc", "/dev", "/dev/pts", "/dev/shm", "/sys", "/tmp", "/scratch", "/rt-home",
+        "/proc",
+        "/dev",
+        "/dev/pts",
+        "/dev/shm",
+        "/sys",
+        "/tmp",
+        "/scratch",
+        "/rt-home",
+        "/etc/resolv.conf",
     ] {
         if !plan
             .mounts
@@ -1256,6 +1466,7 @@ pub(super) fn verify_installed_profile(
         ("scratch", true),
         ("run/codeg/roundtable.sock", false),
         ("run/codeg/gateway.sock", false),
+        ("etc/resolv.conf", false),
     ] {
         let metadata = fs::symlink_metadata(profile.rootfs.join(path))
             .map_err(|_| rt_error(ErrorCode::CapabilityUnqualified, "rootfs_mount_target"))?;
