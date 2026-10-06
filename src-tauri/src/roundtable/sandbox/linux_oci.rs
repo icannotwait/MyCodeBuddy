@@ -1250,12 +1250,52 @@ fn validate_proc_number_space(link: &str, pid: u32) -> RtResult<()> {
 }
 
 #[cfg(target_os = "linux")]
+fn validate_proc_namespace_status(status: &str, pid: u32, tid: u32) -> RtResult<()> {
+    let invalid = || {
+        rt_error(
+            ErrorCode::PolicyUnenforceable,
+            "slirp_proc_namespace_domain",
+        )
+    };
+    if status.len() > 4096 || pid == 0 || tid == 0 {
+        return Err(invalid());
+    }
+    for (field, expected) in [("NStgid", pid), ("NSpid", tid)] {
+        let mut lines = status
+            .lines()
+            .filter(|line| line.trim_start().starts_with(field));
+        let line = lines.next().ok_or_else(invalid)?;
+        if lines.next().is_some() {
+            return Err(invalid());
+        }
+        let values = line
+            .strip_prefix(field)
+            .and_then(|rest| rest.strip_prefix(':'))
+            .ok_or_else(invalid)?;
+        let mut values = values.split_whitespace();
+        let value = values.next().ok_or_else(invalid)?;
+        if values.next().is_some()
+            || !value.bytes().all(|byte| byte.is_ascii_digit())
+            || value.parse::<u32>().ok() != Some(expected)
+        {
+            return Err(invalid());
+        }
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
 fn helper_start_ticks(stat: &str) -> RtResult<u64> {
     stat.rsplit_once(") ")
         .and_then(|(_, rest)| rest.split_whitespace().nth(19))
         .and_then(|value| value.parse::<u64>().ok())
         .filter(|value| *value > 0)
-        .ok_or_else(|| rt_error(ErrorCode::PolicyUnenforceable, "slirp_proc_start_unreadable"))
+        .ok_or_else(|| {
+            rt_error(
+                ErrorCode::PolicyUnenforceable,
+                "slirp_proc_start_unreadable",
+            )
+        })
 }
 
 #[cfg(target_os = "linux")]
@@ -1283,7 +1323,10 @@ fn usable_helper_boot_clock(
 impl HelperBirthContext {
     fn capture() -> RtResult<Self> {
         let unavailable = || {
-            rt_error(ErrorCode::PolicyUnenforceable, "slirp_birth_context_unavailable")
+            rt_error(
+                ErrorCode::PolicyUnenforceable,
+                "slirp_birth_context_unavailable",
+            )
         };
         let read = |path: &str| -> RtResult<String> {
             let mut text = String::new();
@@ -1319,6 +1362,15 @@ impl HelperBirthContext {
         validate_proc_number_space(
             self_link.to_str().ok_or_else(unavailable)?,
             std::process::id(),
+        )?;
+        // Equal caller IDs alone are insufficient: an ancestor-mounted proc
+        // filesystem can coincidentally use the same numbers for this caller
+        // while mapping another numeric PID to a different process. Kernel
+        // status lists every namespace level, including duplicate equal IDs.
+        validate_proc_namespace_status(
+            &read("/proc/thread-self/status")?,
+            std::process::id(),
+            tid as u32,
         )?;
         let boot_id = uuid::Uuid::parse_str(read("/proc/sys/kernel/random/boot_id")?.trim())
             .map_err(|_| unavailable())?;
@@ -1475,7 +1527,10 @@ fn resolve_helper_environment(
         Err(error) => {
             // A zombie can deny environ even when its proc directory remains.
             // Only the identity pinned before this read can prove it exited.
-            let reason = match (error.kind() == std::io::ErrorKind::PermissionDenied, age_proof) {
+            let reason = match (
+                error.kind() == std::io::ErrorKind::PermissionDenied,
+                age_proof,
+            ) {
                 (true, true) => "slirp_proc_environment_denied_within_scope",
                 (true, false) => "slirp_proc_environment_denied_no_age_proof",
                 (false, true) => "slirp_proc_environment_unreadable_within_scope",
@@ -1657,7 +1712,8 @@ pub(super) fn stop_slirp(runtime_root: &Path, id: &str, expected: bool) -> RtRes
                         &fd,
                         environment,
                         birth.is_some_and(|birth| birth.zero_boottime_offset),
-                    )? else {
+                    )?
+                    else {
                         return Ok(None);
                     };
                     if !marked(&environment, runtime_root, id, None) {
@@ -2860,6 +2916,44 @@ mod control_tests {
 
     #[cfg(target_os = "linux")]
     #[test]
+    fn proc_namespace_status_requires_one_matching_level_for_process_and_thread() {
+        let valid = "Name:\tfake\nNStgid:\t500\nNSpid:\t501\nNSpgid:\t500\n";
+        super::validate_proc_namespace_status(valid, 500, 501).unwrap();
+        for status in [
+            "NStgid: 500 500\nNSpid: 501 501\n",
+            "NStgid: 900 500\nNSpid: 901 501\n",
+            "NStgid: 500\nNSpid: 501 501\n",
+            "NStgid: 500 500\nNSpid: 501\n",
+            "NStgid: 500\nNSpid: 501\nNSpid: 501\n",
+            "NStgid: 500\nNStgid: 500\nNSpid: 501\n",
+            "NStgid: 501\nNSpid: 501\n",
+            "NStgid: 500\nNSpid: 500\n",
+            "NStgid: 500\n",
+            "NSpid: 501\n",
+            "NStgid: 500\nNSpid:\n",
+            "NStgid: +500\nNSpid: 501\n",
+            "NStgid: 500\nNSpid: -501\n",
+            "NStgid: 500\nNSpid: 4294967296\n",
+            "NStgid: 500\nNSpid: 501x\n",
+            "NStgid: 500\nNSpid 501\nNSpid: 501\n",
+            " NStgid: 500\nNSpid: 501\n",
+            "NStgid: 500\n NSpid: 501\nNSpid: 501\n",
+        ] {
+            let error = super::validate_proc_namespace_status(status, 500, 501).unwrap_err();
+            assert_eq!(
+                error.details.reason.as_deref(),
+                Some("slirp_proc_namespace_domain")
+            );
+        }
+        assert!(
+            super::validate_proc_namespace_status("NStgid: 0\nNSpid: 0\n", 0, 0).is_err()
+        );
+        let oversized = format!("{valid}{}", "x".repeat(4097));
+        assert!(super::validate_proc_namespace_status(&oversized, 500, 501).is_err());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
     fn helper_birth_exclusion_is_strict_and_keeps_the_original_context() {
         let mut original = super::HelperBirthContext::capture().unwrap();
         original.creator_start_ticks = 100;
@@ -2961,7 +3055,10 @@ mod control_tests {
                 path.with_extension(suffix)
             };
             std::fs::write(&artifact, b"old artifact").unwrap();
-            assert!(super::initialize_slirp_lifecycle(&path).is_err(), "{suffix}");
+            assert!(
+                super::initialize_slirp_lifecycle(&path).is_err(),
+                "{suffix}"
+            );
             assert_eq!(std::fs::read(&artifact).unwrap(), b"old artifact");
             if suffix != "pid.birth" {
                 assert!(!path.with_extension("pid.birth").exists());
@@ -2973,7 +3070,13 @@ mod control_tests {
     #[test]
     fn missing_or_mismatched_birth_evidence_cannot_be_upgraded_during_cleanup() {
         for kind in [
-            "missing", "malformed", "missing-time", "duplicate", "boot", "pid", "time",
+            "missing",
+            "malformed",
+            "missing-time",
+            "duplicate",
+            "boot",
+            "pid",
+            "time",
         ] {
             let root = tempfile::tempdir().unwrap();
             let pin = helper_fixture(root.path(), kind, "prepared\n");
@@ -3002,7 +3105,10 @@ mod control_tests {
                 }
             }
             let before = std::fs::read(&birth).ok();
-            assert!(super::stop_slirp(root.path(), kind, true).is_err(), "{kind}");
+            assert!(
+                super::stop_slirp(root.path(), kind, true).is_err(),
+                "{kind}"
+            );
             assert_eq!(std::fs::read(&birth).ok(), before, "{kind}");
             assert_ne!(
                 std::fs::read_to_string(pin.with_extension("pid.state")).unwrap(),
@@ -3234,11 +3340,16 @@ mod control_tests {
         }
         assert_eq!(
             result.unwrap_err().details.reason.as_deref(),
-            Some(if super::HelperBirthContext::capture().unwrap().zero_boottime_offset {
-                "slirp_proc_environment_denied_within_scope"
-            } else {
-                "slirp_proc_environment_denied_no_age_proof"
-            })
+            Some(
+                if super::HelperBirthContext::capture()
+                    .unwrap()
+                    .zero_boottime_offset
+                {
+                    "slirp_proc_environment_denied_within_scope"
+                } else {
+                    "slirp_proc_environment_denied_no_age_proof"
+                }
+            )
         );
         assert!(owned_ended, "verified helpers must still be terminated");
         assert!(

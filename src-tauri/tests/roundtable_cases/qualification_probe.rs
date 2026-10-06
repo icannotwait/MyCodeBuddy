@@ -1278,8 +1278,12 @@ fn spawn_owned_watcher(runtime_root: &Path, id: &str) -> std::process::Child {
 fn initialize_fake_helper_lifecycle(runtime_root: &Path, id: &str) {
     // The actual initializer publishes birth evidence before fake children,
     // exactly as it does before returning a production hook specification.
-    codeg_lib::roundtable::live_slirp_document(runtime_root, id, &runtime_root.join("unused-slirp"))
-        .expect("initialize fake helper lifecycle");
+    codeg_lib::roundtable::live_slirp_document(
+        runtime_root,
+        id,
+        &runtime_root.join("unused-slirp"),
+    )
+    .expect("initialize fake helper lifecycle");
 }
 
 #[cfg(target_os = "linux")]

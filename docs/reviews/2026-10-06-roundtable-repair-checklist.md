@@ -157,6 +157,21 @@ Separate-process regressions exercise older exclusion and newer-process
 rejection after restart. Three formatter-only hunks from this CI run are also
 applied exactly. These changes still require CI on their final commit.
 
+### Runtime checkpoint: `c447542`
+
+The [runtime job for `c447542`](https://github.com/icannotwait/MyCodeBuddy/actions/runs/37439676019/job/112190690486)
+passed all 122 executable tests, with 1 live-host test ignored. Both original
+helper-cleanup proof regressions and the terminal-budget regressions passed.
+This is runtime evidence for that commit, not a full-matrix or live-host pass.
+
+A final narrow guard also checks that proc status exposes exactly one matching
+process/thread PID namespace level before pairing proc observations with a
+pidfd. Numeric self-ID coincidence alone does not prove a shared PID number
+space when an ancestor procfs is mounted. Pure regressions reject equal and
+distinct multi-level vectors, malformed fields and duplicates. The formatter
+diagnostics from this run are applied separately. The final commit still
+requires its own complete CI result.
+
 ## Capability boundaries retained
 
 The false-success and unsafe-admission defects are addressed by fail-closed guards, but the corresponding live capabilities in F02, F03 and F14 remain unimplemented. They are not closed feature-delivery items. Rerunning the current host probe cannot produce a usable certificate or supply the missing measurements.

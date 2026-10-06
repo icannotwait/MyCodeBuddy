@@ -219,3 +219,29 @@ prevent cleanup proof. Such evidence requires separate host-level recovery;
 resetting quarantine or synthesizing a fresh birth record is not supported.
 No live qualification capability, native credential isolation, receipt/drain
 measurement, request-envelope measurement or gate enablement is claimed.
+
+## Proc mount PID-domain guard
+
+Matching `/proc/self` and `/proc/thread-self` numeric IDs is necessary but
+not sufficient. An ancestor-mounted procfs can coincidentally give this
+caller the same IDs while mapping another numeric PID differently. That
+could associate one process's proc ownership markers with another process's
+pidfd. Linux status emits every namespace level in `NStgid` and `NSpid`,
+including repeated equal numbers. [Linux v6.8 status implementation](https://raw.githubusercontent.com/torvalds/linux/v6.8/fs/proc/array.c)
+
+Context capture now also reads at most 4097 bytes from
+`/proc/thread-self/status`, rejects a body exceeding 4096 bytes, and requires
+exactly one `NStgid` value matching `getpid` and one `NSpid` value matching
+`gettid`. Missing, malformed or duplicate fields and multi-level vectors
+are rejected before any helper scan or pidfd association. Both existing
+symlink checks remain. This is a read-only guard; no namespace is created
+or changed.
+
+Pure parser regressions cover valid single-level status, distinct and equal
+multi-level IDs, duplicate fields, wrong IDs, absent/empty fields, signs,
+overflow, malformed decimal text and oversized input. A local read-only
+probe confirms this host supplies bounded single-level matching fields;
+that is OS-interface evidence, not execution of the Rust implementation.
+Fake hook tests pass 3/3 and the native aggregate remains 96/98 with the same
+two missing Rust prerequisites. Local Rust tests and rustfmt remain UNRUN;
+existing CI must verify the final patch.
