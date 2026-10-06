@@ -227,6 +227,47 @@ relax production ownership, signaling or proof decisions. Further production
 changes require the actual denied identity; an unknown live process must
 continue to invalidate cleanup proof.
 
+### Diagnostic evidence: `b1d5ee5`
+
+The diagnostic-only [CI run for `b1d5ee5`](https://github.com/icannotwait/MyCodeBuddy/actions/runs/37452779145)
+identified the actual denied candidates. The [Linux server job](https://github.com/icannotwait/MyCodeBuddy/actions/runs/37452779145/job/112233312908)
+ran 7,771 passing tests, 1 failure and 1 ignored. The [Linux desktop job](https://github.com/icannotwait/MyCodeBuddy/actions/runs/37452779145/job/112233312889)
+ran 8,082 passing tests, 1 failure and 1 ignored. Both failures were the
+deterministic retained-identity fixture; its three registered workers were not
+the denied candidates. The denied PIDs were unretained, newer than the durable
+creator bound, and positively live when the real environment read returned
+`EACCES`. The error was not the fixture's injected read denial. The original
+TERM-to-exec environment-clear regression passed in both jobs.
+
+These observations rule out the fixture's retained descendant as the source
+of these failures. The precise owner and cause of the other processes' read
+denials are not established. Concurrent test activity is consistent with the
+logs, but is not an identified owner. The failed result assertion preceded the
+fixture's final SIGKILL and proven-state assertions, so those assertions did
+not pass in either failing execution.
+
+The production response is correctly fail-closed under its current proof
+model: a global census cannot exclude an unknown, live, unreadable process
+inside the birth bound. Full-host readability was therefore an invalid
+unconditional success precondition for these parallel unit fixtures.
+
+The component-test correction uses an explicitly complete fixture inventory,
+available only under `cfg(test)` and scoped by thread-local RAII. It retains
+real process reads, pidfds, signaling, persistence and termination assertions.
+An explicit additional unknown-live denied candidate must still quarantine,
+survive signaling and not prevent termination of known helpers. A test-only
+forced-rediscovery control must fail where the retained-identity positive
+passes. Unrestricted production-discovery negative/integration coverage is
+kept separate. None of these component results certifies a shared host.
+
+Production discovery remains a full `/proc` census. Reliable cleanup proof
+alongside arbitrary concurrent same-UID processes remains an architectural
+availability limitation. Closing it requires a separately proven, durable,
+OS-enforced helper membership boundary established before any helper fork;
+no such boundary, new host permission or cgroup configuration is introduced
+by this test correction. Do not suppress `EACCES`, retry an unproven lifecycle
+into success or relabel this limitation as completed host qualification.
+
 ## Capability boundaries retained
 
 The false-success and unsafe-admission defects are addressed by fail-closed guards, but the corresponding live capabilities in F02, F03 and F14 remain unimplemented. They are not closed feature-delivery items. Rerunning the current host probe cannot produce a usable certificate or supply the missing measurements.

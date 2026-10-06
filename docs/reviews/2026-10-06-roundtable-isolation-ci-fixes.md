@@ -317,3 +317,86 @@ thread-local release. Local Rust execution remains UNRUN (Cargo command exits
 127), as does rustfmt. Fake hook tests pass 3/3; native aggregate remains
 96/98, with the missing-rustc and missing-Cargo prerequisites. Existing CI
 must provide the denied-candidate evidence before any further behavioral fix.
+
+## Controlled component inventories after b1d5ee5
+
+The diagnostic evidence identifies a violated test precondition. Linux server
+CI reports 7771 passed, 1 failed, 1 ignored. Its failed retained-unreadability
+fixture owns PIDs 16107–16109, but the denied candidate is PID 16111, observed
+parent 2490. It is newer than the creator bound, unretained, live by the existing
+pidfd poll, and has a real EACCES read rather than the injected denial. Linux
+desktop reports 8082 passed, 1 failed, 1 ignored; its equivalent candidates
+19267 and 19275 are outside fixture PIDs 19263–19265 and have observed parent
+5453. The exact concurrent owners are not established. The three intended
+workers in this fixture do not fork after readiness.
+
+The production proof correctly remains unavailable for an unknown, live,
+unreadable in-scope candidate. Expecting unconditional whole-host success from
+these unit fixtures was invalid on a shared process space. This patch changes
+the component-test input boundary, not that production outcome.
+
+### Boundary and safeguards
+
+- Only `cfg(test)` unit builds can install an explicit candidate inventory.
+  Production and `test-utils` integration library builds retain the direct
+  full `/proc` iterator. Without an installed unit inventory, the unit adapter
+  also forwards the real directory entries and errors
+- Inventories come from declared fake-child IDs, including intentionally
+  unknown children in negative cases. They are never derived by filtering
+  markers, unreadability or errors. Candidate metadata/stat/environ, namespace
+  checks, pidfds, signals and lifecycle files remain real
+- Inventory and denial guards are thread-local, non-Send and RAII-reset.
+  A regression checks explicit membership, cross-thread isolation and unwind
+  restoration. Controlled children have kill/wait-on-drop protection
+- Marker-clearing fixtures retain the real TERM-to-exec/environment-clear
+  transition. Their pre-TERM wait is builtin-only so each declared inventory
+  is complete. The simple-helper case captures first-call pidfd exit and
+  durable-state evidence before retry; reaping is delayed until afterward to
+  prevent numeric ID reuse without letting retry repair the first assertion
+- The mutation control has a fresh lifecycle and forces rediscovery only
+  inside its unit inventory scope. It requires the exact injected descendant
+  denial, a successful original read and a live retained poll, while still
+  asserting SIGKILL and durable quarantine. The normal fresh fixture requires
+  successful proof; neither case accepts either outcome
+
+### Explicit test mapping
+
+The following existing cases are reclassified and named as controlled
+component tests; none is skipped or removed:
+
+- `controlled_persisted_birth_excludes_only_an_older_unreadable_child_after_restart`
+- `controlled_helper_cleanup_waits_for_both_pinned_helper_and_watcher`
+- `controlled_retained_live_identity_survives_unreadable_environment_on_later_sweeps`
+- `controlled_verified_descendant_remains_owned_after_term_clears_its_environment`
+- `controlled_interrupted_cleanup_cannot_forget_a_descendant_on_retry`
+- `controlled_no_helper_and_durable_never_started_are_distinct_from_missing_configuration`
+
+Added cases are the inventory isolation/unwind regression,
+`controlled_forced_rediscovery_is_a_fail_closed_mutation_control`, and
+`controlled_inventory_unknown_live_candidate_still_quarantines_cleanup`.
+The latter explicitly includes the denied foreign PID and requires quarantine,
+foreign survival and owned-worker termination.
+
+The original
+`unreadable_live_process_quarantines_proof_but_does_not_prevent_owned_termination`
+still uses unrestricted discovery and explicitly asserts no inventory override.
+The forged/reused PID negatives and the real-process integration tests in
+`tests/roundtable_cases/qualification_probe.rs` retain their unrestricted scope.
+
+### What the result can establish
+
+Controlled success establishes the cleanup algorithm's behavior, real kernel
+identity/termination operations and durable state for the declared complete
+fixture input. It does not establish whole-host discovery completeness, live
+qualification or shared-host cleanup availability. Production still quarantines
+unknown live unreadable candidates; replacing that availability limitation
+would require a separately designed, demonstrably exclusive helper boundary.
+No production EACCES exception, suite serialization, retry-to-green, test skip,
+namespace/cgroup setting or live gate change is introduced.
+
+Local checks: the builtin-only TERM fixture reaches readiness and its actual
+exec transition, then remains alive until KILL; fake hook tests pass 3/3.
+The native aggregate remains 96/98 with missing rustc/Cargo prerequisites.
+Rust test attempts exit 127, so local Rust tests, the mutation control and
+rustfmt remain UNRUN. Existing CI must compile and run this exact patch before
+any new Rust GREEN or full-matrix claim.

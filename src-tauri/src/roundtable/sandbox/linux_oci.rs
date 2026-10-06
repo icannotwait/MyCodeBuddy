@@ -1690,7 +1690,11 @@ pub(super) fn stop_slirp(runtime_root: &Path, id: &str, expected: bool) -> RtRes
         ) -> (Vec<(i32, OwnedFd)>, RtResult<()>) {
             let mut found = Vec::new();
             let mut first_error = None;
-            let entries = match fs::read_dir("/proc") {
+            #[cfg(not(test))]
+            let entries = fs::read_dir("/proc");
+            #[cfg(test)]
+            let entries = control_tests::helper_entries();
+            let entries = match entries {
                 Ok(entries) => entries,
                 Err(_) => {
                     return (
@@ -1712,7 +1716,10 @@ pub(super) fn stop_slirp(runtime_root: &Path, id: &str, expected: bool) -> RtRes
                     else {
                         return Ok(None);
                     };
-                    if retained_helper_is_live(retained, pid) {
+                    let retained_live = retained_helper_is_live(retained, pid);
+                    #[cfg(test)]
+                    let retained_live = retained_live && !control_tests::force_rediscovery();
+                    if retained_live {
                         // Ownership is already pinned. Exec may hide or clear
                         // environ, but cannot replace this live identity. Its
                         // original fd remains the signal and exit authority.
@@ -2951,6 +2958,168 @@ pub(super) async fn reap(
 
 #[cfg(test)]
 mod control_tests {
+    // Component-test inputs only. This module and its inventory overrides
+    // are absent from production and test-utils integration library builds.
+    #[cfg(target_os = "linux")]
+    struct InventoryState {
+        pids: Vec<i32>,
+        force_rediscovery: bool,
+    }
+
+    #[cfg(target_os = "linux")]
+    std::thread_local! {
+        static CONTROLLED_INVENTORY: std::cell::RefCell<Option<InventoryState>> = const { std::cell::RefCell::new(None) };
+    }
+
+    #[cfg(target_os = "linux")]
+    struct ControlledInventory {
+        previous_denial: Option<i32>,
+        _thread_local: std::marker::PhantomData<std::rc::Rc<()>>,
+    }
+
+    #[cfg(target_os = "linux")]
+    impl ControlledInventory {
+        fn start(pids: &[u32], force_rediscovery: bool) -> Self {
+            assert!(pids.iter().all(|pid| *pid > 1 && *pid <= i32::MAX as u32));
+            let unique: std::collections::BTreeSet<_> = pids.iter().copied().collect();
+            assert_eq!(
+                unique.len(), pids.len(),
+                "inventory must be explicit and unique"
+            );
+            CONTROLLED_INVENTORY.with(|state| {
+                let mut state = state.borrow_mut();
+                assert!(state.is_none(), "inventory scopes cannot overlap");
+                *state = Some(InventoryState {
+                    pids: pids.iter().map(|pid| *pid as i32).collect(),
+                    force_rediscovery,
+                });
+            });
+            Self {
+                previous_denial: DENIED_ENVIRONMENT_PID.with(|denied| denied.get()),
+                _thread_local: std::marker::PhantomData,
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    impl Drop for ControlledInventory {
+        fn drop(&mut self) {
+            CONTROLLED_INVENTORY.with(|state| *state.borrow_mut() = None);
+            DENIED_ENVIRONMENT_PID.with(|denied| denied.set(self.previous_denial));
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    struct EnvironmentDenialGuard {
+        previous: Option<i32>,
+        _thread_local: std::marker::PhantomData<std::rc::Rc<()>>,
+    }
+
+    #[cfg(target_os = "linux")]
+    impl EnvironmentDenialGuard {
+        fn start(pid: i32) -> Self {
+            Self {
+                previous: DENIED_ENVIRONMENT_PID.with(|denied| denied.replace(Some(pid))),
+                _thread_local: std::marker::PhantomData,
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    impl Drop for EnvironmentDenialGuard {
+        fn drop(&mut self) {
+            DENIED_ENVIRONMENT_PID.with(|denied| denied.set(self.previous));
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn candidate_inventory() -> Option<Vec<i32>> {
+        CONTROLLED_INVENTORY.with(|state| {
+            state.borrow().as_ref().map(|state| state.pids.clone())
+        })
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(super) fn force_rediscovery() -> bool {
+        CONTROLLED_INVENTORY.with(|state| {
+            state
+                .borrow()
+                .as_ref()
+                .is_some_and(|state| state.force_rediscovery)
+        })
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(super) enum InventoryEntry {
+        Host(std::fs::DirEntry),
+        Fixture(i32),
+    }
+
+    #[cfg(target_os = "linux")]
+    impl InventoryEntry {
+        pub(super) fn file_name(&self) -> std::ffi::OsString {
+            match self {
+                Self::Host(entry) => entry.file_name(),
+                Self::Fixture(pid) => pid.to_string().into(),
+            }
+        }
+
+        pub(super) fn path(&self) -> std::path::PathBuf {
+            match self {
+                Self::Host(entry) => entry.path(),
+                Self::Fixture(pid) => std::path::PathBuf::from(format!("/proc/{pid}")),
+            }
+        }
+
+        pub(super) fn metadata(&self) -> std::io::Result<std::fs::Metadata> {
+            match self {
+                Self::Host(entry) => entry.metadata(),
+                Self::Fixture(_) => std::fs::symlink_metadata(self.path()),
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(super) type ProcessEntries = Box<dyn Iterator<Item = std::io::Result<InventoryEntry>>>;
+
+    #[cfg(target_os = "linux")]
+    pub(super) fn helper_entries() -> std::io::Result<ProcessEntries> {
+        if let Some(pids) = candidate_inventory() {
+            return Ok(Box::new(
+                pids.into_iter().map(|pid| Ok(InventoryEntry::Fixture(pid))),
+            ));
+        }
+        Ok(Box::new(
+            std::fs::read_dir("/proc")?.map(|entry| entry.map(InventoryEntry::Host)),
+        ))
+    }
+
+    #[cfg(target_os = "linux")]
+    struct ReapedTestChild(std::process::Child);
+
+    #[cfg(target_os = "linux")]
+    impl std::ops::Deref for ReapedTestChild {
+        type Target = std::process::Child;
+        fn deref(&self) -> &Self::Target {
+            &self.0
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    impl std::ops::DerefMut for ReapedTestChild {
+        fn deref_mut(&mut self) -> &mut Self::Target {
+            &mut self.0
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    impl Drop for ReapedTestChild {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
     #[cfg(target_os = "linux")]
     pub(super) type PollDiagnostic = (i32, i16, Option<i32>);
 
@@ -3166,6 +3335,49 @@ mod control_tests {
         fn drop(&mut self) {
             SWEEP_OBSERVER.with(|observer| *observer.borrow_mut() = None);
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn controlled_inventory_is_explicit_thread_local_and_restored_on_unwind() {
+        assert!(candidate_inventory().is_none());
+        assert!(!force_rediscovery());
+        let fault = std::panic::catch_unwind(|| {
+            let _scope = ControlledInventory::start(&[10, 11, 99], true);
+            DENIED_ENVIRONMENT_PID.with(|denied| denied.set(Some(99)));
+            let entries: Vec<_> = helper_entries()
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name())
+                .collect();
+            assert_eq!(
+                entries,
+                ["10", "11", "99"].map(std::ffi::OsString::from)
+            );
+            assert!(force_rediscovery());
+            std::thread::spawn(|| {
+                assert!(candidate_inventory().is_none());
+                assert!(!force_rediscovery());
+            })
+            .join()
+            .unwrap();
+            panic!("controlled inventory unwind");
+        });
+        assert!(fault.is_err());
+        assert!(candidate_inventory().is_none());
+        assert!(!force_rediscovery());
+        DENIED_ENVIRONMENT_PID.with(|denied| assert_eq!(denied.get(), None));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn controlled_inventory_unknown_live_candidate_still_quarantines_cleanup() {
+        exercise_unreadable_live_candidate(true);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn controlled_forced_rediscovery_is_a_fail_closed_mutation_control() {
+        exercise_retained_unreadability(true);
     }
 
     #[cfg(target_os = "linux")]
@@ -3442,9 +3654,15 @@ mod control_tests {
                 .unwrap()
                 .parse()
                 .unwrap();
-            DENIED_ENVIRONMENT_PID.with(|slot| slot.set(Some(denied)));
+            let inventory: Vec<u32> = std::env::var("CODEG_TEST_HELPER_INVENTORY_PIDS")
+                .unwrap()
+                .split(',')
+                .map(|pid| pid.parse().unwrap())
+                .collect();
+            let _inventory = ControlledInventory::start(&inventory, false);
+            let denial = EnvironmentDenialGuard::start(denied);
             let result = super::stop_slirp(&root, "restored-birth", true);
-            DENIED_ENVIRONMENT_PID.with(|slot| slot.set(None));
+            drop(denial);
             let reason = result
                 .map(|()| "passed".to_string())
                 .unwrap_or_else(|error| error.details.reason.unwrap());
@@ -3454,12 +3672,14 @@ mod control_tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn persisted_birth_excludes_only_an_older_unreadable_child_after_restart() {
+    fn controlled_persisted_birth_excludes_only_an_older_unreadable_child_after_restart() {
         let root = tempfile::tempdir().unwrap();
-        let mut foreign = std::process::Command::new("sleep")
-            .arg("30")
-            .spawn()
-            .unwrap();
+        let mut foreign = ReapedTestChild(
+            std::process::Command::new("sleep")
+                .arg("30")
+                .spawn()
+                .unwrap(),
+        );
         let foreign_start = super::helper_start_ticks(
             &std::fs::read_to_string(format!("/proc/{}/stat", foreign.id())).unwrap(),
         )
@@ -3471,7 +3691,7 @@ mod control_tests {
         std::thread::sleep(std::time::Duration::from_nanos(
             2_000_000_000u64.div_ceil(ticks as u64),
         ));
-        let run = |action, denied_pid: u32| {
+        let run = |action, denied_pid: u32, inventory: &[u32]| {
             std::process::Command::new(std::env::current_exe().unwrap())
                 .args([
                     "--exact",
@@ -3481,18 +3701,28 @@ mod control_tests {
                 .env("CODEG_TEST_HELPER_BIRTH_ROOT", root.path())
                 .env("CODEG_TEST_HELPER_BIRTH_ACTION", action)
                 .env("CODEG_TEST_HELPER_DENIED_PID", denied_pid.to_string())
+                .env(
+                    "CODEG_TEST_HELPER_INVENTORY_PIDS",
+                    inventory
+                        .iter()
+                        .map(u32::to_string)
+                        .collect::<Vec<_>>()
+                        .join(","),
+                )
                 .output()
                 .unwrap()
         };
-        let prepared = run("prepare", foreign.id());
+        let prepared = run("prepare", foreign.id(), &[foreign.id()]);
         let birth_path = root.path().join("slirp-pids/restored-birth.pid.birth");
         let before = std::fs::read(&birth_path);
-        let cleaned = run("cleanup", foreign.id());
+        let cleaned = run("cleanup", foreign.id(), &[foreign.id()]);
         let outcome = std::fs::read_to_string(root.path().join("cleanup-result"));
-        let mut newer = std::process::Command::new("sleep")
-            .arg("30")
-            .spawn()
-            .unwrap();
+        let mut newer = ReapedTestChild(
+            std::process::Command::new("sleep")
+                .arg("30")
+                .spawn()
+                .unwrap(),
+        );
         let newer_start = super::helper_start_ticks(
             &std::fs::read_to_string(format!("/proc/{}/stat", newer.id())).unwrap(),
         )
@@ -3502,7 +3732,7 @@ mod control_tests {
         ));
         // A second recovery process is newer than this candidate. It must
         // still use the original creator's bound, never its own birth time.
-        let retried = run("cleanup", newer.id());
+        let retried = run("cleanup", newer.id(), &[foreign.id(), newer.id()]);
         let retry_outcome = std::fs::read_to_string(root.path().join("cleanup-result"));
         let after = std::fs::read(&birth_path);
         let survived = foreign.try_wait().unwrap().is_none();
@@ -3621,23 +3851,40 @@ mod control_tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn unreadable_live_process_quarantines_proof_but_does_not_prevent_owned_termination() {
+        assert!(
+            candidate_inventory().is_none(),
+            "this test uses full host discovery"
+        );
+        exercise_unreadable_live_candidate(false);
+    }
+
+    #[cfg(target_os = "linux")]
+    fn exercise_unreadable_live_candidate(controlled: bool) {
         let root = tempfile::tempdir().unwrap();
         let id = "fake-denied-discovery";
         let pin = helper_fixture(root.path(), id, "running\n");
-        let mut helper = fake_helper(root.path(), id, "slirp");
-        let mut watcher = fake_helper(root.path(), id, "watcher");
-        let mut descendant = fake_helper(root.path(), id, "watcher");
-        let mut foreign = std::process::Command::new("sleep")
-            .arg("30")
-            .spawn()
-            .unwrap();
+        let mut helper = ReapedTestChild(fake_helper(root.path(), id, "slirp"));
+        let mut watcher = ReapedTestChild(fake_helper(root.path(), id, "watcher"));
+        let mut descendant = ReapedTestChild(fake_helper(root.path(), id, "watcher"));
+        let mut foreign = ReapedTestChild(
+            std::process::Command::new("sleep")
+                .arg("30")
+                .spawn()
+                .unwrap(),
+        );
         write_pins(
             &pin,
             &(pin_line("slirp", helper.id()) + &pin_line("watcher", watcher.id())),
         );
-        DENIED_ENVIRONMENT_PID.with(|denied| denied.set(Some(foreign.id() as i32)));
+        let _inventory = controlled.then(|| {
+            ControlledInventory::start(
+                &[helper.id(), watcher.id(), descendant.id(), foreign.id()],
+                false,
+            )
+        });
+        let denial = EnvironmentDenialGuard::start(foreign.id() as i32);
         let result = super::stop_slirp(root.path(), id, true);
-        DENIED_ENVIRONMENT_PID.with(|denied| denied.set(None));
+        drop(denial);
         let owned_ended = [&mut helper, &mut watcher, &mut descendant]
             .into_iter()
             .all(|child| child.try_wait().unwrap().is_some());
@@ -3739,19 +3986,34 @@ mod control_tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn helper_cleanup_waits_for_both_pinned_helper_and_watcher() {
+    fn controlled_helper_cleanup_waits_for_both_pinned_helper_and_watcher() {
+        use std::os::fd::FromRawFd;
         let root = tempfile::tempdir().unwrap();
         let id = "fake-complete-tree";
         let pin = helper_fixture(root.path(), id, "running\n");
-        let mut helper = fake_helper(root.path(), id, "slirp");
-        let mut watcher = fake_helper(root.path(), id, "watcher");
+        let mut helper = ReapedTestChild(fake_helper(root.path(), id, "slirp"));
+        let mut watcher = ReapedTestChild(fake_helper(root.path(), id, "watcher"));
         // Descendants inherit the watcher marker but do not get a root pin.
-        let mut descendant = fake_helper(root.path(), id, "watcher");
+        let mut descendant = ReapedTestChild(fake_helper(root.path(), id, "watcher"));
         write_pins(
             &pin,
             &(pin_line("slirp", helper.id()) + &pin_line("watcher", watcher.id())),
         );
+        let _inventory = ControlledInventory::start(
+            &[helper.id(), watcher.id(), descendant.id()],
+            false,
+        );
+        let identities = [helper.id(), watcher.id(), descendant.id()].map(|pid| {
+            let raw = unsafe { libc::syscall(libc::SYS_pidfd_open, pid as i32, 0) };
+            assert!(raw >= 0);
+            unsafe { std::os::fd::OwnedFd::from_raw_fd(raw as i32) }
+        });
         let result = super::stop_slirp(root.path(), id, true);
+        // Preserve first-call evidence without reaping the child PIDs. A
+        // retry must not repair the first call's termination or state proof.
+        let first_exited = identities.iter().all(super::helper_process_exited);
+        let first_phase = std::fs::read_to_string(pin.with_extension("pid.state"));
+        let retry = super::stop_slirp(root.path(), id, true);
         let helper_ended = helper.try_wait().unwrap().is_some();
         let watcher_ended = watcher.try_wait().unwrap().is_some();
         let descendant_ended = descendant.try_wait().unwrap().is_some();
@@ -3762,37 +4024,49 @@ mod control_tests {
         let _ = watcher.wait();
         let _ = descendant.wait();
         result.unwrap();
+        assert!(
+            first_exited,
+            "first cleanup must terminate every fixture identity"
+        );
+        assert_eq!(first_phase.unwrap(), "cleanup-proven-started\n");
         assert!(helper_ended && watcher_ended && descendant_ended);
         assert_eq!(
             std::fs::read_to_string(pin.with_extension("pid.state")).unwrap(),
             "cleanup-proven-started\n"
         );
         // Retained pins and the closed startup gate support safe retries.
-        super::stop_slirp(root.path(), id, true).unwrap();
+        retry.unwrap();
     }
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn retained_live_identity_survives_unreadable_environment_on_later_sweeps() {
+    fn controlled_retained_live_identity_survives_unreadable_environment_on_later_sweeps() {
+        exercise_retained_unreadability(false);
+    }
+
+    #[cfg(target_os = "linux")]
+    fn exercise_retained_unreadability(force_rediscovery: bool) {
         use std::os::unix::process::ExitStatusExt;
         let root = tempfile::tempdir().unwrap();
         let id = "fake-retained-unreadable";
         let pin = helper_fixture(root.path(), id, "running\n");
-        let mut helper = fake_helper(root.path(), id, "slirp");
-        let mut watcher = fake_helper(root.path(), id, "watcher");
+        let mut helper = ReapedTestChild(fake_helper(root.path(), id, "slirp"));
+        let mut watcher = ReapedTestChild(fake_helper(root.path(), id, "watcher"));
         let ready_path = root.path().join("retained-ready");
-        let mut descendant = std::process::Command::new("sh")
-            .args([
-                "-c",
-                "trap '' TERM; : > \"$1\"; while :; do :; done",
-                "retained-helper",
-            ])
-            .arg(&ready_path)
-            .env("CODEG_ROUNDTABLE_SLIRP_OWNER", id)
-            .env("CODEG_ROUNDTABLE_SLIRP_ROOT", root.path())
-            .env("CODEG_ROUNDTABLE_SLIRP_ROLE", "watcher")
-            .spawn()
-            .unwrap();
+        let mut descendant = ReapedTestChild(
+            std::process::Command::new("sh")
+                .args([
+                    "-c",
+                    "trap '' TERM; : > \"$1\"; while :; do :; done",
+                    "retained-helper",
+                ])
+                .arg(&ready_path)
+                .env("CODEG_ROUNDTABLE_SLIRP_OWNER", id)
+                .env("CODEG_ROUNDTABLE_SLIRP_ROOT", root.path())
+                .env("CODEG_ROUNDTABLE_SLIRP_ROLE", "watcher")
+                .spawn()
+                .unwrap(),
+        );
         let pid = descendant.id() as i32;
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
         let ready = loop {
@@ -3820,6 +4094,10 @@ mod control_tests {
             }));
         });
         let observer = SweepObserverGuard;
+        let _inventory = ControlledInventory::start(
+            &[helper.id(), watcher.id(), descendant.id()],
+            force_rediscovery,
+        );
         let capture = CleanupDiagnosticCapture::start([
             ("helper", helper.id() as i32),
             ("watcher", watcher.id() as i32),
@@ -3839,12 +4117,39 @@ mod control_tests {
             sweeps.get() >= 2,
             "the denial must follow initial retention"
         );
-        result.unwrap_or_else(|error| panic!("{error:?}; cleanup diagnostics: {diagnostics:?}"));
         assert!(ended.is_some_and(|status| status.signal() == Some(libc::SIGKILL)));
-        assert_eq!(
-            std::fs::read_to_string(pin.with_extension("pid.state")).unwrap(),
-            "cleanup-proven-started\n"
-        );
+        let phase = std::fs::read_to_string(pin.with_extension("pid.state")).unwrap();
+        if force_rediscovery {
+            let error = result.expect_err("forcing old rediscovery must fail closed");
+            let expected = if super::HelperBirthContext::capture()
+                .unwrap()
+                .zero_boottime_offset
+            {
+                "slirp_proc_environment_denied_within_scope"
+            } else {
+                "slirp_proc_environment_denied_no_age_proof"
+            };
+            assert_eq!(error.details.reason.as_deref(), Some(expected));
+            let first = diagnostics
+                .denials
+                .first()
+                .expect("injected denial recorded");
+            assert_eq!(first.pid, pid);
+            assert!(first.injected);
+            assert_eq!(
+                first.read_errno, None,
+                "the real controlled read must succeed"
+            );
+            assert!(matches!(
+                first.retained,
+                RetainedPollObservation::Polled { result: 0, .. }
+            ));
+            assert_eq!(phase, "cleanup-in-progress-started\n");
+        } else {
+            result.unwrap_or_else(|error| panic!("{error:?}; cleanup diagnostics: {diagnostics:?}"));
+            assert!(diagnostics.denials.is_empty());
+            assert_eq!(phase, "cleanup-proven-started\n");
+        }
     }
 
     #[cfg(target_os = "linux")]
@@ -3885,23 +4190,25 @@ mod control_tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn verified_descendant_remains_owned_after_term_clears_its_environment() {
+    fn controlled_verified_descendant_remains_owned_after_term_clears_its_environment() {
         use std::os::unix::process::ExitStatusExt;
         let root = tempfile::tempdir().unwrap();
         let id = "fake-cleared-markers";
         let pin = helper_fixture(root.path(), id, "running\n");
-        let mut helper = fake_helper(root.path(), id, "slirp");
-        let mut watcher = fake_helper(root.path(), id, "watcher");
+        let mut helper = ReapedTestChild(fake_helper(root.path(), id, "slirp"));
+        let mut watcher = ReapedTestChild(fake_helper(root.path(), id, "watcher"));
         let ready = root.path().join("descendant-ready");
         let changed = root.path().join("descendant-execed");
-        let mut descendant = std::process::Command::new("sh")
-            .arg("-c")
-            .arg("trap 'trap \"\" TERM; : > \"$2\"; exec /usr/bin/env -i /bin/sleep 30' TERM; : > \"$1\"; while :; do sleep 0.02; done")
-            .arg("fake-descendant").arg(&ready).arg(&changed)
-            .env("CODEG_ROUNDTABLE_SLIRP_OWNER", id)
-            .env("CODEG_ROUNDTABLE_SLIRP_ROOT", root.path())
-            .env("CODEG_ROUNDTABLE_SLIRP_ROLE", "watcher")
-            .spawn().unwrap();
+        let mut descendant = ReapedTestChild(
+            std::process::Command::new("sh")
+                .arg("-c")
+                .arg("trap 'trap \"\" TERM; : > \"$2\"; exec /usr/bin/env -i /bin/sleep 30' TERM; : > \"$1\"; while :; do :; done")
+                .arg("fake-descendant").arg(&ready).arg(&changed)
+                .env("CODEG_ROUNDTABLE_SLIRP_OWNER", id)
+                .env("CODEG_ROUNDTABLE_SLIRP_ROOT", root.path())
+                .env("CODEG_ROUNDTABLE_SLIRP_ROLE", "watcher")
+                .spawn().unwrap(),
+        );
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
         while !ready.exists() && std::time::Instant::now() < deadline {
             std::thread::sleep(std::time::Duration::from_millis(5));
@@ -3915,6 +4222,10 @@ mod control_tests {
             ("watcher", watcher.id() as i32),
             ("descendant", descendant.id() as i32),
         ]);
+        let _inventory = ControlledInventory::start(
+            &[helper.id(), watcher.id(), descendant.id()],
+            false,
+        );
         let result = super::stop_slirp(root.path(), id, true);
         let diagnostics = capture.finish();
         let ended = descendant.try_wait().unwrap();
@@ -3937,22 +4248,24 @@ mod control_tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn interrupted_cleanup_cannot_forget_a_descendant_on_retry() {
+    fn controlled_interrupted_cleanup_cannot_forget_a_descendant_on_retry() {
         let root = tempfile::tempdir().unwrap();
         let id = "fake-interrupted-cleanup";
         let pin = helper_fixture(root.path(), id, "running\n");
-        let mut helper = fake_helper(root.path(), id, "slirp");
-        let mut watcher = fake_helper(root.path(), id, "watcher");
+        let mut helper = ReapedTestChild(fake_helper(root.path(), id, "slirp"));
+        let mut watcher = ReapedTestChild(fake_helper(root.path(), id, "watcher"));
         let ready = root.path().join("descendant-ready");
         let changed = root.path().join("descendant-execed");
-        let mut descendant = std::process::Command::new("sh")
-            .arg("-c")
-            .arg("trap 'trap \"\" TERM; : > \"$2\"; exec /usr/bin/env -i /bin/sleep 30' TERM; : > \"$1\"; while :; do sleep 0.02; done")
-            .arg("fake-descendant").arg(&ready).arg(&changed)
-            .env("CODEG_ROUNDTABLE_SLIRP_OWNER", id)
-            .env("CODEG_ROUNDTABLE_SLIRP_ROOT", root.path())
-            .env("CODEG_ROUNDTABLE_SLIRP_ROLE", "watcher")
-            .spawn().unwrap();
+        let mut descendant = ReapedTestChild(
+            std::process::Command::new("sh")
+                .arg("-c")
+                .arg("trap 'trap \"\" TERM; : > \"$2\"; exec /usr/bin/env -i /bin/sleep 30' TERM; : > \"$1\"; while :; do :; done")
+                .arg("fake-descendant").arg(&ready).arg(&changed)
+                .env("CODEG_ROUNDTABLE_SLIRP_OWNER", id)
+                .env("CODEG_ROUNDTABLE_SLIRP_ROOT", root.path())
+                .env("CODEG_ROUNDTABLE_SLIRP_ROLE", "watcher")
+                .spawn().unwrap(),
+        );
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
         while !ready.exists() && std::time::Instant::now() < deadline {
             std::thread::sleep(std::time::Duration::from_millis(5));
@@ -3981,6 +4294,10 @@ mod control_tests {
             }));
         });
         let fault = SweepObserverGuard;
+        let _inventory = ControlledInventory::start(
+            &[helper.id(), watcher.id(), descendant.id()],
+            false,
+        );
         let first = super::stop_slirp(root.path(), id, true);
         drop(fault);
         let alive_after_fault = descendant.try_wait().unwrap().is_none();
@@ -4053,11 +4370,12 @@ mod control_tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn no_helper_and_durable_never_started_are_distinct_from_missing_configuration() {
+    fn controlled_no_helper_and_durable_never_started_are_distinct_from_missing_configuration() {
         let root = tempfile::tempdir().unwrap();
         assert!(super::stop_slirp(root.path(), "no-network", false).is_ok());
         assert!(super::stop_slirp(root.path(), "missing-network-state", true).is_err());
         let pin = helper_fixture(root.path(), "not-started", "prepared\n");
+        let _inventory = ControlledInventory::start(&[], false);
         super::stop_slirp(root.path(), "not-started", true).unwrap();
         assert_eq!(
             std::fs::read_to_string(pin.with_extension("pid.state")).unwrap(),
