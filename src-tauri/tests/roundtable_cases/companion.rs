@@ -668,7 +668,7 @@ async fn qualification_uses_production_encoder_and_validator() {
     let closing = QualificationHarness::open(BILLING);
     let closing_scope = closing.result_scope().clone();
     let mut closing_local = roundtable_protocol::SubmissionState::open();
-    for index in 1..=4 {
+    for index in 1..=9 {
         let id = format!("bad-{index}");
         let decision = closing
             .submit_result(&id, &bad_proposal())
@@ -679,9 +679,10 @@ async fn qualification_uses_production_encoder_and_validator() {
         closing_local = direct.next_state;
     }
     assert!(closing_local.closed);
-    assert_eq!(closing_local.invalid_count, 4);
+    assert_eq!(closing_local.shape_invalid_count, 9);
+    assert_eq!(closing_local.invalid_count, 0);
     assert!(closing_local.sealed.is_none());
-    assert_eq!(closing.tool_calls(), 4);
+    assert_eq!(closing.tool_calls(), 9);
 
     closing.close_fake_broker();
     assert_eq!(closing.certificate_status(), QualificationStatus::NotTested);

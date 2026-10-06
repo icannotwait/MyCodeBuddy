@@ -375,7 +375,12 @@ fn bad_raw(summary: &str) -> Vec<u8> {
     canonical_bytes(&json!({
         "kind": "proposal",
         "summary": summary,
-        "claims": []
+        "claims": [{
+            "local_key": "c1",
+            "text": "claim",
+            "evidence_aliases": ["missing-alias"],
+            "confidence": "low"
+        }]
     }))
     .expect("bad")
 }
