@@ -143,8 +143,9 @@ pub use qualification::{
 pub use qualification_harness::QualificationHarness;
 #[cfg(any(test, feature = "test-utils"))]
 pub use qualification_linux::{
-    advertised_probe_models, isolation_probe_script, probe_model_binding_error,
-    probe_reap_classification, probe_scratch_home, remove_probe_scratch_home,
+    advertised_probe_models, isolation_probe_script, probe_acp_exit_cleans_container,
+    probe_model_binding_error, probe_reap_classification, probe_recorded_crun_version,
+    probe_scratch_home, remove_probe_scratch_home,
 };
 #[cfg(any(test, feature = "test-utils"))]
 pub use qualification_probe::{assemble_probe_report_for_test, verify_installed_report_for_test};

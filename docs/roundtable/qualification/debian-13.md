@@ -79,7 +79,14 @@ wait on it forever.
 `crun delete` then fails with `cannot open directory …/state/<id>`.
 That still counts as reaped when the container state directory is gone
 and its cgroup directory is gone. A delete error while the cgroup
-directory remains is not `REAPED`.
+directory remains is not `REAPED`. An ACP `initialize` or `session/new`
+failure drops the same cleanup: the `crun run` process is killed, slirp
+is stopped, and the container is deleted.
+
+The qualification key stores the first `crun version …` line from
+`crun --root <runtime-root>/state --version` (for example
+`crun version 1.21`). A bare `crun --version` can print
+`Failed to get state directory`, and that text is not the version.
 
 ## Rootfs
 

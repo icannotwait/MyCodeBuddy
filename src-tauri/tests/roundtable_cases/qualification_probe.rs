@@ -7,8 +7,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use codeg_lib::roundtable::{
     assemble_probe_report_for_test, os_accepted, profile_for_agent,
-    verify_installed_report_for_test, CertifiedBinary, ProbeCheck, ProbeFacts, ProviderBinding,
-    QualifiedOciProfile,
+    verify_installed_report_for_test, CertifiedBinary, ProbeCheck, ProbeFacts, ProbeRequest,
+    ProviderBinding, QualifiedOciProfile,
 };
 use roundtable_protocol::Hash256;
 
@@ -402,6 +402,71 @@ fn scratch_home_is_per_adapter_and_per_run_and_removed() {
     codeg_lib::roundtable::remove_probe_scratch_home(&grok);
     assert!(!grok.exists());
     let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn crun_version_on_the_key_ignores_the_state_directory_error() {
+    let version = codeg_lib::roundtable::probe_recorded_crun_version(
+        "crun version 1.21\ncommit: abc\nspec: 1.0.0\n",
+    );
+    assert_eq!(version.as_deref(), Some("crun version 1.21"));
+    assert!(
+        codeg_lib::roundtable::probe_recorded_crun_version("Failed to get state directory\n")
+            .is_none()
+    );
+    let mixed = codeg_lib::roundtable::probe_recorded_crun_version(
+        "Failed to get state directory\ncrun version 1.21\n",
+    );
+    assert_eq!(mixed.as_deref(), Some("crun version 1.21"));
+}
+
+#[cfg(unix)]
+#[test]
+fn acp_session_error_stops_slirp_and_deletes_the_container() {
+    use std::os::unix::fs::PermissionsExt;
+    use std::process::Command;
+
+    let dir = scratch();
+    let log = dir.join("crun.log");
+    let crun = dir.join("crun");
+    let log_quoted = format!("'{}'", log.display().to_string().replace('\'', "'\\''"));
+    fs::write(
+        &crun,
+        format!("#!/bin/sh\nprintf '%s\\n' \"$*\" >> {log_quoted}\nexit 1\n"),
+    )
+    .expect("crun script");
+    fs::set_permissions(&crun, fs::Permissions::from_mode(0o755)).expect("chmod");
+    let runtime_root = dir.join("runtime");
+    fs::create_dir_all(runtime_root.join("slirp-pids")).expect("pids");
+    let mut slirp = Command::new("sleep")
+        .arg("30")
+        .spawn()
+        .expect("stand-in slirp");
+    fs::write(
+        runtime_root.join("slirp-pids").join("cq-acp-9.pid"),
+        format!("{}\n", slirp.id()),
+    )
+    .expect("pidfile");
+    let request = ProbeRequest {
+        data_dir: dir.clone(),
+        agent: "cursor".into(),
+        rootfs: dir.join("rootfs"),
+        crun,
+        cgroup_root: dir.join("cgroup"),
+        runtime_root,
+        provider_bindings: dir.join("bindings.json"),
+        home: dir.join("home"),
+        profile_id: None,
+    };
+    let error = codeg_lib::roundtable::probe_acp_exit_cleans_container(&request, "cq-acp-9")
+        .expect_err("session/new");
+    assert!(error.contains("session/new"), "{error}");
+    let text = fs::read_to_string(&log).expect("crun log");
+    assert!(text.contains("kill cq-acp-9 KILL"), "{text}");
+    assert!(text.contains("delete cq-acp-9"), "{text}");
+    let status = slirp.wait().expect("slirp wait");
+    assert!(!status.success(), "slirp still running: {status}");
+    let _ = fs::remove_dir_all(&dir);
 }
 
 #[test]

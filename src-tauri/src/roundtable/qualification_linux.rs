@@ -57,7 +57,16 @@ pub async fn measure_host(request: &ProbeRequest) -> ProbeFacts {
         stamp_failures(&mut facts, &failures);
         return facts;
     }
-    let crun_version = command_text(&request.crun, &["--version"]).await;
+    let state_root = request.runtime_root.join("state");
+    let _ = fs::create_dir_all(&state_root);
+    let state_arg = state_root.to_string_lossy().into_owned();
+    // Bare `crun --version` prints "Failed to get state directory" when crun
+    // has no default root. The key must store the version line from the same
+    // state root the containers use.
+    let crun_version = command_text(&request.crun, &["--root", &state_arg, "--version"])
+        .await
+        .as_deref()
+        .and_then(recorded_crun_version);
     let crun_hash = hash_file(&request.crun);
     let (crun_version, crun_hash) = match (crun_version, crun_hash) {
         (Some(version), Some(hash)) if !version.is_empty() => (version, hash),
@@ -158,17 +167,6 @@ pub async fn measure_host(request: &ProbeRequest) -> ProbeFacts {
         }
     }
 
-    let version_text = command_text(
-        &request.crun,
-        &[
-            "--root",
-            &request.runtime_root.join("state").to_string_lossy(),
-            "--version",
-        ],
-    )
-    .await
-    .unwrap_or_default();
-    let _ = version_text;
     let adapter_version = version_inside(request, profile.container_cli, &["--version"]).await;
     let version_ok = adapter_version
         .as_deref()
@@ -543,6 +541,19 @@ fn first_line(text: &str) -> String {
     text.lines().next().unwrap_or(text).trim().to_string()
 }
 
+/// The line stored on the qualification key. Ignores crun's state-directory
+/// error so two hosts with the same crun binary record the same version.
+fn recorded_crun_version(text: &str) -> Option<String> {
+    text.lines()
+        .map(str::trim)
+        .find(|line| {
+            let lower = line.to_ascii_lowercase();
+            lower.contains("crun version") && !lower.contains("failed to get state directory")
+        })
+        .map(str::to_string)
+        .filter(|line| !line.is_empty())
+}
+
 async fn command_text(bin: &Path, args: &[&str]) -> Option<String> {
     let output = Command::new(bin)
         .args(args)
@@ -758,6 +769,24 @@ async fn run_acp(
     output
 }
 
+/// Stops the ACP `crun run` process, its slirp helper, and the container
+/// when dropped. initialize and session/new return before the normal reap,
+/// and those paths must not leave `cq-acp-*` running.
+struct AcpContainer<'a> {
+    request: &'a ProbeRequest,
+    id: String,
+    child: Option<tokio::process::Child>,
+}
+
+impl Drop for AcpContainer<'_> {
+    fn drop(&mut self) {
+        if let Some(child) = self.child.as_mut() {
+            let _ = child.start_kill();
+        }
+        let _ = reap_blocking(self.request, &self.id);
+    }
+}
+
 async fn run_acp_session(
     request: &ProbeRequest,
     argv: &[String],
@@ -766,18 +795,26 @@ async fn run_acp_session(
     egress_note: String,
 ) -> Result<TurnOutcome, String> {
     let prepared = prepare_bundle(request, argv, mounts, None, true, None)?;
-    let mut child = Command::new(&request.crun)
-        .args(crun_prefix(request))
-        .arg("run")
-        .arg("--bundle")
-        .arg(&prepared.bundle)
-        .arg(&prepared.id)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true)
-        .spawn()
-        .map_err(|error| error.to_string())?;
+    let mut container = AcpContainer {
+        request,
+        id: prepared.id.clone(),
+        child: None,
+    };
+    container.child = Some(
+        Command::new(&request.crun)
+            .args(crun_prefix(request))
+            .arg("run")
+            .arg("--bundle")
+            .arg(&prepared.bundle)
+            .arg(&prepared.id)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .map_err(|error| error.to_string())?,
+    );
+    let child = container.child.as_mut().ok_or("acp child")?;
     let mut stdin = child.stdin.take().ok_or("acp stdin")?;
     let stdout = child.stdout.take().ok_or("acp stdout")?;
     let mut reader = BufReader::new(stdout);
@@ -788,7 +825,6 @@ async fn run_acp_session(
     }))
     .await?;
     if init["protocolVersion"] != 1 {
-        let _ = reap(request, &prepared.id).await;
         return Err("acp protocol version".into());
     }
     let session = rpc(
@@ -825,10 +861,7 @@ async fn run_acp_session(
             "prompt": [{"type": "text", "text": prompt}]
         }),
     )
-    .await;
-    let _ = child.start_kill();
-    let _ = reap(request, &prepared.id).await;
-    let result = result?;
+    .await?;
     Ok(TurnOutcome {
         completed: result["stopReason"] == "end_turn",
         session,
@@ -1465,42 +1498,48 @@ fn delete_reports_missing_container(stderr: &str) -> bool {
         || lower.contains("does not exist")
 }
 
-async fn cgroup_dir_released(path: &Path) -> bool {
+fn cgroup_dir_released(path: &Path) -> bool {
     for _ in 0..25 {
         if !path.exists() {
             return true;
         }
-        tokio::time::sleep(Duration::from_millis(40)).await;
+        std::thread::sleep(Duration::from_millis(40));
     }
     !path.exists()
 }
 
-async fn reap(request: &ProbeRequest, id: &str) -> Result<(), String> {
+fn reap_blocking(request: &ProbeRequest, id: &str) -> Result<(), String> {
     super::sandbox::linux_stop_slirp(&request.runtime_root, id);
-    let _ = Command::new(&request.crun)
+    let _ = std::process::Command::new(&request.crun)
         .args(crun_prefix(request))
         .arg("kill")
         .arg(id)
         .arg("KILL")
-        .output()
-        .await;
-    let output = Command::new(&request.crun)
+        .output();
+    let output = std::process::Command::new(&request.crun)
         .args(crun_prefix(request))
         .arg("delete")
         .arg(id)
         .output()
-        .await
         .map_err(|error| error.to_string())?;
     let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
     let state_dir = request.runtime_root.join("state").join(id);
     let cgroup_dir = request.cgroup_root.join(id);
-    let cgroup_exists = !cgroup_dir_released(&cgroup_dir).await;
+    let cgroup_exists = !cgroup_dir_released(&cgroup_dir);
     classify_container_reap(
         output.status.success(),
         &stderr,
         state_dir.exists(),
         cgroup_exists,
     )
+}
+
+async fn reap(request: &ProbeRequest, id: &str) -> Result<(), String> {
+    let request = request.clone();
+    let id = id.to_string();
+    tokio::task::spawn_blocking(move || reap_blocking(&request, &id))
+        .await
+        .unwrap_or_else(|error| Err(error.to_string()))
 }
 
 fn redact_keep(input: &str) -> String {
@@ -1556,6 +1595,23 @@ pub fn probe_scratch_home(runtime_root: &Path, agent: &str, container_id: &str) 
 #[cfg(any(test, feature = "test-utils"))]
 pub fn remove_probe_scratch_home(path: &Path) {
     remove_scratch_home(path);
+}
+
+#[cfg(any(test, feature = "test-utils"))]
+pub fn probe_recorded_crun_version(text: &str) -> Option<String> {
+    recorded_crun_version(text)
+}
+
+/// Same Drop as `run_acp_session`: returning `session/new rejected` still
+/// stops slirp and deletes the container.
+#[cfg(any(test, feature = "test-utils"))]
+pub fn probe_acp_exit_cleans_container(request: &ProbeRequest, id: &str) -> Result<(), String> {
+    let _container = AcpContainer {
+        request,
+        id: id.to_string(),
+        child: None,
+    };
+    Err("session/new rejected".into())
 }
 
 const ISOLATION_SCRIPT: &str = r#"#!/bin/sh
