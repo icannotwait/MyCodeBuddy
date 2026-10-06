@@ -95,3 +95,27 @@ CI still needs to execute the Rust regression targets and React/Vitest/project c
 - Added helper regressions for both controls and parameterized the UI lost-paid-ACK/projection/preflight/navigation test to send Pause or Stop before verifying exact original-body replay
 - RED: `node scripts/roundtable-product-smoke.mjs` exited 1 with `paid_outcome_unknown` at the newly added Pause preparation assertion before the fix
 - GREEN: the same command exited 0 after the fix, with 16 replay/navigation/cancellation assertions plus 5 source/error assertions. `git diff --check` passed. Native TypeScript parsing passed for the mutation helper/test; React/Vitest and project type checking still require CI
+
+
+## macOS snapshot fixture paths and registered-root limitation
+
+The snapshot opener intentionally rejects symlinks in the selected workspace
+root and every ancestor, as well as in selected file paths. Folder registration
+preserves path spelling (`normalize_folder_storage_path` does not canonicalize),
+and the roundtable command uses that stored root unchanged. Capture through a
+registered root alias or symlinked ancestor therefore remains unsupported; these
+fixture corrections do not claim public alias-root support or weaken that policy.
+
+The snapshot, backup/GC, selected-workspace, and frozen-clone fixtures now resolve
+only their trusted, freshly allocated temporary base before constructing source
+paths. This avoids host temporary-directory aliases (for example, macOS `/var`)
+masking the intended file-type, size, mutation, immutable-byte, and rollback checks.
+Selected paths and
+adversarial aliases are never canonicalized. Both direct workspace-root aliases
+and ancestor redirects are covered by explicit rejection tests.
+
+The original macOS `roundtable_protocol_io` run at `f2fd110` reached 58 passes and
+10 failures before these corrections. The downstream source-capture fixtures in
+`roundtable_transport` were audited for the same setup defect. Rust compilation,
+these regressions, and rustfmt have not run locally because no Rust toolchain is
+installed; existing CI must verify the updated tests.

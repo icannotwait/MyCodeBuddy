@@ -268,6 +268,35 @@ no such boundary, new host permission or cgroup configuration is introduced
 by this test correction. Do not suppress `EACCES`, retry an unproven lifecycle
 into success or relabel this limitation as completed host qualification.
 
+### Component verification and macOS fixture checkpoint: `f2fd110`
+
+At 2026-10-06 13:19 UTC, the [CI run for `f2fd110`](https://github.com/icannotwait/MyCodeBuddy/actions/runs/37459585212)
+had eight successful jobs. Linux server passed 7,775 library tests plus four
+binary tests and Clippy. Linux desktop passed 8,086 library tests, all
+integration targets, Clippy and the handler guard. Both suites explicitly ran
+the nine controlled-inventory cases, the unrestricted unknown-live negative
+and the reused-identity negative. The three local broker/SQLite receipt and
+drain integration tests also passed. Formatting, protocol, runtime, frontend,
+Windows server and Windows desktop passed; Windows desktop remains compile-only
+(`--no-run`) plus Clippy.
+
+macOS desktop passed 8,090 library tests, with two ignored, then its
+`roundtable_protocol_io` target failed with 58 passes and ten failures. Those
+capture fixtures reached the strict source opener through unresolved temporary
+root ancestry and returned `symlink` before their intended file-type, quota,
+mutation or storage assertions. macOS server's test step had passed and Clippy
+was still running at this checkpoint.
+
+The fixture correction resolves only the trusted newly created temporary base
+before constructing source paths. Adversarial aliases and selected paths stay
+unresolved; root/ancestor rejection, FIFO nonblocking, size, mutation, rollback
+and immutable clone assertions remain intact. Downstream transport fixtures
+using the same source opener are corrected for the same setup precondition.
+Production capture and folder registration are unchanged. In particular,
+registration preserves path spelling, so a registered root with symlinked
+ancestry remains unsupported; the correction does not make that public path
+form safe or supported. The updated commit requires its own full CI result.
+
 ## Capability boundaries retained
 
 The false-success and unsafe-admission defects are addressed by fail-closed guards, but the corresponding live capabilities in F02, F03 and F14 remain unimplemented. They are not closed feature-delivery items. Rerunning the current host probe cannot produce a usable certificate or supply the missing measurements.
@@ -275,5 +304,6 @@ The false-success and unsafe-admission defects are addressed by fail-closed guar
 - A fake or diagnostic probe does not qualify production receipt/drain, privacy, credential/native-tool isolation or complete adapter request-envelope behavior
 - Missing request-envelope evidence remains unknown capacity; no token count is substituted for a byte measurement
 - Selected-file capture fails closed on Windows until handle-relative containment is qualified
+- On Unix, selected-file capture also rejects symlinks in the registered root or its ancestors; folder registration does not automatically replace aliases with physical paths
 - Unreferenced content-addressed objects retained after a database rollback are quota-bounded; automatic garbage collection remains unavailable
 - Unresolved paid-request replay survives client-side navigation in memory, but does not survive a full document reload or tab close

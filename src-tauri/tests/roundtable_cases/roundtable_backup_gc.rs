@@ -31,7 +31,7 @@ async fn backup_gc_and_disk_failures() {
         })
         .await
         .unwrap();
-    let source = dir.path().join("source");
+    let source = dir.path().canonicalize().unwrap().join("source");
     std::fs::create_dir(&source).unwrap();
     std::fs::write(source.join("file.txt"), b"immutable source").unwrap();
     let path = dir.path().join("objects");

@@ -463,7 +463,7 @@ async fn product_review_final_synthesis_rejects_next_phase_input_atomically() {
 #[tokio::test]
 async fn product_review_clone_keeps_the_original_frozen_source_bytes() {
     let (dir, _conn, store, service, room) = fixture().await;
-    let root = dir.path().join("selected");
+    let root = dir.path().canonicalize().unwrap().join("selected");
     std::fs::create_dir(&root).unwrap();
     std::fs::write(root.join("source.txt"), "frozen contents\n").unwrap();
     let objects = ObjectStore::open(

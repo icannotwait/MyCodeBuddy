@@ -825,7 +825,7 @@ async fn product_create_selected_files_freezes_only_registered_workspace_evidenc
     use sea_orm::{ConnectionTrait, DbBackend, Statement};
     let (dir, conn) = support::open_pool(1).await;
     migrate_roundtable(&conn).await.unwrap();
-    let workspace = dir.path().join("workspace");
+    let workspace = dir.path().canonicalize().unwrap().join("workspace");
     std::fs::create_dir(&workspace).unwrap();
     std::fs::write(workspace.join("selected.txt"), "approved bytes\n").unwrap();
     std::fs::write(workspace.join("private.txt"), "never selected").unwrap();
@@ -1224,7 +1224,7 @@ async fn product_failed_create_retains_objects_and_respects_remaining_storage_qu
     use sea_orm::{ConnectionTrait, DbBackend, Statement};
     let (dir, conn) = support::open_pool(1).await;
     migrate_roundtable(&conn).await.unwrap();
-    let workspace = dir.path().join("workspace");
+    let workspace = dir.path().canonicalize().unwrap().join("workspace");
     std::fs::create_dir(&workspace).unwrap();
     std::fs::write(workspace.join("selected.txt"), "retained after DB rollback").unwrap();
     conn.execute(Statement::from_string(
