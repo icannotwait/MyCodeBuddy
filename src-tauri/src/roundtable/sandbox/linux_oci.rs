@@ -3539,10 +3539,7 @@ mod control_tests {
             let _ = child.kill();
             let _ = child.wait();
         }
-        assert!(
-            ready,
-            "TERM-ignore must be installed before cleanup starts"
-        );
+        assert!(ready, "TERM-ignore must be installed before cleanup starts");
         assert!(
             sweeps.get() >= 2,
             "the denial must follow initial retention"
