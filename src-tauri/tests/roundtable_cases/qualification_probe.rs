@@ -721,6 +721,73 @@ async fn live_rpc_allows_submit_rejects_terminal_and_keeps_float_frames() {
         ]
     }));
     assert_eq!(sentence["result"]["outcome"]["optionId"], "reject-sentence");
+
+    let antigravity = codeg_lib::roundtable::permission_reply_fixture(serde_json::json!({
+        "toolCall": {
+            "title": "roundtable_submit_result",
+            "kind": "other",
+            "rawInput": {
+                "submission_id": "s-antigravity",
+                "result": {
+                    "kind": "proposal",
+                    "summary": "one sentence",
+                    "claims": [{
+                        "local_key": "c1",
+                        "text": "claim",
+                        "evidence_aliases": [],
+                        "confidence": "medium"
+                    }]
+                }
+            },
+            "_meta": {
+                "mcp": {"tool": "submit_result", "server": "roundtable"},
+                "is_mcp_tool_call": true
+            }
+        },
+        "options": [
+            {"optionId": "allow-antigravity-mcp", "kind": "allow_once", "name": "Allow"},
+            {"optionId": "reject-antigravity-mcp", "kind": "reject_once", "name": "Reject"}
+        ]
+    }));
+    assert_eq!(
+        antigravity["result"]["outcome"]["optionId"],
+        "allow-antigravity-mcp"
+    );
+    assert_eq!(antigravity["result"]["outcome"]["outcome"], "selected");
+    assert!(!antigravity.to_string().contains("cancelled"));
+
+    let bare_title = codeg_lib::roundtable::permission_reply_fixture(serde_json::json!({
+        "toolCall": {
+            "title": "roundtable_submit_result",
+            "kind": "other",
+            "rawInput": {"submission_id": "s-bare", "result": {}}
+        },
+        "options": [
+            {"optionId": "allow-bare", "kind": "allow_once", "name": "Allow"},
+            {"optionId": "reject-bare", "kind": "reject_once", "name": "Reject"}
+        ]
+    }));
+    assert_eq!(bare_title["result"]["outcome"]["optionId"], "reject-bare");
+
+    let other_server = codeg_lib::roundtable::permission_reply_fixture(serde_json::json!({
+        "toolCall": {
+            "title": "roundtable_submit_result",
+            "kind": "other",
+            "rawInput": {"command": "echo submit_result"},
+            "_meta": {
+                "mcp": {"tool": "submit_result", "server": "other"},
+                "is_mcp_tool_call": true
+            }
+        },
+        "options": [
+            {"optionId": "allow-other", "kind": "allow_once", "name": "Allow"},
+            {"optionId": "reject-other", "kind": "reject_once", "name": "Reject"}
+        ]
+    }));
+    assert_eq!(
+        other_server["result"]["outcome"]["optionId"],
+        "reject-other"
+    );
 }
 
 #[tokio::test]

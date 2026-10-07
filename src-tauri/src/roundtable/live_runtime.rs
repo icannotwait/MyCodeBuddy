@@ -1417,7 +1417,9 @@ fn selected_option(params: &Value, allow: bool) -> Option<String> {
 
 /// Structured identity only. A free-text command such as `echo submit_result`
 /// does not match. Grok's `use_tool` wrapper matches `rawInput.tool_name`
-/// when it is exactly `roundtable__<tool>`.
+/// when it is exactly `roundtable__<tool>`. Antigravity 1.3.0 matches
+/// `toolCall._meta` when it names the roundtable MCP server and tool.
+/// The title `roundtable_<tool>` is accepted only together with that meta.
 fn tool_call_is_roundtable(params: &Value) -> bool {
     let call = &params["toolCall"];
     if matches!(
@@ -1425,6 +1427,9 @@ fn tool_call_is_roundtable(params: &Value) -> bool {
         Some("execute" | "edit" | "delete" | "move" | "switch_mode")
     ) {
         return false;
+    }
+    if antigravity_roundtable_meta(call) {
+        return true;
     }
     // A machine name wins over display text. Only the explicit Grok use_tool
     // wrapper may route through its arguments, and only to a scoped MCP name.
@@ -1453,6 +1458,48 @@ fn tool_call_is_roundtable(params: &Value) -> bool {
             .is_some();
     }
     text_names_roundtable_tool(identity)
+}
+
+/// Antigravity 1.3.0 MCP permission identity. The single-underscore title is
+/// not a match by itself; when present it has to name the same tool as
+/// `_meta.mcp.tool`. A native title cannot be promoted by this meta.
+fn antigravity_roundtable_meta(call: &Value) -> bool {
+    let Some(meta) = call.get("_meta").and_then(Value::as_object) else {
+        return false;
+    };
+    if meta.get("is_mcp_tool_call").and_then(Value::as_bool) != Some(true) {
+        return false;
+    }
+    let Some(mcp) = meta.get("mcp").and_then(Value::as_object) else {
+        return false;
+    };
+    if mcp.get("server").and_then(Value::as_str) != Some("roundtable") {
+        return false;
+    }
+    let Some(tool) = mcp.get("tool").and_then(Value::as_str) else {
+        return false;
+    };
+    if !ROUNDTABLE_TOOL_NAMES.contains(&tool) {
+        return false;
+    }
+    if let Some(name) = call.get("name").and_then(Value::as_str) {
+        if !single_underscore_title_agrees(name, tool) {
+            return false;
+        }
+    }
+    match call.get("title").and_then(Value::as_str) {
+        Some(title) => single_underscore_title_agrees(title, tool),
+        None => true,
+    }
+}
+
+fn single_underscore_title_agrees(title: &str, tool: &str) -> bool {
+    if text_names_roundtable_tool(title) {
+        return true;
+    }
+    title
+        .strip_prefix("roundtable_")
+        .is_some_and(|rest| !rest.starts_with('_') && rest == tool)
 }
 
 fn scoped_roundtable_tool(text: &str) -> Option<&str> {

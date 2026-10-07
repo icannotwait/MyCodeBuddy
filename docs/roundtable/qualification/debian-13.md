@@ -461,7 +461,12 @@ qualified as confined to the sealed tool and disposable attempt. An explicit
 `use_tool` identity may wrap a scoped roundtable tool only when its `rawInput`
 contains the exact `tool_name` and an object `tool_input`, with no other keys.
 A conflicting machine name or a native-operation kind cannot be overridden by
-a display title or argument. Every other tool,
+a display title or argument. Antigravity 1.3.0 is allowed when
+`toolCall._meta.is_mcp_tool_call` is true, `_meta.mcp.server` is
+`roundtable`, and `_meta.mcp.tool` is one of those three names. Its title
+`roundtable_submit_result` (one underscore) is accepted only together
+with that meta. The same title without the meta is rejected. A terminal
+command whose text contains `submit_result` is rejected. Every other tool,
 including `run_terminal_command`, selects `reject_once`, or
 `reject_always` when `reject_once` is absent. The reply is
 `{"outcome":{"outcome":"selected","optionId":"..."}}`. The client never
