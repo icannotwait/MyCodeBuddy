@@ -16,8 +16,13 @@ use tokio::process::Command;
 use super::companion::ATTEMPT_TOKEN_ENV;
 use super::installed_runtime::ProviderBinding;
 use super::qualification::CertifiedBinary;
+use super::qualification_experiment::{
+    assess_credential_canary, failed_observation, production_checks, production_prompt,
+    CredentialCanary, ObserveInput, QualificationExperiment,
+};
 use super::qualification_probe::{ProbeCheck, ProbeFacts, ProbeRequest};
 use super::qualification_profiles::{profile_by_id, profile_for_agent};
+use super::relay::SANDBOX_ENDPOINT;
 use super::sandbox::{AuthMount, QualifiedOciProfile};
 
 pub async fn measure_host(request: &ProbeRequest) -> ProbeFacts {
@@ -122,7 +127,7 @@ pub async fn measure_host(request: &ProbeRequest) -> ProbeFacts {
         failures.push(fail("roundtable_mcp", "codeg-mcp missing from rootfs"));
     }
 
-    let mut auth_mounts = Vec::new();
+    let mut host_held = Vec::new();
     for file in profile.auth_files {
         let source = request.home.join(file.home_relative);
         if !source.is_file() {
@@ -143,23 +148,21 @@ pub async fn measure_host(request: &ProbeRequest) -> ProbeFacts {
         let placeholder = request
             .rootfs
             .join(file.destination.trim_start_matches('/'));
-        match fs::symlink_metadata(&placeholder) {
-            Ok(metadata)
-                if metadata.is_file()
-                    && !metadata.file_type().is_symlink()
-                    && metadata.len() == 0 => {}
-            _ => failures.push(fail(
-                "model_credential_material_in_sandbox",
-                "auth placeholder missing or not empty",
-            )),
+        if let Ok(metadata) = fs::symlink_metadata(&placeholder) {
+            if metadata.file_type().is_symlink() || !metadata.is_file() || metadata.len() != 0 {
+                failures.push(fail(
+                    "model_credential_material_in_sandbox",
+                    "auth bytes are baked into the image",
+                ));
+            }
         }
-        auth_mounts.push(AuthMount {
+        host_held.push(AuthMount {
             source,
             destination: file.destination.to_string(),
         });
     }
     if let Some(filename) = profile.require_one_filename {
-        if !auth_mounts
+        if !host_held
             .iter()
             .any(|mount| mount.destination.rsplit('/').next() == Some(filename))
         {
@@ -249,7 +252,8 @@ pub async fn measure_host(request: &ProbeRequest) -> ProbeFacts {
             .collect(),
         service_socket: None,
         gateway_socket: None,
-        auth_mounts: auth_mounts.clone(),
+        auth_mounts: Vec::new(),
+        host_held_credentials: host_held.clone(),
         container_env,
     });
 
@@ -261,7 +265,7 @@ pub async fn measure_host(request: &ProbeRequest) -> ProbeFacts {
         return facts;
     }
 
-    match run_isolation(request, &auth_mounts).await {
+    match run_isolation(request).await {
         Ok(output) => {
             facts.isolation_marker = if output.contains("ISOLATION_OK") && required_denials(&output)
             {
@@ -323,8 +327,28 @@ pub async fn measure_host(request: &ProbeRequest) -> ProbeFacts {
                 "cancel_and_reap",
                 "MCP probe failure did not return a final cleanup proof",
             ));
-            facts.checks.push(fail("roundtable_mcp", &reason));
+            facts
+                .checks
+                .push(fail("companion_socket_connection", &reason));
             facts.checks.push(fail("companion_lifecycle", &reason));
+        }
+    }
+
+    match run_credential_canary(request, &host_held).await {
+        Ok(canary) => facts.checks.extend(assess_credential_canary(&canary)),
+        Err(reason) => {
+            for name in [
+                "model_credential_material_in_sandbox",
+                "model_credentials_visible_to_agent",
+                "native_read_boundary",
+                "api_credential_scope",
+            ] {
+                let mut check = fail(name, &reason);
+                if name != "api_credential_scope" {
+                    check.flag = Some(true);
+                }
+                facts.checks.push(check);
+            }
         }
     }
 
@@ -332,30 +356,40 @@ pub async fn measure_host(request: &ProbeRequest) -> ProbeFacts {
         request,
         profile.container_cli,
         profile.cli_args,
-        &auth_mounts,
         &probe_token,
     )
     .await
     {
-        Ok(turn) => {
-            facts
-                .checks
-                .push(pass("new_session", "ACP initialize and session/new"));
-            match model_binding_error(&request.agent, &turn.session, &facts.providers) {
-                None => facts.checks.push(pass(
-                    "advertised_model_binding",
-                    &format!("protocolVersion 1; {}", turn.egress_note),
-                )),
-                Some(reason) => facts.checks.push(fail(
-                    "endpoint_compatibility",
-                    &format!("{reason}; {}", turn.egress_note),
-                )),
+        Ok(probe) => {
+            match probe.turn {
+                Ok(turn) => {
+                    facts
+                        .checks
+                        .push(pass("new_session", "ACP initialize and session/new"));
+                    if model_binding_error(&request.agent, &turn.session, &facts.providers)
+                        .is_none()
+                    {
+                        facts.checks.push(pass(
+                            "advertised_model_binding",
+                            &format!("protocolVersion 1; {}", turn.egress_note),
+                        ));
+                    }
+                    facts.checks.push(pass_flag(
+                        "ordered_turn_completion",
+                        "session/prompt stopReason=end_turn",
+                        turn.completed,
+                    ));
+                }
+                Err(reason) => {
+                    facts.checks.push(not_tested(
+                        "cancel_and_reap",
+                        "ACP probe failure did not return a final cleanup proof",
+                    ));
+                    facts.checks.push(fail("new_session", &reason));
+                    facts.checks.push(fail("ordered_turn_completion", &reason));
+                }
             }
-            facts.checks.push(pass_flag(
-                "ordered_turn_completion",
-                "session/prompt stopReason=end_turn",
-                turn.completed,
-            ));
+            facts.checks.extend(production_checks(&probe.observation));
         }
         Err(reason) => {
             facts.checks.push(not_tested(
@@ -363,11 +397,10 @@ pub async fn measure_host(request: &ProbeRequest) -> ProbeFacts {
                 "ACP probe failure did not return a final cleanup proof",
             ));
             facts.checks.push(fail("new_session", &reason));
-            facts.checks.push(fail("endpoint_compatibility", &reason));
             facts.checks.push(fail("ordered_turn_completion", &reason));
-            facts.checks.push(fail("bounded_context_delivery", &reason));
-            facts.checks.push(fail("private_events", &reason));
-            facts.checks.push(fail("api_credential_scope", &reason));
+            facts
+                .checks
+                .extend(production_checks(&failed_observation()));
         }
     }
     for name in [
@@ -378,6 +411,7 @@ pub async fn measure_host(request: &ProbeRequest) -> ProbeFacts {
         "sidebar_discovery",
         "global_body_events",
         "model_credentials_visible_to_agent",
+        "model_credential_material_in_sandbox",
         "native_read_boundary",
         "api_credential_scope",
         "endpoint_compatibility",
@@ -389,19 +423,6 @@ pub async fn measure_host(request: &ProbeRequest) -> ProbeFacts {
             ));
         }
     }
-    facts.checks.push(if auth_mounts.is_empty() {
-        not_tested(
-            "model_credential_material_in_sandbox",
-            "native authentication boundary was not measured",
-        )
-    } else {
-        let mut check = fail(
-            "model_credential_material_in_sandbox",
-            "native auth files are mounted or copied into the adapter sandbox and remain readable",
-        );
-        check.flag = Some(true);
-        check
-    });
     stamp_failures(&mut facts, &failures);
     facts
 }
@@ -600,22 +621,103 @@ fn required_denials(output: &str) -> bool {
     .all(|token| output.contains(token))
 }
 
-async fn run_isolation(
+const CREDENTIAL_CANARY_SCRIPT: &str = r#"#!/bin/sh
+set -u
+control=$(cat /scratch/control.txt 2>/dev/null || true)
+printf 'CONTROL:%s\n' "$control"
+for path in "$@"; do
+  if [ -f "$path" ] && [ -s "$path" ]; then
+    printf 'PRESENT %s\n' "$path"
+  else
+    printf 'ABSENT %s\n' "$path"
+  fi
+done
+find /rt-home -type f -size +0c 2>/dev/null | while read -r file; do
+  printf 'HOME_FILE %s\n' "$file"
+done
+"#;
+
+fn secret_visible_in_env(held: &[AuthMount], endpoint: &str) -> bool {
+    for mount in held {
+        let Ok(bytes) = fs::read(&mount.source) else {
+            continue;
+        };
+        if bytes.len() < 8 {
+            continue;
+        }
+        if endpoint
+            .as_bytes()
+            .windows(bytes.len())
+            .any(|window| window == bytes)
+        {
+            return true;
+        }
+    }
+    false
+}
+
+async fn run_credential_canary(
     request: &ProbeRequest,
-    auth_mounts: &[AuthMount],
-) -> Result<String, String> {
+    held: &[AuthMount],
+) -> Result<CredentialCanary, String> {
+    let scratch = request.runtime_root.join("probe-scratch");
+    fs::create_dir_all(&scratch).map_err(|error| error.to_string())?;
+    let control_token = format!("control-{}", uuid::Uuid::new_v4().simple());
+    let unmounted_canary = format!("canary-{}", uuid::Uuid::new_v4().simple());
+    fs::write(scratch.join("control.txt"), &control_token).map_err(|error| error.to_string())?;
+    fs::write(
+        request.runtime_root.join("unmounted-canary"),
+        &unmounted_canary,
+    )
+    .map_err(|error| error.to_string())?;
+    let script = scratch.join("credential-canary.sh");
+    fs::write(&script, CREDENTIAL_CANARY_SCRIPT).map_err(|error| error.to_string())?;
+    let mut argv = vec!["/bin/sh".into(), "/scratch/credential-canary.sh".into()];
+    let destinations: Vec<String> = held.iter().map(|mount| mount.destination.clone()).collect();
+    argv.extend(destinations.iter().cloned());
+    let output = run_container(
+        request,
+        &argv,
+        &[(scratch, "/scratch".into(), false)],
+        None,
+        Duration::from_secs(60),
+        false,
+        None,
+    )
+    .await?;
+    let _ = fs::remove_file(request.runtime_root.join("unmounted-canary"));
+    Ok(CredentialCanary {
+        output,
+        mounted_destinations: 0,
+        destinations,
+        control_token,
+        unmounted_canary,
+        host_files_ready: held.iter().any(|mount| mount.source.is_file())
+            && select_profile(request).is_some_and(|profile| {
+                profile.require_one_filename.is_none_or(|filename| {
+                    held.iter()
+                        .any(|mount| mount.destination.rsplit('/').next() == Some(filename))
+                }) && profile
+                    .auth_files
+                    .iter()
+                    .filter(|file| file.required)
+                    .all(|file| {
+                        held.iter()
+                            .any(|mount| mount.destination == file.destination)
+                    })
+            }),
+        secret_visible_in_env: secret_visible_in_env(held, SANDBOX_ENDPOINT),
+    })
+}
+
+async fn run_isolation(request: &ProbeRequest) -> Result<String, String> {
     let scratch = request.runtime_root.join("probe-scratch");
     fs::create_dir_all(&scratch).map_err(|error| error.to_string())?;
     let secret = request.runtime_root.join("probe-secret");
     fs::write(&secret, b"probe-canary").map_err(|error| error.to_string())?;
     let script = scratch.join("probe.sh");
     fs::write(&script, ISOLATION_SCRIPT).map_err(|error| error.to_string())?;
-    let mut mounts = vec![(scratch.clone(), "/scratch".into(), false)];
-    mounts.extend(
-        auth_mounts
-            .iter()
-            .map(|mount| (mount.source.clone(), mount.destination.clone(), true)),
-    );
+    let mounts = vec![(scratch.clone(), "/scratch".into(), false)];
     let output = run_container(
         request,
         &["/bin/sh".into(), "/scratch/probe.sh".into()],
@@ -709,6 +811,7 @@ async fn run_mcp(request: &ProbeRequest, token: &str) -> Result<(), String> {
 
 struct TurnOutcome {
     completed: bool,
+    session_id: String,
     session: serde_json::Value,
     egress_note: String,
 }
@@ -717,66 +820,93 @@ async fn run_acp(
     request: &ProbeRequest,
     cli: &str,
     args: &[&str],
-    auth_mounts: &[AuthMount],
-    token: &str,
-) -> Result<TurnOutcome, String> {
+    _smoke_token: &str,
+) -> Result<AcpProbe, String> {
     let mut argv = vec![cli.to_string()];
     argv.extend(args.iter().map(|arg| (*arg).to_string()));
     let scratch = request.runtime_root.join("probe-scratch");
     let _ = fs::create_dir_all(&scratch);
-    let mut mounts = vec![(scratch, "/scratch".into(), false)];
-    mounts.extend(
-        auth_mounts
-            .iter()
-            .map(|mount| (mount.source.clone(), mount.destination.clone(), true)),
-    );
-    #[cfg(unix)]
-    let accept = {
-        use std::os::unix::net::UnixListener;
-        let dir = request.runtime_root.join("probe-acp");
-        fs::create_dir_all(&dir).map_err(|error| error.to_string())?;
-        let socket_path = dir.join("roundtable.sock");
-        let _ = fs::remove_file(&socket_path);
-        let listener = UnixListener::bind(&socket_path).map_err(|error| error.to_string())?;
-        listener
-            .set_nonblocking(true)
-            .map_err(|error| error.to_string())?;
-        mounts.push((socket_path, "/run/codeg/roundtable.sock".into(), false));
-        AbortOnDrop(tokio::spawn(async move {
-            let start = std::time::Instant::now();
-            let mut held = Vec::new();
-            loop {
-                match listener.accept() {
-                    Ok((stream, _)) => held.push(stream),
-                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                        if start.elapsed() > Duration::from_secs(120) {
-                            break;
-                        }
-                        tokio::time::sleep(Duration::from_millis(50)).await;
-                    }
-                    Err(_) => break,
-                }
-            }
-            drop(held);
-        }))
-    };
+    let mut mounts = vec![(scratch.clone(), "/scratch".into(), false)];
+    let socket_path = request
+        .runtime_root
+        .join("probe-acp")
+        .join("roundtable.sock");
+    let recipient = facts_model(request);
+    let fixture = Hash256::sha256(request.agent.as_bytes());
+    let experiment =
+        QualificationExperiment::open(&request.data_dir, &socket_path, &recipient, fixture)
+            .await
+            .map_err(|error| {
+                error
+                    .details
+                    .reason
+                    .unwrap_or_else(|| "qualification_experiment".into())
+            })?;
+    let token = experiment.token();
+    mounts.push((
+        experiment.socket_path().to_path_buf(),
+        "/run/codeg/roundtable.sock".into(),
+        false,
+    ));
     let egress_note = match run_egress(request, &mounts).await {
         Ok(note) => note,
         Err(reason) => return Err(reason),
     };
-    let output = run_acp_session(request, &argv, &mounts, token, egress_note).await;
-    #[cfg(unix)]
-    drop(accept);
-    output
+    let private_log = std::sync::Mutex::new(Vec::new());
+    let output = run_acp_session(
+        request,
+        &argv,
+        &mounts,
+        &token,
+        egress_note,
+        Some(&private_log),
+    )
+    .await;
+    let (session_id, endpoint_compatible) = match &output {
+        Ok(turn) => (
+            turn.session_id.clone(),
+            model_binding_error(
+                &request.agent,
+                &turn.session,
+                &read_providers(&request.provider_bindings).unwrap_or_default(),
+            )
+            .is_none(),
+        ),
+        Err(_) => (String::new(), false),
+    };
+    let frames = private_log
+        .lock()
+        .map(|log| log.clone())
+        .unwrap_or_default();
+    let observation = experiment
+        .observe(ObserveInput {
+            session_id,
+            agent: crate::models::AgentType::from_wire(&request.agent)
+                .unwrap_or(crate::models::AgentType::Grok),
+            private_frames: frames,
+            endpoint_compatible,
+            sandbox_endpoint: SANDBOX_ENDPOINT.to_string(),
+            scratch_root: scratch,
+        })
+        .await;
+    Ok(AcpProbe {
+        turn: output,
+        observation,
+    })
 }
 
-#[cfg(unix)]
-struct AbortOnDrop(tokio::task::JoinHandle<()>);
-#[cfg(unix)]
-impl Drop for AbortOnDrop {
-    fn drop(&mut self) {
-        self.0.abort();
-    }
+struct AcpProbe {
+    turn: Result<TurnOutcome, String>,
+    observation: super::qualification_experiment::ProductionObservation,
+}
+
+fn facts_model(request: &ProbeRequest) -> String {
+    read_providers(&request.provider_bindings)
+        .ok()
+        .and_then(|providers| {
+            provider_for_agent(&providers, &request.agent).map(|provider| provider.model.clone())
+        })
+        .unwrap_or_else(|| request.agent.clone())
 }
 
 #[cfg(any(test, feature = "test-utils"))]
@@ -850,6 +980,7 @@ async fn run_acp_session(
     mounts: &[(PathBuf, String, bool)],
     token: &str,
     egress_note: String,
+    private_log: Option<&std::sync::Mutex<Vec<String>>>,
 ) -> Result<TurnOutcome, String> {
     let prepared = prepare_bundle(request, argv, mounts, None, true, None)?;
     let mut container = ProbeContainer {
@@ -883,6 +1014,7 @@ async fn run_acp_session(
         1,
         "initialize",
         super::live_runtime::roundtable_initialize_params("codeg-roundtable-qualify"),
+        private_log,
     )
     .await?;
     if init["protocolVersion"] != 1 {
@@ -902,13 +1034,14 @@ async fn run_acp_session(
             "args": ["--service-roundtable", "--socket-path", "/run/codeg/roundtable.sock", "--incarnation", "qualify"],
             "env": [{"name": ATTEMPT_TOKEN_ENV, "value": token}]
         }])),
+        private_log,
     )
     .await?;
     let session_id = session["sessionId"]
         .as_str()
         .ok_or("acp session")?
         .to_string();
-    let prompt = "Reply with the single word pong.";
+    let prompt = production_prompt();
     if prompt.len() > 8_192 {
         return Err("prompt over cap".into());
     }
@@ -921,11 +1054,13 @@ async fn run_acp_session(
             "sessionId": session_id,
             "prompt": [{"type": "text", "text": prompt}]
         }),
+        private_log,
     )
     .await?;
     container.finish().await?;
     Ok(TurnOutcome {
         completed: result["stopReason"] == "end_turn",
+        session_id,
         session,
         egress_note,
     })
@@ -937,6 +1072,7 @@ async fn rpc(
     id: u64,
     method: &str,
     params: serde_json::Value,
+    private_log: Option<&std::sync::Mutex<Vec<String>>>,
 ) -> Result<serde_json::Value, String> {
     let mut seq = 0;
     let rejected = std::sync::atomic::AtomicBool::new(false);
@@ -951,6 +1087,7 @@ async fn rpc(
             assistant: None,
             deadline: Some(Duration::from_secs(90)),
             rejected_permission: &rejected,
+            private_log,
         },
     )
     .await
@@ -1106,6 +1243,8 @@ fn prepare_bundle(
         "cq-mcp".to_string()
     } else if argv.iter().any(|arg| arg.ends_with("probe.sh")) {
         "cq-isolation".to_string()
+    } else if argv.iter().any(|arg| arg.ends_with("credential-canary.sh")) {
+        "cq-canary".to_string()
     } else if argv.iter().any(|arg| arg.ends_with("egress.sh")) {
         "cq-egress".to_string()
     } else if argv.iter().any(|arg| arg == "--version") {
@@ -1130,12 +1269,15 @@ fn prepare_bundle(
     let bundle = request.runtime_root.join("bundles").join(&id);
     let _ = fs::remove_dir_all(&bundle);
     fs::create_dir_all(&bundle).map_err(|error| error.to_string())?;
-    let mut oci_mounts = super::sandbox::linux_runtime_mounts_json();
-    let (host_mounts, auth_mounts): (Vec<_>, Vec<_>) = mounts
+    if mounts
         .iter()
-        .cloned()
-        .partition(|(_, destination, _)| !destination.starts_with("/rt-home/"));
-    for (source, destination, read_only) in &host_mounts {
+        .any(|(_, destination, _)| destination.starts_with("/rt-home/"))
+    {
+        return Err("credential material cannot be mounted or copied into the sandbox".into());
+    }
+    let mut oci_mounts = super::sandbox::linux_runtime_mounts_json();
+    let host_mounts = mounts;
+    for (source, destination, read_only) in host_mounts {
         let mut options = vec!["bind", "nosuid", "nodev"];
         options.push(if *read_only { "ro" } else { "rw" });
         oci_mounts.push(serde_json::json!({
@@ -1148,35 +1290,12 @@ fn prepare_bundle(
     let upper = scratch_home_dir(&request.runtime_root, &request.agent, &id);
     fs::create_dir_all(&upper).map_err(|error| error.to_string())?;
     let home_guard = RemoveOnDrop::arm(upper.clone());
-    let mut readonly_binds = Vec::new();
-    for (source, destination, read_only) in &auth_mounts {
-        let bind = super::sandbox::linux_prepare_attempt_auth(&upper, source, destination)
-            .map_err(|error| {
-                error
-                    .details
-                    .reason
-                    .unwrap_or_else(|| "auth_copy".to_string())
-            })?;
-        if bind {
-            readonly_binds.push((source.clone(), destination.clone(), *read_only));
-        }
-    }
     oci_mounts.push(serde_json::json!({
         "destination": "/rt-home",
         "type": "bind",
         "source": upper,
         "options": ["bind", "rw", "nosuid", "nodev"]
     }));
-    for (source, destination, read_only) in &readonly_binds {
-        let mut options = vec!["bind", "nosuid", "nodev", "nosymfollow"];
-        options.push(if *read_only { "ro" } else { "rw" });
-        oci_mounts.push(serde_json::json!({
-            "destination": destination,
-            "type": "bind",
-            "source": source,
-            "options": options
-        }));
-    }
     let secret_note = secret
         .map(|path| path.display().to_string())
         .unwrap_or_default();
@@ -1192,6 +1311,10 @@ fn prepare_bundle(
             return Err("missing_attempt_token".into());
         }
         env.push(format!("{ATTEMPT_TOKEN_ENV}={token}"));
+    }
+    if slirp {
+        env.push(format!("OPENAI_BASE_URL={SANDBOX_ENDPOINT}"));
+        env.push(format!("OPENAI_API_KEY={}", uuid::Uuid::new_v4().simple()));
     }
     if let Some(profile) = select_profile(request) {
         for (key, value) in profile.container_env {

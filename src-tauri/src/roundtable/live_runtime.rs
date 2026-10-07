@@ -53,7 +53,12 @@ pub(crate) struct LiveParticipantExecutor {
 
 fn auth_denylist(installed: &InstalledRuntime, seeds: &[String]) -> RtResult<Vec<String>> {
     let mut secrets = seeds.to_vec();
-    for mount in &installed.oci.auth_mounts {
+    for mount in installed
+        .oci
+        .host_held_credentials
+        .iter()
+        .chain(installed.oci.auth_mounts.iter())
+    {
         secrets.extend(super::diagnostics::auth_file_secrets(&mount.source)?);
     }
     secrets.sort();
@@ -128,11 +133,35 @@ fn agent_type_for(agent: &str) -> RtResult<crate::models::AgentType> {
 }
 
 fn file_auth_ready(installed: &InstalledRuntime) -> bool {
-    !installed.oci.auth_mounts.is_empty()
-        && installed.oci.auth_mounts.iter().all(|mount| {
+    // Only host-held files count. Sandbox mounts are refused and are not a
+    // credential boundary.
+    !installed.oci.host_held_credentials.is_empty()
+        && installed.oci.host_held_credentials.iter().all(|mount| {
             let path = std::path::Path::new(&mount.source);
             path.is_absolute() && path.is_file()
         })
+}
+
+fn host_gateway_secret(
+    installed: &InstalledRuntime,
+    binding: &super::installed_runtime::ProviderBinding,
+) -> RtResult<String> {
+    if let Ok(value) = std::env::var(&binding.credential_env) {
+        if !value.is_empty() {
+            return Ok(value);
+        }
+    }
+    for mount in &installed.oci.host_held_credentials {
+        if let Ok(text) = std::fs::read_to_string(&mount.source) {
+            if !text.is_empty() {
+                return Ok(text);
+            }
+        }
+    }
+    Err(rt_error(
+        ErrorCode::CapabilityUnqualified,
+        "provider_credential_missing",
+    ))
 }
 
 fn credential_ready(
@@ -601,9 +630,7 @@ impl RoundtableTurnExecutor for LiveParticipantExecutor {
                 self.data_dir.clone(),
                 (
                     super::ApprovedOrigin::parse(&provider.origin)?,
-                    super::HostCredential::injected(
-                        std::env::var(&provider.credential_env).unwrap_or_default(),
-                    ),
+                    super::HostCredential::injected(host_gateway_secret(&installed, &provider)?),
                     provider.model.clone(),
                     request.participant.effort.clone(),
                 ),
@@ -1147,6 +1174,7 @@ where
                 assistant: control.assistant,
                 deadline: control.deadline,
                 rejected_permission: &rejected,
+                private_log: None,
             },
         )
         .await?;
@@ -1181,6 +1209,8 @@ pub(crate) struct AcpExchange<'a> {
     /// Set when this exchange rejects a tool. A later `cancelled` stop can
     /// be retried by [`finish_seat_prompt`].
     pub(crate) rejected_permission: &'a AtomicBool,
+    /// Qualification probe log of private ACP frames. Live seats pass `None`.
+    pub(crate) private_log: Option<&'a std::sync::Mutex<Vec<String>>>,
 }
 
 async fn rpc(
@@ -1204,6 +1234,7 @@ async fn rpc(
             assistant: Some(&active.assistant),
             deadline: None,
             rejected_permission: &rejected,
+            private_log: None,
         },
     )
     .await
@@ -1274,6 +1305,7 @@ where
         // Ordered failure observations are consumed before any terminal
         // response can release a previously staged submission for acceptance.
         if message["method"] == "session/update" {
+            note_private_frame(exchange, "session/update");
             check_failure_metadata(&message["params"]["update"], super::FailureSource::Update)?;
             check_failure_metadata(&message["params"], super::FailureSource::Update)?;
         }
@@ -1327,8 +1359,18 @@ where
                     "acp_abnormal_finish",
                 ));
             }
+            note_private_frame(exchange, exchange.method);
             return Ok(result);
         }
+    }
+}
+
+fn note_private_frame(exchange: &AcpExchange<'_>, label: &str) {
+    let Some(log) = exchange.private_log else {
+        return;
+    };
+    if let Ok(mut frames) = log.lock() {
+        frames.push(label.to_string());
     }
 }
 
@@ -1929,6 +1971,7 @@ fn unqualified_live_fixture(
         service_socket: None,
         gateway_socket: None,
         auth_mounts: Vec::new(),
+        host_held_credentials: Vec::new(),
         container_env: BTreeMap::new(),
     };
     let installed = InstalledRuntime {
@@ -2047,6 +2090,7 @@ pub async fn exercise_live_acp_rpc() -> RtResult<LiveAcpRpcObservation> {
                 assistant: Some(&capture),
                 deadline: Some(Duration::from_secs(5)),
                 rejected_permission: &rejected,
+                private_log: None,
             },
         )
         .await?;
@@ -2064,6 +2108,7 @@ pub async fn exercise_live_acp_rpc() -> RtResult<LiveAcpRpcObservation> {
                 assistant: Some(&capture),
                 deadline: Some(Duration::from_secs(5)),
                 rejected_permission: &rejected,
+                private_log: None,
             },
         )
         .await
@@ -2374,6 +2419,7 @@ pub async fn drive_prompt_frames_fixture(frames: &[Value]) -> RtResult<u64> {
             assistant: None,
             deadline: None,
             rejected_permission: &rejected,
+            private_log: None,
         },
     )
     .await?;
@@ -2421,6 +2467,7 @@ pub async fn exercise_schema_seat_rpc() -> RtResult<SchemaSeatObservation> {
                 assistant: Some(&capture),
                 deadline: Some(Duration::from_secs(5)),
                 rejected_permission: &rejected,
+                private_log: None,
             },
         )
         .await?;
@@ -2440,6 +2487,7 @@ pub async fn exercise_schema_seat_rpc() -> RtResult<SchemaSeatObservation> {
                 assistant: Some(&capture),
                 deadline: Some(Duration::from_secs(5)),
                 rejected_permission: &rejected,
+                private_log: None,
             },
         )
         .await?;

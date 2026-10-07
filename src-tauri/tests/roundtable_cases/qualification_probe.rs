@@ -115,6 +115,7 @@ fn passing(agent: &str, os_version: &str) -> ProbeFacts {
             service_socket: None,
             gateway_socket: None,
             auth_mounts: Vec::new(),
+            host_held_credentials: Vec::new(),
             container_env: BTreeMap::new(),
         }),
         providers: vec![ProviderBinding {
@@ -313,7 +314,7 @@ fn live_container_spec_bind_mounts_the_slirp_resolver() {
 }
 
 #[test]
-fn grok_auth_refresh_stays_in_the_attempt_copy() {
+fn attempt_home_does_not_receive_auth_bytes() {
     let root = scratch();
     let host = root.join("host");
     let attempt = root.join("attempt");
@@ -321,40 +322,25 @@ fn grok_auth_refresh_stays_in_the_attempt_copy() {
     let host_auth = host.join(".grok/auth.json");
     let original = br#"{"refresh_token":"host-token","access_token":"old"}"#;
     fs::write(&host_auth, original).expect("host auth");
-    let copied =
-        codeg_lib::roundtable::stage_attempt_auth(&attempt, &host_auth, "/rt-home/.grok/auth.json")
-            .expect("copy");
-    assert!(!copied, "grok auth is not a read-only bind");
-    let scratch_auth = attempt.join(".grok/auth.json");
-    assert_eq!(fs::read(&scratch_auth).expect("scratch"), original);
-    fs::write(&scratch_auth, br#"{"refresh_token":"rotated"}"#).expect("refresh");
+    let refused =
+        codeg_lib::roundtable::stage_attempt_auth(&attempt, &host_auth, "/rt-home/.grok/auth.json");
+    assert!(
+        refused.is_err(),
+        "grok auth must not be copied into the attempt"
+    );
+    assert!(!attempt.join(".grok/auth.json").exists());
     assert_eq!(fs::read(&host_auth).expect("host unchanged"), original);
 
     let cursor = host.join(".cursor/auth.json");
     fs::create_dir_all(cursor.parent().expect("parent")).expect("cursor home");
     fs::write(&cursor, b"cursor-token").expect("cursor auth");
-    let bind =
+    assert!(
         codeg_lib::roundtable::stage_attempt_auth(&attempt, &cursor, "/rt-home/.cursor/auth.json")
-            .expect("cursor bind");
-    assert!(bind, "cursor auth stays a read-only bind");
-    assert_eq!(
-        fs::read(attempt.join(".cursor/auth.json")).expect("placeholder"),
-        b""
+            .is_err(),
+        "cursor auth must not be staged into the attempt"
     );
+    assert!(!attempt.join(".cursor/auth.json").exists());
     assert_eq!(fs::read(&cursor).expect("cursor host"), b"cursor-token");
-
-    #[cfg(unix)]
-    {
-        let link = root.join("link.json");
-        std::os::unix::fs::symlink(&host_auth, &link).expect("symlink");
-        assert!(codeg_lib::roundtable::stage_attempt_auth(
-            &attempt,
-            &link,
-            "/rt-home/.grok/auth.json",
-        )
-        .is_err());
-        assert_eq!(fs::read(&host_auth).expect("host after symlink"), original);
-    }
     let _ = fs::remove_dir_all(&root);
 }
 

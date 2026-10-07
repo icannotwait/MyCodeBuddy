@@ -32,6 +32,7 @@ mod ownership;
 mod paging;
 mod product;
 mod qualification;
+mod qualification_experiment;
 mod qualification_harness;
 mod qualification_linux;
 mod qualification_probe;

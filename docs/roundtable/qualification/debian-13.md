@@ -8,22 +8,29 @@ mismatch, or a failed ACP turn is a failing report and no certificate.
 
 ## Current qualification limitation
 
-The host probe currently measures OS isolation, adapter startup, and a basic
-ACP prompt. It does not yet exercise production `submit_result` receipt plus
-completion/drain, the product's private event/sidebar/global-body paths,
-or the adapter's native tools against mounted authentication files. Those
-checks remain `not_tested`; this version cannot issue a usable product
-certificate. A successful `pong` response is only an ACP smoke test.
+The probe can issue a certificate only when every required check is measured
+on this host. Credential files stay on the host for the gateway. They are not
+bind-mounted and they are not copied into the attempt home. A non-empty
+`auth_mounts` list still fails `model_credential_material_in_sandbox`. The
+sandbox process receives a random attempt bearer and
+`OPENAI_BASE_URL=http://127.0.0.1:39173/v1`. It does not receive
+`CURSOR_API_KEY`.
 
-Auth files are readable by the adapter process inside its sandbox. Read-only
-binds still expose their bytes; Grok's writable attempt-local copy exposes
-bytes too. No verified separate model-tool credential boundary is implemented.
-The report must describe this material as present and refuse certification.
-These are limitations to fix in code, not checks an operator may waive by
-editing the report or enabling the execution gate.
+The production experiment binds the real broker and durable store under a
+qualification-experiment authority. That authority requires
+`certificate=not_tested`, expires, and fixture limits. It does not authorize
+product scope and it does not enable `execution-policy.json`. `roundtable_mcp`
+passes only after the broker seals one `submit_result`. Receipt, bounded
+evidence, private ACP frames, sidebar hide, and global-body counts are read
+from that same run. A smoke `pong` is not a certificate.
 
-The setup and probe commands below are preparatory diagnostics. They do not
-restore live qualification or authorize real provider calls by themselves.
+`request_envelope` stays `not_tested` until the host gateway records a real
+model request body. Do not fill it with the ACP prompt size. Do not edit a
+report or turn the product gate on to waive a failed or unmeasured check.
+
+This repository build does not run `crun`. A passing unit test of the broker
+is not a live adapter certificate. Re-run `roundtable-qualify` on the Debian
+host after installing this build.
 
 Profiles accept Debian 12 and Debian 13 as profile parameters. The
 issued key still pins the OS, kernel, and architecture that were
@@ -34,7 +41,7 @@ measured. A Debian 12 certificate does not verify on Debian 13.
 
 ## Profiles
 
-| Agent | Profile id | Binary inside the rootfs | Version text must contain | Auth files (host home, read-only) |
+| Agent | Profile id | Binary inside the rootfs | Version text must contain | Auth files (host-held, not mounted) |
 | --- | --- | --- | --- | --- |
 | Codex | `linux-codex-2.1.1` | `/usr/local/bin/codex-acp` | `2.1.1` | `.codex/auth.json` |
 | Grok | `linux-grok-1.0.46` | `/usr/local/bin/grok` with args `--no-auto-update agent stdio` | `1.0.46` | `.grok/auth.json` |
@@ -126,17 +133,18 @@ paths. The same paths retain that template hash when only the resolver
 contents change. `core_hash` separately binds the shared implementation;
 the changes between `2f57bcde4` and `a8ee4042f` therefore invalidate
 previously issued certificates. Probe/profile implementation sources are
-also bound into new certificates. Changed production or probe semantics
-require fresh qualification once the missing product checks and credential
-boundary are implemented. Keep the execution policy disabled meanwhile.
+also bound into new certificates. Changed production or probe semantics,
+including host-held credentials in `plan_hash`, require a fresh
+qualification on this host. Keep the execution policy disabled.
 A different `--runtime-root` or rootfs path also changes `plan_hash` even
 when the implementation is unchanged.
 The shared-core hash includes the validator, seat prompt, MCP broker and
 live ACP client. The `submit_result` JSON Schema is answered by the
 codeg-server broker on `tools/list`; the `codeg-mcp` process in the rootfs
 only proxies that socket, so a schema-only broker change does not require
-a new rootfs. Rerunning the current diagnostic probe cannot produce a
-usable live certificate or resolve the missing product measurements.
+a new rootfs. A certificate is issued only when this host measures the
+production broker path and the host-held credential boundary. `request_envelope`
+stays unmeasured, and the product execution policy stays disabled.
 Without that mount the live container keeps the empty file, so
 `auth.x.ai` and `cli-chat-proxy.grok.com` fail with
 `dns error: failed to lookup address information` until the attempt
@@ -159,9 +167,9 @@ The qualification key stores the first `crun version …` line from
 
 One rootfs directory can hold every adapter. Do not put credentials,
 tokens, or `auth.json` contents in the image or in git. The probe
-rejects a placeholder that is missing, non-empty, or a symlink. Cursor,
-Codex, and Antigravity auth files are bind-mounted read-only. Grok's
-`auth.json` is copied into the attempt home instead; see below.
+rejects a placeholder that is missing, non-empty, or a symlink. Auth
+files stay on the host. They are not bind-mounted and they are not
+copied into the attempt home.
 
 ```bash
 export ROOTFS=/var/lib/codeg/roundtable-rootfs
@@ -206,13 +214,10 @@ device nodes in the image and change the digest. `/sys` is mounted
 read-only. `/tmp` is a writable tmpfs. `/rt-home` is a writable scratch
 directory for that adapter and that container run
 (`home-upper/<agent>/<container-id>-<run>` on the probe,
-`scratch/rt-home` on a live attempt). Cursor, Codex, and Antigravity
-auth files are bind-mounted read-only on top of it. Grok's `auth.json`
-is a regular file in that directory, not a second mount. The probe
-removes the scratch directory after the container is reaped, including
-when the run fails. A live reap removes
-`oci/runs/<incarnation>/scratch`, including
-`rt-home/.grok/auth.json`, before the attempt is marked confirmed. It
+`scratch/rt-home` on a live attempt). That directory must not receive
+auth bytes. The probe removes the scratch directory after the container
+is reaped, including when the run fails. A live reap removes
+`oci/runs/<incarnation>/scratch` before the attempt is marked confirmed. It
 then keeps the eight newest real run directories under `oci/runs/` and
 does not follow a symlink out of that directory. A scratch path or an
 intermediate home path that is a symlink fails the reap instead of
@@ -290,39 +295,20 @@ access without changing modes:
 sudo chown -R "$USER:$USER" "$ROOTFS"
 ```
 
-Auth stays on the host. These files are used when they exist and are
-not inside the rootfs:
-
-- `$HOME/.grok/auth.json` is copied into the per-attempt home at
-  `/rt-home/.grok/auth.json` and is not bind-mounted. Grok 1.0.46
-  refreshes the OIDC login in that file (the issuer stored in the file;
-  on this host that is `auth.x.ai`) and replaces it with a temporary
-  sibling plus `auth.json.lock`. A read-only bind rejects that replace,
-  so the container would keep an expired access token even after DNS
-  works. The copy is a regular file of at most 64 KiB, opened with
-  `O_NOFOLLOW`. The host file is never opened for write, and the
-  refreshed token is never copied back. If the issuer rotates the
-  refresh token, the new token dies with the attempt scratch and
-  `grok login` on the host is required again. The copy is deleted when
-  the attempt is reaped; it is not written back to the host. Cursor's
-  files stay
-  read-only binds. This path does not read or write them differently
-  and does not inject `CURSOR_API_KEY`.
+Auth stays on the host. The gateway may read these files. The probe and
+the live plan both refuse to bind-mount them or copy them into
+`/rt-home`. Cursor still has no `CURSOR_API_KEY` injection. A missing
+required file fails `api_credential_scope`; it is not replaced with an
+invented key.
 - `$HOME/.cursor/cli-config.json`
-- Cursor's token: `$HOME/.config/cursor/auth.json` (what the Linux CLI
-  reads under `XDG_CONFIG_HOME`, set to `/rt-home/.config`) or
-  `$HOME/.cursor/auth.json` when that build stores it beside
-  `CURSOR_CONFIG_DIR`. At least one of those two files must exist.
-  `session/new` also needs the slirp path to the Cursor origin; a
-  visible token with no network still returns `Authentication required`.
-  On the Debian 13 host those files were still not enough: `cursor-agent
-  acp` returned `Authentication required` against the real home as well,
-  while `cursor-agent status` was logged in. ACP `session/new` succeeded
-  on the host only with `CURSOR_API_KEY` (desktop
-  `CURSOR_AUTH_MODE=custom`). This probe does not inject that key.
+- Cursor's token: `$HOME/.config/cursor/auth.json` or
+  `$HOME/.cursor/auth.json`. At least one of those two files must exist
+  on the host. The sandbox does not receive either file, and this probe
+  does not inject `CURSOR_API_KEY`.
 - `$HOME/.gemini/antigravity-acp/settings.json` and
   `$HOME/.gemini/antigravity-acp/acp_token.json`
-  (`acp_business_token.json` is mounted when it exists)
+  (`acp_business_token.json` stays on the host when it exists; it is not
+  mounted)
 - `$HOME/.codex/auth.json` for Codex
 
 ## Provider bindings
@@ -371,11 +357,15 @@ authentication succeeds. The probe reads ids from that response
 production `session/set_config_option` selection or endpoint compatibility. Do
 not invent an id the adapter did not report. Origins must be `https`
 with no user, path, or query.
-File-auth adapters (Grok, Cursor, Antigravity) can perform an ACP startup
-probe with mounted auth files even if that environment variable is unset.
-The existence of those files does not qualify them for product admission.
-Codex still uses the named variable as the host-side gateway
-credential. The value is never copied into the image.
+File-auth adapters (Grok, Cursor, Antigravity) keep those files on the host.
+The sandbox does not receive them. The host gateway reads the named
+environment variable when it is set, and otherwise the host file, and
+injects that secret only on the provider side of the gateway. Codex uses
+the same host-side path. The value is never copied into the image or the
+attempt home. Grok and Antigravity can be certified only when their ACP
+process completes the measured production broker path through that gateway.
+If a CLI still requires the auth file inside the sandbox, the probe fails
+the production checks instead of mounting the file.
 
 ## Probe
 
@@ -427,9 +417,8 @@ forbidden. The generic sandbox-plan builder has no HOME exception.
 
 ## Execution policy
 
-Keep the execution gate disabled while the missing product qualification
-checks or native credential boundary remain unimplemented. The probe does
-not enable it. The policy file is:
+Keep the execution gate disabled. A qualification experiment is not product
+admission, and this probe does not enable the gate. The policy file is:
 
 `$CODEG_DATA_DIR/roundtable/execution-policy.json`
 

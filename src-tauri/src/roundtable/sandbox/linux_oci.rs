@@ -646,7 +646,7 @@ pub(super) fn profile_hash(
         "rootfs":profile.rootfs,"rootfs_sha256":profile.rootfs_sha256,
         "runtime_root":profile.runtime_root,"cgroup_root":profile.cgroup_root,
         "cli_args":profile.cli_args,"socket_destinations":["/run/codeg/roundtable.sock","/run/codeg/gateway.sock"],
-        "auth_mounts":profile.auth_mounts,"container_env":profile.container_env,
+        "auth_mounts":profile.auth_mounts,"host_held_credentials":profile.host_held_credentials,"container_env":profile.container_env,
         "binaries":key.binaries,"image_digest":key.image_digest,"policy_hash":key.policy_hash,
         "syscalls":SYSCALLS,"memory":MEMORY_MAX_BYTES,"pids":PIDS_MAX,"cpu":CPU_QUOTA_US
     }))
@@ -856,51 +856,13 @@ fn apply_auth_mounts(plan: &mut SandboxPlan, profile: &QualifiedOciProfile) -> R
         .map(|(key, value)| format!("{key}={value}"))
         .collect();
     plan.oci["process"]["env"] = json!(env_list);
-    let upper = plan
-        .mounts
-        .iter()
-        .find(|item| item.destination == "/rt-home")
-        .map(|item| item.source.clone())
-        .ok_or_else(|| rt_error(ErrorCode::InvalidArgument, "home_upper"))?;
-    for mount in &profile.auth_mounts {
-        if !auth_destination_allowed(&mount.destination) || !mount.source.is_absolute() {
-            return Err(rt_error(ErrorCode::InvalidArgument, "auth_mount"));
-        }
-        let root = profile
-            .rootfs
-            .canonicalize()
-            .map_err(|_| rt_error(ErrorCode::CapabilityUnqualified, "rootfs_unreadable"))?;
-        let source = mount
-            .source
-            .canonicalize()
-            .map_err(|_| rt_error(ErrorCode::CapabilityUnqualified, "auth_mount"))?;
-        if source.starts_with(&root) || !source.is_file() {
-            return Err(rt_error(
-                ErrorCode::CapabilityUnqualified,
-                "credential_baked_into_image",
-            ));
-        }
-        // Grok refreshes `auth.json` in place. That destination is a writable
-        // copy in the attempt home. Every other file, including Cursor, stays
-        // a read-only bind and is never copied.
-        if !prepare_attempt_auth(&upper, &mount.source, &mount.destination)? {
-            continue;
-        }
-        plan.mounts.push(PlanMount {
-            source: mount.source.clone(),
-            destination: mount.destination.clone(),
-            read_only: true,
-        });
-        plan.home_mounted = false;
-        plan.oci["mounts"]
-            .as_array_mut()
-            .ok_or_else(|| rt_error(ErrorCode::InvalidArgument, "oci_mounts"))?
-            .push(json!({
-                "source": mount.source,
-                "destination": mount.destination,
-                "type": "bind",
-                "options": ["bind", "ro", "nosuid", "nodev", "noexec", "nosymfollow"]
-            }));
+    // Host-held credentials stay on the host. A listed sandbox mount is raw
+    // account material, including a writable attempt-local copy.
+    if !profile.auth_mounts.is_empty() {
+        return Err(rt_error(
+            ErrorCode::CapabilityUnqualified,
+            "credential_material_in_sandbox",
+        ));
     }
     Ok(())
 }
@@ -1032,9 +994,6 @@ pub(crate) const SLIRP_RESOLV_BODY: &[u8] = b"nameserver 10.0.2.3\n";
 pub(crate) const SLIRP_NETWORK: &str = "slirp-egress-not-origin-filtered";
 /// Grok replaces this file when it refreshes the OIDC login. Keyed by
 /// destination so the certificate schema, and therefore `plan_hash`, stays put.
-pub(crate) const GROK_AUTH_DESTINATION: &str = "/rt-home/.grok/auth.json";
-const ATTEMPT_AUTH_COPY_LIMIT: u64 = 64 * 1024;
-
 pub(crate) struct SlirpAttachment {
     pub hooks: Value,
     pub resolv_mount: Value,
@@ -1119,36 +1078,21 @@ fn apply_slirp_edits(
     Ok(())
 }
 
-/// `true` means the caller must bind `source` read-only at `destination`.
-/// Grok's auth file returns `false`: the bytes live only in the attempt home.
+/// Refuses to copy or stage credential bytes into an attempt home.
+/// Callers that still name an auth destination fail closed.
 pub(crate) fn prepare_attempt_auth(
     upper: &Path,
     source: &Path,
     destination: &str,
 ) -> RtResult<bool> {
-    let relative = destination
-        .strip_prefix("/rt-home/")
-        .filter(|relative| {
-            !relative.is_empty() && !relative.contains("..") && !relative.ends_with('/')
-        })
-        .ok_or_else(|| rt_error(ErrorCode::InvalidArgument, "auth_mount"))?;
-    let path = upper.join(relative);
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)
-            .map_err(|_| rt_error(ErrorCode::StorageUnavailable, "auth_copy"))?;
-    }
-    if destination == GROK_AUTH_DESTINATION {
-        copy_regular_nofollow(source, &path, ATTEMPT_AUTH_COPY_LIMIT)?;
-        Ok(false)
-    } else {
-        if !path.exists() {
-            fs::write(&path, b"")
-                .map_err(|_| rt_error(ErrorCode::StorageUnavailable, "auth_copy"))?;
-        }
-        Ok(true)
-    }
+    let _ = (upper, source, destination);
+    Err(rt_error(
+        ErrorCode::CapabilityUnqualified,
+        "credential_material_in_sandbox",
+    ))
 }
 
+#[cfg(test)]
 fn copy_regular_nofollow(source: &Path, dest: &Path, limit: u64) -> RtResult<()> {
     #[cfg(unix)]
     {
@@ -2284,13 +2228,7 @@ pub(super) fn verify_profile(plan: &SandboxPlan, profile: &QualifiedOciProfile) 
                     && mount.source == slirp_resolv_path(&profile.runtime_root)
                     && fs::read(&mount.source).ok().as_deref() == Some(SLIRP_RESOLV_BODY)
             }
-            destination if destination.starts_with("/rt-home/") => {
-                mount.read_only
-                    && profile
-                        .auth_mounts
-                        .iter()
-                        .any(|item| item.destination == destination && item.source == mount.source)
-            }
+            destination if destination.starts_with("/rt-home/") => false,
             _ => false,
         };
         if !allowed {
@@ -2434,25 +2372,20 @@ pub(super) fn verify_installed_profile(
             ));
         }
     }
-    for mount in &profile.auth_mounts {
+    if !profile.auth_mounts.is_empty() {
+        return Err(rt_error(
+            ErrorCode::CapabilityUnqualified,
+            "credential_material_in_sandbox",
+        ));
+    }
+    let root = profile
+        .rootfs
+        .canonicalize()
+        .map_err(|_| rt_error(ErrorCode::CapabilityUnqualified, "rootfs_unreadable"))?;
+    for mount in &profile.host_held_credentials {
         if !auth_destination_allowed(&mount.destination) || !mount.source.is_absolute() {
             return Err(rt_error(ErrorCode::CapabilityUnqualified, "auth_mount"));
         }
-        let target = profile
-            .rootfs
-            .join(mount.destination.trim_start_matches('/'));
-        let metadata = fs::symlink_metadata(&target)
-            .map_err(|_| rt_error(ErrorCode::CapabilityUnqualified, "rootfs_mount_target"))?;
-        if metadata.file_type().is_symlink() || !metadata.is_file() || metadata.len() != 0 {
-            return Err(rt_error(
-                ErrorCode::CapabilityUnqualified,
-                "credential_baked_into_image",
-            ));
-        }
-        let root = profile
-            .rootfs
-            .canonicalize()
-            .map_err(|_| rt_error(ErrorCode::CapabilityUnqualified, "rootfs_unreadable"))?;
         let source = mount
             .source
             .canonicalize()
@@ -2462,6 +2395,17 @@ pub(super) fn verify_installed_profile(
                 ErrorCode::CapabilityUnqualified,
                 "credential_baked_into_image",
             ));
+        }
+        let target = profile
+            .rootfs
+            .join(mount.destination.trim_start_matches('/'));
+        if let Ok(metadata) = fs::symlink_metadata(&target) {
+            if metadata.file_type().is_symlink() || !metadata.is_file() || metadata.len() != 0 {
+                return Err(rt_error(
+                    ErrorCode::CapabilityUnqualified,
+                    "credential_baked_into_image",
+                ));
+            }
         }
     }
     for (key, value) in &profile.container_env {

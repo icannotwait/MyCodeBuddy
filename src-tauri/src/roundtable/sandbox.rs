@@ -131,11 +131,14 @@ pub struct QualifiedOciProfile {
     pub service_socket: Option<PathBuf>,
     #[serde(default)]
     pub gateway_socket: Option<PathBuf>,
-    /// Host credential files named by the certificate. Never a home directory.
-    /// `/rt-home/.grok/auth.json` is copied into the attempt home at launch.
-    /// Every other destination is a read-only bind. The certificate fields are unchanged.
+    /// Sandbox credential mounts. A non-empty list is refused: raw account
+    /// files are not bind-mounted or copied into the model-tool sandbox.
     #[serde(default)]
     pub auth_mounts: Vec<AuthMount>,
+    /// Host paths the gateway may read. Destinations are the sandbox paths
+    /// that must stay absent. These files are never mounted or copied.
+    #[serde(default)]
+    pub host_held_credentials: Vec<AuthMount>,
     /// Fixed in-container environment. Host `HOME` and `PATH` are not copied.
     #[serde(default)]
     pub container_env: BTreeMap<String, String>,
@@ -205,14 +208,6 @@ pub(crate) fn linux_attach_slirp(
         resolv_mount: attached.resolv_mount,
         network: attached.network,
     })
-}
-
-pub(crate) fn linux_prepare_attempt_auth(
-    upper: &Path,
-    source: &Path,
-    destination: &str,
-) -> RtResult<bool> {
-    linux_oci::prepare_attempt_auth(upper, source, destination)
 }
 
 pub(crate) fn linux_stop_slirp(runtime_root: &Path, id: &str, expected: bool) -> RtResult<()> {
@@ -1041,6 +1036,7 @@ mod shared_journal_tests {
             service_socket: None,
             gateway_socket: None,
             auth_mounts: Vec::new(),
+            host_held_credentials: Vec::new(),
             container_env: BTreeMap::new(),
         };
         let db = DbIdentity::new("cleanup-retry-review").unwrap();
@@ -1288,6 +1284,7 @@ mod shared_journal_tests {
             service_socket: None,
             gateway_socket: None,
             auth_mounts: Vec::new(),
+            host_held_credentials: Vec::new(),
             container_env: BTreeMap::new(),
         };
         let base = LinuxOciIsolator::with_profile(

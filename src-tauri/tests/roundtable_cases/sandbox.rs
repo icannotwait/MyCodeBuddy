@@ -700,6 +700,7 @@ fn qualified_profile_hash_binds_execution_template_without_attempt_socket_names(
         service_socket: Some(dir.path().join("one.sock")),
         gateway_socket: None,
         auth_mounts: Vec::new(),
+        host_held_credentials: Vec::new(),
         container_env: BTreeMap::new(),
     };
     let first = codeg_lib::roundtable::qualified_oci_profile_hash(&profile, &key).unwrap();
@@ -813,6 +814,7 @@ fn qualified_default_home_scratch_reaches_the_certificate_check() {
         service_socket: Some(dir.path().join("service.sock")),
         gateway_socket: Some(dir.path().join("gateway.sock")),
         auth_mounts: vec![],
+        host_held_credentials: vec![],
         container_env: BTreeMap::new(),
     };
     // Deliberately use a stale certificate: passing path validation does not

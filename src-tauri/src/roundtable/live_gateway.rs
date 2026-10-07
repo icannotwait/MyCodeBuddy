@@ -90,6 +90,9 @@ impl LiveModelGateway {
         if matches!(scope, ExecutionScope::Fake) {
             return Err(rt_error(ErrorCode::Forbidden, "fake_scope_not_live"));
         }
+        if matches!(scope, ExecutionScope::QualificationExperiment { .. }) {
+            return Err(rt_error(ErrorCode::Forbidden, "experiment_scope_not_live"));
+        }
         super::request_accounting::enforce_profile_caps(&profile)?;
         ExecutionGate::open(&data_dir).check(&scope, &facts, now())?;
         Ok(Self {

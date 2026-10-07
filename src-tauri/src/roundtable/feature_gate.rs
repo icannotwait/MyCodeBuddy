@@ -27,6 +27,17 @@ pub enum ExecutionScope {
     Product {
         rollout_generation: u64,
     },
+    /// Probe-only authority. It admits the production broker before a
+    /// certificate exists. It is not a certificate and cannot authorize
+    /// product or qualification scope.
+    QualificationExperiment {
+        approval_id: String,
+        expires_at: MonoMs,
+        attempt_limit: u32,
+        spend_limit: u64,
+        recipient: String,
+        fixture_hash: roundtable_protocol::Hash256,
+    },
 }
 
 /// Always false. Same-variant equality is not a conversion either.
@@ -64,6 +75,10 @@ impl GatePermit {
             (
                 ExecutionScope::Qualification { .. } | ExecutionScope::Product { .. },
                 ExecutionScope::Qualification { .. } | ExecutionScope::Product { .. },
+            ) => self.scope == *scope,
+            (
+                ExecutionScope::QualificationExperiment { .. },
+                ExecutionScope::QualificationExperiment { .. },
             ) => self.scope == *scope,
             _ => false,
         }
@@ -160,6 +175,44 @@ impl ExecutionGate {
                     return Err(rt_error(
                         ErrorCode::CapabilityUnqualified,
                         "certificate_not_passed",
+                    ));
+                }
+                if now.0 >= expires_at.0 {
+                    return Err(rt_error(
+                        ErrorCode::CapabilityUnqualified,
+                        "qualification_expired",
+                    ));
+                }
+                if facts.qualification_attempts_used >= *attempt_limit {
+                    return Err(rt_error(ErrorCode::CapabilityUnqualified, "attempt_limit"));
+                }
+                if facts.qualification_spend_used > *spend_limit {
+                    return Err(rt_error(ErrorCode::CapabilityUnqualified, "spend_limit"));
+                }
+                if &facts.recipient != recipient || &facts.fixture_hash != fixture_hash {
+                    return Err(rt_error(
+                        ErrorCode::CapabilityUnqualified,
+                        "fixture_mismatch",
+                    ));
+                }
+                Ok(GatePermit {
+                    scope: scope.clone(),
+                })
+            }
+            ExecutionScope::QualificationExperiment {
+                approval_id: _,
+                expires_at,
+                attempt_limit,
+                spend_limit,
+                recipient,
+                fixture_hash,
+            } => {
+                // NotTested is required. A Passed fact must not bootstrap the
+                // product gate, and a failed certificate must not be reused.
+                if facts.certificate != QualificationStatus::NotTested {
+                    return Err(rt_error(
+                        ErrorCode::CapabilityUnqualified,
+                        "experiment_not_a_certificate",
                     ));
                 }
                 if now.0 >= expires_at.0 {

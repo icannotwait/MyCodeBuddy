@@ -331,6 +331,15 @@ pub struct ServiceProcess {
 }
 
 impl ServiceProcess {
+    #[cfg(test)]
+    pub(crate) fn for_experiment(socket_path: String, incarnation: String, token: String) -> Self {
+        Self {
+            token,
+            socket_path,
+            incarnation,
+        }
+    }
+
     pub fn reads_host_parent_pid(&self) -> bool {
         false
     }
