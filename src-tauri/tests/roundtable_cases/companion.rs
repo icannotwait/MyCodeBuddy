@@ -689,3 +689,72 @@ async fn qualification_uses_production_encoder_and_validator() {
     assert!(!closing.fake_transport_is_certificate());
     assert_eq!(harness.certificate_status(), QualificationStatus::NotTested);
 }
+
+#[tokio::test]
+async fn empty_corpus_evidence_tools_return_structured_empty() {
+    let mut empty = binding(21);
+    empty.aliases.evidence.clear();
+    empty.result_scope.aliases.evidence.clear();
+    empty.evidence.clear();
+    let registry = TokenRegistry::new();
+    let token = registry.issue(empty.clone());
+    let store = InMemoryToolStore::new();
+    for (tool, arguments) in [
+        (
+            "search_evidence",
+            json!({"file_alias":"f0","query":"alpha","limit":5}),
+        ),
+        (
+            "read_evidence",
+            json!({"file_alias":"e0","start_line":1,"end_line":20}),
+        ),
+        (
+            "search_evidence",
+            json!({"file_alias":"a0","query":"src","limit":1}),
+        ),
+    ] {
+        let scope = registry
+            .admit(token.reveal_for_same_sandbox(), &empty, tool)
+            .expect("admit");
+        let response = dispatch_tool(
+            &scope,
+            RoundtableToolCall {
+                name: tool.to_string(),
+                arguments,
+            },
+            &store,
+        )
+        .await
+        .expect("empty corpus");
+        let body: Value = serde_json::from_slice(&response.body).unwrap();
+        assert_eq!(body["empty"], true);
+        assert_eq!(body["aliases"], json!([]));
+        assert_eq!(body["hint"], "no frozen evidence; submit without citations");
+        assert!(
+            !String::from_utf8_lossy(&response.body).contains("unknown_alias"),
+            "{body}"
+        );
+    }
+
+    let populated = binding(22);
+    let registry = TokenRegistry::new();
+    let token = registry.issue(populated.clone());
+    let scope = registry
+        .admit(
+            token.reveal_for_same_sandbox(),
+            &populated,
+            "search_evidence",
+        )
+        .expect("admit");
+    let unknown = dispatch_tool(
+        &scope,
+        RoundtableToolCall {
+            name: "search_evidence".into(),
+            arguments: json!({"file_alias":"f0","query":"alpha","limit":5}),
+        },
+        &InMemoryToolStore::new(),
+    )
+    .await
+    .expect_err("invented alias");
+    assert_eq!(reason(&unknown), "unknown_alias");
+}

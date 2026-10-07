@@ -441,6 +441,9 @@ async fn read_evidence(
     arguments: &Value,
     store: &dyn ToolStore,
 ) -> RtResult<RoundtableToolResponse> {
+    if scope.aliases.evidence.is_empty() {
+        return empty_corpus_response("read_evidence", scope, arguments);
+    }
     require_keys(arguments, &["file_alias", "start_line", "end_line"])?;
     let alias = required_str(arguments, "file_alias")?;
     let start = required_u64(arguments, "start_line")?;
@@ -470,6 +473,9 @@ async fn search_evidence(
     arguments: &Value,
     store: &dyn ToolStore,
 ) -> RtResult<RoundtableToolResponse> {
+    if scope.aliases.evidence.is_empty() {
+        return empty_corpus_response("search_evidence", scope, arguments);
+    }
     require_keys(arguments, &["file_alias", "query", "limit"])?;
     let alias = required_str(arguments, "file_alias")?;
     let query = required_str(arguments, "query")?;
@@ -580,6 +586,30 @@ async fn submit_result(
         body,
         receipt,
         decision: Some(decision),
+    })
+}
+
+const EMPTY_CORPUS_HINT: &str = "no frozen evidence; submit without citations";
+
+/// A frozen corpus with zero evidence aliases has nothing to search. Return
+/// one structured empty page instead of `unknown_alias` for every guessed name.
+fn empty_corpus_response(
+    tool: &str,
+    scope: &AdmittedToolScope,
+    arguments: &Value,
+) -> RtResult<RoundtableToolResponse> {
+    let body = canonical_bytes(&EmptyCorpusBody {
+        aliases: &[],
+        empty: true,
+        hint: EMPTY_CORPUS_HINT,
+    })?;
+    let argument_bytes = canonical_bytes(arguments)?;
+    charge_exchange(scope, &argument_bytes, &body, false)?;
+    Ok(RoundtableToolResponse {
+        tool: tool.to_string(),
+        body,
+        receipt: None,
+        decision: None,
     })
 }
 
@@ -694,6 +724,13 @@ fn required_u64(arguments: &Value, key: &str) -> RtResult<u64> {
 
 fn object_key(object: &ObjectRef) -> String {
     format!("{}:{}", object.object_id, object.content_hash.to_hex())
+}
+
+#[derive(Serialize)]
+struct EmptyCorpusBody<'a> {
+    aliases: &'a [&'a str],
+    empty: bool,
+    hint: &'a str,
 }
 
 #[derive(Serialize)]

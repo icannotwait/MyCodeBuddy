@@ -255,8 +255,8 @@ async fn dispatch(
             let submit_schema =
                 roundtable_protocol::submit_result_input_schema(authority.pinned_phase_kind());
             json!({"tools":[
-                {"name":"read_evidence","description":"Read frozen evidence lines","inputSchema":{"type":"object","additionalProperties":false,"required":["file_alias","start_line","end_line"],"properties":{"file_alias":{"type":"string"},"start_line":{"type":"integer","minimum":1},"end_line":{"type":"integer","minimum":1}}}},
-                {"name":"search_evidence","description":"Search frozen evidence literally","inputSchema":{"type":"object","additionalProperties":false,"required":["file_alias","query","limit"],"properties":{"file_alias":{"type":"string"},"query":{"type":"string","maxLength":256},"limit":{"type":"integer","minimum":1,"maximum":20}}}},
+                {"name":"read_evidence","description":"Read frozen evidence lines. If no evidence aliases are frozen, returns empty=true instead of an unknown alias.","inputSchema":{"type":"object","additionalProperties":false,"required":["file_alias","start_line","end_line"],"properties":{"file_alias":{"type":"string"},"start_line":{"type":"integer","minimum":1},"end_line":{"type":"integer","minimum":1}}}},
+                {"name":"search_evidence","description":"Search frozen evidence literally. If no evidence aliases are frozen, returns empty=true instead of an unknown alias.","inputSchema":{"type":"object","additionalProperties":false,"required":["file_alias","query","limit"],"properties":{"file_alias":{"type":"string"},"query":{"type":"string","maxLength":256},"limit":{"type":"integer","minimum":1,"maximum":20}}}},
                 {"name":"submit_result","description":"Submit one phase result. result must match inputSchema for this phase. Use a new submission_id for each distinct body.","inputSchema": submit_schema}
             ]})
         }

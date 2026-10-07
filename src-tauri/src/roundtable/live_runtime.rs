@@ -1763,14 +1763,54 @@ pub(crate) fn complete_after_gateway_drain(
     Ok(watermark)
 }
 
+/// `attempt_timeout` is written on the attempt before reap. It must win over
+/// the unset-reason default `"cancelled"`, which is a permission cancel.
+#[cfg(any(test, feature = "test-utils"))]
+pub fn diagnostic_finish_reason_fixture(
+    stored: Option<&str>,
+    gateway: Option<String>,
+    recorded: Option<String>,
+) -> String {
+    diagnostic_finish_reason(stored, gateway, recorded)
+}
+
+fn diagnostic_finish_reason(
+    stored: Option<&str>,
+    gateway: Option<String>,
+    recorded: Option<String>,
+) -> String {
+    if stored == Some("attempt_timeout") {
+        return "attempt_timeout".to_string();
+    }
+    gateway
+        .or(recorded)
+        .unwrap_or_else(|| "cancelled".to_string())
+}
+
 async fn persist_diagnostic(active: &Active) -> RtResult<()> {
     let gateway_reason = active
         .gateway
         .completion_error()
         .and_then(|error| error.details.reason);
-    let reason = gateway_reason
-        .or_else(|| active.finish_reason.lock().expect("finish reason").clone())
-        .unwrap_or_else(|| "cancelled".into());
+    let stored = optional_row(
+        active.store.connection(),
+        "SELECT finish_reason FROM rt_attempts WHERE room_id=? AND attempt_id=?",
+        vec![
+            text(&active.room.to_string()),
+            text(&active.attempt.to_string()),
+        ],
+    )
+    .await?;
+    let stored_reason = stored
+        .as_ref()
+        .map(|row| column::<Option<String>>(row, 0))
+        .transpose()?
+        .flatten();
+    let reason = diagnostic_finish_reason(
+        stored_reason.as_deref(),
+        gateway_reason,
+        active.finish_reason.lock().expect("finish reason").clone(),
+    );
     persist_capture(
         &active.store,
         active.room,
@@ -2700,6 +2740,19 @@ pub async fn drive_permission_repair_frames_fixture(frames: &[Value]) -> (RtResu
 #[cfg(test)]
 mod completion_contract_tests {
     use super::*;
+
+    #[test]
+    fn attempt_timeout_is_not_recorded_as_cancelled() {
+        assert_eq!(
+            diagnostic_finish_reason(Some("attempt_timeout"), None, None),
+            "attempt_timeout"
+        );
+        assert_eq!(
+            diagnostic_finish_reason(Some("attempt_timeout"), Some("cancelled".to_string()), None),
+            "attempt_timeout"
+        );
+        assert_eq!(diagnostic_finish_reason(None, None, None), "cancelled");
+    }
 
     fn failure(severity: &str) -> Value {
         json!({"jetbrains":{"air":{"version":1,"sessionFailure":{"id":"provider","revision":1,"severity":severity}}}})

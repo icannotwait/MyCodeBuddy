@@ -479,6 +479,15 @@ Other stop reasons are not retried. A request with no usable option gets
 JSON-RPC `-32601`. Failure observations are checked again after gateway drain
 and before a staged candidate may be accepted.
 
+Proposal and critique prompts add an instruction when `context.sources[].entries`
+and `context.aliases.evidence` are both empty: do not call `search_evidence`
+or `read_evidence`; submit or abstain from the topic and `published_messages`
+only; `evidence_aliases` may be `[]`. Those tools then return
+`{"empty":true,"aliases":[],"hint":"no frozen evidence; submit without citations"}`
+instead of `unknown_alias`. An attempt killed by its `attempt_timeout` records
+`finish_reason` and diagnostic `error_class` `attempt_timeout` before the seat
+is reaped. That row is not a permission cancel.
+
 `tools/list` publishes the full `submit_result` JSON Schema for the
 attempt's phase. Proposal and critique schemas declare `kind`, `summary`,
 and `claims` of `local_key`, `text`, `evidence_aliases`, and `confidence`,

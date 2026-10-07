@@ -114,9 +114,9 @@ pub use live_gateway::{
 };
 #[cfg(any(test, feature = "test-utils"))]
 pub use live_runtime::{
-    acp_frame_fixture, drive_permission_repair_frames_fixture, drive_prompt_frames_fixture,
-    exercise_live_acp_rpc, exercise_schema_seat_rpc, permission_reply_fixture,
-    persist_runtime_diagnostic_fixture, prepared_live_cleanup_fixture,
+    acp_frame_fixture, diagnostic_finish_reason_fixture, drive_permission_repair_frames_fixture,
+    drive_prompt_frames_fixture, exercise_live_acp_rpc, exercise_schema_seat_rpc,
+    permission_reply_fixture, persist_runtime_diagnostic_fixture, prepared_live_cleanup_fixture,
     redact_untrusted_excerpt_fixture, rejected_live_executor_fixture, retire_attempt_files_fixture,
     retired_live_executor_fixture, run_dir_retention_fixture, session_params_fixture,
     verify_confirmed_option_fixture, LiveAcpRpcObservation, SchemaSeatObservation,

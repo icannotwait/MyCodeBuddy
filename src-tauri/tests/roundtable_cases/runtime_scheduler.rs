@@ -100,6 +100,23 @@ impl RoundtableTurnExecutor for ControlledExecutor {
             serde_json::from_str(prompt["metadata"]["schema"].as_str().unwrap()).unwrap();
         assert_eq!(schema["$id"], "roundtable_result_v1");
         assert!(schema["properties"].as_object().unwrap().len() >= 7);
+        let sources_empty = prompt["context"]["sources"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|source| source["entries"].as_array().unwrap().is_empty());
+        let aliases_empty = prompt["context"]["aliases"]["evidence"]
+            .as_object()
+            .unwrap()
+            .is_empty();
+        if request.phase.kind == PhaseKind::Synthesis || !sources_empty || !aliases_empty {
+            assert!(prompt["context"].get("instruction").is_none());
+        } else {
+            let instruction = prompt["context"]["instruction"].as_str().unwrap();
+            assert!(instruction.contains("Do not call search_evidence or read_evidence"));
+            assert!(instruction.contains("published_messages"));
+            assert!(instruction.contains("evidence_aliases may be []"));
+        }
 
         let result = if request.phase.kind == PhaseKind::Synthesis {
             assert!(
@@ -1458,6 +1475,134 @@ async fn lifecycle_owned_phase_deadline_publishes_quorum_then_runs_synthesis() {
     assert_eq!(
         support::scalar_text(&conn, "SELECT status FROM rt_rooms").await,
         "completed"
+    );
+}
+
+struct SlowSeatExecutor {
+    inner: ControlledExecutor,
+}
+impl TokenBound for SlowSeatExecutor {
+    fn upper_bound(&self, bytes: &[u8]) -> RtResult<u64> {
+        Ok(bytes.len() as u64)
+    }
+    fn capacity_tokens(&self) -> Option<u64> {
+        Some(2_000_000)
+    }
+}
+#[async_trait]
+impl RoundtableTurnExecutor for SlowSeatExecutor {
+    fn request_envelope_bound_bytes(&self, participant: &ParticipantV1) -> RtResult<Option<u64>> {
+        self.inner.request_envelope_bound_bytes(participant)
+    }
+    async fn capability(&self, config: &RoundtableConfigV1) -> RtResult<RuntimeCapability> {
+        self.inner.capability(config).await
+    }
+    fn token_bound(&self) -> &(dyn TokenBound + Send + Sync) {
+        self
+    }
+    async fn execute_turn(
+        &self,
+        request: RoundtableTurnRequest,
+    ) -> RtResult<RoundtableTurnOutcome> {
+        if request.participant.ordinal == 2 {
+            let prompt: Value = serde_json::from_slice(&request.prompt).unwrap();
+            let instruction = prompt["context"]["instruction"]
+                .as_str()
+                .expect("empty evidence instruction");
+            assert!(instruction.contains("Do not call search_evidence or read_evidence"));
+            assert!(instruction.contains("evidence_aliases may be []"));
+            std::future::pending().await
+        } else {
+            self.inner.execute_turn(request).await
+        }
+    }
+    async fn cancel_and_reap(&self, identity: RuntimeIdentity) -> RtResult<CleanupProof> {
+        Ok(proof(identity.incarnation))
+    }
+}
+
+#[tokio::test]
+async fn attempt_timeout_is_not_stored_as_cancelled() {
+    let (dir, conn) = support::open_pool(5).await;
+    migrate_roundtable(&conn).await.unwrap();
+    let store = open_roundtable_store(conn.clone()).await.unwrap();
+    let executor = Arc::new(SlowSeatExecutor {
+        inner: ControlledExecutor {
+            root: dir.path().into(),
+            prompts: Mutex::new(Vec::new()),
+            requests: Mutex::new(Vec::new()),
+        },
+    });
+    let runtime = Arc::new(OwnedParticipantRuntime::with_executor(
+        dir.path().into(),
+        Arc::new(ConnectionManager::new()),
+        executor,
+    ));
+    let service = RoundtableService::open(
+        ServiceConfig {
+            data_dir: dir.path().into(),
+            db_path: dir.path().join("roundtable.db"),
+            db_identity: DbIdentity::new("attempt-timeout").unwrap(),
+            discover: None,
+        },
+        store.clone(),
+        runtime.clone(),
+    )
+    .await
+    .unwrap();
+    let actor = ActorContext::from_trusted_entry(
+        "00000000-0000-4000-8000-000000000001".parse().unwrap(),
+        OperatorScope::SingleOperator,
+        ClientIdentity {
+            kind: ClientKind::Web,
+            session_ref: "attempt-timeout".into(),
+        },
+    );
+    let mut config = config();
+    config["participants"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!({"ordinal":2,"role":"slow critic","provider_ref":"provider:c"}));
+    config["timeouts"]["attempt_timeout"] = json!("300");
+    let created = service
+        .execute_fake_command(
+            &actor,
+            "roundtable_create",
+            json!({"request_id":uuid::Uuid::new_v4().to_string(),"config":config}),
+        )
+        .await
+        .unwrap();
+    let room: RoomId = created["room_id"].as_str().unwrap().parse().unwrap();
+    conn.execute_unprepared("UPDATE rt_rooms SET status='running'")
+        .await
+        .unwrap();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(15),
+        runtime.run_room(store, room, serde_json::from_value(config).unwrap()),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(
+        support::scalar_i64(
+            &conn,
+            "SELECT COUNT(*) FROM rt_attempts WHERE state='failed' AND finish_reason='attempt_timeout'"
+        )
+        .await,
+        2,
+        "the slow seat is retried once"
+    );
+    assert_eq!(
+        support::scalar_i64(
+            &conn,
+            "SELECT COUNT(*) FROM rt_attempts WHERE finish_reason='cancelled'"
+        )
+        .await,
+        0
+    );
+    assert_eq!(
+        diagnostic_finish_reason_fixture(Some("attempt_timeout"), None, None),
+        "attempt_timeout"
     );
 }
 

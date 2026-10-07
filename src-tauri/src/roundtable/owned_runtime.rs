@@ -1323,6 +1323,53 @@ fn validate_plan_context(
     Ok(())
 }
 
+enum TurnStop {
+    Finished(RtResult<RoundtableTurnOutcome>),
+    AttemptTimeout,
+    Stopped,
+}
+
+/// Shown on proposal and critique prompts when the frozen corpus has no
+/// source entries and no evidence aliases. Searching that corpus only burns
+/// the attempt timeout.
+const EMPTY_EVIDENCE_INSTRUCTION: &str = "No frozen evidence is published. Do not call search_evidence or read_evidence. Submit or abstain from the topic and published_messages only. evidence_aliases may be [].";
+
+fn frozen_evidence_is_empty(context: &Value) -> bool {
+    let sources_empty = context
+        .get("sources")
+        .and_then(Value::as_array)
+        .is_none_or(|sources| {
+            sources.iter().all(|source| {
+                source
+                    .get("entries")
+                    .and_then(Value::as_array)
+                    .is_none_or(|entries| entries.is_empty())
+            })
+        });
+    let aliases_empty = context
+        .get("aliases")
+        .and_then(|aliases| aliases.get("evidence"))
+        .and_then(Value::as_object)
+        .is_none_or(|evidence| evidence.is_empty());
+    sources_empty && aliases_empty
+}
+
+fn member_prompt_context(kind: PhaseKind, context: &Value) -> Option<Value> {
+    if !matches!(kind, PhaseKind::Proposal | PhaseKind::Critique)
+        || !frozen_evidence_is_empty(context)
+    {
+        return None;
+    }
+    let mut copy = context.clone();
+    if let Some(object) = copy.as_object_mut() {
+        object.insert(
+            "instruction".to_string(),
+            Value::String(EMPTY_EVIDENCE_INSTRUCTION.to_string()),
+        );
+    }
+    Some(copy)
+}
+
 fn result_role(participant: &ParticipantV1, kind: PhaseKind) -> RoleSnapshot {
     RoleSnapshot {
         role: participant.role.clone(),
@@ -1408,13 +1455,14 @@ async fn prepare_turn(
         capacity,
     };
     let role = result_role(participant, phase.kind);
+    let annotated = member_prompt_context(phase.kind, context);
     let prompt = DeliveryEncoder::prompt_for_speaker(
         phase,
         &role,
         &binding_id,
         &speaker.0,
         &scope,
-        context,
+        annotated.as_ref().unwrap_or(context),
     )?;
     let delivery =
         DeliveryEncoder::encode_prompt(phase, &role, &binding_id, &tokens, &profile, &prompt)?;
@@ -1536,18 +1584,26 @@ async fn run_turn(
     let deadline = request.deadline_mono;
     let remaining = deadline.saturating_sub(store.clock_sample().0);
     let completed = tokio::select! {
-        result=executor.execute_turn(request)=>Some(result),
-        _=tokio::time::sleep(std::time::Duration::from_millis(remaining))=>None,
+        result=executor.execute_turn(request)=>TurnStop::Finished(result),
+        _=tokio::time::sleep(std::time::Duration::from_millis(remaining))=>TurnStop::AttemptTimeout,
         _=async {
             loop {
                 tokio::time::sleep(std::time::Duration::from_millis(250)).await;
                 if require_running(&store,&room,fence.boot_epoch,fence.run_epoch).await.is_err() {break;}
             }
-        }=>None,
+        }=>TurnStop::Stopped,
     };
     let outcome = match completed {
-        Some(Ok(outcome)) => outcome,
-        result => {
+        TurnStop::Finished(Ok(outcome)) => outcome,
+        stop => {
+            if matches!(stop, TurnStop::AttemptTimeout) {
+                // Record this before reap. Live diagnostics otherwise default
+                // an unset finish reason to "cancelled" (a permission cancel).
+                let marked = exec(store.connection(),"UPDATE rt_attempts SET finish_reason='attempt_timeout' WHERE room_id=? AND attempt_id=?",vec![text(&room.to_string()),text(&fence.attempt_id.to_string())]).await?;
+                if marked != 1 {
+                    return Err(rt_error(ErrorCode::StorageUnavailable, "attempt_timeout"));
+                }
+            }
             let proof = executor
                 .cancel_and_reap(RuntimeIdentity {
                     incarnation: fence.incarnation,
@@ -1558,7 +1614,6 @@ async fn run_turn(
                 return Err(rt_error(ErrorCode::RuntimeUnavailable, "cleanup_unproven"));
             }
             exec(store.connection(),"UPDATE rt_attempts SET state='failed',cleanup_state='confirmed' WHERE room_id=? AND attempt_id=?",vec![text(&room.to_string()),text(&fence.attempt_id.to_string())]).await?;
-            let _ = result;
             return Ok((speaker, SlotOutcome::Failed));
         }
     };
