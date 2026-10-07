@@ -2208,7 +2208,7 @@ mod cleanup_regressions {
                 .expect("owned run id");
             assert!(id.starts_with(&format!("{prefix}-")), "{id}");
             assert!(calls.contains(&format!("kill {id} KILL")), "{calls}");
-            assert!(calls.contains(&format!("delete {id}")), "{calls}");
+            assert!(calls.contains(&format!("delete --force {id}")), "{calls}");
             let pid = fs::read_to_string(self.root.path().join("pid"))
                 .unwrap()
                 .trim()
