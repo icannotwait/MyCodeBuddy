@@ -686,6 +686,9 @@ fn render_report(
         "runtime_implementation_version": "roundtable-oci-acp-v1",
         "provider_bindings_hash": provider_hash,
         "context_profile_hash": context_hash,
+        // Leave this unmeasured. Antigravity's model body never reaches the
+        // host gateway, and the ACP prompt size is not that body. Live
+        // admission reserves a fixed wrapper for `not_tested` instead.
         "request_envelope": {"status": "not_tested", "max_bytes": null, "evidence_hash": null},
         "host_kernel_release": facts.kernel,
         "host_arch": facts.arch,

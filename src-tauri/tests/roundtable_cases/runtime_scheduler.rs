@@ -2228,10 +2228,9 @@ async fn preflight_requires_envelope_proof_and_binds_changes_to_confirmation() {
         executor.clone(),
     );
     let configuration: RoundtableConfigV1 = serde_json::from_value(config()).unwrap();
-    assert_eq!(
-        runtime.preflight(&configuration).await.unwrap_err().code,
-        ErrorCode::CapacityUnknown
-    );
+    // No measured bound (u64::MAX → None) still confirms. Admission pays the
+    // fixed unmeasured reserve instead of reporting unknown capacity.
+    runtime.preflight(&configuration).await.unwrap();
     let measured = fixture_request_envelope(&configuration.participants[0]);
     executor
         .bytes

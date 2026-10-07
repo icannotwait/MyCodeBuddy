@@ -72,8 +72,10 @@ pub trait RoundtableTurnExecutor: Send + Sync {
     fn context_profile(&self, _participant: &ParticipantV1) -> Option<QualifiedContextProfile> {
         None
     }
-    /// Byte-unit proof for the complete request envelope outside prompt text.
-    /// Missing qualification is unknown, never an assumed zero-byte envelope.
+    /// Measured bytes outside the canonical prompt, when the certificate has
+    /// a hash-verified model-body bound. `None` means that bound was not
+    /// measured. Admission then pays [`UNMEASURED_REQUEST_ENVELOPE_BYTES`]
+    /// and still refuses a plan that cannot fit it. It does not assume zero.
     fn request_envelope_bound_bytes(&self, _participant: &ParticipantV1) -> RtResult<Option<u64>> {
         Ok(None)
     }
@@ -1222,6 +1224,29 @@ fn required_future_context_bytes(config: &RoundtableConfigV1) -> RtResult<u64> {
         .ok_or_else(|| rt_error(ErrorCode::ContextTooLarge, "context_too_large"))
 }
 
+/// Wrapper bytes reserved when a certificate leaves `request_envelope`
+/// `not_tested`. This is an admission ceiling, not a measured model body.
+///
+/// Qualify cannot see Antigravity's request: that call leaves the sandbox
+/// over slirp and never hits the host gateway. Inventing `passed` from the
+/// ACP prompt size would claim a proof the report does not have. 64 KiB
+/// covers a duplicated submit-result schema plus provider metadata, and it
+/// is larger than the empty-prompt gateway fixture the scheduler tests
+/// encode. A plan that cannot pay `prompt × 2 + reserve` still fails
+/// `required_request_body_limit`. A later `passed` bound replaces it.
+pub(crate) const UNMEASURED_REQUEST_ENVELOPE_BYTES: u64 = 65_536;
+
+fn admitted_request_envelope(measured: Option<u64>, max_request_body_bytes: u64) -> RtResult<u64> {
+    match measured {
+        Some(bound) if bound > max_request_body_bytes => Err(rt_error(
+            ErrorCode::CapacityUnknown,
+            "request_envelope_unqualified",
+        )),
+        Some(bound) => Ok(bound),
+        None => Ok(UNMEASURED_REQUEST_ENVELOPE_BYTES),
+    }
+}
+
 /// Admission reserves the whole immutable history, not only the first prompt.
 /// This uses each selected adapter's qualified profile, including the moderator.
 fn validate_plan_context(
@@ -1287,18 +1312,12 @@ fn validate_plan_context(
                 .ok_or_else(|| rt_error(ErrorCode::ContextTooLarge, "context_too_large"))?;
             // ACP carries the canonical prompt as JSON text (at most a
             // twofold quotes/backslashes escape). Everything outside that
-            // text needs a separately qualified bound expressed in bytes.
-            let envelope = executor
-                .request_envelope_bound_bytes(participant)?
-                .ok_or_else(|| {
-                    rt_error(ErrorCode::CapacityUnknown, "request_envelope_unqualified")
-                })?;
-            if envelope > profile.max_request_body_bytes {
-                return Err(rt_error(
-                    ErrorCode::CapacityUnknown,
-                    "request_envelope_unqualified",
-                ));
-            }
+            // text is either a hash-verified model-body bound or the fixed
+            // unmeasured reserve. The reserve is not a certificate proof.
+            let envelope = admitted_request_envelope(
+                executor.request_envelope_bound_bytes(participant)?,
+                profile.max_request_body_bytes,
+            )?;
             let required_request = required_prompt
                 .checked_mul(2)
                 .and_then(|v| v.checked_add(envelope))
@@ -1784,5 +1803,132 @@ mod plan_context_contract_tests {
         small.quotas.input_byte_limit = SafeInt(2_048);
         small.quotas.interjection_byte_limit = SafeInt(1);
         assert_eq!(required_future_context_bytes(&small).unwrap(), 67_398);
+    }
+
+    struct AdmissionExecutor {
+        bound: Option<u64>,
+        profile: QualifiedContextProfile,
+        tokens: DefaultByteBound,
+    }
+    #[async_trait]
+    impl RoundtableTurnExecutor for AdmissionExecutor {
+        async fn capability(&self, _: &RoundtableConfigV1) -> RtResult<RuntimeCapability> {
+            Err(rt_error(ErrorCode::RuntimeUnavailable, "unused"))
+        }
+        fn token_bound(&self) -> &(dyn TokenBound + Send + Sync) {
+            &self.tokens
+        }
+        fn context_profile(&self, _: &ParticipantV1) -> Option<QualifiedContextProfile> {
+            Some(self.profile.clone())
+        }
+        fn request_envelope_bound_bytes(&self, _: &ParticipantV1) -> RtResult<Option<u64>> {
+            Ok(self.bound)
+        }
+        async fn execute_turn(&self, _: RoundtableTurnRequest) -> RtResult<RoundtableTurnOutcome> {
+            Err(rt_error(ErrorCode::RuntimeUnavailable, "unused"))
+        }
+        async fn cancel_and_reap(&self, _: RuntimeIdentity) -> RtResult<CleanupProof> {
+            Err(rt_error(ErrorCode::RuntimeUnavailable, "unused"))
+        }
+    }
+
+    fn qualify_profile() -> QualifiedContextProfile {
+        QualifiedContextProfile::proposed(
+            "utf8-byte-upper-bound-v1",
+            Hash256::sha256(b"utf8-byte-upper-bound-v1"),
+            2_000_000,
+            0,
+            "roundtable-qualify",
+        )
+    }
+
+    fn live_grok_antigravity() -> RoundtableConfigV1 {
+        serde_json::from_value(json!({
+            "schema_version": 1,
+            "topic": "Review the patch",
+            "workspace_id": "1",
+            "source_refs": [],
+            "participants": [
+                {"ordinal": 0, "role": "proposer", "provider_ref": "provider:grok", "model": "grok-4.6", "agent": "grok"},
+                {"ordinal": 1, "role": "critic", "provider_ref": "provider:antigravity", "model": "gemini-3.8-flash-high", "agent": "antigravity"}
+            ],
+            "moderator_ordinal": 0,
+            "strategy": {"type": "phased_rounds", "version": 1, "critique_rounds": 1},
+            "concurrency": 1,
+            "strict_snapshot_v1": true,
+            "budgets": {"room_budget": "1800000", "phase_budget": "450000"},
+            "timeouts": {"attempt_timeout": "225000"},
+            "quotas": {"output_byte_limit": 8192, "input_byte_limit": 16384, "interjection_byte_limit": 16384}
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn unmeasured_envelope_admits_the_live_grok_antigravity_room() {
+        let profile = qualify_profile();
+        let fixture = canonical_bytes(&json!({"model":"fixture-model-0","store":false,"max_output_tokens":8192,"input":[{"role":"user","content":[{"type":"input_text","text":""}]}],"tools":[{"type":"function","name":"submit_result","parameters":result_schema(None)}]})).unwrap().len() as u64;
+        assert!(
+            fixture < UNMEASURED_REQUEST_ENVELOPE_BYTES,
+            "the unmeasured reserve must cover the empty-prompt gateway fixture ({fixture})"
+        );
+        let capability = RuntimeCapability {
+            recipients: json!([]),
+            qualification_keys: json!([]),
+            policy_hash: Hash256::from_bytes([2; 32]),
+            profile: profile.clone(),
+        };
+        let executor = AdmissionExecutor {
+            bound: None,
+            profile,
+            tokens: DefaultByteBound,
+        };
+        validate_plan_context(&live_grok_antigravity(), &executor, &capability).unwrap();
+    }
+
+    #[test]
+    fn unmeasured_envelope_still_refuses_a_body_the_reserve_cannot_pay() {
+        let mut profile = qualify_profile();
+        profile.max_request_body_bytes = 4_096;
+        let capability = RuntimeCapability {
+            recipients: json!([]),
+            qualification_keys: json!([]),
+            policy_hash: Hash256::from_bytes([2; 32]),
+            profile: profile.clone(),
+        };
+        let executor = AdmissionExecutor {
+            bound: None,
+            profile,
+            tokens: DefaultByteBound,
+        };
+        let error =
+            validate_plan_context(&live_grok_antigravity(), &executor, &capability).unwrap_err();
+        assert_eq!(error.code, ErrorCode::ContextTooLarge);
+        assert_eq!(
+            error.details.reason.as_deref(),
+            Some("required_request_body_limit")
+        );
+    }
+
+    #[test]
+    fn measured_envelope_above_the_profile_cap_stays_unqualified() {
+        let profile = qualify_profile();
+        let capability = RuntimeCapability {
+            recipients: json!([]),
+            qualification_keys: json!([]),
+            policy_hash: Hash256::from_bytes([2; 32]),
+            profile: profile.clone(),
+        };
+        let executor = AdmissionExecutor {
+            bound: Some(profile.max_request_body_bytes + 1),
+            profile,
+            tokens: DefaultByteBound,
+        };
+        let error =
+            validate_plan_context(&live_grok_antigravity(), &executor, &capability).unwrap_err();
+        assert_eq!(error.code, ErrorCode::CapacityUnknown);
+        assert_eq!(
+            error.details.reason.as_deref(),
+            Some("request_envelope_unqualified")
+        );
     }
 }

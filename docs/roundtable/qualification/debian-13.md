@@ -56,9 +56,14 @@ passes only after the broker seals one `submit_result`. Receipt, bounded
 evidence, private ACP frames, sidebar hide, and global-body counts are read
 from that same run. A smoke `pong` is not a certificate.
 
-`request_envelope` stays `not_tested` until the host gateway records a real
-model request body. Do not fill it with the ACP prompt size. Do not edit a
-report or turn the product gate on to waive a failed or unmeasured check.
+`request_envelope` stays `not_tested` until a host gateway records a real
+model request body. Antigravity's model call leaves over slirp and is not
+visible to that gateway, so a fresh certificate does not invent a `passed`
+bound and does not fill one with the ACP prompt size. Live preflight admits
+that unmeasured certificate by reserving 65536 wrapper bytes outside the
+canonical prompt, on top of the twofold JSON escape, and still refuses the
+room when the sum exceeds the profile request-body cap. A later `passed`
+bound replaces the reserve. Do not edit a report to waive a failed check.
 
 This repository build does not run `crun`. A passing unit test of the broker
 is not a live adapter certificate. Re-run `roundtable-qualify` on the Debian
@@ -176,7 +181,8 @@ codeg-server broker on `tools/list`; the `codeg-mcp` process in the rootfs
 only proxies that socket, so a schema-only broker change does not require
 a new rootfs. A certificate is issued only when this host measures the
 production broker path and the host-held credential boundary. `request_envelope`
-stays unmeasured, and the product execution policy stays disabled.
+stays unmeasured on the certificate. Live admission reserves a fixed wrapper
+for that field instead of treating it as unknown capacity.
 Without that mount the live container keeps the empty file, so
 `auth.x.ai` and `cli-chat-proxy.grok.com` fail with
 `dns error: failed to lookup address information` until the attempt
