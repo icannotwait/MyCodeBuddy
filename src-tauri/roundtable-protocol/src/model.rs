@@ -462,6 +462,19 @@ pub struct ParticipantV1 {
         deserialize_with = "de_optional"
     )]
     pub effort: Option<String>,
+    /// ACP agent for this seat. Absent means Codex, so older rooms keep working.
+    /// `grok`, `cursor`, and `antigravity` select the other qualified adapters.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "de_optional"
+    )]
+    pub agent: Option<String>,
+}
+
+/// Agents a roundtable seat may name. Absent is Codex.
+pub fn is_roundtable_agent(agent: &str) -> bool {
+    matches!(agent, "codex" | "grok" | "cursor" | "antigravity")
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -565,6 +578,13 @@ pub fn validate_config(config: &RoundtableConfigV1, limits: &ResourceLimits) -> 
         }
         if participant.provider_ref.is_empty() {
             return Err(RtError::from_reason(InternalReason::ProviderRef));
+        }
+        if participant
+            .agent
+            .as_deref()
+            .is_some_and(|agent| !is_roundtable_agent(agent))
+        {
+            return Err(RtError::from_reason(InternalReason::UnknownAgent));
         }
     }
     if config.strategy.version != 1 {
@@ -885,6 +905,7 @@ pub enum InternalReason {
     ResyncRequired,
     SubmissionConflict,
     ResultAlreadySealed,
+    UnknownAgent,
 }
 
 impl InternalReason {
@@ -931,6 +952,7 @@ impl InternalReason {
             Self::ResyncRequired => "resync_required",
             Self::SubmissionConflict => "submission_conflict",
             Self::ResultAlreadySealed => "result_already_sealed",
+            Self::UnknownAgent => "unknown_agent",
         }
     }
 

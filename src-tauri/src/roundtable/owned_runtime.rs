@@ -9,7 +9,6 @@ use std::sync::Mutex;
 
 use async_trait::async_trait;
 use roundtable_protocol::*;
-use sea_orm::TransactionTrait;
 use serde_json::{json, Value};
 use uuid::Uuid;
 
@@ -30,7 +29,8 @@ use super::store::{
 pub struct OwnedParticipantRuntime {
     data_dir: PathBuf,
     manager: Arc<ConnectionManager>,
-    executor: Option<Arc<dyn RoundtableTurnExecutor>>,
+    executor: Option<Arc<LeasedExecutor>>,
+    permissions: Mutex<HashMap<RoomId, Arc<super::resources::ExecutionLease>>>,
     discovery: Option<Arc<dyn IsolationProvider + Send + Sync>>,
 }
 
@@ -53,6 +53,7 @@ pub struct RoundtableTurnRequest {
     pub scope: ResultScope,
     pub prompt: Vec<u8>,
     pub deadline_mono: u64,
+    pub execution_lease: Option<Arc<super::resources::ExecutionLease>>,
 }
 
 pub struct RoundtableTurnOutcome {
@@ -67,6 +68,25 @@ pub struct RoundtableTurnOutcome {
 pub trait RoundtableTurnExecutor: Send + Sync {
     async fn capability(&self, config: &RoundtableConfigV1) -> RtResult<RuntimeCapability>;
     fn token_bound(&self) -> &(dyn TokenBound + Send + Sync);
+    /// A qualified adapter may have a different context limit for each seat.
+    fn context_profile(&self, _participant: &ParticipantV1) -> Option<QualifiedContextProfile> {
+        None
+    }
+    /// Measured bytes outside the canonical prompt, when the certificate has
+    /// a hash-verified model-body bound. `None` means that bound was not
+    /// measured. Admission then pays [`UNMEASURED_REQUEST_ENVELOPE_BYTES`]
+    /// and still refuses a plan that cannot fit it. It does not assume zero.
+    fn request_envelope_bound_bytes(&self, _participant: &ParticipantV1) -> RtResult<Option<u64>> {
+        Ok(None)
+    }
+    /// Hash of the verified evidence/report. Test executors may use an explicit
+    /// fake encoder without claiming a production qualification report.
+    fn request_envelope_proof_hash(
+        &self,
+        _participant: &ParticipantV1,
+    ) -> RtResult<Option<Hash256>> {
+        Ok(None)
+    }
     async fn execute_turn(&self, request: RoundtableTurnRequest)
         -> RtResult<RoundtableTurnOutcome>;
     async fn cancel_and_reap(&self, identity: RuntimeIdentity) -> RtResult<CleanupProof>;
@@ -77,15 +97,41 @@ struct LeasedExecutor {
     allocator: super::resources::ResourceAllocator,
     leases: Mutex<HashMap<IncarnationId, super::resources::PermitBundle>>,
     proofs: Mutex<HashMap<IncarnationId, CleanupProof>>,
+    rooms: Mutex<HashMap<IncarnationId, RoomId>>,
 }
 impl LeasedExecutor {
-    fn wrap(inner: Arc<dyn RoundtableTurnExecutor>) -> Arc<dyn RoundtableTurnExecutor> {
+    fn wrap(inner: Arc<dyn RoundtableTurnExecutor>) -> Arc<Self> {
         Arc::new(Self {
             inner,
             allocator: super::resources::ResourceAllocator::new(16),
             leases: Mutex::new(HashMap::new()),
             proofs: Mutex::new(HashMap::new()),
+            rooms: Mutex::new(HashMap::new()),
         })
+    }
+    async fn cleanup_room(&self, room: RoomId) -> RtResult<()> {
+        let incarnations: Vec<_> = self
+            .rooms
+            .lock()
+            .expect("runtime rooms")
+            .iter()
+            .filter_map(|(id, owner)| (*owner == room).then_some(*id))
+            .collect();
+        // One failed proof must not prevent revoking/reaping every other owner.
+        let mut error = None;
+        for result in futures::future::join_all(incarnations.into_iter().map(|incarnation| {
+            self.cancel_and_reap(RuntimeIdentity {
+                incarnation,
+                pid: 0,
+            })
+        }))
+        .await
+        {
+            if let Err(failure) = result {
+                error = Some(failure);
+            }
+        }
+        error.map_or(Ok(()), Err)
     }
     fn release(&self, proof: &CleanupProof) -> RtResult<()> {
         if !proof.process.process_tree_empty
@@ -115,6 +161,10 @@ impl LeasedExecutor {
             }
         }
         proofs.insert(proof.process.incarnation, proof.clone());
+        self.rooms
+            .lock()
+            .expect("runtime rooms")
+            .remove(&proof.process.incarnation);
         debug_assert!(proofs.len() <= 1024);
         Ok(())
     }
@@ -127,11 +177,33 @@ impl RoundtableTurnExecutor for LeasedExecutor {
     fn token_bound(&self) -> &(dyn TokenBound + Send + Sync) {
         self.inner.token_bound()
     }
+    fn context_profile(&self, participant: &ParticipantV1) -> Option<QualifiedContextProfile> {
+        self.inner.context_profile(participant)
+    }
+    fn request_envelope_bound_bytes(&self, participant: &ParticipantV1) -> RtResult<Option<u64>> {
+        self.inner.request_envelope_bound_bytes(participant)
+    }
+    fn request_envelope_proof_hash(
+        &self,
+        participant: &ParticipantV1,
+    ) -> RtResult<Option<Hash256>> {
+        self.inner.request_envelope_proof_hash(participant)
+    }
     async fn execute_turn(
         &self,
         request: RoundtableTurnRequest,
     ) -> RtResult<RoundtableTurnOutcome> {
         let incarnation = request.fence.incarnation;
+        if request
+            .execution_lease
+            .as_ref()
+            .is_some_and(|lease| lease.admit_enqueue(request.store.clock_sample().0) == 0)
+        {
+            return Err(rt_error(
+                ErrorCode::InsufficientBudget,
+                "prepaid_lease_expired",
+            ));
+        }
         let lease = self
             .allocator
             .acquire_incarnation(request.room_id, incarnation)?;
@@ -139,6 +211,10 @@ impl RoundtableTurnExecutor for LeasedExecutor {
             .lock()
             .expect("runtime leases")
             .insert(incarnation, lease);
+        self.rooms
+            .lock()
+            .expect("runtime rooms")
+            .insert(incarnation, request.room_id);
         let result = self.inner.execute_turn(request).await;
         if let Ok(outcome) = &result {
             if outcome.cleanup.process.incarnation != incarnation {
@@ -180,6 +256,7 @@ impl OwnedParticipantRuntime {
             manager,
             executor,
             discovery,
+            permissions: Mutex::new(HashMap::new()),
         }
     }
 
@@ -194,6 +271,7 @@ impl OwnedParticipantRuntime {
             manager,
             executor: Some(LeasedExecutor::wrap(executor)),
             discovery: None,
+            permissions: Mutex::new(HashMap::new()),
         }
     }
 
@@ -217,9 +295,24 @@ impl ParticipantRuntime for OwnedParticipantRuntime {
     async fn preflight(&self, config: &RoundtableConfigV1) -> RtResult<Value> {
         let executor = self.executor.as_ref().ok_or_else(|| self.unavailable())?;
         let capability = executor.capability(config).await?;
+        validate_plan_context(config, executor.as_ref(), &capability)?;
+        let profiles: Vec<_> = config
+            .participants
+            .iter()
+            .map(|participant| {
+                Ok((
+                    participant.ordinal,
+                    executor
+                        .context_profile(participant)
+                        .unwrap_or_else(|| capability.profile.clone()),
+                    executor.request_envelope_bound_bytes(participant)?,
+                    executor.request_envelope_proof_hash(participant)?,
+                ))
+            })
+            .collect::<RtResult<Vec<_>>>()?;
         Ok(
             json!({"recipients":capability.recipients,"qualification_keys":capability.qualification_keys,
-            "policy_hash":capability.policy_hash,"limits_hash":canonical_hash(&capability.profile)?}),
+            "policy_hash":capability.policy_hash,"limits_hash":canonical_hash(&profiles)?}),
         )
     }
 
@@ -248,44 +341,185 @@ impl ParticipantRuntime for OwnedParticipantRuntime {
             vec![text(&room.to_string())],
         )
         .await?;
+        let boot_epoch = Epoch(nonnegative(column(&row, 0)?)?);
+        let run_epoch = Epoch(nonnegative(column(&row, 1)?)?);
         let mut lease = super::budget_ledger::ActiveBudgetLease::begin(
             store.clone(),
             room,
-            Epoch(nonnegative(column(&row, 0)?)?),
-            Epoch(nonnegative(column(&row, 1)?)?),
+            boot_epoch,
+            run_epoch,
         )
         .await?;
-        let stop = tokio_util::sync::CancellationToken::new();
-        let monitor_stop = stop.clone();
-        let mut monitor = BudgetMonitor(tokio::spawn(async move {
-            loop {
-                tokio::select! {
-                    _=monitor_stop.cancelled()=>{lease.finish().await?;return Ok(());},
-                    _=tokio::time::sleep(std::time::Duration::from_secs(1))=>{
-                        let ledger=lease.checkpoint().await?;
-                        if ledger.prepaid_until.0<=ledger.last_sample_mono.0 {return Err(rt_error(ErrorCode::InsufficientBudget,"budget_exhausted"));}
+        let now = store.clock_sample().0;
+        let permission = Arc::new(super::resources::ExecutionLease::issue(
+            now,
+            lease.prepaid_until().saturating_sub(now),
+        ));
+        self.permissions
+            .lock()
+            .expect("room permissions")
+            .insert(room, permission.clone());
+        let _revoke_on_drop = RevokeOnDrop(permission.clone());
+        let result = {
+            let executor: Arc<dyn RoundtableTurnExecutor> = executor.clone();
+            let run = run_room(store.clone(), room, config, executor, permission.clone());
+            // Both futures stay polled: the scheduler may own the writer
+            // transaction that a checkpoint is waiting to acquire. A crun
+            // launch can also block this task for longer than the one-second
+            // slice. That gap is sampled and charged instead of pausing the
+            // room as soon as the old deadline passes.
+            let monitor = async {
+                loop {
+                    let remaining = permission
+                        .prepaid_until()
+                        .saturating_sub(store.clock_sample().0);
+                    if remaining == 0 {
+                        match account_elapsed_slice(
+                            &mut lease,
+                            &permission,
+                            &store,
+                            &room,
+                            boot_epoch,
+                            run_epoch,
+                        )
+                        .await?
+                        {
+                            SliceRenewal::Renewed => continue,
+                            SliceRenewal::Finished => return Ok(()),
+                        }
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(remaining.min(250))).await;
+                    let remaining = permission
+                        .prepaid_until()
+                        .saturating_sub(store.clock_sample().0);
+                    if remaining == 0 {
+                        match account_elapsed_slice(
+                            &mut lease,
+                            &permission,
+                            &store,
+                            &room,
+                            boot_epoch,
+                            run_epoch,
+                        )
+                        .await?
+                        {
+                            SliceRenewal::Renewed => continue,
+                            SliceRenewal::Finished => return Ok(()),
+                        }
+                    }
+                    let checkpoint =
+                        sample_budget(&mut lease, &store, &room, boot_epoch, run_epoch);
+                    let sampled = tokio::time::timeout(
+                        std::time::Duration::from_millis(remaining),
+                        checkpoint,
+                    )
+                    .await;
+                    match sampled {
+                        Ok(Ok(Some(ledger))) => {
+                            if !grant_prepaid_slice(
+                                &permission,
+                                store.clock_sample().0,
+                                ledger.prepaid_until.0,
+                            ) {
+                                return Err(rt_error(
+                                    ErrorCode::InsufficientBudget,
+                                    "prepaid_lease_expired",
+                                ));
+                            }
+                        }
+                        Ok(Ok(None)) => {
+                            permission.revoke_local();
+                            return Ok(());
+                        }
+                        Ok(Err(error)) => return Err(error),
+                        Err(_elapsed) => {
+                            match account_elapsed_slice(
+                                &mut lease,
+                                &permission,
+                                &store,
+                                &room,
+                                boot_epoch,
+                                run_epoch,
+                            )
+                            .await?
+                            {
+                                SliceRenewal::Renewed => {}
+                                SliceRenewal::Finished => return Ok(()),
+                            }
+                        }
                     }
                 }
+            };
+            tokio::pin!(run, monitor);
+            tokio::select! {
+                result = &mut run => result,
+                result = &mut monitor => match result {
+                    // Durable completion stops renewal, but it cannot replace
+                    // the scheduler's result or hide its final storage error.
+                    Ok(()) => (&mut run).await,
+                    Err(error) => Err(error),
+                },
             }
-        }));
-        let (result, monitor_finished) = tokio::select! {
-            result=run_room(store,room,config,Arc::clone(executor))=>(result,false),
-            budget=&mut monitor.0=>(budget.map_err(|_|rt_error(ErrorCode::RuntimeUnavailable,"budget_monitor"))?,true),
-        };
-        stop.cancel();
-        if !monitor_finished {
-            (&mut monitor.0)
-                .await
-                .map_err(|_| rt_error(ErrorCode::RuntimeUnavailable, "budget_monitor"))??;
-        }
+        }; // Drop all turn futures before local cleanup, regardless of SQLite.
+        permission.revoke_local();
+        self.cleanup_local_room(room).await?;
+        lease.finish().await?;
+        self.permissions
+            .lock()
+            .expect("room permissions")
+            .remove(&room);
         result
+    }
+
+    async fn cleanup_local_room(&self, room: RoomId) -> RtResult<()> {
+        if let Some(permission) = self
+            .permissions
+            .lock()
+            .expect("room permissions")
+            .remove(&room)
+        {
+            permission.revoke_local();
+        }
+        if let Some(executor) = &self.executor {
+            executor.cleanup_room(room).await?;
+        }
+        Ok(())
+    }
+    async fn cleanup_all_local(&self) -> RtResult<()> {
+        let mut rooms: std::collections::HashSet<_> = self
+            .permissions
+            .lock()
+            .expect("room permissions")
+            .keys()
+            .copied()
+            .collect();
+        if let Some(executor) = &self.executor {
+            rooms.extend(
+                executor
+                    .rooms
+                    .lock()
+                    .expect("runtime rooms")
+                    .values()
+                    .copied(),
+            );
+        }
+        let mut error = None;
+        for result in
+            futures::future::join_all(rooms.into_iter().map(|room| self.cleanup_local_room(room)))
+                .await
+        {
+            if let Err(failure) = result {
+                error = Some(failure);
+            }
+        }
+        error.map_or(Ok(()), Err)
     }
 }
 
-struct BudgetMonitor(tokio::task::JoinHandle<RtResult<()>>);
-impl Drop for BudgetMonitor {
+struct RevokeOnDrop(Arc<super::resources::ExecutionLease>);
+impl Drop for RevokeOnDrop {
     fn drop(&mut self) {
-        self.0.abort();
+        self.0.revoke_local();
     }
 }
 
@@ -309,13 +543,81 @@ fn nonnegative(value: i64) -> RtResult<u64> {
     u64::try_from(value).map_err(|_| rt_error(ErrorCode::StorageUnavailable, "runtime_counter"))
 }
 
+enum SliceRenewal {
+    Renewed,
+    Finished,
+}
+
+/// Extend local permission from a durable sample. A sample that arrives after
+/// the old one-second slice still counts when it charges the gap and grants a
+/// fresh slice. A revoked lease does not come back.
+fn grant_prepaid_slice(
+    permission: &super::resources::ExecutionLease,
+    now_ms: u64,
+    prepaid_until: u64,
+) -> bool {
+    permission.renew_until(now_ms, prepaid_until)
+        || permission.renew_accounted(now_ms, prepaid_until)
+}
+
+async fn sample_budget(
+    lease: &mut super::budget_ledger::ActiveBudgetLease,
+    store: &RoundtableStore,
+    room: &RoomId,
+    boot_epoch: Epoch,
+    run_epoch: Epoch,
+) -> RtResult<Option<TimeLedger>> {
+    match lease.checkpoint().await {
+        Ok(ledger) => Ok(Some(ledger)),
+        Err(error) => {
+            // Publication can commit completed before the scheduler's final
+            // reads return. That ends paid execution only for this exact owner.
+            if error.code == ErrorCode::InvalidState
+                && error.details.reason.as_deref() == Some("budget_fence")
+                && completed_for_epoch(store, room, boot_epoch, run_epoch).await?
+            {
+                Ok(None)
+            } else {
+                Err(error)
+            }
+        }
+    }
+}
+
+async fn account_elapsed_slice(
+    lease: &mut super::budget_ledger::ActiveBudgetLease,
+    permission: &super::resources::ExecutionLease,
+    store: &RoundtableStore,
+    room: &RoomId,
+    boot_epoch: Epoch,
+    run_epoch: Epoch,
+) -> RtResult<SliceRenewal> {
+    match sample_budget(lease, store, room, boot_epoch, run_epoch).await? {
+        Some(ledger)
+            if grant_prepaid_slice(permission, store.clock_sample().0, ledger.prepaid_until.0) =>
+        {
+            Ok(SliceRenewal::Renewed)
+        }
+        Some(_) => Err(rt_error(
+            ErrorCode::InsufficientBudget,
+            "prepaid_lease_expired",
+        )),
+        None => {
+            permission.revoke_local();
+            Ok(SliceRenewal::Finished)
+        }
+    }
+}
+
 async fn run_room(
     store: RoundtableStore,
     room: RoomId,
     config: RoundtableConfigV1,
     executor: Arc<dyn RoundtableTurnExecutor>,
+    permission: Arc<super::resources::ExecutionLease>,
 ) -> RtResult<()> {
     let capability = executor.capability(&config).await?;
+    validate_plan_context(&config, executor.as_ref(), &capability)?;
     let room_text = room.to_string();
     let room_row = one_row(
         store.connection(),
@@ -339,16 +641,32 @@ async fn run_room(
     for row in rows(store.connection(),"SELECT speaker_id,ordinal,model_snapshot_json FROM rt_speakers WHERE room_id=? ORDER BY ordinal",vec![text(&room_text)]).await? {
         speakers.push((SpeakerOrdinal{speaker_id:parse(&column::<String>(&row,0)?)?,ordinal:u32::try_from(column::<i64>(&row,1)?).map_err(|_|rt_error(ErrorCode::StorageUnavailable,"speaker_ordinal"))?},from_json::<ParticipantV1>(&column::<String>(&row,2)?)?));
     }
-    for (_, participant) in &mut speakers {
+    for (speaker, participant) in &mut speakers {
         if participant.model.is_none() {
             participant.model = capability
                 .recipients
                 .as_array()
                 .into_iter()
                 .flatten()
-                .find(|recipient| recipient["provider_ref"] == participant.provider_ref)
+                .find(|recipient| {
+                    recipient["ordinal"] == participant.ordinal
+                        || (recipient.get("ordinal").is_none()
+                            && recipient["provider_ref"] == participant.provider_ref)
+                })
                 .and_then(|recipient| recipient["model"].as_str())
                 .map(str::to_owned);
+        }
+        if let Some(model) = &participant.model {
+            exec(
+                store.connection(),
+                "UPDATE rt_speakers SET model_id=? WHERE room_id=? AND speaker_id=?",
+                vec![
+                    text(model),
+                    text(&room_text),
+                    text(&speaker.speaker_id.to_string()),
+                ],
+            )
+            .await?;
         }
     }
     let moderator = speakers
@@ -397,7 +715,7 @@ async fn run_room(
     {
         return Err(rt_error(ErrorCode::RuntimeUnavailable, "cleanup_unproven"));
     }
-    let txn = store.connection().begin().await.map_err(storage_err)?;
+    let txn = store.write_transaction().await?;
     store.recover_frozen_in(&txn, &room_text).await?;
     txn.commit().await.map_err(storage_err)?;
     let mut published = load_history(&store, &room).await?;
@@ -485,6 +803,9 @@ async fn run_room(
             existing_fence(&store, &room, phase_id, boot_epoch, run_epoch).await?;
         // Every first launch runs once before any retry. A wave cannot exceed C.
         for retry in [false, true] {
+            if store.clock_sample().0 >= phase_deadline {
+                break;
+            }
             if retry {
                 for slot in &mut slots {
                     if matches!(slot.outcome, SlotOutcome::Failed | SlotOutcome::Invalid) {
@@ -510,9 +831,21 @@ async fn run_room(
                 moderator: moderator.0,
                 next_phase_id: fresh()?,
             })?;
+            // next_intents may propose a successor once this phase expires.
+            // The scheduler publishes this phase before scheduling a successor.
+            let intents: Vec<_> = intents
+                .into_iter()
+                .filter(|intent| intent.phase_id == phase_id)
+                .collect();
             for wave in intents.chunks(config.concurrency as usize) {
+                if store.clock_sample().0 >= phase_deadline {
+                    break;
+                }
                 let mut pending = Vec::new();
                 for intent in wave {
+                    if store.clock_sample().0 >= phase_deadline {
+                        break;
+                    }
                     let local = phase_speakers
                         .iter()
                         .position(|(speaker, _)| speaker.speaker_id == intent.speaker_id)
@@ -549,16 +882,17 @@ async fn run_room(
                         Err(error) => return Err(error),
                     }
                     slots[local].first_launch_spent = true;
-                    let request = prepare_turn(
+                    let mut request = prepare_turn(
                         &store,
                         room,
                         &config,
                         (&snapshot, &context, &aliases, &published),
                         &phase_speakers[local],
                         (boot_epoch, run_epoch, phase_deadline),
-                        (&capability, executor.token_bound()),
+                        (&capability, executor.as_ref()),
                     )
                     .await?;
+                    request.execution_lease = Some(permission.clone());
                     closing_fence = Some(request.fence.clone());
                     pending.push(run_turn(Arc::clone(&executor), request));
                 }
@@ -594,6 +928,12 @@ async fn run_room(
                 cleanup_confirmed: true,
             })
             .await?;
+        #[cfg(any(test, feature = "test-utils"))]
+        if kind == PhaseKind::Synthesis {
+            if let Some(gate) = store.take_completed_run_gate() {
+                gate.wait().await;
+            }
+        }
         published = load_history(&store, &room).await?;
     }
     Ok(())
@@ -621,6 +961,28 @@ async fn existing_fence(
         })
     })
     .transpose()
+}
+
+async fn completed_for_epoch(
+    store: &RoundtableStore,
+    room: &RoomId,
+    boot: Epoch,
+    run: Epoch,
+) -> RtResult<bool> {
+    #[cfg(any(test, feature = "test-utils"))]
+    if let Some(gate) = store.take_completion_observation_gate() {
+        gate.wait().await;
+    }
+    let row = one_row(
+        store.connection(),
+        "SELECT status,boot_epoch,run_epoch,active_control_id FROM rt_rooms WHERE room_id=?",
+        vec![text(&room.to_string())],
+    )
+    .await?;
+    Ok(column::<String>(&row, 0)? == "completed"
+        && nonnegative(column(&row, 1)?)? == boot.0
+        && nonnegative(column(&row, 2)?)? == run.0
+        && column::<Option<String>>(&row, 3)?.is_none())
 }
 
 async fn require_running(
@@ -684,6 +1046,44 @@ async fn freeze_phase(
             }
         }
     }
+    for (speaker, _) in speakers {
+        aliases
+            .speakers
+            .insert(format!("s{}", speaker.ordinal), speaker.speaker_id);
+    }
+    let mut claim_catalog = Vec::new();
+    let mut response_catalog = Vec::new();
+    for published in &history.phases {
+        for member in &published.members {
+            for claim in &member.claims {
+                let alias = aliases
+                    .claims
+                    .iter()
+                    .find(|(_, reference)| reference.claim_id == claim.claim_id)
+                    .map(|(alias, _)| alias);
+                claim_catalog.push(json!({"alias":alias,"text":claim.text,"speaker_alias":format!("s{}",member.speaker.ordinal)}));
+            }
+            for response in &member.responses {
+                let alias = aliases
+                    .responses
+                    .iter()
+                    .find(|(_, reference)| reference.response_id == response.response_id)
+                    .map(|(alias, _)| alias);
+                let detail = one_row(
+                    store.connection(),
+                    "SELECT body_json FROM rt_response_details WHERE room_id=? AND response_id=?",
+                    vec![
+                        text(&room.to_string()),
+                        text(&response.response_id.to_string()),
+                    ],
+                )
+                .await?;
+                let body: Value = from_json(&column::<String>(&detail, 0)?)?;
+                response_catalog.push(json!({"alias":alias,"speaker_alias":format!("s{}",member.speaker.ordinal),"body":body}));
+            }
+        }
+    }
+    let alias_catalog = json!({"claims":claim_catalog,"responses":response_catalog});
     let room_text = room.to_string();
     let ready=optional_row(store.connection(),"SELECT phase_id,revision FROM rt_phases WHERE room_id=? AND phase_index=? AND status='ready' ORDER BY revision DESC LIMIT 1",vec![text(&room_text),num(index as i64)]).await?;
     let phase_id = match &ready {
@@ -796,6 +1196,15 @@ async fn freeze_phase(
         );
         evidence.push(json!({"alias":alias,"evidence_id":evidence_id,"path":entry.path,"object":ObjectRefV1{object_id:entry.object.object_id.clone(),kind:ObjectKind::SourceExcerpt,content_hash:entry.object.content_hash,total_bytes:SafeInt(entry.object.total_bytes)}}));
     }
+    if canonical_bytes(&json!({"topic":config.topic,"sources":sources,"evidence":evidence}))?.len()
+        as u64
+        > config.quotas.input_byte_limit.0
+    {
+        return Err(rt_error(
+            ErrorCode::ContextTooLarge,
+            "initial_context_bytes",
+        ));
+    }
     let snapshot = PhaseSnapshotV1 {
         schema_version: 1,
         phase_id,
@@ -827,11 +1236,11 @@ async fn freeze_phase(
         policy_hash,
         output_byte_limit: config.quotas.output_byte_limit,
         tool_quota: ToolQuotaV1 {
-            per_call_bytes: SafeInt(8192),
-            per_attempt_bytes: SafeInt(32768),
+            per_call_bytes: SafeInt(EVIDENCE_REPLY_BYTES),
+            per_attempt_bytes: SafeInt(EVIDENCE_ATTEMPT_BYTES),
         },
     };
-    let txn = store.connection().begin().await.map_err(storage_err)?;
+    let txn = store.write_transaction().await?;
     let room_row = one_row(
         &txn,
         "SELECT status,active_control_id FROM rt_rooms WHERE room_id=?",
@@ -847,7 +1256,8 @@ async fn freeze_phase(
     for row in rows(&txn,"SELECT input_id,text FROM rt_user_inputs WHERE room_id=? AND state IN ('queued','applied') AND target_phase_index<=? ORDER BY accepted_seq",vec![text(&room_text),num(index as i64)]).await? {
         inputs.push(json!({"input_id":column::<String>(&row,0)?,"text":column::<String>(&row,1)?}));
     }
-    let context = json!({"topic":config.topic,"sources":sources,"published_messages":messages,"inputs":inputs,"aliases":aliases,"evidence":evidence});
+    validate_interjection_context(&json!(inputs), config.quotas.interjection_byte_limit.0)?;
+    let context = json!({"topic":config.topic,"sources":sources,"published_messages":messages,"inputs":inputs,"aliases":aliases,"alias_catalog":alias_catalog,"evidence":evidence});
     exec(&txn,"INSERT INTO rt_source_manifests(room_id,manifest_id,version,manifest_hash,body_json) VALUES(?,?,?,?,?)",vec![text(&room_text),text(&source_manifest_id.to_string()),num(version),text(&source_manifest_hash.to_hex()),text(&serialized(&manifest)?)]).await?;
     for entry in &evidence {
         let body = json!({"file_alias":entry["alias"],"workspace_snapshot_id":source_manifest_id,"manifest_hash":source_manifest_hash.to_hex(),"path":entry["path"],"owner_attempt_id":null,"staged_phase_id":phase_id,"phase_revision":phase_revision,"line_start":null,"line_end":null,"byte_start":null,"byte_end":null,"excerpt_hash":Hash256::sha256(b"").to_hex(),"excerpt":"","verified":true,"origin":"snapshot"});
@@ -867,6 +1277,230 @@ async fn freeze_phase(
     Ok((snapshot, context, aliases))
 }
 
+struct SeatTokenBound<'a> {
+    inner: &'a (dyn TokenBound + Send + Sync),
+    capacity: Option<u64>,
+}
+impl TokenBound for SeatTokenBound<'_> {
+    fn upper_bound(&self, bytes: &[u8]) -> RtResult<u64> {
+        self.inner.upper_bound(bytes)
+    }
+    fn capacity_tokens(&self) -> Option<u64> {
+        self.capacity
+    }
+    fn upper_bound_for_length(&self, len: u64) -> RtResult<u64> {
+        self.inner.upper_bound_for_length(len)
+    }
+}
+
+fn required_future_context_bytes(config: &RoundtableConfigV1) -> RtResult<u64> {
+    let results = member_result_body_bytes(
+        config.participants.len() as u32,
+        config.strategy.critique_rounds,
+        config.quotas.output_byte_limit.0,
+    )?;
+    let count = (config.participants.len() as u64)
+        .checked_mul(u64::from(config.strategy.critique_rounds) + 1)
+        .ok_or_else(|| rt_error(ErrorCode::ContextTooLarge, "context_too_large"))?;
+    // Result quotas already measure canonical JSON; history is embedded as
+    // objects. The catalog duplicates disjoint claim text/response bodies once.
+    // ASCII UUID/alias wrappers are bounded independently, without re-escaping.
+    let wrappers =
+        count.checked_mul((v1_1::MAX_CLAIMS as u64 + v1_1::MAX_RESPONSES as u64) * 192 + 1024);
+    results
+        .checked_mul(2)
+        .and_then(|v| v.checked_add(wrappers?))
+        .and_then(|v| v.checked_add(config.quotas.input_byte_limit.0.checked_mul(4)?))
+        .and_then(|v| {
+            v.checked_add(interjection_context_limit(config.quotas.interjection_byte_limit.0).ok()?)
+        })
+        .and_then(|v| v.checked_add(4096 + 512 * config.participants.len() as u64))
+        .ok_or_else(|| rt_error(ErrorCode::ContextTooLarge, "context_too_large"))
+}
+
+/// Wrapper bytes reserved when a certificate leaves `request_envelope`
+/// `not_tested`. This is an admission ceiling, not a measured model body.
+///
+/// Qualify cannot see Antigravity's request: that call leaves the sandbox
+/// over slirp and never hits the host gateway. Inventing `passed` from the
+/// ACP prompt size would claim a proof the report does not have. 64 KiB
+/// covers a duplicated submit-result schema plus provider metadata, and it
+/// is larger than the empty-prompt gateway fixture the scheduler tests
+/// encode. A plan that cannot pay `prompt × 2 + reserve` still fails
+/// `required_request_body_limit`. A later `passed` bound replaces it.
+pub(crate) const UNMEASURED_REQUEST_ENVELOPE_BYTES: u64 = 65_536;
+
+fn admitted_request_envelope(measured: Option<u64>, max_request_body_bytes: u64) -> RtResult<u64> {
+    match measured {
+        Some(bound) if bound > max_request_body_bytes => Err(rt_error(
+            ErrorCode::CapacityUnknown,
+            "request_envelope_unqualified",
+        )),
+        Some(bound) => Ok(bound),
+        None => Ok(UNMEASURED_REQUEST_ENVELOPE_BYTES),
+    }
+}
+
+/// Admission reserves the whole immutable history, not only the first prompt.
+/// This uses each selected adapter's qualified profile, including the moderator.
+fn validate_plan_context(
+    config: &RoundtableConfigV1,
+    executor: &dyn RoundtableTurnExecutor,
+    capability: &RuntimeCapability,
+) -> RtResult<()> {
+    let mut resolved = config.clone();
+    for participant in &mut resolved.participants {
+        if participant.model.is_none() {
+            participant.model = capability
+                .recipients
+                .as_array()
+                .into_iter()
+                .flatten()
+                .find(|recipient| {
+                    recipient["ordinal"] == participant.ordinal
+                        || (recipient.get("ordinal").is_none()
+                            && recipient["provider_ref"] == participant.provider_ref)
+                })
+                .and_then(|recipient| recipient["model"].as_str())
+                .map(str::to_owned);
+        }
+    }
+    let config = &resolved;
+    let required_future = required_future_context_bytes(config)?;
+    for participant in &config.participants {
+        let selected = executor.context_profile(participant);
+        let capacity = selected
+            .as_ref()
+            .map(|profile| profile.model_capacity_tokens)
+            .or_else(|| executor.token_bound().capacity_tokens());
+        let profile = selected.unwrap_or_else(|| capability.profile.clone());
+        let tokens = SeatTokenBound {
+            inner: executor.token_bound(),
+            capacity,
+        };
+        // Every member sees critique history; the moderator sees every result.
+        let phases = if participant.ordinal == config.moderator_ordinal {
+            vec![
+                PhaseKind::Proposal,
+                PhaseKind::Critique,
+                PhaseKind::Synthesis,
+            ]
+        } else {
+            vec![PhaseKind::Proposal, PhaseKind::Critique]
+        };
+        for phase in phases {
+            let role = result_role(participant, phase);
+            let input = EncodedInputBounds {
+                question: config.topic.clone(),
+                role: role.role,
+                interjection: String::new(),
+                evidence: String::new(),
+                schema: role.schema_text,
+                tools: role.tool_text,
+                embedded: serde_json::to_string(config)
+                    .map_err(|_| rt_error(ErrorCode::InvalidArgument, "config"))?,
+            };
+            let known = preflight_exact_prompt(config, &input)?.len() as u64;
+            let required_prompt = known
+                .checked_add(required_future)
+                .ok_or_else(|| rt_error(ErrorCode::ContextTooLarge, "context_too_large"))?;
+            // ACP carries the canonical prompt as JSON text (at most a
+            // twofold quotes/backslashes escape). Everything outside that
+            // text is either a hash-verified model-body bound or the fixed
+            // unmeasured reserve. The reserve is not a certificate proof.
+            let envelope = admitted_request_envelope(
+                executor.request_envelope_bound_bytes(participant)?,
+                profile.max_request_body_bytes,
+            )?;
+            let required_request = required_prompt
+                .checked_mul(2)
+                .and_then(|v| v.checked_add(envelope))
+                .ok_or_else(|| rt_error(ErrorCode::ContextTooLarge, "context_too_large"))?;
+            if required_request > profile.max_request_body_bytes {
+                return Err(rt_error(
+                    ErrorCode::ContextTooLarge,
+                    "required_request_body_limit",
+                ));
+            }
+            // Use exactly the same qualified reserve contract as the later
+            // DeliveryEncoder, with a bound on every required future prompt.
+            admit_qualified_delivery(
+                tokens.upper_bound_for_length(required_prompt)?,
+                config.quotas.output_byte_limit.0,
+                EVIDENCE_ATTEMPT_BYTES,
+                &tokens,
+                &profile,
+            )?;
+        }
+    }
+    Ok(())
+}
+
+enum TurnStop {
+    Finished(RtResult<RoundtableTurnOutcome>),
+    AttemptTimeout,
+    Stopped,
+}
+
+/// Shown on proposal and critique prompts when the frozen corpus has no
+/// source entries and no evidence aliases. Searching that corpus only burns
+/// the attempt timeout.
+const EMPTY_EVIDENCE_INSTRUCTION: &str = "No frozen evidence is published. Do not call search_evidence or read_evidence. Submit or abstain from the topic and published_messages only. evidence_aliases may be [].";
+
+fn frozen_evidence_is_empty(context: &Value) -> bool {
+    let sources_empty = context
+        .get("sources")
+        .and_then(Value::as_array)
+        .is_none_or(|sources| {
+            sources.iter().all(|source| {
+                source
+                    .get("entries")
+                    .and_then(Value::as_array)
+                    .is_none_or(|entries| entries.is_empty())
+            })
+        });
+    let aliases_empty = context
+        .get("aliases")
+        .and_then(|aliases| aliases.get("evidence"))
+        .and_then(Value::as_object)
+        .is_none_or(|evidence| evidence.is_empty());
+    sources_empty && aliases_empty
+}
+
+fn member_prompt_context(kind: PhaseKind, context: &Value) -> Option<Value> {
+    if !matches!(kind, PhaseKind::Proposal | PhaseKind::Critique)
+        || !frozen_evidence_is_empty(context)
+    {
+        return None;
+    }
+    let mut copy = context.clone();
+    if let Some(object) = copy.as_object_mut() {
+        object.insert(
+            "instruction".to_string(),
+            Value::String(EMPTY_EVIDENCE_INSTRUCTION.to_string()),
+        );
+    }
+    Some(copy)
+}
+
+fn result_role(participant: &ParticipantV1, kind: PhaseKind) -> RoleSnapshot {
+    RoleSnapshot {
+        role: participant.role.clone(),
+        model: participant
+            .model
+            .clone()
+            .unwrap_or_else(|| "default".into()),
+        effort: participant.effort.clone().unwrap_or_default(),
+        provider_ref: participant.provider_ref.clone(),
+        prompt_version: "roundtable.v1".into(),
+        template_version: "roundtable.v1".into(),
+        schema_id: super::SERVICE_RESULT_SCHEMA_ID.into(),
+        schema_text: result_schema(Some(kind)).to_string(),
+        tool_version: super::SERVICE_TOOL_VERSION.into(),
+        tool_text: super::service_tool_schema().into(),
+    }
+}
+
 async fn prepare_turn(
     store: &RoundtableStore,
     room: RoomId,
@@ -874,37 +1508,16 @@ async fn prepare_turn(
     frozen: (&PhaseSnapshotV1, &Value, &VisibleAliases, &PublishedHistory),
     speaker: &(SpeakerOrdinal, ParticipantV1),
     lease: (Epoch, Epoch, u64),
-    encoder: (&RuntimeCapability, &(dyn TokenBound + Send + Sync)),
+    encoder: (&RuntimeCapability, &dyn RoundtableTurnExecutor),
 ) -> RtResult<RoundtableTurnRequest> {
     let (phase, context, aliases, history) = frozen;
     let (boot, run, deadline) = lease;
-    let (capability, tokens) = encoder;
+    let (capability, executor) = encoder;
     require_running(store, &room, boot, run).await?;
     let binding_id: BindingId = fresh()?;
     let attempt_id: AttemptId = fresh()?;
     let incarnation: IncarnationId = fresh()?;
     let participant = &speaker.1;
-    let role=RoleSnapshot{role:participant.role.clone(),model:participant.model.clone().unwrap_or_else(||"default".into()),effort:participant.effort.clone().unwrap_or_default(),provider_ref:participant.provider_ref.clone(),prompt_version:"roundtable.v1".into(),template_version:"roundtable.v1".into(),schema_id:if phase.kind==PhaseKind::Synthesis {"moderator"} else {"member"}.into(),schema_text:if phase.kind==PhaseKind::Synthesis {"Submit a moderator result using submit_result; cite visible aliases and published support."} else {"Submit a member result using submit_result; address every mandatory target and cite visible aliases."}.into(),tool_version:super::tool_core::SERVICE_TOOL_VERSION.into(),tool_text:"read_evidence, search_evidence, submit_result".into()};
-    let delivery = DeliveryEncoder::encode_with_context(
-        phase,
-        &role,
-        &binding_id,
-        context,
-        tokens,
-        &capability.profile,
-    )?;
-    let prompt = DeliveryEncoder::prompt_with_context(phase, &role, &binding_id, context)?;
-    let fence = Fence {
-        boot_epoch: boot,
-        run_epoch: run,
-        phase_id: phase.phase_id,
-        phase_revision: phase.revision,
-        attempt_id,
-        binding_id,
-        incarnation,
-        context_hash: canonical_hash(&delivery)?,
-        policy_hash: capability.policy_hash,
-    };
     let mut mandatory_targets = Vec::new();
     for target in phase
         .mandatory_targets
@@ -943,6 +1556,39 @@ async fn prepare_turn(
         published: history.clone(),
         quota_bytes: u32::try_from(config.quotas.output_byte_limit.0)
             .map_err(|_| rt_error(ErrorCode::InvalidArgument, "output_quota"))?,
+    };
+    let selected = executor.context_profile(participant);
+    let capacity = selected
+        .as_ref()
+        .map(|profile| profile.model_capacity_tokens)
+        .or_else(|| executor.token_bound().capacity_tokens());
+    let profile = selected.unwrap_or_else(|| capability.profile.clone());
+    let tokens = SeatTokenBound {
+        inner: executor.token_bound(),
+        capacity,
+    };
+    let role = result_role(participant, phase.kind);
+    let annotated = member_prompt_context(phase.kind, context);
+    let prompt = DeliveryEncoder::prompt_for_speaker(
+        phase,
+        &role,
+        &binding_id,
+        &speaker.0,
+        &scope,
+        annotated.as_ref().unwrap_or(context),
+    )?;
+    let delivery =
+        DeliveryEncoder::encode_prompt(phase, &role, &binding_id, &tokens, &profile, &prompt)?;
+    let fence = Fence {
+        boot_epoch: boot,
+        run_epoch: run,
+        phase_id: phase.phase_id,
+        phase_revision: phase.revision,
+        attempt_id,
+        binding_id,
+        incarnation,
+        context_hash: canonical_hash(&delivery)?,
+        policy_hash: capability.policy_hash,
     };
     let room_text = room.to_string();
     let generation = super::store::query_i64(
@@ -1030,6 +1676,7 @@ async fn prepare_turn(
         phase: phase.clone(),
         scope,
         prompt,
+        execution_lease: None,
         deadline_mono: deadline.min(
             store
                 .clock_sample()
@@ -1050,18 +1697,26 @@ async fn run_turn(
     let deadline = request.deadline_mono;
     let remaining = deadline.saturating_sub(store.clock_sample().0);
     let completed = tokio::select! {
-        result=executor.execute_turn(request)=>Some(result),
-        _=tokio::time::sleep(std::time::Duration::from_millis(remaining))=>None,
+        result=executor.execute_turn(request)=>TurnStop::Finished(result),
+        _=tokio::time::sleep(std::time::Duration::from_millis(remaining))=>TurnStop::AttemptTimeout,
         _=async {
             loop {
                 tokio::time::sleep(std::time::Duration::from_millis(250)).await;
                 if require_running(&store,&room,fence.boot_epoch,fence.run_epoch).await.is_err() {break;}
             }
-        }=>None,
+        }=>TurnStop::Stopped,
     };
     let outcome = match completed {
-        Some(Ok(outcome)) => outcome,
-        result => {
+        TurnStop::Finished(Ok(outcome)) => outcome,
+        stop => {
+            if matches!(stop, TurnStop::AttemptTimeout) {
+                // Record this before reap. Live diagnostics otherwise default
+                // an unset finish reason to "cancelled" (a permission cancel).
+                let marked = exec(store.connection(),"UPDATE rt_attempts SET finish_reason='attempt_timeout' WHERE room_id=? AND attempt_id=?",vec![text(&room.to_string()),text(&fence.attempt_id.to_string())]).await?;
+                if marked != 1 {
+                    return Err(rt_error(ErrorCode::StorageUnavailable, "attempt_timeout"));
+                }
+            }
             let proof = executor
                 .cancel_and_reap(RuntimeIdentity {
                     incarnation: fence.incarnation,
@@ -1072,7 +1727,6 @@ async fn run_turn(
                 return Err(rt_error(ErrorCode::RuntimeUnavailable, "cleanup_unproven"));
             }
             exec(store.connection(),"UPDATE rt_attempts SET state='failed',cleanup_state='confirmed' WHERE room_id=? AND attempt_id=?",vec![text(&room.to_string()),text(&fence.attempt_id.to_string())]).await?;
-            let _ = result;
             return Ok((speaker, SlotOutcome::Failed));
         }
     };
@@ -1169,4 +1823,206 @@ pub(crate) async fn load_history_in(
         history.phases.push(PublishedPhase{phase_id,phase_index,kind,publication_seq,members});
     }
     Ok(history)
+}
+
+#[cfg(test)]
+mod plan_context_contract_tests {
+    use super::*;
+
+    struct DefaultByteBound;
+    impl TokenBound for DefaultByteBound {
+        fn upper_bound(&self, bytes: &[u8]) -> RtResult<u64> {
+            Ok(bytes.len() as u64)
+        }
+        fn capacity_tokens(&self) -> Option<u64> {
+            Some(2_000_000)
+        }
+    }
+
+    #[test]
+    fn unchanged_default_plan_has_an_exact_canonical_future_reserve() {
+        let config:RoundtableConfigV1=serde_json::from_value(json!({"schema_version":1,"topic":"Review the implementation","workspace_id":"fixture","source_refs":[],"participants":[{"ordinal":0,"role":"reviewer","provider_ref":"fixture","model":"fixture-model-0"},{"ordinal":1,"role":"critic","provider_ref":"fixture","model":"fixture-model-1"},{"ordinal":2,"role":"reviewer","provider_ref":"fixture","model":"fixture-model-2"}],"moderator_ordinal":0,"strategy":{"type":"phased_rounds","version":1,"critique_rounds":1},"concurrency":1,"strict_snapshot_v1":true,"budgets":{"room_budget":"1800000","phase_budget":"450000"},"timeouts":{"attempt_timeout":"225000"},"quotas":{"output_byte_limit":8192,"input_byte_limit":16384,"interjection_byte_limit":16384}})).unwrap();
+        // 98,304 result/catalog bytes + 63,744 ID wrappers + 65,536 initial
+        // source/clone bytes + 98,368 admitted input bytes + 5,632 phase bytes.
+        assert_eq!(required_future_context_bytes(&config).unwrap(), 331_584);
+        for kind in [
+            PhaseKind::Proposal,
+            PhaseKind::Critique,
+            PhaseKind::Synthesis,
+        ] {
+            let role = result_role(&config.participants[0], kind);
+            let input = EncodedInputBounds {
+                question: config.topic.clone(),
+                role: role.role,
+                interjection: String::new(),
+                evidence: String::new(),
+                schema: role.schema_text,
+                tools: role.tool_text,
+                embedded: serde_json::to_string(&config).unwrap(),
+            };
+            let known = preflight_exact_prompt(&config, &input).unwrap().len() as u64;
+            // The fixture below has an explicitly encoded envelope. This is
+            // not an assumption about a real adapter's hidden instructions.
+            let envelope=canonical_bytes(&json!({"model":"fixture-model-0","store":false,"max_output_tokens":8192,"input":[{"role":"user","content":[{"type":"input_text","text":""}]}],"tools":[{"type":"function","name":"submit_result","parameters":result_schema(None)}]})).unwrap().len() as u64;
+            let request = 2 * (known + 331_584) + envelope;
+            eprintln!(
+                "default {kind:?}: known={known}, envelope={envelope}, required_request={request}"
+            );
+            assert!(
+                request <= 1_048_576,
+                "required default request must fit the unchanged 1MiB profile"
+            );
+            let profile = QualifiedContextProfile::proposed(
+                "explicit-test-byte-bound",
+                Hash256::sha256(b"fake byte proof"),
+                2_000_000,
+                0,
+                "test-only",
+            );
+            assert_eq!(
+                admit_qualified_delivery(
+                    known + 331_584,
+                    8_192,
+                    EVIDENCE_ATTEMPT_BYTES,
+                    &DefaultByteBound,
+                    &profile
+                )
+                .unwrap(),
+                1_056_768
+            );
+        }
+        let mut small = config;
+        small.participants.truncate(2);
+        small.strategy.critique_rounds = 0;
+        small.quotas.input_byte_limit = SafeInt(2_048);
+        small.quotas.interjection_byte_limit = SafeInt(1);
+        assert_eq!(required_future_context_bytes(&small).unwrap(), 67_398);
+    }
+
+    struct AdmissionExecutor {
+        bound: Option<u64>,
+        profile: QualifiedContextProfile,
+        tokens: DefaultByteBound,
+    }
+    #[async_trait]
+    impl RoundtableTurnExecutor for AdmissionExecutor {
+        async fn capability(&self, _: &RoundtableConfigV1) -> RtResult<RuntimeCapability> {
+            Err(rt_error(ErrorCode::RuntimeUnavailable, "unused"))
+        }
+        fn token_bound(&self) -> &(dyn TokenBound + Send + Sync) {
+            &self.tokens
+        }
+        fn context_profile(&self, _: &ParticipantV1) -> Option<QualifiedContextProfile> {
+            Some(self.profile.clone())
+        }
+        fn request_envelope_bound_bytes(&self, _: &ParticipantV1) -> RtResult<Option<u64>> {
+            Ok(self.bound)
+        }
+        async fn execute_turn(&self, _: RoundtableTurnRequest) -> RtResult<RoundtableTurnOutcome> {
+            Err(rt_error(ErrorCode::RuntimeUnavailable, "unused"))
+        }
+        async fn cancel_and_reap(&self, _: RuntimeIdentity) -> RtResult<CleanupProof> {
+            Err(rt_error(ErrorCode::RuntimeUnavailable, "unused"))
+        }
+    }
+
+    fn qualify_profile() -> QualifiedContextProfile {
+        QualifiedContextProfile::proposed(
+            "utf8-byte-upper-bound-v1",
+            Hash256::sha256(b"utf8-byte-upper-bound-v1"),
+            2_000_000,
+            0,
+            "roundtable-qualify",
+        )
+    }
+
+    fn live_grok_antigravity() -> RoundtableConfigV1 {
+        serde_json::from_value(json!({
+            "schema_version": 1,
+            "topic": "Review the patch",
+            "workspace_id": "1",
+            "source_refs": [],
+            "participants": [
+                {"ordinal": 0, "role": "proposer", "provider_ref": "provider:grok", "model": "grok-4.6", "agent": "grok"},
+                {"ordinal": 1, "role": "critic", "provider_ref": "provider:antigravity", "model": "gemini-3.8-flash-high", "agent": "antigravity"}
+            ],
+            "moderator_ordinal": 0,
+            "strategy": {"type": "phased_rounds", "version": 1, "critique_rounds": 1},
+            "concurrency": 1,
+            "strict_snapshot_v1": true,
+            "budgets": {"room_budget": "1800000", "phase_budget": "450000"},
+            "timeouts": {"attempt_timeout": "225000"},
+            "quotas": {"output_byte_limit": 8192, "input_byte_limit": 16384, "interjection_byte_limit": 16384}
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn unmeasured_envelope_admits_the_live_grok_antigravity_room() {
+        let profile = qualify_profile();
+        let fixture = canonical_bytes(&json!({"model":"fixture-model-0","store":false,"max_output_tokens":8192,"input":[{"role":"user","content":[{"type":"input_text","text":""}]}],"tools":[{"type":"function","name":"submit_result","parameters":result_schema(None)}]})).unwrap().len() as u64;
+        assert!(
+            fixture < UNMEASURED_REQUEST_ENVELOPE_BYTES,
+            "the unmeasured reserve must cover the empty-prompt gateway fixture ({fixture})"
+        );
+        let capability = RuntimeCapability {
+            recipients: json!([]),
+            qualification_keys: json!([]),
+            policy_hash: Hash256::from_bytes([2; 32]),
+            profile: profile.clone(),
+        };
+        let executor = AdmissionExecutor {
+            bound: None,
+            profile,
+            tokens: DefaultByteBound,
+        };
+        validate_plan_context(&live_grok_antigravity(), &executor, &capability).unwrap();
+    }
+
+    #[test]
+    fn unmeasured_envelope_still_refuses_a_body_the_reserve_cannot_pay() {
+        let mut profile = qualify_profile();
+        profile.max_request_body_bytes = 4_096;
+        let capability = RuntimeCapability {
+            recipients: json!([]),
+            qualification_keys: json!([]),
+            policy_hash: Hash256::from_bytes([2; 32]),
+            profile: profile.clone(),
+        };
+        let executor = AdmissionExecutor {
+            bound: None,
+            profile,
+            tokens: DefaultByteBound,
+        };
+        let error =
+            validate_plan_context(&live_grok_antigravity(), &executor, &capability).unwrap_err();
+        assert_eq!(error.code, ErrorCode::ContextTooLarge);
+        assert_eq!(
+            error.details.reason.as_deref(),
+            Some("required_request_body_limit")
+        );
+    }
+
+    #[test]
+    fn measured_envelope_above_the_profile_cap_stays_unqualified() {
+        let profile = qualify_profile();
+        let capability = RuntimeCapability {
+            recipients: json!([]),
+            qualification_keys: json!([]),
+            policy_hash: Hash256::from_bytes([2; 32]),
+            profile: profile.clone(),
+        };
+        let executor = AdmissionExecutor {
+            bound: Some(profile.max_request_body_bytes + 1),
+            profile,
+            tokens: DefaultByteBound,
+        };
+        let error =
+            validate_plan_context(&live_grok_antigravity(), &executor, &capability).unwrap_err();
+        assert_eq!(error.code, ErrorCode::CapacityUnknown);
+        assert_eq!(
+            error.details.reason.as_deref(),
+            Some("request_envelope_unqualified")
+        );
+    }
 }

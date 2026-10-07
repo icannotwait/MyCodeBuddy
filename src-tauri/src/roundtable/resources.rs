@@ -224,6 +224,32 @@ impl ExecutionLease {
         self.admit(now_ms)
     }
 
+    /// Renew only to the deadline of an acknowledged durable reservation.
+    /// An unsampled slice that has already elapsed cannot be extended here.
+    pub fn renew_until(&self, now_ms: u64, prepaid_until: u64) -> bool {
+        if self.revoked() || now_ms >= self.prepaid_until() || prepaid_until <= now_ms {
+            return false;
+        }
+        let previous = self.prepaid_until();
+        self.prepaid_until
+            .compare_exchange(previous, prepaid_until, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+    }
+
+    /// Replace an elapsed slice with a checkpoint that already sampled the gap.
+    /// The room pays for that gap in the ledger. A revoked lease stays revoked,
+    /// and the new deadline cannot reach past the one-second prepaid cap.
+    pub fn renew_accounted(&self, now_ms: u64, prepaid_until: u64) -> bool {
+        if self.revoked() || prepaid_until <= now_ms {
+            return false;
+        }
+        if prepaid_until.saturating_sub(now_ms) > 1_000 {
+            return false;
+        }
+        self.prepaid_until.store(prepaid_until, Ordering::SeqCst);
+        !self.revoked()
+    }
+
     pub fn late_ack(&self, generation: u64, now_ms: u64) -> bool {
         if self.revoked() || generation != self.generation() || now_ms >= self.prepaid_until() {
             return false;
@@ -241,5 +267,23 @@ impl ExecutionLease {
         } else {
             1
         }
+    }
+}
+
+#[cfg(test)]
+mod prepaid_slice_tests {
+    use super::ExecutionLease;
+
+    #[test]
+    fn accounted_sample_replaces_an_elapsed_slice_and_keeps_the_one_second_cap() {
+        let lease = ExecutionLease::issue(0, 1_000);
+        assert!(!lease.renew_until(1_000, 2_000));
+        assert!(lease.renew_accounted(1_000, 2_000));
+        assert_eq!(lease.prepaid_until(), 2_000);
+        assert_eq!(lease.admit_enqueue(1_999), 1);
+        assert!(!ExecutionLease::issue(0, 1_000).renew_accounted(1_000, 2_001));
+        let revoked = ExecutionLease::issue(0, 1_000);
+        revoked.revoke_local();
+        assert!(!revoked.renew_accounted(1_000, 2_000));
     }
 }

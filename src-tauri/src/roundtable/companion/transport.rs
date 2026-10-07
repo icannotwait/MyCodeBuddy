@@ -119,6 +119,7 @@ impl ServiceBroker {
         authority: Arc<GateToolAuthority>,
         store: Arc<dyn ToolStore>,
     ) -> RtResult<Self> {
+        ensure_unix_socket_path(path)?;
         #[cfg(unix)]
         let listener = {
             use std::os::unix::fs::PermissionsExt;
@@ -251,11 +252,15 @@ async fn dispatch(
             json!({"protocolVersion":"2024-11-05","capabilities":{"tools":{}},"serverInfo":{"name":"codeg-roundtable","version":"1"}})
         }
         Some("ping") => json!({}),
-        Some("tools/list") => json!({"tools":[
-            {"name":"read_evidence","description":"Read frozen evidence lines","inputSchema":{"type":"object","additionalProperties":false,"required":["file_alias","start_line","end_line"],"properties":{"file_alias":{"type":"string"},"start_line":{"type":"integer","minimum":1},"end_line":{"type":"integer","minimum":1}}}},
-            {"name":"search_evidence","description":"Search frozen evidence literally","inputSchema":{"type":"object","additionalProperties":false,"required":["file_alias","query","limit"],"properties":{"file_alias":{"type":"string"},"query":{"type":"string","maxLength":256},"limit":{"type":"integer","minimum":1,"maximum":20}}}},
-            {"name":"submit_result","description":"Submit a structured roundtable result","inputSchema":{"type":"object","additionalProperties":false,"required":["submission_id","result"],"properties":{"submission_id":{"type":"string"},"result":{"type":"object"}}}}
-        ]}),
+        Some("tools/list") => {
+            let submit_schema =
+                roundtable_protocol::submit_result_input_schema(authority.pinned_phase_kind());
+            json!({"tools":[
+                {"name":"read_evidence","description":"Read frozen evidence lines. If no evidence aliases are frozen, returns empty=true instead of an unknown alias.","inputSchema":{"type":"object","additionalProperties":false,"required":["file_alias","start_line","end_line"],"properties":{"file_alias":{"type":"string"},"start_line":{"type":"integer","minimum":1},"end_line":{"type":"integer","minimum":1}}}},
+                {"name":"search_evidence","description":"Search frozen evidence literally. If no evidence aliases are frozen, returns empty=true instead of an unknown alias.","inputSchema":{"type":"object","additionalProperties":false,"required":["file_alias","query","limit"],"properties":{"file_alias":{"type":"string"},"query":{"type":"string","maxLength":256},"limit":{"type":"integer","minimum":1,"maximum":20}}}},
+                {"name":"submit_result","description":"Submit one phase result. result must match inputSchema for this phase. Use a new submission_id for each distinct body.","inputSchema": submit_schema}
+            ]})
+        }
         Some("tools/call") => {
             let params = &request["params"];
             let call = RoundtableToolCall {
@@ -284,6 +289,25 @@ fn unavailable() -> roundtable_protocol::RtError {
     rt_error(ErrorCode::RuntimeUnavailable, "broker_unavailable")
 }
 
+/// `sockaddr_un.sun_path` is 108 bytes including the trailing NUL.
+pub(crate) const UNIX_SOCKET_PATH_MAX: usize = 107;
+
+pub(crate) fn ensure_unix_socket_path(path: &str) -> RtResult<()> {
+    #[cfg(unix)]
+    if path.len() > UNIX_SOCKET_PATH_MAX {
+        return Err(rt_error(ErrorCode::InvalidArgument, "socket_path_too_long"));
+    }
+    let _ = path;
+    Ok(())
+}
+
+/// A pathname socket that stays under [`UNIX_SOCKET_PATH_MAX`] even when
+/// `--data-dir` is long. The container still sees `/run/codeg/*.sock`.
+pub(crate) fn short_socket_path(label: &str) -> std::path::PathBuf {
+    let id = &uuid::Uuid::new_v4().simple().to_string()[..12];
+    std::env::temp_dir().join(format!("cg{label}{id}.sock"))
+}
+
 async fn write<W: AsyncWrite + Unpin, T: Serialize>(stream: &mut W, value: &T) -> RtResult<()> {
     let bytes = serde_json::to_vec(value).map_err(|_| unavailable())?;
     if bytes.len() > FRAME_LIMIT {
@@ -308,4 +332,23 @@ async fn read<R: AsyncRead + Unpin, T: for<'de> Deserialize<'de>>(stream: &mut R
         .await
         .map_err(|_| unavailable())?;
     serde_json::from_slice(&bytes).map_err(|_| rt_error(ErrorCode::InvalidArgument, "invalid_json"))
+}
+
+#[cfg(test)]
+mod socket_path_tests {
+    use super::{ensure_unix_socket_path, short_socket_path, UNIX_SOCKET_PATH_MAX};
+
+    #[test]
+    fn overlong_pathname_is_an_explicit_error_and_short_paths_fit() {
+        let path = short_socket_path("a");
+        let text = path.to_string_lossy();
+        assert!(text.len() <= UNIX_SOCKET_PATH_MAX, "{text}");
+        ensure_unix_socket_path(&text).unwrap();
+        let long = "x".repeat(UNIX_SOCKET_PATH_MAX + 1);
+        let error = ensure_unix_socket_path(&long).unwrap_err();
+        assert_eq!(
+            error.details.reason.as_deref(),
+            Some("socket_path_too_long")
+        );
+    }
 }

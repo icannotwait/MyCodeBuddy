@@ -20,6 +20,7 @@ mod e2e;
 mod events;
 mod feature_gate;
 mod gateway;
+mod host_model_auth;
 pub(crate) mod ingress;
 mod installed_runtime;
 mod live_gateway;
@@ -32,7 +33,11 @@ mod ownership;
 mod paging;
 mod product;
 mod qualification;
+mod qualification_experiment;
 mod qualification_harness;
+mod qualification_linux;
+mod qualification_probe;
+mod qualification_profiles;
 mod recovery;
 mod registry;
 mod relay;
@@ -103,15 +108,20 @@ pub use ingress::{
 };
 #[cfg(any(test, feature = "test-utils"))]
 pub use installed_runtime::verify_runtime_contract_fixture;
+pub use installed_runtime::ProviderBinding;
 #[cfg(any(test, feature = "test-utils"))]
 pub use live_gateway::{
-    exercise_gateway_shutdown_fixture, exercise_live_gateway_fixture,
-    exercise_queued_gateway_fixture, GatewayFixtureObservation,
+    exercise_gateway_http_failure_fixture, exercise_gateway_shutdown_fixture,
+    exercise_live_gateway_fixture, exercise_queued_gateway_fixture, GatewayFixtureObservation,
 };
 #[cfg(any(test, feature = "test-utils"))]
 pub use live_runtime::{
-    persist_runtime_diagnostic_fixture, rejected_live_executor_fixture,
-    retired_live_executor_fixture, verify_confirmed_option_fixture,
+    acp_frame_fixture, diagnostic_finish_reason_fixture, drive_permission_repair_frames_fixture,
+    drive_prompt_frames_fixture, exercise_live_acp_rpc, exercise_schema_seat_rpc,
+    permission_reply_fixture, persist_runtime_diagnostic_fixture, prepared_live_cleanup_fixture,
+    redact_untrusted_excerpt_fixture, rejected_live_executor_fixture, retire_attempt_files_fixture,
+    retired_live_executor_fixture, run_dir_retention_fixture, session_params_fixture,
+    verify_confirmed_option_fixture, LiveAcpRpcObservation, SchemaSeatObservation,
 };
 pub use maintenance::{
     backup_roundtable, gc_unreferenced, restore_roundtable, BackupManifest, GcReport,
@@ -137,6 +147,19 @@ pub use qualification::{
     QualificationReport,
 };
 pub use qualification_harness::QualificationHarness;
+#[cfg(any(test, feature = "test-utils"))]
+pub use qualification_linux::{
+    advertised_probe_models, isolation_probe_script, probe_acp_exit_cleans_container,
+    probe_model_binding_error, probe_reap_classification, probe_recorded_crun_version,
+    probe_scratch_home, remove_probe_scratch_home,
+};
+#[cfg(any(test, feature = "test-utils"))]
+pub use qualification_probe::{assemble_probe_report_for_test, verify_installed_report_for_test};
+pub use qualification_probe::{
+    qualify_adapter_on_host, roundtable_qualify_requested, run_roundtable_qualify, ProbeCheck,
+    ProbeFacts, ProbeOutcome, ProbeRequest,
+};
+pub use qualification_profiles::{adapter_profiles, os_accepted, profile_by_id, profile_for_agent};
 pub use recovery::{recover_service, RecoveryReport};
 #[cfg(any(test, feature = "test-utils"))]
 pub use recovery::{recovery_action, RecoveryAction, RecoveryState};
@@ -163,10 +186,15 @@ pub use runtime::{
 };
 pub use sandbox::{
     attempt_live_escapes, build_qualified_sandbox_plan, build_sandbox_plan,
-    qualified_oci_profile_hash, qualified_rootfs_digest, verify_qualified_oci_profile, DbIdentity,
-    EscapeReport, IsolationProvider, JournalLaunchIntentStore, LaunchIntent, LaunchIntentStore,
-    LinuxOciIsolator, PreparedSandbox, QualifiedOciProfile, SandboxInput, SandboxInstance,
-    SandboxPlan,
+    qualified_oci_profile_hash, qualified_rootfs_digest, qualified_rootfs_digest_detail,
+    verify_qualified_oci_profile, DbIdentity, EscapeReport, IsolationProvider,
+    JournalLaunchIntentStore, LaunchIntent, LaunchIntentStore, LinuxOciIsolator, PreparedSandbox,
+    QualifiedOciProfile, SandboxInput, SandboxInstance, SandboxPlan,
+};
+#[cfg(any(test, feature = "test-utils"))]
+pub use sandbox::{
+    cgroup_delegation_failure, live_slirp_document, slirp_hook_phase, slirp_hook_script,
+    stage_attempt_auth, syscall_allowlist,
 };
 pub use schema::{
     apply_roundtable_schema, drop_roundtable_schema, roundtable_table_names, DurabilityProfile,

@@ -651,6 +651,41 @@ fn qualified_rootfs_digest_detects_frozen_file_changes() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn qualified_rootfs_digest_hashes_symlink_text_and_special_files() {
+    let dir = tempdir().unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::os::unix::fs::symlink("/usr/bin/mawk", dir.path().join("awk-link")).unwrap();
+    std::os::unix::fs::symlink("missing-target", dir.path().join("dangling")).unwrap();
+    let fifo = dir.path().join("pipe");
+    assert!(std::process::Command::new("mkfifo")
+        .arg(&fifo)
+        .status()
+        .expect("mkfifo")
+        .success());
+    let first = codeg_lib::roundtable::qualified_rootfs_digest_detail(dir.path()).expect("digest");
+    std::fs::remove_file(dir.path().join("awk-link")).unwrap();
+    std::os::unix::fs::symlink("/usr/bin/gawk", dir.path().join("awk-link")).unwrap();
+    let changed =
+        codeg_lib::roundtable::qualified_rootfs_digest_detail(dir.path()).expect("digest");
+    assert_ne!(first, changed);
+    let status = fs::read_to_string("/proc/self/status").unwrap_or_default();
+    let root = status
+        .lines()
+        .any(|line| line.starts_with("Uid:") && line.split_whitespace().nth(1) == Some("0"));
+    if !root {
+        let hidden = dir.path().join("root-only");
+        fs::write(&hidden, b"shadow").unwrap();
+        fs::set_permissions(&hidden, fs::Permissions::from_mode(0o000)).unwrap();
+        let error = codeg_lib::roundtable::qualified_rootfs_digest_detail(dir.path())
+            .expect_err("unreadable file");
+        assert!(error.contains("root-only"), "{error}");
+        assert!(error.contains("chown"), "{error}");
+        let _ = fs::set_permissions(&hidden, fs::Permissions::from_mode(0o644));
+    }
+}
+
 #[test]
 fn qualified_profile_hash_binds_execution_template_without_attempt_socket_names() {
     let dir = tempdir().unwrap();
@@ -664,6 +699,9 @@ fn qualified_profile_hash_binds_execution_template_without_attempt_socket_names(
         cli_args: vec!["--acp".into()],
         service_socket: Some(dir.path().join("one.sock")),
         gateway_socket: None,
+        auth_mounts: Vec::new(),
+        host_held_credentials: Vec::new(),
+        container_env: BTreeMap::new(),
     };
     let first = codeg_lib::roundtable::qualified_oci_profile_hash(&profile, &key).unwrap();
     let mut next = profile.clone();
@@ -745,4 +783,60 @@ fn sandbox_scratch_cannot_use_a_symlink_to_a_forbidden_directory() {
     std::os::unix::fs::symlink(&input.project, &alias).unwrap();
     input.scratch = alias;
     assert!(build_sandbox_plan(&input).is_err());
+}
+
+#[test]
+fn qualified_default_home_scratch_reaches_the_certificate_check() {
+    let dir = tempdir().unwrap();
+    let mut input = scratch_review_input(dir.path());
+    let runtime_root = input.home.join(".codeg/roundtable/oci");
+    input.scratch = runtime_root
+        .join("runs")
+        .join(input.incarnation.to_string())
+        .join("scratch");
+    fs::create_dir_all(&input.scratch).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(
+            input.scratch.parent().unwrap(),
+            fs::Permissions::from_mode(0o700),
+        )
+        .unwrap();
+    }
+    let profile = codeg_lib::roundtable::QualifiedOciProfile {
+        runtime: input.certificate.binaries[0].clone(),
+        rootfs: dir.path().join("rootfs"),
+        rootfs_sha256: digest(2),
+        runtime_root,
+        cgroup_root: dir.path().join("unqualified-cgroup"),
+        cli_args: vec![],
+        service_socket: Some(dir.path().join("service.sock")),
+        gateway_socket: Some(dir.path().join("gateway.sock")),
+        auth_mounts: vec![],
+        host_held_credentials: vec![],
+        container_env: BTreeMap::new(),
+    };
+    // Deliberately use a stale certificate: passing path validation does not
+    // authorize any runtime, socket, auth-file, or cgroup operation.
+    let error = codeg_lib::roundtable::build_qualified_sandbox_plan(&input, &profile).unwrap_err();
+    assert_eq!(
+        error.details.reason.as_deref(),
+        Some("qualification_plan_drift")
+    );
+    for rejected in [
+        input.home.clone(),
+        profile.runtime_root.clone(),
+        input.scratch.parent().unwrap().to_path_buf(),
+        input.home.join(".ssh"),
+    ] {
+        fs::create_dir_all(&rejected).unwrap();
+        input.scratch = rejected;
+        let error =
+            codeg_lib::roundtable::build_qualified_sandbox_plan(&input, &profile).unwrap_err();
+        assert!(matches!(
+            error.details.reason.as_deref(),
+            Some("scratch_is_host_path" | "scratch_not_owned")
+        ));
+    }
 }

@@ -7,6 +7,9 @@ import { pathToFileURL } from "node:url"
 // Disposable P00 gate. Not imported by the product. It records whether a
 // real probe is allowed, and it never installs crun, starts a container,
 // reads credentials, or sends a model or network request.
+// qualification_issued stays false here. The product probe is:
+//   codeg-server roundtable-qualify
+// See docs/roundtable/qualification/debian-13.md.
 
 const REQUIRED_IDS = [
   "rootless_crun_create_list_reap",

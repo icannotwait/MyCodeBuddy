@@ -164,4 +164,10 @@ impl LockGate {
 pub struct AcceptFaults {
     pub fail_step: Option<AcceptStep>,
     pub lock_gate: Option<Arc<LockGate>>,
+    #[cfg(any(test, feature = "test-utils"))]
+    pub writer_gate: Option<Arc<LockGate>>,
+    #[cfg(any(test, feature = "test-utils"))]
+    pub completed_run_gate: Option<Arc<LockGate>>,
+    #[cfg(any(test, feature = "test-utils"))]
+    pub completion_observation_gate: Option<Arc<LockGate>>,
 }

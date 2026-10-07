@@ -16,8 +16,8 @@ use roundtable_protocol::{
     canonical_bytes, charge_interjection, parse_strict_json, profile_suggestions, submit_candidate,
     v1_1, validate_result, AttemptId, CandidateReceipt, DecisionKind, ErrorCode, ErrorDetails,
     Fence, FieldError as WireFieldError, FinishKind, HandlerId, Hash256, InternalReason,
-    LimitsOrigin, MonoMs, ParseLimits, ResultScope, RoomId, RtError, RtResult, SubmissionId,
-    SubmissionState,
+    LimitsOrigin, MonoMs, ParseLimits, PhaseKind, ResultScope, RoomId, RtError, RtResult,
+    SubmissionId, SubmissionState,
 };
 use sea_orm::{
     ConnectionTrait, DatabaseBackend, DatabaseTransaction, DbErr, QueryResult, Statement,
@@ -162,6 +162,7 @@ pub struct GateToolAuthority {
     facts: AdmissionFacts,
     pinned: TokenBinding,
     expires_at: MonoMs,
+    execution_lease: Option<Arc<super::resources::ExecutionLease>>,
     now: Mutex<MonoMs>,
     clock: Option<Arc<dyn super::clock::MonoClock>>,
     control: Mutex<TokenBinding>,
@@ -188,6 +189,7 @@ impl GateToolAuthority {
             facts,
             pinned: pinned.clone(),
             expires_at,
+            execution_lease: None,
             now: Mutex::new(now),
             clock: None,
             control: Mutex::new(pinned),
@@ -209,9 +211,23 @@ impl GateToolAuthority {
         ExecutionGate::open(&self.data_dir).enabled()
     }
 
+    /// Phase pinned when this authority was opened. `tools/list` publishes
+    /// that phase's result schema.
+    pub fn pinned_phase_kind(&self) -> PhaseKind {
+        self.pinned.result_scope.phase_kind
+    }
+
     /// Production authorities sample the host clock on every admission.
     pub fn with_clock(mut self, clock: Arc<dyn super::clock::MonoClock>) -> Self {
         self.clock = Some(clock);
+        self
+    }
+
+    pub fn with_execution_lease(
+        mut self,
+        lease: Option<Arc<super::resources::ExecutionLease>>,
+    ) -> Self {
+        self.execution_lease = lease;
         self
     }
 
@@ -331,6 +347,16 @@ impl GateToolAuthority {
             .get(secret)
             .cloned()
             .ok_or_else(|| rt_error(ErrorCode::Unauthenticated, "token_unknown"))?;
+        if self
+            .execution_lease
+            .as_ref()
+            .is_some_and(|lease| lease.admit_tool(now.0) == 0)
+        {
+            return Err(rt_error(
+                ErrorCode::Unauthenticated,
+                "prepaid_lease_expired",
+            ));
+        }
         if now.0 >= issued.expires_at.0 {
             return Err(rt_error(ErrorCode::Unauthenticated, "token_expired"));
         }
@@ -1132,8 +1158,13 @@ fn canonical_submission(raw: &[u8]) -> RtResult<Vec<u8>> {
         max_bytes: v1_1::MAX_RESULT_BYTES as usize,
         max_depth: profile_suggestions::MAX_JSON_DEPTH,
     };
-    let value = parse_strict_json(raw, &limits)
-        .map_err(|_| rt_error(ErrorCode::InvalidState, "validator_disagreement"))?;
+    let value = parse_strict_json(raw, &limits).map_err(|_| {
+        tracing::warn!(
+            excerpt = %super::diagnostics::redact_untrusted_excerpt(raw),
+            "rejected submit_result payload"
+        );
+        rt_error(ErrorCode::InvalidState, "validator_disagreement")
+    })?;
     canonical_bytes(&value).map_err(|_| rt_error(ErrorCode::InvalidState, "validator_disagreement"))
 }
 

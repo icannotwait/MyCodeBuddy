@@ -46,6 +46,10 @@ fn main() -> ExitCode {
     // credential protocol on stdin and exit. Mirrors the desktop binary's
     // early-exit in `main.rs` so server deployments don't accidentally try
     // to start a second server instance per `git credential` invocation.
+    if codeg_lib::roundtable::roundtable_qualify_requested(&args) {
+        return codeg_lib::roundtable::run_roundtable_qualify();
+    }
+
     if args.iter().any(|a| a == "--credential-helper") {
         // Subprocess mode, before init_server(): stderr-only subscriber so
         // helper diagnostics aren't dropped, while stdout stays the git

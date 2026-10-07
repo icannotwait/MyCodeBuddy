@@ -38,6 +38,10 @@ pub struct PreflightRequest {
 pub struct CreateRequest {
     pub request_id: RequestId,
     pub config: RoundtableConfigV1,
+    /// Explicit workspace-relative files to freeze locally before confirmation.
+    /// Omitted/empty means a topic-only room; never traverse the whole workspace.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub selected_source_paths: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -152,6 +156,13 @@ pub struct ResumeRequest {
     )]
     pub concurrency: Option<u32>,
     pub recovery_consent: bool,
+    /// Bind each paid restart to the recipients and evidence just disclosed.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "de_optional"
+    )]
+    pub confirmed_preflight_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -179,6 +190,13 @@ pub struct InterjectRequest {
     pub expected_revision: Revision,
     pub text: String,
     pub mode: InterjectMode,
+    /// Bind each paid restart to the recipients and evidence just disclosed.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "de_optional"
+    )]
+    pub confirmed_preflight_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -187,6 +205,13 @@ pub struct RetrySynthesisRequest {
     pub room_id: RoomId,
     pub request_id: RequestId,
     pub expected_revision: Revision,
+    /// Bind each paid restart to the recipients and evidence just disclosed.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "de_optional"
+    )]
+    pub confirmed_preflight_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

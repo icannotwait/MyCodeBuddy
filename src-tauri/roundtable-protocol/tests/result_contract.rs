@@ -21,7 +21,7 @@ use roundtable_protocol::{
     PublicationStatus, PublishedClaim, PublishedHistory, PublishedMember, PublishedPhase,
     PublishedResponse, RequiredTarget, ResponseId, ResponseRef, ResultScope, Seq, SpeakerId,
     SpeakerOrdinal, Stance, SubmissionId, ValidatedResult, VisibleAliases,
-    MAX_REPAIRABLE_INVALID_SUBMISSIONS,
+    MAX_REPAIRABLE_INVALID_SUBMISSIONS, MAX_REPAIRABLE_SHAPE_SUBMISSIONS,
 };
 
 #[test]
@@ -38,38 +38,43 @@ fn submission_seals_once() {
         "claims": []
     }))
     .unwrap();
+    assert_eq!(
+        MAX_REPAIRABLE_SHAPE_SUBMISSIONS, 8,
+        "shape mistakes stay bounded"
+    );
     let mut state = roundtable_protocol::SubmissionState::open();
-    let mut third_invalid = None;
-    for index in 1..=3 {
+    let mut eighth_invalid = None;
+    for index in 1..=8 {
         let decision = submit(&state, &format!("bad-{index}"), &bad, &scope);
         assert!(
             matches!(decision.outcome, DecisionKind::FieldErrors(ref errors) if !errors.is_empty()),
             "invalid {index} returns field errors"
         );
-        assert!(!decision.closes_attempt);
+        assert!(!decision.closes_attempt, "shape {index} stays open");
         assert!(!decision.next_state.closed);
-        if index == 3 {
-            third_invalid = Some(decision);
+        if index == 8 {
+            eighth_invalid = Some(decision);
         } else {
             state = decision.next_state;
         }
     }
-    let third_invalid = third_invalid.expect("third invalid");
-    let fourth_invalid = submit(&third_invalid.next_state, "bad-4", &bad, &scope);
-    assert_eq!(third_invalid.next_state.invalid_count, 3);
-    assert!(!third_invalid.closes_attempt);
-    assert!(fourth_invalid.closes_attempt);
-    assert!(fourth_invalid.next_state.closed);
-    assert_eq!(fourth_invalid.next_state.invalid_count, 4);
+    let eighth_invalid = eighth_invalid.expect("eighth invalid");
+    let ninth_invalid = submit(&eighth_invalid.next_state, "bad-9", &bad, &scope);
+    assert_eq!(eighth_invalid.next_state.shape_invalid_count, 8);
+    assert_eq!(eighth_invalid.next_state.invalid_count, 0);
+    assert!(!eighth_invalid.closes_attempt);
+    assert!(ninth_invalid.closes_attempt);
+    assert!(ninth_invalid.next_state.closed);
+    assert_eq!(ninth_invalid.next_state.shape_invalid_count, 9);
     assert!(matches!(
-        fourth_invalid.outcome,
+        ninth_invalid.outcome,
         DecisionKind::FieldErrors(_)
     ));
-    let replay = submit(&third_invalid.next_state, "bad-1", &bad, &scope);
-    assert_eq!(replay.next_state.invalid_count, 3);
+    let replay = submit(&eighth_invalid.next_state, "bad-1", &bad, &scope);
+    assert_eq!(replay.next_state.shape_invalid_count, 8);
     assert!(!replay.closes_attempt);
     let conflict = submit(
-        &third_invalid.next_state,
+        &eighth_invalid.next_state,
         "bad-1",
         &canonical_bytes(&json!({
             "kind": "proposal",
@@ -80,7 +85,8 @@ fn submission_seals_once() {
         &scope,
     );
     assert!(matches!(conflict.outcome, DecisionKind::SubmissionConflict));
-    assert_eq!(conflict.next_state.invalid_count, 3);
+    assert_eq!(conflict.next_state.shape_invalid_count, 8);
+    assert_eq!(conflict.next_state.invalid_count, 0);
     assert!(!conflict.closes_attempt);
 
     let mut repair = roundtable_protocol::SubmissionState::open();
@@ -93,7 +99,8 @@ fn submission_seals_once() {
     assert_eq!(receipt.state, CandidateState::Staged);
     assert!(!sealed.closes_attempt);
     assert!(!sealed.next_state.closed);
-    assert_eq!(sealed.next_state.invalid_count, 3);
+    assert_eq!(sealed.next_state.shape_invalid_count, 3);
+    assert_eq!(sealed.next_state.invalid_count, 0);
     assert!(sealed.next_state.sealed.is_some());
     let again = submit(&sealed.next_state, "seal-after-3", &good, &scope);
     assert_eq!(staged(&again), receipt);
@@ -132,11 +139,101 @@ fn submission_seals_once() {
     let rendered = format!("{sealed:?}{receipt:?}");
     assert!(!rendered.contains("Accepted"));
     assert!(!rendered.contains("normal_finish"));
-    let closed = submit(&fourth_invalid.next_state, "late", &good, &scope);
+    let semantic = canonical_bytes(&json!({
+        "kind": "proposal",
+        "summary": "alias",
+        "claims": [{
+            "local_key": "c0",
+            "text": "claim",
+            "evidence_aliases": ["missing-alias"],
+            "confidence": "low"
+        }]
+    }))
+    .unwrap();
+    let mut semantic_state = roundtable_protocol::SubmissionState::open();
+    for index in 1..=3 {
+        let decision = submit(&semantic_state, &format!("sem-{index}"), &semantic, &scope);
+        assert!(!decision.closes_attempt, "semantic {index} stays open");
+        semantic_state = decision.next_state;
+    }
+    assert_eq!(semantic_state.invalid_count, 3);
+    assert_eq!(semantic_state.shape_invalid_count, 0);
+    let fourth_semantic = submit(&semantic_state, "sem-4", &semantic, &scope);
+    assert!(fourth_semantic.closes_attempt);
+    assert_eq!(fourth_semantic.next_state.invalid_count, 4);
+    assert!(matches!(
+        fourth_semantic.outcome,
+        DecisionKind::FieldErrors(_)
+    ));
+    let closed = submit(&fourth_semantic.next_state, "late", &good, &scope);
     assert!(matches!(closed.outcome, DecisionKind::AttemptClosed));
     assert!(!closed.closes_attempt);
     assert_eq!(closed.next_state.invalid_count, 4);
     assert!(closed.next_state.sealed.is_none());
+}
+
+#[test]
+fn nested_missing_claim_field_names_its_path() {
+    let scope = result_scope(PhaseKind::Proposal, 8 * 1024);
+    let raw = canonical_bytes(&json!({
+        "kind": "proposal",
+        "summary": "partial",
+        "claims": [{}]
+    }))
+    .unwrap();
+    let errors = validate_result(&raw, &scope).unwrap_err();
+    for path in [
+        "$.claims[0].local_key",
+        "$.claims[0].text",
+        "$.claims[0].evidence_aliases",
+        "$.claims[0].confidence",
+    ] {
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.path == path && error.code == FieldCode::MissingField),
+            "missing {path} in {errors:?}"
+        );
+    }
+    let bad_confidence = canonical_bytes(&json!({
+        "kind": "proposal",
+        "summary": "partial",
+        "claims": [{
+            "local_key": "c1",
+            "text": "claim",
+            "evidence_aliases": [],
+            "confidence": "huge"
+        }]
+    }))
+    .unwrap();
+    assert_code(
+        &bad_confidence,
+        &scope,
+        "$.claims[0].confidence",
+        FieldCode::InvalidJson,
+    );
+    let schema = roundtable_protocol::submit_result_input_schema(PhaseKind::Proposal);
+    let required = schema["properties"]["result"]["required"]
+        .as_array()
+        .expect("proposal required");
+    assert!(required.iter().any(|field| field == "kind"));
+    assert!(required.iter().any(|field| field == "summary"));
+    assert!(required.iter().any(|field| field == "claims"));
+    let claim_required = schema["properties"]["result"]["properties"]["claims"]["items"]
+        ["required"]
+        .as_array()
+        .expect("claim required");
+    assert!(claim_required.iter().any(|field| field == "local_key"));
+    let synthesis = roundtable_protocol::submit_result_input_schema(PhaseKind::Synthesis);
+    let properties = synthesis["properties"]["result"]["properties"]
+        .as_object()
+        .expect("synthesis properties");
+    assert!(properties.contains_key("consensus_items"));
+    assert!(!properties.contains_key("speaker_id"));
+    assert!(!properties.contains_key("coverage"));
+    let example = roundtable_protocol::seat_schema_example(PhaseKind::Proposal);
+    assert!(example.contains("\"kind\":\"proposal\""));
+    assert!(example.contains("local_key"));
 }
 
 #[test]
@@ -1019,5 +1116,280 @@ impl FixtureCase {
             return raw.as_bytes().to_vec();
         }
         canonical_bytes(self.payload.as_ref().expect("payload")).unwrap()
+    }
+}
+
+#[test]
+fn delivered_schemas_have_complete_nested_contract_and_valid_examples() {
+    for kind in [
+        PhaseKind::Proposal,
+        PhaseKind::Critique,
+        PhaseKind::Synthesis,
+    ] {
+        let schema = roundtable_protocol::result_schema(Some(kind));
+        assert_eq!(schema["$id"], "roundtable_result_v1");
+        assert_eq!(schema["additionalProperties"], false);
+        assert!(schema["description"].as_str().unwrap().contains("alias"));
+        let mut scope = result_scope(kind, 65_536);
+        scope.mandatory_targets.clear();
+        for example in schema["examples"].as_array().unwrap() {
+            validate_result(&canonical_bytes(example).unwrap(), &scope).unwrap();
+        }
+        if kind != PhaseKind::Synthesis {
+            assert_eq!(
+                schema["properties"]["claims"]["items"]["required"],
+                json!(["local_key", "text", "evidence_aliases", "confidence"])
+            );
+            assert_eq!(
+                schema["properties"]["responses"]["items"]["properties"]["stance"]["enum"],
+                json!(["support", "challenge", "clarify", "revise"])
+            );
+        } else {
+            assert_eq!(
+                schema["properties"]["recommendation"]["required"],
+                json!(["text", "aliases", "inference"])
+            );
+            assert!(
+                schema["properties"]["consensus_items"]["items"]["properties"]
+                    ["support_response_aliases"]
+                    .is_object()
+            );
+            assert!(schema["properties"].get("speaker_id").is_none());
+            assert!(schema["properties"].get("coverage").is_none());
+        }
+    }
+}
+
+// Small independent evaluator for the complete subset emitted by result_schema.
+// It consumes the published schema, never the production validation functions.
+fn schema_accepts(schema: &Value, value: &Value) -> bool {
+    if schema
+        .get("const")
+        .is_some_and(|expected| expected != value)
+    {
+        return false;
+    }
+    if schema
+        .get("enum")
+        .and_then(Value::as_array)
+        .is_some_and(|values| !values.contains(value))
+    {
+        return false;
+    }
+    if schema
+        .get("not")
+        .is_some_and(|other| schema_accepts(other, value))
+    {
+        return false;
+    }
+    if schema
+        .get("allOf")
+        .and_then(Value::as_array)
+        .is_some_and(|rules| !rules.iter().all(|rule| schema_accepts(rule, value)))
+    {
+        return false;
+    }
+    if schema
+        .get("oneOf")
+        .and_then(Value::as_array)
+        .is_some_and(|rules| {
+            rules
+                .iter()
+                .filter(|rule| schema_accepts(rule, value))
+                .count()
+                != 1
+        })
+    {
+        return false;
+    }
+    if let Some(condition) = schema.get("if") {
+        let branch = if schema_accepts(condition, value) {
+            "then"
+        } else {
+            "else"
+        };
+        if schema
+            .get(branch)
+            .is_some_and(|rule| !schema_accepts(rule, value))
+        {
+            return false;
+        }
+    }
+    if let Some(kind) = schema.get("type").and_then(Value::as_str) {
+        let matches = match kind {
+            "object" => value.is_object(),
+            "array" => value.is_array(),
+            "string" => value.is_string(),
+            "boolean" => value.is_boolean(),
+            _ => panic!("unsupported schema type {kind}"),
+        };
+        if !matches {
+            return false;
+        }
+    }
+    if let Some(object) = value.as_object() {
+        if schema
+            .get("required")
+            .and_then(Value::as_array)
+            .is_some_and(|keys| {
+                keys.iter()
+                    .any(|key| !object.contains_key(key.as_str().unwrap()))
+            })
+        {
+            return false;
+        }
+        if let Some(properties) = schema.get("properties").and_then(Value::as_object) {
+            for (key, item) in object {
+                match properties.get(key) {
+                    Some(rule) if !schema_accepts(rule, item) => return false,
+                    None if schema["additionalProperties"] == false => return false,
+                    _ => {}
+                }
+            }
+        }
+    }
+    if let Some(items) = value.as_array() {
+        if schema
+            .get("minItems")
+            .and_then(Value::as_u64)
+            .is_some_and(|min| items.len() < min as usize)
+            || schema
+                .get("maxItems")
+                .and_then(Value::as_u64)
+                .is_some_and(|max| items.len() > max as usize)
+        {
+            return false;
+        }
+        if schema
+            .get("items")
+            .is_some_and(|rule| !items.iter().all(|item| schema_accepts(rule, item)))
+        {
+            return false;
+        }
+    }
+    if let Some(text) = value.as_str() {
+        if schema
+            .get("minLength")
+            .and_then(Value::as_u64)
+            .is_some_and(|min| text.chars().count() < min as usize)
+        {
+            return false;
+        }
+        if let Some(pattern) = schema.get("pattern").and_then(Value::as_str) {
+            assert_eq!(pattern, "\\S", "unsupported schema pattern");
+            if text.trim().is_empty() {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+#[test]
+fn delivered_schema_matches_validator_fixture_corpus_and_optional_null_rules() {
+    for case in fixture().cases {
+        let phase = phase_kind(&case.phase_kind);
+        let schema = roundtable_protocol::result_schema(Some(phase));
+        let raw = case.raw_bytes();
+        let Ok(value) = serde_json::from_slice::<Value>(&raw) else {
+            continue;
+        };
+        let structural = schema_accepts(&schema, &value);
+        let accepted = validate_result(&raw, &result_scope(phase, 65_536)).is_ok();
+        if accepted {
+            assert!(
+                structural,
+                "schema rejected validator fixture {}",
+                case.name
+            );
+        }
+        if matches!(
+            case.code.as_deref(),
+            Some(
+                "claim_count"
+                    | "empty_summary"
+                    | "abstain_reason"
+                    | "abstain_claims"
+                    | "ambiguous_target"
+                    | "missing_target"
+                    | "identity_not_selectable"
+                    | "coverage_rejected"
+                    | "wrong_phase_kind"
+            )
+        ) {
+            assert!(!structural, "schema accepted invalid shape {}", case.name);
+        }
+    }
+    let schema = roundtable_protocol::result_schema(Some(PhaseKind::Proposal));
+    let scope = scope_with_alias(PhaseKind::Proposal, 65_536);
+    let original: Value = serde_json::from_slice(&minimal_proposal()).unwrap();
+    for field in ["responses", "open_questions", "position_changes", "reason"] {
+        let mut omitted = original.clone();
+        omitted.as_object_mut().unwrap().remove(field);
+        assert!(schema_accepts(&schema, &omitted));
+        assert!(validate_result(&json_bytes(&omitted), &scope).is_ok());
+        omitted[field] = Value::Null;
+        assert!(!schema_accepts(&schema, &omitted), "null {field}");
+        assert!(validate_result(&json_bytes(&omitted), &scope).is_err());
+    }
+    let mut proposal = original;
+    // reason is semantically required only for abstention.
+    proposal["reason"] = json!("");
+    assert!(validate_result(&json_bytes(&proposal), &scope).is_ok());
+    assert!(schema_accepts(&schema, &proposal));
+    for confidence in ["low", "medium", "high"] {
+        proposal["claims"][0]["confidence"] = json!(confidence);
+        for stance in ["support", "challenge", "clarify", "revise"] {
+            for priority in ["normal", "critical"] {
+                proposal["responses"] = json!([{"target_claim_alias":"c-pub","stance":stance,"priority":priority,"text":"Response","evidence_aliases":[]}]);
+                assert!(schema_accepts(&schema, &proposal));
+                assert!(validate_result(&json_bytes(&proposal), &scope).is_ok());
+                let mut nulled = proposal.clone();
+                nulled["responses"][0]["target_response_alias"] = Value::Null;
+                assert!(!schema_accepts(&schema, &nulled));
+                assert!(validate_result(&json_bytes(&nulled), &scope).is_err());
+            }
+        }
+    }
+    let moderator = roundtable_protocol::result_schema(Some(PhaseKind::Synthesis));
+    let mut result = moderator["examples"][0].clone();
+    for field in moderator["required"].as_array().unwrap() {
+        let mut omitted = result.clone();
+        omitted
+            .as_object_mut()
+            .unwrap()
+            .remove(field.as_str().unwrap());
+        assert!(!schema_accepts(&moderator, &omitted));
+        assert!(validate_result(
+            &json_bytes(&omitted),
+            &result_scope(PhaseKind::Synthesis, 65_536)
+        )
+        .is_err());
+    }
+    for agreement in ["compatible_positions", "unresolved"] {
+        result["consensus_items"] = json!([{"text":"An inference","agreement_level":agreement,"aliases":[],"supporter_aliases":[],"support_response_aliases":[],"inference":true}]);
+        assert!(schema_accepts(&moderator, &result));
+        assert!(validate_result(
+            &json_bytes(&result),
+            &result_scope(PhaseKind::Synthesis, 65_536)
+        )
+        .is_ok());
+    }
+}
+
+#[test]
+fn phase_pinned_mcp_prompt_and_examples_share_one_result_contract() {
+    for phase in [
+        PhaseKind::Proposal,
+        PhaseKind::Critique,
+        PhaseKind::Synthesis,
+    ] {
+        let schema = roundtable_protocol::result_schema(Some(phase));
+        let tool = roundtable_protocol::submit_result_input_schema(phase);
+        assert_eq!(tool["properties"]["result"], schema);
+        let text = roundtable_protocol::seat_schema_example(phase);
+        let example: Value = serde_json::from_str(text.split_once("result: ").unwrap().1).unwrap();
+        assert_eq!(example, schema["examples"][0]);
+        validate_result(&json_bytes(&example), &result_scope(phase, 65_536)).unwrap();
     }
 }

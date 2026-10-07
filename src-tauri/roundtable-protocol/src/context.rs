@@ -105,6 +105,21 @@ impl QualifiedContextProfile {
 pub trait TokenBound {
     fn upper_bound(&self, utf8: &[u8]) -> RtResult<u64>;
     fn capacity_tokens(&self) -> Option<u64>;
+
+    /// Qualified length-only bounds can override this without allocating.
+    /// The conservative default refuses unbounded user-controlled witnesses.
+    fn upper_bound_for_length(&self, len: u64) -> RtResult<u64> {
+        if len > 16 * 1024 * 1024 {
+            return Err(unknown("capacity_unknown"));
+        }
+        let size = usize::try_from(len).map_err(|_| invalid("overflow"))?;
+        let mut witness = Vec::new();
+        witness
+            .try_reserve_exact(size)
+            .map_err(|_| unknown("capacity_unknown"))?;
+        witness.resize(size, 0);
+        self.upper_bound(&witness)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -159,20 +174,38 @@ pub fn preflight_context(
     profile: &QualifiedContextProfile,
 ) -> RtResult<ContextBound> {
     let participants = u32::try_from(config.participants.len()).map_err(|_| invalid("overflow"))?;
+    let results = member_result_body_bytes(
+        participants,
+        config.strategy.critique_rounds,
+        config.quotas.output_byte_limit.0,
+    )?;
+    let future_bytes = json_string_worst_bytes(results)?
+        .checked_add(json_string_worst_bytes(
+            config.quotas.interjection_byte_limit.0,
+        )?)
+        .and_then(|value| value.checked_add(json_string_worst_bytes(EVIDENCE_ATTEMPT_BYTES).ok()?))
+        .and_then(|value| {
+            value.checked_add(json_string_worst_bytes(profile.max_tool_reply_bytes).ok()?)
+        })
+        .ok_or_else(|| invalid("overflow"))?;
+    preflight_encoded_context(config, input, tokens, profile, future_bytes)
+}
+
+/// Bound an already encoded future representation. Canonical result objects
+/// must not be charged as if their strings were escaped a second time.
+pub fn preflight_encoded_context(
+    config: &RoundtableConfigV1,
+    input: &EncodedInputBounds,
+    tokens: &dyn TokenBound,
+    profile: &QualifiedContextProfile,
+    future_bytes: u64,
+) -> RtResult<ContextBound> {
+    let participants = u32::try_from(config.participants.len()).map_err(|_| invalid("overflow"))?;
     let rounds = config.strategy.critique_rounds;
     let result_bytes = config.quotas.output_byte_limit.0;
     let member_result_body_bytes = member_result_body_bytes(participants, rounds, result_bytes)?;
     let full_plan_reading_bytes =
         cumulative_result_reading_bytes(participants, rounds, result_bytes)?;
-    let future_bytes = json_string_worst_bytes(member_result_body_bytes)?
-        .checked_add(json_string_worst_bytes(
-            config.quotas.interjection_byte_limit.0,
-        )?)
-        .ok_or_else(|| invalid("overflow"))?
-        .checked_add(json_string_worst_bytes(EVIDENCE_ATTEMPT_BYTES)?)
-        .ok_or_else(|| invalid("overflow"))?
-        .checked_add(json_string_worst_bytes(profile.max_tool_reply_bytes)?)
-        .ok_or_else(|| invalid("overflow"))?;
     let prompt = preflight_exact_prompt(config, input)?;
     let exact_bytes = u64::try_from(prompt.len()).map_err(|_| invalid("overflow"))?;
     let Some(capacity) = tokens.capacity_tokens() else {
@@ -203,6 +236,27 @@ pub fn preflight_context(
     })
 }
 
+/// Raw text quota and encoded context space are separate ceilings. The extra
+/// 64 bytes admit one maximum-escaped input with its host-owned UUID wrapper.
+pub fn interjection_context_limit(raw_quota: u64) -> RtResult<u64> {
+    json_string_worst_bytes(raw_quota)?
+        .checked_add(64)
+        .ok_or_else(|| invalid("overflow"))
+}
+
+/// Called both before an optional input is accepted and before frozen delivery.
+/// Rejection here cannot spend a later model turn on an oversized input list.
+pub fn validate_interjection_context(inputs: &serde_json::Value, raw_quota: u64) -> RtResult<u64> {
+    if !inputs.is_array() {
+        return Err(invalid("interjection_context"));
+    }
+    let bytes = canonical_bytes(inputs)?.len() as u64;
+    if bytes > interjection_context_limit(raw_quota)? {
+        return Err(too_large("interjection_context_bytes"));
+    }
+    Ok(bytes)
+}
+
 /// `reserved` is the creation-time interjection quota. Overspend is rejected.
 pub fn charge_interjection(reserved: u64, already: u64, incoming: u64) -> RtResult<u64> {
     let used = already
@@ -214,16 +268,7 @@ pub fn charge_interjection(reserved: u64, already: u64, incoming: u64) -> RtResu
 }
 
 fn bound_length(tokens: &dyn TokenBound, len: u64) -> RtResult<u64> {
-    let size = usize::try_from(len).map_err(|_| invalid("overflow"))?;
-    // The qualified `TokenBound` must upper-bound every string of this length.
-    // The bytes are only the witness the trait can see. A failed allocation is
-    // an unknown bound, not a guessed one.
-    let mut witness = Vec::new();
-    if witness.try_reserve_exact(size).is_err() {
-        return Err(unknown("capacity_unknown"));
-    }
-    witness.resize(size, 0);
-    tokens.upper_bound(&witness)
+    tokens.upper_bound_for_length(len)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -239,6 +284,42 @@ pub struct RoleSnapshot {
     pub schema_text: String,
     pub tool_version: String,
     pub tool_text: String,
+}
+
+/// One admission contract for creation-time worst-case delivery and the exact
+/// prompt delivered later. Retain the result/evidence reserves and cover every
+/// model request admitted by the qualified request-body cap. Token counts are
+/// obtained only from the qualified bound; hidden and generation are charged
+/// once after taking the larger of those two obligations.
+pub fn admit_qualified_delivery(
+    prompt_token_upper_bound: u64,
+    output_byte_limit: u64,
+    evidence_attempt_bytes: u64,
+    tokens: &dyn TokenBound,
+    profile: &QualifiedContextProfile,
+) -> RtResult<u64> {
+    let capacity = tokens
+        .capacity_tokens()
+        .ok_or_else(|| unknown("capacity_unknown"))?;
+    if capacity != profile.model_capacity_tokens {
+        return Err(unknown("capacity_unknown"));
+    }
+    let future = json_string_worst_bytes(output_byte_limit)?
+        .checked_add(json_string_worst_bytes(evidence_attempt_bytes)?)
+        .ok_or_else(|| invalid("overflow"))?;
+    let delivery = prompt_token_upper_bound
+        .checked_add(bound_length(tokens, future)?)
+        .ok_or_else(|| invalid("overflow"))?;
+    let request = bound_length(tokens, profile.max_request_body_bytes)?;
+    let admission = delivery
+        .max(request)
+        .checked_add(profile.adapter_hidden_bound_tokens)
+        .and_then(|value| value.checked_add(profile.generation_reserve_tokens))
+        .ok_or_else(|| invalid("overflow"))?;
+    if admission > capacity {
+        return Err(too_large("context_too_large"));
+    }
+    Ok(admission)
 }
 
 pub struct DeliveryEncoder;
@@ -303,7 +384,30 @@ impl DeliveryEncoder {
         Self::encode_prompt(phase, role, binding, tokens, profile, &prompt)
     }
 
-    fn encode_prompt(
+    /// Bind the service-owned seat and its alias-based targets into the exact
+    /// bytes delivered to a fresh session. The shared phase hash stays intact.
+    pub fn prompt_for_speaker(
+        phase: &PhaseSnapshotV1,
+        role: &RoleSnapshot,
+        binding: &BindingId,
+        speaker: &crate::SpeakerOrdinal,
+        scope: &crate::ResultScope,
+        context: &serde_json::Value,
+    ) -> RtResult<Vec<u8>> {
+        if scope.speaker_id != speaker.speaker_id || scope.phase_kind != phase.kind {
+            return Err(invalid("delivery_identity"));
+        }
+        let mut metadata: serde_json::Value =
+            serde_json::from_slice(&Self::prompt_utf8(phase, role, binding)?)
+                .map_err(|_| invalid("delivery_encoding"))?;
+        metadata["speaker_id"] = serde_json::json!(speaker.speaker_id);
+        metadata["speaker_ordinal"] = serde_json::json!(speaker.ordinal);
+        metadata["mandatory_targets"] = serde_json::json!(scope.mandatory_targets);
+        canonical_bytes(&serde_json::json!({"metadata":metadata,"context":context}))
+    }
+
+    /// Hash and capacity-check the exact prompt sent by the runtime.
+    pub fn encode_prompt(
         phase: &PhaseSnapshotV1,
         role: &RoleSnapshot,
         binding: &BindingId,
@@ -315,26 +419,13 @@ impl DeliveryEncoder {
         if exact > crate::MAX_SAFE_INTEGER {
             return Err(invalid("overflow"));
         }
-        let Some(capacity) = tokens.capacity_tokens() else {
-            return Err(unknown("capacity_unknown"));
-        };
-        if capacity != profile.model_capacity_tokens {
-            return Err(unknown("capacity_unknown"));
-        }
-        let future = json_string_worst_bytes(phase.output_byte_limit.0)?
-            .checked_add(json_string_worst_bytes(
-                phase.tool_quota.per_attempt_bytes.0,
-            )?)
-            .ok_or_else(|| invalid("overflow"))?;
-        let admission = tokens
-            .upper_bound(prompt)?
-            .checked_add(bound_length(tokens, future)?)
-            .and_then(|value| value.checked_add(profile.adapter_hidden_bound_tokens))
-            .and_then(|value| value.checked_add(profile.generation_reserve_tokens))
-            .ok_or_else(|| invalid("overflow"))?;
-        if admission > capacity {
-            return Err(too_large("context_too_large"));
-        }
+        admit_qualified_delivery(
+            tokens.upper_bound(prompt)?,
+            phase.output_byte_limit.0,
+            phase.tool_quota.per_attempt_bytes.0,
+            tokens,
+            profile,
+        )?;
         Ok(DeliveryManifestV1 {
             schema_version: SCHEMA_VERSION,
             public_view_hash: canonical_hash(phase)?,

@@ -205,7 +205,26 @@ pub async fn open_roundtable_store(conn: DatabaseConnection) -> RtResult<Roundta
     })
 }
 
-impl RoundtableStore {}
+impl RoundtableStore {
+    /// Acquire SQLite's writer reservation before establishing a read snapshot.
+    /// WAL permits concurrent readers, but a deferred read snapshot cannot be
+    /// upgraded after another writer commits (SQLITE_BUSY_SNAPSHOT). The no-op
+    /// write takes that reservation with the pool's bounded busy timeout.
+    pub(crate) async fn write_transaction(&self) -> RtResult<DatabaseTransaction> {
+        let txn = self.conn.begin().await.map_err(storage_err)?;
+        if let Err(error) = exec(
+            &txn,
+            "UPDATE rt_rooms SET revision=revision WHERE 0",
+            vec![],
+        )
+        .await
+        {
+            let _ = txn.rollback().await;
+            return Err(error);
+        }
+        Ok(txn)
+    }
+}
 
 /// Apply the registered roundtable schema in one short transaction.
 ///
@@ -273,7 +292,7 @@ impl RoundtableStore {
     }
 
     pub(crate) async fn bump_coordinator_boot(&self) -> RtResult<u64> {
-        let txn = self.conn.begin().await.map_err(storage_err)?;
+        let txn = self.write_transaction().await?;
         let result = async {
             exec(
                 &txn,
@@ -580,7 +599,7 @@ impl RoundtableStore {
     }
 
     pub async fn insert_event(&self, row: &NewEvent) -> RtResult<()> {
-        let txn = self.conn.begin().await.map_err(storage_err)?;
+        let txn = self.write_transaction().await?;
         let result = insert_event_in(&txn, row).await;
         finish(txn, result).await
     }
@@ -626,7 +645,7 @@ impl RoundtableStore {
         expected_revision: i64,
         phase_id: &str,
     ) -> RtResult<()> {
-        let txn = self.conn.begin().await.map_err(storage_err)?;
+        let txn = self.write_transaction().await?;
         let updated = exec(
             &txn,
             "UPDATE rt_rooms
@@ -660,7 +679,7 @@ impl RoundtableStore {
         turn_id: &str,
         attempt_id: &str,
     ) -> RtResult<()> {
-        let txn = self.conn.begin().await.map_err(storage_err)?;
+        let txn = self.write_transaction().await?;
         let updated = exec(
             &txn,
             "UPDATE rt_turns
@@ -710,6 +729,53 @@ impl RoundtableStore {
         gate
     }
 
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn arm_accept_writer_gate(&self) -> Arc<LockGate> {
+        let gate = LockGate::new();
+        self.faults.lock().expect("faults").writer_gate = Some(gate.clone());
+        gate
+    }
+
+    #[cfg(any(test, feature = "test-utils"))]
+    pub(crate) fn take_accept_writer_gate(&self) -> Option<Arc<LockGate>> {
+        self.faults.lock().expect("faults").writer_gate.take()
+    }
+
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn arm_completed_run_gate(&self) -> Arc<LockGate> {
+        let gate = LockGate::new();
+        self.faults.lock().expect("faults").completed_run_gate = Some(gate.clone());
+        gate
+    }
+
+    #[cfg(any(test, feature = "test-utils"))]
+    pub(crate) fn take_completed_run_gate(&self) -> Option<Arc<LockGate>> {
+        self.faults
+            .lock()
+            .expect("faults")
+            .completed_run_gate
+            .take()
+    }
+
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn arm_completion_observation_gate(&self) -> Arc<LockGate> {
+        let gate = LockGate::new();
+        self.faults
+            .lock()
+            .expect("faults")
+            .completion_observation_gate = Some(gate.clone());
+        gate
+    }
+
+    #[cfg(any(test, feature = "test-utils"))]
+    pub(crate) fn take_completion_observation_gate(&self) -> Option<Arc<LockGate>> {
+        self.faults
+            .lock()
+            .expect("faults")
+            .completion_observation_gate
+            .take()
+    }
+
     pub(crate) fn clock_sample(&self) -> (u64, String) {
         let clock = Arc::clone(&self.clock.lock().expect("clock"));
         (clock.now_ms(), clock.utc())
@@ -753,7 +819,7 @@ impl RegistryStore for RoundtableStore {
 
 impl RoundtableStore {
     pub(crate) async fn record_launch(&self, intent: LaunchIntent) -> RtResult<()> {
-        let txn = self.conn.begin().await.map_err(storage_err)?;
+        let txn = self.write_transaction().await?;
         let result = async {
             let incarnation = intent.incarnation.to_string();
             let inserted = exec(
@@ -800,7 +866,7 @@ impl RoundtableStore {
         if instance.incarnation != incarnation {
             return Err(rt_error(ErrorCode::InvalidArgument, "launch_incarnation"));
         }
-        let txn = self.conn.begin().await.map_err(storage_err)?;
+        let txn = self.write_transaction().await?;
         let key = incarnation.to_string();
         let result = async {
             let updated = exec(
@@ -871,7 +937,7 @@ impl RoundtableStore {
     }
 
     pub(crate) async fn mark_launch_reaped(&self, incarnation: IncarnationId) -> RtResult<()> {
-        let txn = self.conn.begin().await.map_err(storage_err)?;
+        let txn = self.write_transaction().await?;
         let key = incarnation.to_string();
         let result = async {
             let updated = exec(

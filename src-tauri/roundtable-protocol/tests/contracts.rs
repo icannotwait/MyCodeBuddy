@@ -35,6 +35,31 @@ fn config_ranges_and_closed_commands() {
     assert_ne!(limits.max_participants, 2);
 
     assert!(validate_config(&support::config(7, 5, 2), &limits).is_ok());
+    let mut mixed = support::config(3, 1, 3);
+    for (participant, agent) in mixed
+        .participants
+        .iter_mut()
+        .zip(["grok", "cursor", "antigravity"])
+    {
+        participant.agent = Some(agent.to_string());
+    }
+    mixed.moderator_ordinal = 2;
+    assert!(validate_config(&mixed, &limits).is_ok());
+    assert_eq!(
+        mixed.participants[mixed.moderator_ordinal as usize]
+            .agent
+            .as_deref(),
+        Some("antigravity")
+    );
+    mixed.participants[0].agent = Some("claude".into());
+    assert_eq!(
+        validate_config(&mixed, &limits)
+            .unwrap_err()
+            .details
+            .reason
+            .as_deref(),
+        Some("unknown_agent")
+    );
     assert_eq!(
         validate_config(&support::config(1, 0, 1), &limits)
             .unwrap_err()

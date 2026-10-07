@@ -49,14 +49,91 @@ describe("create roundtable", () => {
     expect(screen.getAllByRole("button")[1].hasAttribute("disabled")).toBe(true)
     render(
       <PreflightConfirmation
-        targets={["主持人", "成员"]}
+        recipients={[
+          {
+            ordinal: 0,
+            provider_ref: "provider:1",
+            model: "actual",
+            origin: "https://provider.test",
+            agent: "codex",
+            effort: null,
+          },
+        ]}
+        moderatorOrdinal={0}
+        sourceManifests={[]}
+        selectedPaths={[]}
         tools={["read"]}
         network="none"
         writes="none"
         budget="10"
       />
     )
-    expect(screen.getByText("主持人、成员")).toBeTruthy()
+    expect(
+      screen.getByText("https://provider.test", { exact: false })
+    ).toBeTruthy()
     expect(screen.getByText("10")).toBeTruthy()
   })
+})
+
+it("discloses resolved recipients and immutable selected source hashes", () => {
+  render(
+    <PreflightConfirmation
+      recipients={[
+        {
+          ordinal: 0,
+          provider_ref: "provider:9",
+          model: "actual-model",
+          origin: "https://provider.example",
+          agent: "grok",
+          effort: "high",
+        },
+      ]}
+      moderatorOrdinal={0}
+      sourceManifests={[
+        {
+          hash: "manifest-hash",
+          manifest: {
+            manifest_id: "snapshot",
+            entries: [
+              {
+                path: "src/selected.ts",
+                size: 42,
+                content_hash: "content-hash",
+                text_admissible: true,
+                object: {
+                  object_id: "content-hash",
+                  content_hash: "content-hash",
+                  total_bytes: 42,
+                },
+              },
+            ],
+          },
+        },
+      ]}
+      selectedPaths={[]}
+      sourcePreviews={{
+        "content-hash": "<script>fixture</script> sk-fake-preview",
+      }}
+      tools={["read"]}
+      network="model_gateway_only"
+      writes="scratch_only"
+      budget="10"
+    />
+  )
+  expect(
+    screen.getByText("<script>fixture</script> sk-fake-preview")
+  ).toBeTruthy()
+  expect(document.querySelector("script")).toBeNull()
+  for (const text of [
+    "provider:9",
+    "actual-model",
+    "https://provider.example",
+    "grok",
+    "high",
+    "src/selected.ts",
+    "content-hash",
+    "manifest-hash",
+  ]) {
+    expect(screen.getByText(text, { exact: false })).toBeTruthy()
+  }
 })

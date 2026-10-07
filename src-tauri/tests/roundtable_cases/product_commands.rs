@@ -818,3 +818,487 @@ async fn product_completed_control_replay_does_not_abort_a_resumed_run() {
         Some("service_draining")
     );
 }
+
+#[cfg(not(windows))]
+#[tokio::test]
+async fn product_create_selected_files_freezes_only_registered_workspace_evidence() {
+    use sea_orm::{ConnectionTrait, DbBackend, Statement};
+    let (dir, conn) = support::open_pool(1).await;
+    migrate_roundtable(&conn).await.unwrap();
+    let workspace = dir.path().canonicalize().unwrap().join("workspace");
+    std::fs::create_dir(&workspace).unwrap();
+    std::fs::write(workspace.join("selected.txt"), "approved bytes\n").unwrap();
+    std::fs::write(workspace.join("private.txt"), "never selected").unwrap();
+    conn.execute(Statement::from_string(
+        DbBackend::Sqlite,
+        "CREATE TABLE folder(id INTEGER PRIMARY KEY,path TEXT,deleted_at TEXT,kind TEXT)",
+    ))
+    .await
+    .unwrap();
+    conn.execute(Statement::from_sql_and_values(
+        DbBackend::Sqlite,
+        "INSERT INTO folder(id,path,kind) VALUES(7,?,'regular')",
+        vec![workspace.to_string_lossy().to_string().into()],
+    ))
+    .await
+    .unwrap();
+    let runtime = Arc::new(PendingRun {
+        entered: Default::default(),
+        release: Default::default(),
+        after_release: Default::default(),
+    });
+    let service = RoundtableService::open(
+        ServiceConfig {
+            data_dir: dir.path().into(),
+            db_path: dir.path().join("roundtable.db"),
+            db_identity: DbIdentity::new("selected-files").unwrap(),
+            discover: Some(Arc::new(EmptyDiscovery)),
+        },
+        open_roundtable_store(conn.clone()).await.unwrap(),
+        runtime.clone(),
+    )
+    .await
+    .unwrap();
+    let mut config = config();
+    config["workspace_id"] = json!("7");
+    let request = json!({"request_id":uuid::Uuid::new_v4(),"config":config,"selected_source_paths":["selected.txt"]});
+    let ack = service
+        .execute_fake_command(&actor(1), "roundtable_create", request.clone())
+        .await
+        .unwrap();
+    std::fs::write(workspace.join("selected.txt"), "changed after capture").unwrap();
+    let retry = service
+        .execute_fake_command(&actor(1), "roundtable_create", request)
+        .await
+        .unwrap();
+    assert_eq!(ack, retry);
+    let view = service
+        .execute_command(
+            &actor(1),
+            "roundtable_get",
+            json!({"room_id":ack["room_id"]}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(view["config"]["source_refs"].as_array().unwrap().len(), 1);
+    let preflight = service
+        .execute_fake_command(
+            &actor(1),
+            "roundtable_preflight",
+            json!({"room_id":ack["room_id"],"revision":"1","config":view["config"]}),
+        )
+        .await
+        .unwrap();
+    let entries = preflight["source_manifests"][0]["manifest"]["entries"]
+        .as_array()
+        .unwrap();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0]["path"], "selected.txt");
+    let mut object_ref = entries[0]["object"].clone();
+    object_ref["kind"] = json!("source_excerpt");
+    let preview = service
+        .execute_command(
+            &actor(1),
+            "roundtable_get",
+            json!({"room_id":ack["room_id"],"read":{"object":{"object_ref":object_ref}}}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(preview["text"], "approved bytes\n");
+    let mut reduced = view["config"].clone();
+    reduced["quotas"]["input_byte_limit"] = json!(1);
+    let clone_error=service.execute_fake_command(&actor(1),"roundtable_clone",json!({"room_id":ack["room_id"],"request_id":uuid::Uuid::new_v4(),"expected_revision":"1","carry_published_context":false,"config_override":reduced})).await.unwrap_err();
+    assert_eq!(
+        clone_error.details.reason.as_deref(),
+        Some("source_metadata_bytes")
+    );
+    assert_eq!(
+        support::scalar_i64(&conn, "SELECT COUNT(*) FROM rt_rooms").await,
+        1
+    );
+    let object = entries[0]["object"]["object_id"].as_str().unwrap();
+    assert_eq!(
+        std::fs::read(dir.path().join("roundtable/objects").join(object)).unwrap(),
+        b"approved bytes\n"
+    );
+    for paths in [
+        json!(["../private.txt"]),
+        json!(["selected.txt", "./selected.txt"]),
+        json!(["/etc/passwd"]),
+        json!(vec!["selected.txt"; 33]),
+    ] {
+        let before = support::scalar_i64(&conn, "SELECT COUNT(*) FROM rt_rooms").await;
+        let error = service.execute_fake_command(&actor(1), "roundtable_create", json!({"request_id":uuid::Uuid::new_v4(),"config":config,"selected_source_paths":paths})).await.unwrap_err();
+        assert_eq!(error.code, ErrorCode::InvalidArgument);
+        assert_eq!(
+            support::scalar_i64(&conn, "SELECT COUNT(*) FROM rt_rooms").await,
+            before
+        );
+    }
+    std::fs::write(workspace.join("metadata-heavy.txt"), "a\n".repeat(6000)).unwrap();
+    let too_large = service.execute_fake_command(&actor(1), "roundtable_create", json!({"request_id":uuid::Uuid::new_v4(),"config":config,"selected_source_paths":["metadata-heavy.txt"]})).await.unwrap_err();
+    assert_eq!(too_large.code, ErrorCode::InsufficientBudget);
+    assert_eq!(
+        too_large.details.reason.as_deref(),
+        Some("source_metadata_bytes")
+    );
+    assert_eq!(
+        support::scalar_i64(&conn, "SELECT COUNT(*) FROM rt_rooms").await,
+        1
+    );
+    assert_eq!(
+        std::fs::read_dir(dir.path().join("roundtable/objects"))
+            .unwrap()
+            .count(),
+        1,
+        "metadata rejection must happen before any additional source bytes are stored"
+    );
+    config["workspace_id"] = json!("8");
+    let denied = service.execute_fake_command(&actor(1), "roundtable_create", json!({"request_id":uuid::Uuid::new_v4(),"config":config,"selected_source_paths":["selected.txt"]})).await.unwrap_err();
+    assert_eq!(
+        denied.details.reason.as_deref(),
+        Some("workspace_not_found")
+    );
+    assert_eq!(
+        support::scalar_i64(&conn, "SELECT COUNT(*) FROM rt_rooms").await,
+        1
+    );
+    let second = service
+        .execute_fake_command(
+            &actor(1),
+            "roundtable_preflight",
+            json!({"room_id":ack["room_id"],"revision":"1","config":view["config"]}),
+        )
+        .await
+        .unwrap();
+    let started=service.execute_fake_command(&actor(1),"roundtable_start",json!({"room_id":ack["room_id"],"request_id":uuid::Uuid::new_v4(),"expected_revision":"1","confirmed_preflight_id":second["confirmed_preflight_id"]})).await.unwrap();
+    assert_eq!(started["status"], "running");
+    tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        runtime.entered.notified(),
+    )
+    .await
+    .unwrap();
+    service.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn product_create_moderator_uses_ordinal_not_participant_position() {
+    let (dir, conn) = support::open_pool(1).await;
+    migrate_roundtable(&conn).await.unwrap();
+    let service = RoundtableService::open(
+        ServiceConfig {
+            data_dir: dir.path().into(),
+            db_path: dir.path().join("roundtable.db"),
+            db_identity: DbIdentity::new("moderator-ordinal").unwrap(),
+            discover: None,
+        },
+        open_roundtable_store(conn).await.unwrap(),
+        Arc::new(NoModel),
+    )
+    .await
+    .unwrap();
+    let mut config = config();
+    config["participants"].as_array_mut().unwrap().reverse();
+    let ack = service
+        .execute_fake_command(
+            &actor(1),
+            "roundtable_create",
+            json!({"request_id":uuid::Uuid::new_v4(),"config":config}),
+        )
+        .await
+        .unwrap();
+    let view = service
+        .execute_command(
+            &actor(1),
+            "roundtable_get",
+            json!({"room_id":ack["room_id"]}),
+        )
+        .await
+        .unwrap();
+    let moderator = view["projection"]["body"]["replay"]["speakers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|seat| seat["role"] == "moderator")
+        .unwrap();
+    assert_eq!(moderator["provider_ref"], "provider:a");
+    service.shutdown().await.unwrap();
+}
+
+struct ChangingCapability(std::sync::atomic::AtomicUsize);
+#[async_trait]
+impl ParticipantRuntime for ChangingCapability {
+    async fn prepare(&self, _: RoundtableLaunch) -> RtResult<PreparedRoundtableConnection> {
+        panic!("confirmation rejection must not launch")
+    }
+    async fn cancel_and_reap(&self, _: RuntimeIdentity) -> RtResult<CleanupProof> {
+        panic!("no launch")
+    }
+    async fn preflight(
+        &self,
+        _: &roundtable_protocol::RoundtableConfigV1,
+    ) -> RtResult<serde_json::Value> {
+        Ok(
+            json!({"recipients":[{"provider_ref":"provider:a","model":format!("model-{}",self.0.load(std::sync::atomic::Ordering::SeqCst))}],"qualification_keys":[self.0.load(std::sync::atomic::Ordering::SeqCst)]}),
+        )
+    }
+}
+
+#[tokio::test]
+async fn product_resume_rejects_changed_recipient_or_certificate_after_confirmation() {
+    use sea_orm::{ConnectionTrait, DbBackend, Statement};
+    let (dir, conn) = support::open_pool(1).await;
+    migrate_roundtable(&conn).await.unwrap();
+    let runtime = Arc::new(ChangingCapability(std::sync::atomic::AtomicUsize::new(1)));
+    let service = RoundtableService::open(
+        ServiceConfig {
+            data_dir: dir.path().into(),
+            db_path: dir.path().join("roundtable.db"),
+            db_identity: DbIdentity::new("changed-confirmation").unwrap(),
+            discover: None,
+        },
+        open_roundtable_store(conn.clone()).await.unwrap(),
+        runtime.clone(),
+    )
+    .await
+    .unwrap();
+    let ack = service
+        .execute_fake_command(
+            &actor(1),
+            "roundtable_create",
+            json!({"request_id":uuid::Uuid::new_v4(),"config":config()}),
+        )
+        .await
+        .unwrap();
+    conn.execute(Statement::from_string(
+        DbBackend::Sqlite,
+        "UPDATE rt_rooms SET status='paused'",
+    ))
+    .await
+    .unwrap();
+    let preflight = service
+        .execute_fake_command(
+            &actor(1),
+            "roundtable_preflight",
+            json!({"room_id":ack["room_id"],"revision":"1","config":config()}),
+        )
+        .await
+        .unwrap();
+    assert!(preflight["confirmed_preflight_id"].is_string());
+    runtime.0.store(2, std::sync::atomic::Ordering::SeqCst);
+    let error = service.execute_fake_command(&actor(1), "roundtable_resume", json!({"room_id":ack["room_id"],"request_id":uuid::Uuid::new_v4(),"expected_revision":"1","recovery_consent":true,"confirmed_preflight_id":preflight["confirmed_preflight_id"]})).await.unwrap_err();
+    assert_eq!(
+        error.details.reason.as_deref(),
+        Some("preflight_confirmation")
+    );
+    assert_eq!(
+        support::scalar_i64(&conn, "SELECT run_epoch FROM rt_rooms").await,
+        0
+    );
+    service.shutdown().await.unwrap();
+}
+
+struct NoProviderCredentials;
+#[async_trait]
+impl ParticipantRuntime for NoProviderCredentials {
+    async fn prepare(&self, _: RoundtableLaunch) -> RtResult<PreparedRoundtableConnection> {
+        panic!("no model call")
+    }
+    async fn cancel_and_reap(&self, _: RuntimeIdentity) -> RtResult<CleanupProof> {
+        panic!("no process")
+    }
+    async fn preflight(
+        &self,
+        _: &roundtable_protocol::RoundtableConfigV1,
+    ) -> RtResult<serde_json::Value> {
+        Err(roundtable_protocol::RtError {
+            code: ErrorCode::CapabilityUnqualified,
+            message: "Provider credentials are unavailable".into(),
+            retryable: false,
+            current_revision: None,
+            details: roundtable_protocol::ErrorDetails {
+                reason: Some("provider_credential_missing".into()),
+                field_errors: vec![],
+            },
+        })
+    }
+}
+
+#[tokio::test]
+async fn product_http_provider_failure_preserves_authenticated_application_access() {
+    use codeg_lib::app_state::AppState;
+    use codeg_lib::db::test_helpers::fresh_in_memory_db;
+    use codeg_lib::web::{router::build_router, shutdown::ShutdownSignal};
+    let (dir, conn) = support::open_pool(1).await;
+    migrate_roundtable(&conn).await.unwrap();
+    let service = RoundtableService::open(
+        ServiceConfig {
+            data_dir: dir.path().into(),
+            db_path: dir.path().join("roundtable.db"),
+            db_identity: DbIdentity::new("provider-auth-domain").unwrap(),
+            discover: None,
+        },
+        open_roundtable_store(conn).await.unwrap(),
+        Arc::new(NoProviderCredentials),
+    )
+    .await
+    .unwrap();
+    let state = Arc::new(AppState::new_for_test(
+        fresh_in_memory_db().await,
+        dir.path().into(),
+    ));
+    state.roundtable.install(service.clone());
+    let server = axum_test::TestServer::new(build_router(
+        state,
+        "valid-app-token".into(),
+        dir.path().into(),
+        Arc::new(ShutdownSignal::new()),
+    ))
+    .unwrap();
+    let response = server
+        .post("/api/roundtable_preflight")
+        .add_header("authorization", "Bearer valid-app-token")
+        .json(&json!({"request":{"config":config()}}))
+        .await;
+    assert_eq!(response.status_code(), 200);
+    let error: roundtable_protocol::RtError =
+        serde_json::from_value(response.json::<serde_json::Value>()["error"].clone()).unwrap();
+    assert_eq!(error.code, ErrorCode::CapabilityUnqualified);
+    assert_eq!(error.code.http_status(), 422);
+    assert_eq!(
+        error.details.reason.as_deref(),
+        Some("provider_credential_missing")
+    );
+    let read = server
+        .post("/api/roundtable_list")
+        .add_header("authorization", "Bearer valid-app-token")
+        .json(&json!({"workspace_id":"test-workspace"}))
+        .await;
+    assert_eq!(read.status_code(), 200);
+    let unauthenticated = server
+        .post("/api/roundtable_list")
+        .json(&json!({"workspace_id":"test-workspace"}))
+        .await;
+    assert_eq!(unauthenticated.status_code(), 401);
+    assert!(!dir.path().join("roundtable/execution-policy.json").exists());
+    service.shutdown().await.unwrap();
+}
+
+#[cfg(windows)]
+#[tokio::test]
+async fn product_windows_source_capture_is_unqualified_without_reading_files() {
+    let (dir, conn) = support::open_pool(1).await;
+    migrate_roundtable(&conn).await.unwrap();
+    let service = RoundtableService::open(
+        ServiceConfig {
+            data_dir: dir.path().into(),
+            db_path: dir.path().join("roundtable.db"),
+            db_identity: DbIdentity::new("windows-source-denial").unwrap(),
+            discover: None,
+        },
+        open_roundtable_store(conn.clone()).await.unwrap(),
+        Arc::new(NoModel),
+    )
+    .await
+    .unwrap();
+    let error = service.execute_fake_command(&actor(1), "roundtable_create", json!({
+        "request_id":uuid::Uuid::new_v4(),"config":config(),"selected_source_paths":["secret.txt"]
+    })).await.unwrap_err();
+    assert_eq!(error.code, ErrorCode::PolicyUnenforceable);
+    assert_eq!(
+        error.details.reason.as_deref(),
+        Some("source_capture_unqualified")
+    );
+    assert_eq!(
+        support::scalar_i64(&conn, "SELECT COUNT(*) FROM rt_rooms").await,
+        0
+    );
+    assert!(!dir.path().join("roundtable/objects").exists());
+    service.shutdown().await.unwrap();
+}
+
+#[cfg(not(windows))]
+#[tokio::test]
+async fn product_failed_create_retains_objects_and_respects_remaining_storage_quota() {
+    use sea_orm::{ConnectionTrait, DbBackend, Statement};
+    let (dir, conn) = support::open_pool(1).await;
+    migrate_roundtable(&conn).await.unwrap();
+    let workspace = dir.path().canonicalize().unwrap().join("workspace");
+    std::fs::create_dir(&workspace).unwrap();
+    std::fs::write(workspace.join("selected.txt"), "retained after DB rollback").unwrap();
+    conn.execute(Statement::from_string(
+        DbBackend::Sqlite,
+        "CREATE TABLE folder(id INTEGER PRIMARY KEY,path TEXT,deleted_at TEXT,kind TEXT)",
+    ))
+    .await
+    .unwrap();
+    conn.execute(Statement::from_sql_and_values(
+        DbBackend::Sqlite,
+        "INSERT INTO folder(id,path,kind) VALUES(7,?,'regular')",
+        vec![workspace.to_string_lossy().to_string().into()],
+    ))
+    .await
+    .unwrap();
+    conn.execute(Statement::from_string(DbBackend::Sqlite,"CREATE TRIGGER fail_room BEFORE INSERT ON rt_rooms BEGIN SELECT RAISE(ABORT,'fixture failure'); END")).await.unwrap();
+    let service = RoundtableService::open(
+        ServiceConfig {
+            data_dir: dir.path().into(),
+            db_path: dir.path().join("roundtable.db"),
+            db_identity: DbIdentity::new("capture-retention-quota").unwrap(),
+            discover: None,
+        },
+        open_roundtable_store(conn.clone()).await.unwrap(),
+        Arc::new(NoModel),
+    )
+    .await
+    .unwrap();
+    let mut selected = config();
+    selected["workspace_id"] = json!("7");
+    let error = service.execute_fake_command(&actor(1),"roundtable_create",json!({
+        "request_id":uuid::Uuid::new_v4(),"config":selected,"selected_source_paths":["selected.txt"]
+    })).await.unwrap_err();
+    assert_eq!(error.code, ErrorCode::StorageUnavailable);
+    assert_eq!(
+        support::scalar_i64(&conn, "SELECT COUNT(*) FROM rt_rooms").await,
+        0
+    );
+    assert_eq!(
+        support::scalar_i64(&conn, "SELECT COUNT(*) FROM rt_source_manifests").await,
+        0
+    );
+    let objects = dir.path().join("roundtable/objects");
+    let retained: Vec<_> = std::fs::read_dir(&objects)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .collect();
+    assert_eq!(retained.len(), 1);
+    assert_eq!(
+        std::fs::read(&retained[0]).unwrap(),
+        b"retained after DB rollback"
+    );
+    conn.execute(Statement::from_string(
+        DbBackend::Sqlite,
+        "DROP TRIGGER fail_room",
+    ))
+    .await
+    .unwrap();
+    // Sparse fixture models retained storage pressure without allocating 256 MiB of RAM.
+    std::fs::File::create(objects.join("storage-pressure-fixture"))
+        .unwrap()
+        .set_len(256 * 1024 * 1024)
+        .unwrap();
+    let full=service.execute_fake_command(&actor(1),"roundtable_create",json!({
+        "request_id":uuid::Uuid::new_v4(),"config":selected,"selected_source_paths":["selected.txt"]
+    })).await.unwrap_err();
+    assert_eq!(full.details.reason.as_deref(), Some("storage_quota"));
+    assert_eq!(
+        support::scalar_i64(&conn, "SELECT COUNT(*) FROM rt_rooms").await,
+        0
+    );
+    assert!(
+        retained[0].exists(),
+        "no unimplemented garbage collection may be assumed"
+    );
+    service.shutdown().await.unwrap();
+}

@@ -5,7 +5,7 @@
 //! possible only when every required check has real evidence. A label, a fake
 //! broker, or a fake FD is not that evidence.
 //!
-//! The ignored live entry is not a certificate. This host's archived verdict
+//! The product probe is tested separately. This host's archived verdict
 //! is `blocked_platform` / `not_tested` and is not G1.
 
 use std::collections::BTreeSet;
@@ -1462,23 +1462,42 @@ async fn archived_linux_codex_report_is_not_passed() {
     }
 }
 
-/// Live qualification entry. Ignored until a Debian host, exact profile,
-/// synthetic fixtures, model service, and spend limit are approved together.
-/// Running it with `--ignored` must not install, log in, call a model, or
-/// turn into a pass.
+/// The product probe must not invent a certificate when this host has no
+/// working isolator. A real pass is `codeg-server roundtable-qualify` on a
+/// prepared Debian host, not this test.
 #[tokio::test(flavor = "current_thread")]
-#[ignore = "live linux-codex-2.1.1 qualification is not approved; ignored is not a pass"]
-async fn linux_codex_2_1_1_live_experiment() {
-    let profile = this_host_profile();
-    assert!(
-        !profile.platform_blocked && profile.host_os_name == "linux",
-        "refusing to treat this host as a passed adapter qualification"
-    );
-    let report = qualify_adapter(&profile, &absent_approval(), &this_host_cases())
-        .await
-        .expect("checker");
-    assert_ne!(report.verdict, CheckStatus::Passed);
-    assert!(!report.g1_passed);
-    assert!(!report.qualification_issued);
-    panic!("no approved live probe is embedded; refusing to install, log in, or call a model");
+async fn live_probe_fails_closed_without_an_isolator() {
+    let root = std::env::temp_dir().join(format!(
+        "rt-qualify-closed-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    ));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(root.join("rootfs")).expect("rootfs");
+    let bindings = root.join("bindings.json");
+    std::fs::write(
+        &bindings,
+        r#"[{"provider_ref":"provider:grok","model":"grok-4","origin":"https://api.x.ai","credential_env":"XAI_API_KEY","supported_efforts":[]}]"#,
+    )
+    .expect("bindings");
+    let outcome =
+        codeg_lib::roundtable::qualify_adapter_on_host(codeg_lib::roundtable::ProbeRequest {
+            data_dir: root.join("data"),
+            agent: "grok".into(),
+            rootfs: root.join("rootfs"),
+            crun: root.join("missing-crun"),
+            cgroup_root: root.join("missing-cgroup"),
+            runtime_root: root.join("oci"),
+            provider_bindings: bindings,
+            home: root.join("home"),
+            profile_id: None,
+        })
+        .await;
+    assert!(!outcome.qualification_issued);
+    assert_ne!(outcome.verdict, "passed");
+    assert!(!root.join("data/roundtable/qualified-runtime.json").exists());
+    let _ = std::fs::remove_dir_all(&root);
 }

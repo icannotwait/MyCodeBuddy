@@ -22,7 +22,7 @@ use super::tool_core::AttemptToken;
 
 pub const ATTEMPT_TOKEN_ENV: &str = "CODEG_ROUNDTABLE_ATTEMPT_TOKEN";
 
-mod transport;
+pub(super) mod transport;
 pub use transport::{ServiceBroker, ServiceConnection};
 
 const LEGACY_HELP: &str = "codeg-mcp --parent-connection-id <uuid> --socket-path <path> --token <secret> [--parent-pid <pid>] [--features delegation,coordination_v1,feedback,ask,sessions,workflow_v2] [--role root|delegation_child] [--can-spawn-child true|false] [--disabled-agents <agent>,...] [--custom-agents <ignored>]";
@@ -331,6 +331,15 @@ pub struct ServiceProcess {
 }
 
 impl ServiceProcess {
+    #[cfg(test)]
+    pub(crate) fn for_experiment(socket_path: String, incarnation: String, token: String) -> Self {
+        Self {
+            token,
+            socket_path,
+            incarnation,
+        }
+    }
+
     pub fn reads_host_parent_pid(&self) -> bool {
         false
     }
