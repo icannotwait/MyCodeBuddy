@@ -32,7 +32,7 @@ export function PreflightConfirmation({
 }) {
   const t = useTranslations("Roundtable")
   return (
-    <dl className="space-y-2 break-words">
+    <dl className="min-w-0 space-y-2 [overflow-wrap:anywhere]">
       <dt>{t("targets")}</dt>
       <dd>
         <ul>
@@ -87,7 +87,7 @@ export function PreflightConfirmation({
                   {entry.text_admissible && onPreview ? (
                     <button
                       type="button"
-                      className="ml-2 underline"
+                      className="ms-2 rounded-sm text-start underline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring"
                       onClick={() => onPreview(entry)}
                     >
                       {t("previewSource")}: {entry.path}
@@ -95,7 +95,7 @@ export function PreflightConfirmation({
                   ) : null}
                   {!entry.text_admissible ? <p>{t("binarySource")}</p> : null}
                   {sourcePreviews[entry.content_hash] !== undefined ? (
-                    <pre className="whitespace-pre-wrap break-words">
+                    <pre className="min-w-0 whitespace-pre-wrap [overflow-wrap:anywhere]">
                       {sourcePreviews[entry.content_hash]}
                     </pre>
                   ) : null}

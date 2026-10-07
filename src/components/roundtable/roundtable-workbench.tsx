@@ -40,6 +40,7 @@ import { Input } from "@/components/ui/input"
 import { Textarea } from "@/components/ui/textarea"
 import { PreflightConfirmation } from "./preflight-confirmation"
 import { RoundtableSafeContent } from "./roundtable-safe-content"
+import { RoundtableRoomList } from "./roundtable-room-list"
 
 type LoadedRoom = Awaited<ReturnType<typeof loadRoundtable>>
 type RoomSummary = { room_id: string; status: string; config: RoundtableConfig }
@@ -57,7 +58,18 @@ export function RoundtableWorkbench({
   const [providers, setProviders] = useState<ModelProviderInfo[]>([])
   const [rooms, setRooms] = useState<RoomSummary[]>([])
   const [listCursor, setListCursor] = useState<string | null>(null)
+  const [listLoading, setListLoading] = useState(!!workspaceId)
+  const [listError, setListError] = useState<string | null>(null)
+  const listInFlight = useRef(false)
+  const listGeneration = useRef(0)
+  const [providersLoading, setProvidersLoading] = useState(true)
+  const [providersError, setProvidersError] = useState<string | null>(null)
+  const providersInFlight = useRef(false)
+  const providersGeneration = useRef(0)
   const [loaded, setLoaded] = useState<LoadedRoom | null>(null)
+  const [roomLoading, setRoomLoading] = useState(!!roomId)
+  const [roomError, setRoomError] = useState<string | null>(null)
+  const [streamError, setStreamError] = useState<string | null>(null)
   const [topic, setTopic] = useState("")
   const [selectedSourcePaths, setSelectedSourcePaths] = useState("")
   const [sourcePreviews, setSourcePreviews] = useState<Record<string, string>>(
@@ -83,6 +95,7 @@ export function RoundtableWorkbench({
     {}
   )
   const [busy, setBusy] = useState(false)
+  const actionInFlight = useRef(false)
   const [error, setError] = useState<string | null>(null)
   const [interjection, setInterjection] = useState("")
   const [interjectMode, setInterjectMode] = useState("next_phase")
@@ -99,6 +112,8 @@ export function RoundtableWorkbench({
   )
 
   const run = useCallback(async (action: () => Promise<void>) => {
+    if (actionInFlight.current) return
+    actionInFlight.current = true
     setBusy(true)
     setError(null)
     try {
@@ -106,41 +121,87 @@ export function RoundtableWorkbench({
     } catch (error) {
       setError(roundtableError(error))
     } finally {
+      actionInFlight.current = false
       setBusy(false)
     }
   }, [])
 
   const listRooms = useCallback(
     async (cursor?: string) => {
-      const page = await roundtableCall<{
-        rooms: RoomSummary[]
-        cursor: string | null
-      }>("roundtable_list", {
-        workspace_id: workspaceId,
-        limit: 100,
-        ...(cursor ? { cursor } : {}),
-      })
-      setRooms((previous) =>
-        cursor ? [...previous, ...page.rooms] : page.rooms
-      )
-      setListCursor(page.cursor)
+      if (!workspaceId || listInFlight.current) return
+      listInFlight.current = true
+      const generation = ++listGeneration.current
+      setListLoading(true)
+      setListError(null)
+      try {
+        const page = await roundtableCall<{
+          rooms: RoomSummary[]
+          cursor: string | null
+        }>("roundtable_list", {
+          workspace_id: workspaceId,
+          limit: 100,
+          ...(cursor ? { cursor } : {}),
+        })
+        if (generation !== listGeneration.current) return
+        setRooms((previous) =>
+          Array.from(
+            new Map(
+              [...(cursor ? previous : []), ...page.rooms].map((room) => [
+                room.room_id,
+                room,
+              ])
+            ).values()
+          )
+        )
+        setListCursor(page.cursor)
+      } catch (error) {
+        if (generation === listGeneration.current)
+          setListError(roundtableError(error))
+      } finally {
+        if (generation === listGeneration.current) {
+          listInFlight.current = false
+          setListLoading(false)
+        }
+      }
     },
     [workspaceId]
   )
 
   useEffect(() => {
-    let live = true
-    Promise.all([listModelProviders(), listRooms()])
-      .then(([items]) => {
-        if (live) setProviders(items)
-      })
-      .catch((error) => {
-        if (live) setError(roundtableError(error))
-      })
+    void listRooms()
     return () => {
-      live = false
+      listGeneration.current += 1
+      listInFlight.current = false
     }
   }, [listRooms])
+
+  const loadProviders = useCallback(async () => {
+    if (providersInFlight.current) return
+    providersInFlight.current = true
+    const generation = ++providersGeneration.current
+    setProvidersLoading(true)
+    setProvidersError(null)
+    try {
+      const items = await listModelProviders()
+      if (generation === providersGeneration.current) setProviders(items)
+    } catch (error) {
+      if (generation === providersGeneration.current)
+        setProvidersError(roundtableError(error))
+    } finally {
+      if (generation === providersGeneration.current) {
+        providersInFlight.current = false
+        setProvidersLoading(false)
+      }
+    }
+  }, [])
+
+  useEffect(() => {
+    void loadProviders()
+    return () => {
+      providersGeneration.current += 1
+      providersInFlight.current = false
+    }
+  }, [loadProviders])
 
   useEffect(() => {
     if (!roomId) return
@@ -148,6 +209,9 @@ export function RoundtableWorkbench({
     let syncing = false
     let previous: RoundtableProjection | null = null
     let unsubscribe: (() => void) | undefined
+    setRoomLoading(true)
+    setRoomError(null)
+    setStreamError(null)
     const transport = getTransport()
     const subscriptionId = crypto.randomUUID()
     const attach = () =>
@@ -188,31 +252,37 @@ export function RoundtableWorkbench({
           )
           previous = latest.projection
           setLoaded(latest)
-          setError(null)
+          setRoomError(null)
         }
       } catch (error) {
         previous = null
         if (live) {
           setPreviews({})
-          setError(roundtableError(error))
+          setRoomError(roundtableError(error))
         }
       } finally {
         syncing = false
+        if (live) setRoomLoading(false)
       }
     }
     const reconnect = transport.onReconnect?.(() => {
+      if (!live) return
       previous = null
       setPreviews({})
+      void sync()
       void attach()
-        .then(sync)
+        .then(() => {
+          if (live) setStreamError(null)
+        })
         .catch((error) => {
-          if (live) setError(roundtableError(error))
+          if (live) setStreamError(roundtableError(error))
         })
     })
     void (async () => {
       unsubscribe = await transport.subscribe(
         `roundtable://${subscriptionId}`,
         (payload: unknown) => {
+          if (!live) return
           if (
             previous &&
             payload &&
@@ -244,10 +314,12 @@ export function RoundtableWorkbench({
         return
       }
       await attach()
-      await sync()
+      if (live) setStreamError(null)
     })().catch((error) => {
-      if (live) setError(roundtableError(error))
+      if (live) setStreamError(roundtableError(error))
     })
+    // Reading verified history must not depend on the live-update channel.
+    void sync()
     // Private notification delivery is best effort; immutable reads recover loss.
     const timer = window.setInterval(() => {
       void sync()
@@ -450,6 +522,7 @@ export function RoundtableWorkbench({
     })
   const canRun =
     !uncertainPaid &&
+    (!roomId || (!!loaded && !roomError && !roomLoading)) &&
     preflight?.enabled === true &&
     preflight.readiness === "ready" &&
     !preflight.error &&
@@ -471,7 +544,8 @@ export function RoundtableWorkbench({
     !editingDraft
   const projection = loaded?.projection
   const status = projection?.body.status
-  const buttonClass = "justify-start"
+  const buttonClass =
+    "h-auto min-h-9 max-w-full justify-start whitespace-normal py-2 text-start"
   const editDraft = () => {
     const members = [...config.participants].sort(
       (left, right) => left.ordinal - right.ordinal
@@ -490,13 +564,21 @@ export function RoundtableWorkbench({
   }
 
   return (
-    <main className="mx-auto flex max-w-5xl flex-col gap-5 overflow-auto p-6">
-      <header className="flex items-center justify-between">
-        <h1 className="text-2xl font-semibold">{t("title")}</h1>
-        <Link href="/workspace">{t("back")}</Link>
+    <main className="mx-auto flex w-full min-w-0 max-w-6xl flex-col gap-5 overflow-auto p-4 sm:p-6">
+      <header className="flex flex-wrap items-center justify-between gap-3 border-b pb-4">
+        <h1 className="text-2xl font-semibold tracking-tight">{t("title")}</h1>
+        <Link
+          href="/workspace"
+          className="rounded-md text-sm text-muted-foreground hover:text-foreground focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring"
+        >
+          {t("back")}
+        </Link>
       </header>
       {error ? (
-        <p role="alert" className="text-destructive">
+        <p
+          role="alert"
+          className="rounded-lg border border-destructive/30 bg-destructive/5 p-3 text-sm text-destructive [overflow-wrap:anywhere]"
+        >
           {error}
         </p>
       ) : null}
@@ -516,40 +598,62 @@ export function RoundtableWorkbench({
           </Button>
         </section>
       ) : null}
-      <div className="grid gap-6 md:grid-cols-[15rem_1fr]">
-        <aside className="flex flex-col gap-2">
-          <Link
-            href={`/roundtable?workspace_id=${encodeURIComponent(workspaceId)}`}
-          >
-            {t("new")}
-          </Link>
-          <Button variant="outline" onClick={() => void run(() => listRooms())}>
-            {t("refresh")}
-          </Button>
-          <ul>
-            {rooms.map((room) => (
-              <li key={room.room_id} className="py-2">
-                <Link
-                  href={`/roundtable?workspace_id=${encodeURIComponent(workspaceId)}&room_id=${encodeURIComponent(room.room_id)}`}
-                >
-                  {room.config.topic}
-                  <span className="block text-xs text-muted-foreground">
-                    {room.status}
-                  </span>
-                </Link>
-              </li>
-            ))}
-          </ul>
-          {listCursor ? (
-            <Button
-              variant="outline"
-              onClick={() => void run(() => listRooms(listCursor))}
-            >
-              {t("more")}
-            </Button>
+      <div className="grid min-w-0 gap-5 md:grid-cols-[15rem_minmax(0,1fr)]">
+        <RoundtableRoomList
+          workspaceId={workspaceId}
+          roomId={roomId}
+          rooms={rooms}
+          loading={listLoading}
+          error={listError}
+          cursor={listCursor}
+          onRefresh={() => void listRooms()}
+          onMore={() => {
+            if (listCursor) void listRooms(listCursor)
+          }}
+        />
+        <section className="flex min-w-0 flex-col gap-5 rounded-xl border bg-card p-4 [overflow-wrap:anywhere] sm:p-5 [&_button]:h-auto [&_button]:min-h-9 [&_button]:max-w-full [&_button]:whitespace-normal [&_button]:py-2 [&_select]:max-w-full">
+          {providersError && (!roomId || editingDraft) ? (
+            <div role="alert" className="space-y-2 text-sm text-destructive">
+              <p>{providersError}</p>
+              <Button
+                variant="outline"
+                disabled={providersLoading}
+                onClick={() => void loadProviders()}
+              >
+                {t("retryProviders")}
+              </Button>
+            </div>
           ) : null}
-        </aside>
-        <section className="flex flex-col gap-4">
+          {roomError ? (
+            <div
+              role="alert"
+              className="space-y-2 rounded-lg border border-destructive/30 bg-destructive/5 p-3 text-sm text-destructive"
+            >
+              {loaded ? <p>{t("refreshFailed")}</p> : null}
+              <p>{roomError}</p>
+              <Button
+                variant="outline"
+                disabled={roomLoading}
+                onClick={() => setRefresh((value) => value + 1)}
+              >
+                {t("retryLoad")}
+              </Button>
+            </div>
+          ) : null}
+          {streamError ? (
+            <div className="space-y-2 rounded-lg border p-3 text-sm text-muted-foreground">
+              <p role="status">{t("liveUpdatesUnavailable")}</p>
+              {!roomError ? (
+                <Button
+                  variant="outline"
+                  disabled={roomLoading}
+                  onClick={() => setRefresh((value) => value + 1)}
+                >
+                  {t("retryLoad")}
+                </Button>
+              ) : null}
+            </div>
+          ) : null}
           {!roomId || editingDraft ? (
             <>
               <label>
@@ -589,7 +693,7 @@ export function RoundtableWorkbench({
               {roles.map((role, index) => (
                 <fieldset
                   key={index}
-                  className="grid gap-2 rounded-lg border p-3"
+                  className="grid min-w-0 gap-3 rounded-lg border p-3"
                 >
                   <legend>
                     {t("member")} {index + 1}
@@ -656,7 +760,7 @@ export function RoundtableWorkbench({
                   </label>
                 </fieldset>
               ))}
-              <div className="flex gap-2">
+              <div className="flex flex-wrap gap-2">
                 <Button
                   variant="outline"
                   disabled={roles.length >= 7}
@@ -737,14 +841,16 @@ export function RoundtableWorkbench({
             </>
           ) : projection ? (
             <>
-              <h2 className="text-xl">{config.topic}</h2>
-              <p>
+              <h2 className="text-xl font-semibold leading-relaxed tracking-tight">
+                {config.topic}
+              </h2>
+              <p className="text-sm text-muted-foreground">
                 {t("status")}: {status}
               </p>
               {projection.body.blocked_reason ? (
                 <p role="status">{projection.body.blocked_reason}</p>
               ) : null}
-              <ol>
+              <ol className="space-y-2 rounded-lg bg-muted/40 p-3 text-sm leading-relaxed">
                 {projection.body.replay.speakers.map((speaker) => (
                   <li key={speaker.speaker_id}>
                     {speaker.role === "moderator"
@@ -772,14 +878,15 @@ export function RoundtableWorkbench({
                 ))}
               <section
                 aria-label={t("results")}
-                className="flex flex-col gap-3"
+                className="flex min-w-0 flex-col gap-3"
               >
+                <h3 className="text-sm font-semibold">{t("results")}</h3>
                 {loaded?.messages
                   .filter((message) => message.visibility !== "void")
                   .map((message) => (
                     <div
                       key={message.message_id}
-                      className="rounded-lg border p-3"
+                      className="min-w-0 space-y-3 rounded-lg border bg-background p-4"
                     >
                       <p className="text-xs text-muted-foreground">
                         {message.visibility === "published"
@@ -794,8 +901,10 @@ export function RoundtableWorkbench({
                         }
                         preview={false}
                       />
-                      <details>
-                        <summary>{t("details")}</summary>
+                      <details className="min-w-0 border-t pt-3 text-sm">
+                        <summary className="cursor-pointer rounded-sm text-muted-foreground focus-visible:outline-2 focus-visible:outline-ring">
+                          {t("details")}
+                        </summary>
                         <RoundtableSafeContent
                           text={JSON.stringify(message.body, null, 2)}
                           preview={false}
@@ -851,14 +960,15 @@ export function RoundtableWorkbench({
                   ))}
               </section>
             </>
-          ) : (
+          ) : !roomError ? (
             <p role="status">{t("loading")}</p>
-          )}
+          ) : null}
           <Button
             variant="outline"
             disabled={
               busy ||
               !workspaceId ||
+              (!!roomId && (!loaded || !!roomError || roomLoading)) ||
               !sourceSelectionValid ||
               editingDraft ||
               (!roomId && (!topic.trim() || providers.length === 0))
@@ -1043,7 +1153,7 @@ export function RoundtableWorkbench({
                 </Button>
                 <Button
                   variant="outline"
-                  disabled={busy}
+                  disabled={busy || !loaded || !!roomError || roomLoading}
                   onClick={() =>
                     void run(async () => {
                       setUsage(

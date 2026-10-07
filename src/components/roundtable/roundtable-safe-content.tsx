@@ -17,8 +17,11 @@ export function RoundtableSafeContent({
     .replace(/思考过程/g, "")
     .replace(/sk-[a-z0-9-]+/gi, "[redacted]")
   return (
-    <article dir={rtl === undefined ? "auto" : rtl ? "rtl" : "ltr"}>
-      <p className="whitespace-pre-wrap break-words">{visible}</p>
+    <article
+      className="min-w-0"
+      dir={rtl === undefined ? "auto" : rtl ? "rtl" : "ltr"}
+    >
+      <p className="whitespace-pre-wrap [overflow-wrap:anywhere]">{visible}</p>
       {preview ? (
         <>
           <p>{t("preview")}</p>

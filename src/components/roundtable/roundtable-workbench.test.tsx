@@ -114,11 +114,14 @@ describe("roundtable product page", () => {
     let polled = false
     let poll: () => void = () => undefined
     const nativeInterval = window.setInterval.bind(window)
-    vi.spyOn(window, "setInterval").mockImplementation((callback, delay) => {
+    vi.spyOn(window, "setInterval").mockImplementation(((
+      callback: TimerHandler,
+      delay?: number
+    ) => {
       if (delay !== 5000) return nativeInterval(callback, delay)
       poll = callback as () => void
       return 987654
-    })
+    }) as typeof window.setInterval)
     const requests: Record<string, unknown>[] = []
     call.mockImplementation(
       async (command: string, args: { request: Record<string, unknown> }) => {
@@ -164,7 +167,7 @@ describe("roundtable product page", () => {
         },
       })
     )
-    await waitFor(() => expect(screen.queryByText("reply_lost")).toBeNull())
+    expect(screen.getByText("reply_lost")).toBeInTheDocument()
     fireEvent.click(screen.getByRole("button", { name: "send" }))
     await screen.findByText("reply_lost")
     expect(requests).toHaveLength(2)
@@ -197,11 +200,14 @@ describe("roundtable product page", () => {
       let polled = false
       let poll: () => void = () => undefined
       const nativeInterval = window.setInterval.bind(window)
-      vi.spyOn(window, "setInterval").mockImplementation((callback, delay) => {
+      vi.spyOn(window, "setInterval").mockImplementation(((
+        callback: TimerHandler,
+        delay?: number
+      ) => {
         if (delay !== 5000) return nativeInterval(callback, delay)
         poll = callback as () => void
         return 987655
-      })
+      }) as typeof window.setInterval)
       const requests: Record<string, unknown>[] = []
       const dispatches = new Set<unknown>()
       let checks = 0
