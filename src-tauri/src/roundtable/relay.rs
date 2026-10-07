@@ -7,6 +7,7 @@ use roundtable_protocol::{ErrorCode, RtResult};
 
 use super::rt_error;
 
+pub const SANDBOX_ORIGIN: &str = "http://127.0.0.1:39173";
 pub const SANDBOX_ENDPOINT: &str = "http://127.0.0.1:39173/v1";
 
 #[derive(Debug)]

@@ -249,6 +249,9 @@ fn sandbox_gateway_env_is_adapter_specific_and_not_a_host_secret() {
     assert!(antigravity
         .iter()
         .any(|(key, value)| key == "AGY_ACP_ENABLE_GATEWAY_AUTH" && value == "1"));
+    assert!(antigravity.iter().any(|(key, value)| {
+        key == "AGY_ACP_CCPA_BASE_URL" && value == "http://127.0.0.1:39173"
+    }));
     let cursor = profile_for_agent("cursor")
         .expect("cursor")
         .model_gateway

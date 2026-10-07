@@ -25,6 +25,11 @@ use super::qualification_experiment::{
 };
 use super::qualification_probe::{ProbeCheck, ProbeFacts, ProbeRequest};
 use super::qualification_profiles::{profile_by_id, profile_for_agent};
+#[cfg(test)]
+use super::qualification_profiles::{
+    write_antigravity_gateway_settings, ANTIGRAVITY_GATEWAY_SETTINGS_BODY,
+    ANTIGRAVITY_GATEWAY_SETTINGS_DEST, ANTIGRAVITY_GATEWAY_SETTINGS_REL,
+};
 use super::relay::SANDBOX_ENDPOINT;
 use super::sandbox::{AuthMount, QualifiedOciProfile};
 
@@ -822,11 +827,15 @@ async fn run_acp(
     let scratch = request.runtime_root.join("probe-scratch");
     let _ = fs::create_dir_all(&scratch);
     let mut mounts = vec![(scratch.clone(), "/scratch".into(), false)];
-    let socket_path = request
-        .runtime_root
-        .join("probe-acp")
-        .join(uuid::Uuid::new_v4().simple().to_string())
-        .join("roundtable.sock");
+    let socket_path = super::companion::transport::short_socket_path("a");
+    super::companion::transport::ensure_unix_socket_path(&socket_path.to_string_lossy()).map_err(
+        |error| {
+            error
+                .details
+                .reason
+                .unwrap_or_else(|| "socket_path_too_long".into())
+        },
+    )?;
     let recipient = facts_model(request);
     let fixture = Hash256::sha256(request.agent.as_bytes());
     let experiment =
@@ -1306,9 +1315,15 @@ async fn start_probe_gateway(
                 .unwrap_or_else(|| "probe_gateway".into())
         })?,
     );
-    let directory = request.runtime_root.join("probe-gateway");
-    fs::create_dir_all(&directory).map_err(|error| error.to_string())?;
-    let path = directory.join(format!("{}.sock", uuid::Uuid::new_v4().simple()));
+    let path = super::companion::transport::short_socket_path("g");
+    super::companion::transport::ensure_unix_socket_path(&path.to_string_lossy()).map_err(
+        |error| {
+            error
+                .details
+                .reason
+                .unwrap_or_else(|| "socket_path_too_long".into())
+        },
+    )?;
     let _ = fs::remove_file(&path);
     let server = LiveGatewayServer::bind(&path, gateway)
         .await
@@ -1382,6 +1397,10 @@ fn prepare_bundle(
     }
     let upper = scratch_home_dir(&request.runtime_root, &request.agent, &id);
     fs::create_dir_all(&upper).map_err(|error| error.to_string())?;
+    if select_profile(request).is_some_and(super::qualification_profiles::antigravity_profile) {
+        super::qualification_profiles::write_antigravity_gateway_settings(&upper)
+            .map_err(|error| error.to_string())?;
+    }
     let home_guard = RemoveOnDrop::arm(upper.clone());
     oci_mounts.push(serde_json::json!({
         "destination": "/rt-home",
@@ -1582,6 +1601,12 @@ fn append_host_auth_mounts(
         })
         .unwrap_or_default();
     for (source, destination) in overlays {
+        if destination.as_str() == super::qualification_profiles::ANTIGRAVITY_GATEWAY_SETTINGS_DEST
+        {
+            // The attempt home already has the non-secret gateway settings.
+            // A host oauth settings.json would hide auth.type=gateway.
+            continue;
+        }
         if !allowed.iter().any(|item| *item == destination.as_str()) {
             return Err(format!(
                 "auth destination is not in the adapter profile: {destination}"
@@ -2338,5 +2363,48 @@ mod host_auth_mounts {
         )
         .expect_err("foreign destination");
         assert!(error.contains("not in the adapter profile"), "{error}");
+    }
+
+    #[test]
+    fn antigravity_attempt_home_gets_gateway_settings_not_the_host_file() {
+        let root = tempfile::tempdir().expect("temp");
+        let upper = root.path().join("upper");
+        fs::create_dir_all(&upper).expect("upper");
+        let host = root.path().join("settings.json");
+        let oauth = br#"{"auth":{"type":"oauth-personal"}}"#;
+        fs::write(&host, oauth).expect("host settings");
+        write_antigravity_gateway_settings(&upper).expect("gateway settings");
+        let profile = profile_for_agent("antigravity").expect("antigravity");
+        let mut mounts = Vec::new();
+        append_host_auth_mounts(
+            &mut mounts,
+            &upper,
+            &[(host.clone(), ANTIGRAVITY_GATEWAY_SETTINGS_DEST.to_string())],
+            Some(profile),
+        )
+        .expect("skip host settings");
+        assert!(mounts.is_empty(), "{mounts:?}");
+        assert_eq!(
+            fs::read(upper.join(ANTIGRAVITY_GATEWAY_SETTINGS_REL)).expect("written"),
+            ANTIGRAVITY_GATEWAY_SETTINGS_BODY
+        );
+        assert_eq!(fs::read(&host).expect("host unchanged"), oauth);
+        let token = root.path().join("acp_token.json");
+        fs::write(&token, b"{\"access_token\":\"secret\"}").expect("token");
+        append_host_auth_mounts(
+            &mut mounts,
+            &upper,
+            &[(
+                token,
+                "/rt-home/.gemini/antigravity-acp/acp_token.json".into(),
+            )],
+            Some(profile),
+        )
+        .expect("token overlay");
+        assert_eq!(mounts.len(), 1);
+        assert_eq!(
+            fs::read(upper.join(ANTIGRAVITY_GATEWAY_SETTINGS_REL)).expect("still gateway"),
+            ANTIGRAVITY_GATEWAY_SETTINGS_BODY
+        );
     }
 }

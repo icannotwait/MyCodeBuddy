@@ -51,6 +51,9 @@ pub struct AdapterProfile {
 pub struct ModelGatewayEnv {
     pub base_url_keys: &'static [&'static str],
     pub bearer_keys: &'static [&'static str],
+    /// Keys whose value is the relay origin with no `/v1` suffix. Antigravity's
+    /// cloud-code client appends `/v1internal:...` to this base.
+    pub origin_keys: &'static [&'static str],
     pub fixed: &'static [(&'static str, &'static str)],
 }
 
@@ -62,6 +65,9 @@ impl ModelGatewayEnv {
                 (*key).to_string(),
                 super::relay::SANDBOX_ENDPOINT.to_string(),
             ));
+        }
+        for key in self.origin_keys {
+            entries.push(((*key).to_string(), super::relay::SANDBOX_ORIGIN.to_string()));
         }
         for key in self.bearer_keys {
             entries.push(((*key).to_string(), bearer.to_string()));
@@ -76,12 +82,14 @@ impl ModelGatewayEnv {
 const NO_MODEL_GATEWAY: ModelGatewayEnv = ModelGatewayEnv {
     base_url_keys: &[],
     bearer_keys: &[],
+    origin_keys: &[],
     fixed: &[],
 };
 
 const OPENAI_GATEWAY: ModelGatewayEnv = ModelGatewayEnv {
     base_url_keys: &["OPENAI_BASE_URL"],
     bearer_keys: &["OPENAI_API_KEY"],
+    origin_keys: &[],
     fixed: &[],
 };
 
@@ -90,20 +98,42 @@ const OPENAI_GATEWAY: ModelGatewayEnv = ModelGatewayEnv {
 const GROK_GATEWAY: ModelGatewayEnv = ModelGatewayEnv {
     base_url_keys: &["GROK_XAI_API_BASE_URL"],
     bearer_keys: &["XAI_API_KEY"],
+    origin_keys: &[],
     fixed: &[],
 };
 
-/// Antigravity 1.3.0 reads its own gateway variables. The enable flag selects
-/// gateway auth so the sandbox does not need the host token files.
+/// Antigravity 1.3.0 reads its own gateway variables. `auth.type=gateway` is
+/// not an `authenticate` method; the attempt home must contain
+/// `settings.json` before the process starts. The cloud-code base is the
+/// relay origin so `/v1internal:...` is forwarded unchanged.
 const ANTIGRAVITY_GATEWAY: ModelGatewayEnv = ModelGatewayEnv {
-    base_url_keys: &[
-        "AGY_LLM_GATEWAY_URL",
-        "AGY_GATEWAY_URL",
-        "AGY_ACP_CCPA_BASE_URL",
-    ],
+    base_url_keys: &["AGY_LLM_GATEWAY_URL", "AGY_GATEWAY_URL"],
     bearer_keys: &["AGY_LLM_GATEWAY_API_KEY", "AGY_GATEWAY_API_KEY"],
+    origin_keys: &["AGY_ACP_CCPA_BASE_URL"],
     fixed: &[("AGY_ACP_ENABLE_GATEWAY_AUTH", "1")],
 };
+
+/// Non-secret file the ACP server reads at process start. `gateway` is absent
+/// from `authMethods`, so `authenticate` cannot select it.
+pub const ANTIGRAVITY_GATEWAY_SETTINGS_REL: &str = ".gemini/antigravity-acp/settings.json";
+pub const ANTIGRAVITY_GATEWAY_SETTINGS_DEST: &str =
+    "/rt-home/.gemini/antigravity-acp/settings.json";
+pub const ANTIGRAVITY_GATEWAY_SETTINGS_BODY: &[u8] = b"{\"auth\":{\"type\":\"gateway\"}}\n";
+
+pub fn antigravity_profile(profile: &AdapterProfile) -> bool {
+    profile
+        .container_env
+        .iter()
+        .any(|(key, _)| *key == "GEMINI_HOME")
+}
+
+pub fn write_antigravity_gateway_settings(upper: &std::path::Path) -> std::io::Result<()> {
+    let path = upper.join(ANTIGRAVITY_GATEWAY_SETTINGS_REL);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(path, ANTIGRAVITY_GATEWAY_SETTINGS_BODY)
+}
 
 const DEBIAN: &[AcceptedOs] = &[
     AcceptedOs {
@@ -262,7 +292,10 @@ const ANTIGRAVITY_AUTH: &[AuthFile] = &[
     AuthFile {
         home_relative: ".gemini/antigravity-acp/settings.json",
         destination: "/rt-home/.gemini/antigravity-acp/settings.json",
-        required: true,
+        // The attempt writes a non-secret gateway settings file. A missing
+        // host copy is not a credential failure, and a host copy must not
+        // be mounted over the gateway file.
+        required: false,
     },
     AuthFile {
         home_relative: ".gemini/antigravity-acp/acp_token.json",

@@ -119,6 +119,7 @@ impl ServiceBroker {
         authority: Arc<GateToolAuthority>,
         store: Arc<dyn ToolStore>,
     ) -> RtResult<Self> {
+        ensure_unix_socket_path(path)?;
         #[cfg(unix)]
         let listener = {
             use std::os::unix::fs::PermissionsExt;
@@ -288,6 +289,25 @@ fn unavailable() -> roundtable_protocol::RtError {
     rt_error(ErrorCode::RuntimeUnavailable, "broker_unavailable")
 }
 
+/// `sockaddr_un.sun_path` is 108 bytes including the trailing NUL.
+pub(crate) const UNIX_SOCKET_PATH_MAX: usize = 107;
+
+pub(crate) fn ensure_unix_socket_path(path: &str) -> RtResult<()> {
+    #[cfg(unix)]
+    if path.len() > UNIX_SOCKET_PATH_MAX {
+        return Err(rt_error(ErrorCode::InvalidArgument, "socket_path_too_long"));
+    }
+    let _ = path;
+    Ok(())
+}
+
+/// A pathname socket that stays under [`UNIX_SOCKET_PATH_MAX`] even when
+/// `--data-dir` is long. The container still sees `/run/codeg/*.sock`.
+pub(crate) fn short_socket_path(label: &str) -> std::path::PathBuf {
+    let id = &uuid::Uuid::new_v4().simple().to_string()[..12];
+    std::env::temp_dir().join(format!("cg{label}{id}.sock"))
+}
+
 async fn write<W: AsyncWrite + Unpin, T: Serialize>(stream: &mut W, value: &T) -> RtResult<()> {
     let bytes = serde_json::to_vec(value).map_err(|_| unavailable())?;
     if bytes.len() > FRAME_LIMIT {
@@ -312,4 +332,23 @@ async fn read<R: AsyncRead + Unpin, T: for<'de> Deserialize<'de>>(stream: &mut R
         .await
         .map_err(|_| unavailable())?;
     serde_json::from_slice(&bytes).map_err(|_| rt_error(ErrorCode::InvalidArgument, "invalid_json"))
+}
+
+#[cfg(test)]
+mod socket_path_tests {
+    use super::{ensure_unix_socket_path, short_socket_path, UNIX_SOCKET_PATH_MAX};
+
+    #[test]
+    fn overlong_pathname_is_an_explicit_error_and_short_paths_fit() {
+        let path = short_socket_path("a");
+        let text = path.to_string_lossy();
+        assert!(text.len() <= UNIX_SOCKET_PATH_MAX, "{text}");
+        ensure_unix_socket_path(&text).unwrap();
+        let long = "x".repeat(UNIX_SOCKET_PATH_MAX + 1);
+        let error = ensure_unix_socket_path(&long).unwrap_err();
+        assert_eq!(
+            error.details.reason.as_deref(),
+            Some("socket_path_too_long")
+        );
+    }
 }

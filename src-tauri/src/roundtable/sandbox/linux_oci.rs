@@ -871,7 +871,25 @@ fn apply_auth_mounts(plan: &mut SandboxPlan, profile: &QualifiedOciProfile) -> R
         .find(|mount| mount.destination == "/rt-home")
         .map(|mount| mount.source.clone())
         .ok_or_else(|| rt_error(ErrorCode::InvalidArgument, "home_upper"))?;
+    if profile
+        .container_env
+        .get("GEMINI_HOME")
+        .is_some_and(|value| !value.is_empty())
+    {
+        crate::roundtable::qualification_profiles::write_antigravity_gateway_settings(&upper)
+            .map_err(|_| {
+                rt_error(
+                    ErrorCode::StorageUnavailable,
+                    "antigravity_gateway_settings",
+                )
+            })?;
+    }
     for held in &profile.host_held_credentials {
+        if held.destination
+            == crate::roundtable::qualification_profiles::ANTIGRAVITY_GATEWAY_SETTINGS_DEST
+        {
+            continue;
+        }
         if !auth_destination_allowed(&held.destination) {
             return Err(rt_error(ErrorCode::CapabilityUnqualified, "auth_mount"));
         }
@@ -1732,6 +1750,131 @@ pub(super) fn stop_slirp(runtime_root: &Path, id: &str, expected: bool) -> RtRes
                 result => result,
             }
         }
+        /// A same-uid `EACCES` on `/proc/<pid>/environ` is not proof that this
+        /// pid is a slirp helper. Exec and short-lived processes deny the file
+        /// for a few milliseconds, and a busy host has other same-uid work
+        /// inside the birth window. Retry that race, then ignore a candidate
+        /// only when its comm is not `slirp4netns` and its parent chain leaves
+        /// this process before the attempt creator. A descendant of this
+        /// process, an unreadable comm, or `slirp4netns` still fails closed.
+        /// Pinned pidfds are signaled whether or not this census skips a row.
+        fn read_helper_environment(
+            proc_dir: &Path,
+            pid: i32,
+            fd: &OwnedFd,
+            birth: Option<&HelperBirthContext>,
+        ) -> RtResult<Option<Vec<u8>>> {
+            let age_proof = birth.is_some_and(|birth| birth.zero_boottime_offset);
+            #[cfg(test)]
+            let mut first_errno = None;
+            let mut attempts = 0;
+            loop {
+                attempts += 1;
+                let environment = fs::read(proc_dir.join("environ"));
+                #[cfg(test)]
+                if attempts == 1 {
+                    first_errno = environment
+                        .as_ref()
+                        .err()
+                        .and_then(|error| error.raw_os_error());
+                }
+                #[cfg(test)]
+                let environment = control_tests::helper_environment(pid, environment);
+                let resolved = resolve_helper_environment(fd, environment, age_proof);
+                let reason = resolved
+                    .as_ref()
+                    .err()
+                    .and_then(|error| error.details.reason.as_deref());
+                let denied = matches!(
+                    reason,
+                    Some(
+                        "slirp_proc_environment_denied_within_scope"
+                            | "slirp_proc_environment_denied_no_age_proof"
+                    )
+                );
+                if resolved.is_ok() {
+                    return resolved;
+                }
+                if helper_process_exited(fd) {
+                    return Ok(None);
+                }
+                if denied && attempts < 4 {
+                    std::thread::sleep(Duration::from_millis(2));
+                    if helper_process_exited(fd) {
+                        return Ok(None);
+                    }
+                    continue;
+                }
+                if reason == Some("slirp_proc_environment_denied_within_scope")
+                    && birth.is_some_and(|birth| unrelated_non_descendant(pid, fd, birth))
+                    && !helper_process_exited(fd)
+                {
+                    return Ok(None);
+                }
+                #[cfg(test)]
+                control_tests::record_environment_denial(pid, fd.as_raw_fd(), first_errno);
+                return resolved;
+            }
+        }
+        fn proc_comm(pid: i32) -> Option<String> {
+            let bytes = fs::read(format!("/proc/{pid}/comm")).ok()?;
+            let text = String::from_utf8(bytes).ok()?;
+            let text = text.trim();
+            if text.is_empty() {
+                None
+            } else {
+                Some(text.to_string())
+            }
+        }
+        fn proc_ppid_start(pid: i32) -> Option<(i32, u64)> {
+            let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+            let rest = stat.rsplit_once(") ")?.1;
+            let mut fields = rest.split_whitespace();
+            let _state = fields.next()?;
+            let ppid = fields.next()?.parse().ok()?;
+            // starttime is field 22 of stat, which is index 19 after ") ".
+            let start = fields.nth(17)?.parse::<u64>().ok()?;
+            (start > 0).then_some((ppid, start))
+        }
+        fn unrelated_non_descendant(pid: i32, fd: &OwnedFd, birth: &HelperBirthContext) -> bool {
+            if !birth.zero_boottime_offset || helper_process_exited(fd) {
+                return false;
+            }
+            // Missing or empty comm is uncertainty, not permission to skip.
+            let Some(comm) = proc_comm(pid) else {
+                return false;
+            };
+            if comm == "slirp4netns" {
+                return false;
+            }
+            let self_pid = std::process::id() as i32;
+            let mut current = pid;
+            for _ in 0..64 {
+                if helper_process_exited(fd) || current == self_pid {
+                    return false;
+                }
+                let Some((ppid, _)) = proc_ppid_start(current) else {
+                    return false;
+                };
+                if ppid == self_pid {
+                    return false;
+                }
+                if ppid <= 1 {
+                    return !helper_process_exited(fd);
+                }
+                let Some((_, parent_start)) = proc_ppid_start(ppid) else {
+                    return false;
+                };
+                if birth.predates(parent_start) {
+                    return !helper_process_exited(fd);
+                }
+                if ppid == current {
+                    return false;
+                }
+                current = ppid;
+            }
+            false
+        }
         fn owned_helpers(
             runtime_root: &Path,
             id: &str,
@@ -1816,24 +1959,8 @@ pub(super) fn stop_slirp(runtime_root: &Path, id: &str, expected: bool) -> RtRes
                             return Ok(None);
                         }
                     }
-                    let environment = fs::read(entry.path().join("environ"));
-                    #[cfg(test)]
-                    let read_errno = environment
-                        .as_ref()
-                        .err()
-                        .and_then(|error| error.raw_os_error());
-                    #[cfg(test)]
-                    let environment = control_tests::helper_environment(pid, environment);
-                    let environment = resolve_helper_environment(
-                        &fd,
-                        environment,
-                        birth.is_some_and(|birth| birth.zero_boottime_offset),
-                    );
-                    #[cfg(test)]
-                    if environment.is_err() {
-                        control_tests::record_environment_denial(pid, fd.as_raw_fd(), read_errno);
-                    }
-                    let Some(environment) = environment? else {
+                    let environment = read_helper_environment(&entry.path(), pid, &fd, birth)?;
+                    let Some(environment) = environment else {
                         return Ok(None);
                     };
                     if !marked(&environment, runtime_root, id, None) {
@@ -3864,10 +3991,13 @@ mod control_tests {
             survived && newer_survived,
             "age exclusion cannot authorize a foreign signal"
         );
+        // The newer sleep is a child of this test, not of the cleanup
+        // subprocess. Its parent predates the persisted creator, so a denied
+        // environ is unrelated and must not block the proof. It is still not
+        // signaled. Without an age proof the first failure stays quarantined.
         let expected_retry = if birth.zero_boottime_offset {
-            "slirp_proc_environment_denied_within_scope"
+            "passed"
         } else {
-            // The first attempt already quarantined the unsupported domain.
             "slirp_cleanup_interrupted"
         };
         assert_eq!(retry_outcome.unwrap(), expected_retry);

@@ -592,8 +592,10 @@ impl RoundtableTurnExecutor for LiveParticipantExecutor {
             std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700))
                 .map_err(|_| rt_error(ErrorCode::StorageUnavailable, "runtime_directory"))?;
         }
-        let service_path = directory.join("roundtable.sock");
-        let gateway_path = directory.join("gateway.sock");
+        let service_path = super::companion::transport::short_socket_path("s");
+        let gateway_path = super::companion::transport::short_socket_path("w");
+        super::companion::transport::ensure_unix_socket_path(&service_path.to_string_lossy())?;
+        super::companion::transport::ensure_unix_socket_path(&gateway_path.to_string_lossy())?;
         let clock = Arc::new(StoreClock(request.store.clone()));
         let binding = TokenBinding {
             attempt_id: request.fence.attempt_id,

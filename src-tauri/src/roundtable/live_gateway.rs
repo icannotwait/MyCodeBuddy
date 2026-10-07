@@ -508,13 +508,13 @@ impl LiveModelGateway {
         Ok((content_type, received))
     }
 
-    fn admit_native(&self, headers: &axum::http::HeaderMap, body_len: usize) -> RtResult<()> {
-        let expected = format!("Bearer {}", self.bearer);
-        let supplied = headers
-            .get(axum::http::header::AUTHORIZATION)
-            .and_then(|header| header.to_str().ok())
-            .unwrap_or("");
-        if !constant_eq(supplied.as_bytes(), expected.as_bytes()) {
+    fn admit_native(
+        &self,
+        headers: &axum::http::HeaderMap,
+        path_and_query: &str,
+        body_len: usize,
+    ) -> RtResult<()> {
+        if !attempt_credential_presented(headers, path_and_query, &self.bearer) {
             return Err(rt_error(ErrorCode::Unauthenticated, "gateway_token"));
         }
         if self.revoked.load(Ordering::Acquire) {
@@ -557,13 +557,14 @@ impl LiveModelGateway {
         headers: axum::http::HeaderMap,
         body: axum::body::Bytes,
     ) -> RtResult<(axum::http::StatusCode, String, Vec<u8>)> {
-        self.admit_native(&headers, body.len())?;
+        self.admit_native(&headers, path_and_query, body.len())?;
+        let path_and_query = strip_attempt_key_query(path_and_query);
         let sent = self
-            .dispatch_native(method.clone(), path_and_query, &headers, body.clone())
+            .dispatch_native(method.clone(), &path_and_query, &headers, body.clone())
             .await?;
         if sent.0 == axum::http::StatusCode::UNAUTHORIZED && self.refresh_native().await.is_ok() {
             return self
-                .dispatch_native(method, path_and_query, &headers, body)
+                .dispatch_native(method, &path_and_query, &headers, body)
                 .await;
         }
         Ok(sent)
@@ -678,6 +679,62 @@ fn completed_output(bytes: &[u8], content_type: &str) -> RtResult<Vec<Value>> {
         .cloned()
         .ok_or_else(|| rt_error(ErrorCode::RuntimeUnavailable, "upstream_output"))
 }
+/// Antigravity gateway mode presents the attempt bearer as `Authorization:
+/// Bearer`, `x-goog-api-key`, `x-api-key`, `api-key`, or a `key`/`api_key`
+/// query parameter. The host credential is attached later and these copies
+/// are not forwarded.
+fn attempt_credential_presented(
+    headers: &axum::http::HeaderMap,
+    path_and_query: &str,
+    bearer: &str,
+) -> bool {
+    let expected = format!("Bearer {bearer}");
+    if headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|header| header.to_str().ok())
+        .is_some_and(|supplied| constant_eq(supplied.as_bytes(), expected.as_bytes()))
+    {
+        return true;
+    }
+    for name in ["x-goog-api-key", "x-api-key", "api-key"] {
+        if headers
+            .get(name)
+            .and_then(|header| header.to_str().ok())
+            .is_some_and(|supplied| constant_eq(supplied.as_bytes(), bearer.as_bytes()))
+        {
+            return true;
+        }
+    }
+    let Some((_, query)) = path_and_query.split_once('?') else {
+        return false;
+    };
+    query.split('&').any(|part| {
+        let Some((key, value)) = part.split_once('=') else {
+            return false;
+        };
+        matches!(key, "key" | "api_key" | "api-key")
+            && constant_eq(value.as_bytes(), bearer.as_bytes())
+    })
+}
+
+fn strip_attempt_key_query(path_and_query: &str) -> String {
+    let Some((path, query)) = path_and_query.split_once('?') else {
+        return path_and_query.to_string();
+    };
+    let kept: Vec<&str> = query
+        .split('&')
+        .filter(|part| {
+            let key = part.split_once('=').map(|(key, _)| key).unwrap_or(part);
+            !matches!(key, "key" | "api_key" | "api-key")
+        })
+        .collect();
+    if kept.is_empty() {
+        path.to_string()
+    } else {
+        format!("{path}?{}", kept.join("&"))
+    }
+}
+
 fn constant_eq(left: &[u8], right: &[u8]) -> bool {
     left.len() == right.len()
         && left
@@ -802,6 +859,7 @@ impl LiveGatewayServer {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
+            super::companion::transport::ensure_unix_socket_path(&path.to_string_lossy())?;
             let listener = tokio::net::UnixListener::bind(path)
                 .map_err(|_| rt_error(ErrorCode::RuntimeUnavailable, "gateway_bind"))?;
             std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
@@ -1725,5 +1783,43 @@ mod completion_drain_tests {
         assert_eq!(seen[0].1, "xai-grok-cli");
         assert!(seen[0].2.contains("grok-4.6"));
         assert!(!seen[0].0.contains("attempt-bearer"));
+    }
+}
+
+#[cfg(test)]
+mod attempt_credential_tests {
+    use super::{attempt_credential_presented, strip_attempt_key_query};
+
+    #[test]
+    fn api_key_headers_and_query_admit_then_the_query_key_is_stripped() {
+        let bearer = "attempt-bearer";
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert("x-goog-api-key", bearer.parse().unwrap());
+        assert!(attempt_credential_presented(
+            &headers,
+            "/v1internal:streamGenerateContent",
+            bearer
+        ));
+        headers.clear();
+        headers.insert("x-api-key", bearer.parse().unwrap());
+        assert!(attempt_credential_presented(&headers, "/v1", bearer));
+        headers.clear();
+        assert!(attempt_credential_presented(
+            &headers,
+            "/v1internal:streamGenerateContent?alt=sse&key=attempt-bearer",
+            bearer
+        ));
+        assert!(!attempt_credential_presented(
+            &headers,
+            "/v1internal:streamGenerateContent?key=other",
+            bearer
+        ));
+        assert_eq!(
+            strip_attempt_key_query(
+                "/v1internal:streamGenerateContent?alt=sse&key=attempt-bearer&api_key=x"
+            ),
+            "/v1internal:streamGenerateContent?alt=sse"
+        );
+        assert_eq!(strip_attempt_key_query("/v1"), "/v1");
     }
 }
