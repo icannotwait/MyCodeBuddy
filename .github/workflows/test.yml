@@ -102,10 +102,10 @@ jobs:
         run: cargo fmt --check --manifest-path src-tauri/roundtable-protocol/Cargo.toml
 
       - name: cargo test --locked
-        run: cargo --config .cargo/low-memory.toml test --locked --manifest-path src-tauri/roundtable-protocol/Cargo.toml
+        run: cargo test --locked --manifest-path src-tauri/roundtable-protocol/Cargo.toml
 
       - name: cargo clippy
-        run: cargo --config .cargo/low-memory.toml clippy --locked --manifest-path src-tauri/roundtable-protocol/Cargo.toml --all-targets -- -D warnings
+        run: cargo clippy --locked --manifest-path src-tauri/roundtable-protocol/Cargo.toml --all-targets -- -D warnings
 
   roundtable-runtime:
     name: Roundtable runtime gate
@@ -117,7 +117,7 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
 
       - name: cargo test roundtable_runtime
-        run: cargo --config .cargo/low-memory.toml test --locked --manifest-path src-tauri/Cargo.toml --no-default-features --features test-utils --test roundtable_runtime
+        run: cargo test --locked --manifest-path src-tauri/Cargo.toml --no-default-features --features test-utils --test roundtable_runtime
 
   rust:
     name: Rust ${{ matrix.mode }} on ${{ matrix.os }}
