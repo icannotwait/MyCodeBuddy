@@ -75,6 +75,33 @@ export async function verifyRoundtableProjection(
     throw new Error("projection_hash")
 }
 
+function membershipRevision(value: unknown): bigint | null {
+  if (typeof value !== "string" || !/^(0|[1-9][0-9]*)$/.test(value)) return null
+  return BigInt(value)
+}
+
+/** Page manifests record each message's highest membership_version. */
+function currentMessageMembership(
+  memberships: RoundtableProjection["body"]["replay"]["message_memberships"],
+  messageId: string
+) {
+  const rows = memberships.filter((item) => item.message_id === messageId)
+  if (rows.length === 0) return undefined
+  if (rows.length === 1) return rows[0]
+  let current = rows[0]
+  let currentVersion = membershipRevision(current.membership_version)
+  if (currentVersion === null) return undefined
+  for (const row of rows.slice(1)) {
+    const version = membershipRevision(row.membership_version)
+    if (version === null || version === currentVersion) return undefined
+    if (version > currentVersion) {
+      current = row
+      currentVersion = version
+    }
+  }
+  return current
+}
+
 export async function loadRoundtable(roomId: string, projectionId?: string) {
   const response = await roundtableCall<{
     projection: RoundtableProjection
@@ -102,8 +129,9 @@ export async function loadRoundtable(roomId: string, projectionId?: string) {
       const ref = projection.body.messages.find(
         (ref) => ref.message_id === message.message_id
       )
-      const membership = projection.body.replay.message_memberships.find(
-        (item) => item.message_id === message.message_id
+      const membership = currentMessageMembership(
+        projection.body.replay.message_memberships,
+        message.message_id
       )
       if (
         !ref ||

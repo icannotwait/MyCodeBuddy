@@ -105,7 +105,9 @@ export interface RoundtableProjection {
       }[]
       message_memberships: {
         message_id: string
+        membership_version?: string
         visibility: "staged" | "published" | "void"
+        published_seq?: string | null
       }[]
       evidence: {
         evidence_id: string

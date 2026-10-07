@@ -182,6 +182,64 @@ describe("roundtable api", () => {
     )
     vi.unstubAllGlobals()
   })
+
+  it("loads a published message when staged membership history is still present", async () => {
+    vi.stubGlobal("crypto", webcrypto)
+    const golden = fixture.cases[0]
+    const body = JSON.parse(Buffer.from(golden.original_hex, "hex").toString())
+    const message = { summary: "accepted proposal" }
+    const hash = await roundtableHash(message)
+    body.messages = [{ message_id: "fixed-message", hash }]
+    body.replay.message_memberships = [
+      {
+        message_id: "fixed-message",
+        membership_version: "1",
+        visibility: "staged",
+        published_seq: null,
+      },
+      {
+        message_id: "fixed-message",
+        membership_version: "2",
+        visibility: "published",
+        published_seq: "9",
+      },
+    ]
+    const projection = {
+      projection_ref: { id: "fixed", hash: await roundtableHash(body) },
+      body,
+    }
+    const page = {
+      messages: [
+        {
+          message_id: "fixed-message",
+          body_hash: hash,
+          body: message,
+          visibility: "published" as const,
+        },
+      ],
+      cursor: null,
+    }
+    call.mockImplementation(async (command: string) =>
+      command === "roundtable_get"
+        ? { projection, message_manifest_id: "fixed" }
+        : page
+    )
+    expect(await loadRoundtable(body.room_id, "fixed")).toMatchObject({
+      messages: page.messages,
+    })
+
+    body.replay.message_memberships.push({
+      message_id: "fixed-message",
+      membership_version: "3",
+      visibility: "void",
+      published_seq: null,
+    })
+    projection.projection_ref.hash = await roundtableHash(body)
+    await expect(loadRoundtable(body.room_id, "fixed")).rejects.toThrow(
+      "message_membership"
+    )
+    vi.unstubAllGlobals()
+  })
   it("loads exactly the frozen manifest and verifies body membership", async () => {
     vi.stubGlobal("crypto", webcrypto)
     const golden = fixture.cases[0]
