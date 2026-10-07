@@ -11,22 +11,22 @@ mismatch, or a failed ACP turn is a failing report and no certificate.
 The probe can issue a certificate only when every required check is measured
 on this host. Sandbox credential isolation is deferred for this iteration:
 the ACP container bind-mounts the host auth files the CLI already reads
-(`~/.grok/auth.json` for Grok, `acp_token.json` for Antigravity). Those
-files are not copied into the attempt home. Antigravity's
-`settings.json` is the exception: the probe and the live attempt write
-the non-secret `{"auth":{"type":"gateway"}}` into the attempt home before
-the process starts, and do not mount a host `settings.json` over it.
-`gateway` is not an `authenticate` method. `AGY_ACP_CCPA_BASE_URL` is
-`http://127.0.0.1:39173` so a cloud-code path such as
-`/v1internal:streamGenerateContent` is forwarded as-is. The four
+(`~/.grok/auth.json` for Grok; Antigravity `settings.json` with
+`auth.type` such as `oauth-personal`, plus `acp_token.json`). Those
+files are not copied into the attempt home. Antigravity does not receive
+`AGY_*` gateway variables. `AGY_ACP_CCPA_BASE_URL` sends
+`fetchAvailableModels` to the loopback relay, which does not serve that
+API, and `session/new` then fails with connection refused. With the host
+oauth files mounted and no `AGY_*` variables, model listing and the
+prompt use the same oauth client and leave through slirp. The four
 credential-boundary checks are `not_applicable` and do not block the
 certificate. A non-empty `auth_mounts` list still fails the report. The
-sandbox also receives a random attempt bearer and its own gateway
-variables, all pointed at `http://127.0.0.1:39173/v1` except that
-cloud-code base. Grok 1.0.46 reads `XAI_API_KEY` and
-`GROK_XAI_API_BASE_URL`. Antigravity 1.3.0 reads `AGY_LLM_GATEWAY_URL`,
-`AGY_LLM_GATEWAY_API_KEY`, and `AGY_ACP_ENABLE_GATEWAY_AUTH=1`. Codex
-still reads `OPENAI_BASE_URL` and `OPENAI_API_KEY`. The host gateway
+sandbox also receives a random attempt bearer and, for adapters that use
+it, gateway variables pointed at `http://127.0.0.1:39173/v1`. Grok
+1.0.46 reads `XAI_API_KEY` and `GROK_XAI_API_BASE_URL`. Codex still
+reads `OPENAI_BASE_URL` and `OPENAI_API_KEY`. A rejected `session/new`
+trace includes the ACP error `code`, `message`, and `data.details`. The
+host gateway
 accepts the attempt bearer from `Authorization: Bearer` or
 `x-goog-api-key` / `x-api-key` / `api-key`, strips `key` query
 parameters, and swaps in the host-held credential before the request
@@ -75,7 +75,7 @@ measured. A Debian 12 certificate does not verify on Debian 13.
 | Codex | `linux-codex-2.1.1` | `/usr/local/bin/codex-acp` | `2.1.1` | `.codex/auth.json` |
 | Grok | `linux-grok-1.0.46` | `/usr/local/bin/grok` with args `--no-auto-update agent stdio` | `1.0.46` | `.grok/auth.json` |
 | Cursor | `linux-cursor-acp-2026.09.28-64d2043` | `/usr/local/bin/cursor-agent` with arg `acp` | `2026.09.28-64d2043` | `.cursor/cli-config.json`, plus one of `.config/cursor/auth.json` (XDG) or `.cursor/auth.json` |
-| Antigravity | `linux-antigravity-acp-1.3.0` (default) | `/usr/local/bin/agy_acp_server.par` with arg `--uid=` | `1.3.0` | `acp_token.json` (host-held). Attempt home gets gateway `settings.json` |
+| Antigravity | `linux-antigravity-acp-1.3.0` (default) | `/usr/local/bin/agy_acp_server.par` with arg `--uid=` | `1.3.0` | host `settings.json` and `acp_token.json` (no `AGY_*` gateway env) |
 | Antigravity | `linux-antigravity-acp-1.2.1` | same binary and arg | `1.2.1` | same files |
 
 `--agent antigravity` selects `linux-antigravity-acp-1.3.0`. Pass
@@ -334,10 +334,11 @@ invented key.
   `$HOME/.cursor/auth.json`. At least one of those two files must exist
   on the host. The sandbox does not receive either file, and this probe
   does not inject `CURSOR_API_KEY`.
-- `$HOME/.gemini/antigravity-acp/acp_token.json`
-  (`acp_business_token.json` stays on the host when it exists; it is
-  mounted when present). The attempt writes its own gateway
-  `settings.json`; a host `settings.json` is not mounted over that file.
+- `$HOME/.gemini/antigravity-acp/settings.json` and
+  `$HOME/.gemini/antigravity-acp/acp_token.json` are bind-mounted.
+  `settings.json` keeps the host `auth.type` (for example
+  `oauth-personal`). The probe does not inject `AGY_*` variables.
+  `acp_business_token.json` is mounted when it exists.
 - `$HOME/.codex/auth.json` for Codex
 
 ## Provider bindings

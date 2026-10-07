@@ -626,22 +626,10 @@ impl RoundtableTurnExecutor for LiveParticipantExecutor {
             provider_token.clone(),
             token.reveal_for_same_sandbox().to_owned(),
         ]);
-        let modeled = super::qualification_profiles::profile_for_agent(agent.as_str())
-            .map(|profile| profile.model_gateway.entries(&provider_token))
-            .unwrap_or_default();
-        let env_allowlist: BTreeMap<String, String> = if modeled.is_empty() {
-            [
-                (
-                    "OPENAI_BASE_URL".to_owned(),
-                    super::relay::SANDBOX_ENDPOINT.to_owned(),
-                ),
-                ("OPENAI_API_KEY".to_owned(), provider_token.clone()),
-            ]
-            .into_iter()
-            .collect()
-        } else {
-            modeled.into_iter().collect()
-        };
+        let env_allowlist: BTreeMap<String, String> =
+            super::qualification_profiles::live_model_env(agent.as_str(), &provider_token)
+                .into_iter()
+                .collect();
         let store_clock = request.store.clone();
         let mut gateway = LiveModelGateway::new(
             self.data_dir.clone(),
@@ -1272,6 +1260,100 @@ async fn rpc(
     .await
 }
 
+/// JSON-RPC error text for a qualification trace. `code`, `message`, and
+/// `data.details` stay on separate lines. Secret-like fields are removed so
+/// the trace writer does not drop the whole diagnostic.
+pub(crate) fn describe_acp_rejection(error: &Value) -> String {
+    let code = match error.get("code") {
+        Some(Value::Number(number)) => number.to_string(),
+        Some(Value::String(text)) => text.clone(),
+        _ => "absent".to_string(),
+    };
+    let message = error
+        .get("message")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .replace(['\n', '\r'], " ");
+    let details = match error.pointer("/data/details") {
+        Some(value) => compact_acp_details(value),
+        None => "absent".to_string(),
+    };
+    format!("code={code}\nmessage={message}\ndetails={details}")
+        .lines()
+        .map(scrub_trace_line)
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn compact_acp_details(value: &Value) -> String {
+    let mut copy = value.clone();
+    redact_acp_value(&mut copy);
+    let text = serde_json::to_string(&copy).unwrap_or_else(|_| "unprintable".to_string());
+    if text.len() > 1024 {
+        format!("{}…", &text[..1024])
+    } else {
+        text
+    }
+}
+
+fn redact_acp_value(value: &mut Value) {
+    const SENSITIVE: &[&str] = &[
+        "authorization",
+        "bearer",
+        "api_key",
+        "apikey",
+        "token",
+        "secret",
+        "password",
+        "credential",
+    ];
+    match value {
+        Value::Object(map) => {
+            for (key, child) in map.iter_mut() {
+                let lower = key.to_ascii_lowercase();
+                if SENSITIVE.iter().any(|word| lower.contains(word)) {
+                    *child = Value::String("[redacted]".to_string());
+                } else {
+                    redact_acp_value(child);
+                }
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                redact_acp_value(item);
+            }
+        }
+        Value::String(text) if text.to_ascii_lowercase().contains("sk-") => {
+            *text = "[redacted]".to_string();
+        }
+        _ => {}
+    }
+}
+
+fn scrub_trace_line(line: &str) -> String {
+    const TRIGGERS: &[&str] = &[
+        "authorization",
+        "bearer",
+        "api_key",
+        "token",
+        "secret",
+        "password",
+        "sk-",
+    ];
+    let mut out = line.to_string();
+    loop {
+        let lower = out.to_ascii_lowercase();
+        let Some(trigger) = TRIGGERS.iter().find(|trigger| lower.contains(*trigger)) else {
+            break;
+        };
+        let Some(pos) = lower.find(trigger) else {
+            break;
+        };
+        out.replace_range(pos..pos + trigger.len(), "[redacted]");
+    }
+    out
+}
+
 /// Live and probe ACP loop. Transport frames are lenient JSON. A rejected
 /// tool stays inside this loop; only the prompt's `stopReason` ends the turn.
 pub(crate) async fn acp_exchange<W, R>(
@@ -1372,8 +1454,10 @@ where
             continue;
         }
         if message["id"] == exchange.id {
-            if message.get("error").is_some() {
-                return Err(rt_error(ErrorCode::RuntimeUnavailable, "acp_rejected"));
+            if let Some(rejected) = message.get("error") {
+                let mut error = rt_error(ErrorCode::RuntimeUnavailable, "acp_rejected");
+                error.message = describe_acp_rejection(rejected);
+                return Err(error);
             }
             let result = message
                 .get("result")
@@ -3083,5 +3167,29 @@ mod completion_contract_tests {
         ])
         .await
         .is_err());
+    }
+
+    #[test]
+    fn acp_rejection_keeps_code_message_and_details() {
+        let text = describe_acp_rejection(&json!({
+            "code": -32603,
+            "message": "fetchAvailableModels failed: [Errno 111] Connection refused",
+            "data": {
+                "details": {
+                    "errno": 111,
+                    "access_token": "secret-value",
+                    "trace": "sk-live"
+                }
+            }
+        }));
+        assert!(text.contains("code=-32603"), "{text}");
+        assert!(
+            text.contains("message=fetchAvailableModels failed: [Errno 111] Connection refused"),
+            "{text}"
+        );
+        assert!(text.contains("\"errno\":111"), "{text}");
+        assert!(!text.contains("secret-value"), "{text}");
+        assert!(!text.to_ascii_lowercase().contains("token"), "{text}");
+        assert!(!text.contains("sk-"), "{text}");
     }
 }

@@ -240,18 +240,11 @@ fn sandbox_gateway_env_is_adapter_specific_and_not_a_host_secret() {
         .expect("antigravity")
         .model_gateway
         .entries(bearer);
-    assert!(antigravity.iter().any(|(key, value)| {
-        key == "AGY_LLM_GATEWAY_URL" && value == "http://127.0.0.1:39173/v1"
-    }));
-    assert!(antigravity
-        .iter()
-        .any(|(key, value)| { key == "AGY_LLM_GATEWAY_API_KEY" && value == bearer }));
-    assert!(antigravity
-        .iter()
-        .any(|(key, value)| key == "AGY_ACP_ENABLE_GATEWAY_AUTH" && value == "1"));
-    assert!(antigravity.iter().any(|(key, value)| {
-        key == "AGY_ACP_CCPA_BASE_URL" && value == "http://127.0.0.1:39173"
-    }));
+    assert!(
+        antigravity.is_empty(),
+        "antigravity uses host oauth files, not AGY gateway vars: {antigravity:?}"
+    );
+    assert!(!antigravity.iter().any(|(key, _)| key.starts_with("AGY_")));
     let cursor = profile_for_agent("cursor")
         .expect("cursor")
         .model_gateway
@@ -266,6 +259,9 @@ fn antigravity_default_profile_is_1_3_0_and_mounts_the_token_file() {
     assert_eq!(profile.exact_id, "linux-antigravity-acp-1.3.0");
     assert!(profile.auth_files.iter().any(|file| {
         file.home_relative == ".gemini/antigravity-acp/acp_token.json" && file.required
+    }));
+    assert!(profile.auth_files.iter().any(|file| {
+        file.home_relative == ".gemini/antigravity-acp/settings.json" && file.required
     }));
     let pinned =
         codeg_lib::roundtable::profile_by_id("linux-antigravity-acp-1.2.1").expect("1.2.1");

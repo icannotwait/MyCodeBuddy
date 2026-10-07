@@ -25,11 +25,6 @@ use super::qualification_experiment::{
 };
 use super::qualification_probe::{ProbeCheck, ProbeFacts, ProbeRequest};
 use super::qualification_profiles::{profile_by_id, profile_for_agent};
-#[cfg(test)]
-use super::qualification_profiles::{
-    write_antigravity_gateway_settings, ANTIGRAVITY_GATEWAY_SETTINGS_BODY,
-    ANTIGRAVITY_GATEWAY_SETTINGS_DEST, ANTIGRAVITY_GATEWAY_SETTINGS_REL,
-};
 use super::relay::SANDBOX_ENDPOINT;
 use super::sandbox::{AuthMount, QualifiedOciProfile};
 
@@ -1125,7 +1120,7 @@ async fn rpc(
     .map_err(|error| match error.details.reason.as_deref() {
         Some("acp_timeout") => format!("{method} timed out"),
         Some("acp_closed") => format!("{method} closed"),
-        Some("acp_rejected") => format!("{method} rejected"),
+        Some("acp_rejected") => format!("{method} rejected\n{}", error.message),
         Some("acp_response") => format!("{method} response"),
         Some(reason) => format!("{method} {reason}"),
         None => method.to_string(),
@@ -1397,10 +1392,6 @@ fn prepare_bundle(
     }
     let upper = scratch_home_dir(&request.runtime_root, &request.agent, &id);
     fs::create_dir_all(&upper).map_err(|error| error.to_string())?;
-    if select_profile(request).is_some_and(super::qualification_profiles::antigravity_profile) {
-        super::qualification_profiles::write_antigravity_gateway_settings(&upper)
-            .map_err(|error| error.to_string())?;
-    }
     let home_guard = RemoveOnDrop::arm(upper.clone());
     oci_mounts.push(serde_json::json!({
         "destination": "/rt-home",
@@ -1601,12 +1592,6 @@ fn append_host_auth_mounts(
         })
         .unwrap_or_default();
     for (source, destination) in overlays {
-        if destination.as_str() == super::qualification_profiles::ANTIGRAVITY_GATEWAY_SETTINGS_DEST
-        {
-            // The attempt home already has the non-secret gateway settings.
-            // A host oauth settings.json would hide auth.type=gateway.
-            continue;
-        }
         if !allowed.iter().any(|item| *item == destination.as_str()) {
             return Err(format!(
                 "auth destination is not in the adapter profile: {destination}"
@@ -2366,27 +2351,28 @@ mod host_auth_mounts {
     }
 
     #[test]
-    fn antigravity_attempt_home_gets_gateway_settings_not_the_host_file() {
+    fn antigravity_attempt_home_mounts_host_oauth_settings() {
         let root = tempfile::tempdir().expect("temp");
         let upper = root.path().join("upper");
         fs::create_dir_all(&upper).expect("upper");
         let host = root.path().join("settings.json");
         let oauth = br#"{"auth":{"type":"oauth-personal"}}"#;
         fs::write(&host, oauth).expect("host settings");
-        write_antigravity_gateway_settings(&upper).expect("gateway settings");
         let profile = profile_for_agent("antigravity").expect("antigravity");
+        let destination = "/rt-home/.gemini/antigravity-acp/settings.json";
         let mut mounts = Vec::new();
         append_host_auth_mounts(
             &mut mounts,
             &upper,
-            &[(host.clone(), ANTIGRAVITY_GATEWAY_SETTINGS_DEST.to_string())],
+            &[(host.clone(), destination.to_string())],
             Some(profile),
         )
-        .expect("skip host settings");
-        assert!(mounts.is_empty(), "{mounts:?}");
+        .expect("mount host settings");
+        assert_eq!(mounts.len(), 1, "{mounts:?}");
+        assert_eq!(mounts[0]["destination"], destination);
         assert_eq!(
-            fs::read(upper.join(ANTIGRAVITY_GATEWAY_SETTINGS_REL)).expect("written"),
-            ANTIGRAVITY_GATEWAY_SETTINGS_BODY
+            fs::read(upper.join(".gemini/antigravity-acp/settings.json")).expect("placeholder"),
+            b""
         );
         assert_eq!(fs::read(&host).expect("host unchanged"), oauth);
         let token = root.path().join("acp_token.json");
@@ -2401,10 +2387,10 @@ mod host_auth_mounts {
             Some(profile),
         )
         .expect("token overlay");
-        assert_eq!(mounts.len(), 1);
+        assert_eq!(mounts.len(), 2);
         assert_eq!(
-            fs::read(upper.join(ANTIGRAVITY_GATEWAY_SETTINGS_REL)).expect("still gateway"),
-            ANTIGRAVITY_GATEWAY_SETTINGS_BODY
+            fs::read(upper.join(".gemini/antigravity-acp/settings.json")).expect("still empty"),
+            b""
         );
     }
 }

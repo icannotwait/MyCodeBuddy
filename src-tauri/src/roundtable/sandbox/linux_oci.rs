@@ -871,25 +871,7 @@ fn apply_auth_mounts(plan: &mut SandboxPlan, profile: &QualifiedOciProfile) -> R
         .find(|mount| mount.destination == "/rt-home")
         .map(|mount| mount.source.clone())
         .ok_or_else(|| rt_error(ErrorCode::InvalidArgument, "home_upper"))?;
-    if profile
-        .container_env
-        .get("GEMINI_HOME")
-        .is_some_and(|value| !value.is_empty())
-    {
-        crate::roundtable::qualification_profiles::write_antigravity_gateway_settings(&upper)
-            .map_err(|_| {
-                rt_error(
-                    ErrorCode::StorageUnavailable,
-                    "antigravity_gateway_settings",
-                )
-            })?;
-    }
     for held in &profile.host_held_credentials {
-        if held.destination
-            == crate::roundtable::qualification_profiles::ANTIGRAVITY_GATEWAY_SETTINGS_DEST
-        {
-            continue;
-        }
         if !auth_destination_allowed(&held.destination) {
             return Err(rt_error(ErrorCode::CapabilityUnqualified, "auth_mount"));
         }

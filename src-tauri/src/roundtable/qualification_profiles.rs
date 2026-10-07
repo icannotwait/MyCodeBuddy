@@ -51,8 +51,7 @@ pub struct AdapterProfile {
 pub struct ModelGatewayEnv {
     pub base_url_keys: &'static [&'static str],
     pub bearer_keys: &'static [&'static str],
-    /// Keys whose value is the relay origin with no `/v1` suffix. Antigravity's
-    /// cloud-code client appends `/v1internal:...` to this base.
+    /// Keys whose value is the relay origin with no `/v1` suffix.
     pub origin_keys: &'static [&'static str],
     pub fixed: &'static [(&'static str, &'static str)],
 }
@@ -102,37 +101,25 @@ const GROK_GATEWAY: ModelGatewayEnv = ModelGatewayEnv {
     fixed: &[],
 };
 
-/// Antigravity 1.3.0 reads its own gateway variables. `auth.type=gateway` is
-/// not an `authenticate` method; the attempt home must contain
-/// `settings.json` before the process starts. The cloud-code base is the
-/// relay origin so `/v1internal:...` is forwarded unchanged.
-const ANTIGRAVITY_GATEWAY: ModelGatewayEnv = ModelGatewayEnv {
-    base_url_keys: &["AGY_LLM_GATEWAY_URL", "AGY_GATEWAY_URL"],
-    bearer_keys: &["AGY_LLM_GATEWAY_API_KEY", "AGY_GATEWAY_API_KEY"],
-    origin_keys: &["AGY_ACP_CCPA_BASE_URL"],
-    fixed: &[("AGY_ACP_ENABLE_GATEWAY_AUTH", "1")],
-};
-
-/// Non-secret file the ACP server reads at process start. `gateway` is absent
-/// from `authMethods`, so `authenticate` cannot select it.
-pub const ANTIGRAVITY_GATEWAY_SETTINGS_REL: &str = ".gemini/antigravity-acp/settings.json";
-pub const ANTIGRAVITY_GATEWAY_SETTINGS_DEST: &str =
-    "/rt-home/.gemini/antigravity-acp/settings.json";
-pub const ANTIGRAVITY_GATEWAY_SETTINGS_BODY: &[u8] = b"{\"auth\":{\"type\":\"gateway\"}}\n";
-
-pub fn antigravity_profile(profile: &AdapterProfile) -> bool {
-    profile
-        .container_env
-        .iter()
-        .any(|(key, _)| *key == "GEMINI_HOME")
-}
-
-pub fn write_antigravity_gateway_settings(upper: &std::path::Path) -> std::io::Result<()> {
-    let path = upper.join(ANTIGRAVITY_GATEWAY_SETTINGS_REL);
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
+/// Live seat environment. A profile with gateway variables uses those.
+/// Antigravity does not: `AGY_ACP_CCPA_BASE_URL` points `fetchAvailableModels`
+/// at the loopback relay, which does not serve that API, and the other `AGY_*`
+/// gateway variables are unnecessary once the host oauth files are mounted.
+/// Adapters with neither still get the OpenAI loopback pair.
+pub fn live_model_env(agent: &str, bearer: &str) -> Vec<(String, String)> {
+    let modeled = profile_for_agent(agent)
+        .map(|profile| profile.model_gateway.entries(bearer))
+        .unwrap_or_default();
+    if !modeled.is_empty() || agent == "antigravity" {
+        return modeled;
     }
-    std::fs::write(path, ANTIGRAVITY_GATEWAY_SETTINGS_BODY)
+    vec![
+        (
+            "OPENAI_BASE_URL".to_string(),
+            super::relay::SANDBOX_ENDPOINT.to_string(),
+        ),
+        ("OPENAI_API_KEY".to_string(), bearer.to_string()),
+    ]
 }
 
 const DEBIAN: &[AcceptedOs] = &[
@@ -260,7 +247,7 @@ const PROFILES: &[AdapterProfile] = &[
         container_mcp: "/usr/local/bin/codeg-mcp",
         auth_files: ANTIGRAVITY_AUTH,
         container_env: ANTIGRAVITY_ENV,
-        model_gateway: ANTIGRAVITY_GATEWAY,
+        model_gateway: NO_MODEL_GATEWAY,
         require_one_filename: None,
         requires_acp_turn: true,
     },
@@ -276,7 +263,7 @@ const PROFILES: &[AdapterProfile] = &[
         container_mcp: "/usr/local/bin/codeg-mcp",
         auth_files: ANTIGRAVITY_AUTH,
         container_env: ANTIGRAVITY_ENV,
-        model_gateway: ANTIGRAVITY_GATEWAY,
+        model_gateway: NO_MODEL_GATEWAY,
         require_one_filename: None,
         requires_acp_turn: true,
     },
@@ -292,10 +279,9 @@ const ANTIGRAVITY_AUTH: &[AuthFile] = &[
     AuthFile {
         home_relative: ".gemini/antigravity-acp/settings.json",
         destination: "/rt-home/.gemini/antigravity-acp/settings.json",
-        // The attempt writes a non-secret gateway settings file. A missing
-        // host copy is not a credential failure, and a host copy must not
-        // be mounted over the gateway file.
-        required: false,
+        // Host oauth selection (`auth.type`) is what `session/new` reads.
+        // A gateway settings file is not written over this mount.
+        required: true,
     },
     AuthFile {
         home_relative: ".gemini/antigravity-acp/acp_token.json",
@@ -308,3 +294,29 @@ const ANTIGRAVITY_AUTH: &[AuthFile] = &[
         required: false,
     },
 ];
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn antigravity_live_env_is_empty_and_grok_keeps_its_gateway() {
+        let bearer = "attempt-bearer";
+        assert!(live_model_env("antigravity", bearer).is_empty());
+        let grok = live_model_env("grok", bearer);
+        assert!(grok.iter().any(|(key, value)| {
+            key == "GROK_XAI_API_BASE_URL" && value == "http://127.0.0.1:39173/v1"
+        }));
+        assert!(grok
+            .iter()
+            .any(|(key, value)| key == "XAI_API_KEY" && value == bearer));
+        assert!(!grok.iter().any(|(key, _)| key.starts_with("AGY_")));
+        let cursor = live_model_env("cursor", bearer);
+        assert!(cursor
+            .iter()
+            .any(|(key, value)| key == "OPENAI_BASE_URL" && value == "http://127.0.0.1:39173/v1"));
+        assert!(cursor
+            .iter()
+            .any(|(key, value)| key == "OPENAI_API_KEY" && value == bearer));
+    }
+}
