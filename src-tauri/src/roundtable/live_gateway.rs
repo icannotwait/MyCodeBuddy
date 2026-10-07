@@ -73,6 +73,9 @@ pub(crate) struct LiveModelGateway {
     cancelled: tokio_util::sync::CancellationToken,
     skip_admission: bool,
     native: Option<NativeRelay>,
+    /// Method, path, and upstream status for each native forward. No
+    /// credentials and no request body.
+    exchanges: Mutex<Vec<String>>,
     #[cfg(any(test, feature = "test-utils"))]
     fixture_origin: Option<String>,
 }
@@ -129,6 +132,7 @@ impl LiveModelGateway {
             cancelled: tokio_util::sync::CancellationToken::new(),
             skip_admission: false,
             native: None,
+            exchanges: Mutex::new(Vec::new()),
             #[cfg(any(test, feature = "test-utils"))]
             fixture_origin: None,
         })
@@ -212,9 +216,34 @@ impl LiveModelGateway {
                 bearer: Mutex::new(host_bearer),
                 refresh: upstream.refresh,
             }),
+            exchanges: Mutex::new(Vec::new()),
             #[cfg(any(test, feature = "test-utils"))]
             fixture_origin: None,
         })
+    }
+
+    pub(crate) fn exchange_log(&self) -> Vec<String> {
+        self.exchanges
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .clone()
+    }
+
+    pub(crate) fn note_upstream(
+        &self,
+        method: &axum::http::Method,
+        path_and_query: &str,
+        status: &str,
+    ) {
+        let mut log = self
+            .exchanges
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        if log.len() >= 32 {
+            return;
+        }
+        let path = path_and_query.split('#').next().unwrap_or(path_and_query);
+        log.push(format!("{} {} status={status}", method.as_str(), path));
     }
 
     pub(crate) fn with_execution_lease(
@@ -598,7 +627,7 @@ impl LiveModelGateway {
         let origin = self.fixture_origin.as_deref().unwrap_or(origin);
         let url = format!("{}{path_and_query}", origin.trim_end_matches('/'));
         let previously_uncertain = self.uncertain.swap(true, Ordering::AcqRel);
-        let mut request = self.client.request(method, &url);
+        let mut request = self.client.request(method.clone(), &url);
         if let Some(content_type) = headers.get(axum::http::header::CONTENT_TYPE) {
             request = request.header(axum::http::header::CONTENT_TYPE, content_type);
         }
@@ -612,17 +641,25 @@ impl LiveModelGateway {
         if !body.is_empty() {
             request = request.body(body);
         }
-        let response = request
-            .send()
-            .await
-            .map_err(|_| rt_error(ErrorCode::RuntimeUnavailable, "upstream_transport"))?;
+        let response = match request.send().await {
+            Ok(response) => response,
+            Err(_) => {
+                self.note_upstream(&method, path_and_query, "upstream_transport");
+                return Err(rt_error(
+                    ErrorCode::RuntimeUnavailable,
+                    "upstream_transport",
+                ));
+            }
+        };
         if response.status().is_redirection() {
+            self.note_upstream(&method, path_and_query, response.status().as_str());
             return Err(rt_error(
                 ErrorCode::PolicyUnenforceable,
                 "redirect_forbidden",
             ));
         }
         let status = response.status();
+        self.note_upstream(&method, path_and_query, status.as_str());
         let content_type = response
             .headers()
             .get(axum::http::header::CONTENT_TYPE)
@@ -853,6 +890,7 @@ pub(crate) struct LiveGatewayServer {
     task: tokio::task::JoinHandle<()>,
     path: PathBuf,
     cancelled: tokio_util::sync::CancellationToken,
+    gateway: Arc<LiveModelGateway>,
 }
 impl LiveGatewayServer {
     pub(crate) async fn bind(path: &Path, gateway: Arc<LiveModelGateway>) -> RtResult<Self> {
@@ -871,6 +909,7 @@ impl LiveGatewayServer {
                 task,
                 path: path.to_path_buf(),
                 cancelled,
+                gateway,
             })
         }
         #[cfg(not(unix))]
@@ -885,6 +924,10 @@ impl LiveGatewayServer {
     pub(crate) async fn shutdown(mut self) {
         self.cancelled.cancel();
         let _ = (&mut self.task).await;
+    }
+
+    pub(crate) fn exchange_log(&self) -> Vec<String> {
+        self.gateway.exchange_log()
     }
 }
 impl Drop for LiveGatewayServer {
@@ -1326,6 +1369,7 @@ fn fixture_gateway(root: &Path, profile: QualifiedContextProfile) -> RtResult<Li
         cancelled: tokio_util::sync::CancellationToken::new(),
         skip_admission: false,
         native: None,
+        exchanges: Mutex::new(Vec::new()),
         fixture_origin: None,
     })
 }
@@ -1376,6 +1420,7 @@ pub async fn exercise_gateway_shutdown_fixture(
         task,
         path: root.join("fixture-gateway.sock"),
         cancelled,
+        gateway: gateway.clone(),
     };
     let idle = tokio::net::TcpStream::connect(address)
         .await
@@ -1783,6 +1828,39 @@ mod completion_drain_tests {
         assert_eq!(seen[0].1, "xai-grok-cli");
         assert!(seen[0].2.contains("grok-4.6"));
         assert!(!seen[0].0.contains("attempt-bearer"));
+    }
+}
+
+#[cfg(test)]
+mod exchange_log_tests {
+    use super::*;
+
+    #[test]
+    fn upstream_status_is_recorded_without_the_request_body() {
+        let gateway = LiveModelGateway::native_probe(
+            super::super::host_model_auth::ResolvedUpstream {
+                origin: "https://cloudcode-pa.googleapis.com".into(),
+                bearer: "host-oauth".into(),
+                headers: Vec::new(),
+                refresh: None,
+            },
+            "attempt-bearer".into(),
+        )
+        .expect("probe gateway");
+        gateway.note_upstream(
+            &axum::http::Method::POST,
+            "/v1/v1beta/models/gemini-3.8-flash:streamGenerateContent?alt=sse",
+            "404",
+        );
+        let log = gateway.exchange_log();
+        assert_eq!(
+            log,
+            vec![
+                "POST /v1/v1beta/models/gemini-3.8-flash:streamGenerateContent?alt=sse status=404"
+                    .to_string()
+            ]
+        );
+        assert!(!log[0].contains("host-oauth"));
     }
 }
 

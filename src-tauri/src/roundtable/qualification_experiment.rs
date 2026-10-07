@@ -167,6 +167,11 @@ pub(crate) struct ProductionObservation {
     pub private_sink_frames: u64,
     pub endpoint_compatible: bool,
     pub sandbox_endpoint: String,
+    /// Antigravity reaches this provider origin with the host oauth client.
+    /// The loopback gateway is not required.
+    pub direct_provider_origin: bool,
+    /// One line per native gateway forward: method, path, upstream status.
+    pub gateway_exchanges: Vec<String>,
 }
 
 pub(crate) fn failed_observation() -> ProductionObservation {
@@ -185,6 +190,8 @@ pub(crate) fn failed_observation() -> ProductionObservation {
         private_sink_frames: 0,
         endpoint_compatible: false,
         sandbox_endpoint: String::new(),
+        direct_provider_origin: false,
+        gateway_exchanges: Vec::new(),
     }
 }
 
@@ -283,17 +290,32 @@ pub(crate) fn production_checks(obs: &ProductionObservation) -> Vec<ProbeCheck> 
         )
     };
     global.count = Some(obs.global_frames);
-    let endpoint_ok = obs.endpoint_compatible && obs.sandbox_endpoint == SANDBOX_ENDPOINT;
-    let endpoint = if endpoint_ok {
-        pass(
-            "endpoint_compatibility",
-            "advertised model matches the binding and the sandbox endpoint is the host gateway",
+    let gateway_endpoint = obs.sandbox_endpoint == SANDBOX_ENDPOINT && !obs.direct_provider_origin;
+    let direct = obs.direct_provider_origin
+        && obs.sandbox_endpoint.starts_with("https://")
+        && !obs.sandbox_endpoint.contains("127.0.0.1");
+    let endpoint_ok = obs.endpoint_compatible && (gateway_endpoint || direct);
+    let mut evidence = if direct {
+        format!(
+            "advertised model matches the binding; host oauth client reaches {} over slirp",
+            obs.sandbox_endpoint
         )
+    } else if endpoint_ok {
+        "advertised model matches the binding and the sandbox endpoint is the host gateway"
+            .to_string()
     } else {
-        fail(
-            "endpoint_compatibility",
-            "advertised model or sandbox gateway endpoint did not match",
-        )
+        "advertised model or sandbox gateway endpoint did not match".to_string()
+    };
+    if !obs.gateway_exchanges.is_empty() {
+        evidence.push('\n');
+        evidence.push_str(&obs.gateway_exchanges.join("\n"));
+    } else if direct {
+        evidence.push_str("\ngateway requests: none");
+    }
+    let endpoint = if endpoint_ok {
+        pass("endpoint_compatibility", &evidence)
+    } else {
+        fail("endpoint_compatibility", &evidence)
     };
     vec![mcp, receipt, bounded, private, sidebar, global, endpoint]
 }
@@ -311,6 +333,8 @@ pub(crate) struct ObserveInput {
     pub private_frames: Vec<String>,
     pub endpoint_compatible: bool,
     pub sandbox_endpoint: String,
+    pub direct_provider_origin: bool,
+    pub gateway_exchanges: Vec<String>,
     pub scratch_root: PathBuf,
 }
 
@@ -616,6 +640,8 @@ impl QualificationExperiment {
             private_sink_frames,
             endpoint_compatible: input.endpoint_compatible,
             sandbox_endpoint: input.sandbox_endpoint,
+            direct_provider_origin: input.direct_provider_origin,
+            gateway_exchanges: input.gateway_exchanges,
         }
     }
 
@@ -929,8 +955,45 @@ mod tests {
             private_sink_frames: 0,
             endpoint_compatible: false,
             sandbox_endpoint: String::new(),
+            direct_provider_origin: false,
+            gateway_exchanges: Vec::new(),
         });
         assert!(checks.iter().all(|check| check.status == "failed"));
+    }
+
+    #[test]
+    fn antigravity_direct_origin_passes_without_the_loopback_gateway() {
+        let mut obs = failed_observation();
+        obs.endpoint_compatible = true;
+        obs.direct_provider_origin = true;
+        obs.sandbox_endpoint = "https://cloudcode-pa.googleapis.com".into();
+        let endpoint = production_checks(&obs)
+            .into_iter()
+            .find(|check| check.name == "endpoint_compatibility")
+            .expect("endpoint");
+        assert_eq!(endpoint.status, "passed", "{}", endpoint.evidence);
+        assert!(endpoint
+            .evidence
+            .contains("https://cloudcode-pa.googleapis.com"));
+        assert!(endpoint.evidence.contains("gateway requests: none"));
+    }
+
+    #[test]
+    fn gateway_upstream_status_stays_on_the_endpoint_trace() {
+        let mut obs = failed_observation();
+        obs.endpoint_compatible = true;
+        obs.sandbox_endpoint = SANDBOX_ENDPOINT.into();
+        obs.gateway_exchanges = vec![
+            "POST /v1/v1beta/models/gemini-3.8-flash:streamGenerateContent?alt=sse status=404"
+                .into(),
+        ];
+        let endpoint = production_checks(&obs)
+            .into_iter()
+            .find(|check| check.name == "endpoint_compatibility")
+            .expect("endpoint");
+        assert_eq!(endpoint.status, "passed", "{}", endpoint.evidence);
+        assert!(endpoint.evidence.contains("host gateway"));
+        assert!(endpoint.evidence.contains("status=404"));
     }
 
     #[test]
@@ -1016,6 +1079,8 @@ mod tests {
                 private_frames: vec!["session/prompt result".into()],
                 endpoint_compatible: true,
                 sandbox_endpoint: SANDBOX_ENDPOINT.into(),
+                direct_provider_origin: false,
+                gateway_exchanges: Vec::new(),
                 scratch_root: scratch,
             })
             .await;

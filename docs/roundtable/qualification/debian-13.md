@@ -18,7 +18,10 @@ files are not copied into the attempt home. Antigravity does not receive
 `fetchAvailableModels` to the loopback relay, which does not serve that
 API, and `session/new` then fails with connection refused. With the host
 oauth files mounted and no `AGY_*` variables, model listing and the
-prompt use the same oauth client and leave through slirp. The four
+prompt use the same oauth client and leave through slirp.
+`endpoint_compatibility` for Antigravity accepts that provider origin.
+Grok still uses the loopback gateway. Each gateway request records its
+method, path, and upstream status in the probe trace. The four
 credential-boundary checks are `not_applicable` and do not block the
 certificate. A non-empty `auth_mounts` list still fails the report. The
 sandbox also receives a random attempt bearer and, for adapters that use

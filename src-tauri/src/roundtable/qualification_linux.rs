@@ -876,6 +876,10 @@ async fn run_acp(
         &auth_overlays,
     )
     .await;
+    let gateway_exchanges = match gateway.as_ref() {
+        Some(started) => started.server.exchange_log(),
+        None => Vec::new(),
+    };
     drop(gateway);
     let (session_id, endpoint_compatible) = match &output {
         Ok(turn) => (
@@ -893,6 +897,7 @@ async fn run_acp(
         .lock()
         .map(|log| log.clone())
         .unwrap_or_default();
+    let (sandbox_endpoint, direct_provider_origin) = measured_endpoint(request, &model_env);
     let observation = experiment
         .observe(ObserveInput {
             session_id,
@@ -900,7 +905,9 @@ async fn run_acp(
                 .unwrap_or(crate::models::AgentType::Grok),
             private_frames: frames,
             endpoint_compatible,
-            sandbox_endpoint: SANDBOX_ENDPOINT.to_string(),
+            sandbox_endpoint,
+            direct_provider_origin,
+            gateway_exchanges,
             scratch_root: scratch,
         })
         .await;
@@ -913,6 +920,25 @@ async fn run_acp(
 struct AcpProbe {
     turn: Result<TurnOutcome, String>,
     observation: super::qualification_experiment::ProductionObservation,
+}
+
+/// Grok keeps the loopback gateway. Antigravity with no `AGY_*` variables
+/// is measured against the provider origin the host oauth client calls.
+fn measured_endpoint(request: &ProbeRequest, model_env: &[(String, String)]) -> (String, bool) {
+    if request.agent == "antigravity" && model_env.is_empty() {
+        let origin = read_providers(&request.provider_bindings)
+            .ok()
+            .and_then(|providers| {
+                provider_for_agent(&providers, "antigravity")
+                    .map(|provider| provider.origin.clone())
+            })
+            .unwrap_or_default();
+        if origin.starts_with("https://") && !origin.contains("127.0.0.1") {
+            return (origin, true);
+        }
+        return (String::new(), false);
+    }
+    (SANDBOX_ENDPOINT.to_string(), false)
 }
 
 fn facts_model(request: &ProbeRequest) -> String {
