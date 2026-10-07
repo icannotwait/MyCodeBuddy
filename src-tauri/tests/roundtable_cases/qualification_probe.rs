@@ -598,7 +598,7 @@ fn acp_session_error_stops_slirp_and_deletes_the_container() {
     assert!(error.contains("session/new"), "{error}");
     let text = fs::read_to_string(&log).expect("crun log");
     assert!(text.contains("kill cq-acp-9 KILL"), "{text}");
-    assert!(text.contains("delete cq-acp-9"), "{text}");
+    assert!(text.contains("delete --force cq-acp-9"), "{text}");
     assert_eq!(
         phase.unwrap(),
         "cleanup-proven-started\n",

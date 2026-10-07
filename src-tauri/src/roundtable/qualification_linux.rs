@@ -756,7 +756,18 @@ async fn run_mcp(request: &ProbeRequest, token: &str) -> Result<(), String> {
             "--incarnation".into(),
             "qualify".into(),
         ];
-        let prepared = prepare_bundle(request, &argv, &mounts, None, false, Some(token), &[], &[])?;
+        let prepared = prepare_bundle(
+            request,
+            &argv,
+            &mounts,
+            None,
+            false,
+            Some(token),
+            &ProbeModelInput {
+                env: &[],
+                auth_overlays: &[],
+            },
+        )?;
         let mut container = ProbeContainer {
             request,
             id: prepared.id.clone(),
@@ -872,8 +883,10 @@ async fn run_acp(
         &token,
         egress_note,
         Some(&private_log),
-        &model_env,
-        &auth_overlays,
+        &ProbeModelInput {
+            env: &model_env,
+            auth_overlays: &auth_overlays,
+        },
     )
     .await;
     let gateway_exchanges = match gateway.as_ref() {
@@ -1015,6 +1028,11 @@ impl Drop for ProbeContainer<'_> {
     }
 }
 
+struct ProbeModelInput<'a> {
+    env: &'a [(String, String)],
+    auth_overlays: &'a [(PathBuf, String)],
+}
+
 async fn run_acp_session(
     request: &ProbeRequest,
     argv: &[String],
@@ -1022,19 +1040,9 @@ async fn run_acp_session(
     token: &str,
     egress_note: String,
     private_log: Option<&std::sync::Mutex<Vec<String>>>,
-    model_env: &[(String, String)],
-    auth_overlays: &[(PathBuf, String)],
+    model: &ProbeModelInput<'_>,
 ) -> Result<TurnOutcome, String> {
-    let prepared = prepare_bundle(
-        request,
-        argv,
-        mounts,
-        None,
-        true,
-        None,
-        model_env,
-        auth_overlays,
-    )?;
+    let prepared = prepare_bundle(request, argv, mounts, None, true, None, model)?;
     let mut container = ProbeContainer {
         request,
         id: prepared.id.clone(),
@@ -1084,7 +1092,7 @@ async fn run_acp_session(
             "name": "roundtable",
             "command": "/usr/local/bin/codeg-mcp",
             "args": ["--service-roundtable", "--socket-path", "/run/codeg/roundtable.sock", "--incarnation", "qualify"],
-            "env": mcp_env(token, !model_env.is_empty())
+            "env": mcp_env(token, !model.env.is_empty())
         }])),
         private_log,
     )
@@ -1162,7 +1170,18 @@ async fn run_container(
     slirp: bool,
     token: Option<&str>,
 ) -> Result<String, String> {
-    let prepared = prepare_bundle(request, argv, mounts, secret, slirp, token, &[], &[])?;
+    let prepared = prepare_bundle(
+        request,
+        argv,
+        mounts,
+        secret,
+        slirp,
+        token,
+        &ProbeModelInput {
+            env: &[],
+            auth_overlays: &[],
+        },
+    )?;
     let mut container = ProbeContainer {
         request,
         id: prepared.id.clone(),
@@ -1364,8 +1383,7 @@ fn prepare_bundle(
     secret: Option<&Path>,
     slirp: bool,
     token: Option<&str>,
-    model_env: &[(String, String)],
-    auth_overlays: &[(PathBuf, String)],
+    model: &ProbeModelInput<'_>,
 ) -> Result<PreparedBundle, String> {
     let _ = fs::create_dir_all(request.runtime_root.join("state"));
     let id = if argv.iter().any(|arg| arg.contains("codeg-mcp")) {
@@ -1428,7 +1446,7 @@ fn prepare_bundle(
     append_host_auth_mounts(
         &mut oci_mounts,
         &upper,
-        auth_overlays,
+        model.auth_overlays,
         select_profile(request),
     )?;
     let secret_note = secret
@@ -1448,7 +1466,7 @@ fn prepare_bundle(
         env.push(format!("{ATTEMPT_TOKEN_ENV}={token}"));
     }
     if slirp {
-        for (key, value) in model_env {
+        for (key, value) in model.env {
             if key != "PATH" && key != "HOME" && !value.is_empty() {
                 env.push(format!("{key}={value}"));
             }
@@ -1618,7 +1636,7 @@ fn append_host_auth_mounts(
         })
         .unwrap_or_default();
     for (source, destination) in overlays {
-        if !allowed.iter().any(|item| *item == destination.as_str()) {
+        if !allowed.contains(&destination.as_str()) {
             return Err(format!(
                 "auth destination is not in the adapter profile: {destination}"
             ));

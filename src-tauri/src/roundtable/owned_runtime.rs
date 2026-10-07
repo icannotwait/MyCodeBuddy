@@ -433,19 +433,13 @@ impl ParticipantRuntime for OwnedParticipantRuntime {
                         }
                         Ok(Err(error)) => return Err(error),
                         Err(_elapsed) => {
-                            match account_elapsed_slice(
-                                &mut lease,
-                                &permission,
-                                &store,
-                                &room,
-                                boot_epoch,
-                                run_epoch,
-                            )
-                            .await?
-                            {
-                                SliceRenewal::Renewed => {}
-                                SliceRenewal::Finished => return Ok(()),
-                            }
+                            // Unlike delayed scheduler polling above, this
+                            // checkpoint was pending past its prepaid deadline.
+                            // Do not wait for SQLite again before local cleanup.
+                            return Err(rt_error(
+                                ErrorCode::InsufficientBudget,
+                                "prepaid_lease_expired",
+                            ));
                         }
                     }
                 }
@@ -1437,7 +1431,7 @@ fn validate_plan_context(
 }
 
 enum TurnStop {
-    Finished(RtResult<RoundtableTurnOutcome>),
+    Finished(RtResult<Box<RoundtableTurnOutcome>>),
     AttemptTimeout,
     Stopped,
 }
@@ -1697,7 +1691,7 @@ async fn run_turn(
     let deadline = request.deadline_mono;
     let remaining = deadline.saturating_sub(store.clock_sample().0);
     let completed = tokio::select! {
-        result=executor.execute_turn(request)=>TurnStop::Finished(result),
+        result=executor.execute_turn(request)=>TurnStop::Finished(result.map(Box::new)),
         _=tokio::time::sleep(std::time::Duration::from_millis(remaining))=>TurnStop::AttemptTimeout,
         _=async {
             loop {
@@ -1707,7 +1701,7 @@ async fn run_turn(
         }=>TurnStop::Stopped,
     };
     let outcome = match completed {
-        TurnStop::Finished(Ok(outcome)) => outcome,
+        TurnStop::Finished(Ok(outcome)) => *outcome,
         stop => {
             if matches!(stop, TurnStop::AttemptTimeout) {
                 // Record this before reap. Live diagnostics otherwise default

@@ -1134,6 +1134,7 @@ fn apply_slirp_edits(
 
 /// Refuses to copy or stage credential bytes into an attempt home.
 /// Callers that still name an auth destination fail closed.
+#[cfg(any(test, feature = "test-utils"))]
 pub(crate) fn prepare_attempt_auth(
     upper: &Path,
     source: &Path,
@@ -1146,7 +1147,7 @@ pub(crate) fn prepare_attempt_auth(
     ))
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 fn copy_regular_nofollow(source: &Path, dest: &Path, limit: u64) -> RtResult<()> {
     #[cfg(unix)]
     {
@@ -1194,11 +1195,6 @@ fn copy_regular_nofollow(source: &Path, dest: &Path, limit: u64) -> RtResult<()>
         }
         fs::rename(&tmp, dest).map_err(|_| rt_error(ErrorCode::StorageUnavailable, "auth_copy"))?;
         Ok(())
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = (source, dest, limit);
-        Err(rt_error(ErrorCode::PolicyUnenforceable, "auth_copy"))
     }
 }
 

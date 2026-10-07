@@ -565,30 +565,33 @@ impl QualificationExperiment {
     }
 
     pub(crate) async fn observe(self, input: ObserveInput) -> ProductionObservation {
-        let mut hub = self.hub.lock().unwrap_or_else(|poison| poison.into_inner());
-        let principal = id::<PrincipalId>(30);
-        let actor = roundtable_protocol::ActorContext::from_trusted_entry(
-            principal,
-            roundtable_protocol::OperatorScope::SingleOperator,
-            roundtable_protocol::ClientIdentity {
-                kind: roundtable_protocol::ClientKind::Desktop,
-                session_ref: "qualification-probe".into(),
-            },
-        );
-        let directory = super::authorization::RoomDirectory {
-            rooms: vec![super::authorization::RoomGrant {
-                room_id: self.room_id,
-                principal: id::<PrincipalId>(30),
-                hidden: false,
-            }],
+        let (private_sink_frames, global_frames) = {
+            let mut hub = self.hub.lock().unwrap_or_else(|poison| poison.into_inner());
+            let principal = id::<PrincipalId>(30);
+            let actor = roundtable_protocol::ActorContext::from_trusted_entry(
+                principal,
+                roundtable_protocol::OperatorScope::SingleOperator,
+                roundtable_protocol::ClientIdentity {
+                    kind: roundtable_protocol::ClientKind::Desktop,
+                    session_ref: "qualification-probe".into(),
+                },
+            );
+            let directory = super::authorization::RoomDirectory {
+                rooms: vec![super::authorization::RoomGrant {
+                    room_id: self.room_id,
+                    principal: id::<PrincipalId>(30),
+                    hidden: false,
+                }],
+            };
+            let _ = hub.attach(&actor, &self.room_id, &directory, "private");
+            for frame in &input.private_frames {
+                hub.publish("private", frame.clone());
+            }
+            (
+                hub.frames_for("private").len() as u64,
+                hub.frames_for("global").len() as u64,
+            )
         };
-        let _ = hub.attach(&actor, &self.room_id, &directory, "private");
-        for frame in &input.private_frames {
-            hub.publish("private", frame.clone());
-        }
-        let private_sink_frames = hub.frames_for("private").len() as u64;
-        let global_frames = hub.frames_for("global").len() as u64;
-        drop(hub);
         let roundtable_hidden = if input.session_id.is_empty() {
             false
         } else if let Ok(root) = input.scratch_root.canonicalize() {

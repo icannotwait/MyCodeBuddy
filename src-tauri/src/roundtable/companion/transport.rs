@@ -290,6 +290,7 @@ fn unavailable() -> roundtable_protocol::RtError {
 }
 
 /// `sockaddr_un.sun_path` is 108 bytes including the trailing NUL.
+#[cfg(any(unix, test))]
 pub(crate) const UNIX_SOCKET_PATH_MAX: usize = 107;
 
 pub(crate) fn ensure_unix_socket_path(path: &str) -> RtResult<()> {
@@ -301,7 +302,7 @@ pub(crate) fn ensure_unix_socket_path(path: &str) -> RtResult<()> {
     Ok(())
 }
 
-/// A pathname socket that stays under [`UNIX_SOCKET_PATH_MAX`] even when
+/// A pathname socket that stays under `UNIX_SOCKET_PATH_MAX` even when
 /// `--data-dir` is long. The container still sees `/run/codeg/*.sock`.
 pub(crate) fn short_socket_path(label: &str) -> std::path::PathBuf {
     let id = &uuid::Uuid::new_v4().simple().to_string()[..12];

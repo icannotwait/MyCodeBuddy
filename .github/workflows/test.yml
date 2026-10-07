@@ -123,9 +123,9 @@ jobs:
     name: Rust ${{ matrix.mode }} on ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
     env:
-      # Ubuntu desktop links the full Tauri + integration-test graph. Parallel
-      # rustc on the 7 GiB runner SIGTERMs (exit 143) after the 0.31.0 merge.
-      CARGO_BUILD_JOBS: ${{ (matrix.os == 'ubuntu-22.04' && matrix.mode == 'desktop') && '1' || '4' }}
+      # Avoid overlapping large rustc/link processes for desktop test binaries
+      # and the 7 GiB macOS hosts. Keep every target and test enabled.
+      CARGO_BUILD_JOBS: ${{ matrix.build_jobs || 4 }}
     strategy:
       fail-fast: false
       matrix:
@@ -133,6 +133,7 @@ jobs:
         mode: [desktop, server]
         include:
           - mode: desktop
+            build_jobs: 1
             # `test-utils` exposes test scaffolding (AppState::new_for_test,
             # EventEmitter::test_web_only, ConnectionManager::insert_test_connection,
             # parser `with_base_dir`, `db::test_helpers`) for integration tests
@@ -155,6 +156,8 @@ jobs:
             # codeg-server binary, which is exactly the cfg-gated surface
             # that this cell exists to verify.
             clippy_args: "--no-default-features --features server --bin codeg-server --lib"
+          - os: macos-latest
+            build_jobs: 1
     steps:
       - uses: actions/checkout@v4
 
