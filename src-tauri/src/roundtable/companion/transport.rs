@@ -336,8 +336,11 @@ async fn read<R: AsyncRead + Unpin, T: for<'de> Deserialize<'de>>(stream: &mut R
 
 #[cfg(test)]
 mod socket_path_tests {
-    use super::{ensure_unix_socket_path, short_socket_path, UNIX_SOCKET_PATH_MAX};
+    #[cfg(unix)]
+    use super::short_socket_path;
+    use super::{ensure_unix_socket_path, UNIX_SOCKET_PATH_MAX};
 
+    #[cfg(unix)]
     #[test]
     fn overlong_pathname_is_an_explicit_error_and_short_paths_fit() {
         let path = short_socket_path("a");
@@ -350,5 +353,13 @@ mod socket_path_tests {
             error.details.reason.as_deref(),
             Some("socket_path_too_long")
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn named_pipes_do_not_use_the_unix_socket_path_limit() {
+        let path = format!(r"\\.\pipe\{}", "x".repeat(UNIX_SOCKET_PATH_MAX));
+        assert!(path.len() > UNIX_SOCKET_PATH_MAX);
+        ensure_unix_socket_path(&path).unwrap();
     }
 }

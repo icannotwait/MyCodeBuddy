@@ -416,11 +416,14 @@ impl QualificationExperiment {
         recipient: &str,
         fixture_hash: Hash256,
     ) -> RtResult<Self> {
-        if let Some(parent) = socket_path.parent() {
-            std::fs::create_dir_all(parent)
-                .map_err(|_| rt_error(ErrorCode::StorageUnavailable, "experiment_socket"))?;
+        #[cfg(unix)]
+        {
+            if let Some(parent) = socket_path.parent() {
+                std::fs::create_dir_all(parent)
+                    .map_err(|_| rt_error(ErrorCode::StorageUnavailable, "experiment_socket"))?;
+            }
+            let _ = std::fs::remove_file(socket_path);
         }
-        let _ = std::fs::remove_file(socket_path);
         // One database per open. A second adapter, or a rerun, in the same
         // data dir must not reuse room and attempt primary keys.
         let run_dir = data_dir
@@ -883,6 +886,20 @@ mod tests {
     use roundtable_protocol::canonical_bytes;
     use serde_json::{json, Value};
 
+    fn broker_path(root: &Path, name: &str) -> PathBuf {
+        #[cfg(unix)]
+        let path = root.join(name);
+        #[cfg(windows)]
+        let path = {
+            let _ = (root, name);
+            PathBuf::from(format!(
+                r"\\.\pipe\codeg-qualification-test-{}",
+                uuid::Uuid::new_v4()
+            ))
+        };
+        path
+    }
+
     fn clean_canary() -> CredentialCanary {
         CredentialCanary {
             output: "CONTROL:nonce\nABSENT /rt-home/.grok/auth.json\n".into(),
@@ -1011,7 +1028,7 @@ mod tests {
         let fixture = Hash256::sha256(b"fixture");
         let experiment = QualificationExperiment::open(
             dir.path(),
-            &dir.path().join("broker.sock"),
+            &broker_path(dir.path(), "broker.sock"),
             "grok-4.6",
             fixture,
         )
@@ -1120,7 +1137,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let first = QualificationExperiment::open(
             dir.path(),
-            &dir.path().join("a/roundtable.sock"),
+            &broker_path(dir.path(), "a/roundtable.sock"),
             "host",
             Hash256::sha256(b"grok"),
         )
@@ -1128,12 +1145,13 @@ mod tests {
         .expect("first experiment");
         let second = QualificationExperiment::open(
             dir.path(),
-            &dir.path().join("b/roundtable.sock"),
+            &broker_path(dir.path(), "b/roundtable.sock"),
             "host",
             Hash256::sha256(b"antigravity"),
         )
         .await
         .expect("second experiment");
         assert_ne!(first.token(), second.token());
+        assert_ne!(first.socket_path(), second.socket_path());
     }
 }
