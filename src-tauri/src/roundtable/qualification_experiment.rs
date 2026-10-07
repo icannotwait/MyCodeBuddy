@@ -395,7 +395,14 @@ impl QualificationExperiment {
                 .map_err(|_| rt_error(ErrorCode::StorageUnavailable, "experiment_socket"))?;
         }
         let _ = std::fs::remove_file(socket_path);
-        let db_path = data_dir.join("qualification-experiment.sqlite");
+        // One database per open. A second adapter, or a rerun, in the same
+        // data dir must not reuse room and attempt primary keys.
+        let run_dir = data_dir
+            .join("qualification-runs")
+            .join(uuid::Uuid::new_v4().simple().to_string());
+        std::fs::create_dir_all(&run_dir)
+            .map_err(|_| rt_error(ErrorCode::StorageUnavailable, "experiment_store"))?;
+        let db_path = run_dir.join("experiment.sqlite");
         let url = format!(
             "sqlite:{}?mode=rwc",
             urlencoding::encode(db_path.to_string_lossy().as_ref())
@@ -417,7 +424,7 @@ impl QualificationExperiment {
         let attempt_id = id::<AttemptId>(6);
         seed_graph(&db, room_id, speaker_id, phase, binding_id, attempt_id).await?;
         let objects = ObjectStore::open(
-            data_dir.join("qualification-objects"),
+            run_dir.join("objects"),
             Arc::new(ReservationLedger::new(8_000_000)),
             id::<PrincipalId>(1),
         )?;
@@ -1038,5 +1045,27 @@ mod tests {
                 .count,
             Some(0)
         );
+    }
+
+    #[tokio::test]
+    async fn two_experiments_in_one_data_dir_do_not_collide() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = QualificationExperiment::open(
+            dir.path(),
+            &dir.path().join("a/roundtable.sock"),
+            "host",
+            Hash256::sha256(b"grok"),
+        )
+        .await
+        .expect("first experiment");
+        let second = QualificationExperiment::open(
+            dir.path(),
+            &dir.path().join("b/roundtable.sock"),
+            "host",
+            Hash256::sha256(b"antigravity"),
+        )
+        .await
+        .expect("second experiment");
+        assert_ne!(first.token(), second.token());
     }
 }

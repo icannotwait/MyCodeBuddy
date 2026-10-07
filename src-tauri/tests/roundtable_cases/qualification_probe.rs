@@ -223,6 +223,41 @@ fn catalog_keeps_a_passed_adapter_when_another_fails() {
 }
 
 #[test]
+fn sandbox_gateway_env_is_adapter_specific_and_not_a_host_secret() {
+    let bearer = "attempt-bearer";
+    let grok = profile_for_agent("grok")
+        .expect("grok")
+        .model_gateway
+        .entries(bearer);
+    assert!(grok.iter().any(|(key, value)| {
+        key == "GROK_XAI_API_BASE_URL" && value == "http://127.0.0.1:39173/v1"
+    }));
+    assert!(grok
+        .iter()
+        .any(|(key, value)| key == "XAI_API_KEY" && value == bearer));
+    assert!(!grok.iter().any(|(key, _)| key == "OPENAI_API_KEY"));
+    let antigravity = profile_for_agent("antigravity")
+        .expect("antigravity")
+        .model_gateway
+        .entries(bearer);
+    assert!(antigravity.iter().any(|(key, value)| {
+        key == "AGY_LLM_GATEWAY_URL" && value == "http://127.0.0.1:39173/v1"
+    }));
+    assert!(antigravity
+        .iter()
+        .any(|(key, value)| { key == "AGY_LLM_GATEWAY_API_KEY" && value == bearer }));
+    assert!(antigravity
+        .iter()
+        .any(|(key, value)| key == "AGY_ACP_ENABLE_GATEWAY_AUTH" && value == "1"));
+    let cursor = profile_for_agent("cursor")
+        .expect("cursor")
+        .model_gateway
+        .entries(bearer);
+    assert!(cursor.is_empty());
+    assert!(!cursor.iter().any(|(key, _)| key == "CURSOR_API_KEY"));
+}
+
+#[test]
 fn antigravity_default_profile_is_1_3_0_and_mounts_the_token_file() {
     let profile = profile_for_agent("antigravity").expect("default");
     assert_eq!(profile.exact_id, "linux-antigravity-acp-1.3.0");

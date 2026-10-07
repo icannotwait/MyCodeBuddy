@@ -35,6 +35,10 @@ pub struct AdapterProfile {
     pub container_mcp: &'static str,
     pub auth_files: &'static [AuthFile],
     pub container_env: &'static [(&'static str, &'static str)],
+    /// Sandbox variables that point this adapter's own client at the host
+    /// gateway. The base URL is the loopback relay. The bearer is the attempt
+    /// token, never a host credential.
+    pub model_gateway: ModelGatewayEnv,
     /// When set, at least one existing auth file must use this filename.
     /// Cursor accepts either XDG `auth.json` or `~/.cursor/auth.json`.
     pub require_one_filename: Option<&'static str>,
@@ -42,6 +46,64 @@ pub struct AdapterProfile {
     /// inside the isolator. A missing adapter or a failed turn is a failure.
     pub requires_acp_turn: bool,
 }
+
+#[derive(Clone, Copy, Debug)]
+pub struct ModelGatewayEnv {
+    pub base_url_keys: &'static [&'static str],
+    pub bearer_keys: &'static [&'static str],
+    pub fixed: &'static [(&'static str, &'static str)],
+}
+
+impl ModelGatewayEnv {
+    pub fn entries(self, bearer: &str) -> Vec<(String, String)> {
+        let mut entries = Vec::new();
+        for key in self.base_url_keys {
+            entries.push((
+                (*key).to_string(),
+                super::relay::SANDBOX_ENDPOINT.to_string(),
+            ));
+        }
+        for key in self.bearer_keys {
+            entries.push(((*key).to_string(), bearer.to_string()));
+        }
+        for (key, value) in self.fixed {
+            entries.push(((*key).to_string(), (*value).to_string()));
+        }
+        entries
+    }
+}
+
+const NO_MODEL_GATEWAY: ModelGatewayEnv = ModelGatewayEnv {
+    base_url_keys: &[],
+    bearer_keys: &[],
+    fixed: &[],
+};
+
+const OPENAI_GATEWAY: ModelGatewayEnv = ModelGatewayEnv {
+    base_url_keys: &["OPENAI_BASE_URL"],
+    bearer_keys: &["OPENAI_API_KEY"],
+    fixed: &[],
+};
+
+/// Grok 1.0.46 ignores `OPENAI_*`. `session/new` succeeds when these two
+/// variables name the loopback gateway and the attempt bearer.
+const GROK_GATEWAY: ModelGatewayEnv = ModelGatewayEnv {
+    base_url_keys: &["GROK_XAI_API_BASE_URL"],
+    bearer_keys: &["XAI_API_KEY"],
+    fixed: &[],
+};
+
+/// Antigravity 1.3.0 reads its own gateway variables. The enable flag selects
+/// gateway auth so the sandbox does not need the host token files.
+const ANTIGRAVITY_GATEWAY: ModelGatewayEnv = ModelGatewayEnv {
+    base_url_keys: &[
+        "AGY_LLM_GATEWAY_URL",
+        "AGY_GATEWAY_URL",
+        "AGY_ACP_CCPA_BASE_URL",
+    ],
+    bearer_keys: &["AGY_LLM_GATEWAY_API_KEY", "AGY_GATEWAY_API_KEY"],
+    fixed: &[("AGY_ACP_ENABLE_GATEWAY_AUTH", "1")],
+};
 
 const DEBIAN: &[AcceptedOs] = &[
     AcceptedOs {
@@ -95,6 +157,7 @@ const PROFILES: &[AdapterProfile] = &[
             required: true,
         }],
         container_env: COMMON_ENV,
+        model_gateway: OPENAI_GATEWAY,
         require_one_filename: None,
         requires_acp_turn: true,
     },
@@ -114,6 +177,7 @@ const PROFILES: &[AdapterProfile] = &[
             required: true,
         }],
         container_env: COMMON_ENV,
+        model_gateway: GROK_GATEWAY,
         require_one_filename: None,
         requires_acp_turn: true,
     },
@@ -150,6 +214,7 @@ const PROFILES: &[AdapterProfile] = &[
             ("CURSOR_CONFIG_DIR", "/rt-home/.cursor"),
             ("XDG_CONFIG_HOME", "/rt-home/.config"),
         ],
+        model_gateway: NO_MODEL_GATEWAY,
         require_one_filename: Some("auth.json"),
         requires_acp_turn: true,
     },
@@ -165,6 +230,7 @@ const PROFILES: &[AdapterProfile] = &[
         container_mcp: "/usr/local/bin/codeg-mcp",
         auth_files: ANTIGRAVITY_AUTH,
         container_env: ANTIGRAVITY_ENV,
+        model_gateway: ANTIGRAVITY_GATEWAY,
         require_one_filename: None,
         requires_acp_turn: true,
     },
@@ -180,6 +246,7 @@ const PROFILES: &[AdapterProfile] = &[
         container_mcp: "/usr/local/bin/codeg-mcp",
         auth_files: ANTIGRAVITY_AUTH,
         container_env: ANTIGRAVITY_ENV,
+        model_gateway: ANTIGRAVITY_GATEWAY,
         require_one_filename: None,
         requires_acp_turn: true,
     },

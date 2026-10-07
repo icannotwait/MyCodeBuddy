@@ -624,24 +624,62 @@ impl RoundtableTurnExecutor for LiveParticipantExecutor {
             provider_token.clone(),
             token.reveal_for_same_sandbox().to_owned(),
         ]);
-        let store_clock = request.store.clone();
-        let gateway = Arc::new(
-            LiveModelGateway::new(
-                self.data_dir.clone(),
+        let modeled = super::qualification_profiles::profile_for_agent(agent.as_str())
+            .map(|profile| profile.model_gateway.entries(&provider_token))
+            .unwrap_or_default();
+        let env_allowlist: BTreeMap<String, String> = if modeled.is_empty() {
+            [
                 (
-                    super::ApprovedOrigin::parse(&provider.origin)?,
-                    super::HostCredential::injected(host_gateway_secret(&installed, &provider)?),
-                    provider.model.clone(),
-                    request.participant.effort.clone(),
+                    "OPENAI_BASE_URL".to_owned(),
+                    super::relay::SANDBOX_ENDPOINT.to_owned(),
                 ),
-                provider_token.clone(),
-                (execution, facts),
-                MonoMs(request.deadline_mono),
-                Arc::new(move || MonoMs(store_clock.clock_sample().0)),
-                installed.context_profile.clone(),
-            )?
-            .with_execution_lease(request.execution_lease.clone()),
-        );
+                ("OPENAI_API_KEY".to_owned(), provider_token.clone()),
+            ]
+            .into_iter()
+            .collect()
+        } else {
+            modeled.into_iter().collect()
+        };
+        let store_clock = request.store.clone();
+        let mut gateway = LiveModelGateway::new(
+            self.data_dir.clone(),
+            (
+                super::ApprovedOrigin::parse(&provider.origin)?,
+                super::HostCredential::injected(host_gateway_secret(&installed, &provider)?),
+                provider.model.clone(),
+                request.participant.effort.clone(),
+            ),
+            provider_token.clone(),
+            (execution, facts),
+            MonoMs(request.deadline_mono),
+            Arc::new(move || MonoMs(store_clock.clock_sample().0)),
+            installed.context_profile.clone(),
+        )?;
+        if matches!(agent.as_str(), "grok" | "antigravity") {
+            let files: Vec<PathBuf> = installed
+                .oci
+                .host_held_credentials
+                .iter()
+                .map(|mount| PathBuf::from(&mount.source))
+                .collect();
+            let version = super::qualification_profiles::profile_for_agent(agent.as_str())
+                .map(|profile| profile.version_needle)
+                .unwrap_or("");
+            let upstream = super::host_model_auth::resolve_model_upstream(
+                super::host_model_auth::ResolveInput {
+                    agent: agent.as_str(),
+                    binding_origin: &provider.origin,
+                    env_secret: std::env::var(&provider.credential_env).ok(),
+                    auth_files: &files,
+                    adapter_version: version,
+                    now_unix: super::host_model_auth::unix_now(),
+                },
+            )
+            .await?;
+            diagnostic_secrets.push(upstream.bearer.clone());
+            gateway = gateway.with_native_upstream(upstream)?;
+        }
+        let gateway = Arc::new(gateway.with_execution_lease(request.execution_lease.clone()));
         let principal_row = one_row(
             request.store.connection(),
             "SELECT principal_id FROM rt_rooms WHERE room_id=?",
@@ -762,15 +800,7 @@ impl RoundtableTurnExecutor for LiveParticipantExecutor {
             other_scratches: Vec::new(),
             decoy_paths,
             inherited_env: BTreeMap::new(),
-            env_allowlist: [
-                (
-                    "OPENAI_BASE_URL".to_owned(),
-                    super::relay::SANDBOX_ENDPOINT.to_owned(),
-                ),
-                ("OPENAI_API_KEY".to_owned(), provider_token),
-            ]
-            .into_iter()
-            .collect(),
+            env_allowlist,
             global_mcp: false,
         };
         let plan = build_qualified_sandbox_plan(&input, &oci)?;

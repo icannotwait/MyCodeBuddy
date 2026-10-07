@@ -14,7 +14,9 @@ use tokio::io::BufReader;
 use tokio::process::Command;
 
 use super::companion::ATTEMPT_TOKEN_ENV;
+use super::host_model_auth::{resolve_model_upstream, unix_now, ResolveInput};
 use super::installed_runtime::ProviderBinding;
+use super::live_gateway::{LiveGatewayServer, LiveModelGateway};
 use super::qualification::CertifiedBinary;
 use super::qualification_experiment::{
     assess_credential_canary, failed_observation, production_checks, production_prompt,
@@ -761,7 +763,7 @@ async fn run_mcp(request: &ProbeRequest, token: &str) -> Result<(), String> {
             "--incarnation".into(),
             "qualify".into(),
         ];
-        let prepared = prepare_bundle(request, &argv, &mounts, None, false, Some(token))?;
+        let prepared = prepare_bundle(request, &argv, &mounts, None, false, Some(token), &[])?;
         let mut container = ProbeContainer {
             request,
             id: prepared.id.clone(),
@@ -830,6 +832,7 @@ async fn run_acp(
     let socket_path = request
         .runtime_root
         .join("probe-acp")
+        .join(uuid::Uuid::new_v4().simple().to_string())
         .join("roundtable.sock");
     let recipient = facts_model(request);
     let fixture = Hash256::sha256(request.agent.as_bytes());
@@ -853,6 +856,17 @@ async fn run_acp(
         Err(reason) => return Err(reason),
     };
     let private_log = std::sync::Mutex::new(Vec::new());
+    let attempt_bearer = uuid::Uuid::new_v4().simple().to_string();
+    let model_env = profile_for_agent(&request.agent)
+        .map(|profile| profile.model_gateway.entries(&attempt_bearer))
+        .unwrap_or_default();
+    let gateway = if model_env.is_empty() {
+        None
+    } else {
+        let started = start_probe_gateway(request, &attempt_bearer).await?;
+        mounts.push((started.path.clone(), "/run/codeg/gateway.sock".into(), true));
+        Some(started)
+    };
     let output = run_acp_session(
         request,
         &argv,
@@ -860,8 +874,10 @@ async fn run_acp(
         &token,
         egress_note,
         Some(&private_log),
+        &model_env,
     )
     .await;
+    drop(gateway);
     let (session_id, endpoint_compatible) = match &output {
         Ok(turn) => (
             turn.session_id.clone(),
@@ -981,8 +997,9 @@ async fn run_acp_session(
     token: &str,
     egress_note: String,
     private_log: Option<&std::sync::Mutex<Vec<String>>>,
+    model_env: &[(String, String)],
 ) -> Result<TurnOutcome, String> {
-    let prepared = prepare_bundle(request, argv, mounts, None, true, None)?;
+    let prepared = prepare_bundle(request, argv, mounts, None, true, None, model_env)?;
     let mut container = ProbeContainer {
         request,
         id: prepared.id.clone(),
@@ -1032,7 +1049,7 @@ async fn run_acp_session(
             "name": "roundtable",
             "command": "/usr/local/bin/codeg-mcp",
             "args": ["--service-roundtable", "--socket-path", "/run/codeg/roundtable.sock", "--incarnation", "qualify"],
-            "env": [{"name": ATTEMPT_TOKEN_ENV, "value": token}]
+            "env": mcp_env(token, !model_env.is_empty())
         }])),
         private_log,
     )
@@ -1110,7 +1127,7 @@ async fn run_container(
     slirp: bool,
     token: Option<&str>,
 ) -> Result<String, String> {
-    let prepared = prepare_bundle(request, argv, mounts, secret, slirp, token)?;
+    let prepared = prepare_bundle(request, argv, mounts, secret, slirp, token, &[])?;
     let mut container = ProbeContainer {
         request,
         id: prepared.id.clone(),
@@ -1230,6 +1247,75 @@ impl Drop for RemoveOnDrop {
     }
 }
 
+fn mcp_env(token: &str, gateway: bool) -> Vec<serde_json::Value> {
+    let mut env = vec![serde_json::json!({"name": ATTEMPT_TOKEN_ENV, "value": token})];
+    if gateway {
+        env.push(serde_json::json!({
+            "name": "CODEG_RT_MODEL_SOCKET",
+            "value": "/run/codeg/gateway.sock"
+        }));
+    }
+    env
+}
+
+struct ProbeGateway {
+    path: PathBuf,
+    /// Kept alive until the ACP turn returns. Drop closes the socket.
+    #[allow(dead_code)]
+    server: LiveGatewayServer,
+}
+
+async fn start_probe_gateway(
+    request: &ProbeRequest,
+    attempt_bearer: &str,
+) -> Result<ProbeGateway, String> {
+    let profile = profile_for_agent(&request.agent).ok_or("adapter profile")?;
+    let providers = read_providers(&request.provider_bindings).unwrap_or_default();
+    let provider =
+        provider_for_agent(&providers, &request.agent).ok_or("provider bindings missing")?;
+    let files: Vec<PathBuf> = profile
+        .auth_files
+        .iter()
+        .map(|file| request.home.join(file.home_relative))
+        .collect();
+    let upstream = resolve_model_upstream(ResolveInput {
+        agent: &request.agent,
+        binding_origin: &provider.origin,
+        env_secret: std::env::var(&provider.credential_env).ok(),
+        auth_files: &files,
+        adapter_version: profile.version_needle,
+        now_unix: unix_now(),
+    })
+    .await
+    .map_err(|error| {
+        error
+            .details
+            .reason
+            .unwrap_or_else(|| "provider_credential_missing".into())
+    })?;
+    let gateway = std::sync::Arc::new(
+        LiveModelGateway::native_probe(upstream, attempt_bearer.to_string()).map_err(|error| {
+            error
+                .details
+                .reason
+                .unwrap_or_else(|| "probe_gateway".into())
+        })?,
+    );
+    let directory = request.runtime_root.join("probe-gateway");
+    fs::create_dir_all(&directory).map_err(|error| error.to_string())?;
+    let path = directory.join(format!("{}.sock", uuid::Uuid::new_v4().simple()));
+    let _ = fs::remove_file(&path);
+    let server = LiveGatewayServer::bind(&path, gateway)
+        .await
+        .map_err(|error| {
+            error
+                .details
+                .reason
+                .unwrap_or_else(|| "probe_gateway".into())
+        })?;
+    Ok(ProbeGateway { path, server })
+}
+
 fn prepare_bundle(
     request: &ProbeRequest,
     argv: &[String],
@@ -1237,6 +1323,7 @@ fn prepare_bundle(
     secret: Option<&Path>,
     slirp: bool,
     token: Option<&str>,
+    model_env: &[(String, String)],
 ) -> Result<PreparedBundle, String> {
     let _ = fs::create_dir_all(request.runtime_root.join("state"));
     let id = if argv.iter().any(|arg| arg.contains("codeg-mcp")) {
@@ -1313,8 +1400,11 @@ fn prepare_bundle(
         env.push(format!("{ATTEMPT_TOKEN_ENV}={token}"));
     }
     if slirp {
-        env.push(format!("OPENAI_BASE_URL={SANDBOX_ENDPOINT}"));
-        env.push(format!("OPENAI_API_KEY={}", uuid::Uuid::new_v4().simple()));
+        for (key, value) in model_env {
+            if key != "PATH" && key != "HOME" && !value.is_empty() {
+                env.push(format!("{key}={value}"));
+            }
+        }
     }
     if let Some(profile) = select_profile(request) {
         for (key, value) in profile.container_env {

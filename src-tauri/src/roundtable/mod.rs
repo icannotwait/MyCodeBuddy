@@ -20,6 +20,7 @@ mod e2e;
 mod events;
 mod feature_gate;
 mod gateway;
+mod host_model_auth;
 pub(crate) mod ingress;
 mod installed_runtime;
 mod live_gateway;

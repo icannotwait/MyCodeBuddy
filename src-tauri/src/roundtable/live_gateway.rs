@@ -71,8 +71,16 @@ pub(crate) struct LiveModelGateway {
     uncertain: AtomicBool,
     fatal_failure: Mutex<Option<RtError>>,
     cancelled: tokio_util::sync::CancellationToken,
+    skip_admission: bool,
+    native: Option<NativeRelay>,
     #[cfg(any(test, feature = "test-utils"))]
     fixture_origin: Option<String>,
+}
+
+struct NativeRelay {
+    headers: Vec<(String, String)>,
+    bearer: Mutex<String>,
+    refresh: Option<super::host_model_auth::RefreshMaterial>,
 }
 
 impl LiveModelGateway {
@@ -119,6 +127,91 @@ impl LiveModelGateway {
             uncertain: AtomicBool::new(false),
             fatal_failure: Mutex::new(None),
             cancelled: tokio_util::sync::CancellationToken::new(),
+            skip_admission: false,
+            native: None,
+            #[cfg(any(test, feature = "test-utils"))]
+            fixture_origin: None,
+        })
+    }
+
+    pub(crate) fn with_native_upstream(
+        mut self,
+        upstream: super::host_model_auth::ResolvedUpstream,
+    ) -> RtResult<Self> {
+        self.origin = ApprovedOrigin::parse(&upstream.origin)?;
+        self.credential = HostCredential::injected(upstream.bearer.clone());
+        self.native = Some(NativeRelay {
+            headers: upstream.headers,
+            bearer: Mutex::new(upstream.bearer),
+            refresh: upstream.refresh,
+        });
+        Ok(self)
+    }
+
+    /// Probe relay. It checks the attempt bearer and forwards to the host
+    /// credential. It does not admit product scope.
+    pub(crate) fn native_probe(
+        upstream: super::host_model_auth::ResolvedUpstream,
+        attempt_bearer: String,
+    ) -> RtResult<Self> {
+        let origin = ApprovedOrigin::parse(&upstream.origin)?;
+        let host_bearer = upstream.bearer.clone();
+        Ok(Self {
+            data_dir: PathBuf::new(),
+            origin,
+            credential: HostCredential::injected(host_bearer.clone()),
+            model: String::new(),
+            effort: None,
+            bearer: attempt_bearer,
+            scope: ExecutionScope::Fake,
+            facts: AdmissionFacts {
+                certificate: roundtable_protocol::QualificationStatus::NotTested,
+                presented_key: super::QualificationKey {
+                    os: super::qualification::OsIdentity {
+                        name: "probe".into(),
+                        version: "0".into(),
+                    },
+                    binaries: Vec::new(),
+                    image_digest: String::new(),
+                    policy_hash: roundtable_protocol::Hash256::from_bytes([0; 32]),
+                    tool_contract_hash: roundtable_protocol::Hash256::from_bytes([0; 32]),
+                    core_hash: roundtable_protocol::Hash256::from_bytes([0; 32]),
+                    adapter_version: String::new(),
+                    isolator_version: String::new(),
+                    plan_hash: roundtable_protocol::Hash256::from_bytes([0; 32]),
+                },
+                qualification_attempts_used: 0,
+                qualification_spend_used: 0,
+                fixture_hash: roundtable_protocol::Hash256::from_bytes([0; 32]),
+                recipient: "probe".into(),
+            },
+            expires: MonoMs(u64::MAX / 4),
+            execution_lease: None,
+            now: Arc::new(|| MonoMs(0)),
+            profile: QualifiedContextProfile::proposed(
+                "probe",
+                roundtable_protocol::Hash256::from_bytes([0; 32]),
+                2_000_000,
+                0,
+                "probe",
+            ),
+            client: ClientPolicy::approved().build_client()?,
+            transcript: tokio::sync::Mutex::new(Transcript {
+                accounting: RequestAccounting::new(),
+                prior_generated: Vec::new(),
+                required_input: Vec::new(),
+                instructions: None,
+            }),
+            revoked: AtomicBool::new(false),
+            uncertain: AtomicBool::new(false),
+            fatal_failure: Mutex::new(None),
+            cancelled: tokio_util::sync::CancellationToken::new(),
+            skip_admission: true,
+            native: Some(NativeRelay {
+                headers: upstream.headers,
+                bearer: Mutex::new(host_bearer),
+                refresh: upstream.refresh,
+            }),
             #[cfg(any(test, feature = "test-utils"))]
             fixture_origin: None,
         })
@@ -414,6 +507,149 @@ impl LiveModelGateway {
             .store(previously_uncertain, Ordering::Release);
         Ok((content_type, received))
     }
+
+    fn admit_native(&self, headers: &axum::http::HeaderMap, body_len: usize) -> RtResult<()> {
+        let expected = format!("Bearer {}", self.bearer);
+        let supplied = headers
+            .get(axum::http::header::AUTHORIZATION)
+            .and_then(|header| header.to_str().ok())
+            .unwrap_or("");
+        if !constant_eq(supplied.as_bytes(), expected.as_bytes()) {
+            return Err(rt_error(ErrorCode::Unauthenticated, "gateway_token"));
+        }
+        if self.revoked.load(Ordering::Acquire) {
+            return Err(rt_error(ErrorCode::RuntimeUnavailable, "gateway_revoked"));
+        }
+        if !self.skip_admission {
+            if self.lease_expired() {
+                return Err(rt_error(ErrorCode::CapabilityUnqualified, "lease_expired"));
+            }
+            ExecutionGate::open(&self.data_dir).check(&self.scope, &self.facts, (self.now)())?;
+        }
+        if body_len > 8 * 1024 * 1024 {
+            return Err(rt_error(ErrorCode::ContextTooLarge, "request_body_limit"));
+        }
+        Ok(())
+    }
+
+    async fn refresh_native(&self) -> RtResult<()> {
+        let Some(refresh) = self
+            .native
+            .as_ref()
+            .and_then(|native| native.refresh.clone())
+        else {
+            return Err(rt_error(
+                ErrorCode::RuntimeUnavailable,
+                "credential_refresh",
+            ));
+        };
+        let access = refresh.refresh(&self.client).await?;
+        if let Some(native) = &self.native {
+            *native.bearer.lock().expect("upstream bearer") = access;
+        }
+        Ok(())
+    }
+
+    async fn forward_native(
+        &self,
+        method: axum::http::Method,
+        path_and_query: &str,
+        headers: axum::http::HeaderMap,
+        body: axum::body::Bytes,
+    ) -> RtResult<(axum::http::StatusCode, String, Vec<u8>)> {
+        self.admit_native(&headers, body.len())?;
+        let sent = self
+            .dispatch_native(method.clone(), path_and_query, &headers, body.clone())
+            .await?;
+        if sent.0 == axum::http::StatusCode::UNAUTHORIZED && self.refresh_native().await.is_ok() {
+            return self
+                .dispatch_native(method, path_and_query, &headers, body)
+                .await;
+        }
+        Ok(sent)
+    }
+
+    async fn dispatch_native(
+        &self,
+        method: axum::http::Method,
+        path_and_query: &str,
+        headers: &axum::http::HeaderMap,
+        body: axum::body::Bytes,
+    ) -> RtResult<(axum::http::StatusCode, String, Vec<u8>)> {
+        if !matches!(
+            method,
+            axum::http::Method::GET
+                | axum::http::Method::POST
+                | axum::http::Method::PUT
+                | axum::http::Method::PATCH
+                | axum::http::Method::DELETE
+        ) || !native_path_allowed(path_and_query)
+        {
+            return Err(rt_error(ErrorCode::PolicyUnenforceable, "request_shape"));
+        }
+        let native = self
+            .native
+            .as_ref()
+            .ok_or_else(|| rt_error(ErrorCode::PolicyUnenforceable, "request_shape"))?;
+        let host_bearer = native.bearer.lock().expect("upstream bearer").clone();
+        let origin = self.origin.as_str();
+        #[cfg(any(test, feature = "test-utils"))]
+        let origin = self.fixture_origin.as_deref().unwrap_or(origin);
+        let url = format!("{}{path_and_query}", origin.trim_end_matches('/'));
+        let previously_uncertain = self.uncertain.swap(true, Ordering::AcqRel);
+        let mut request = self.client.request(method, &url);
+        if let Some(content_type) = headers.get(axum::http::header::CONTENT_TYPE) {
+            request = request.header(axum::http::header::CONTENT_TYPE, content_type);
+        }
+        if let Some(accept) = headers.get(axum::http::header::ACCEPT) {
+            request = request.header(axum::http::header::ACCEPT, accept);
+        }
+        for (key, value) in &native.headers {
+            request = request.header(key, value);
+        }
+        request = request.bearer_auth(&host_bearer);
+        if !body.is_empty() {
+            request = request.body(body);
+        }
+        let response = request
+            .send()
+            .await
+            .map_err(|_| rt_error(ErrorCode::RuntimeUnavailable, "upstream_transport"))?;
+        if response.status().is_redirection() {
+            return Err(rt_error(
+                ErrorCode::PolicyUnenforceable,
+                "redirect_forbidden",
+            ));
+        }
+        let status = response.status();
+        let content_type = response
+            .headers()
+            .get(axum::http::header::CONTENT_TYPE)
+            .and_then(|header| header.to_str().ok())
+            .unwrap_or("application/json")
+            .to_owned();
+        let mut received = Vec::new();
+        let mut stream = response.bytes_stream();
+        while let Some(chunk) = stream.next().await {
+            let chunk =
+                chunk.map_err(|_| rt_error(ErrorCode::RuntimeUnavailable, "upstream_transport"))?;
+            if received.len().saturating_add(chunk.len()) > 8 * 1024 * 1024 {
+                return Err(rt_error(ErrorCode::ContextTooLarge, "generated_utf8_limit"));
+            }
+            received.extend_from_slice(&chunk);
+        }
+        if contains(&received, host_bearer.as_bytes())
+            || contains(&received, self.bearer.as_bytes())
+        {
+            return Err(rt_error(
+                ErrorCode::RuntimeUnavailable,
+                "unsafe_upstream_body",
+            ));
+        }
+        self.uncertain
+            .store(previously_uncertain, Ordering::Release);
+        Ok((status, content_type, received))
+    }
 }
 
 fn completed_output(bytes: &[u8], content_type: &str) -> RtResult<Vec<Value>> {
@@ -571,7 +807,7 @@ impl LiveGatewayServer {
             std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
                 .map_err(|_| rt_error(ErrorCode::RuntimeUnavailable, "gateway_permissions"))?;
             let cancelled = gateway.cancelled.clone();
-            let router = gateway_router(gateway);
+            let router = gateway_router(gateway.clone());
             let task = connections::spawn(listener, router, cancelled.clone());
             Ok(Self {
                 task,
@@ -600,15 +836,22 @@ impl Drop for LiveGatewayServer {
         let _ = std::fs::remove_file(&self.path);
     }
 }
-fn gateway_routes() -> axum::Router<Arc<LiveModelGateway>> {
-    axum::Router::new()
-        .route("/v1/responses", axum::routing::post(handle))
-        .fallback(reject_gateway_route)
-        .method_not_allowed_fallback(reject_gateway_method)
-        .layer(axum::extract::DefaultBodyLimit::max(1_048_576))
+fn gateway_routes(native: bool) -> axum::Router<Arc<LiveModelGateway>> {
+    if native {
+        axum::Router::new()
+            .fallback(native_handle)
+            .layer(axum::extract::DefaultBodyLimit::max(8 * 1024 * 1024))
+    } else {
+        axum::Router::new()
+            .route("/v1/responses", axum::routing::post(handle))
+            .fallback(reject_gateway_route)
+            .method_not_allowed_fallback(reject_gateway_method)
+            .layer(axum::extract::DefaultBodyLimit::max(1_048_576))
+    }
 }
 fn gateway_router(gateway: Arc<LiveModelGateway>) -> axum::Router {
-    gateway_routes()
+    let native = gateway.native.is_some();
+    gateway_routes(native)
         .layer(axum::middleware::from_fn_with_state(
             gateway.clone(),
             observe_http_failure,
@@ -705,6 +948,65 @@ async fn handle(
         }
         Err(error) => gateway_error_response(error),
     }
+}
+
+async fn native_handle(
+    axum::extract::State(gateway): axum::extract::State<Arc<LiveModelGateway>>,
+    request: axum::extract::Request,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    let (parts, body) = request.into_parts();
+    let bytes = match axum::body::to_bytes(body, 8 * 1024 * 1024).await {
+        Ok(bytes) => bytes,
+        Err(error) if caused_by_owner_revocation(&error) => {
+            return gateway_error_response(rt_error(
+                ErrorCode::RuntimeUnavailable,
+                "gateway_revoked",
+            ))
+        }
+        Err(_) => {
+            gateway.observe_failure(&rt_error(
+                ErrorCode::RuntimeUnavailable,
+                "gateway_http_error",
+            ));
+            return axum::http::StatusCode::PAYLOAD_TOO_LARGE.into_response();
+        }
+    };
+    let path = parts
+        .uri
+        .path_and_query()
+        .map(|value| value.as_str().to_string())
+        .unwrap_or_else(|| "/".to_string());
+    let result = tokio::select! {
+        biased;
+        result = gateway.forward_native(parts.method, &path, parts.headers, bytes) => result,
+        _ = gateway.cancelled.cancelled() => Err(rt_error(ErrorCode::RuntimeUnavailable, "gateway_revoked")),
+    };
+    match result {
+        Ok((status, content_type, bytes)) => {
+            let mut response = (status, bytes).into_response();
+            if let Ok(value) = axum::http::HeaderValue::from_str(&content_type) {
+                response
+                    .headers_mut()
+                    .insert(axum::http::header::CONTENT_TYPE, value);
+            }
+            response
+        }
+        Err(error) => {
+            gateway.observe_failure(&error);
+            gateway_error_response(error)
+        }
+    }
+}
+
+fn native_path_allowed(path_and_query: &str) -> bool {
+    let path = path_and_query.split('?').next().unwrap_or("");
+    !path.is_empty()
+        && path.starts_with('/')
+        && !path.contains('\\')
+        && path
+            .split('/')
+            .all(|segment| segment != ".." && segment != ".")
 }
 
 #[cfg(any(test, feature = "test-utils"))]
@@ -964,6 +1266,8 @@ fn fixture_gateway(root: &Path, profile: QualifiedContextProfile) -> RtResult<Li
         uncertain: AtomicBool::new(false),
         fatal_failure: Mutex::new(None),
         cancelled: tokio_util::sync::CancellationToken::new(),
+        skip_admission: false,
+        native: None,
         fixture_origin: None,
     })
 }
@@ -1229,7 +1533,7 @@ mod completion_drain_tests {
             let release = Arc::new(tokio::sync::Notify::new());
             let ready = rejected.clone();
             let go = release.clone();
-            let router = gateway_routes()
+            let router = gateway_routes(false)
                 .layer(axum::middleware::from_fn(
                     move |request: axum::extract::Request, next: axum::middleware::Next| {
                         let ready = ready.clone();
@@ -1352,5 +1656,74 @@ mod completion_drain_tests {
             Some("upstream_transport")
         );
         server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn native_forward_swaps_the_attempt_bearer_for_the_host_token() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let seen = Arc::new(Mutex::new(Vec::<(String, String, String)>::new()));
+        let record = seen.clone();
+        tokio::spawn(async move {
+            let app = axum::Router::new().route(
+                "/v1/responses",
+                axum::routing::post(
+                    move |headers: axum::http::HeaderMap, body: axum::body::Bytes| {
+                        let record = record.clone();
+                        async move {
+                            record.lock().expect("seen").push((
+                                headers
+                                    .get(axum::http::header::AUTHORIZATION)
+                                    .and_then(|value| value.to_str().ok())
+                                    .unwrap_or("")
+                                    .to_string(),
+                                headers
+                                    .get("x-xai-token-auth")
+                                    .and_then(|value| value.to_str().ok())
+                                    .unwrap_or("")
+                                    .to_string(),
+                                String::from_utf8_lossy(&body).into_owned(),
+                            ));
+                            (axum::http::StatusCode::OK, r#"{"status":"completed"}"#)
+                        }
+                    },
+                ),
+            );
+            axum::serve(listener, app).await.unwrap();
+        });
+        let upstream = super::super::host_model_auth::ResolvedUpstream {
+            origin: "https://cli-chat-proxy.grok.com".into(),
+            bearer: "host-oidc-token".into(),
+            headers: vec![("X-XAI-Token-Auth".into(), "xai-grok-cli".into())],
+            refresh: None,
+        };
+        let mut gateway =
+            LiveModelGateway::native_probe(upstream, "attempt-bearer".into()).unwrap();
+        gateway.fixture_origin = Some(format!("http://{address}"));
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            axum::http::header::AUTHORIZATION,
+            "Bearer attempt-bearer".parse().unwrap(),
+        );
+        headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            "application/json".parse().unwrap(),
+        );
+        let (status, _, body) = gateway
+            .forward_native(
+                axum::http::Method::POST,
+                "/v1/responses",
+                headers,
+                br#"{"model":"grok-4.6","input":"ping"}"#.as_slice().into(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(status, axum::http::StatusCode::OK);
+        assert_eq!(body, br#"{"status":"completed"}"#);
+        let seen = seen.lock().expect("seen");
+        assert_eq!(seen[0].0, "Bearer host-oidc-token");
+        assert_eq!(seen[0].1, "xai-grok-cli");
+        assert!(seen[0].2.contains("grok-4.6"));
+        assert!(!seen[0].0.contains("attempt-bearer"));
     }
 }
