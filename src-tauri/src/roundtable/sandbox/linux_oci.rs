@@ -1626,6 +1626,111 @@ pub(super) fn stop_slirp(runtime_root: &Path, id: &str, expected: bool) -> RtRes
                 .and_then(|()| file.sync_all())
                 .map_err(|_| unproven_at("slirp_lifecycle_state_write"))
         }
+        /// Obligations written before the first signal. A later process
+        /// re-opens these pidfds. A missing file is an empty set: this
+        /// cleanup has not yet published a descendant, so census still
+        /// has to find marked helpers.
+        fn load_retained(path: &Path) -> RtResult<Vec<(i32, u64)>> {
+            if !path
+                .try_exists()
+                .map_err(|_| unproven_at("slirp_retained_unreadable"))?
+            {
+                return Ok(Vec::new());
+            }
+            let mut body = String::new();
+            private_file(path, false)?
+                .take(8193)
+                .read_to_string(&mut body)
+                .map_err(|_| unproven_at("slirp_retained_unreadable"))?;
+            if body.len() > 8192 {
+                return Err(unproven_at("slirp_retained_oversized"));
+            }
+            let mut rows = Vec::new();
+            let mut seen = std::collections::BTreeSet::new();
+            for line in body.lines() {
+                let fields: Vec<_> = line.split_whitespace().collect();
+                if fields.len() != 2 {
+                    return Err(unproven_at("slirp_retained_evidence_invalid"));
+                }
+                let pid = fields[0]
+                    .parse::<i32>()
+                    .map_err(|_| unproven_at("slirp_retained_evidence_invalid"))?;
+                let start = fields[1]
+                    .parse::<u64>()
+                    .map_err(|_| unproven_at("slirp_retained_evidence_invalid"))?;
+                if pid <= 1 || start == 0 || !seen.insert(pid) {
+                    return Err(unproven_at("slirp_retained_evidence_invalid"));
+                }
+                rows.push((pid, start));
+            }
+            Ok(rows)
+        }
+        /// `None` discharges the obligation: the pinned identity exited, or
+        /// the numeric PID was reused and must not be signaled. A live
+        /// process whose start time cannot be read stays an error.
+        fn reopen_obligation(pid: i32, expected: u64) -> RtResult<Option<OwnedFd>> {
+            let Some(fd) = pidfd(pid, "slirp_retained_pidfd_open")? else {
+                return Ok(None);
+            };
+            if helper_process_exited(&fd) {
+                return Ok(None);
+            }
+            let stat = fs::read_to_string(format!("/proc/{pid}/stat"));
+            if helper_process_exited(&fd) {
+                return Ok(None);
+            }
+            let stat = stat
+                .map_err(|error| unproven_syscall("slirp_retained_stat", error.raw_os_error()))?;
+            let observed = helper_start_ticks(&stat)
+                .map_err(|_| unproven_at("slirp_retained_start_invalid"))?;
+            if helper_process_exited(&fd) {
+                return Ok(None);
+            }
+            if observed != expected {
+                return Ok(None);
+            }
+            Ok(Some(fd))
+        }
+        fn persist_retained(path: &Path, retained: &BTreeMap<i32, OwnedFd>) -> RtResult<()> {
+            let mut body = String::new();
+            for (pid, fd) in retained {
+                if helper_process_exited(fd) {
+                    continue;
+                }
+                let stat = fs::read_to_string(format!("/proc/{pid}/stat"));
+                if helper_process_exited(fd) {
+                    continue;
+                }
+                let stat = stat.map_err(|error| {
+                    unproven_syscall("slirp_retained_stat", error.raw_os_error())
+                })?;
+                let start = helper_start_ticks(&stat)
+                    .map_err(|_| unproven_at("slirp_retained_start_invalid"))?;
+                if helper_process_exited(fd) {
+                    continue;
+                }
+                body.push_str(&format!("{pid} {start}\n"));
+            }
+            if !path
+                .symlink_metadata()
+                .map(|metadata| metadata.is_file())
+                .unwrap_or(false)
+            {
+                let mut options = fs::OpenOptions::new();
+                options.write(true).create_new(true);
+                #[cfg(unix)]
+                {
+                    options
+                        .mode(0o600)
+                        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK);
+                }
+                options
+                    .open(path)
+                    .map_err(|_| unproven_at("slirp_retained_write"))?;
+            }
+            let mut file = private_file(path, true)?;
+            persist_phase(&mut file, body.as_bytes())
+        }
         fn pidfd(pid: i32, operation: &'static str) -> RtResult<Option<OwnedFd>> {
             if pid <= 1 {
                 return Err(unproven_at("slirp_pidfd_invalid_pid"));
@@ -2056,12 +2161,13 @@ pub(super) fn stop_slirp(runtime_root: &Path, id: &str, expected: bool) -> RtRes
             "preparing" => return Err(unproven_at("slirp_lifecycle_initializing")),
             "prepared" | "cleanup-proven-never-started" => true,
             "starting" | "running" | "cleanup-proven-started" => false,
-            // Old cancelled states did not persist descendant obligations.
-            // They are just as unproven as an interrupted new cleanup.
-            "cancelled-never-started"
-            | "cancelled-started"
-            | "cleanup-in-progress-never-started"
-            | "cleanup-in-progress-started" => {
+            // Resume an interrupted sweep. Retained pid/start obligations
+            // are re-pinned below; a missing file means none were published.
+            "cleanup-in-progress-never-started" => true,
+            "cleanup-in-progress-started" => false,
+            // Legacy cancelled states did not persist descendant obligations
+            // and cannot be upgraded into a proof.
+            "cancelled-never-started" | "cancelled-started" => {
                 return Err(rt_error(
                     ErrorCode::PolicyUnenforceable,
                     "slirp_cleanup_interrupted",
@@ -2111,6 +2217,11 @@ pub(super) fn stop_slirp(runtime_root: &Path, id: &str, expected: bool) -> RtRes
         let began = std::time::Instant::now();
         let mut empty_observations = 0;
         let mut retained: BTreeMap<i32, OwnedFd> = BTreeMap::new();
+        for (pid, start) in load_retained(&pidfile.with_extension("pid.retained"))? {
+            if let Some(fd) = reopen_obligation(pid, start)? {
+                retained.insert(pid, fd);
+            }
+        }
         let (birth, mut discovery_error) = match birth {
             Ok(birth) => (Some(birth), None),
             Err(error) => (None, Some(error)),
@@ -2141,6 +2252,9 @@ pub(super) fn stop_slirp(runtime_root: &Path, id: &str, expected: bool) -> RtRes
             if retained.len() > 1024 {
                 return Err(unproven_at("slirp_retained_limit"));
             }
+            // Publish identities before this iteration can signal. A crash
+            // or a later census error must still be able to re-pin them.
+            persist_retained(&pidfile.with_extension("pid.retained"), &retained)?;
             let roots_exited = pin_proof
                 .as_ref()
                 .map(|roots| roots.iter().all(helper_process_exited))
@@ -3128,7 +3242,9 @@ pub(super) async fn reap(
     }
     verify_runtime(profile)?;
     verify_instance(profile, instance)?;
-    let initial_helper_cleanup = stop_slirp(&profile.runtime_root, &instance.runtime_id, true);
+    // Stop helpers before the container can spawn another hook. A failure
+    // here leaves `cleanup-in-progress-*`; the post-delete sweep resumes it.
+    let _initial_helper_cleanup = stop_slirp(&profile.runtime_root, &instance.runtime_id, true);
     let exists = list(profile)
         .await?
         .iter()
@@ -3148,9 +3264,9 @@ pub(super) async fn reap(
                 .any(|entry| entry["id"] == instance.runtime_id)
             && !launcher_present(profile, &instance.runtime_id)?
         {
-            let final_helper_cleanup =
-                stop_slirp(&profile.runtime_root, &instance.runtime_id, true);
-            initial_helper_cleanup.and(final_helper_cleanup)?;
+            // This later sweep is the proof. It resumes an interrupted
+            // first sweep instead of keeping that sweep's error.
+            stop_slirp(&profile.runtime_root, &instance.runtime_id, true)?;
             return Ok(ProcessTreeProof {
                 instance_id: instance.runtime_id.clone(),
                 incarnation: instance.incarnation,
@@ -3976,11 +4092,12 @@ mod control_tests {
         // The newer sleep is a child of this test, not of the cleanup
         // subprocess. Its parent predates the persisted creator, so a denied
         // environ is unrelated and must not block the proof. It is still not
-        // signaled. Without an age proof the first failure stays quarantined.
+        // signaled. Without an age proof the resumed sweep reports the same
+        // denial again; it does not tombstone the cleanup.
         let expected_retry = if birth.zero_boottime_offset {
             "passed"
         } else {
-            "slirp_cleanup_interrupted"
+            "slirp_proc_environment_denied_no_age_proof"
         };
         assert_eq!(retry_outcome.unwrap(), expected_retry);
     }
@@ -4093,15 +4210,21 @@ mod control_tests {
         let owned_ended = [&mut helper, &mut watcher, &mut descendant]
             .into_iter()
             .all(|child| child.try_wait().unwrap().is_some());
-        let foreign_survived = foreign.try_wait().unwrap().is_none();
+        let foreign_after_first = foreign.try_wait().unwrap().is_none();
         let phase = std::fs::read_to_string(pin.with_extension("pid.state")).unwrap();
+        // The injected denial is gone. The resumed sweep can read the
+        // foreign sleep, see that it is not a helper, and prove cleanup.
+        // It still must not signal that process.
         let retry = super::stop_slirp(root.path(), id, true);
+        let foreign_after_retry = foreign.try_wait().unwrap().is_none();
+        let phase_after = std::fs::read_to_string(pin.with_extension("pid.state")).unwrap();
         for child in [&mut helper, &mut watcher, &mut descendant, &mut foreign] {
             let _ = child.kill();
             let _ = child.wait();
         }
+        let reason = result.unwrap_err().details.reason;
         assert_eq!(
-            result.unwrap_err().details.reason.as_deref(),
+            reason.as_deref(),
             Some(
                 if super::HelperBirthContext::capture()
                     .unwrap()
@@ -4115,14 +4238,12 @@ mod control_tests {
         );
         assert!(owned_ended, "verified helpers must still be terminated");
         assert!(
-            foreign_survived,
+            foreign_after_first && foreign_after_retry,
             "unreadable identity cannot authorize a signal"
         );
         assert_eq!(phase, "cleanup-in-progress-started\n");
-        assert_eq!(
-            retry.unwrap_err().details.reason.as_deref(),
-            Some("slirp_cleanup_interrupted")
-        );
+        retry.unwrap();
+        assert_eq!(phase_after, "cleanup-proven-started\n");
     }
 
     #[cfg(target_os = "linux")]
@@ -4501,8 +4622,10 @@ mod control_tests {
         let first = super::stop_slirp(root.path(), id, true);
         drop(fault);
         let alive_after_fault = descendant.try_wait().unwrap().is_none();
+        let retained =
+            std::fs::read_to_string(pin.with_extension("pid.retained")).unwrap_or_default();
         // No observer/fault is installed for the second call. It reopens the
-        // durable state exactly as a new cleanup process would after restart.
+        // durable pid/start exactly as a new cleanup process would.
         let retry = super::stop_slirp(root.path(), id, true);
         let alive_after_retry = descendant.try_wait().unwrap().is_none();
         let phase = std::fs::read_to_string(pin.with_extension("pid.state")).unwrap();
@@ -4517,15 +4640,18 @@ mod control_tests {
             Some("injected_helper_enumeration")
         );
         assert!(changed.exists() && alive_after_fault);
-        assert_eq!(
-            retry.unwrap_err().details.reason.as_deref(),
-            Some("slirp_cleanup_interrupted")
-        );
         assert!(
-            alive_after_retry,
-            "retry must not act on lost process identity"
+            retained
+                .lines()
+                .any(|line| line.starts_with(&format!("{descendant_pid} "))),
+            "first sweep must persist the descendant before it returns: {retained}"
         );
-        assert_eq!(phase, "cleanup-in-progress-started\n");
+        retry.unwrap();
+        assert!(
+            !alive_after_retry,
+            "retry must finish the persisted descendant"
+        );
+        assert_eq!(phase, "cleanup-proven-started\n");
     }
 
     #[cfg(target_os = "linux")]
@@ -4582,6 +4708,71 @@ mod control_tests {
             "cleanup-proven-never-started\n"
         );
         assert!(!pin.exists());
+    }
+
+    #[cfg(target_os = "linux")]
+    fn write_private(path: &std::path::Path, body: &str) {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
+            .open(path)
+            .unwrap();
+        file.write_all(body.as_bytes()).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn in_progress_cleanup_without_retained_obligations_proves_when_pins_are_gone() {
+        let root = tempfile::tempdir().unwrap();
+        let id = "fake-resume-empty";
+        let pin = helper_fixture(root.path(), id, "cleanup-in-progress-started\n");
+        let mut helper = ReapedTestChild(fake_helper(root.path(), id, "slirp"));
+        let mut watcher = ReapedTestChild(fake_helper(root.path(), id, "watcher"));
+        write_pins(
+            &pin,
+            &(pin_line("slirp", helper.id()) + &pin_line("watcher", watcher.id())),
+        );
+        helper.0.kill().unwrap();
+        helper.0.wait().unwrap();
+        watcher.0.kill().unwrap();
+        watcher.0.wait().unwrap();
+        let _inventory = ControlledInventory::start(&[], false);
+        super::stop_slirp(root.path(), id, true).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(pin.with_extension("pid.state")).unwrap(),
+            "cleanup-proven-started\n"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn resumed_retained_obligation_does_not_signal_a_reused_pid() {
+        let root = tempfile::tempdir().unwrap();
+        let id = "fake-reused-obligation";
+        let pin = helper_fixture(root.path(), id, "cleanup-in-progress-never-started\n");
+        let mut foreign = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        write_private(
+            &pin.with_extension("pid.retained"),
+            &format!("{} 1\n", foreign.id()),
+        );
+        let _inventory = ControlledInventory::start(&[], false);
+        let result = super::stop_slirp(root.path(), id, true);
+        let survived = foreign.try_wait().unwrap().is_none();
+        let _ = foreign.kill();
+        let _ = foreign.wait();
+        result.unwrap();
+        assert!(survived, "a mismatched start time authorized a signal");
+        assert_eq!(
+            std::fs::read_to_string(pin.with_extension("pid.state")).unwrap(),
+            "cleanup-proven-never-started\n"
+        );
     }
 
     #[cfg(target_os = "linux")]

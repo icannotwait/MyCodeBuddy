@@ -1986,32 +1986,25 @@ fn bounded_reap_command(
 }
 
 fn reap_blocking(request: &ProbeRequest, id: &str, slirp_expected: bool) -> Result<(), String> {
-    let initial_helper_cleanup =
-        super::sandbox::linux_stop_slirp(&request.runtime_root, id, slirp_expected).map_err(
-            |error| {
-                error
-                    .details
-                    .reason
-                    .unwrap_or_else(|| "slirp cleanup unproven".into())
-            },
-        );
+    // The post-delete sweep is the proof and resumes an interrupted first
+    // sweep. `crun delete` without `--force` refuses a container that is
+    // still `running` (exec fifo already consumed) with "not in created or
+    // stopped state". Kill is not ordered with that check.
+    let _initial_helper_cleanup =
+        super::sandbox::linux_stop_slirp(&request.runtime_root, id, slirp_expected);
     let _ = bounded_reap_command(request, &["kill", id, "KILL"]);
-    let (status, stderr) = bounded_reap_command(request, &["delete", id])?;
+    let (status, stderr) = bounded_reap_command(request, &["delete", "--force", id])?;
     let state_dir = request.runtime_root.join("state").join(id);
     let cgroup_dir = request.cgroup_root.join(id);
     let cgroup_exists = !cgroup_dir_released(&cgroup_dir)?;
     let state_exists = state_dir.try_exists().map_err(|error| error.to_string())?;
     classify_container_reap(status.success(), &stderr, state_exists, cgroup_exists)?;
-    let final_helper_cleanup =
-        super::sandbox::linux_stop_slirp(&request.runtime_root, id, slirp_expected).map_err(
-            |error| {
-                error
-                    .details
-                    .reason
-                    .unwrap_or_else(|| "slirp cleanup unproven".into())
-            },
-        );
-    initial_helper_cleanup.and(final_helper_cleanup)
+    super::sandbox::linux_stop_slirp(&request.runtime_root, id, slirp_expected).map_err(|error| {
+        error
+            .details
+            .reason
+            .unwrap_or_else(|| "slirp cleanup unproven".into())
+    })
 }
 
 async fn reap(request: &ProbeRequest, id: &str, slirp_expected: bool) -> Result<(), String> {

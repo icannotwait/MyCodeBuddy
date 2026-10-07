@@ -970,7 +970,39 @@ impl IsolationProvider for LinuxOciIsolator {
             ));
         };
         let intents = self.intents.list_unreaped()?;
-        linux_oci::discover_owned(profile, db, &intents).await
+        let found = linux_oci::discover_owned(profile, db, &intents).await?;
+        // An omitted intent is already absent from the container list, with an
+        // empty cgroup and no launcher. Finish a half-done slirp proof and
+        // retire the journal so the next startup does not keep enumerating it.
+        // A cleanup that cannot be proved stays unreaped and does not turn
+        // this successful container list into an enumeration failure.
+        for intent in intents.iter().filter(|intent| intent.db == *db) {
+            if found
+                .iter()
+                .any(|instance| instance.incarnation == intent.incarnation)
+            {
+                continue;
+            }
+            let instance = self.instance_from_intent(intent);
+            let state = profile
+                .runtime_root
+                .join("slirp-pids")
+                .join(format!("{}.pid.state", instance.runtime_id));
+            let state_exists = state
+                .try_exists()
+                .map_err(|_| rt_error(ErrorCode::PolicyUnenforceable, "enumeration_unproven"))?;
+            if state_exists
+                && linux_oci::stop_slirp(&profile.runtime_root, &instance.runtime_id, true).is_err()
+            {
+                tracing::warn!(
+                    incarnation = %intent.incarnation,
+                    "roundtable slirp cleanup still unproven"
+                );
+                continue;
+            }
+            self.intents.mark_reaped(intent.incarnation)?;
+        }
+        Ok(found)
     }
 
     async fn reap(&self, instance: &SandboxInstance) -> RtResult<ProcessTreeProof> {

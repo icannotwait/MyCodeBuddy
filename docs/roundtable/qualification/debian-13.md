@@ -150,14 +150,16 @@ unprovable ownership leaves cleanup failed rather than signaling another
 process. A durable never-started state is distinct from version/isolation/
 MCP probes that intentionally configure no slirp helper.
 
-Cleanup durably records an in-progress quarantine before signaling anything.
-Only that same successful, lock-owning cleanup call can publish a proven
-state after every retained process identity exits. An interrupted call or a
-legacy cancelled marker cannot be retried into a success merely because
-processes erased their environment markers. It remains
-`slirp_cleanup_interrupted` and requires explicit host-level recovery that
-proves the complete owned process tree is gone. Do not delete or reset the
-quarantine marker merely to unblock execution; bare saved PIDs are not proof.
+Cleanup durably records an in-progress quarantine before signaling anything,
+and writes each retained helper's PID and start time before the signal.
+A later call, including startup after a crash, resumes `cleanup-in-progress-*`.
+It re-opens those pidfds, signals only a start-time match, and publishes a
+proven state when the pins, the persisted set, and a complete census have
+all exited. A reused numeric PID is not signaled. A missing retained file
+means no descendant was published yet, so a clean census can still prove
+the sweep. Legacy `cancelled-*` markers did not persist those obligations
+and remain `slirp_cleanup_interrupted`. Do not delete or reset a quarantine
+marker by hand; bare saved PIDs are not proof.
 
 The qualification probe and the live room write that hook, the watcher,
 the seccomp allowlist, and the resolver through one shared path. The
