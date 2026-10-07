@@ -829,14 +829,27 @@ impl LinuxOciIsolator {
             }
         }
         let prepared = self.prepare(&prepared.plan).await?;
-        let launch = linux_oci::prepare_spawn(&prepared.plan, profile)?;
-        // Everything before this durable transition is proven no-exec. There
-        // is no await between the transition and synchronous process creation.
-        self.intents.mark_exec_pending(intent.incarnation)?;
-        let (instance, mut child) = linux_oci::spawn_prepared(launch)?;
-        if let Err(error) = self.intents.mark_spawned(intent.incarnation, &instance) {
+        let profile = profile.clone();
+        let intents = Arc::clone(&self.intents);
+        let plan = prepared.plan.clone();
+        let incarnation = intent.incarnation;
+        // crun creation is synchronous. Run it off this task so the room's
+        // prepaid checkpoint keeps being polled during the launch.
+        let spawned = tokio::task::spawn_blocking(move || -> RtResult<_> {
+            let launch = linux_oci::prepare_spawn(&plan, &profile)?;
+            // Everything before this durable transition is proven no-exec.
+            // There is no await between the transition and process creation.
+            intents.mark_exec_pending(incarnation)?;
+            let (instance, child) = linux_oci::spawn_prepared(launch)?;
+            let ack_error = intents.mark_spawned(incarnation, &instance).err();
+            Ok((instance, child, ack_error, profile, plan.runtime_path))
+        })
+        .await
+        .map_err(|_| rt_error(ErrorCode::RuntimeUnavailable, "oci_spawn"))??;
+        let (instance, mut child, ack_error, profile, runtime_path) = spawned;
+        if let Some(error) = ack_error {
             // Keep the intent live, even when acknowledgement cannot be durable.
-            let _ = linux_oci::reap(&prepared.plan.runtime_path, profile, &instance).await;
+            let _ = linux_oci::reap(&runtime_path, &profile, &instance).await;
             let _ = child.kill().await;
             let _ = child.wait().await;
             return Err(error);

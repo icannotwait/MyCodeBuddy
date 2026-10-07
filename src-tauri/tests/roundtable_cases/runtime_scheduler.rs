@@ -1521,6 +1521,113 @@ impl RoundtableTurnExecutor for SlowSeatExecutor {
     }
 }
 
+struct DispatchStallExecutor {
+    inner: ControlledExecutor,
+    stalled: std::sync::atomic::AtomicBool,
+}
+#[async_trait]
+impl RoundtableTurnExecutor for DispatchStallExecutor {
+    fn request_envelope_bound_bytes(&self, participant: &ParticipantV1) -> RtResult<Option<u64>> {
+        self.inner.request_envelope_bound_bytes(participant)
+    }
+    async fn capability(&self, config: &RoundtableConfigV1) -> RtResult<RuntimeCapability> {
+        self.inner.capability(config).await
+    }
+    fn token_bound(&self) -> &(dyn TokenBound + Send + Sync) {
+        self.inner.token_bound()
+    }
+    async fn execute_turn(
+        &self,
+        request: RoundtableTurnRequest,
+    ) -> RtResult<RoundtableTurnOutcome> {
+        if self
+            .stalled
+            .compare_exchange(
+                false,
+                true,
+                std::sync::atomic::Ordering::SeqCst,
+                std::sync::atomic::Ordering::SeqCst,
+            )
+            .is_ok()
+        {
+            // Blocks the scheduler task the way synchronous crun startup does.
+            // Longer than the one-second prepaid slice.
+            std::thread::sleep(std::time::Duration::from_millis(2_500));
+        }
+        self.inner.execute_turn(request).await
+    }
+    async fn cancel_and_reap(&self, identity: RuntimeIdentity) -> RtResult<CleanupProof> {
+        self.inner.cancel_and_reap(identity).await
+    }
+}
+
+#[tokio::test]
+async fn dispatch_stall_longer_than_the_prepaid_slice_still_completes() {
+    let (dir, conn) = support::open_pool(5).await;
+    migrate_roundtable(&conn).await.unwrap();
+    let store = open_roundtable_store(conn.clone()).await.unwrap();
+    let executor = Arc::new(DispatchStallExecutor {
+        inner: ControlledExecutor {
+            root: dir.path().into(),
+            prompts: Mutex::new(Vec::new()),
+            requests: Mutex::new(Vec::new()),
+        },
+        stalled: std::sync::atomic::AtomicBool::new(false),
+    });
+    let runtime = Arc::new(OwnedParticipantRuntime::with_executor(
+        dir.path().into(),
+        Arc::new(ConnectionManager::new()),
+        executor.clone(),
+    ));
+    let service = RoundtableService::open(
+        ServiceConfig {
+            data_dir: dir.path().into(),
+            db_path: dir.path().join("roundtable.db"),
+            db_identity: DbIdentity::new("dispatch-stall").unwrap(),
+            discover: None,
+        },
+        store.clone(),
+        runtime.clone(),
+    )
+    .await
+    .unwrap();
+    let actor = ActorContext::from_trusted_entry(
+        "00000000-0000-4000-8000-000000000001".parse().unwrap(),
+        OperatorScope::SingleOperator,
+        ClientIdentity {
+            kind: ClientKind::Web,
+            session_ref: "dispatch-stall".into(),
+        },
+    );
+    let created = service
+        .execute_fake_command(
+            &actor,
+            "roundtable_create",
+            json!({"request_id":uuid::Uuid::new_v4().to_string(),"config":config()}),
+        )
+        .await
+        .unwrap();
+    let room: RoomId = created["room_id"].as_str().unwrap().parse().unwrap();
+    conn.execute_unprepared("UPDATE rt_rooms SET status='running'")
+        .await
+        .unwrap();
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(20),
+        runtime.run_room(store, room, serde_json::from_value(config()).unwrap()),
+    )
+    .await
+    .expect("room should finish after a 2.5s dispatch stall");
+    assert!(
+        result.is_ok(),
+        "prepaid slice must be resampled after the stall: {result:?}"
+    );
+    assert_eq!(
+        support::scalar_text(&conn, "SELECT status FROM rt_rooms").await,
+        "completed"
+    );
+    assert!(executor.stalled.load(std::sync::atomic::Ordering::SeqCst));
+}
+
 #[tokio::test]
 async fn attempt_timeout_is_not_stored_as_cancelled() {
     let (dir, conn) = support::open_pool(5).await;

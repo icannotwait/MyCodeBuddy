@@ -364,60 +364,88 @@ impl ParticipantRuntime for OwnedParticipantRuntime {
             let executor: Arc<dyn RoundtableTurnExecutor> = executor.clone();
             let run = run_room(store.clone(), room, config, executor, permission.clone());
             // Both futures stay polled: the scheduler may own the writer
-            // transaction that a checkpoint is waiting to acquire.
+            // transaction that a checkpoint is waiting to acquire. A crun
+            // launch can also block this task for longer than the one-second
+            // slice. That gap is sampled and charged instead of pausing the
+            // room as soon as the old deadline passes.
             let monitor = async {
                 loop {
                     let remaining = permission
                         .prepaid_until()
                         .saturating_sub(store.clock_sample().0);
                     if remaining == 0 {
-                        return Err(rt_error(
-                            ErrorCode::InsufficientBudget,
-                            "prepaid_lease_expired",
-                        ));
+                        match account_elapsed_slice(
+                            &mut lease,
+                            &permission,
+                            &store,
+                            &room,
+                            boot_epoch,
+                            run_epoch,
+                        )
+                        .await?
+                        {
+                            SliceRenewal::Renewed => continue,
+                            SliceRenewal::Finished => return Ok(()),
+                        }
                     }
                     tokio::time::sleep(std::time::Duration::from_millis(remaining.min(250))).await;
                     let remaining = permission
                         .prepaid_until()
                         .saturating_sub(store.clock_sample().0);
-                    let checkpoint = async {
-                        match lease.checkpoint().await {
-                            Ok(ledger) => Ok(Some(ledger)),
-                            Err(error) => {
-                                // Publication can commit completed before the
-                                // scheduler's final reads return. That ends
-                                // paid execution only for this exact owner.
-                                if error.code == ErrorCode::InvalidState
-                                    && error.details.reason.as_deref() == Some("budget_fence")
-                                    && completed_for_epoch(&store, &room, boot_epoch, run_epoch)
-                                        .await?
-                                {
-                                    Ok(None)
-                                } else {
-                                    Err(error)
-                                }
-                            }
+                    if remaining == 0 {
+                        match account_elapsed_slice(
+                            &mut lease,
+                            &permission,
+                            &store,
+                            &room,
+                            boot_epoch,
+                            run_epoch,
+                        )
+                        .await?
+                        {
+                            SliceRenewal::Renewed => continue,
+                            SliceRenewal::Finished => return Ok(()),
                         }
-                    };
+                    }
+                    let checkpoint =
+                        sample_budget(&mut lease, &store, &room, boot_epoch, run_epoch);
                     let sampled = tokio::time::timeout(
                         std::time::Duration::from_millis(remaining),
                         checkpoint,
                     )
                     .await;
                     match sampled {
-                        Ok(Ok(Some(ledger)))
-                            if permission
-                                .renew_until(store.clock_sample().0, ledger.prepaid_until.0) => {}
+                        Ok(Ok(Some(ledger))) => {
+                            if !grant_prepaid_slice(
+                                &permission,
+                                store.clock_sample().0,
+                                ledger.prepaid_until.0,
+                            ) {
+                                return Err(rt_error(
+                                    ErrorCode::InsufficientBudget,
+                                    "prepaid_lease_expired",
+                                ));
+                            }
+                        }
                         Ok(Ok(None)) => {
                             permission.revoke_local();
                             return Ok(());
                         }
                         Ok(Err(error)) => return Err(error),
-                        _ => {
-                            return Err(rt_error(
-                                ErrorCode::InsufficientBudget,
-                                "prepaid_lease_expired",
-                            ))
+                        Err(_elapsed) => {
+                            match account_elapsed_slice(
+                                &mut lease,
+                                &permission,
+                                &store,
+                                &room,
+                                boot_epoch,
+                                run_epoch,
+                            )
+                            .await?
+                            {
+                                SliceRenewal::Renewed => {}
+                                SliceRenewal::Finished => return Ok(()),
+                            }
                         }
                     }
                 }
@@ -513,6 +541,72 @@ fn serialized<T: serde::Serialize>(value: &T) -> RtResult<String> {
 }
 fn nonnegative(value: i64) -> RtResult<u64> {
     u64::try_from(value).map_err(|_| rt_error(ErrorCode::StorageUnavailable, "runtime_counter"))
+}
+
+enum SliceRenewal {
+    Renewed,
+    Finished,
+}
+
+/// Extend local permission from a durable sample. A sample that arrives after
+/// the old one-second slice still counts when it charges the gap and grants a
+/// fresh slice. A revoked lease does not come back.
+fn grant_prepaid_slice(
+    permission: &super::resources::ExecutionLease,
+    now_ms: u64,
+    prepaid_until: u64,
+) -> bool {
+    permission.renew_until(now_ms, prepaid_until)
+        || permission.renew_accounted(now_ms, prepaid_until)
+}
+
+async fn sample_budget(
+    lease: &mut super::budget_ledger::ActiveBudgetLease,
+    store: &RoundtableStore,
+    room: &RoomId,
+    boot_epoch: Epoch,
+    run_epoch: Epoch,
+) -> RtResult<Option<TimeLedger>> {
+    match lease.checkpoint().await {
+        Ok(ledger) => Ok(Some(ledger)),
+        Err(error) => {
+            // Publication can commit completed before the scheduler's final
+            // reads return. That ends paid execution only for this exact owner.
+            if error.code == ErrorCode::InvalidState
+                && error.details.reason.as_deref() == Some("budget_fence")
+                && completed_for_epoch(store, room, boot_epoch, run_epoch).await?
+            {
+                Ok(None)
+            } else {
+                Err(error)
+            }
+        }
+    }
+}
+
+async fn account_elapsed_slice(
+    lease: &mut super::budget_ledger::ActiveBudgetLease,
+    permission: &super::resources::ExecutionLease,
+    store: &RoundtableStore,
+    room: &RoomId,
+    boot_epoch: Epoch,
+    run_epoch: Epoch,
+) -> RtResult<SliceRenewal> {
+    match sample_budget(lease, store, room, boot_epoch, run_epoch).await? {
+        Some(ledger)
+            if grant_prepaid_slice(permission, store.clock_sample().0, ledger.prepaid_until.0) =>
+        {
+            Ok(SliceRenewal::Renewed)
+        }
+        Some(_) => Err(rt_error(
+            ErrorCode::InsufficientBudget,
+            "prepaid_lease_expired",
+        )),
+        None => {
+            permission.revoke_local();
+            Ok(SliceRenewal::Finished)
+        }
+    }
 }
 
 async fn run_room(
