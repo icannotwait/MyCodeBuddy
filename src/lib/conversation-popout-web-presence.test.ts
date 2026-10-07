@@ -135,13 +135,13 @@ describe("web pop-out presence", () => {
   })
 
   it("drops a closed window handle so main can own again", async () => {
-    const popup = { closed: false, focus: vi.fn() } as unknown as Window
+    const popup = { closed: false, focus: vi.fn() }
     publishWebPopoutOpened({
       conversationId: 7,
       folderId: 3,
       agentType: "codex",
     })
-    rememberWebPopoutWindow(7, popup)
+    rememberWebPopoutWindow(7, popup as unknown as Window)
     popup.closed = true
 
     await expect(focusOrRefuseWebPopout(7)).resolves.toBe("absent")

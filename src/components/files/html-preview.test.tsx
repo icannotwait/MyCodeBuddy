@@ -70,6 +70,7 @@ function tab(id = "file:%2Ftmp%2Fa.html"): FileWorkspaceTab {
     language: "html",
     content: "<!doctype html><title>Hello</title><p>hi</p>",
     loading: false,
+    hasLoadedSuccessfully: true,
   }
 }
 

@@ -143,6 +143,7 @@ function emptySession(
     batchBoundaryIndex: null,
     batchBoundaryPrefixHash: null,
     loadingOlderTurns: false,
+    pendingOutOfTurnContent: false,
     olderTurnsPrependEpoch: 0,
     pendingCleanup: false,
     delegateSyncError: null,

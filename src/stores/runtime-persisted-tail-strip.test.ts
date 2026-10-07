@@ -36,6 +36,8 @@ function seed(turns: MessageTurn[]) {
       folder_id: 1,
       title: "t",
       title_locked: false,
+      auto_title_finalized: false,
+      awaiting_reply_token: null,
       agent_type: "claude_code",
       status: "in_progress",
       kind: "regular",
@@ -59,6 +61,7 @@ function seed(turns: MessageTurn[]) {
     detail,
     detailLoading: false,
     detailError: null,
+    detailHistoryLoadingOlder: false,
     acpLoadError: null,
     // A promoted reply in hand is what arms the strip.
     localTurns: [turn("live-reply", "assistant")],
@@ -72,6 +75,7 @@ function seed(turns: MessageTurn[]) {
     liveOwnsActiveTurn: true,
     delegationKickoffText: null,
     sessionStats: null,
+    delegationActivities: [],
     historyAssistantBaseline: null,
     batchBoundaryIndex: null,
     batchBoundaryPrefixHash: null,
@@ -79,6 +83,10 @@ function seed(turns: MessageTurn[]) {
     olderTurnsPrependEpoch: 0,
     pendingOutOfTurnContent: false,
     pendingCleanup: false,
+    delegateSyncError: null,
+    pendingCancel: null,
+    softFence: false,
+    ownerPreserve: false,
   })
   useConversationRuntimeStore.setState({ byConversationId: next })
 }

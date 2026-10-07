@@ -415,7 +415,8 @@ function estimatorSnapshotPatch(
     sessionFailures: [],
     asyncTasks: [],
     lastError: null,
-    lastErrorDetails: null,
+    lastErrorCode: null,
+    lastErrorLevel: "error",
     eventSeq: 1,
     activeDelegations: [],
     delegationRoute: null,
@@ -4422,6 +4423,7 @@ describe("AcpConnectionsProvider preview-tab release (disconnectIfIdle)", () => 
         type: "turn_complete",
         session_id: "sess-1",
         stop_reason: "end_turn",
+        mark_awaiting_reply: true,
       })
     }
 
@@ -4671,6 +4673,7 @@ describe("AcpConnectionsProvider AIR session-failure lifecycle", () => {
       type: "turn_complete",
       session_id: "sess-1",
       stop_reason: "end_turn",
+      mark_awaiting_reply: true,
     })
 
     expect(h.notifyDesktop).toHaveBeenCalledTimes(1)
@@ -4697,6 +4700,7 @@ describe("AcpConnectionsProvider AIR session-failure lifecycle", () => {
       type: "turn_complete",
       session_id: "sess-1",
       stop_reason: "end_turn",
+      mark_awaiting_reply: true,
     })
     expect(h.playEventSound).toHaveBeenCalledWith(
       expect.objectContaining({ type: "turn_complete", seq: 2 })
@@ -4714,6 +4718,7 @@ describe("AcpConnectionsProvider AIR session-failure lifecycle", () => {
       type: "turn_complete",
       session_id: "sess-1",
       stop_reason: "end_turn",
+      mark_awaiting_reply: true,
     })
     expect(h.playEventSound).not.toHaveBeenCalledWith(
       expect.objectContaining({ type: "turn_complete" })
@@ -4744,6 +4749,7 @@ describe("AcpConnectionsProvider AIR session-failure lifecycle", () => {
       type: "turn_complete",
       session_id: "other-session",
       stop_reason: "end_turn",
+      mark_awaiting_reply: true,
     })
     expect(h.playEventSound).not.toHaveBeenCalledWith(
       expect.objectContaining({ type: "turn_complete" })
@@ -4901,6 +4907,7 @@ describe("AcpConnectionsProvider AIR session-failure lifecycle", () => {
         type: "turn_complete",
         session_id: "sess-1",
         stop_reason,
+        mark_awaiting_reply: stop_reason === "end_turn",
       })
     }
     h.notifyDesktop.mockClear()
@@ -9111,6 +9118,7 @@ describe("AcpConnectionsProvider Grok cross-agent-type model switch", () => {
       message: instructions,
       agent_type: "pi",
       code: "agent_runtime_outdated",
+      terminal: true,
     })
 
     expect(h.toastError).toHaveBeenCalledTimes(1)
@@ -9472,6 +9480,7 @@ describe("AcpConnectionsProvider Grok cross-agent-type model switch", () => {
       message: "Failed to set config option: boom",
       agent_type: "grok",
       code: null,
+      terminal: false,
     })
     emitAcpEvent(handlers, {
       seq: 3,
@@ -9658,6 +9667,7 @@ describe("empty-turn error diagnostics", () => {
         message: "raw english fallback",
         agent_type: "claude_code",
         code,
+        terminal: false,
       })
       expect(h.store!.getConnection(TAB)!.error).toMatch(new RegExp(`^${key}`))
     })
@@ -9677,6 +9687,7 @@ describe("empty-turn error diagnostics", () => {
       message: "raw english fallback",
       agent_type: "claude_code",
       code: "turn_failed_auth_required",
+      terminal: false,
     })
 
     expect(h.store!.getConnection(TAB)!.error).toMatch(
@@ -9697,6 +9708,7 @@ describe("empty-turn error diagnostics", () => {
       message: "raw english fallback",
       agent_type: "claude_code",
       code: "turn_failed_empty_protocol",
+      terminal: false,
       details,
     })
 
@@ -9734,6 +9746,7 @@ describe("empty-turn error diagnostics", () => {
       message: "raw english fallback",
       agent_type: "claude_code",
       code: "turn_failed_empty",
+      terminal: false,
       details: "   \n  ",
     })
 
@@ -9761,6 +9774,7 @@ describe("empty-turn error diagnostics", () => {
       message: "Failed to set mode: Invalid params",
       agent_type: "claude_code",
       code: "set_mode_failed",
+      terminal: false,
     })
 
     expect(h.toastError).toHaveBeenCalledWith(
@@ -9791,6 +9805,7 @@ describe("empty-turn error diagnostics", () => {
       message: "Failed to load session, starting new: Internal error",
       agent_type: "claude_code",
       code: "session_load_fallback",
+      terminal: false,
     })
 
     const conn = h.store!.getConnection(TAB)!
@@ -9819,6 +9834,7 @@ describe("empty-turn error diagnostics", () => {
         message: "agent process exited",
         agent_type: "claude_code",
         code: "process_exited",
+        terminal: true,
       })
     }
     const keys = h.recordAlert.mock.calls.map(([alert]) => alert.key)
@@ -9861,6 +9877,7 @@ describe("empty-turn error diagnostics", () => {
       message: "Context compaction failed: API error (status 503)",
       agent_type: "grok",
       code: "compaction_failed",
+      terminal: false,
     })
 
     expect(h.store!.getConnection(TAB)!.error).toBeNull()
@@ -10137,6 +10154,7 @@ describe("HYDRATE_FROM_SNAPSHOT last_error recovery", () => {
       message: "raw english fallback",
       agent_type: "claude_code",
       code: "turn_failed_auth_required",
+      terminal: false,
     })
 
     // useTranslations mock appends `(agent=…)` when values are passed; the
@@ -10160,6 +10178,7 @@ describe("HYDRATE_FROM_SNAPSHOT last_error recovery", () => {
       message: "raw english fallback",
       agent_type: "claude_code",
       code: "turn_failed_empty_protocol",
+      terminal: false,
       details,
     })
 
@@ -10208,6 +10227,7 @@ describe("HYDRATE_FROM_SNAPSHOT live message identity", () => {
       liveMessage,
       pendingPermission: null,
       pendingUserMessage: null,
+      steeredMessageIds: [],
       pendingQuestion: null,
       pendingAskQuestion: null,
       pendingPlanApproval: null,
@@ -15250,6 +15270,7 @@ describe("APPLY_EVENT_FRAME reducer parity", () => {
         options: [],
       },
       pendingUserMessage: null,
+      steeredMessageIds: [],
       pendingQuestion: {
         tool_call_id: "tq",
         question: "old?",
@@ -16655,6 +16676,7 @@ describe("tool_watchdog_changed reduction and desktop notification", () => {
       liveMessage: null,
       pendingPermission: null,
       pendingUserMessage: null,
+      steeredMessageIds: [],
       pendingQuestion: null,
       pendingAskQuestion: null,
       pendingPlanApproval: null,
@@ -16728,6 +16750,7 @@ describe("tool_watchdog_changed reduction and desktop notification", () => {
       liveMessage: null,
       pendingPermission: null,
       pendingUserMessage: null,
+      steeredMessageIds: [],
       pendingQuestion: null,
       pendingAskQuestion: null,
       pendingPlanApproval: null,
@@ -16819,6 +16842,7 @@ describe("tool_watchdog_changed reduction and desktop notification", () => {
       liveMessage: null,
       pendingPermission: null,
       pendingUserMessage: null,
+      steeredMessageIds: [],
       pendingQuestion: null,
       pendingAskQuestion: null,
       pendingPlanApproval: null,
@@ -16913,6 +16937,7 @@ describe("tool_watchdog_changed reduction and desktop notification", () => {
       liveMessage: null,
       pendingPermission: null,
       pendingUserMessage: null,
+      steeredMessageIds: [],
       pendingQuestion: null,
       pendingAskQuestion: null,
       pendingPlanApproval: null,
@@ -17030,6 +17055,7 @@ describe("tool_watchdog_changed reduction and desktop notification", () => {
       liveMessage: null,
       pendingPermission: null,
       pendingUserMessage: null,
+      steeredMessageIds: [],
       pendingQuestion: null,
       pendingAskQuestion: null,
       pendingPlanApproval: null,
@@ -17141,6 +17167,7 @@ describe("tool_watchdog_changed reduction and desktop notification", () => {
       liveMessage: null,
       pendingPermission: null,
       pendingUserMessage: null,
+      steeredMessageIds: [],
       pendingQuestion: null,
       pendingAskQuestion: null,
       pendingPlanApproval: null,
@@ -20927,6 +20954,7 @@ describe("AcpConnectionsProvider observe_existing intent", () => {
       message: "raw",
       agent_type: "claude_code",
       code: "turn_failed_refusal",
+      terminal: false,
     })
     h.denormalizeSnapshot.mockReturnValue(
       snapshotPatch({

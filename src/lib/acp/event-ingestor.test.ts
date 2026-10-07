@@ -132,7 +132,7 @@ function createIngestorHarness(
 describe("EventIngestor", () => {
   it("stamps a missing received_at exactly once before queueing", () => {
     const now = vi.spyOn(performance, "now").mockReturnValue(123.5)
-    const original = content("c1", 1, "a")
+    const original: EventEnvelope = content("c1", 1, "a")
     const prepared = prepareEventEnvelope(original)
 
     expect(prepared.received_at).toBe(123.5)

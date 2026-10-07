@@ -34,6 +34,8 @@ function detail(): DbConversationDetail {
       agent_type: "code_buddy",
       title: null,
       title_locked: false,
+      auto_title_finalized: false,
+      awaiting_reply_token: null,
       status: "completed",
       kind: "regular",
       model: null,
@@ -72,6 +74,7 @@ function emptySession(conversationId: number): ConversationRuntimeSession {
     detail: null,
     detailLoading: false,
     detailError: null,
+    detailHistoryLoadingOlder: false,
     acpLoadError: null,
     localTurns: [],
     backgroundTurns: [],
@@ -84,6 +87,7 @@ function emptySession(conversationId: number): ConversationRuntimeSession {
     liveOwnsActiveTurn: false,
     delegationKickoffText: null,
     sessionStats: null,
+    delegationActivities: [],
     historyAssistantBaseline: null,
     batchBoundaryIndex: null,
     batchBoundaryPrefixHash: null,
@@ -91,6 +95,10 @@ function emptySession(conversationId: number): ConversationRuntimeSession {
     olderTurnsPrependEpoch: 0,
     pendingOutOfTurnContent: false,
     pendingCleanup: false,
+    delegateSyncError: null,
+    pendingCancel: null,
+    softFence: false,
+    ownerPreserve: false,
   }
 }
 

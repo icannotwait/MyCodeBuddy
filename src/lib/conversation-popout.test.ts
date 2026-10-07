@@ -368,11 +368,11 @@ describe("web conversation pop-out", () => {
   })
 
   it("opens again after the remembered pop-out window closes", async () => {
-    const first = { closed: false, focus: vi.fn() } as unknown as Window
+    const first = { closed: false, focus: vi.fn() }
     const second = { closed: false, focus: vi.fn() } as unknown as Window
     const open = vi
       .spyOn(window, "open")
-      .mockReturnValueOnce(first)
+      .mockReturnValueOnce(first as unknown as Window)
       .mockReturnValueOnce(second)
 
     try {

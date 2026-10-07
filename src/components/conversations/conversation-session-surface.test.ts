@@ -694,7 +694,17 @@ const surfaceH = vi.hoisted(() => ({
   pendingUserMessage: null as PendingUserMessage | null,
   tabStoreState: {
     tabs: [{ id: "tab-1", folderId: 1, isPinned: true }] as HarnessTab[],
-    rawTabs: [{ id: "tab-1" }],
+    rawTabs: [
+      {
+        id: "tab-1",
+        kind: "conversation" as const,
+        folderId: 1,
+        conversationId: 42,
+        agentType: "claude_code" as const,
+        title: "Test conversation",
+        isPinned: true,
+      },
+    ],
     groupOf: { "tab-1": "g-main" } as Record<string, string>,
     groupLayout: { type: "group" as const, id: "g-main" },
   },
@@ -1632,7 +1642,17 @@ function resetSurfaceHarness() {
   surfaceH.pendingUserMessage = null
   surfaceH.tabStoreState = {
     tabs: [{ id: "tab-1", folderId: 1, isPinned: true }] as HarnessTab[],
-    rawTabs: [{ id: "tab-1" }],
+    rawTabs: [
+      {
+        id: "tab-1",
+        kind: "conversation" as const,
+        folderId: 1,
+        conversationId: 42,
+        agentType: "claude_code" as const,
+        title: "Test conversation",
+        isPinned: true,
+      },
+    ],
     groupOf: { "tab-1": "g-main" },
     groupLayout: { type: "group", id: "g-main" },
   }
@@ -2029,9 +2049,7 @@ describe("ConversationSessionSurface useConnectionLifecycle options harness", ()
   })
 
   function tabRegistryState() {
-    return surfaceH.tabStoreState as Parameters<
-      typeof reparentedViewRuntimeConversationId
-    >[0]
+    return surfaceH.tabStoreState
   }
 
   it("preserves the runtime during a split-group reparent unmount", () => {

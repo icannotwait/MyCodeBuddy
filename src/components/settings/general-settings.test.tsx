@@ -381,7 +381,10 @@ describe("GeneralSettings terminal shell", () => {
     mockGetSettings.mockReset()
     mockGetShells.mockReset()
     mockUpdateSettings.mockReset()
-    mockUpdateSettings.mockResolvedValue({ default_shell: null })
+    mockUpdateSettings.mockResolvedValue({
+      default_shell: null,
+      colorize_command_output: false,
+    })
   })
 
   it("shows the selected effective shell and expanded scope", async () => {
@@ -494,7 +497,7 @@ describe("GeneralSettings", () => {
       effective_shell: "/bin/zsh",
       options: baseOptions,
     })
-    mockUpdateSettings.mockImplementation(async (v: unknown) => v)
+    mockUpdateSettings.mockImplementation(async (settings) => settings)
   })
 
   it("mounts every section and wires each row's label to its control", async () => {

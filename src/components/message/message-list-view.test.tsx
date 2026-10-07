@@ -832,6 +832,7 @@ function seedHistory(
           batchBoundaryIndex: null,
           batchBoundaryPrefixHash: null,
           loadingOlderTurns: false,
+          pendingOutOfTurnContent: false,
           olderTurnsPrependEpoch: 0,
           delegateSyncError: null,
           pendingCancel: null,
@@ -3343,6 +3344,8 @@ describe("compactionOnlyPart", () => {
       ],
       resources: [],
       images: [],
+      autolinkableTextParts: new Set(),
+      grokSessionImageTextParts: new Set(),
     }
   }
 

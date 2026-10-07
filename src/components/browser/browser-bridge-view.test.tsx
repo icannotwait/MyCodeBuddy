@@ -65,6 +65,7 @@ function tab(url = "http://localhost:3000/docs?x=1"): BrowserWorkspaceTab {
     language: "browser",
     content: "",
     loading: true,
+    hasLoadedSuccessfully: false,
     readonly: true,
     browser: { initialUrl: url, openerTabId: null, profile: "default" },
   }

@@ -1,6 +1,9 @@
 import { act, cleanup, fireEvent, render, screen } from "@testing-library/react"
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
-import type { FileWorkspaceTab } from "@/contexts/workspace-context"
+import type {
+  FileLikeWorkspaceTab,
+  FileWorkspaceTab,
+} from "@/contexts/workspace-context"
 import type { DetectedService } from "@/lib/browser/types"
 import enMessages from "@/i18n/messages/en.json"
 import { DEFAULT_SHORTCUTS } from "@/lib/keyboard-shortcuts"
@@ -242,8 +245,8 @@ vi.mock("motion/react", () => ({
 import { FileWorkspaceTabBar } from "./file-workspace-tab-bar"
 
 function makeFileTab(
-  overrides: Partial<FileWorkspaceTab> & { id: string } = { id: "file-1" }
-): FileWorkspaceTab {
+  overrides: Partial<FileLikeWorkspaceTab> & { id: string } = { id: "file-1" }
+): FileLikeWorkspaceTab {
   return {
     kind: "file",
     folderId: null,
