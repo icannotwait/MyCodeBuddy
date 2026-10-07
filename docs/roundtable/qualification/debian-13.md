@@ -9,20 +9,23 @@ mismatch, or a failed ACP turn is a failing report and no certificate.
 ## Current qualification limitation
 
 The probe can issue a certificate only when every required check is measured
-on this host. Credential files stay on the host for the gateway. They are not
-bind-mounted and they are not copied into the attempt home. A non-empty
-`auth_mounts` list still fails `model_credential_material_in_sandbox`. The
-sandbox process receives a random attempt bearer and its own
-gateway variables, all pointed at `http://127.0.0.1:39173/v1`. Grok
-1.0.46 reads `XAI_API_KEY` and `GROK_XAI_API_BASE_URL`. Antigravity
-1.3.0 reads `AGY_LLM_GATEWAY_URL`, `AGY_LLM_GATEWAY_API_KEY`, and
-`AGY_ACP_ENABLE_GATEWAY_AUTH=1`. Codex still reads `OPENAI_BASE_URL`
-and `OPENAI_API_KEY`. The host gateway swaps that attempt bearer for
-the host-held credential before the request leaves the machine. A Grok
-OIDC session (`~/.grok/auth.json`) is forwarded to
-`cli-chat-proxy.grok.com` with the CLI session headers, and refreshed
-on the host. An `XAI_API_KEY` in the server environment, with no
-session file, is forwarded to the binding origin without those
+on this host. Sandbox credential isolation is deferred for this iteration:
+the ACP container bind-mounts the host auth files the CLI already reads
+(`~/.grok/auth.json` for Grok, `~/.gemini/antigravity-acp/settings.json`
+and `acp_token.json` for Antigravity). Those files are not copied into
+the attempt home. The four credential-boundary checks are
+`not_applicable` and do not block the certificate. A non-empty
+`auth_mounts` list still fails the report. The sandbox also receives a
+random attempt bearer and its own gateway variables, all pointed at
+`http://127.0.0.1:39173/v1`. Grok 1.0.46 reads `XAI_API_KEY` and
+`GROK_XAI_API_BASE_URL`. Antigravity 1.3.0 reads `AGY_LLM_GATEWAY_URL`,
+`AGY_LLM_GATEWAY_API_KEY`, and `AGY_ACP_ENABLE_GATEWAY_AUTH=1`. Codex
+still reads `OPENAI_BASE_URL` and `OPENAI_API_KEY`. The host gateway
+swaps that attempt bearer for the host-held credential before the
+request leaves the machine. A Grok OIDC session (`~/.grok/auth.json`)
+is forwarded to `cli-chat-proxy.grok.com` with the CLI session headers,
+and refreshed on the host. An `XAI_API_KEY` in the server environment,
+with no session file, is forwarded to the binding origin without those
 headers. The sandbox does not receive `CURSOR_API_KEY`.
 Each qualification open uses its own database under
 `qualification-runs/`, so grok and antigravity can be measured in one

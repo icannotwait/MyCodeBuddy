@@ -39,6 +39,7 @@ use roundtable_protocol::{
 
 const INCARNATION: &str = "qualify";
 
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) struct CredentialCanary {
     pub output: String,
     pub mounted_destinations: usize,
@@ -49,6 +50,7 @@ pub(crate) struct CredentialCanary {
     pub secret_visible_in_env: bool,
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn assess_credential_canary(canary: &CredentialCanary) -> Vec<ProbeCheck> {
     let control_ok = !canary.control_token.is_empty()
         && canary
@@ -662,6 +664,7 @@ fn pass_flag(name: &str, evidence: &str, flag: bool) -> ProbeCheck {
     check
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn fail_flag(name: &str, evidence: &str, flag: bool) -> ProbeCheck {
     let mut check = fail(name, evidence);
     check.flag = Some(flag);

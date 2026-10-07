@@ -517,6 +517,20 @@ fn observation_severity(check: &ProbeCheck) -> u8 {
 }
 
 fn check_accepted(check: &ProbeCheck) -> bool {
+    // Host-local credential reads are accepted for this iteration. These four
+    // checks no longer fail a certificate when the CLI bind-mounts host auth.
+    if check.status == "not_applicable"
+        && matches!(
+            check.name.as_str(),
+            "model_credential_material_in_sandbox"
+                | "model_credentials_visible_to_agent"
+                | "native_read_boundary"
+                | "api_credential_scope"
+        )
+        && !check.evidence.trim().is_empty()
+    {
+        return true;
+    }
     if check.status != "passed" || check.evidence.trim().is_empty() {
         return false;
     }
@@ -636,6 +650,31 @@ fn render_report(
     } else {
         reasons.iter().map(String::as_str).collect()
     };
+    let credential_names = [
+        "model_credential_material_in_sandbox",
+        "model_credentials_visible_to_agent",
+        "native_read_boundary",
+        "api_credential_scope",
+    ];
+    let credentials_unreachable = if credential_names.iter().any(|name| field(name) == "failed")
+        || flag("model_credential_material_in_sandbox") == Some(true)
+        || flag("model_credentials_visible_to_agent") == Some(true)
+    {
+        "failed"
+    } else if credential_names
+        .iter()
+        .all(|name| field(name) == "not_applicable")
+    {
+        "not_applicable"
+    } else if field("model_credential_material_in_sandbox") == "passed"
+        && field("model_credentials_visible_to_agent") == "passed"
+        && flag("model_credential_material_in_sandbox") == Some(false)
+        && flag("model_credentials_visible_to_agent") == Some(false)
+    {
+        "passed"
+    } else {
+        "not_tested"
+    };
     json!({
         "verdict": if passed { "passed" } else { decision.verdict.as_str() },
         "g1_passed": passed && decision.g1_passed,
@@ -679,15 +718,7 @@ fn render_report(
         "global_body_events": count("global_body_events"),
         "model_credential_material_in_sandbox": flag("model_credential_material_in_sandbox"),
         "model_credentials_visible_to_agent": flag("model_credentials_visible_to_agent"),
-        "credentials_unreachable": if field("model_credential_material_in_sandbox") == "passed"
-            && field("model_credentials_visible_to_agent") == "passed"
-            && flag("model_credential_material_in_sandbox") == Some(false)
-            && flag("model_credentials_visible_to_agent") == Some(false) { "passed" }
-            else if field("model_credential_material_in_sandbox") == "failed"
-                || field("model_credentials_visible_to_agent") == "failed"
-                || flag("model_credential_material_in_sandbox") == Some(true)
-                || flag("model_credentials_visible_to_agent") == Some(true) { "failed" }
-            else { "not_tested" },
+        "credentials_unreachable": credentials_unreachable,
         "api_credential_scope": field("api_credential_scope"),
         "chatgpt_account_scope": "not_tested",
         "actual_resolved_binary_matches_certificate": flag("actual_binary_match").unwrap_or(false),

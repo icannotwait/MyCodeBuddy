@@ -131,12 +131,14 @@ pub struct QualifiedOciProfile {
     pub service_socket: Option<PathBuf>,
     #[serde(default)]
     pub gateway_socket: Option<PathBuf>,
-    /// Sandbox credential mounts. A non-empty list is refused: raw account
-    /// files are not bind-mounted or copied into the model-tool sandbox.
+    /// Legacy sandbox mount list. A non-empty list still fails the probe.
+    /// Host files for this iteration are recorded in `host_held_credentials`
+    /// and bind-mounted from there.
     #[serde(default)]
     pub auth_mounts: Vec<AuthMount>,
-    /// Host paths the gateway may read. Destinations are the sandbox paths
-    /// that must stay absent. These files are never mounted or copied.
+    /// Host auth files the CLI already uses. Qualification bind-mounts each
+    /// one at `destination` so the process can read it locally. Sandbox
+    /// credential isolation is deferred and does not block a certificate.
     #[serde(default)]
     pub host_held_credentials: Vec<AuthMount>,
     /// Fixed in-container environment. Host `HOME` and `PATH` are not copied.
@@ -144,7 +146,7 @@ pub struct QualifiedOciProfile {
     pub container_env: BTreeMap<String, String>,
 }
 
-/// One credential file mounted read-only at a fixed container path.
+/// One host credential file bind-mounted at a fixed container path.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AuthMount {

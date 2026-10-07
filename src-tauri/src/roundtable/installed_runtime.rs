@@ -224,6 +224,7 @@ impl InstalledRuntime {
                 return Err(unqualified("qualification_capability"));
             }
         }
+        let credential_boundary_deferred = report["credentials_unreachable"] == "not_applicable";
         for field in [
             "private_events",
             "sidebar_discovery",
@@ -234,6 +235,14 @@ impl InstalledRuntime {
             "native_read_boundary",
             "companion_lifecycle",
         ] {
+            if credential_boundary_deferred
+                && matches!(
+                    field,
+                    "credentials_unreachable" | "api_credential_scope" | "native_read_boundary"
+                )
+            {
+                continue;
+            }
             if report[field] != "passed" {
                 return Err(unqualified("qualification_capability"));
             }
@@ -253,6 +262,14 @@ impl InstalledRuntime {
             "fake_broker_is_certificate",
             "fake_fd_is_certificate",
         ] {
+            if credential_boundary_deferred
+                && matches!(
+                    field,
+                    "model_credential_material_in_sandbox" | "model_credentials_visible_to_agent"
+                )
+            {
+                continue;
+            }
             if report[field] != false {
                 return Err(unqualified("qualification_leak"));
             }

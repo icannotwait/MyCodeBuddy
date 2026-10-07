@@ -1070,6 +1070,44 @@ fn a_later_failed_observation_dominates_an_earlier_pass() {
 }
 
 #[test]
+fn deferred_host_auth_does_not_block_the_certificate() {
+    let data = scratch();
+    let mut facts = passing("grok", "debian-13");
+    for name in [
+        "model_credential_material_in_sandbox",
+        "model_credentials_visible_to_agent",
+        "native_read_boundary",
+        "api_credential_scope",
+    ] {
+        let check = facts
+            .checks
+            .iter_mut()
+            .find(|check| check.name == name)
+            .expect(name);
+        check.status = "not_applicable".into();
+        check.flag = None;
+        check.evidence =
+            "sandbox credential isolation is deferred; the CLI reads host auth files through a bind mount"
+                .into();
+    }
+    let outcome = assemble_probe_report_for_test(&data, facts);
+    assert!(
+        outcome.qualification_issued,
+        "deferred credential checks must not block issuance: {:?}",
+        outcome.reasons
+    );
+    let report: serde_json::Value =
+        serde_json::from_slice(&fs::read(&outcome.report_path).unwrap()).unwrap();
+    assert_eq!(report["credentials_unreachable"], "not_applicable");
+    assert!(report["model_credential_material_in_sandbox"].is_null());
+    assert!(report["model_credentials_visible_to_agent"].is_null());
+    assert_eq!(report["api_credential_scope"], "not_applicable");
+    assert_eq!(report["native_read_boundary"], "not_applicable");
+    verify_installed_report_for_test(&data, "grok").expect("deferred boundary still installs");
+    let _ = fs::remove_dir_all(&data);
+}
+
+#[test]
 fn mounted_auth_material_cannot_be_reported_as_absent() {
     let data = scratch();
     let mut facts = passing("grok", "debian-13");

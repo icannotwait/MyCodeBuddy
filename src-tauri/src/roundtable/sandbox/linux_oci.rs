@@ -856,13 +856,67 @@ fn apply_auth_mounts(plan: &mut SandboxPlan, profile: &QualifiedOciProfile) -> R
         .map(|(key, value)| format!("{key}={value}"))
         .collect();
     plan.oci["process"]["env"] = json!(env_list);
-    // Host-held credentials stay on the host. A listed sandbox mount is raw
-    // account material, including a writable attempt-local copy.
+    // `auth_mounts` remains refused. Host files named on the certificate are
+    // bind-mounted so the CLI can read the same paths it uses on the host.
+    // Sandbox credential isolation is deferred for this iteration.
     if !profile.auth_mounts.is_empty() {
         return Err(rt_error(
             ErrorCode::CapabilityUnqualified,
             "credential_material_in_sandbox",
         ));
+    }
+    let upper = plan
+        .mounts
+        .iter()
+        .find(|mount| mount.destination == "/rt-home")
+        .map(|mount| mount.source.clone())
+        .ok_or_else(|| rt_error(ErrorCode::InvalidArgument, "home_upper"))?;
+    for held in &profile.host_held_credentials {
+        if !auth_destination_allowed(&held.destination) {
+            return Err(rt_error(ErrorCode::CapabilityUnqualified, "auth_mount"));
+        }
+        let source = held
+            .source
+            .canonicalize()
+            .map_err(|_| rt_error(ErrorCode::CapabilityUnqualified, "auth_mount"))?;
+        if !source.is_file() {
+            return Err(rt_error(ErrorCode::CapabilityUnqualified, "auth_mount"));
+        }
+        reject_baked_credential(
+            profile,
+            &PlanMount {
+                source: source.clone(),
+                destination: held.destination.clone(),
+                read_only: false,
+            },
+        )?;
+        let relative = held
+            .destination
+            .strip_prefix("/rt-home/")
+            .ok_or_else(|| rt_error(ErrorCode::CapabilityUnqualified, "auth_mount"))?;
+        let mount_point = upper.join(relative);
+        if let Some(parent) = mount_point.parent() {
+            fs::create_dir_all(parent)
+                .map_err(|_| rt_error(ErrorCode::StorageUnavailable, "auth_mount"))?;
+        }
+        if !mount_point.exists() {
+            fs::write(&mount_point, b"")
+                .map_err(|_| rt_error(ErrorCode::StorageUnavailable, "auth_mount"))?;
+        }
+        plan.mounts.push(PlanMount {
+            source: source.clone(),
+            destination: held.destination.clone(),
+            read_only: false,
+        });
+        plan.oci["mounts"]
+            .as_array_mut()
+            .ok_or_else(|| rt_error(ErrorCode::InvalidArgument, "oci_mounts"))?
+            .push(json!({
+                "source": source,
+                "destination": held.destination,
+                "type": "bind",
+                "options": ["bind", "rw", "nosuid", "nodev"]
+            }));
     }
     Ok(())
 }
@@ -2158,13 +2212,22 @@ fn reject_baked_credential(profile: &QualifiedOciProfile, mount: &PlanMount) -> 
     let target = profile
         .rootfs
         .join(mount.destination.trim_start_matches('/'));
-    let metadata = fs::symlink_metadata(&target)
-        .map_err(|_| rt_error(ErrorCode::CapabilityUnqualified, "rootfs_mount_target"))?;
-    if metadata.len() != 0 {
-        return Err(rt_error(
-            ErrorCode::CapabilityUnqualified,
-            "credential_baked_into_image",
-        ));
+    match fs::symlink_metadata(&target) {
+        Ok(metadata) => {
+            if metadata.file_type().is_symlink() || !metadata.is_file() || metadata.len() != 0 {
+                return Err(rt_error(
+                    ErrorCode::CapabilityUnqualified,
+                    "credential_baked_into_image",
+                ));
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(_) => {
+            return Err(rt_error(
+                ErrorCode::CapabilityUnqualified,
+                "rootfs_mount_target",
+            ));
+        }
     }
     Ok(())
 }
@@ -2228,7 +2291,17 @@ pub(super) fn verify_profile(plan: &SandboxPlan, profile: &QualifiedOciProfile) 
                     && mount.source == slirp_resolv_path(&profile.runtime_root)
                     && fs::read(&mount.source).ok().as_deref() == Some(SLIRP_RESOLV_BODY)
             }
-            destination if destination.starts_with("/rt-home/") => false,
+            destination if destination.starts_with("/rt-home/") => {
+                !mount.read_only
+                    && profile.host_held_credentials.iter().any(|held| {
+                        held.destination == destination
+                            && held
+                                .source
+                                .canonicalize()
+                                .ok()
+                                .is_some_and(|source| source == mount.source)
+                    })
+            }
             _ => false,
         };
         if !allowed {
@@ -2245,11 +2318,26 @@ pub(super) fn verify_profile(plan: &SandboxPlan, profile: &QualifiedOciProfile) 
         }
         // Mount targets are part of the frozen image. Do not let crun create
         // placeholders in a shared rootfs and invalidate later launches.
+        // Host auth overlays are the exception: their mount point is an empty
+        // file in the attempt upper, created after `/rt-home` is mounted.
         let target = profile
             .rootfs
             .join(mount.destination.trim_start_matches('/'));
-        let metadata = fs::symlink_metadata(&target)
-            .map_err(|_| rt_error(ErrorCode::CapabilityUnqualified, "rootfs_mount_target"))?;
+        let metadata = match fs::symlink_metadata(&target) {
+            Ok(metadata) => metadata,
+            Err(error)
+                if error.kind() == std::io::ErrorKind::NotFound
+                    && mount.destination.starts_with("/rt-home/") =>
+            {
+                continue;
+            }
+            Err(_) => {
+                return Err(rt_error(
+                    ErrorCode::CapabilityUnqualified,
+                    "rootfs_mount_target",
+                ));
+            }
+        };
         let file_mount = mount.destination.starts_with("/run/codeg/")
             || mount.destination.starts_with("/rt-home/")
             || mount.destination == "/etc/resolv.conf";
