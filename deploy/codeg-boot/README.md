@@ -66,6 +66,31 @@ or ACP caches. When scripts change, the watchdog reloads itself via
 
 Disable by removing execute bit: `chmod a-x /workspace/codeg-boot/auto-sync-boot.sh`.
 
+## Resume / wake recovery
+
+The box VM is paused when idle. Wall clock keeps running, but uptime and the
+monotonic clock freeze, and on resume cloudflared (http2) still believes its 4
+connections are up while the edge has dropped them (530/1033). The watchdog
+therefore measures each loop **sleep** on the wall clock (loop work is not
+counted, so a slow WebDAV rebuild is never a "wake"):
+
+- Sleep took more than `WAKE_GAP_THRESHOLD` (default **180 s** for a 60 s
+  sleep): log `resume detected gap=Ns` and probe the public edge on the very
+  next iteration.
+- A failing probe (530 / 1033 / connect failure with local UI ok) is confirmed
+  by **one re-probe** after `WAKE_REPROBE_DELAY` (10 s), which also lets a
+  self-reconnecting cloudflared recover without a restart. If it still fails,
+  cloudflared **only** is force-restarted at once: no 2-failure threshold and
+  no cooldown/backoff (a long pause already elapsed), but the daily cap and the
+  60 s post-restart readiness grace still apply. This bypass is used at most
+  **once per wake**; afterwards normal threshold/cooldown rules resume.
+- No blind restart: a healthy probe after wake restarts nothing, but for
+  `WAKE_WATCH_SECS` (300 s) the loop sleeps `WAKE_FAST_SLEEP` (15 s) and a
+  late-appearing zombie can still use the single fast restart.
+- codeg-server is never restarted for public failures.
+
+All four keys are accepted from the local config file (see above).
+
 ## Tunnel config and HOME
 
 `start-codeg-tunnel.sh` never depends on the caller's `$HOME`. It resolves the
@@ -160,7 +185,7 @@ cp deploy/codeg-boot/env.example /workspace/codeg-boot/local.env
   `auto-sync-boot.sh` only copy the known scripts, so they never overwrite it.
 - The file is **parsed, never sourced**: blank lines, `#` comments, an optional
   `export ` prefix, `KEY=VALUE` with optional matching quotes. Only
-  `CODEG_PUBLIC_URL` and the numeric limits below are read; other keys are
+  `CODEG_PUBLIC_URL`, the numeric limits below, and the `WAKE_*` keys are read; other keys are
   ignored, malformed lines are warned about, and `CODEG_PUBLIC_URL` must be
   `http(s)://...`.
 - Precedence: non-empty launcher environment > local file > built-in default.
@@ -208,6 +233,9 @@ Configuration (decimal integers; leading zeroes are accepted):
   if configured below it
 - `TUNNEL_RESTART_DAILY_CAP=0`: range 0–1000, where 0 disables the cap
 - `TUNNEL_RESTART_GRACE=60`: range 0–3600 seconds, where 0 disables grace
+- `WAKE_GAP_THRESHOLD=180` (90–86400), `WAKE_REPROBE_DELAY=10` (0–120),
+  `WAKE_WATCH_SECS=300` (0–3600), `WAKE_FAST_SLEEP=15` (5–60): see
+  [Resume / wake recovery](#resume--wake-recovery)
 
 Invalid/out-of-range values produce a warning and use the documented default.
 State is written before starting a force restart; if it cannot be persisted, the

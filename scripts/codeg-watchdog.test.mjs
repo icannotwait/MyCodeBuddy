@@ -618,3 +618,190 @@ sleep_hook() {
   // Routine start-if-missing only; one 530 is below the threshold of 2.
   assert.doesNotMatch(result.starts, /--force/)
 })
+
+// Resume/wake detection. The VM is paused when idle; a pause shows up only as
+// a sleep that took far longer on the wall clock than requested. The fake
+// sleep advances the fake clock to model that.
+const wakeSetup = (sleptSeconds) => `
+configure_watchdog
+TUNNEL_RESTART_GRACE=0
+sleep() {
+  echo "$*" >>"$TEST_ROOT/sleeps"
+  if [ "$1" = 60 ] || [ "$1" = 15 ]; then
+    echo "$(( $(cat "$TEST_ROOT/now") + ${sleptSeconds} ))" >"$TEST_ROOT/now"
+  fi
+}
+watchdog_sleep
+`
+const wakeReport = `printf 'result=%s streak=%s used=%s pub=%s\\n' "$result" "$pub_fail_streak" "\${wake_restart_used:-unset}" "$pub"`
+
+test("a resume gap probes immediately and restarts cloudflared on the first 1033", () => {
+  const result = runWatchdog(`
+${wakeSetup(400)}
+CURL_CODE=530
+check_public_tunnel; result=$?
+${wakeReport}
+`)
+  assert.equal(result.status, 0, result.stderr)
+  assert.equal(result.stdout, "result=0 streak=1 used=1 pub=bad\n")
+  assert.equal(result.starts, "1 --force\n")
+  assert.match(result.log, /resume detected gap=340s \(slept 400s, expected 60s\)/)
+  assert.match(result.log, /resume: public probe bad code=530 mention=none; re-probing in 10s/)
+  assert.match(result.log, /restart cloudflared ONLY \(wake: cooldown bypassed\): resume: public code=530/)
+  assert.equal(result.curls.trim().split("\n").length, 2)
+})
+
+test("a normal loop interval is not a wake and keeps the 2-failure threshold", () => {
+  const result = runWatchdog(`
+${wakeSetup(100)}
+CURL_CODE=530
+check_public_tunnel; result=$?
+${wakeReport}
+`)
+  assert.equal(result.status, 0, result.stderr)
+  assert.equal(result.stdout, "result=0 streak=1 used=unset pub=bad\n")
+  assert.equal(result.starts, "")
+  assert.doesNotMatch(result.log, /resume/)
+})
+
+test("a resume with a healthy edge does not restart and switches to fast checks", () => {
+  const result = runWatchdog(`
+${wakeSetup(400)}
+CURL_CODE=200
+check_public_tunnel; result=$?
+${wakeReport}
+watchdog_sleep
+printf 'sleeps=%s\n' "$(tr '\n' ' ' <"$TEST_ROOT/sleeps")"
+`)
+  assert.equal(result.status, 0, result.stderr)
+  // First sleep is the normal 60s; inside the watch window the next is 15s.
+  assert.equal(result.stdout, "result=0 streak=0 used=0 pub=ok\nsleeps=60 15 \n")
+  assert.equal(result.starts, "")
+  assert.match(result.log, /resume: public probe ok code=200; no restart \(watching 300s\)/)
+})
+
+test("a re-probe that recovers (self-reconnect) avoids a restart", () => {
+  const result = runWatchdog(`
+${wakeSetup(400)}
+CURL_CODE=530
+sleep() { echo "$*" >>"$TEST_ROOT/sleeps"; CURL_CODE=200; }
+check_public_tunnel; result=$?
+${wakeReport}
+`)
+  assert.equal(result.status, 0, result.stderr)
+  assert.equal(result.stdout, "result=0 streak=0 used=0 pub=ok\n")
+  assert.equal(result.starts, "")
+  assert.match(result.log, /resume: re-probe ok code=200; no restart/)
+})
+
+test("a late zombie inside the watch window still gets the single fast restart", () => {
+  const result = runWatchdog(`
+${wakeSetup(400)}
+CURL_CODE=200
+check_public_tunnel
+echo $(( $(cat "$TEST_ROOT/now") + 120 )) >"$TEST_ROOT/now"
+CURL_CODE=530
+check_public_tunnel; result=$?
+${wakeReport}
+`)
+  assert.equal(result.status, 0, result.stderr)
+  assert.equal(result.stdout, "result=0 streak=1 used=1 pub=bad\n")
+  assert.equal(result.starts, "1 --force\n")
+})
+
+test("wake bypasses cooldown once, never the daily cap or readiness grace", () => {
+  const capped = runWatchdog(`
+TUNNEL_RESTART_DAILY_CAP=1
+printf '%s\\n' "1999999990 180 $((2000000000 / 86400)) 1 0" >"$TUNNEL_RESTART_STAMP"
+${wakeSetup(400)}
+TUNNEL_RESTART_DAILY_CAP=1
+CURL_CODE=530
+check_public_tunnel; result=$?
+${wakeReport}
+`)
+  assert.equal(capped.stdout, "result=2 streak=1 used=1 pub=bad\n")
+  assert.equal(capped.starts, "")
+  assert.match(capped.log, /tunnel restart skipped: daily cap 1\/1/)
+
+  const cooldown = runWatchdog(`
+printf '%s\\n' "2000000300 180 $((2000000000 / 86400)) 1 0" >"$TUNNEL_RESTART_STAMP"
+${wakeSetup(400)}
+CURL_CODE=530
+check_public_tunnel
+${wakeReport.replace("$result", "0")}
+check_public_tunnel; result=$?
+${wakeReport}
+`)
+  assert.equal(cooldown.status, 0, cooldown.stderr)
+  // Recent attempt (100s ago) is bypassed once; the next failure is normal.
+  assert.equal(cooldown.starts, "1 --force\n")
+  assert.equal(cooldown.stdout, "result=0 streak=1 used=1 pub=bad\nresult=2 streak=2 used=1 pub=bad\n")
+  assert.match(cooldown.log, /tunnel restart skipped: cooldown\/backoff/)
+
+  const grace = runWatchdog(`
+${wakeSetup(400)}
+printf '%s\\n' "2000000300 180 $((2000000000 / 86400)) 1 2000000430" >"$TUNNEL_RESTART_STAMP"
+CURL_CODE=530
+check_public_tunnel; result=$?
+${wakeReport}
+`)
+  assert.equal(grace.stdout, "result=0 streak=0 used=0 pub=pending\n")
+  assert.equal(grace.starts, "")
+})
+
+test("wake settings come from the local config whitelist with range checks", () => {
+  const result = runWatchdog(`
+${unsetConfigEnv}
+printf '%s\\n' WAKE_GAP_THRESHOLD=600 WAKE_REPROBE_DELAY=0 WAKE_WATCH_SECS=999999 WAKE_FAST_SLEEP=20 >"$BOOT/local.env"
+configure_watchdog
+printf '%s %s %s %s\\n' "$WAKE_GAP_THRESHOLD" "$WAKE_REPROBE_DELAY" "$WAKE_WATCH_SECS" "$WAKE_FAST_SLEEP"
+`)
+  assert.equal(result.status, 0, result.stderr)
+  assert.equal(result.stdout, "600 0 300 20\n")
+  assert.match(result.log, /invalid WAKE_WATCH_SECS/)
+})
+
+test("daemon loop: a pause during sleep triggers one immediate restart and fast re-checks", () => {
+  const result = runWatchdog(
+    `
+loop=0
+port_up() { return 0; }
+http_ok() { return 0; }
+webdav_ok() { return 0; }
+cf_up() { return 0; }
+restart_server() { echo 'unexpected server restart' >&2; exit 90; }
+ps() { printf '123\\n'; }
+cat >"$BOOT/start-webdav.sh" <<'MOCK'
+#!/bin/bash
+exit 0
+MOCK
+chmod +x "$BOOT/start-webdav.sh"
+TUNNEL_RESTART_GRACE=0
+sleep() {
+  echo "$*" >>"$TEST_ROOT/sleeps"
+  case $1 in
+    60|15)
+      if [ "$loop" -ge 3 ]; then
+        printf 'sleeps=%s\\n' "$(tr '\\n' ' ' <"$TEST_ROOT/sleeps")"
+        exit 0
+      fi
+      # Loop 1 sleeps through a 20-minute VM pause; later sleeps are normal.
+      if [ "$loop" -eq 1 ]; then step=1200; else step=$1; fi
+      echo "$(( $(cat "$TEST_ROOT/now") + step ))" >"$TEST_ROOT/now"
+      ;;
+  esac
+}
+CURL_CODE=530
+`,
+    {},
+    true
+  )
+  assert.equal(result.status, 0, result.stderr)
+  assert.equal(result.stderr, "")
+  assert.match(result.log, /resume detected gap=1140s/)
+  assert.match(result.log, /cooldown bypassed/)
+  // Loop 1: 530 x1 (below threshold). Wake after loop 1's sleep: immediate
+  // restart. Loop 2 sleeps 15s (watch window). No codeg-server restart.
+  assert.equal(result.starts.match(/1 --force/g)?.length, 1)
+  assert.equal(result.stdout, "sleeps=60 10 15 15 \n")
+})
