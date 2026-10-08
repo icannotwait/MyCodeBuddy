@@ -1017,7 +1017,7 @@ export function RoundtableWorkbench({
               <div className="mt-4 flex flex-wrap items-center gap-3 border-t pt-4">
                 <Button
                   size="lg"
-                  className="min-w-40"
+                  className="w-full sm:w-auto sm:min-w-40"
                   disabled={busy || !canRun}
                   onClick={() =>
                     void mutate("roundtable_create", {

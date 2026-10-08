@@ -23,9 +23,19 @@ function Group({ label, children }: { label: string; children: ReactNode }) {
   )
 }
 
-function Fact({ label, children }: { label: string; children: ReactNode }) {
+function Fact({
+  label,
+  children,
+  className,
+}: {
+  label: string
+  children: ReactNode
+  className?: string
+}) {
   return (
-    <div className="min-w-0 rounded-lg border bg-background p-3">
+    <div
+      className={cn("min-w-0 rounded-lg border bg-background p-3", className)}
+    >
       <dt className="text-xs text-muted-foreground">{label}</dt>
       <dd className="mt-1 min-w-0 text-sm font-medium [overflow-wrap:anywhere]">
         {children}
@@ -187,8 +197,8 @@ export function PreflightConfirmation({
           ))}
         </Group>
       </dl>
-      <dl className="grid min-w-0 grid-cols-1 gap-2 sm:grid-cols-2 lg:grid-cols-4">
-        <Fact label={t("tools")}>
+      <dl className="grid min-w-0 grid-cols-2 gap-2 lg:grid-cols-4">
+        <Fact label={t("tools")} className="col-span-2 lg:col-span-1">
           {tools.length > 0 ? (
             <span className="flex flex-wrap gap-1">
               {tools.map((tool) => (

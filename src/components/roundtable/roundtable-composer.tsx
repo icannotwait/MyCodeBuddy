@@ -246,7 +246,7 @@ export function RoundtableComposer({
                 data-brand={seat.key}
                 style={brandStyle(seat.brand)}
                 className={cn(
-                  "relative flex min-w-0 flex-col gap-3 rounded-xl border bg-background p-3 shadow-xs transition-colors sm:p-4",
+                  "@container relative flex min-w-0 flex-col gap-3 rounded-xl border bg-background p-3 shadow-xs transition-colors sm:p-4",
                   isModerator && BRAND_CLASSES.border
                 )}
               >
@@ -305,7 +305,7 @@ export function RoundtableComposer({
                       {t("agent")} {index + 1}
                     </span>
                   </legend>
-                  <div className="grid grid-cols-2 gap-1.5 sm:grid-cols-4">
+                  <div className="grid grid-cols-2 gap-1.5 @md:grid-cols-4">
                     {ROUNDTABLE_AGENTS.map((agent) => {
                       const key = roundtableBrandKey(agent)
                       const checked = member.agent === agent
