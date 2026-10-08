@@ -18,6 +18,10 @@ const { stableT, mockOpenDiff, mockOpenFilePreview, mockReveal, mockExtract } =
 
 vi.mock("next-intl", () => ({ useTranslations: () => stableT }))
 vi.mock("@/contexts/workspace-context", () => ({
+  useOptionalWorkspaceActions: () => ({
+    openFilePreview: mockOpenFilePreview,
+    openSessionFileDiff: mockOpenDiff,
+  }),
   useWorkspaceActions: () => ({
     openFilePreview: mockOpenFilePreview,
     openSessionFileDiff: mockOpenDiff,

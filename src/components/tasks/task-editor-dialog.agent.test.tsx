@@ -158,6 +158,7 @@ function agent(
     is_acp_adapter: false,
     custom_source: null,
     enabled: true,
+    show_thinking: false,
     sort_order: 0,
     installed_version: "1.0.0",
     host_tools_agent_mode: false,

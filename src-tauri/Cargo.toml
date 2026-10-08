@@ -139,6 +139,9 @@ required-features = ["server-bin"]
 tauri-build = { version = "2", features = [], optional = true }
 
 [dependencies]
+# Roundtable protocol contracts. First main-crate path dependency. Production
+# execution stays off until the persistent gate is explicitly enabled.
+roundtable-protocol = { path = "roundtable-protocol" }
 # `devtools` is what makes the web inspector exist in a RELEASE build — in a
 # debug one `debug_assertions` already does. It reaches wry through
 # tauri-runtime-wry, which is where a browser tab's child webview is built, and

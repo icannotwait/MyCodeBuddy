@@ -127,6 +127,48 @@ function connectReady() {
 const ok200 = () => ({ status: 200, ok: true, json: async () => ({}) })
 const resp401 = () => ({ status: 401, ok: false, json: async () => ({}) })
 
+describe("private roundtable subscriptions", () => {
+  it("forwards successful attach and detach only to the requesting socket", async () => {
+    const { t, ws } = connectReady()
+    fetchMock.mockResolvedValue({
+      status: 200,
+      ok: true,
+      text: async () => JSON.stringify({ accepted: true }),
+    })
+    const request = {
+      room_id: "room",
+      subscription_id: "private",
+      protocol_version: 1,
+    }
+    await t.call("roundtable_attach", { request })
+    expect(ws.sent).toContain(
+      JSON.stringify({ action: "roundtable_attach", request })
+    )
+    await t.call("roundtable_detach", { request })
+    expect(ws.sent).toContain(
+      JSON.stringify({
+        action: "roundtable_detach",
+        subscription_id: "private",
+      })
+    )
+  })
+
+  it("does not forward a rejected room attach", async () => {
+    const { t, ws } = connectReady()
+    fetchMock.mockResolvedValue({
+      status: 403,
+      ok: false,
+      json: async () => ({ code: "forbidden" }),
+    })
+    await expect(
+      t.call("roundtable_attach", { request: { subscription_id: "private" } })
+    ).rejects.toEqual({ code: "forbidden" })
+    expect(ws.sent.some((frame) => frame.includes("roundtable_attach"))).toBe(
+      false
+    )
+  })
+})
+
 describe("WebTransport silent disconnect recovery", () => {
   function attachShared(t: WebTransport) {
     return t.eventStream().attach(
@@ -876,5 +918,27 @@ describe("WebTransport completion context capture/replay", () => {
     const headers = callHeaders(0) as Record<string, string>
     expect(headers[COMPLETION_CONTEXT_HEADER]).toBeUndefined()
     expect(headers.Authorization).toBe("Bearer tok")
+  })
+})
+
+describe("roundtable provider authentication", () => {
+  it("retains a healthy application session on provider capability failure", async () => {
+    const { t, ws } = connectReady()
+    const error = {
+      code: "capability_unqualified",
+      message: "Provider credentials are missing",
+      details: { reason: "provider_credential_missing" },
+    }
+    fetchMock.mockResolvedValue({
+      status: 422,
+      ok: false,
+      json: async () => error,
+    })
+    await expect(t.call("roundtable_resume", { request: {} })).rejects.toEqual(
+      error
+    )
+    expect(t.getConnectionSnapshot()).toBe("connected")
+    expect(localStorage.getItem("codeg_token")).toBe("tok")
+    expect(ws.readyState).toBe(MockWebSocket.OPEN)
   })
 })

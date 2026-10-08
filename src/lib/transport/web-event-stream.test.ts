@@ -27,7 +27,7 @@ function snapshot(eventSeq: number): LiveSessionSnapshot {
 function hostFixture() {
   let ready: (() => void) | null = null
   let wsOpen = true
-  const sendFrame = vi.fn(() => true)
+  const sendFrame = vi.fn<AttachTransportHost["sendFrame"]>(() => true)
   const host: AttachTransportHost = {
     isWsOpen: () => wsOpen,
     sendFrame,
@@ -191,8 +191,8 @@ describe("WebEventStream reconnect mode", () => {
     vi.useFakeTimers()
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {})
     const f = hostFixture()
-    f.sendFrame.mockImplementation((frame: { action?: string }) => {
-      return frame.action !== "ping"
+    f.sendFrame.mockImplementation((frame) => {
+      return !("action" in frame && frame.action === "ping")
     })
     const stream = new WebEventStream(f.host)
     stream.attach(

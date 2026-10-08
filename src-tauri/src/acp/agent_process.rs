@@ -21,8 +21,9 @@
 //! * a UNC workspace behind a Windows batch launcher takes a `pushd` detour so
 //!   `cmd.exe` does not silently swap the cwd for `C:\Windows`.
 
+use std::collections::BTreeMap;
 use std::future::Future;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use agent_client_protocol::schema::v1::{EnvVariable, McpServer, McpServerStdio};
@@ -811,6 +812,184 @@ fn parse_env_var(s: &str) -> Option<(String, String)> {
     }
 
     Some((name.to_string(), value.to_string()))
+}
+
+/// How a roundtable member would be executed. The program and every env
+/// value come from the prepared sandbox. Process env is not consulted, and
+/// neither PATH nor npx is a launcher.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RoundtableProcessPlan {
+    pub program: PathBuf,
+    pub args: Vec<String>,
+    pub env: BTreeMap<String, String>,
+    pub env_cleared: bool,
+    pub uses_path_lookup: bool,
+    pub uses_npx: bool,
+}
+
+const ROUNDTABLE_FORBIDDEN_ENV: &[&str] = &[
+    "PATH",
+    "PATHEXT",
+    "HOME",
+    "USERPROFILE",
+    "TMPDIR",
+    "TEMP",
+    "TMP",
+    "MCP_CONFIG",
+    "MCP_SERVERS",
+];
+
+#[cfg(any(test, feature = "test-utils"))]
+static ROUNDTABLE_PROCESS_EXECS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// How many times the roundtable seam has called `Command::spawn`.
+/// Stays zero while the product gate is closed.
+#[cfg(any(test, feature = "test-utils"))]
+pub fn roundtable_process_exec_count() -> usize {
+    ROUNDTABLE_PROCESS_EXECS.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+fn is_npx_path(path: &Path) -> bool {
+    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+    let lower = name.to_ascii_lowercase();
+    lower == "npx" || lower == "npx.exe" || lower == "npx.cmd" || lower == "npx.bat"
+}
+
+/// Validate the sandbox plan as the only source of the service executable.
+///
+/// Does not spawn. A relative program, an `npx` launcher, or an env map that
+/// still carries host paths is `policy_unenforceable`.
+pub(crate) fn plan_roundtable_process(
+    prepared: &crate::roundtable::PreparedSandbox,
+) -> roundtable_protocol::RtResult<RoundtableProcessPlan> {
+    use crate::roundtable::rt_error;
+    use roundtable_protocol::ErrorCode;
+
+    if !prepared.plan.env_cleared_before_allowlist {
+        return Err(rt_error(
+            ErrorCode::PolicyUnenforceable,
+            "policy_unenforceable",
+        ));
+    }
+    let Some(cli) = prepared
+        .plan
+        .allowed_binaries
+        .iter()
+        .find(|binary| binary.role == "cli")
+    else {
+        return Err(rt_error(
+            ErrorCode::PolicyUnenforceable,
+            "policy_unenforceable",
+        ));
+    };
+    let program = PathBuf::from(&cli.absolute_path);
+    let runtime = PathBuf::from(prepared.plan.argv.first().map(String::as_str).unwrap_or(""));
+    if !program.is_absolute()
+        || !runtime.is_absolute()
+        || is_npx_path(&program)
+        || is_npx_path(&runtime)
+    {
+        return Err(rt_error(
+            ErrorCode::PolicyUnenforceable,
+            "policy_unenforceable",
+        ));
+    }
+    if prepared
+        .plan
+        .argv
+        .iter()
+        .any(|arg| is_npx_path(Path::new(arg)) || arg.eq_ignore_ascii_case("npx"))
+    {
+        return Err(rt_error(
+            ErrorCode::PolicyUnenforceable,
+            "policy_unenforceable",
+        ));
+    }
+    for key in prepared.plan.env.keys() {
+        if ROUNDTABLE_FORBIDDEN_ENV
+            .iter()
+            .any(|forbidden| key.eq_ignore_ascii_case(forbidden))
+        {
+            return Err(rt_error(
+                ErrorCode::PolicyUnenforceable,
+                "policy_unenforceable",
+            ));
+        }
+    }
+    Ok(RoundtableProcessPlan {
+        program,
+        args: Vec::new(),
+        env: prepared.plan.env.clone(),
+        env_cleared: true,
+        uses_path_lookup: false,
+        uses_npx: false,
+    })
+}
+
+/// Inspection-only member plans cannot bypass the attached OCI launcher.
+/// The service executor launches through a prepared, pinned isolator instead.
+pub(crate) fn spawn_roundtable_process(
+    plan: &RoundtableProcessPlan,
+) -> roundtable_protocol::RtResult<()> {
+    use crate::roundtable::rt_error;
+    use roundtable_protocol::ErrorCode;
+
+    let _ = plan;
+    Err(rt_error(
+        ErrorCode::PolicyUnenforceable,
+        "policy_unenforceable",
+    ))
+}
+
+/// The only real Roundtable exec seam. Callers have already checked the
+/// installed crun pin and recorded the immutable launch intent. Close every
+/// extra descriptor before exec, clear env, and retain attached ACP stdio.
+pub(crate) fn spawn_attached_roundtable_oci(
+    runtime: &Path,
+    args: &[String],
+    cwd: &Path,
+) -> roundtable_protocol::RtResult<tokio::process::Child> {
+    use crate::roundtable::rt_error;
+    use roundtable_protocol::ErrorCode;
+    if !cfg!(target_os = "linux")
+        || !runtime.is_absolute()
+        || !cwd.is_absolute()
+        || is_npx_path(runtime)
+    {
+        return Err(rt_error(
+            ErrorCode::PolicyUnenforceable,
+            "policy_unenforceable",
+        ));
+    }
+    let mut command = tokio::process::Command::new(runtime);
+    command
+        .args(args)
+        .current_dir(cwd)
+        .env_clear()
+        .kill_on_drop(true)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    #[cfg(target_os = "linux")]
+    unsafe {
+        command.pre_exec(|| {
+            // CLOEXEC preserves Tokio's exec-error pipe until its own exec.
+            if libc::syscall(libc::SYS_close_range, 3u32, u32::MAX, 4u32) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    #[cfg(any(test, feature = "test-utils"))]
+    {
+        ROUNDTABLE_PROCESS_EXECS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+    command
+        .spawn()
+        .map_err(|_| rt_error(ErrorCode::PolicyUnenforceable, "oci_spawn"))
 }
 
 #[cfg(test)]

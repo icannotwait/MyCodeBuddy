@@ -9,17 +9,25 @@
 // (rust-lang/rust#159105).
 #![cfg_attr(debug_assertions, allow(linker_messages))]
 
-fn main() {
+use std::process::ExitCode;
+
+fn main() -> ExitCode {
+    let args: Vec<String> = std::env::args().collect();
+    if codeg_lib::roundtable::roundtable_qualify_requested(&args) {
+        return codeg_lib::roundtable::run_roundtable_qualify();
+    }
+
     // When called as a git credential helper, handle it immediately and exit.
     // This avoids starting the full Tauri GUI runtime.
-    if std::env::args().any(|a| a == "--credential-helper") {
+    if args.iter().any(|a| a == "--credential-helper") {
         // Subprocess mode, before the desktop logging init in `run()`: install a
         // stderr-only subscriber so helper diagnostics aren't dropped, while
         // stdout stays the git credential protocol channel.
         let _log_guard = codeg_lib::logging::init::init_stderr_only();
         codeg_lib::git_credential::run_credential_helper();
-        return;
+        return ExitCode::SUCCESS;
     }
 
-    codeg_lib::run()
+    codeg_lib::run();
+    ExitCode::SUCCESS
 }

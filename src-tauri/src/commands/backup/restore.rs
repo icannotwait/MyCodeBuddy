@@ -254,6 +254,11 @@ pub(crate) async fn stage_restore_core(
     .await
     .map_err(spawn_err)??;
     emit(emitter, op_id, BackupPhase::Verifying);
+    crate::roundtable::RoundtableStore::validate_backup_objects(
+        &staging_root.join("db/codeg.db"),
+        &staging_root.join("roundtable-objects"),
+    )
+    .await?;
 
     // Force-create the staged directory of every `AlwaysReplace` section this
     // archive DECLARES, so "the backup had nothing here" is representable and
@@ -1140,9 +1145,14 @@ fn spawn_err(e: tokio::task::JoinError) -> AppCommandError {
     AppCommandError::task_execution_failed("Restore task failed").with_detail(e.to_string())
 }
 
+pub fn refuse_missing_roundtable_object() -> bool {
+    true
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sea_orm::{ConnectionTrait, Database, DatabaseBackend, Statement};
     use sea_orm_migration::MigratorTrait;
 
     fn known_migration() -> String {
@@ -1185,6 +1195,34 @@ mod tests {
         .unwrap();
     }
 
+    async fn legacy_database_bytes(
+        path: &Path,
+        manifest: Option<&crate::roundtable::SourceManifestV1>,
+    ) -> Vec<u8> {
+        let url = format!(
+            "sqlite:{}?mode=rwc",
+            urlencoding::encode(path.to_string_lossy().as_ref())
+        );
+        let conn = Database::connect(url).await.unwrap();
+        conn.execute_unprepared("CREATE TABLE legacy_settings (name TEXT)")
+            .await
+            .unwrap();
+        if let Some(manifest) = manifest {
+            conn.execute_unprepared("CREATE TABLE rt_source_manifests (body_json TEXT NOT NULL)")
+                .await
+                .unwrap();
+            conn.execute(Statement::from_sql_and_values(
+                DatabaseBackend::Sqlite,
+                "INSERT INTO rt_source_manifests(body_json) VALUES (?)",
+                [serde_json::to_string(manifest).unwrap().into()],
+            ))
+            .await
+            .unwrap();
+        }
+        conn.close().await.unwrap();
+        std::fs::read(path).unwrap()
+    }
+
     /// Restoring a pre-`managedSections` archive must not touch a section that
     /// format never knew about — otherwise fixing D1 would itself wipe every
     /// custom-agent transcript on the machine being restored onto.
@@ -1194,10 +1232,11 @@ mod tests {
         let data_dir = dir.path().join("data");
         std::fs::create_dir_all(&data_dir).unwrap();
         let src = dir.path().join("legacy.zip");
+        let database = legacy_database_bytes(&dir.path().join("legacy.db"), None).await;
         write_archive(
             &src,
             None,
-            &[("db/codeg.db", b"NEW-DB"), ("uploads/a.txt", b"A")],
+            &[("db/codeg.db", &database), ("uploads/a.txt", b"A")],
         );
 
         let live_base = dir.path().join("live");
@@ -1222,6 +1261,235 @@ mod tests {
 
         apply_pending_restore_with_paths(&data_dir, &LiveRoots::rooted_at(&live_base)).unwrap();
         assert_eq!(std::fs::read(&transcript).unwrap(), b"KEEP-ME");
+    }
+
+    #[tokio::test]
+    async fn legacy_manifest_without_sections_rejects_invalid_database() {
+        let dir = tempfile::tempdir().unwrap();
+        let data_dir = dir.path().join("data");
+        let src = dir.path().join("legacy.zip");
+        write_archive(&src, None, &[("db/codeg.db", b"NEW-DB")]);
+        let error = stage_restore_core(
+            &src,
+            &data_dir,
+            &EventEmitter::Noop,
+            "invalid",
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.code, crate::app_error::AppErrorCode::DatabaseError);
+        assert!(!data_dir.join(PENDING_MARKER).exists());
+    }
+
+    async fn referenced_roundtable_database(root: &Path) -> (Vec<u8>, String) {
+        use crate::roundtable::{
+            ObjectRef, RoundtableStore, SnapshotEncoding, SourceClass, SourceEntryV1,
+            SourceManifestV1,
+        };
+        use roundtable_protocol::Hash256;
+
+        let content = b"snapshot bytes";
+        let hash = Hash256::sha256(content);
+        let manifest = SourceManifestV1 {
+            schema_version: 1,
+            manifest_id: uuid::Uuid::new_v4().to_string().parse().unwrap(),
+            room_id: uuid::Uuid::new_v4().to_string().parse().unwrap(),
+            version: 1,
+            base_commit: None,
+            read_limit: 2,
+            entries: vec![SourceEntryV1 {
+                path: "source.txt".into(),
+                class: SourceClass::Tracked,
+                encoding: SnapshotEncoding::Utf8,
+                size: content.len() as u64,
+                mode: 0,
+                captured_at_ms: 0,
+                content_hash: hash,
+                line_offsets: vec![0],
+                text_admissible: true,
+                object: ObjectRef {
+                    object_id: hash.to_hex(),
+                    content_hash: hash,
+                    total_bytes: content.len() as u64,
+                },
+            }],
+            manifest_hash: Hash256::sha256(b"manifest"),
+        };
+        let database_path = root.join("legacy.db");
+        let database = legacy_database_bytes(&database_path, Some(&manifest)).await;
+        let objects = root.join("valid-objects");
+        std::fs::create_dir_all(&objects).unwrap();
+        std::fs::write(objects.join(hash.to_hex()), content).unwrap();
+        RoundtableStore::validate_backup_objects(&database_path, &objects)
+            .await
+            .expect("fixture references a real valid object");
+        (database, hash.to_hex())
+    }
+
+    #[tokio::test]
+    async fn legacy_manifest_without_sections_rejects_missing_or_corrupt_roundtable_objects() {
+        let dir = tempfile::tempdir().unwrap();
+        let (database, object_id) = referenced_roundtable_database(dir.path()).await;
+        for (name, corrupt, declared) in [
+            ("legacy-missing", false, false),
+            ("legacy-corrupt", true, false),
+            ("declared-missing", false, true),
+            ("declared-corrupt", true, true),
+        ] {
+            let data_dir = dir.path().join(name);
+            let src = dir.path().join(format!("{name}.zip"));
+            let object_path = format!("roundtable-objects/{object_id}");
+            let mut files = vec![("db/codeg.db", database.as_slice())];
+            if corrupt {
+                files.push((&object_path, b"SNAPSHOT BYTES"));
+            }
+            write_archive(
+                &src,
+                declared.then(|| vec!["roundtable-objects".into()]),
+                &files,
+            );
+            let error = stage_restore_core(
+                &src,
+                &data_dir,
+                &EventEmitter::Noop,
+                name,
+                &CancellationToken::new(),
+            )
+            .await
+            .unwrap_err();
+            if corrupt && !declared {
+                assert_eq!(error.code, crate::app_error::AppErrorCode::InvalidInput);
+            } else {
+                assert_eq!(error.code, crate::app_error::AppErrorCode::DatabaseError);
+                assert_eq!(
+                    error.message,
+                    "Roundtable backup objects are missing or corrupt"
+                );
+            }
+            assert!(!data_dir.join(PENDING_MARKER).exists());
+        }
+    }
+
+    #[tokio::test]
+    async fn legacy_manifest_without_sections_rejects_undeclared_valid_roundtable_objects() {
+        let dir = tempfile::tempdir().unwrap();
+        let (database, object_id) = referenced_roundtable_database(dir.path()).await;
+        let content = std::fs::read(dir.path().join("valid-objects").join(&object_id)).unwrap();
+        for (index, section) in [
+            "roundtable-objects",
+            "ROUNDTABLE-OBJECTS",
+            "roundtable-objects.",
+            "roundtable-objects ",
+            "roundtable-objects::$INDEX_ALLOCATION",
+        ]
+        .iter()
+        .enumerate()
+        {
+            let data_dir = dir.path().join(format!("data-{index}"));
+            let src = dir.path().join(format!("legacy-{index}.zip"));
+            write_archive(
+                &src,
+                None,
+                &[
+                    ("db/codeg.db", &database),
+                    (&format!("{section}/{object_id}"), &content),
+                ],
+            );
+            let result = stage_restore_core(
+                &src,
+                &data_dir,
+                &EventEmitter::Noop,
+                "undeclared",
+                &CancellationToken::new(),
+            )
+            .await;
+            assert!(
+                result.is_err(),
+                "legacy marker cannot authorize the referenced objects: {result:?}"
+            );
+            assert!(!data_dir.join(PENDING_MARKER).exists());
+        }
+    }
+
+    #[tokio::test]
+    async fn declared_roundtable_objects_restore_references_intact() {
+        let dir = tempfile::tempdir().unwrap();
+        let (database, object_id) = referenced_roundtable_database(dir.path()).await;
+        let content = std::fs::read(dir.path().join("valid-objects").join(&object_id)).unwrap();
+        let data_dir = dir.path().join("data");
+        let live_base = dir.path().join("live");
+        let src = dir.path().join("declared.zip");
+        write_archive(
+            &src,
+            Some(vec!["roundtable-objects".into()]),
+            &[
+                ("db/codeg.db", &database),
+                (&format!("roundtable-objects/{object_id}"), &content),
+            ],
+        );
+        stage_restore_core(
+            &src,
+            &data_dir,
+            &EventEmitter::Noop,
+            "declared",
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        apply_pending_restore_with_paths(&data_dir, &LiveRoots::rooted_at(&live_base)).unwrap();
+        assert_eq!(
+            std::fs::read(live_base.join("roundtable-objects").join(&object_id)).unwrap(),
+            content
+        );
+        crate::roundtable::RoundtableStore::validate_backup_objects(
+            &data_dir.join(crate::db::database_file_name()),
+            &live_base.join("roundtable-objects"),
+        )
+        .await
+        .unwrap();
+        assert!(!data_dir.join(PENDING_MARKER).exists());
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn declared_roundtable_object_aliases_cannot_stage_unrestorable_references() {
+        let dir = tempfile::tempdir().unwrap();
+        let (database, object_id) = referenced_roundtable_database(dir.path()).await;
+        let content = std::fs::read(dir.path().join("valid-objects").join(&object_id)).unwrap();
+        for (index, section) in [
+            "ROUNDTABLE-OBJECTS",
+            "roundtable-objects.",
+            "roundtable-objects ",
+            "roundtable-objects::$INDEX_ALLOCATION",
+        ]
+        .iter()
+        .enumerate()
+        {
+            let data_dir = dir.path().join(format!("data-{index}"));
+            let src = dir.path().join(format!("alias-{index}.zip"));
+            write_archive(
+                &src,
+                Some(vec![(*section).into()]),
+                &[
+                    ("db/codeg.db", &database),
+                    (&format!("{section}/{object_id}"), &content),
+                ],
+            );
+            let result = stage_restore_core(
+                &src,
+                &data_dir,
+                &EventEmitter::Noop,
+                "alias",
+                &CancellationToken::new(),
+            )
+            .await;
+            assert!(
+                result.is_err(),
+                "alias declaration is dropped by marker normalization: {result:?}"
+            );
+            assert!(!data_dir.join(PENDING_MARKER).exists());
+        }
     }
 
     /// Same guarantee one layer down: a marker written by the previous build

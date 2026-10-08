@@ -96,7 +96,6 @@ function renderShell(
       <ConversationShell
         status="connected"
         promptCapabilities={CAPS}
-        error={null}
         claudeApiRetry={null}
         pendingPermission={pendingPermission}
         pendingQuestion={{
@@ -160,7 +159,6 @@ describe("ConversationShell interactionLocked capability", () => {
         <ConversationShell
           status="connected"
           promptCapabilities={CAPS}
-          error={null}
           claudeApiRetry={null}
           pendingPermission={null}
           pendingQuestion={null}

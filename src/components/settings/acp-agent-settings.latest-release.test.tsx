@@ -69,6 +69,7 @@ function agent(overrides: Partial<AcpAgentInfo>): AcpAgentInfo {
     is_acp_adapter: false,
     custom_source: null,
     enabled: true,
+    show_thinking: false,
     sort_order: 0,
     installed_version: "0.60.0",
     host_tools_agent_mode: false,

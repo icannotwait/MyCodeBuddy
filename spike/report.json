@@ -1,0 +1,142 @@
+{
+  "can_probe": false,
+  "model_request_count": 0,
+  "qualification_issued": false,
+  "g1_unblocked": false,
+  "verdict": "blocked_platform",
+  "endpoint_compatibility": "not_tested",
+  "os_build": "Windows 11 Pro 10.0.26200.9457",
+  "kernel": "10.0.26200.9457",
+  "host_platform": "win32",
+  "host_arch": "x64",
+  "host_node_version": "v24.14.0",
+  "crun_version": "not_installed",
+  "crun_sha256": "unknown",
+  "image_digest": "unknown",
+  "adapter_sha256": "unknown",
+  "codex_sha256": "unknown",
+  "node_sha256": "unknown",
+  "mcp_sha256": "unknown",
+  "block_reason": "missing profile; probe approval is absent; model request approval is absent; endpoint compatibility is not_tested; host Windows 11 Pro 10.0.26200.9457 (win32/x64, kernel 10.0.26200.9457) is not Linux x86_64/Debian 12; model_request_count is 0; no credential was read; this result is not a qualification certificate and does not unblock G1",
+  "cases": [
+    {
+      "id": "rootless_crun_create_list_reap",
+      "chain": "rootless_process",
+      "kind": "linux_sandbox",
+      "critical": true,
+      "command_sha256": null,
+      "planned_command_sha256": "6ad1dd91f97607f369730c3b52751dd514c9fab293b044c01a28e19087ffd977",
+      "exit_status": null,
+      "expected_rejection": false,
+      "actual_rejection": "not_executed",
+      "status": "blocked_platform",
+      "block_reason": "blocked_platform: Windows 11 Pro 10.0.26200.9457 (win32/x64) cannot run rootless crun create/list/reap. where.exe did not find crun; it was not installed or started. No image was downloaded and no container was started."
+    },
+    {
+      "id": "namespace_cgroup_isolation",
+      "chain": "rootless_process",
+      "kind": "linux_sandbox",
+      "critical": true,
+      "command_sha256": null,
+      "planned_command_sha256": "7e7cc9e8ff64654504b403325740e81cddf9908e03eae8356a8bc68c43e14b17",
+      "exit_status": null,
+      "expected_rejection": true,
+      "actual_rejection": "not_executed",
+      "status": "blocked_platform",
+      "block_reason": "blocked_platform: win32 cannot prove Linux user, mount, pid, or network namespaces, or cgroup limits. The isolation probe was not executed."
+    },
+    {
+      "id": "codex_custom_base_url",
+      "chain": "model_gateway",
+      "kind": "linux_sandbox",
+      "critical": true,
+      "command_sha256": null,
+      "planned_command_sha256": "233dcbed82fff1bb07acb00af036f8fe307a760a3b2a6663ffef368f87fc1355",
+      "exit_status": null,
+      "expected_rejection": false,
+      "actual_rejection": "not_executed",
+      "status": "blocked_platform",
+      "block_reason": "blocked_platform: Codex custom base_url inside a rootless Linux sandbox was not executed on win32. Host model credentials were not read and were not mounted."
+    },
+    {
+      "id": "endpoint_compatibility",
+      "chain": "model_gateway",
+      "kind": "model_request",
+      "critical": false,
+      "command_sha256": null,
+      "planned_command_sha256": "19ca9f527fb4aa341015ac62256e06eef562ef13daeec2c28810b5a8454a35d3",
+      "exit_status": null,
+      "expected_rejection": false,
+      "actual_rejection": "not_executed",
+      "status": "not_tested",
+      "block_reason": "Endpoint compatibility is not_tested. Model-request approval is absent, and no model or network request was sent."
+    },
+    {
+      "id": "codeg_mcp_mounted_socket",
+      "chain": "companion_injection",
+      "kind": "linux_sandbox",
+      "critical": true,
+      "command_sha256": null,
+      "planned_command_sha256": "47781986eb291aa53c9ff592750000733c77dd896f2d6c5abd507d6ffe885bd3",
+      "exit_status": null,
+      "expected_rejection": false,
+      "actual_rejection": "not_executed",
+      "status": "blocked_platform",
+      "block_reason": "blocked_platform: codeg-mcp was not launched and no Unix socket was mounted. win32 is not the Linux candidate that can host that socket."
+    },
+    {
+      "id": "shell_fs_escape",
+      "chain": "native_tool_boundary",
+      "kind": "linux_sandbox",
+      "critical": true,
+      "command_sha256": null,
+      "planned_command_sha256": "55cd4fbb5af1aa207881e69c6b04249827ece20f846f0d887ef988d5efddedc2",
+      "exit_status": null,
+      "expected_rejection": true,
+      "actual_rejection": "not_executed",
+      "status": "blocked_platform",
+      "block_reason": "blocked_platform: shell startup and native fs escape were not executed on win32. A shell starting would not by itself be a failure; escape, egress, and tool bypass were not marked passed."
+    }
+  ],
+  "untested": [
+    {
+      "id": "endpoint_compatibility",
+      "reason": "Endpoint compatibility is not_tested. Model-request approval is absent, and no model or network request was sent."
+    }
+  ],
+  "critical_chains": [
+    {
+      "id": "rootless_process",
+      "verdict": "blocked_platform",
+      "covers": [
+        "rootless_crun_create_list_reap",
+        "namespace_cgroup_isolation"
+      ],
+      "block_reason": "blocked_platform: Windows 11 Pro 10.0.26200.9457 (win32/x64) cannot run rootless crun create/list/reap. where.exe did not find crun; it was not installed or started. No image was downloaded and no container was started. blocked_platform: win32 cannot prove Linux user, mount, pid, or network namespaces, or cgroup limits. The isolation probe was not executed."
+    },
+    {
+      "id": "model_gateway",
+      "verdict": "blocked_platform",
+      "covers": [
+        "codex_custom_base_url"
+      ],
+      "block_reason": "blocked_platform: Codex custom base_url inside a rootless Linux sandbox was not executed on win32. Host model credentials were not read and were not mounted."
+    },
+    {
+      "id": "companion_injection",
+      "verdict": "blocked_platform",
+      "covers": [
+        "codeg_mcp_mounted_socket"
+      ],
+      "block_reason": "blocked_platform: codeg-mcp was not launched and no Unix socket was mounted. win32 is not the Linux candidate that can host that socket."
+    },
+    {
+      "id": "native_tool_boundary",
+      "verdict": "blocked_platform",
+      "covers": [
+        "shell_fs_escape"
+      ],
+      "block_reason": "blocked_platform: shell startup and native fs escape were not executed on win32. A shell starting would not by itself be a failure; escape, egress, and tool bypass were not marked passed."
+    }
+  ]
+}

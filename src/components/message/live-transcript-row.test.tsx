@@ -796,6 +796,7 @@ describe("LiveTranscriptRow", () => {
       {
         attachedResources: "Attached resources",
         toolCallFailed: "failed",
+        pageHandoffName: () => "",
       },
       false
     )

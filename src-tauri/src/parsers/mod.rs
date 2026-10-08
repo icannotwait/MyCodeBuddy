@@ -475,16 +475,21 @@ struct RouteSanitized(Box<dyn AgentParser>);
 impl AgentParser for RouteSanitized {
     fn list_conversations(&self) -> Result<Vec<ConversationSummary>, ParseError> {
         let mut summaries = self.0.list_conversations()?;
-        for summary in &mut summaries {
+        summaries.retain_mut(|summary| {
             sanitize_summary(summary);
-        }
+            !roundtable_summary_hidden(summary)
+        });
         Ok(summaries)
     }
 
     fn get_conversation(&self, conversation_id: &str) -> Result<ConversationDetail, ParseError> {
-        self.0
-            .get_conversation(conversation_id)
-            .map(sanitize_detail)
+        let detail = sanitize_detail(self.0.get_conversation(conversation_id)?);
+        if roundtable_detail_hidden(conversation_id, &detail) {
+            return Err(ParseError::ConversationNotFound(
+                conversation_id.to_string(),
+            ));
+        }
+        Ok(detail)
     }
 
     fn recover_conversation(
@@ -492,10 +497,34 @@ impl AgentParser for RouteSanitized {
         query: &RecoveryQuery<'_>,
         accept: &dyn Fn(&ConversationSummary) -> bool,
     ) -> Result<Option<ConversationDetail>, ParseError> {
-        self.0
-            .recover_conversation(query, accept)
-            .map(|detail| detail.map(sanitize_detail))
+        let gate =
+            |summary: &ConversationSummary| accept(summary) && !roundtable_summary_hidden(summary);
+        self.0.recover_conversation(query, &gate).map(|detail| {
+            detail.and_then(|detail| {
+                if roundtable_summary_hidden(&detail.summary) {
+                    None
+                } else {
+                    Some(sanitize_detail(detail))
+                }
+            })
+        })
     }
+}
+
+fn roundtable_summary_hidden(summary: &ConversationSummary) -> bool {
+    crate::roundtable::hidden_from_ordinary_discovery(
+        summary.agent_type,
+        Some(summary.id.as_str()),
+        summary.folder_path.as_deref(),
+    )
+}
+
+fn roundtable_detail_hidden(conversation_id: &str, detail: &ConversationDetail) -> bool {
+    crate::roundtable::hidden_from_ordinary_discovery(
+        detail.summary.agent_type,
+        Some(conversation_id),
+        detail.summary.folder_path.as_deref(),
+    ) || roundtable_summary_hidden(&detail.summary)
 }
 
 fn sanitize_detail(mut detail: ConversationDetail) -> ConversationDetail {

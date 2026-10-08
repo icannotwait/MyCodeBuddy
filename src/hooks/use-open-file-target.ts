@@ -4,7 +4,7 @@ import { useCallback } from "react"
 
 import { useSessionViewerHost } from "@/components/message/session-viewer-host-context"
 import { useOptionalWorkbenchRoute } from "@/contexts/workbench-route-context"
-import { useWorkspaceActions } from "@/contexts/workspace-context"
+import { useOptionalWorkspaceActions } from "@/contexts/workspace-context"
 
 interface OpenFileTargetOptions {
   line?: number | null
@@ -43,7 +43,10 @@ interface OpenFileTargetOptions {
  * is how the diff action was left silently failing on those very routes.
  */
 export function useOpenFileTarget() {
-  const { openFilePreview, openSessionFileDiff } = useWorkspaceActions()
+  // Roundtable and other full-page routes render the shared markdown
+  // renderer without a workspace. Missing actions must not throw at render;
+  // a file click there has no column to open into.
+  const actions = useOptionalWorkspaceActions()
   const route = useOptionalWorkbenchRoute()
   const viewerHost = useSessionViewerHost()
   const fileColumnVisible = route ? route.isConversations : true
@@ -60,8 +63,9 @@ export function useOpenFileTarget() {
         })
         return
       }
+      if (!actions) return
       if (options?.diff) {
-        openSessionFileDiff(
+        actions.openSessionFileDiff(
           path,
           options.diff.content,
           options.diff.groupLabel,
@@ -69,11 +73,11 @@ export function useOpenFileTarget() {
         )
         return
       }
-      await openFilePreview(path, {
+      await actions.openFilePreview(path, {
         line: options?.line ?? undefined,
         ...(options?.folderId != null ? { folderId: options.folderId } : {}),
       })
     },
-    [fileColumnVisible, openFilePreview, openSessionFileDiff, viewerHost]
+    [actions, fileColumnVisible, viewerHost]
   )
 }

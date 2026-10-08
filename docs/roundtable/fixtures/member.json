@@ -1,0 +1,156 @@
+{
+  "cases": [
+    {
+      "canonical_utf8_hex": "7b22636c61696d73223a5b7b22636f6e666964656e6365223a226c6f77222c2265766964656e63655f616c6961736573223a5b5d2c226c6f63616c5f6b6579223a226330222c2274657874223a22636c61696d227d5d2c226b696e64223a2270726f706f73616c222c226f70656e5f7175657374696f6e73223a5b5d2c22706f736974696f6e5f6368616e676573223a5b5d2c22726573706f6e736573223a5b5d2c2273756d6d617279223a22e4b8ade69687e69198e8a681227d",
+      "name": "member",
+      "normalized_utf8_hex": "7b22636c61696d73223a5b7b22636f6e666964656e6365223a226c6f77222c2265766964656e63655f616c6961736573223a5b5d2c226c6f63616c5f6b6579223a226330222c2274657874223a22636c61696d227d5d2c226b696e64223a2270726f706f73616c222c226f70656e5f7175657374696f6e73223a5b5d2c22706f736974696f6e5f6368616e676573223a5b5d2c22726573706f6e736573223a5b5d2c2273756d6d617279223a22e4b8ade69687e69198e8a681227d",
+      "original_hex": "7b0a202022636c61696d73223a205b0a202020207b0a20202020202022636f6e666964656e6365223a20226c6f77222c0a2020202020202265766964656e63655f616c6961736573223a205b5d2c0a202020202020226c6f63616c5f6b6579223a20226330222c0a2020202020202274657874223a2022636c61696d220a202020207d0a20205d2c0a2020226b696e64223a202270726f706f73616c222c0a2020226f70656e5f7175657374696f6e73223a205b5d2c0a202022706f736974696f6e5f6368616e676573223a205b5d2c0a202022726573706f6e736573223a205b5d2c0a20202273756d6d617279223a2022e4b8ade69687e69198e8a681220a7d",
+      "sha256": "d6189a24a1b1606bc69b1d84b85f550d7977d979846d8a33c6adefc65ed1440d"
+    }
+  ],
+  "contract_profile": "roundtable_plan_1_2",
+  "json_schema": {
+    "description": "Nullable properties are required and allow null. Optional properties are omitted when absent and do not allow null.",
+    "type": "object",
+    "additionalProperties": false,
+    "required": [
+      "kind",
+      "summary",
+      "claims"
+    ],
+    "properties": {
+      "kind": {
+        "type": "string",
+        "enum": [
+          "proposal",
+          "critique",
+          "abstain"
+        ]
+      },
+      "summary": {
+        "type": "string"
+      },
+      "claims": {
+        "type": "array",
+        "items": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "local_key",
+            "text",
+            "evidence_aliases",
+            "confidence"
+          ],
+          "properties": {
+            "local_key": {
+              "type": "string"
+            },
+            "text": {
+              "type": "string"
+            },
+            "evidence_aliases": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "confidence": {
+              "type": "string",
+              "enum": [
+                "low",
+                "medium",
+                "high"
+              ]
+            }
+          }
+        }
+      },
+      "responses": {
+        "type": "array",
+        "items": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "stance",
+            "priority",
+            "text",
+            "evidence_aliases"
+          ],
+          "properties": {
+            "target_claim_alias": {
+              "type": "string"
+            },
+            "target_response_alias": {
+              "type": "string"
+            },
+            "stance": {
+              "type": "string",
+              "enum": [
+                "support",
+                "challenge",
+                "clarify",
+                "revise"
+              ]
+            },
+            "priority": {
+              "type": "string",
+              "enum": [
+                "normal",
+                "critical"
+              ]
+            },
+            "text": {
+              "type": "string"
+            },
+            "evidence_aliases": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            }
+          }
+        }
+      },
+      "open_questions": {
+        "type": "array",
+        "items": {
+          "type": "string"
+        }
+      },
+      "position_changes": {
+        "type": "array",
+        "items": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "own_prior_claim_alias",
+            "new_local_claim_key",
+            "reason",
+            "trigger_response_aliases"
+          ],
+          "properties": {
+            "own_prior_claim_alias": {
+              "type": "string"
+            },
+            "new_local_claim_key": {
+              "type": "string"
+            },
+            "reason": {
+              "type": "string"
+            },
+            "trigger_response_aliases": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            }
+          }
+        }
+      },
+      "reason": {
+        "type": "string"
+      }
+    }
+  },
+  "schema_version": 1
+}

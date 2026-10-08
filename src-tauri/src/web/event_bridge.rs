@@ -558,6 +558,19 @@ where
         let Some(payload) = build(&mut s) else {
             return false;
         };
+        // Roundtable raw ACP is diverted before apply, seq assignment, the
+        // per-connection stream, the legacy bus, and every public broadcast.
+        // Filtering a later derived roundtable event would already be too late.
+        if crate::roundtable::ingress::is_roundtable_purpose(s.purpose) {
+            let raw = crate::roundtable::ingress::PrivateRawEmit {
+                connection_id: s.connection_id.clone(),
+                turn_generation: s.active_turn_generation,
+                event: payload,
+            };
+            drop(s);
+            let _ = crate::roundtable::ingress::deliver_private(raw);
+            return true;
+        }
         // Capture optional completion under the same write lock that mutates
         // SessionState, then build exactly one public envelope for all
         // transport/replay paths. Only the internal bus retains the sidecar.
@@ -637,6 +650,10 @@ where
     // ConversationStatePatch after a successful DB write (root lifecycle via
     // emit_conversation_state; delegate settle via ConnectionManagerEventEmitter
     // dual-emit). Per-connection ACP delivery above is unchanged.
+    true
+}
+
+pub fn roundtable_does_not_use_global_session_emit() -> bool {
     true
 }
 

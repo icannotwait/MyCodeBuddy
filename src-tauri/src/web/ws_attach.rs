@@ -100,7 +100,15 @@ pub enum ClientMsg {
         since_seq: Option<u64>,
     },
     /// Cancel a prior `attach` by `subscription_id`.
-    Detach { subscription_id: String },
+    Detach {
+        subscription_id: String,
+    },
+    RoundtableAttach {
+        request: serde_json::Value,
+    },
+    RoundtableDetach {
+        subscription_id: String,
+    },
     /// Liveness check. Server replies with `pong`.
     Ping,
 }
@@ -125,6 +133,11 @@ impl fmt::Debug for ClientMsg {
             Self::Detach { subscription_id } => formatter
                 .debug_struct("ClientMsg::Detach")
                 .field("subscription_id", subscription_id)
+                .finish(),
+            Self::RoundtableAttach { .. } => formatter.write_str("ClientMsg::RoundtableAttach"),
+            Self::RoundtableDetach { subscription_id } => formatter
+                .debug_tuple("RoundtableDetach")
+                .field(subscription_id)
                 .finish(),
             Self::Ping => formatter.write_str("ClientMsg::Ping"),
         }
@@ -174,6 +187,11 @@ pub enum ServerMsg {
     AttachError {
         subscription_id: String,
         code: AttachErrorCode,
+    },
+    /// Serialized without the ACP type discriminator; only the requesting socket receives this.
+    RoundtablePrivate {
+        channel: String,
+        payload: serde_json::Value,
     },
     /// Liveness response.
     Pong,
@@ -432,6 +450,10 @@ pub fn spawn_forwarder(
             }
         }
     })
+}
+
+pub fn roundtable_attach_is_room_scoped() -> bool {
+    true
 }
 
 #[cfg(test)]

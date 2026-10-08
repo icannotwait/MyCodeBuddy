@@ -567,7 +567,14 @@ describe("denormalizeSnapshot — truncated tool projections", () => {
   it("keeps a dangling tool_call_ref instead of dropping the card", () => {
     const patch = denormalizeSnapshot(
       baseSnapshot({
-        truncation: { omitted_tool_calls: 1, omitted_live_tool_refs: 1 },
+        truncation: {
+          omitted_tool_calls: 1,
+          omitted_live_tool_refs: 1,
+          omitted_images: 0,
+          omitted_failures: 0,
+          omitted_watchdog_tombstones: 0,
+          truncated_text_fields: 0,
+        },
         live_message: {
           id: "lm-gap",
           role: "assistant",
@@ -598,7 +605,13 @@ describe("denormalizeSnapshot — truncated tool projections", () => {
   it("counts a dangling ref when an older snapshot has no omitted_live_tool_refs", () => {
     const patch = denormalizeSnapshot(
       baseSnapshot({
-        truncation: { omitted_tool_calls: 2 },
+        truncation: {
+          omitted_tool_calls: 2,
+          omitted_images: 0,
+          omitted_failures: 0,
+          omitted_watchdog_tombstones: 0,
+          truncated_text_fields: 0,
+        },
         live_message: {
           id: "lm-old",
           role: "assistant",
@@ -649,7 +662,14 @@ describe("denormalizeSnapshot — truncated tool projections", () => {
       baseSnapshot({
         live_message: refs,
         active_tool_calls: calls,
-        truncation: { omitted_tool_calls: 0, omitted_live_tool_refs: 0 },
+        truncation: {
+          omitted_tool_calls: 0,
+          omitted_live_tool_refs: 0,
+          omitted_images: 0,
+          omitted_failures: 0,
+          omitted_watchdog_tombstones: 0,
+          truncated_text_fields: 0,
+        },
       })
     )
     expect(patch.liveMessage?.content).toHaveLength(160)

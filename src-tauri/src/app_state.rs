@@ -135,6 +135,9 @@ pub struct AppState {
     /// The upgrade UI subscribes to it and re-syncs from a snapshot on mount,
     /// so download progress survives settings-page navigation and reloads.
     pub update_state: crate::update::AppUpdateStateHandle,
+    /// One roundtable coordinator slot. Desktop and the embedded web server
+    /// clone this handle; neither constructs a second service.
+    pub roundtable: Arc<crate::roundtable::RoundtableSlot>,
 }
 
 pub fn default_system_op_lock() -> Arc<tokio::sync::Mutex<()>> {
@@ -592,6 +595,7 @@ impl AppState {
             computer_service: std::sync::OnceLock::new(),
             system_op_lock: default_system_op_lock(),
             update_state: default_update_state(),
+            roundtable: Arc::new(crate::roundtable::RoundtableSlot::new()),
         }
     }
 }

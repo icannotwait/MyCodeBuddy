@@ -11,12 +11,10 @@ use sea_orm::{
 };
 
 use crate::acp::agent_mentions::strip_route_separator_from_prompt;
-#[cfg(any(test, feature = "test-utils"))]
-use crate::acp::connection::{connection_channel, matching_config_pair};
 use crate::acp::connection::{
-    spawn_agent_connection, AgentConnection, ConnectionCommand, ConnectionControl,
-    GoalControlAction, LaneSender, RegisteredSpawnAttempt, RouteBootstrapOutcome, SpawnHandshake,
-    SteerOutcome, SuspensionAck,
+    connection_channel, matching_config_pair, spawn_agent_connection, AgentConnection,
+    ConnectionCommand, ConnectionControl, GoalControlAction, LaneSender, RegisteredSpawnAttempt,
+    RouteBootstrapOutcome, SpawnHandshake, SteerOutcome, SuspensionAck,
 };
 use crate::acp::delegation::continuation::build_continuation_prompt_text;
 use crate::acp::delegation::continuation::coordinator::{
@@ -28,8 +26,9 @@ use crate::acp::delegation::continuation::store::{
 use crate::acp::delegation::continuation::types::ContinuationState;
 use crate::acp::delegation::metrics::PromptAdmissionSource;
 use crate::acp::delegation::route::{
-    safe_native_fallback, DelegationConnectionOrigin, DelegationRoutePlan, DelegationRoutePolicy,
-    DelegationRouteSource, RouteDegradedReason,
+    resolve_route, safe_native_fallback, DelegationConnectionOrigin, DelegationRoutePlan,
+    DelegationRoutePolicy, DelegationRouteSource, RouteCapabilitySnapshot, RouteDegradedReason,
+    RouteResolutionInput, SuppressionCapability, ROUTE_ADAPTER_CONTRACT_VERSION,
 };
 use crate::acp::delegation::workflow::{
     require_writable_conversation_workflow, WorkflowStoreError,
@@ -1053,6 +1052,57 @@ fn prune_reaped(draining: &mut DrainingChildren) {
     });
 }
 
+/// Compatibility label for service-owned roundtable connections.
+///
+/// Window cleanup must not treat this string as an observer window. The
+/// [`ConnectionOwner`] map is the source of truth.
+pub const ROUNDTABLE_SERVICE_LABEL: &str = "__roundtable_service__";
+
+/// Who may reap a connection. `Service` survives an observer disconnect even
+/// when `owner_window_label` is [`ROUNDTABLE_SERVICE_LABEL`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConnectionOwner {
+    Window {
+        label: String,
+        operation_id: Option<String>,
+    },
+    Service {
+        room_id: roundtable_protocol::RoomId,
+        attempt_id: roundtable_protocol::AttemptId,
+        boot_epoch: roundtable_protocol::Epoch,
+    },
+}
+
+/// In-memory lane for one service-owned member. The receivers stay with the
+/// caller so dropping every `LaneSender` is what closes the lane.
+pub(crate) struct RoundtableServiceLane {
+    pub connection_id: String,
+    pub state: Arc<RwLock<SessionState>>,
+    pub cmd_tx: LaneSender<ConnectionCommand>,
+    pub cmd_rx: tokio::sync::mpsc::Receiver<ConnectionCommand>,
+    pub control_rx: tokio::sync::mpsc::Receiver<ConnectionControl>,
+}
+
+fn roundtable_inert_shell() -> crate::terminal::shell::ResolvedShellSnapshot {
+    use crate::terminal::shell::{
+        ResolvedShellSnapshot, ResolvedShellSpec, ShellCommandStrategy, ShellDialect, ShellSource,
+    };
+    ResolvedShellSnapshot {
+        selection_key: "roundtable-none".into(),
+        spec: ResolvedShellSpec {
+            executable: PathBuf::from(if cfg!(windows) {
+                r"C:\codeg\roundtable-no-host-terminal"
+            } else {
+                "/codeg/roundtable-no-host-terminal"
+            }),
+            dialect: ShellDialect::Posix,
+            display_name: "roundtable-none".into(),
+            source: ShellSource::Custom,
+            command_strategy: ShellCommandStrategy::Posix,
+        },
+    }
+}
+
 pub struct ConnectionManager {
     pub(crate) connections: Arc<Mutex<HashMap<String, AgentConnection>>>,
     /// Connections whose teardown was requested but whose child process has
@@ -1152,6 +1202,8 @@ pub struct ConnectionManager {
     shared_control_adapter: Arc<dyn SharedControlAdapter>,
     shared_launches: Arc<Mutex<HashMap<(String, u64), SharedConnectLaunch>>>,
     admission: Arc<ConnectionAdmissionGate>,
+    /// Service owners keyed by connection id. Absent ids are windows.
+    roundtable_service_owners: Arc<std::sync::Mutex<HashMap<String, ConnectionOwner>>>,
     #[cfg(any(test, feature = "test-utils"))]
     shared_spawn_override: Option<Arc<dyn SharedSpawnDriver>>,
     #[cfg(any(test, feature = "test-utils"))]
@@ -1261,6 +1313,7 @@ impl ConnectionManager {
             shared_control_adapter: Arc::new(ManagerSharedControlAdapter),
             shared_launches: Arc::new(Mutex::new(HashMap::new())),
             admission: ConnectionAdmissionGate::new(),
+            roundtable_service_owners: Arc::new(std::sync::Mutex::new(HashMap::new())),
             #[cfg(any(test, feature = "test-utils"))]
             shared_spawn_override: None,
             #[cfg(any(test, feature = "test-utils"))]
@@ -1318,6 +1371,7 @@ impl ConnectionManager {
             shared_control_adapter: self.shared_control_adapter.clone(),
             shared_launches: self.shared_launches.clone(),
             admission: self.admission.clone(),
+            roundtable_service_owners: self.roundtable_service_owners.clone(),
             #[cfg(any(test, feature = "test-utils"))]
             shared_spawn_override: self.shared_spawn_override.clone(),
             #[cfg(any(test, feature = "test-utils"))]
@@ -8113,17 +8167,162 @@ impl ConnectionManager {
         }
     }
 
+    fn service_owner(&self, connection_id: &str) -> Option<ConnectionOwner> {
+        self.roundtable_service_owners
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .get(connection_id)
+            .cloned()
+    }
+
+    fn owner_for(&self, connection_id: &str, conn: &AgentConnection) -> ConnectionOwner {
+        if let Some(owner) = self.service_owner(connection_id) {
+            return owner;
+        }
+        ConnectionOwner::Window {
+            label: conn.owner_window_label.clone(),
+            operation_id: conn.owner_operation_id.clone(),
+        }
+    }
+
+    /// Owner of a live connection. Service entries do not become windows just
+    /// because their compatibility label is [`ROUNDTABLE_SERVICE_LABEL`].
+    pub async fn connection_owner(&self, connection_id: &str) -> Option<ConnectionOwner> {
+        let connections = self.connections.lock().await;
+        let conn = connections.get(connection_id)?;
+        Some(self.owner_for(connection_id, conn))
+    }
+
+    /// Register one roundtable member. Does not spawn, does not import a
+    /// conversation, and does not install a delegation route.
+    pub(crate) async fn register_roundtable_service_connection(
+        &self,
+        owner: ConnectionOwner,
+    ) -> Result<RoundtableServiceLane, AcpError> {
+        let ConnectionOwner::Service { .. } = &owner else {
+            return Err(AcpError::protocol(
+                "roundtable connection requires a service owner",
+            ));
+        };
+        let capability = RouteCapabilitySnapshot {
+            suppression: SuppressionCapability::supported(ROUTE_ADAPTER_CONTRACT_VERSION),
+            agent_mcp_supported: false,
+            companion_binary_available: false,
+        };
+        let route_plan = resolve_route(RouteResolutionInput {
+            agent_type: AgentType::Codex,
+            origin: DelegationConnectionOrigin::Root,
+            session_override: None,
+            global_policy: DelegationRoutePolicy::Native,
+            delegation_enabled: false,
+            suppression: capability.suppression.clone(),
+            agent_mcp_supported: false,
+            companion_binary_available: false,
+        })
+        .map_err(|error| AcpError::protocol(error.to_string()))?;
+        if route_plan.expose_codeg_delegation {
+            return Err(AcpError::protocol(
+                "roundtable must not install a delegation route",
+            ));
+        }
+        let connection_id = uuid::Uuid::new_v4().to_string();
+        let terminal_shell = roundtable_inert_shell();
+        let (spawn_config, observed_config) = matching_config_pair(
+            String::new(),
+            terminal_shell.selection_key.clone(),
+            route_plan.fingerprint.clone(),
+        );
+        let mut session = SessionState::new(
+            connection_id.clone(),
+            AgentType::Codex,
+            None,
+            ROUNDTABLE_SERVICE_LABEL.to_string(),
+            None,
+        );
+        session.purpose = ConnectionPurpose::Roundtable;
+        session.status = ConnectionStatus::Connected;
+        session.tool_lease_registry = self.tool_lease_registry.clone();
+        session.mcp_cancel_registry = self.mcp_cancel_registry.clone();
+        session.set_route_plan_snapshot(&route_plan);
+        let connection_incarnation = session.connection_incarnation.clone();
+        let state = Arc::new(RwLock::new(session));
+        let (cmd_tx, cmd_rx, _cmd_closed) = connection_channel(1);
+        let (control_tx, control_rx, _control_closed) = connection_channel(8);
+        let conn = AgentConnection {
+            id: connection_id.clone(),
+            agent_type: AgentType::Codex,
+            status: ConnectionStatus::Connected,
+            owner_window_label: ROUNDTABLE_SERVICE_LABEL.to_string(),
+            owner_operation_id: None,
+            ownership_generation: 0,
+            connection_incarnation,
+            tool_lease_registry: self.tool_lease_registry.clone(),
+            parent_connection_id: None,
+            cmd_tx: cmd_tx.clone(),
+            control_tx,
+            task_abort: None,
+            state: Arc::clone(&state),
+            emitter: crate::web::event_bridge::EventEmitter::Noop,
+            prompt_lock: Arc::new(tokio::sync::Mutex::new(())),
+            spawn_config,
+            observed_config,
+            terminal_shell,
+            route_plan,
+            origin: DelegationConnectionOrigin::Root,
+            route_preference: None,
+            route_capability: capability,
+            child_pid: Arc::new(std::sync::atomic::AtomicU32::new(0)),
+        };
+        let mut map = self.connections.lock().await;
+        self.roundtable_service_owners
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .insert(connection_id.clone(), owner);
+        map.insert(connection_id.clone(), conn);
+        Ok(RoundtableServiceLane {
+            connection_id,
+            state,
+            cmd_tx,
+            cmd_rx,
+            control_rx,
+        })
+    }
+
+    /// Point a synthetic window connection at another label. Service owners
+    /// cannot be retagged into windows.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub async fn retag_test_connection_window(
+        &self,
+        connection_id: &str,
+        label: &str,
+        operation_id: Option<String>,
+    ) -> bool {
+        let state = {
+            let mut connections = self.connections.lock().await;
+            if self.service_owner(connection_id).is_some() {
+                return false;
+            }
+            let Some(conn) = connections.get_mut(connection_id) else {
+                return false;
+            };
+            conn.owner_window_label = label.to_string();
+            conn.owner_operation_id = operation_id;
+            Arc::clone(&conn.state)
+        };
+        state.write().await.owner_window_label = label.to_string();
+        true
+    }
+
     pub async fn disconnect_by_owner_window(&self, owner_window_label: &str) -> usize {
         let planned: Vec<DisconnectSelection> = {
             let connections = self.connections.lock().await;
             connections
                 .iter()
-                .filter_map(|(id, conn)| {
-                    if conn.owner_window_label == owner_window_label {
+                .filter_map(|(id, conn)| match self.owner_for(id, conn) {
+                    ConnectionOwner::Window { label, .. } if label == owner_window_label => {
                         Some(DisconnectSelection::with_ownership(id.clone(), conn))
-                    } else {
-                        None
                     }
+                    _ => None,
                 })
                 .collect()
         };
@@ -8154,16 +8353,16 @@ impl ConnectionManager {
             let connections = self.connections.lock().await;
             connections
                 .iter()
-                .filter_map(|(id, conn)| {
-                    if conn.owner_window_label != owner_window_label {
-                        return None;
-                    }
-                    let conn_op = conn.owner_operation_id.as_deref().unwrap_or("");
-                    if conn_op == operation_id {
+                .filter_map(|(id, conn)| match self.owner_for(id, conn) {
+                    ConnectionOwner::Window {
+                        label,
+                        operation_id: stamped,
+                    } if label == owner_window_label
+                        && stamped.as_deref().unwrap_or("") == operation_id =>
+                    {
                         Some(DisconnectSelection::with_ownership(id.clone(), conn))
-                    } else {
-                        None
                     }
+                    _ => None,
                 })
                 .collect()
         };

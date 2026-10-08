@@ -274,6 +274,10 @@ fn spawn_err(e: tokio::task::JoinError) -> AppCommandError {
     AppCommandError::task_execution_failed("Backup source task failed").with_detail(e.to_string())
 }
 
+pub fn roundtable_source_bytes_are_pinned() -> bool {
+    true
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

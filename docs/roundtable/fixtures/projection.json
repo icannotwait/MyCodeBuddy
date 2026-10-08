@@ -1,0 +1,686 @@
+{
+  "cases": [
+    {
+      "canonical_utf8_hex": "7b22626c6f636b65645f726561736f6e223a6e756c6c2c22636f6e6669675f68617368223a2261626162616261626162616261626162616261626162616261626162616261626162616261626162616261626162616261626162616261626162616261626162222c2265766964656e63655f6d616e696665737473223a5b2236363636363636362d363636362d343636362d383636362d363636363636363636363636225d2c226c6173745f736571223a2234222c226c65646765725f736571223a2234222c226d65737361676573223a5b7b2268617368223a2263646364636463646364636463646364636463646364636463646364636463646364636463646364636463646364636463646364636463646364636463646364222c226d6573736167655f6964223a2235353535353535352d353535352d343535352d383535352d353535353535353535353535227d5d2c226d6f64657261746f725f737065616b65725f6964223a2232323232323232322d323232322d343232322d383232322d323232323232323232323232222c2270686173655f72656673223a5b7b22696e646578223a302c226b696e64223a2270726f706f73616c222c2270686173655f6964223a2234343434343434342d343434342d343434342d383434342d343434343434343434343434222c227265766973696f6e223a2233222c227374617465223a2272756e6e696e67227d5d2c227265706c6179223a7b226163746976655f636f6e74726f6c5f6964223a6e756c6c2c22617474656d707473223a5b5d2c2262696e64696e6773223a5b5d2c22626f6f745f65706f6368223a2231222c22627564676574223a7b2261646d69747465645f617474656d707473223a302c2272656d61696e696e675f6163746976655f6d73223a2231303030222c227265736572766174696f6e73223a5b5d7d2c22636f6e666967223a6e756c6c2c22636f6e74726f6c5f6f7065726174696f6e73223a5b5d2c22636f766572616765223a6e756c6c2c2263757272656e745f70686173655f6964223a2234343434343434342d343434342d343434342d383434342d343434343434343434343434222c2265766964656e6365223a5b5d2c22696e70757473223a5b5d2c226d6573736167655f6d656d6265727368697073223a5b7b226d656d626572736869705f76657273696f6e223a2231222c226d6573736167655f6964223a2235353535353535352d353535352d343535352d383535352d353535353535353535353535222c227075626c69736865645f736571223a6e756c6c2c227669736962696c697479223a22737461676564227d5d2c22726573756c745f7175616c697479223a6e756c6c2c22736f757263655f6d616e696665737473223a5b7b2268617368223a2265666566656665666566656665666566656665666566656665666566656665666566656665666566656665666566656665666566656665666566656665666566222c226d616e69666573745f6964223a2236363636363636362d363636362d343636362d383636362d363636363636363636363636227d5d2c22737065616b657273223a5b5d2c227475726e73223a5b5d7d2c227265766973696f6e223a2233222c22726f6f6d5f6964223a2233333333333333332d333333332d343333332d383333332d333333333333333333333333222c2272756e5f65706f6368223a2231222c2273616d706c65645f6163746976655f6d73223a2231353030222c2273616d706c65645f61745f757463223a22323032362d31302d30335431323a30303a30305a222c22736368656d615f76657273696f6e223a312c22737461747573223a2272756e6e696e67227d",
+      "name": "projection",
+      "normalized_utf8_hex": "7b22626c6f636b65645f726561736f6e223a6e756c6c2c22636f6e6669675f68617368223a2261626162616261626162616261626162616261626162616261626162616261626162616261626162616261626162616261626162616261626162616261626162222c2265766964656e63655f6d616e696665737473223a5b2236363636363636362d363636362d343636362d383636362d363636363636363636363636225d2c226c6173745f736571223a2234222c226c65646765725f736571223a2234222c226d65737361676573223a5b7b2268617368223a2263646364636463646364636463646364636463646364636463646364636463646364636463646364636463646364636463646364636463646364636463646364222c226d6573736167655f6964223a2235353535353535352d353535352d343535352d383535352d353535353535353535353535227d5d2c226d6f64657261746f725f737065616b65725f6964223a2232323232323232322d323232322d343232322d383232322d323232323232323232323232222c2270686173655f72656673223a5b7b22696e646578223a302c226b696e64223a2270726f706f73616c222c2270686173655f6964223a2234343434343434342d343434342d343434342d383434342d343434343434343434343434222c227265766973696f6e223a2233222c227374617465223a2272756e6e696e67227d5d2c227265706c6179223a7b226163746976655f636f6e74726f6c5f6964223a6e756c6c2c22617474656d707473223a5b5d2c2262696e64696e6773223a5b5d2c22626f6f745f65706f6368223a2231222c22627564676574223a7b2261646d69747465645f617474656d707473223a302c2272656d61696e696e675f6163746976655f6d73223a2231303030222c227265736572766174696f6e73223a5b5d7d2c22636f6e666967223a6e756c6c2c22636f6e74726f6c5f6f7065726174696f6e73223a5b5d2c22636f766572616765223a6e756c6c2c2263757272656e745f70686173655f6964223a2234343434343434342d343434342d343434342d383434342d343434343434343434343434222c2265766964656e6365223a5b5d2c22696e70757473223a5b5d2c226d6573736167655f6d656d6265727368697073223a5b7b226d656d626572736869705f76657273696f6e223a2231222c226d6573736167655f6964223a2235353535353535352d353535352d343535352d383535352d353535353535353535353535222c227075626c69736865645f736571223a6e756c6c2c227669736962696c697479223a22737461676564227d5d2c22726573756c745f7175616c697479223a6e756c6c2c22736f757263655f6d616e696665737473223a5b7b2268617368223a2265666566656665666566656665666566656665666566656665666566656665666566656665666566656665666566656665666566656665666566656665666566222c226d616e69666573745f6964223a2236363636363636362d363636362d343636362d383636362d363636363636363636363636227d5d2c22737065616b657273223a5b5d2c227475726e73223a5b5d7d2c227265766973696f6e223a2233222c22726f6f6d5f6964223a2233333333333333332d333333332d343333332d383333332d333333333333333333333333222c2272756e5f65706f6368223a2231222c2273616d706c65645f6163746976655f6d73223a2231353030222c2273616d706c65645f61745f757463223a22323032362d31302d30335431323a30303a30305a222c22736368656d615f76657273696f6e223a312c22737461747573223a2272756e6e696e67227d",
+      "original_hex": "7b0a202022626c6f636b65645f726561736f6e223a206e756c6c2c0a202022636f6e6669675f68617368223a202261626162616261626162616261626162616261626162616261626162616261626162616261626162616261626162616261626162616261626162616261626162222c0a2020226c6173745f736571223a202234222c0a2020226c65646765725f736571223a202234222c0a2020226d6f64657261746f725f737065616b65725f6964223a202232323232323232322d323232322d343232322d383232322d323232323232323232323232222c0a20202270686173655f72656673223a205b0a202020207b0a20202020202022696e646578223a20302c0a202020202020226b696e64223a202270726f706f73616c222c0a2020202020202270686173655f6964223a202234343434343434342d343434342d343434342d383434342d343434343434343434343434222c0a202020202020227265766973696f6e223a202233222c0a202020202020227374617465223a202272756e6e696e67220a202020207d0a20205d2c0a2020227265766973696f6e223a202233222c0a202022726f6f6d5f6964223a202233333333333333332d333333332d343333332d383333332d333333333333333333333333222c0a20202272756e5f65706f6368223a202231222c0a20202273616d706c65645f6163746976655f6d73223a202231353030222c0a20202273616d706c65645f61745f757463223a2022323032362d31302d30335431323a30303a30305a222c0a202022736368656d615f76657273696f6e223a20312c0a202022737461747573223a202272756e6e696e67222c0a2020226d65737361676573223a205b0a202020207b0a202020202020226d6573736167655f6964223a202235353535353535352d353535352d343535352d383535352d353535353535353535353535222c0a2020202020202268617368223a202263646364636463646364636463646364636463646364636463646364636463646364636463646364636463646364636463646364636463646364636463646364220a202020207d0a20205d2c0a20202265766964656e63655f6d616e696665737473223a205b0a202020202236363636363636362d363636362d343636362d383636362d363636363636363636363636220a20205d2c0a2020227265706c6179223a207b0a2020202022636f6e666967223a206e756c6c2c0a2020202022626f6f745f65706f6368223a202231222c0a202020202263757272656e745f70686173655f6964223a202234343434343434342d343434342d343434342d383434342d343434343434343434343434222c0a20202020226163746976655f636f6e74726f6c5f6964223a206e756c6c2c0a2020202022726573756c745f7175616c697479223a206e756c6c2c0a2020202022737065616b657273223a205b5d2c0a20202020227475726e73223a205b5d2c0a2020202022617474656d707473223a205b5d2c0a202020202262696e64696e6773223a205b5d2c0a2020202022636f6e74726f6c5f6f7065726174696f6e73223a205b5d2c0a2020202022696e70757473223a205b5d2c0a2020202022627564676574223a207b0a2020202020202272656d61696e696e675f6163746976655f6d73223a202231303030222c0a2020202020202261646d69747465645f617474656d707473223a20302c0a202020202020227265736572766174696f6e73223a205b5d0a202020207d2c0a2020202022636f766572616765223a206e756c6c2c0a20202020226d6573736167655f6d656d6265727368697073223a205b0a2020202020207b0a2020202020202020226d6573736167655f6964223a202235353535353535352d353535352d343535352d383535352d353535353535353535353535222c0a2020202020202020226d656d626572736869705f76657273696f6e223a202231222c0a2020202020202020227669736962696c697479223a2022737461676564222c0a2020202020202020227075626c69736865645f736571223a206e756c6c0a2020202020207d0a202020205d2c0a202020202265766964656e6365223a205b5d2c0a2020202022736f757263655f6d616e696665737473223a205b0a2020202020207b0a2020202020202020226d616e69666573745f6964223a202236363636363636362d363636362d343636362d383636362d363636363636363636363636222c0a20202020202020202268617368223a202265666566656665666566656665666566656665666566656665666566656665666566656665666566656665666566656665666566656665666566656665666566220a2020202020207d0a202020205d0a20207d0a7d",
+      "sha256": "50b80489b7adf4093b075e2559e9ef2384b26b956979136a092634873b0d39ef"
+    }
+  ],
+  "contract_profile": "roundtable_plan_1_2",
+  "json_schema": {
+    "description": "Nullable properties are required and allow null. Optional properties are omitted when absent and do not allow null.",
+    "type": "object",
+    "additionalProperties": false,
+    "required": [
+      "schema_version",
+      "room_id",
+      "revision",
+      "run_epoch",
+      "last_seq",
+      "status",
+      "blocked_reason",
+      "config_hash",
+      "moderator_speaker_id",
+      "phase_refs",
+      "ledger_seq",
+      "sampled_active_ms",
+      "sampled_at_utc",
+      "messages",
+      "evidence_manifests",
+      "replay"
+    ],
+    "properties": {
+      "schema_version": {
+        "type": "integer",
+        "minimum": 0
+      },
+      "room_id": {
+        "type": "string",
+        "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+      },
+      "revision": {
+        "type": "string",
+        "pattern": "^(0|[1-9][0-9]*)$"
+      },
+      "run_epoch": {
+        "type": "string",
+        "pattern": "^(0|[1-9][0-9]*)$"
+      },
+      "last_seq": {
+        "type": "string",
+        "pattern": "^(0|[1-9][0-9]*)$"
+      },
+      "status": {
+        "type": "string",
+        "enum": [
+          "draft",
+          "ready",
+          "running",
+          "pausing",
+          "paused",
+          "recovering",
+          "stopping",
+          "stopped",
+          "failed",
+          "completed"
+        ]
+      },
+      "blocked_reason": {
+        "type": [
+          "string",
+          "null"
+        ],
+        "enum": [
+          "synthesis_failed",
+          "recovery_required",
+          null
+        ]
+      },
+      "config_hash": {
+        "type": "string",
+        "pattern": "^[0-9a-f]{64}$"
+      },
+      "moderator_speaker_id": {
+        "type": [
+          "string",
+          "null"
+        ],
+        "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+      },
+      "phase_refs": {
+        "type": "array",
+        "items": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "phase_id",
+            "index",
+            "revision",
+            "kind",
+            "state"
+          ],
+          "properties": {
+            "phase_id": {
+              "type": "string",
+              "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+            },
+            "index": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "revision": {
+              "type": "string",
+              "pattern": "^(0|[1-9][0-9]*)$"
+            },
+            "kind": {
+              "type": "string",
+              "enum": [
+                "proposal",
+                "critique",
+                "synthesis"
+              ]
+            },
+            "state": {
+              "type": "string",
+              "enum": [
+                "ready",
+                "running",
+                "closing",
+                "published",
+                "failed",
+                "superseded"
+              ]
+            }
+          }
+        }
+      },
+      "ledger_seq": {
+        "type": "string",
+        "pattern": "^(0|[1-9][0-9]*)$"
+      },
+      "sampled_active_ms": {
+        "type": "string",
+        "pattern": "^(0|[1-9][0-9]*)$"
+      },
+      "sampled_at_utc": {
+        "type": "string"
+      },
+      "messages": {
+        "type": "array",
+        "items": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "message_id",
+            "hash"
+          ],
+          "properties": {
+            "message_id": {
+              "type": "string",
+              "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+            },
+            "hash": {
+              "type": "string",
+              "pattern": "^[0-9a-f]{64}$"
+            }
+          }
+        }
+      },
+      "evidence_manifests": {
+        "type": "array",
+        "items": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+        }
+      },
+      "replay": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "config",
+          "boot_epoch",
+          "current_phase_id",
+          "active_control_id",
+          "result_quality",
+          "speakers",
+          "turns",
+          "attempts",
+          "bindings",
+          "control_operations",
+          "inputs",
+          "budget",
+          "coverage",
+          "message_memberships",
+          "evidence",
+          "source_manifests"
+        ],
+        "properties": {
+          "config": {
+            "type": [
+              "object",
+              "null"
+            ]
+          },
+          "boot_epoch": {
+            "type": "string",
+            "pattern": "^(0|[1-9][0-9]*)$"
+          },
+          "current_phase_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+          },
+          "active_control_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+          },
+          "result_quality": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "speakers": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "speaker_id",
+                "ordinal",
+                "role",
+                "provider_ref",
+                "model_id"
+              ],
+              "properties": {
+                "speaker_id": {
+                  "type": "string",
+                  "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+                },
+                "ordinal": {
+                  "type": "integer",
+                  "minimum": 0,
+                  "maximum": 9007199254740991
+                },
+                "role": {
+                  "type": "string"
+                },
+                "provider_ref": {
+                  "type": "string"
+                },
+                "model_id": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "turns": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "turn_id",
+                "phase_id",
+                "speaker_id",
+                "status",
+                "accepted_attempt_id",
+                "admitted_attempt_count"
+              ],
+              "properties": {
+                "turn_id": {
+                  "type": "string",
+                  "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+                },
+                "phase_id": {
+                  "type": "string",
+                  "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+                },
+                "speaker_id": {
+                  "type": "string",
+                  "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+                },
+                "status": {
+                  "type": "string"
+                },
+                "accepted_attempt_id": {
+                  "type": [
+                    "string",
+                    "null"
+                  ],
+                  "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+                },
+                "admitted_attempt_count": {
+                  "type": "integer",
+                  "minimum": 0,
+                  "maximum": 9007199254740991
+                }
+              }
+            }
+          },
+          "attempts": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "attempt_id",
+                "turn_id",
+                "attempt_no",
+                "binding_id",
+                "state",
+                "dispatch_state",
+                "cleanup_state",
+                "residual_remote_work"
+              ],
+              "properties": {
+                "attempt_id": {
+                  "type": "string",
+                  "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+                },
+                "turn_id": {
+                  "type": "string",
+                  "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+                },
+                "attempt_no": {
+                  "type": "integer",
+                  "minimum": 0,
+                  "maximum": 9007199254740991
+                },
+                "binding_id": {
+                  "type": "string",
+                  "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+                },
+                "state": {
+                  "type": "string"
+                },
+                "dispatch_state": {
+                  "type": "string"
+                },
+                "cleanup_state": {
+                  "type": "string"
+                },
+                "residual_remote_work": {
+                  "type": "boolean"
+                }
+              }
+            }
+          },
+          "bindings": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "binding_id",
+                "speaker_id",
+                "generation",
+                "state",
+                "context_state",
+                "retire_reason"
+              ],
+              "properties": {
+                "binding_id": {
+                  "type": "string",
+                  "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+                },
+                "speaker_id": {
+                  "type": "string",
+                  "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+                },
+                "generation": {
+                  "type": "string",
+                  "pattern": "^(0|[1-9][0-9]*)$"
+                },
+                "state": {
+                  "type": "string"
+                },
+                "context_state": {
+                  "type": "string"
+                },
+                "retire_reason": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                }
+              }
+            }
+          },
+          "control_operations": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "operation_id",
+                "kind",
+                "step",
+                "target_phase_id",
+                "target_revision",
+                "requested_epoch",
+                "status",
+                "blocked_reason",
+                "successor_phase_id",
+                "superseded_by"
+              ],
+              "properties": {
+                "operation_id": {
+                  "type": "string",
+                  "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+                },
+                "kind": {
+                  "type": "string"
+                },
+                "step": {
+                  "type": "string"
+                },
+                "target_phase_id": {
+                  "type": [
+                    "string",
+                    "null"
+                  ],
+                  "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+                },
+                "target_revision": {
+                  "type": [
+                    "string",
+                    "null"
+                  ],
+                  "pattern": "^(0|[1-9][0-9]*)$"
+                },
+                "requested_epoch": {
+                  "type": "string",
+                  "pattern": "^(0|[1-9][0-9]*)$"
+                },
+                "status": {
+                  "type": "string"
+                },
+                "blocked_reason": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "successor_phase_id": {
+                  "type": [
+                    "string",
+                    "null"
+                  ],
+                  "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+                },
+                "superseded_by": {
+                  "type": [
+                    "string",
+                    "null"
+                  ],
+                  "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+                }
+              }
+            }
+          },
+          "inputs": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "input_id",
+                "text",
+                "mode",
+                "accepted_seq",
+                "target_phase_index",
+                "applied_phase_id",
+                "applied_seq",
+                "state"
+              ],
+              "properties": {
+                "input_id": {
+                  "type": "string"
+                },
+                "text": {
+                  "type": "string"
+                },
+                "mode": {
+                  "type": "string"
+                },
+                "accepted_seq": {
+                  "type": "string",
+                  "pattern": "^(0|[1-9][0-9]*)$"
+                },
+                "target_phase_index": {
+                  "type": "integer",
+                  "minimum": 0,
+                  "maximum": 9007199254740991
+                },
+                "applied_phase_id": {
+                  "type": [
+                    "string",
+                    "null"
+                  ],
+                  "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+                },
+                "applied_seq": {
+                  "type": [
+                    "string",
+                    "null"
+                  ],
+                  "pattern": "^(0|[1-9][0-9]*)$"
+                },
+                "state": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "budget": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "remaining_active_ms",
+              "admitted_attempts",
+              "reservations"
+            ],
+            "properties": {
+              "remaining_active_ms": {
+                "type": "string",
+                "pattern": "^(0|[1-9][0-9]*)$"
+              },
+              "admitted_attempts": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 9007199254740991
+              },
+              "reservations": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": [
+                    "reservation_id",
+                    "purpose",
+                    "amount_ms",
+                    "amount_bytes",
+                    "state"
+                  ],
+                  "properties": {
+                    "reservation_id": {
+                      "type": "string"
+                    },
+                    "purpose": {
+                      "type": "string"
+                    },
+                    "amount_ms": {
+                      "type": "string",
+                      "pattern": "^(0|[1-9][0-9]*)$"
+                    },
+                    "amount_bytes": {
+                      "type": "integer",
+                      "minimum": 0,
+                      "maximum": 9007199254740991
+                    },
+                    "state": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "coverage": {
+            "type": [
+              "object",
+              "null"
+            ]
+          },
+          "message_memberships": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "message_id",
+                "membership_version",
+                "visibility",
+                "published_seq"
+              ],
+              "properties": {
+                "message_id": {
+                  "type": "string",
+                  "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+                },
+                "membership_version": {
+                  "type": "string",
+                  "pattern": "^(0|[1-9][0-9]*)$"
+                },
+                "visibility": {
+                  "type": "string",
+                  "enum": [
+                    "staged",
+                    "published",
+                    "void"
+                  ]
+                },
+                "published_seq": {
+                  "type": [
+                    "string",
+                    "null"
+                  ],
+                  "pattern": "^(0|[1-9][0-9]*)$"
+                }
+              }
+            }
+          },
+          "evidence": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "evidence_id",
+                "manifest_id",
+                "owner_speaker_id",
+                "content_hash",
+                "published_seq"
+              ],
+              "properties": {
+                "evidence_id": {
+                  "type": "string",
+                  "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+                },
+                "manifest_id": {
+                  "type": "string",
+                  "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+                },
+                "owner_speaker_id": {
+                  "type": "string",
+                  "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+                },
+                "content_hash": {
+                  "type": "string",
+                  "pattern": "^[0-9a-f]{64}$"
+                },
+                "published_seq": {
+                  "type": [
+                    "string",
+                    "null"
+                  ],
+                  "pattern": "^(0|[1-9][0-9]*)$"
+                }
+              }
+            }
+          },
+          "source_manifests": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "manifest_id",
+                "hash"
+              ],
+              "properties": {
+                "manifest_id": {
+                  "type": "string",
+                  "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+                },
+                "hash": {
+                  "type": "string",
+                  "pattern": "^[0-9a-f]{64}$"
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "schema_version": 1
+}

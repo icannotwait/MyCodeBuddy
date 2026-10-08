@@ -55,6 +55,7 @@ function claudeAgent(overrides: Partial<AcpAgentInfo> = {}): AcpAgentInfo {
     is_acp_adapter: true,
     custom_source: null,
     enabled: true,
+    show_thinking: false,
     sort_order: 0,
     installed_version: null,
     host_tools_agent_mode: false,

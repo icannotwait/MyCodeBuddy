@@ -61,6 +61,7 @@ pub mod reference_search;
 pub mod remote_proxy;
 #[cfg(feature = "tauri-runtime")]
 pub mod remote_workspace;
+pub mod roundtable;
 pub mod science;
 pub mod session_info;
 pub mod simple_workflow;

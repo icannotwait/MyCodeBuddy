@@ -83,9 +83,64 @@ use crate::models::system::AppLocale;
 use crate::network::proxy;
 use crate::parsers::COMPACTION_SUMMARY_META_KEY;
 use crate::terminal::shell::ResolvedShellSpec;
-use crate::web::event_bridge::{
-    emit_with_state, emit_with_state_built, emit_with_state_gated, EventEmitter,
-};
+use crate::web::event_bridge::EventEmitter;
+
+/// Branch before the public emit. A roundtable raw event is pushed to the
+/// private ingress and never enters `emit_with_state`.
+async fn emit_with_state(
+    state: &Arc<RwLock<SessionState>>,
+    emitter: &EventEmitter,
+    payload: AcpEvent,
+) {
+    if let Some(payload) = crate::roundtable::ingress::divert_if_roundtable(state, payload).await {
+        crate::web::event_bridge::emit_with_state(state, emitter, payload).await;
+    }
+}
+
+async fn emit_with_state_gated<F>(
+    state: &Arc<RwLock<SessionState>>,
+    emitter: &EventEmitter,
+    payload: AcpEvent,
+    gate: F,
+) -> bool
+where
+    F: FnOnce(&SessionState) -> bool,
+{
+    if crate::roundtable::ingress::is_roundtable_session(state).await {
+        let allowed = {
+            let guard = state.read().await;
+            gate(&guard)
+        };
+        if !allowed {
+            return false;
+        }
+        crate::roundtable::ingress::deliver_from_state(state, payload).await;
+        return true;
+    }
+    crate::web::event_bridge::emit_with_state_gated(state, emitter, payload, gate).await
+}
+
+async fn emit_with_state_built<F>(
+    state: &Arc<RwLock<SessionState>>,
+    emitter: &EventEmitter,
+    build: F,
+) -> bool
+where
+    F: FnOnce(&mut SessionState) -> Option<AcpEvent>,
+{
+    if crate::roundtable::ingress::is_roundtable_session(state).await {
+        let event = {
+            let mut guard = state.write().await;
+            build(&mut guard)
+        };
+        let Some(event) = event else {
+            return false;
+        };
+        crate::roundtable::ingress::deliver_from_state(state, event).await;
+        return true;
+    }
+    crate::web::event_bridge::emit_with_state_built(state, emitter, build).await
+}
 
 /// Injected into the agent process only when the user has opted in — see
 /// [`force_command_color_enabled`] for why it is not a default.
@@ -1367,9 +1422,67 @@ impl<T> Drop for LaneSender<T> {
     }
 }
 
+/// A reserved command slot that owns a [`LaneSender`] until the command is
+/// sent or the reservation is dropped.
+///
+/// Tokio's [`mpsc::OwnedPermit`] keeps an `mpsc::Sender` alive, but that
+/// sender is not a [`LaneSender`]. Parking an owned permit after every
+/// `LaneSender` was dropped would publish the lane closed while a send was
+/// still possible, and the connection task would exit before `permit.send`.
+/// `permit` is declared first, so it drops before `sender`: sender liveness
+/// stays above zero for the whole reservation.
+pub struct LaneOwnedPermit<T> {
+    permit: mpsc::OwnedPermit<T>,
+    sender: LaneSender<T>,
+}
+
+impl<T> LaneOwnedPermit<T> {
+    /// Send without awaiting. The slot was reserved earlier, so a full queue
+    /// cannot fail this call. A disconnected receiver discards the value.
+    pub fn send(self, value: T) {
+        let LaneOwnedPermit { permit, sender } = self;
+        drop(permit.send(value));
+        drop(sender);
+    }
+}
+
 impl<T> LaneSender<T> {
     pub async fn send(&self, value: T) -> Result<(), mpsc::error::SendError<T>> {
         self.tx.send(value).await
+    }
+
+    /// Reserve one slot and keep this lane alive until the permit is used.
+    ///
+    /// The [`LaneSender`] clone is taken before the channel reserve. A failed
+    /// reserve drops that clone, so a rejected reservation does not leak
+    /// liveness or capacity.
+    pub async fn reserve_owned(&self) -> Result<LaneOwnedPermit<T>, mpsc::error::SendError<()>> {
+        let sender = self.clone();
+        match sender.tx.clone().reserve_owned().await {
+            Ok(permit) => Ok(LaneOwnedPermit { permit, sender }),
+            Err(error) => {
+                drop(sender);
+                Err(error)
+            }
+        }
+    }
+
+    /// Non-blocking form of [`Self::reserve_owned`].
+    ///
+    /// Tokio returns the `mpsc::Sender` inside the error so the caller can
+    /// tell a full queue from a closed one. The [`LaneSender`] clone is still
+    /// dropped here; that returned sender is not a lane owner.
+    pub fn try_reserve_owned(
+        &self,
+    ) -> Result<LaneOwnedPermit<T>, mpsc::error::TrySendError<mpsc::Sender<T>>> {
+        let sender = self.clone();
+        match sender.tx.clone().try_reserve_owned() {
+            Ok(permit) => Ok(LaneOwnedPermit { permit, sender }),
+            Err(error) => {
+                drop(sender);
+                Err(error)
+            }
+        }
     }
 
     pub fn try_send(&self, value: T) -> Result<(), mpsc::error::TrySendError<T>> {
@@ -1399,6 +1512,15 @@ pub(crate) fn connection_channel<T>(
         closed_tx,
     });
     (LaneSender { tx, liveness }, rx, closed_rx)
+}
+
+/// Test-only view of [`connection_channel`]. Production admission uses the
+/// `pub(crate)` constructor directly.
+#[cfg(any(test, feature = "test-utils"))]
+pub fn connection_channel_for_test<T>(
+    capacity: usize,
+) -> (LaneSender<T>, mpsc::Receiver<T>, watch::Receiver<bool>) {
+    connection_channel(capacity)
 }
 
 fn both_connection_lanes_closed(
@@ -5915,6 +6037,29 @@ fn build_initialize_request(
         .meta(meta))
 }
 
+/// Service initialize starts empty. It does not take ordinary client
+/// capabilities and then delete filesystem, terminal, or elicitation.
+fn service_client_capabilities() -> ClientCapabilities {
+    let mut meta = serde_json::Map::new();
+    meta.insert(
+        "jetbrains".to_string(),
+        serde_json::json!({
+            "air": { "version": 1, "capabilities": ["sessionFailure"] }
+        }),
+    );
+    ClientCapabilities::new().meta(meta)
+}
+
+fn build_service_initialize_request() -> InitializeRequest {
+    InitializeRequest::new(ProtocolVersion::V1)
+        .client_capabilities(service_client_capabilities())
+        .meta(Meta::default())
+}
+
+pub(crate) fn service_client_capabilities_value() -> serde_json::Value {
+    serde_json::to_value(service_client_capabilities()).unwrap_or(serde_json::Value::Null)
+}
+
 /// The client capabilities codeg advertises on Initialize, with per-agent
 /// gates. Extracted for testability — each gate is a documented product
 /// decision:
@@ -7919,6 +8064,7 @@ async fn run_connection(
     host_tools: HostToolsPolicy,
     stderr_tail: Arc<StderrTail>,
 ) -> Result<(), AcpError> {
+    let host_tools = host_tools.for_purpose(state.read().await.purpose);
     let parent_connection_exit_evidence = delegation_injection
         .as_ref()
         .map(|injection| Arc::clone(&injection.parent_connection_exit_causes));
@@ -8415,13 +8561,20 @@ async fn run_connection(
 
             // Advertise filesystem, terminal and Codex elicitation capabilities
             // while preserving the connection's terminal snapshot metadata.
-            let init_request = build_initialize_request(
-                agent_type,
-                &terminal_shell.spec,
-                adapter_for(agent_type),
-                host_tools,
-            )
-            .map_err(|e| agent_client_protocol::util::internal_error(e.to_string()))?;
+            // Roundtable service sessions do not inherit that advertisement.
+            let service_session =
+                crate::roundtable::ingress::is_roundtable_purpose(state.read().await.purpose);
+            let init_request = if service_session {
+                build_service_initialize_request()
+            } else {
+                build_initialize_request(
+                    agent_type,
+                    &terminal_shell.spec,
+                    adapter_for(agent_type),
+                    host_tools,
+                )
+                .map_err(|e| agent_client_protocol::util::internal_error(e.to_string()))?
+            };
             // Bound the Initialize handshake so an outdated / incompatible
             // cached binary that never responds can't leave the frontend
             // stuck on "Connecting...". A healthy agent answers in <1s; we
@@ -8571,7 +8724,9 @@ async fn run_connection(
             // Load MCP servers configured for this agent and filter by the
             // capabilities the agent just declared. Stdio is mandatory per
             // ACP spec; HTTP/SSE are gated on `mcp_capabilities.{http,sse}`.
-            let mut mcp_servers: Vec<McpServer> = if agent_supports_mcp {
+            let mut mcp_servers: Vec<McpServer> = if service_session {
+                Vec::new()
+            } else if agent_supports_mcp {
                 let mcp_caps = &init_resp.agent_capabilities.mcp_capabilities;
                 load_mcp_servers_for_agent(agent_type)
                     .into_iter()
@@ -8623,7 +8778,9 @@ async fn run_connection(
             // exempts when the ready lease is missing. User MCP via
             // ~/.gemini/config/mcp_config.json is separate; a file-based
             // Antigravity companion write was considered and deferred.
-            let mut delegate_injection = if skips_wire_companion(agent_type) {
+            let mut delegate_injection = if service_session {
+                None
+            } else if skips_wire_companion(agent_type) {
                 if agent_type == AgentType::Antigravity {
                     tracing::info!(
                         "[ACP] skipping codeg-mcp inject for Antigravity (agy does not spawn wire mcpServers; companion unsupported)"
@@ -10792,7 +10949,10 @@ async fn handle_permission_request(
     // still emit so the private-stream runner observes Interactive failure.
     let (is_hidden_generation, request_turn_generation) = {
         let s = state.read().await;
-        (s.purpose.is_hidden_generation(), s.active_turn_generation)
+        (
+            crate::acp::host_tools_policy::denies_interactive_permission(s.purpose),
+            s.active_turn_generation,
+        )
     };
     if is_hidden_generation {
         let request_id = uuid::Uuid::new_v4().to_string();
@@ -13999,6 +14159,16 @@ async fn finalize_bound_prompt_response(
         .await;
     }
     let raw_reason_str = stop_reason_to_str(reason);
+    if crate::roundtable::ingress::is_roundtable_session(state).await {
+        let connection_id = state.read().await.connection_id.clone();
+        let turn = state.read().await.active_turn_generation;
+        crate::roundtable::capabilities::record_service_response(
+            &connection_id,
+            turn,
+            response.meta.as_ref(),
+            raw_reason_str,
+        );
+    }
     // A severity-error sessionFailure already explains a blank end_turn.
     // Do not rewrite that into "empty".
     let (reason_str, empty_report) = if terminal_failure
@@ -19142,6 +19312,44 @@ fn response_session_failure(
     record
 }
 
+/// Roundtable classification reuses the typed AIR parser. An unreadable
+/// versioned record fails closed; it is not treated as success.
+pub(crate) fn classify_service_failure(
+    meta: Option<&serde_json::Map<String, serde_json::Value>>,
+    source: crate::roundtable::capabilities::FailureSource,
+    stop_reason: Option<&str>,
+    http_status: Option<u16>,
+) -> crate::roundtable::capabilities::FailureClassification {
+    let mut records = Vec::new();
+    let mut incompatible = false;
+    if let Some(raw) = air_session_failure(meta) {
+        match parse_session_failure_record(raw) {
+            Some(record) => records.push(crate::roundtable::capabilities::ParsedFailure {
+                id: record.id,
+                revision: record.revision,
+                severity: record.severity,
+                source,
+            }),
+            None => incompatible = true,
+        }
+    } else if meta
+        .and_then(|value| value.get("jetbrains"))
+        .and_then(|value| value.get("air"))
+        .and_then(|value| value.get("sessionFailure"))
+        .is_some()
+    {
+        // A declared record outside air_session_failure's envelope/version
+        // domain is incompatible, never an absent successful observation.
+        incompatible = true;
+    }
+    crate::roundtable::capabilities::FailureClassification {
+        records,
+        incompatible,
+        http_status,
+        stop_reason: stop_reason.map(str::to_string),
+    }
+}
+
 /// Strict SemVer floor check: true when `version >= min` by SemVer
 /// PRECEDENCE. Prerelease ordering matters here — `0.64.0-rc1` precedes
 /// `0.64.0` and may predate the very commit that shipped the
@@ -23286,6 +23494,15 @@ async fn emit_conversation_update(
                         "[ACP] dropped AIR sessionFailure without usable id/revision: {raw:?}"
                     ),
                 }
+            }
+            if crate::roundtable::ingress::is_roundtable_session(state).await {
+                let connection_id = state.read().await.connection_id.clone();
+                let turn = state.read().await.active_turn_generation;
+                crate::roundtable::capabilities::record_service_update(
+                    &connection_id,
+                    turn,
+                    info.meta.as_ref(),
+                );
             }
             // codex-acp #289 (v1.1.3+): a retryable turn error rides under
             // `_meta.codex.error` (only when `willRetry == true`) and the turn

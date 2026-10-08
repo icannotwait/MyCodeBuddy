@@ -20,7 +20,7 @@ import {
 import type { LinkSafetyConfig, LinkSafetyModalProps } from "streamdown"
 import { toast } from "sonner"
 import { useActiveFolder } from "@/contexts/active-folder-context"
-import { useWorkspaceActions } from "@/contexts/workspace-context"
+import { useOptionalWorkspaceActions } from "@/contexts/workspace-context"
 import { useGrokSessionImageScope } from "@/components/ai-elements/grok-session-image-context"
 import { useOpenFileTarget } from "@/hooks/use-open-file-target"
 import { isHomeRelativePath } from "@/lib/file-open-target"
@@ -213,7 +213,8 @@ export function useOpenLinkOrFile() {
   const folderPath = folder?.path
   const grokScope = useGrokSessionImageScope()
   const grokConversationId = grokScope?.conversationId ?? null
-  const { openResolvedImagePreview } = useWorkspaceActions()
+  const openResolvedImagePreview =
+    useOptionalWorkspaceActions()?.openResolvedImagePreview
   const resolveImage = resolveGrokSessionImage
   const grokInflightRef = useRef(new Map<string, Promise<void>>())
   const mountedRef = useRef(true)
@@ -243,7 +244,7 @@ export function useOpenLinkOrFile() {
     async (url: string) => {
       const grokRef =
         grokConversationId !== null ? parseGrokSessionImageRef(url) : null
-      if (grokConversationId !== null && grokRef) {
+      if (grokConversationId !== null && grokRef && openResolvedImagePreview) {
         const conversationId = grokConversationId
         const scopeEpoch = scopeEpochRef.current
         const inflightKey = `${scopeEpoch}\0${conversationId}\0${grokRef.path}`

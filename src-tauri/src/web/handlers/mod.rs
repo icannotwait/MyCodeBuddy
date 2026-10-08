@@ -39,6 +39,7 @@ pub mod project_boot;
 pub mod question;
 pub mod quick_messages;
 pub mod reference_search;
+pub mod roundtable;
 pub mod science;
 pub mod session_info;
 pub mod simple_workflow;

@@ -31,10 +31,6 @@ import {
   emitAttachSessionToSession,
 } from "@/lib/session-attachment-events"
 import { streamingPerfRecorder } from "@/lib/perf/streaming-perf-recorder"
-import {
-  loadMessageInputDraftV2,
-  saveMessageInputDraftV2,
-} from "@/lib/message-input-draft"
 import type { DbConversationSummary } from "@/lib/types"
 
 // MessageInput holds its RichComposer handle internally and does not forward a

@@ -73,6 +73,7 @@ function tab(id = "abc"): BrowserWorkspaceTab {
     language: "browser",
     content: "",
     loading: true,
+    hasLoadedSuccessfully: false,
     readonly: true,
     browser: {
       initialUrl: "https://example.com/",

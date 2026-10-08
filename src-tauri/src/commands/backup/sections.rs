@@ -62,6 +62,12 @@ pub const LEGACY_SECTION_IDS: &[&str] = &["uploads", "tokens.json", "preferences
 
 pub const MANAGED_SECTIONS: &[ManagedSection] = &[
     ManagedSection {
+        id: "roundtable-objects",
+        kind: SectionKind::Dir,
+        policy: SectionPolicy::AlwaysReplace,
+        live_path: |data_dir| data_dir.join("roundtable/objects"),
+    },
+    ManagedSection {
         id: "uploads",
         kind: SectionKind::Dir,
         policy: SectionPolicy::AlwaysReplace,
@@ -216,6 +222,10 @@ impl LiveRoots {
                 .collect(),
         }
     }
+}
+
+pub fn roundtable_section_pinned() -> &'static str {
+    super::manifest::ROUNDTABLE_BACKUP_SECTION
 }
 
 #[cfg(test)]

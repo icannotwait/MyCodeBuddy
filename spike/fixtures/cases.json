@@ -1,0 +1,53 @@
+{
+  "description": "Disposable P00 case catalog. Templates only. No secrets, credentials, image digests, or live commands.",
+  "cases": [
+    {
+      "id": "rootless_crun_create_list_reap",
+      "chain": "rootless_process",
+      "kind": "linux_sandbox",
+      "critical": true,
+      "expected_rejection": false,
+      "planned_command": "crun --root <isolated> create|list|delete <synthetic-bait>"
+    },
+    {
+      "id": "namespace_cgroup_isolation",
+      "chain": "rootless_process",
+      "kind": "linux_sandbox",
+      "critical": true,
+      "expected_rejection": true,
+      "planned_command": "crun spec user,mount,pid,network namespaces plus cgroup limits; host escape must be rejected"
+    },
+    {
+      "id": "codex_custom_base_url",
+      "chain": "model_gateway",
+      "kind": "linux_sandbox",
+      "critical": true,
+      "expected_rejection": false,
+      "planned_command": "in-image codex absolute path with custom base_url via loopback relay; host credentials not mounted"
+    },
+    {
+      "id": "endpoint_compatibility",
+      "chain": "model_gateway",
+      "kind": "model_request",
+      "critical": false,
+      "expected_rejection": false,
+      "planned_command": "approved real model request against the gateway endpoint"
+    },
+    {
+      "id": "codeg_mcp_mounted_socket",
+      "chain": "companion_injection",
+      "kind": "linux_sandbox",
+      "critical": true,
+      "expected_rejection": false,
+      "planned_command": "candidate CLI launches absolute codeg-mcp; readiness through a mounted unix socket"
+    },
+    {
+      "id": "shell_fs_escape",
+      "chain": "native_tool_boundary",
+      "kind": "linux_sandbox",
+      "critical": true,
+      "expected_rejection": true,
+      "planned_command": "sandbox shell may start; out-of-root read/write, egress, and tool bypass must be rejected"
+    }
+  ]
+}

@@ -3032,6 +3032,7 @@ describe("adaptMessageTurn — TurnOutcome presentation path", () => {
   const msgText = {
     attachedResources: "Attached resources",
     toolCallFailed: "Tool failed",
+    pageHandoffName,
   }
 
   const interruptedOutcome = {
@@ -3141,6 +3142,7 @@ describe("adaptMessageTurn reasoning effort metadata", () => {
   const msgText = {
     attachedResources: "Attached resources",
     toolCallFailed: "Tool failed",
+    pageHandoffName,
   }
 
   it("copies reasoning effort onto the adapted message", () => {

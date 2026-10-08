@@ -1,0 +1,98 @@
+{
+  "cases": [
+    {
+      "canonical_utf8_hex": "7b22636f6465223a22696e76616c69645f617267756d656e74222c2263757272656e745f7265766973696f6e223a6e756c6c2c2264657461696c73223a7b226669656c645f6572726f7273223a5b7b2270617468223a22242e6e222c22726561736f6e223a226475706c69636174655f6b6579227d5d2c22726561736f6e223a226475706c69636174655f6b6579227d2c226d657373616765223a22546865207265717565737420697320696e76616c69642e222c22726574727961626c65223a66616c73657d",
+      "name": "duplicate_key",
+      "normalized_utf8_hex": "7b22636f6465223a22696e76616c69645f617267756d656e74222c2263757272656e745f7265766973696f6e223a6e756c6c2c2264657461696c73223a7b226669656c645f6572726f7273223a5b7b2270617468223a22242e6e222c22726561736f6e223a226475706c69636174655f6b6579227d5d2c22726561736f6e223a226475706c69636174655f6b6579227d2c226d657373616765223a22546865207265717565737420697320696e76616c69642e222c22726574727961626c65223a66616c73657d",
+      "original_hex": "7b0a202022636f6465223a2022696e76616c69645f617267756d656e74222c0a20202263757272656e745f7265766973696f6e223a206e756c6c2c0a20202264657461696c73223a207b0a20202020226669656c645f6572726f7273223a205b0a2020202020207b0a20202020202020202270617468223a2022242e6e222c0a202020202020202022726561736f6e223a20226475706c69636174655f6b6579220a2020202020207d0a202020205d2c0a2020202022726561736f6e223a20226475706c69636174655f6b6579220a20207d2c0a2020226d657373616765223a2022546865207265717565737420697320696e76616c69642e222c0a202022726574727961626c65223a2066616c73650a7d",
+      "sha256": "6f0067cf213b16ca83e3bb33690b4858b2fa52cee4a182f66cd799a40148cefe"
+    }
+  ],
+  "contract_profile": "roundtable_plan_1_2",
+  "json_schema": {
+    "description": "Nullable properties are required and allow null. Optional properties are omitted when absent and do not allow null.",
+    "type": "object",
+    "additionalProperties": false,
+    "required": [
+      "code",
+      "message",
+      "retryable",
+      "current_revision",
+      "details"
+    ],
+    "properties": {
+      "code": {
+        "type": "string",
+        "enum": [
+          "invalid_argument",
+          "unauthenticated",
+          "forbidden",
+          "revision_conflict",
+          "idempotency_conflict",
+          "command_in_progress",
+          "control_in_progress",
+          "invalid_state",
+          "policy_unenforceable",
+          "capability_unqualified",
+          "context_too_large",
+          "capacity_unknown",
+          "insufficient_budget",
+          "cannot_reach_quorum",
+          "no_next_phase",
+          "capacity_limited",
+          "storage_unavailable",
+          "runtime_unavailable"
+        ]
+      },
+      "message": {
+        "type": "string"
+      },
+      "retryable": {
+        "type": "boolean"
+      },
+      "current_revision": {
+        "type": [
+          "string",
+          "null"
+        ],
+        "pattern": "^(0|[1-9][0-9]*)$"
+      },
+      "details": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "reason",
+          "field_errors"
+        ],
+        "properties": {
+          "reason": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "field_errors": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "path",
+                "reason"
+              ],
+              "properties": {
+                "path": {
+                  "type": "string"
+                },
+                "reason": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "schema_version": 1
+}

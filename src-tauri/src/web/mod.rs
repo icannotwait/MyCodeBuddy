@@ -986,6 +986,10 @@ pub(crate) async fn do_start_web_server_tauri(
             .state::<crate::update::AppUpdateStateHandle>()
             .inner()
             .clone(),
+        roundtable: app
+            .try_state::<Arc<crate::roundtable::RoundtableSlot>>()
+            .map(|slot| slot.inner().clone())
+            .unwrap_or_else(|| Arc::new(crate::roundtable::RoundtableSlot::new())),
     });
 
     // See do_start_web_server_with_state for rationale on the reset.
