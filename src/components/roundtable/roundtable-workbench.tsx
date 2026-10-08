@@ -44,6 +44,7 @@ import {
   ROUNDTABLE_MIN_MEMBERS,
   RoundtableComposer,
   RoundtableStep,
+  roundtableAgentLabel,
   type ComposerMember,
 } from "./roundtable-composer"
 import { RoundtableSafeContent } from "./roundtable-safe-content"
@@ -561,6 +562,17 @@ export function RoundtableWorkbench({
     !editingDraft
   const projection = loaded?.projection
   const status = projection?.body.status
+  // Keep the room list's status in step with the verified room snapshot.
+  useEffect(() => {
+    if (!roomId || !status) return
+    setRooms((current) =>
+      current.some((room) => room.room_id === roomId && room.status !== status)
+        ? current.map((room) =>
+            room.room_id === roomId ? { ...room, status } : room
+          )
+        : current
+    )
+  }, [roomId, status])
   const buttonClass =
     "h-auto min-h-9 max-w-full justify-start whitespace-normal py-2 text-start"
   const editDraft = () => {
@@ -632,6 +644,22 @@ export function RoundtableWorkbench({
       moderator === index ? 0 : moderator > index ? moderator - 1 : moderator
     )
     invalidate()
+  }
+  // Drafts created without a pinned model store "default" until the run
+  // resolves the seat's binding; show the checked model or the agent instead.
+  const speakerModelLabel = (
+    modelId: string,
+    seatOrdinal: number | null,
+    agent: string
+  ) => {
+    if (modelId && modelId !== "default") return modelId
+    const resolved =
+      preflight && preflightKey === configKey && seatOrdinal !== null
+        ? preflight.capability?.recipients.find(
+            (recipient) => recipient.ordinal === seatOrdinal
+          )?.model
+        : undefined
+    return resolved || roundtableAgentLabel(agent)
   }
   const budgetMinutes = Math.ceil(Number(config.budgets.room_budget) / 60000)
   const preflightCurrent = !!preflight && preflightKey === configKey
@@ -935,7 +963,12 @@ export function RoundtableWorkbench({
                         {speaker.role === "moderator"
                           ? t("moderator")
                           : `${t("member")} ${speaker.ordinal + 1}`}{" "}
-                        · {speaker.model_id}
+                        ·{" "}
+                        {speakerModelLabel(
+                          speaker.model_id,
+                          seatOrdinal,
+                          agent
+                        )}
                       </span>
                       <span className="text-xs whitespace-nowrap text-muted-foreground">
                         {projection.body.replay.attempts

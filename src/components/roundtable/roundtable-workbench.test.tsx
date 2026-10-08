@@ -546,6 +546,43 @@ describe("roundtable product page", () => {
     expect(title?.querySelector("code")).toHaveTextContent("HttpOnly")
     expect(title).not.toHaveTextContent("`")
   })
+
+  it("labels an unpinned draft seat by its agent instead of default", async () => {
+    const body = await room("draft", false, async (draft) => {
+      const config = draft.replay.config as {
+        participants: { model?: string; agent?: string }[]
+      }
+      for (const member of config.participants) {
+        delete member.model
+        member.agent = "grok"
+      }
+      draft.replay.speakers = [
+        {
+          speaker_id: "speaker-0",
+          ordinal: 0,
+          role: "member",
+          provider_ref: "provider:grok",
+          model_id: "default",
+        },
+        {
+          speaker_id: "speaker-m",
+          ordinal: 3,
+          role: "moderator",
+          provider_ref: "provider:grok",
+          model_id: "default",
+        },
+      ]
+      return []
+    })
+    render(
+      <RoundtableWorkbench workspaceId="workspace" roomId={body.room_id} />
+    )
+    expect(
+      (await screen.findAllByText("member 1 · Grok")).length
+    ).toBeGreaterThan(0)
+    expect(screen.getByText("moderator · Grok")).toBeInTheDocument()
+    expect(screen.queryByText(/· default$/)).not.toBeInTheDocument()
+  })
 })
 
 it("includes only explicit relative source selections and invalidates changed selections", async () => {
