@@ -7548,6 +7548,25 @@
     "speakerId": "发言人 ID",
     "phaseId": "阶段 ID",
     "publishedSeq": "发布序号",
-    "evidenceAliases": "证据别名"
+    "evidenceAliases": "证据别名",
+    "newSubtitle": "提出一个问题，选好参与成员，运行前先核对将要发送的全部内容。",
+    "topicHelp": "问题越明确越好。每位成员会先各自独立作答。",
+    "topicPlaceholder": "例如：内部 Web 应用的会话令牌应该存放在 HttpOnly Cookie 还是 localStorage？",
+    "topicRequired": "请先输入要讨论的问题。",
+    "sourcesOptional": "附加工作区文件（可选）",
+    "sourcesCount": "已选 {count} 个",
+    "members": "参与成员",
+    "membersHelp": "2–7 位成员。先各自作答，再相互评议；主持人还会撰写最终综合结论。",
+    "agentDefaultProvider": "智能体默认",
+    "rolePlaceholder": "例如：提案者、批评者、安全评审",
+    "settings": "讨论设置",
+    "roundsHelp": "成员相互评议彼此回答的轮数。",
+    "concurrencyHelp": "同时作答的成员数量。",
+    "budgetMinutes": "{minutes} 分钟",
+    "budgetHelp": "最长运行时间，由成员数、轮数和并发数推算。",
+    "review": "核对并创建",
+    "reviewHelp": "预检会解析实际的模型、工具和预算。创建只会保存草稿，点“开始”之前不会运行。",
+    "checking": "正在预检，可能需要几秒钟…",
+    "confirmToCreate": "勾选上方确认后即可创建草稿。"
   }
 }

@@ -7548,6 +7548,25 @@
     "speakerId": "Identifiant du participant",
     "phaseId": "Identifiant de phase",
     "publishedSeq": "Numéro de publication",
-    "evidenceAliases": "Alias de preuve"
+    "evidenceAliases": "Alias de preuve",
+    "newSubtitle": "Posez une question, choisissez les participants, puis vérifiez exactement ce qui sera envoyé avant tout lancement.",
+    "topicHelp": "Une question claire fonctionne le mieux. Chaque membre y répond d'abord indépendamment.",
+    "topicPlaceholder": "ex. : notre application web interne doit-elle stocker les jetons de session dans des cookies HttpOnly ou dans localStorage ?",
+    "topicRequired": "Saisissez une question pour continuer.",
+    "sourcesOptional": "Joindre des fichiers de l'espace de travail (facultatif)",
+    "sourcesCount": "{count} sélectionné(s)",
+    "members": "Membres",
+    "membersHelp": "De 2 à 7 membres. Ils répondent puis se critiquent mutuellement ; le modérateur rédige aussi la synthèse finale.",
+    "agentDefaultProvider": "Par défaut de l'agent",
+    "rolePlaceholder": "ex. : Proposant, Critique, Relecteur sécurité",
+    "settings": "Paramètres de la discussion",
+    "roundsHelp": "Tours pendant lesquels les membres examinent les réponses des autres.",
+    "concurrencyHelp": "Nombre de membres qui répondent en même temps.",
+    "budgetMinutes": "{minutes} min",
+    "budgetHelp": "Durée maximale, calculée à partir des membres, des tours et de la concurrence.",
+    "review": "Vérifier et créer",
+    "reviewHelp": "La vérification détermine les modèles, outils et budget réels. Créer enregistre un brouillon ; rien ne s'exécute avant que vous ne le lanciez.",
+    "checking": "Vérification en cours… cela peut prendre quelques secondes.",
+    "confirmToCreate": "Cochez la confirmation ci-dessus pour créer le brouillon."
   }
 }

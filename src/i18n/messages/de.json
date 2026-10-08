@@ -7548,6 +7548,25 @@
     "speakerId": "Sprecher-ID",
     "phaseId": "Phasen-ID",
     "publishedSeq": "Veröffentlichungsnummer",
-    "evidenceAliases": "Beweisaliase"
+    "evidenceAliases": "Beweisaliase",
+    "newSubtitle": "Stelle eine Frage, wähle die Teilnehmer und prüfe vor dem Start genau, was gesendet wird.",
+    "topicHelp": "Eine klare Frage funktioniert am besten. Jedes Mitglied antwortet zuerst unabhängig.",
+    "topicPlaceholder": "z. B.: Soll unsere interne Web-App Sitzungstokens in HttpOnly-Cookies oder in localStorage speichern?",
+    "topicRequired": "Gib eine Frage ein, um fortzufahren.",
+    "sourcesOptional": "Arbeitsbereichsdateien anhängen (optional)",
+    "sourcesCount": "{count} ausgewählt",
+    "members": "Mitglieder",
+    "membersHelp": "2–7 Mitglieder. Sie antworten und bewerten sich dann gegenseitig; die Moderation schreibt zusätzlich die Abschlusssynthese.",
+    "agentDefaultProvider": "Agent-Standard",
+    "rolePlaceholder": "z. B. Vorschlagende, Kritik, Security-Review",
+    "settings": "Diskussionseinstellungen",
+    "roundsHelp": "Runden, in denen die Mitglieder die Antworten der anderen prüfen.",
+    "concurrencyHelp": "Wie viele Mitglieder gleichzeitig antworten.",
+    "budgetMinutes": "{minutes} Min.",
+    "budgetHelp": "Maximale Laufzeit, berechnet aus Mitgliedern, Runden und Parallelität.",
+    "review": "Prüfen und erstellen",
+    "reviewHelp": "Die Prüfung ermittelt die tatsächlichen Modelle, Tools und das Budget. Erstellen speichert einen Entwurf; nichts läuft, bevor du ihn startest.",
+    "checking": "Prüfung läuft… das kann einige Sekunden dauern.",
+    "confirmToCreate": "Setze oben das Häkchen zur Bestätigung, um den Entwurf zu erstellen."
   }
 }

@@ -227,9 +227,12 @@ describe("roundtable workbench recovery", () => {
     fireEvent.click(screen.getByRole("button", { name: "retryProviders" }))
 
     await waitFor(() =>
-      expect(screen.getByRole("combobox", { name: "provider 1" })).toHaveValue(
-        "1"
-      )
+      expect(
+        within(screen.getByRole("combobox", { name: "provider 1" })).getByRole(
+          "option",
+          { name: "Available provider" }
+        )
+      ).toHaveValue("1")
     )
     expect(screen.queryByText("providers unavailable")).not.toBeInTheDocument()
     expect(screen.getByRole("link", { name: /Room A/ })).toBeInTheDocument()

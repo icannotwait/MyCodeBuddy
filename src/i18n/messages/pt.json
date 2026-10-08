@@ -7548,6 +7548,25 @@
     "speakerId": "ID do participante",
     "phaseId": "ID da fase",
     "publishedSeq": "Sequência publicada",
-    "evidenceAliases": "Aliases de evidência"
+    "evidenceAliases": "Aliases de evidência",
+    "newSubtitle": "Faça uma pergunta, escolha quem participa da mesa e revise exatamente o que será enviado antes de executar.",
+    "topicHelp": "Uma pergunta clara funciona melhor. Cada membro responde primeiro de forma independente.",
+    "topicPlaceholder": "ex.: nosso app web interno deve guardar tokens de sessão em cookies HttpOnly ou no localStorage?",
+    "topicRequired": "Digite uma pergunta para continuar.",
+    "sourcesOptional": "Anexar arquivos do espaço de trabalho (opcional)",
+    "sourcesCount": "{count} selecionados",
+    "members": "Membros",
+    "membersHelp": "De 2 a 7 membros. Eles respondem e depois se criticam; o moderador também escreve a síntese final.",
+    "agentDefaultProvider": "Padrão do agente",
+    "rolePlaceholder": "ex.: Proponente, Crítico, Revisor de segurança",
+    "settings": "Configurações da discussão",
+    "roundsHelp": "Rodadas em que os membros revisam as respostas uns dos outros.",
+    "concurrencyHelp": "Quantos membros respondem ao mesmo tempo.",
+    "budgetMinutes": "{minutes} min",
+    "budgetHelp": "Tempo máximo de execução, calculado a partir de membros, rodadas e concorrência.",
+    "review": "Revisar e criar",
+    "reviewHelp": "A verificação resolve os modelos, ferramentas e orçamento reais. Criar salva um rascunho; nada é executado até você iniciar.",
+    "checking": "Verificando… pode levar alguns segundos.",
+    "confirmToCreate": "Marque a confirmação acima para criar o rascunho."
   }
 }

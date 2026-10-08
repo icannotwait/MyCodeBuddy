@@ -414,13 +414,15 @@ describe("roundtable product page", () => {
     fireEvent.change(screen.getByLabelText("topic"), {
       target: { value: "Question" },
     })
+    fireEvent.click(screen.getByRole("button", { name: "addMember" }))
     await waitFor(() =>
       expect(screen.getAllByRole("option", { name: "Provider" })).toHaveLength(
         3
       )
     )
-    fireEvent.change(screen.getByLabelText("moderator"), {
-      target: { value: "2" },
+    fireEvent.click(screen.getByRole("radio", { name: "moderator 3" }))
+    fireEvent.change(screen.getByRole("combobox", { name: "provider 1" }), {
+      target: { value: "1" },
     })
     fireEvent.click(screen.getByRole("button", { name: "preflight" }))
     await screen.findByText("disabled")
@@ -436,15 +438,17 @@ describe("roundtable product page", () => {
               provider_ref: "provider:1",
               agent: "grok",
             }),
+            // Without an explicit provider, a seat uses its agent's
+            // qualified default binding.
             expect.objectContaining({
               ordinal: 1,
-              provider_ref: "provider:1",
-              agent: "cursor",
+              provider_ref: "provider:antigravity",
+              agent: "antigravity",
             }),
             expect.objectContaining({
               ordinal: 2,
-              provider_ref: "provider:1",
-              agent: "antigravity",
+              provider_ref: "provider:cursor",
+              agent: "cursor",
             }),
           ],
           moderator_ordinal: 2,
@@ -550,7 +554,11 @@ it("includes only explicit relative source selections and invalidates changed se
   call.mockImplementation(
     async (
       command: string,
-      args: { request: { config: { participants: { ordinal: number }[] } } }
+      args: {
+        request: {
+          config: { participants: { ordinal: number; provider_ref: string }[] }
+        }
+      }
     ) => {
       if (command === "roundtable_list") return { rooms: [], cursor: null }
       if (command === "roundtable_preflight")
@@ -565,14 +573,16 @@ it("includes only explicit relative source selections and invalidates changed se
           source_manifests: [],
           confirmed_preflight_id: null,
           capability: {
-            recipients: args.request.config.participants.map(({ ordinal }) => ({
-              ordinal,
-              provider_ref: "provider:1",
-              model: "resolved-model",
-              origin: "https://example.test",
-              agent: "grok",
-              effort: null,
-            })),
+            recipients: args.request.config.participants.map(
+              ({ ordinal, provider_ref }) => ({
+                ordinal,
+                provider_ref,
+                model: "resolved-model",
+                origin: "https://example.test",
+                agent: "grok",
+                effort: null,
+              })
+            ),
           },
         }
       if (command === "roundtable_create")
@@ -587,7 +597,7 @@ it("includes only explicit relative source selections and invalidates changed se
     target: { value: "src/a.ts\nREADME.md" },
   })
   await waitFor(() =>
-    expect(screen.getAllByRole("option", { name: "Provider" })).toHaveLength(3)
+    expect(screen.getAllByRole("option", { name: "Provider" })).toHaveLength(2)
   )
   fireEvent.click(screen.getByRole("button", { name: "preflight" }))
   await screen.findByText("enabled")
@@ -632,7 +642,7 @@ it("does not present a late preflight as confirmation for an edited selection", 
     target: { value: "Original" },
   })
   await waitFor(() =>
-    expect(screen.getAllByRole("option", { name: "Provider" })).toHaveLength(3)
+    expect(screen.getAllByRole("option", { name: "Provider" })).toHaveLength(2)
   )
   fireEvent.click(screen.getByRole("button", { name: "preflight" }))
   await waitFor(() => expect(checkedConfig).toBeTruthy())
@@ -654,4 +664,53 @@ it("does not present a late preflight as confirmation for an edited selection", 
   })
   expect(screen.queryByLabelText("confirm")).toBeNull()
   expect(screen.getByRole("button", { name: "create" })).toBeDisabled()
+})
+
+it("removes a specific member card and keeps the moderator on the same seat", async () => {
+  call.mockReset()
+  vi.stubGlobal("crypto", webcrypto)
+  let checkedConfig:
+    | {
+        participants: { ordinal: number; role: string; agent: string }[]
+        moderator_ordinal: number
+        concurrency: number
+      }
+    | undefined
+  call.mockImplementation(
+    async (command: string, args: { request: { config: unknown } }) => {
+      if (command === "roundtable_list") return { rooms: [], cursor: null }
+      checkedConfig = args.request.config as typeof checkedConfig
+      return new Promise(() => undefined)
+    }
+  )
+  render(<RoundtableWorkbench workspaceId="workspace" />)
+  expect(
+    screen.queryByRole("button", { name: "removeMember 1" })
+  ).not.toBeInTheDocument()
+  fireEvent.click(screen.getByRole("button", { name: "addMember" }))
+  fireEvent.change(screen.getByLabelText("role 2"), {
+    target: { value: "Leaving" },
+  })
+  fireEvent.change(screen.getByLabelText("role 3"), {
+    target: { value: "Host" },
+  })
+  fireEvent.click(screen.getByRole("radio", { name: "moderator 3" }))
+  fireEvent.click(screen.getByRole("button", { name: "removeMember 2" }))
+  expect(screen.getByRole("radio", { name: "moderator 2" })).toBeChecked()
+  expect(screen.getByLabelText("role 2")).toHaveValue("Host")
+  fireEvent.change(screen.getByLabelText("topic"), {
+    target: { value: "Question" },
+  })
+  fireEvent.click(screen.getByRole("button", { name: "preflight" }))
+  await waitFor(() => expect(checkedConfig).toBeTruthy())
+  expect(checkedConfig?.moderator_ordinal).toBe(1)
+  expect(checkedConfig?.participants.map((member) => member.role)).toEqual([
+    "member 1",
+    "Host",
+  ])
+  expect(checkedConfig?.participants.map((member) => member.agent)).toEqual([
+    "grok",
+    "cursor",
+  ])
+  expect(checkedConfig?.concurrency).toBeLessThanOrEqual(2)
 })

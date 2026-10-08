@@ -35,10 +35,17 @@ import type {
   RoundtableUsage,
   RoundtableView,
 } from "@/lib/roundtable/types"
+import { CircleCheck, Loader2, ShieldCheck, TriangleAlert } from "lucide-react"
 import { Button } from "@/components/ui/button"
-import { Input } from "@/components/ui/input"
 import { Textarea } from "@/components/ui/textarea"
 import { PreflightConfirmation } from "./preflight-confirmation"
+import {
+  ROUNDTABLE_MAX_MEMBERS,
+  ROUNDTABLE_MIN_MEMBERS,
+  RoundtableComposer,
+  RoundtableStep,
+  type ComposerMember,
+} from "./roundtable-composer"
 import { RoundtableSafeContent } from "./roundtable-safe-content"
 import { RoundtableRoomList } from "./roundtable-room-list"
 import { brandStyle, roundtableSeatBrands } from "@/lib/roundtable/brand"
@@ -53,8 +60,6 @@ import {
 
 type LoadedRoom = Awaited<ReturnType<typeof loadRoundtable>>
 type RoomSummary = { room_id: string; status: string; config: RoundtableConfig }
-
-const ROUNDTABLE_AGENTS = ["grok", "cursor", "antigravity", "codex"] as const
 
 export function RoundtableWorkbench({
   workspaceId,
@@ -84,15 +89,14 @@ export function RoundtableWorkbench({
   const [sourcePreviews, setSourcePreviews] = useState<Record<string, string>>(
     {}
   )
-  const [roles, setRoles] = useState(["", "", ""])
-  const [agents, setAgents] = useState<string[]>([
-    "grok",
-    "cursor",
-    "antigravity",
-  ])
+  // Default seats match the adapters most installs qualify first; members can
+  // switch agents or add seats before the readiness check.
+  const [roles, setRoles] = useState(["", ""])
+  const [agents, setAgents] = useState<string[]>(["grok", "antigravity"])
+  // Empty id = the agent's qualified default binding (`provider:<agent>`).
   const [providerIds, setProviderIds] = useState<string[]>([])
   const [rounds, setRounds] = useState(2)
-  const [concurrency, setConcurrency] = useState(3)
+  const [concurrency, setConcurrency] = useState(2)
   const [moderator, setModerator] = useState(0)
   const [preflight, setPreflight] = useState<RoundtablePreflight | null>(null)
   const [confirmed, setConfirmed] = useState(false)
@@ -104,6 +108,7 @@ export function RoundtableWorkbench({
     {}
   )
   const [busy, setBusy] = useState(false)
+  const [checking, setChecking] = useState(false)
   const actionInFlight = useRef(false)
   const [error, setError] = useState<string | null>(null)
   const [interjection, setInterjection] = useState("")
@@ -345,6 +350,8 @@ export function RoundtableWorkbench({
     }
   }, [roomId, refresh])
 
+  const providerRefAt = (ordinal: number) =>
+    `provider:${providerIds[ordinal] || agents[ordinal] || "codex"}`
   const formConfig = (): RoundtableConfig => {
     const original = editingDraft ? loaded?.projection.body.replay.config : null
     const waves = Math.ceil(roles.length / concurrency)
@@ -360,12 +367,12 @@ export function RoundtableWorkbench({
       participants: roles.map((role, ordinal) => ({
         ordinal,
         role: role.trim() || `${t("member")} ${ordinal + 1}`,
-        provider_ref: `provider:${providerIds[ordinal] || providers[0]?.id || ""}`,
+        provider_ref: providerRefAt(ordinal),
         agent: agents[ordinal] || "codex",
         ...(original?.participants.find((member) => member.ordinal === ordinal)
           ?.model &&
         original.participants.find((member) => member.ordinal === ordinal)
-          ?.provider_ref === `provider:${providerIds[ordinal]}`
+          ?.provider_ref === providerRefAt(ordinal)
           ? {
               model: original.participants.find(
                 (member) => member.ordinal === ordinal
@@ -375,7 +382,7 @@ export function RoundtableWorkbench({
         ...(original?.participants.find((member) => member.ordinal === ordinal)
           ?.effort &&
         original.participants.find((member) => member.ordinal === ordinal)
-          ?.provider_ref === `provider:${providerIds[ordinal]}`
+          ?.provider_ref === providerRefAt(ordinal)
           ? {
               effort: original.participants.find(
                 (member) => member.ordinal === ordinal
@@ -449,6 +456,7 @@ export function RoundtableWorkbench({
     run(async () => {
       invalidate()
       const generation = preflightGeneration.current
+      setChecking(true)
       const result = await roundtableCall<RoundtablePreflight>(
         "roundtable_preflight",
         {
@@ -457,7 +465,7 @@ export function RoundtableWorkbench({
             ? { room_id: roomId, revision: loaded?.projection.body.revision }
             : {}),
         }
-      )
+      ).finally(() => setChecking(false))
       if (generation !== preflightGeneration.current) return
       if (result.config_hash !== (await roundtableHash(config)))
         throw new Error("preflight_config")
@@ -562,7 +570,10 @@ export function RoundtableWorkbench({
     setTopic(config.topic)
     setRoles(members.map((member) => member.role))
     setProviderIds(
-      members.map((member) => member.provider_ref.replace(/^provider:/, ""))
+      members.map((member) => {
+        const id = member.provider_ref.replace(/^provider:/, "")
+        return id === (member.agent || "codex") ? "" : id
+      })
     )
     setAgents(members.map((member) => member.agent || "codex"))
     setRounds(config.strategy.critique_rounds)
@@ -571,6 +582,163 @@ export function RoundtableWorkbench({
     setEditingDraft(true)
     invalidate()
   }
+
+  const members: ComposerMember[] = roles.map((role, index) => ({
+    role,
+    agent: agents[index] || "codex",
+    providerId: providerIds[index] || "",
+  }))
+  const updateMember = (index: number, patch: Partial<ComposerMember>) => {
+    if (patch.role !== undefined) {
+      const role = patch.role
+      setRoles(roles.map((old, i) => (i === index ? role : old)))
+    }
+    if (patch.agent !== undefined) {
+      const agent = patch.agent
+      setAgents(
+        members.map((member, i) => (i === index ? agent : member.agent))
+      )
+    }
+    if (patch.providerId !== undefined) {
+      const providerId = patch.providerId
+      setProviderIds(
+        members.map((member, i) =>
+          i === index ? providerId : member.providerId
+        )
+      )
+    }
+    invalidate()
+  }
+  const addMember = () => {
+    if (roles.length >= ROUNDTABLE_MAX_MEMBERS) return
+    const used = new Set(members.map((member) => member.agent))
+    const next =
+      ["grok", "antigravity", "cursor", "codex"].find(
+        (agent) => !used.has(agent)
+      ) ?? "grok"
+    setRoles([...roles, ""])
+    setAgents([...members.map((member) => member.agent), next])
+    setProviderIds([...members.map((member) => member.providerId), ""])
+    invalidate()
+  }
+  const removeMember = (index: number) => {
+    if (roles.length <= ROUNDTABLE_MIN_MEMBERS) return
+    const keep = (_: unknown, i: number) => i !== index
+    setRoles(roles.filter(keep))
+    setAgents(members.map((member) => member.agent).filter(keep))
+    setProviderIds(members.map((member) => member.providerId).filter(keep))
+    setConcurrency(Math.min(concurrency, roles.length - 1))
+    setModerator(
+      moderator === index ? 0 : moderator > index ? moderator - 1 : moderator
+    )
+    invalidate()
+  }
+  const budgetMinutes = Math.ceil(Number(config.budgets.room_budget) / 60000)
+  const preflightCurrent = !!preflight && preflightKey === configKey
+  const preflightOk =
+    preflightCurrent &&
+    preflight.enabled &&
+    preflight.readiness === "ready" &&
+    !preflight.error
+  const preflightDisabled =
+    busy ||
+    !workspaceId ||
+    (!!roomId && (!loaded || !!roomError || roomLoading)) ||
+    !sourceSelectionValid ||
+    editingDraft ||
+    (!roomId && !topic.trim())
+  const preflightPanel = (
+    <div className="flex min-w-0 flex-col gap-3">
+      <div className="flex min-w-0 flex-wrap items-center gap-x-3 gap-y-2">
+        <Button
+          variant="outline"
+          disabled={preflightDisabled}
+          onClick={() => void check()}
+        >
+          {checking ? (
+            <Loader2 aria-hidden="true" className="animate-spin" />
+          ) : (
+            <ShieldCheck aria-hidden="true" />
+          )}
+          {t("preflight")}
+        </Button>
+        {checking ? (
+          <p role="status" className="text-sm text-muted-foreground">
+            {t("checking")}
+          </p>
+        ) : !roomId && !topic.trim() ? (
+          <p className="text-sm text-muted-foreground">{t("topicRequired")}</p>
+        ) : null}
+      </div>
+      {preflight && preflightCurrent ? (
+        <>
+          <div
+            role="status"
+            className={cn(
+              "flex min-w-0 items-start gap-2 rounded-lg border p-3 text-sm",
+              preflightOk
+                ? "border-emerald-600/30 bg-emerald-500/5 text-emerald-800 dark:border-emerald-400/30 dark:text-emerald-300"
+                : "border-amber-600/30 bg-amber-500/5 text-amber-900 dark:border-amber-400/30 dark:text-amber-200"
+            )}
+          >
+            {preflightOk ? (
+              <CircleCheck
+                aria-hidden="true"
+                className="mt-0.5 size-4 shrink-0"
+              />
+            ) : (
+              <TriangleAlert
+                aria-hidden="true"
+                className="mt-0.5 size-4 shrink-0"
+              />
+            )}
+            <span>{preflight.enabled ? t("enabled") : t("disabled")}</span>
+          </div>
+          {preflight.error ? (
+            <p
+              role="alert"
+              className="rounded-lg border border-destructive/30 bg-destructive/5 p-3 text-sm text-destructive [overflow-wrap:anywhere]"
+            >
+              {roundtableError(preflight.error)}
+            </p>
+          ) : null}
+          <PreflightConfirmation
+            recipients={preflight.capability?.recipients ?? []}
+            moderatorOrdinal={config.moderator_ordinal}
+            seatBrands={roundtableSeatBrands(config)}
+            sourceManifests={preflight.source_manifests ?? []}
+            selectedPaths={selectedPaths}
+            sourcePreviews={sourcePreviews}
+            onPreview={
+              roomId
+                ? (entry) =>
+                    void run(async () => {
+                      const text = await loadRoundtableSource(roomId, entry)
+                      setSourcePreviews((previous) => ({
+                        ...previous,
+                        [entry.content_hash]: text,
+                      }))
+                    })
+                : undefined
+            }
+            tools={preflight.tools}
+            network={preflight.network}
+            writes={preflight.writes}
+            budget={`${Math.ceil(Number(config.budgets.room_budget) / 60000)} ${t("minutes")}`}
+          />
+          <label className="flex min-w-0 cursor-pointer items-start gap-3 rounded-lg border bg-background p-3 text-sm leading-relaxed transition-colors has-checked:border-primary/60 has-checked:bg-primary/5 has-[:focus-visible]:ring-[3px] has-[:focus-visible]:ring-ring/50">
+            <input
+              type="checkbox"
+              className="mt-0.5 size-4 shrink-0 accent-primary"
+              checked={confirmed}
+              onChange={(event) => setConfirmed(event.target.checked)}
+            />
+            <span>{t("confirm")}</span>
+          </label>
+        </>
+      ) : null}
+    </div>
+  )
 
   return (
     <main className="mx-auto flex w-full min-w-0 max-w-6xl flex-col gap-5 overflow-auto p-4 sm:p-6">
@@ -665,188 +833,51 @@ export function RoundtableWorkbench({
           ) : null}
           {!roomId || editingDraft ? (
             <>
-              <label>
-                {t("topic")}
-                <Textarea
-                  aria-label={t("topic")}
-                  value={topic}
-                  onChange={(event) => {
-                    setTopic(event.target.value)
-                    invalidate()
-                  }}
-                />
-              </label>
-              {!roomId ? (
-                <label>
-                  {t("selectedSourcePaths")}
-                  <Textarea
-                    aria-label={t("selectedSourcePaths")}
-                    value={selectedSourcePaths}
-                    placeholder={t("sourcePathsPlaceholder")}
-                    onChange={(event) => {
-                      setSelectedSourcePaths(event.target.value)
-                      invalidate()
-                    }}
-                  />
-                  <p className="text-sm text-muted-foreground">
-                    {t("sourceSelectionHelp")}
-                  </p>
-                  <p className="text-sm text-muted-foreground">
-                    {t("sourceRetentionNotice")}
-                  </p>
-                  {!sourceSelectionValid ? (
-                    <p role="alert">{t("invalidSourceSelection")}</p>
-                  ) : null}
-                </label>
-              ) : null}
-              {roles.map((role, index) => (
-                <fieldset
-                  key={index}
-                  className="grid min-w-0 gap-3 rounded-lg border p-3"
-                >
-                  <legend>
-                    {t("member")} {index + 1}
-                  </legend>
-                  <Input
-                    aria-label={`${t("role")} ${index + 1}`}
-                    value={role}
-                    onChange={(event) => {
-                      setRoles(
-                        roles.map((old, i) =>
-                          i === index ? event.target.value : old
-                        )
-                      )
-                      invalidate()
-                    }}
-                  />
-                  <label>
-                    {t("agent")}
-                    <select
-                      aria-label={`${t("agent")} ${index + 1}`}
-                      className="ml-2 rounded border bg-background p-2"
-                      value={agents[index] || "codex"}
-                      onChange={(event) => {
-                        setAgents(
-                          roles.map((_, i) =>
-                            i === index
-                              ? event.target.value
-                              : agents[i] || "codex"
-                          )
-                        )
-                        invalidate()
-                      }}
-                    >
-                      {ROUNDTABLE_AGENTS.map((agent) => (
-                        <option key={agent} value={agent}>
-                          {agent}
-                        </option>
-                      ))}
-                    </select>
-                  </label>
-                  <label>
-                    {t("provider")}
-                    <select
-                      aria-label={`${t("provider")} ${index + 1}`}
-                      className="ml-2 rounded border bg-background p-2"
-                      value={providerIds[index] || providers[0]?.id || ""}
-                      onChange={(event) => {
-                        setProviderIds(
-                          roles.map((_, i) =>
-                            i === index
-                              ? event.target.value
-                              : providerIds[i] || String(providers[0]?.id || "")
-                          )
-                        )
-                        invalidate()
-                      }}
-                    >
-                      {providers.map((provider) => (
-                        <option key={provider.id} value={provider.id}>
-                          {provider.name}
-                        </option>
-                      ))}
-                    </select>
-                  </label>
-                </fieldset>
-              ))}
-              <div className="flex flex-wrap gap-2">
-                <Button
-                  variant="outline"
-                  disabled={roles.length >= 7}
-                  onClick={() => {
-                    setRoles([...roles, ""])
-                    setAgents([...agents, "codex"])
-                    invalidate()
-                  }}
-                >
-                  {t("addMember")}
-                </Button>
-                <Button
-                  variant="outline"
-                  disabled={roles.length <= 2}
-                  onClick={() => {
-                    setRoles(roles.slice(0, -1))
-                    setAgents(agents.slice(0, -1))
-                    setConcurrency(Math.min(concurrency, roles.length - 1))
-                    setModerator(Math.min(moderator, roles.length - 2))
-                    invalidate()
-                  }}
-                >
-                  {t("removeMember")}
-                </Button>
+              <div className="min-w-0 space-y-1">
+                <h2 className="text-xl font-semibold tracking-tight">
+                  {editingDraft ? t("editDraft") : t("new")}
+                </h2>
+                <p className="text-sm leading-relaxed text-muted-foreground">
+                  {t("newSubtitle")}
+                </p>
               </div>
-              <div className="flex flex-wrap gap-4">
-                <label>
-                  {t("rounds")}
-                  <Input
-                    type="number"
-                    min={0}
-                    max={5}
-                    value={rounds}
-                    onChange={(event) => {
-                      setRounds(
-                        Math.max(0, Math.min(5, Number(event.target.value)))
-                      )
-                      invalidate()
-                    }}
-                  />
-                </label>
-                <label>
-                  {t("concurrency")}
-                  <Input
-                    type="number"
-                    min={1}
-                    max={roles.length}
-                    value={concurrency}
-                    onChange={(event) => {
-                      setConcurrency(
-                        Math.max(
-                          1,
-                          Math.min(roles.length, Number(event.target.value))
-                        )
-                      )
-                      invalidate()
-                    }}
-                  />
-                </label>
-                <label>
-                  {t("moderator")}
-                  <select
-                    className="ml-2 rounded border bg-background p-2"
-                    value={moderator}
-                    onChange={(event) => {
-                      setModerator(Number(event.target.value))
-                      invalidate()
-                    }}
-                  >
-                    {roles.map((role, index) => (
-                      <option key={index} value={index}>
-                        {role || `${t("member")} ${index + 1}`}
-                      </option>
-                    ))}
-                  </select>
-                </label>
-              </div>
+              <RoundtableComposer
+                topic={topic}
+                onTopicChange={(value) => {
+                  setTopic(value)
+                  invalidate()
+                }}
+                showSources={!roomId}
+                sourcePaths={selectedSourcePaths}
+                onSourcePathsChange={(value) => {
+                  setSelectedSourcePaths(value)
+                  invalidate()
+                }}
+                sourceCount={selectedPaths.length}
+                sourceValid={sourceSelectionValid}
+                members={members}
+                seatBrands={roundtableSeatBrands(config)}
+                providers={providers}
+                onMemberChange={updateMember}
+                onAddMember={addMember}
+                onRemoveMember={removeMember}
+                moderator={moderator}
+                onModeratorChange={(index) => {
+                  setModerator(index)
+                  invalidate()
+                }}
+                rounds={rounds}
+                onRoundsChange={(value) => {
+                  setRounds(value)
+                  invalidate()
+                }}
+                concurrency={concurrency}
+                onConcurrencyChange={(value) => {
+                  setConcurrency(value)
+                  invalidate()
+                }}
+                budgetMinutes={budgetMinutes}
+              />
             </>
           ) : projection ? (
             <>
@@ -976,75 +1007,44 @@ export function RoundtableWorkbench({
           ) : !roomError ? (
             <p role="status">{t("loading")}</p>
           ) : null}
-          <Button
-            variant="outline"
-            disabled={
-              busy ||
-              !workspaceId ||
-              (!!roomId && (!loaded || !!roomError || roomLoading)) ||
-              !sourceSelectionValid ||
-              editingDraft ||
-              (!roomId && (!topic.trim() || providers.length === 0))
-            }
-            onClick={() => void check()}
-          >
-            {t("preflight")}
-          </Button>
-          {preflight && preflightKey === configKey ? (
-            <>
-              <p role="status">
-                {preflight.enabled ? t("enabled") : t("disabled")}
-              </p>
-              {preflight.error ? (
-                <p role="alert">{roundtableError(preflight.error)}</p>
-              ) : null}
-              <PreflightConfirmation
-                recipients={preflight.capability?.recipients ?? []}
-                moderatorOrdinal={config.moderator_ordinal}
-                sourceManifests={preflight.source_manifests ?? []}
-                selectedPaths={selectedPaths}
-                sourcePreviews={sourcePreviews}
-                onPreview={
-                  roomId
-                    ? (entry) =>
-                        void run(async () => {
-                          const text = await loadRoundtableSource(roomId, entry)
-                          setSourcePreviews((previous) => ({
-                            ...previous,
-                            [entry.content_hash]: text,
-                          }))
-                        })
-                    : undefined
-                }
-                tools={preflight.tools}
-                network={preflight.network}
-                writes={preflight.writes}
-                budget={`${Math.ceil(Number(config.budgets.room_budget) / 60000)} ${t("minutes")}`}
-              />
-              <label>
-                <input
-                  type="checkbox"
-                  checked={confirmed}
-                  onChange={(event) => setConfirmed(event.target.checked)}
-                />{" "}
-                {t("confirm")}
-              </label>
-            </>
-          ) : null}
+          {!roomId ? (
+            <RoundtableStep
+              step={4}
+              title={t("review")}
+              description={t("reviewHelp")}
+            >
+              {preflightPanel}
+              <div className="mt-4 flex flex-wrap items-center gap-3 border-t pt-4">
+                <Button
+                  size="lg"
+                  className="min-w-40"
+                  disabled={busy || !canRun}
+                  onClick={() =>
+                    void mutate("roundtable_create", {
+                      config,
+                      selected_source_paths: selectedPaths,
+                    })
+                  }
+                >
+                  {busy && !checking ? (
+                    <Loader2 aria-hidden="true" className="animate-spin" />
+                  ) : null}
+                  {t("create")}
+                </Button>
+                {!canRun && preflightOk && !confirmed ? (
+                  <p className="text-sm text-muted-foreground">
+                    {t("confirmToCreate")}
+                  </p>
+                ) : null}
+              </div>
+            </RoundtableStep>
+          ) : (
+            <div className="min-w-0 rounded-xl border bg-muted/20 p-3 sm:p-4">
+              {preflightPanel}
+            </div>
+          )}
           <div className="flex flex-wrap gap-2">
-            {!roomId ? (
-              <Button
-                disabled={busy || !canRun}
-                onClick={() =>
-                  void mutate("roundtable_create", {
-                    config,
-                    selected_source_paths: selectedPaths,
-                  })
-                }
-              >
-                {t("create")}
-              </Button>
-            ) : (
+            {!roomId ? null : (
               <>
                 {status === "draft" || status === "ready" ? (
                   <>

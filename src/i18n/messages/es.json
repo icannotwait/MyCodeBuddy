@@ -7548,6 +7548,25 @@
     "speakerId": "ID del participante",
     "phaseId": "ID de fase",
     "publishedSeq": "Secuencia publicada",
-    "evidenceAliases": "Alias de evidencia"
+    "evidenceAliases": "Alias de evidencia",
+    "newSubtitle": "Plantea una pregunta, elige quién se sienta a la mesa y revisa exactamente qué se enviará antes de ejecutar nada.",
+    "topicHelp": "Funciona mejor una pregunta clara. Cada miembro responde primero de forma independiente.",
+    "topicPlaceholder": "p. ej., ¿nuestra app web interna debería guardar los tokens de sesión en cookies HttpOnly o en localStorage?",
+    "topicRequired": "Escribe una pregunta para continuar.",
+    "sourcesOptional": "Adjuntar archivos del espacio de trabajo (opcional)",
+    "sourcesCount": "{count} seleccionados",
+    "members": "Miembros",
+    "membersHelp": "De 2 a 7 miembros. Responden y luego se critican entre sí; el moderador también redacta la síntesis final.",
+    "agentDefaultProvider": "Predeterminado del agente",
+    "rolePlaceholder": "p. ej., Proponente, Crítico, Revisor de seguridad",
+    "settings": "Ajustes de la discusión",
+    "roundsHelp": "Rondas en las que los miembros revisan las respuestas de los demás.",
+    "concurrencyHelp": "Cuántos miembros responden a la vez.",
+    "budgetMinutes": "{minutes} min",
+    "budgetHelp": "Tiempo máximo de ejecución, calculado a partir de miembros, rondas y concurrencia.",
+    "review": "Revisar y crear",
+    "reviewHelp": "La comprobación resuelve los modelos, herramientas y presupuesto reales. Crear guarda un borrador; nada se ejecuta hasta que lo inicies.",
+    "checking": "Comprobando… puede tardar unos segundos.",
+    "confirmToCreate": "Marca la confirmación de arriba para crear el borrador."
   }
 }
