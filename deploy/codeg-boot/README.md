@@ -70,12 +70,27 @@ Disable by removing execute bit: `chmod a-x /workspace/codeg-boot/auto-sync-boot
 
 `ensure-acp-agents.sh` does **not** hardcode agent versions. It asks the live
 `codeg-server` (`POST /api/acp_list_agents`) for each enabled agent's
-`registry_version` (from the MyCodeBuddy registry baked into that build) and
-only downloads/upgrades when `installed_version` differs.
+`registry_version` (from the MyCodeBuddy registry baked into that build).
+
+The registry version is a **minimum, not an exact pin**. The script follows the
+version actually in use (`installed_version`, which for binary agents is the
+highest cached version, the same one the server launches):
+
+- installed **>=** registry (SemVer 2.0 precedence: numeric parts, prerelease
+  below release, `+build` ignored): kept, nothing downloaded or refreshed. A
+  user who upgraded early (e.g. Antigravity 1.3.0 while the registry pins
+  1.2.1) stays on it; the log notes `keep user-installed newer ...`.
+- installed missing, unparseable, or **older**: moved to the registry version.
 
 So after you deploy a new `codeg-dist` that bumps Cursor / Antigravity / Grok
-in registry, the next watchdog `ensure-acp` cycle pulls those versions.
-Optional overrides: `CODEG_ANTIGRAVITY_VER`, `CODEG_CURSOR_VER`, `CODEG_GROK_VER`.
+in registry, the next watchdog `ensure-acp` cycle upgrades anything below it.
+Exact pins (explicit choice, may downgrade): `CODEG_ANTIGRAVITY_VER`,
+`CODEG_CURSOR_VER`, `CODEG_GROK_VER`.
+
+Preview without side effects: `ENSURE_ACP_PLAN_ONLY=1 ensure-acp-agents.sh`
+(or `--plan-only`) prints `plan ...` / `keep ...` rows and exits before any
+restore, mirror, download, or mutating API call. Offline tests:
+`node --test scripts/ensure-acp-agents.test.mjs`.
 
 A failed direct download or failed API download backs off that agent only.
 The stamp `/workspace/heartbeat/ensure-acp-<agent>.fail` stores the failure
@@ -84,8 +99,8 @@ time and the next wait (start `3600` seconds, double each failure, cap
 and continues with the others. Success deletes the stamp. Overrides:
 `CODEG_ACP_BACKOFF_BASE_SECS`, `CODEG_ACP_BACKOFF_CAP_SECS`.
 
-If the wanted version is already on disk but `installed_version` still
-differs, the script does not stop at "already on disk". Antigravity and
+If the wanted (registry or pinned) version is already on disk but
+`installed_version` still differs from it, the script does not stop at "already on disk". Antigravity and
 Cursor call `POST /api/acp_download_agent_binary` for that version (a complete
 server cache hit does not re-download). After a direct Antigravity unzip, it
 re-reads `acp_list_agents` and uses the same API download when the server
