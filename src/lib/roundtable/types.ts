@@ -86,7 +86,15 @@ export interface RoundtableProjection {
     status: RoundtableStatus
     blocked_reason: string | null
     messages: { message_id: string; hash: string }[]
-    phase_refs: { phase_id: string; revision: string; state: string }[]
+    phase_refs: {
+      phase_id: string
+      revision: string
+      state: string
+      /** Present on the wire. Missing only in older fixtures. */
+      index?: number | string
+      /** `proposal`, `critique`, or `synthesis` when the projection includes it. */
+      kind?: string
+    }[]
     replay: {
       config: RoundtableConfig | null
       speakers: {
@@ -96,7 +104,12 @@ export interface RoundtableProjection {
         provider_ref: string
         model_id: string
       }[]
-      attempts: { attempt_id: string; state: string; turn_id: string }[]
+      attempts: {
+        attempt_id: string
+        state: string
+        turn_id: string
+        attempt_no?: number | string
+      }[]
       turns: {
         turn_id: string
         phase_id: string
@@ -141,9 +154,21 @@ export interface RoundtableMessage {
   message_id: string
   body_hash: string
   visibility: "staged" | "published" | "void"
+  /**
+   * Envelope metadata from `roundtable_messages`. Absent on older servers.
+   * Not part of `body_hash`.
+   */
+  speaker_id?: string | null
+  attempt_id?: string | null
+  phase_id?: string | null
+  attempt_no?: number | string | null
+  attempt_state?: string | null
+  finished_at?: string | null
   body: {
     summary?: string
-    recommendation?: { text?: string }
+    kind?: string
+    speaker_id?: string
+    recommendation?: { text?: string; [key: string]: unknown }
     [key: string]: unknown
   }
 }

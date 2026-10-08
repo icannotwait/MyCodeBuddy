@@ -1456,7 +1456,28 @@ async fn message_page(
         ),
         None => None,
     };
-    let entries=rows(store.connection(),"SELECT e.message_id,e.body_hash,e.visibility,m.body_json FROM rt_page_manifest_entries e JOIN rt_messages m ON m.room_id=e.room_id AND m.message_id=e.message_id WHERE e.room_id=? AND e.manifest_id=? ORDER BY e.entry_offset",vec![text(&request.room_id.to_string()),text(&request.manifest_id.to_string())]).await?;
+    // Speaker, attempt, and phase are envelope metadata for the transcript.
+    // `body_hash` still covers only `body`; membership visibility is unchanged.
+    let entries = rows(
+        store.connection(),
+        "SELECT e.message_id, e.body_hash, e.visibility, m.body_json,
+                m.speaker_id, m.attempt_id, t.phase_id, a.attempt_no, a.state,
+                a.finished_at
+         FROM rt_page_manifest_entries e
+         JOIN rt_messages m
+           ON m.room_id = e.room_id AND m.message_id = e.message_id
+         LEFT JOIN rt_attempts a
+           ON a.room_id = m.room_id AND a.attempt_id = m.attempt_id
+         LEFT JOIN rt_turns t
+           ON t.room_id = a.room_id AND t.turn_id = a.turn_id
+         WHERE e.room_id = ? AND e.manifest_id = ?
+         ORDER BY e.entry_offset",
+        vec![
+            text(&request.room_id.to_string()),
+            text(&request.manifest_id.to_string()),
+        ],
+    )
+    .await?;
     let mut serialized = Vec::new();
     for entry in entries {
         let body = json_text(&column::<String>(&entry, 3)?)?;
@@ -1464,7 +1485,29 @@ async fn message_page(
         if roundtable_protocol::canonical_hash(&body)?.to_hex() != body_hash {
             return Err(rt_error(ErrorCode::StorageUnavailable, "message_hash"));
         }
-        serialized.push(json!({"message_id":column::<String>(&entry,0)?,"body_hash":body_hash,"visibility":column::<String>(&entry,2)?,"body":body}).to_string());
+        let message_id: String = column(&entry, 0)?;
+        let visibility: String = column(&entry, 2)?;
+        let speaker_id: String = column(&entry, 4)?;
+        let attempt_id: String = column(&entry, 5)?;
+        let phase_id: Option<String> = column(&entry, 6)?;
+        let attempt_no: Option<i64> = column(&entry, 7)?;
+        let attempt_state: Option<String> = column(&entry, 8)?;
+        let finished_at: Option<String> = column(&entry, 9)?;
+        serialized.push(
+            json!({
+                "message_id": message_id,
+                "body_hash": body_hash,
+                "visibility": visibility,
+                "speaker_id": speaker_id,
+                "attempt_id": attempt_id,
+                "phase_id": phase_id,
+                "attempt_no": attempt_no,
+                "attempt_state": attempt_state,
+                "finished_at": finished_at,
+                "body": body,
+            })
+            .to_string(),
+        );
     }
     let hash = roundtable_protocol::Hash256::sha256(&canonical_bytes(&serialized)?);
     let page = super::read_manifest_page(&serialized, hash, cursor.as_deref(), 100)?;

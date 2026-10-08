@@ -146,4 +146,24 @@ describe("roundtable room navigation", () => {
     expect(handlers.onRefresh).toHaveBeenCalledOnce()
     expect(handlers.onMore).toHaveBeenCalledOnce()
   })
+
+  it("clamps long topics to three lines, keeps the full text as a tooltip, and renders code spans", () => {
+    const topic = `Is \`crun delete --force\` safe? ${"long context ".repeat(60)}`
+    render(
+      <RoundtableRoomList
+        {...props()}
+        rooms={[{ room_id: "long", status: "completed", config: { topic } }]}
+        roomId="long"
+      />
+    )
+    const link = screen.getByRole("link", { name: /crun delete --force/ })
+    expect(link).toHaveAttribute("aria-current", "page")
+    expect(link).toHaveAttribute("title", topic.replace(/`/g, ""))
+    const text = link.querySelector("[data-testid='room-topic']")
+    expect(text).toHaveClass("line-clamp-3")
+    expect(text?.querySelector("code")).toHaveTextContent("crun delete --force")
+    expect(link).not.toHaveTextContent("`")
+    link.focus()
+    expect(document.activeElement).toBe(link)
+  })
 })
