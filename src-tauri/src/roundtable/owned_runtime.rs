@@ -194,15 +194,28 @@ impl RoundtableTurnExecutor for LeasedExecutor {
         request: RoundtableTurnRequest,
     ) -> RtResult<RoundtableTurnOutcome> {
         let incarnation = request.fence.incarnation;
-        if request
-            .execution_lease
-            .as_ref()
-            .is_some_and(|lease| lease.admit_enqueue(request.store.clock_sample().0) == 0)
-        {
-            return Err(rt_error(
-                ErrorCode::InsufficientBudget,
-                "prepaid_lease_expired",
-            ));
+        if let Some(lease) = request.execution_lease.as_ref() {
+            if lease.admit_enqueue(request.store.clock_sample().0) == 0 {
+                // Brief wait for the room monitor to renew an elapsed 1s slice
+                // when durable room budget remains. Genuine exhaustion still
+                // fails as InsufficientBudget.
+                for _ in 0..20 {
+                    let remaining =
+                        room_remaining_active_ms(&request.store, &request.room_id).await?;
+                    if remaining == 0 {
+                        return Err(lease_renewal_failure(0));
+                    }
+                    if lease.admit_enqueue(request.store.clock_sample().0) > 0 {
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                }
+                if lease.admit_enqueue(request.store.clock_sample().0) == 0 {
+                    return Err(lease_renewal_failure(
+                        room_remaining_active_ms(&request.store, &request.room_id).await?,
+                    ));
+                }
+            }
         }
         let lease = self
             .allocator
@@ -421,9 +434,8 @@ impl ParticipantRuntime for OwnedParticipantRuntime {
                                 store.clock_sample().0,
                                 ledger.prepaid_until.0,
                             ) {
-                                return Err(rt_error(
-                                    ErrorCode::InsufficientBudget,
-                                    "prepaid_lease_expired",
+                                return Err(lease_renewal_failure(
+                                    room_remaining_active_ms(&store, &room).await?,
                                 ));
                             }
                         }
@@ -433,13 +445,24 @@ impl ParticipantRuntime for OwnedParticipantRuntime {
                         }
                         Ok(Err(error)) => return Err(error),
                         Err(_elapsed) => {
-                            // Unlike delayed scheduler polling above, this
-                            // checkpoint was pending past its prepaid deadline.
-                            // Do not wait for SQLite again before local cleanup.
-                            return Err(rt_error(
-                                ErrorCode::InsufficientBudget,
-                                "prepaid_lease_expired",
-                            ));
+                            // Checkpoint waited past the local prepaid deadline
+                            // (often while the scheduler held SQLite during
+                            // admit/launch). Charge the gap and renew when the
+                            // room still has budget; do not mislabel that as
+                            // InsufficientBudget.
+                            match account_elapsed_slice(
+                                &mut lease,
+                                &permission,
+                                &store,
+                                &room,
+                                boot_epoch,
+                                run_epoch,
+                            )
+                            .await?
+                            {
+                                SliceRenewal::Renewed => continue,
+                                SliceRenewal::Finished => return Ok(()),
+                            }
                         }
                     }
                 }
@@ -592,15 +615,34 @@ async fn account_elapsed_slice(
         {
             Ok(SliceRenewal::Renewed)
         }
-        Some(_) => Err(rt_error(
-            ErrorCode::InsufficientBudget,
-            "prepaid_lease_expired",
+        Some(_) => Err(lease_renewal_failure(
+            room_remaining_active_ms(store, room).await?,
         )),
         None => {
             permission.revoke_local();
             Ok(SliceRenewal::Finished)
         }
     }
+}
+
+/// Classify a failed local prepaid renew. Room wall time at zero is genuine
+/// exhaustion; a stuck local slice with budget left is a lease stall.
+pub(crate) fn lease_renewal_failure(remaining_active_ms: u64) -> roundtable_protocol::RtError {
+    if remaining_active_ms == 0 {
+        rt_error(ErrorCode::InsufficientBudget, "prepaid_lease_expired")
+    } else {
+        rt_error(ErrorCode::RuntimeUnavailable, "execution_lease_stalled")
+    }
+}
+
+async fn room_remaining_active_ms(store: &RoundtableStore, room: &RoomId) -> RtResult<u64> {
+    let remaining = super::store::query_i64(
+        store.connection(),
+        "SELECT remaining_active_ms FROM rt_rooms WHERE room_id=?",
+        vec![text(&room.to_string())],
+    )
+    .await?;
+    u64::try_from(remaining).map_err(|_| rt_error(ErrorCode::StorageUnavailable, "budget_counter"))
 }
 
 async fn run_room(
@@ -889,7 +931,11 @@ async fn run_room(
                     request.execution_lease = Some(permission.clone());
                     closing_fence = Some(request.fence.clone());
                     pending.push(run_turn(Arc::clone(&executor), request));
+                    // Let the prepaid monitor checkpoint between admits so a
+                    // dual launch cannot starve renewals behind SQLite writes.
+                    tokio::task::yield_now().await;
                 }
+                tokio::task::yield_now().await;
                 for result in futures::future::join_all(pending).await {
                     let (speaker, outcome) = result?;
                     if let Some(slot) = slots
@@ -2017,6 +2063,60 @@ mod plan_context_contract_tests {
         assert_eq!(
             error.details.reason.as_deref(),
             Some("request_envelope_unqualified")
+        );
+    }
+}
+
+#[cfg(test)]
+mod prepaid_lease_renewal_tests {
+    use super::{grant_prepaid_slice, lease_renewal_failure};
+    use roundtable_protocol::ErrorCode;
+
+    #[test]
+    fn renewal_failure_with_no_room_budget_is_insufficient_budget() {
+        let error = lease_renewal_failure(0);
+        assert_eq!(error.code, ErrorCode::InsufficientBudget);
+        assert_eq!(
+            error.details.reason.as_deref(),
+            Some("prepaid_lease_expired")
+        );
+    }
+
+    #[test]
+    fn renewal_failure_with_room_budget_left_is_lease_stalled() {
+        let error = lease_renewal_failure(1_789_093);
+        assert_eq!(error.code, ErrorCode::RuntimeUnavailable);
+        assert_eq!(
+            error.details.reason.as_deref(),
+            Some("execution_lease_stalled")
+        );
+    }
+
+    #[test]
+    fn accounted_grant_recovers_after_a_checkpoint_stall_past_the_slice() {
+        // Slice prepaid until t=1000. A 3s launch stall samples at t=4000 and
+        // grants a fresh one-second prepaid window without failing the room.
+        let permission = super::super::resources::ExecutionLease::issue(0, 1_000);
+        assert_eq!(permission.prepaid_until(), 1_000);
+        assert!(!grant_prepaid_slice(&permission, 4_000, 4_000));
+        assert!(grant_prepaid_slice(&permission, 4_000, 5_000));
+        assert_eq!(permission.prepaid_until(), 5_000);
+        assert_eq!(permission.admit_enqueue(4_999), 1);
+        assert_eq!(permission.admit_enqueue(5_000), 0);
+    }
+
+    #[test]
+    fn accounted_grant_still_refuses_when_the_sample_cannot_extend() {
+        let permission = super::super::resources::ExecutionLease::issue(0, 1_000);
+        // prepaid_until == now yields no extension; classify via remaining.
+        assert!(!grant_prepaid_slice(&permission, 1_000, 1_000));
+        assert_eq!(
+            lease_renewal_failure(0).details.reason.as_deref(),
+            Some("prepaid_lease_expired")
+        );
+        assert_eq!(
+            lease_renewal_failure(500).details.reason.as_deref(),
+            Some("execution_lease_stalled")
         );
     }
 }
