@@ -81,7 +81,7 @@ function membershipRevision(value: unknown): bigint | null {
 }
 
 /** Page manifests record each message's highest membership_version. */
-function currentMessageMembership(
+export function currentMessageMembership(
   memberships: RoundtableProjection["body"]["replay"]["message_memberships"],
   messageId: string
 ) {

@@ -1,6 +1,7 @@
 "use client"
 
 import { useTranslations } from "next-intl"
+import { redactRoundtableText } from "@/lib/roundtable/redact"
 
 export function RoundtableSafeContent({
   text,
@@ -12,10 +13,7 @@ export function RoundtableSafeContent({
   preview?: boolean
 }) {
   const t = useTranslations("Roundtable")
-  const visible = text
-    .replace(/[A-Za-z]:\\[^\s]+/g, "")
-    .replace(/思考过程/g, "")
-    .replace(/sk-[a-z0-9-]+/gi, "[redacted]")
+  const visible = redactRoundtableText(text)
   return (
     <article
       className="min-w-0"

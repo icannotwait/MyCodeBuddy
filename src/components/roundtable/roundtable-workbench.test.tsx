@@ -12,7 +12,10 @@ vi.mock("@/lib/transport", () => ({
 vi.mock("@/lib/api", () => ({
   listModelProviders: async () => [{ id: 1, name: "Provider", model: null }],
 }))
-vi.mock("next-intl", () => ({ useTranslations: () => (key: string) => key }))
+vi.mock("next-intl", () => ({
+  useTranslations: () => (key: string) => key,
+  useLocale: () => "en",
+}))
 
 describe("roundtable product page", () => {
   beforeEach(() => {
@@ -22,7 +25,28 @@ describe("roundtable product page", () => {
 
   afterEach(() => vi.restoreAllMocks())
 
-  async function room(status: string, reverseParticipants = false) {
+  async function room(
+    status: string,
+    reverseParticipants = false,
+    seed?: (body: {
+      messages: { message_id: string; hash: string }[]
+      phase_refs: unknown[]
+      replay: Record<string, unknown>
+    }) => Promise<
+      {
+        message_id: string
+        body_hash: string
+        visibility: "staged" | "published" | "void"
+        speaker_id?: string
+        attempt_id?: string
+        phase_id?: string
+        attempt_no?: number
+        attempt_state?: string
+        finished_at?: string
+        body: Record<string, unknown>
+      }[]
+    >
+  ) {
     const body = JSON.parse(
       Buffer.from(fixture.cases[0].original_hex, "hex").toString()
     )
@@ -55,6 +79,7 @@ describe("roundtable product page", () => {
       },
     }
     if (reverseParticipants) body.replay.config.participants.reverse()
+    const pageMessages = seed ? await seed(body) : []
     const projection = {
       projection_ref: { id: "projection", hash: await roundtableHash(body) },
       body,
@@ -64,7 +89,7 @@ describe("roundtable product page", () => {
       if (command === "roundtable_get" || command === "roundtable_attach")
         return { projection, message_manifest_id: "projection" }
       if (command === "roundtable_messages")
-        return { messages: [], cursor: null }
+        return { messages: pageMessages, cursor: null }
       if (command === "roundtable_preflight")
         return {
           enabled: true,
@@ -429,6 +454,86 @@ describe("roundtable product page", () => {
     expect(
       call.mock.calls.some(([command]) => command === "roundtable_create")
     ).toBe(false)
+  })
+
+  it("shows a verified message in the transcript with its phase and member", async () => {
+    const summary = "Prepaid slices stay elapsed."
+    const loaded = await room("completed", false, async (body) => {
+      const message = { kind: "proposal", summary, claims: [] }
+      const hash = await roundtableHash(message)
+      body.messages = [{ message_id: "message-1", hash }]
+      body.phase_refs = [
+        {
+          phase_id: "phase-proposal",
+          revision: "1",
+          state: "published",
+          index: 0,
+          kind: "proposal",
+        },
+      ]
+      body.replay.speakers = [
+        {
+          speaker_id: "speaker-1",
+          ordinal: 0,
+          role: "member",
+          provider_ref: "provider:grok",
+          model_id: "grok-4.6",
+        },
+      ]
+      body.replay.turns = [
+        {
+          turn_id: "turn-1",
+          phase_id: "phase-proposal",
+          speaker_id: "speaker-1",
+          accepted_attempt_id: "attempt-1",
+        },
+      ]
+      body.replay.attempts = [
+        {
+          attempt_id: "attempt-1",
+          state: "accepted",
+          turn_id: "turn-1",
+          attempt_no: 1,
+        },
+      ]
+      body.replay.message_memberships = [
+        {
+          message_id: "message-1",
+          membership_version: "2",
+          visibility: "published",
+          published_seq: "4",
+        },
+        {
+          message_id: "message-1",
+          membership_version: "1",
+          visibility: "staged",
+          published_seq: null,
+        },
+      ]
+      return [
+        {
+          message_id: "message-1",
+          body_hash: hash,
+          visibility: "published" as const,
+          speaker_id: "speaker-1",
+          attempt_id: "attempt-1",
+          phase_id: "phase-proposal",
+          attempt_no: 1,
+          attempt_state: "accepted",
+          finished_at: "2026-10-08T03:41:00.000Z",
+          body: message,
+        },
+      ]
+    })
+    render(
+      <RoundtableWorkbench workspaceId="workspace" roomId={loaded.room_id} />
+    )
+    const transcript = await screen.findByTestId("roundtable-transcript")
+    expect(transcript).toHaveTextContent("phaseProposal")
+    expect(transcript).toHaveTextContent(summary)
+    expect(transcript).toHaveTextContent("member 1")
+    expect(transcript).toHaveTextContent("grok-4.6")
+    expect(transcript).not.toHaveTextContent("staged")
   })
 })
 

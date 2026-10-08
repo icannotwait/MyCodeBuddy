@@ -41,6 +41,7 @@ import { Textarea } from "@/components/ui/textarea"
 import { PreflightConfirmation } from "./preflight-confirmation"
 import { RoundtableSafeContent } from "./roundtable-safe-content"
 import { RoundtableRoomList } from "./roundtable-room-list"
+import { RoundtableTranscript } from "./roundtable-transcript"
 
 type LoadedRoom = Awaited<ReturnType<typeof loadRoundtable>>
 type RoomSummary = { room_id: string; status: string; config: RoundtableConfig }
@@ -871,48 +872,11 @@ export function RoundtableWorkbench({
                   </li>
                 ))}
               </ol>
-              {Object.entries(previews)
-                .filter(([, view]) => view.preview !== null)
-                .map(([attemptId, view]) => (
-                  <RoundtableSafeContent key={attemptId} text={view.preview!} />
-                ))}
-              <section
-                aria-label={t("results")}
-                className="flex min-w-0 flex-col gap-3"
-              >
-                <h3 className="text-sm font-semibold">{t("results")}</h3>
-                {loaded?.messages
-                  .filter((message) => message.visibility !== "void")
-                  .map((message) => (
-                    <div
-                      key={message.message_id}
-                      className="min-w-0 space-y-3 rounded-lg border bg-background p-4"
-                    >
-                      <p className="text-xs text-muted-foreground">
-                        {message.visibility === "published"
-                          ? t("published")
-                          : t("staged")}
-                      </p>
-                      <RoundtableSafeContent
-                        text={
-                          message.body.summary ??
-                          message.body.recommendation?.text ??
-                          JSON.stringify(message.body)
-                        }
-                        preview={false}
-                      />
-                      <details className="min-w-0 border-t pt-3 text-sm">
-                        <summary className="cursor-pointer rounded-sm text-muted-foreground focus-visible:outline-2 focus-visible:outline-ring">
-                          {t("details")}
-                        </summary>
-                        <RoundtableSafeContent
-                          text={JSON.stringify(message.body, null, 2)}
-                          preview={false}
-                        />
-                      </details>
-                    </div>
-                  ))}
-              </section>
+              <RoundtableTranscript
+                projection={projection}
+                messages={loaded?.messages ?? []}
+                previews={previews}
+              />
               <section
                 aria-label={t("evidence")}
                 className="flex flex-col gap-2"

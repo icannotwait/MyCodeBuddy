@@ -26,7 +26,10 @@ const transport = vi.hoisted(() => ({
 const listModelProviders = vi.hoisted(() => vi.fn())
 vi.mock("@/lib/transport", () => ({ getTransport: () => transport }))
 vi.mock("@/lib/api", () => ({ listModelProviders }))
-vi.mock("next-intl", () => ({ useTranslations: () => (key: string) => key }))
+vi.mock("next-intl", () => ({
+  useTranslations: () => (key: string) => key,
+  useLocale: () => "en",
+}))
 
 type RoomResponse = {
   projection: RoundtableProjection
