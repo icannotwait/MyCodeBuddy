@@ -8,11 +8,6 @@ vi.mock("next-intl", () => ({
   useLocale: () => "en",
 }))
 
-vi.mock("@/contexts/workspace-context", () => ({
-  useWorkspaceActions: () => ({ openResolvedImagePreview: () => false }),
-  useOptionalWorkspaceActions: () => null,
-}))
-
 const summary = [
   "## Keep the wall",
   "",

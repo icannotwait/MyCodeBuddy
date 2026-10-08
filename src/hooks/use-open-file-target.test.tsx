@@ -29,6 +29,10 @@ const { mockOpenFilePreview, mockOpenSessionFileDiff } = vi.hoisted(() => ({
 }))
 
 vi.mock("@/contexts/workspace-context", () => ({
+  useOptionalWorkspaceActions: () => ({
+    openFilePreview: mockOpenFilePreview,
+    openSessionFileDiff: mockOpenSessionFileDiff,
+  }),
   useWorkspaceActions: () => ({
     openFilePreview: mockOpenFilePreview,
     openSessionFileDiff: mockOpenSessionFileDiff,
