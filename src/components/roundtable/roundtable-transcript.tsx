@@ -1,6 +1,12 @@
 "use client"
 
-import { createContext, useContext, useMemo, type ReactNode } from "react"
+import {
+  createContext,
+  useContext,
+  useMemo,
+  type ComponentProps,
+  type ReactNode,
+} from "react"
 import { useLocale, useTranslations } from "next-intl"
 import {
   ChevronRight,
@@ -20,6 +26,13 @@ import type {
   RoundtableProjection,
 } from "@/lib/roundtable/types"
 import {
+  brandStyle,
+  roundtableBrand,
+  roundtableBrandKey,
+  roundtableSeatBrands,
+  type SeatBrand,
+} from "@/lib/roundtable/brand"
+import {
   buildRoundtableTranscript,
   replaceSeatAliases,
   type TranscriptPhase,
@@ -30,81 +43,87 @@ import type { AgentType } from "@/lib/types"
 import { cn } from "@/lib/utils"
 import { RoundtableSafeContent } from "./roundtable-safe-content"
 
-/**
- * Per-seat accent. Indexed by the configured participant ordinal, so a member
- * keeps one color across proposal, critique and (when assigned) moderation.
- * Every class is a literal so Tailwind keeps it; each pairs a light and a dark
- * tone.
- */
-const SEAT_ACCENTS = [
-  {
-    ring: "ring-sky-500/50",
-    bar: "border-l-sky-500/70",
-    name: "text-sky-700 dark:text-sky-300",
-  },
-  {
-    ring: "ring-violet-500/50",
-    bar: "border-l-violet-500/70",
-    name: "text-violet-700 dark:text-violet-300",
-  },
-  {
-    ring: "ring-emerald-500/50",
-    bar: "border-l-emerald-500/70",
-    name: "text-emerald-700 dark:text-emerald-300",
-  },
-  {
-    ring: "ring-amber-500/50",
-    bar: "border-l-amber-500/70",
-    name: "text-amber-700 dark:text-amber-300",
-  },
-  {
-    ring: "ring-rose-500/50",
-    bar: "border-l-rose-500/70",
-    name: "text-rose-700 dark:text-rose-300",
-  },
-  {
-    ring: "ring-indigo-500/50",
-    bar: "border-l-indigo-500/70",
-    name: "text-indigo-700 dark:text-indigo-300",
-  },
-  {
-    ring: "ring-teal-500/50",
-    bar: "border-l-teal-500/70",
-    name: "text-teal-700 dark:text-teal-300",
-  },
-] as const
-
-const NEUTRAL_ACCENT = {
-  ring: "ring-border",
-  bar: "border-l-border",
-  name: "text-foreground",
+/** Static utility classes reading the `--rt-*` brand variables. */
+export const BRAND_CLASSES = {
+  ring: "ring-(--rt-c) dark:ring-(--rt-c-dark)",
+  fill: "bg-(--rt-c)/10 dark:bg-(--rt-c-dark)/15",
+  bar: "border-l-(--rt-c) dark:border-l-(--rt-c-dark)",
+  border: "border-(--rt-c)/40 dark:border-(--rt-c-dark)/45",
+  text: "text-(color:--rt-t) dark:text-(color:--rt-t-dark)",
 } as const
 
-export function seatAccent(seatOrdinal: number | null) {
-  if (seatOrdinal === null || seatOrdinal < 0) return NEUTRAL_ACCENT
-  return SEAT_ACCENTS[seatOrdinal % SEAT_ACCENTS.length]
+const SeatBrandContext = createContext<Map<number, SeatBrand>>(new Map())
+
+/** Brand for a speaker: its seat's brand, else derived from agent/model. */
+export function speakerSeatBrand(
+  speaker: Pick<
+    TranscriptSpeaker,
+    "seatOrdinal" | "agent" | "modelId" | "providerRef"
+  >,
+  seats: Map<number, SeatBrand>
+): SeatBrand {
+  const seat =
+    speaker.seatOrdinal !== null ? seats.get(speaker.seatOrdinal) : undefined
+  if (seat) return seat
+  const key = roundtableBrandKey(speaker.agent, [
+    speaker.modelId,
+    speaker.providerRef,
+  ])
+  return { key, variant: 0, shared: false, brand: roundtableBrand(key) }
 }
 
+/**
+ * Circular avatar: the agent mark centered on a brand-tinted disc with a
+ * brand ring. When several members run the same agent, a seat number badge
+ * keeps them apart (their rings are also shaded differently).
+ */
 export function RoundtableSpeakerAvatar({
   agent,
-  seatOrdinal,
+  seat,
+  seatNumber,
+  size = "md",
   className,
 }: {
   agent: string
-  seatOrdinal: number | null
+  seat: SeatBrand
+  seatNumber?: number | null
+  size?: "md" | "sm"
   className?: string
 }) {
   return (
     <span
       aria-hidden="true"
-      data-seat={seatOrdinal ?? undefined}
+      data-rt-avatar=""
+      data-brand={seat.key}
+      data-variant={seat.variant}
+      style={brandStyle(seat.brand)}
       className={cn(
-        "flex size-8 shrink-0 items-center justify-center rounded-full bg-background ring-2",
-        seatAccent(seatOrdinal).ring,
+        "relative grid shrink-0 place-items-center rounded-full",
+        BRAND_CLASSES.ring,
+        BRAND_CLASSES.fill,
+        size === "md" ? "size-8 ring-2" : "size-6 ring-[1.5px]",
         className
       )}
     >
-      <AgentIcon agentType={agent as AgentType} className="size-4.5" />
+      <AgentIcon
+        agentType={agent as AgentType}
+        className={cn(
+          size === "md" ? "size-4.5" : "size-3.5",
+          BRAND_CLASSES.text
+        )}
+      />
+      {seat.shared && seatNumber != null ? (
+        <span
+          data-testid="seat-number"
+          className={cn(
+            "absolute -end-1 -bottom-1 grid size-3.5 place-items-center rounded-full bg-background text-[9px] leading-none font-semibold tabular-nums ring-1",
+            BRAND_CLASSES.ring,
+            BRAND_CLASSES.text
+          )}
+        >
+          {seatNumber}
+        </span>
+      ) : null}
     </span>
   )
 }
@@ -160,6 +179,10 @@ export function RoundtableTranscript({
     () => buildRoundtableTranscript(projection, messages, previewInputs),
     [projection, messages, previewInputs]
   )
+  const seatBrands = useMemo(
+    () => roundtableSeatBrands(projection.body.replay.config),
+    [projection.body.replay.config]
+  )
   const labelFor = useMemo(() => {
     const labels = new Map(
       Object.entries(model.seats).map(([alias, speaker]) => [
@@ -186,71 +209,73 @@ export function RoundtableTranscript({
   }
 
   return (
-    <SeatLabelContext.Provider value={labelFor}>
-      <section
-        aria-label={t("results")}
-        role="log"
-        data-testid="roundtable-transcript"
-        className="flex w-full max-w-3xl min-w-0 flex-col gap-5"
-      >
-        <h3 className="text-sm font-semibold">{t("results")}</h3>
-        {model.phases.map((phase) => {
-          const title = phaseTitle(phase)
-          const conclusion = phase.kind === "synthesis"
-          const Icon =
-            phase.kind === "proposal"
-              ? Lightbulb
-              : phase.kind === "critique"
-                ? MessagesSquare
-                : conclusion
-                  ? Sparkles
-                  : CircleDot
-          return (
-            <section
-              key={phase.id}
-              aria-label={title}
-              data-phase={phase.kind}
-              className={cn(
-                "flex min-w-0 flex-col gap-1",
-                conclusion &&
-                  "rounded-2xl border border-primary/30 bg-primary/5 p-3 shadow-xs sm:p-4"
-              )}
-            >
-              <div className="flex min-w-0 items-center gap-3">
-                {conclusion ? null : (
-                  <div className="h-px min-w-4 flex-1 bg-border" />
+    <SeatBrandContext.Provider value={seatBrands}>
+      <SeatLabelContext.Provider value={labelFor}>
+        <section
+          aria-label={t("results")}
+          role="log"
+          data-testid="roundtable-transcript"
+          className="flex w-full max-w-3xl min-w-0 flex-col gap-5"
+        >
+          <h3 className="text-sm font-semibold">{t("results")}</h3>
+          {model.phases.map((phase) => {
+            const title = phaseTitle(phase)
+            const conclusion = phase.kind === "synthesis"
+            const Icon =
+              phase.kind === "proposal"
+                ? Lightbulb
+                : phase.kind === "critique"
+                  ? MessagesSquare
+                  : conclusion
+                    ? Sparkles
+                    : CircleDot
+            return (
+              <section
+                key={phase.id}
+                aria-label={title}
+                data-phase={phase.kind}
+                className={cn(
+                  "flex min-w-0 flex-col gap-1",
+                  conclusion &&
+                    "rounded-2xl border border-primary/30 bg-primary/5 p-3 shadow-xs sm:p-4"
                 )}
-                <h4
-                  className={cn(
-                    "inline-flex shrink-0 items-center gap-1.5 text-xs font-semibold tracking-wide",
-                    conclusion
-                      ? "text-sm text-primary"
-                      : "rounded-full border bg-background px-3 py-1 text-muted-foreground"
+              >
+                <div className="flex min-w-0 items-center gap-3">
+                  {conclusion ? null : (
+                    <div className="h-px min-w-4 flex-1 bg-border" />
                   )}
-                >
-                  <Icon aria-hidden="true" className="size-3.5 shrink-0" />
-                  {title}
-                </h4>
-                <div className="h-px min-w-4 flex-1 bg-border" />
-              </div>
-              <ol className="min-w-0">
-                {phase.turns.map((turn, index) => (
-                  <li key={turn.key} className="min-w-0 list-none">
-                    <TranscriptTurnView
-                      turn={turn}
-                      locale={locale}
-                      seats={model.seats}
-                      last={index === phase.turns.length - 1}
-                      conclusion={conclusion}
-                    />
-                  </li>
-                ))}
-              </ol>
-            </section>
-          )
-        })}
-      </section>
-    </SeatLabelContext.Provider>
+                  <h4
+                    className={cn(
+                      "inline-flex shrink-0 items-center gap-1.5 text-xs font-semibold tracking-wide",
+                      conclusion
+                        ? "text-sm text-primary"
+                        : "h-7 rounded-full border bg-background px-3 leading-none text-muted-foreground"
+                    )}
+                  >
+                    <Icon aria-hidden="true" className="size-3.5 shrink-0" />
+                    {title}
+                  </h4>
+                  <div className="h-px min-w-4 flex-1 bg-border" />
+                </div>
+                <ol className="min-w-0">
+                  {phase.turns.map((turn, index) => (
+                    <li key={turn.key} className="min-w-0 list-none">
+                      <TranscriptTurnView
+                        turn={turn}
+                        locale={locale}
+                        seats={model.seats}
+                        last={index === phase.turns.length - 1}
+                        conclusion={conclusion}
+                      />
+                    </li>
+                  ))}
+                </ol>
+              </section>
+            )
+          })}
+        </section>
+      </SeatLabelContext.Provider>
+    </SeatBrandContext.Provider>
   )
 }
 
@@ -277,17 +302,12 @@ function RoundtableMarkdown({ text }: { text: string }) {
   )
 }
 
-function Chip({
-  children,
-  className,
-}: {
-  children: ReactNode
-  className?: string
-}) {
+function Chip({ children, className, ...props }: ComponentProps<"span">) {
   return (
     <span
+      {...props}
       className={cn(
-        "inline-flex items-center rounded-full px-2 py-0.5 text-[11px] leading-4 font-medium",
+        "inline-flex h-5 items-center gap-1 rounded-full px-2 text-[11px] leading-none font-medium whitespace-nowrap",
         className
       )}
     >
@@ -331,7 +351,8 @@ function TranscriptTurnView({
   conclusion: boolean
 }) {
   const t = useTranslations("Roundtable")
-  const accent = seatAccent(turn.speaker.seatOrdinal)
+  const seatBrands = useContext(SeatBrandContext)
+  const seat = speakerSeatBrand(turn.speaker, seatBrands)
   const name = speakerName(turn.speaker, t)
   const moderatorTurn = turn.speaker.role === "moderator"
   const confidence = (value: string) => {
@@ -371,12 +392,19 @@ function TranscriptTurnView({
       data-visibility={turn.visibility}
       data-speaker-role={turn.speaker.role}
       data-seat={turn.speaker.seatOrdinal ?? undefined}
+      data-brand={seat.key}
+      style={brandStyle(seat.brand)}
       className="relative flex min-w-0 gap-2 pt-4 sm:gap-3"
     >
       <div className="flex shrink-0 flex-col items-center">
         <RoundtableSpeakerAvatar
           agent={turn.speaker.agent}
-          seatOrdinal={turn.speaker.seatOrdinal}
+          seat={seat}
+          seatNumber={
+            turn.speaker.seatOrdinal !== null
+              ? turn.speaker.seatOrdinal + 1
+              : null
+          }
         />
         {last ? null : (
           <div
@@ -388,7 +416,13 @@ function TranscriptTurnView({
       </div>
       <div className="min-w-0 flex-1 space-y-2 pb-1">
         <header className="flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1 pt-1 text-xs text-muted-foreground">
-          <span className={cn("text-sm font-semibold", accent.name)}>
+          <span
+            data-testid="speaker-name"
+            className={cn(
+              "text-sm leading-5 font-semibold",
+              BRAND_CLASSES.text
+            )}
+          >
             {name}
           </span>
           {moderatorTurn ? (
@@ -397,22 +431,27 @@ function TranscriptTurnView({
               {t("moderator")}
             </Chip>
           ) : turn.speaker.participantRole ? (
-            <Chip className={cn(MUTED_TONE, "[overflow-wrap:anywhere]")}>
+            <Chip
+              className={cn(
+                MUTED_TONE,
+                "h-auto min-h-5 py-0.5 whitespace-normal [overflow-wrap:anywhere]"
+              )}
+            >
               {turn.speaker.participantRole}
             </Chip>
           ) : null}
           {turn.speaker.modelId ? (
-            <span className="font-mono text-[11px] [overflow-wrap:anywhere]">
+            <span className="font-mono text-[11px] leading-5 [overflow-wrap:anywhere]">
               {turn.speaker.modelId}
             </span>
           ) : null}
           {turn.finishedAt ? (
-            <>
+            <span className="inline-flex items-center gap-2 leading-5 whitespace-nowrap">
               <span aria-hidden="true">·</span>
               <time dateTime={turn.finishedAt} title={turn.finishedAt}>
                 {formatStamp(turn.finishedAt, locale)}
               </time>
-            </>
+            </span>
           ) : null}
           <span className="ms-auto flex flex-wrap items-center gap-1">
             {turn.visibility === "published" ? (
@@ -451,7 +490,7 @@ function TranscriptTurnView({
           data-testid="turn-body"
           className={cn(
             "min-w-0 rounded-xl border border-l-[3px] bg-card px-3 py-3 shadow-xs sm:px-4",
-            accent.bar,
+            BRAND_CLASSES.bar,
             conclusion && "bg-background"
           )}
         >
@@ -574,15 +613,22 @@ function TranscriptTurnView({
                             className="mt-1 flex flex-wrap items-center gap-1 text-xs text-muted-foreground"
                           >
                             <span>{t("supportedBy")}</span>
-                            {supporters.map(({ alias, seat }) => (
+                            {supporters.map(({ alias, seat: supporter }) => (
                               <Chip
                                 key={alias}
+                                data-brand={
+                                  speakerSeatBrand(supporter, seatBrands).key
+                                }
+                                style={brandStyle(
+                                  speakerSeatBrand(supporter, seatBrands).brand
+                                )}
                                 className={cn(
                                   "border bg-background",
-                                  seatAccent(seat.seatOrdinal).name
+                                  BRAND_CLASSES.border,
+                                  BRAND_CLASSES.text
                                 )}
                               >
-                                {seatLabel(seat, t)}
+                                {seatLabel(supporter, t)}
                               </Chip>
                             ))}
                           </p>

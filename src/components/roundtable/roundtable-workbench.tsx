@@ -41,10 +41,14 @@ import { Textarea } from "@/components/ui/textarea"
 import { PreflightConfirmation } from "./preflight-confirmation"
 import { RoundtableSafeContent } from "./roundtable-safe-content"
 import { RoundtableRoomList } from "./roundtable-room-list"
+import { brandStyle, roundtableSeatBrands } from "@/lib/roundtable/brand"
+import { cn } from "@/lib/utils"
 import { RoundtableInlineText } from "./roundtable-inline-text"
 import {
+  BRAND_CLASSES,
   RoundtableSpeakerAvatar,
   RoundtableTranscript,
+  speakerSeatBrand,
 } from "./roundtable-transcript"
 
 type LoadedRoom = Awaited<ReturnType<typeof loadRoundtable>>
@@ -857,6 +861,9 @@ export function RoundtableWorkbench({
               ) : null}
               <ol className="flex flex-wrap gap-2 rounded-lg bg-muted/40 p-3 text-sm leading-relaxed">
                 {projection.body.replay.speakers.map((speaker) => {
+                  const seatBrands = roundtableSeatBrands(
+                    projection.body.replay.config
+                  )
                   const replayConfig = projection.body.replay.config
                   const seatOrdinal =
                     speaker.role === "moderator"
@@ -866,17 +873,34 @@ export function RoundtableWorkbench({
                     replayConfig?.participants.find(
                       (participant) => participant.ordinal === seatOrdinal
                     )?.agent ?? "codex"
+                  const seat = speakerSeatBrand(
+                    {
+                      seatOrdinal,
+                      agent,
+                      modelId: speaker.model_id,
+                      providerRef: speaker.provider_ref,
+                    },
+                    seatBrands
+                  )
                   return (
                     <li
                       key={speaker.speaker_id}
-                      className="flex min-w-0 items-center gap-2 rounded-2xl border bg-background py-1 ps-1 pe-3"
+                      data-brand={seat.key}
+                      style={brandStyle(seat.brand)}
+                      className={cn(
+                        "flex min-h-8 min-w-0 items-center gap-2 rounded-2xl border bg-background py-1 ps-1 pe-3",
+                        BRAND_CLASSES.border
+                      )}
                     >
                       <RoundtableSpeakerAvatar
                         agent={agent}
-                        seatOrdinal={seatOrdinal}
-                        className="size-6 ring-1 [&_svg]:size-3.5"
+                        seat={seat}
+                        seatNumber={
+                          seatOrdinal !== null ? seatOrdinal + 1 : null
+                        }
+                        size="sm"
                       />
-                      <span className="min-w-0 [overflow-wrap:anywhere]">
+                      <span className="min-w-0 leading-5 [overflow-wrap:anywhere]">
                         {speaker.role === "moderator"
                           ? t("moderator")
                           : `${t("member")} ${speaker.ordinal + 1}`}{" "}

@@ -445,14 +445,15 @@ describe("roundtable transcript view", () => {
     expect(
       container.querySelectorAll("[data-testid='turn-connector']")
     ).toHaveLength(2)
-    // The moderator turn keeps the moderating member's seat accent.
+    // The moderator turn keeps the moderating member's brand (Grok).
     expect(container.querySelector("[data-message-id='m5']")).toHaveAttribute(
       "data-seat",
       "0"
     )
-    expect(
-      container.querySelector("[data-message-id='m5'] [data-seat='0']")
-    ).toHaveClass("ring-sky-500/50")
+    expect(container.querySelector("[data-message-id='m5']")).toHaveAttribute(
+      "data-brand",
+      "grok"
+    )
     expect(
       [...turns].map((node) => node.getAttribute("data-message-id"))
     ).toEqual(ids)
@@ -463,5 +464,70 @@ describe("roundtable transcript view", () => {
     expect(
       container.querySelector("[data-message-id='m1'] details")
     ).toHaveTextContent("10")
+  })
+
+  it("colors speakers by agent brand and centers the mark in the avatar", () => {
+    const { container } = render(
+      <RoundtableTranscript projection={projection()} messages={[proposal()]} />
+    )
+    const turn = container.querySelector("[data-message-id='proposal']")
+    expect(turn).toHaveAttribute("data-brand", "grok")
+    expect((turn as HTMLElement).style.getPropertyValue("--rt-c")).toBe(
+      "#111111"
+    )
+    expect((turn as HTMLElement).style.getPropertyValue("--rt-c-dark")).toBe(
+      "#E5E5E5"
+    )
+    const avatar = turn?.querySelector("[data-rt-avatar]")
+    expect(avatar).toHaveClass("grid", "place-items-center", "size-8")
+    // Even box sizes keep the mark on whole pixels (32px disc, 18px mark).
+    expect(avatar?.firstElementChild).toHaveClass("size-4.5")
+    expect(
+      turn?.querySelector("[data-testid='speaker-name']")?.className
+    ).toContain("dark:text-(color:--rt-t-dark)")
+    expect(
+      turn?.querySelector("[data-testid='turn-body']")?.className
+    ).toContain("border-l-(--rt-c)")
+    // Only one member uses Grok here, so no seat number badge.
+    expect(turn?.querySelector("[data-testid='seat-number']")).toBeNull()
+  })
+
+  it("keeps two members on the same agent distinguishable", () => {
+    const base = projection()
+    base.body.replay.config!.participants[1].agent = "grok"
+    const { container } = render(
+      <RoundtableTranscript
+        projection={base}
+        messages={[
+          proposal(),
+          {
+            ...proposal(),
+            message_id: "second",
+            speaker_id: "speaker-2",
+            attempt_id: null,
+            body: { kind: "proposal", summary: "second grok" },
+          },
+        ]}
+      />
+    )
+    const first = container.querySelector(
+      "[data-message-id='proposal'] [data-rt-avatar]"
+    ) as HTMLElement
+    const second = container.querySelector(
+      "[data-message-id='second'] [data-rt-avatar]"
+    ) as HTMLElement
+    expect(first.dataset.brand).toBe("grok")
+    expect(second.dataset.brand).toBe("grok")
+    expect(first.dataset.variant).toBe("0")
+    expect(second.dataset.variant).toBe("1")
+    expect(second.style.getPropertyValue("--rt-c")).not.toBe(
+      first.style.getPropertyValue("--rt-c")
+    )
+    expect(
+      first.querySelector("[data-testid='seat-number']")
+    ).toHaveTextContent("1")
+    expect(
+      second.querySelector("[data-testid='seat-number']")
+    ).toHaveTextContent("2")
   })
 })
