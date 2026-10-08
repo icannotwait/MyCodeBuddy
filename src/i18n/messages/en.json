@@ -7567,6 +7567,17 @@
     "review": "Review and create",
     "reviewHelp": "The check resolves the actual models, tools and budget. Creating saves a draft; nothing runs until you start it.",
     "checking": "Checking readiness… this can take a few seconds.",
-    "confirmToCreate": "Tick the confirmation above to create the draft."
+    "confirmToCreate": "Tick the confirmation above to create the draft.",
+    "workspace": "Workspace",
+    "workspaceHelp": "The room, its history and any source files belong to this workspace.",
+    "workspacePlaceholder": "Choose a workspace",
+    "workspacesLoading": "Loading workspaces…",
+    "workspacesEmpty": "No workspaces yet. Open a project folder first, then come back.",
+    "workspacesError": "Couldn't load workspaces.",
+    "retryWorkspaces": "Retry",
+    "openFolder": "Open a folder",
+    "workspaceUnknown": "Workspace #{id} (unavailable)",
+    "workspaceUnavailable": "This workspace is no longer available. Choose another one.",
+    "sourceRootHelp": "Paths are relative to {path}."
   }
 }

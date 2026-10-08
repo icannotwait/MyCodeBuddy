@@ -25,7 +25,36 @@ const transport = vi.hoisted(() => ({
 }))
 const listModelProviders = vi.hoisted(() => vi.fn())
 vi.mock("@/lib/transport", () => ({ getTransport: () => transport }))
-vi.mock("@/lib/api", () => ({ listModelProviders }))
+const recoveryFolders = vi.hoisted(() => [
+  {
+    id: 7,
+    name: "project",
+    path: "/repo/project",
+    kind: "regular",
+    parent_id: null,
+    alias: null,
+  },
+  {
+    id: 9,
+    name: "other",
+    path: "/repo/other",
+    kind: "regular",
+    parent_id: null,
+    alias: "Other",
+  },
+  {
+    id: 11,
+    name: "chat",
+    path: "/tmp/chat",
+    kind: "chat",
+    parent_id: null,
+    alias: null,
+  },
+])
+vi.mock("@/lib/api", () => ({
+  listModelProviders,
+  listAllFolderDetails: async () => recoveryFolders,
+}))
 vi.mock("next-intl", () => ({
   useTranslations: () => (key: string) => key,
   useLocale: () => "en",
@@ -195,7 +224,7 @@ describe("roundtable workbench recovery", () => {
         return Promise.reject(new Error("list unavailable"))
       return original(command, args)
     })
-    render(<RoundtableWorkbench workspaceId="workspace" />)
+    render(<RoundtableWorkbench workspaceId="7" />)
 
     await screen.findByText("list unavailable")
     await waitFor(() =>
@@ -220,7 +249,7 @@ describe("roundtable workbench recovery", () => {
         return Promise.resolve(page(response, ["Room A"], null))
       return original(command, args)
     })
-    render(<RoundtableWorkbench workspaceId="workspace" />)
+    render(<RoundtableWorkbench workspaceId="7" />)
 
     await screen.findByText("providers unavailable")
     expect(screen.getByRole("link", { name: /Room A/ })).toBeInTheDocument()
@@ -245,7 +274,7 @@ describe("roundtable workbench recovery", () => {
       if (command === "roundtable_list") return list.promise
       return original(command, args)
     })
-    render(<RoundtableWorkbench workspaceId="workspace" />)
+    render(<RoundtableWorkbench workspaceId="7" />)
 
     expect(screen.getByText("loadingRooms")).toBeInTheDocument()
     expect(screen.queryByText("noRooms")).not.toBeInTheDocument()
@@ -447,7 +476,7 @@ describe("roundtable workbench recovery", () => {
           : Promise.resolve(page(response, ["Room A"], "next"))
       return original(command, args)
     })
-    render(<RoundtableWorkbench workspaceId="workspace" />)
+    render(<RoundtableWorkbench workspaceId="7" />)
     const more = await screen.findByRole("button", { name: "more" })
     fireEvent.click(more)
     fireEvent.click(more)
@@ -477,7 +506,7 @@ describe("roundtable workbench recovery", () => {
         )
       return original(command, args)
     })
-    render(<RoundtableWorkbench workspaceId="workspace" />)
+    render(<RoundtableWorkbench workspaceId="7" />)
     fireEvent.click(await screen.findByRole("button", { name: "more" }))
     await screen.findByRole("link", { name: /Room B/ })
 

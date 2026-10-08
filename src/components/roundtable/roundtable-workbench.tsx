@@ -3,7 +3,7 @@
 import Link from "next/link"
 import { useCallback, useEffect, useRef, useState } from "react"
 import { useTranslations } from "next-intl"
-import { listModelProviders } from "@/lib/api"
+import { listAllFolderDetails, listModelProviders } from "@/lib/api"
 import { getTransport } from "@/lib/transport"
 import { initialRoundtableView } from "@/lib/roundtable/reducer"
 import { applyRoundtablePreview } from "@/lib/roundtable/stream"
@@ -25,7 +25,7 @@ import {
   clearPendingPaidMutation,
 } from "@/lib/roundtable/mutation"
 import type { PendingRoundtableMutation } from "@/lib/roundtable/mutation"
-import type { ModelProviderInfo } from "@/lib/types"
+import type { FolderDetail, ModelProviderInfo } from "@/lib/types"
 import type {
   RoundtableConfig,
   RoundtablePreflight,
@@ -35,7 +35,13 @@ import type {
   RoundtableUsage,
   RoundtableView,
 } from "@/lib/roundtable/types"
-import { CircleCheck, Loader2, ShieldCheck, TriangleAlert } from "lucide-react"
+import {
+  CircleCheck,
+  FolderOpen,
+  Loader2,
+  ShieldCheck,
+  TriangleAlert,
+} from "lucide-react"
 import { Button } from "@/components/ui/button"
 import { Textarea } from "@/components/ui/textarea"
 import { PreflightConfirmation } from "./preflight-confirmation"
@@ -49,6 +55,7 @@ import {
 } from "./roundtable-composer"
 import { RoundtableSafeContent } from "./roundtable-safe-content"
 import { RoundtableRoomList } from "./roundtable-room-list"
+import { RoundtableWorkspaceSelect } from "./roundtable-workspace-select"
 import { brandStyle, roundtableSeatBrands } from "@/lib/roundtable/brand"
 import { cn } from "@/lib/utils"
 import { RoundtableInlineText } from "./roundtable-inline-text"
@@ -63,13 +70,21 @@ type LoadedRoom = Awaited<ReturnType<typeof loadRoundtable>>
 type RoomSummary = { room_id: string; status: string; config: RoundtableConfig }
 
 export function RoundtableWorkbench({
-  workspaceId,
+  workspaceId: urlWorkspaceId,
   roomId,
 }: {
   workspaceId: string
   roomId?: string
 }) {
   const t = useTranslations("Roundtable")
+  // The create flow can switch workspace in place (keeping the form); an open
+  // room stays bound to the workspace in its URL.
+  const [workspaceId, setWorkspaceId] = useState(urlWorkspaceId)
+  useEffect(() => setWorkspaceId(urlWorkspaceId), [urlWorkspaceId])
+  const [workspaces, setWorkspaces] = useState<FolderDetail[] | null>(null)
+  const [workspacesLoading, setWorkspacesLoading] = useState(true)
+  const [workspacesError, setWorkspacesError] = useState<string | null>(null)
+  const workspacesGeneration = useRef(0)
   const [providers, setProviders] = useState<ModelProviderInfo[]>([])
   const [rooms, setRooms] = useState<RoomSummary[]>([])
   const [listCursor, setListCursor] = useState<string | null>(null)
@@ -125,6 +140,13 @@ export function RoundtableWorkbench({
   const [uncertainPaid, setUncertainPaid] = useState(
     () => !!pendingPaidMutation(mutationScope)
   )
+  const lastScope = useRef(mutationScope)
+  useEffect(() => {
+    if (lastScope.current === mutationScope) return
+    lastScope.current = mutationScope
+    mutation.current = pendingPaidMutation(mutationScope)
+    setUncertainPaid(!!mutation.current)
+  }, [mutationScope])
 
   const run = useCallback(async (action: () => Promise<void>) => {
     if (actionInFlight.current) return
@@ -183,6 +205,12 @@ export function RoundtableWorkbench({
   )
 
   useEffect(() => {
+    setRooms([])
+    setListCursor(null)
+    setListError(null)
+  }, [workspaceId])
+
+  useEffect(() => {
     void listRooms()
     return () => {
       listGeneration.current += 1
@@ -209,6 +237,31 @@ export function RoundtableWorkbench({
       }
     }
   }, [])
+
+  const loadWorkspaces = useCallback(async () => {
+    const generation = ++workspacesGeneration.current
+    setWorkspacesLoading(true)
+    setWorkspacesError(null)
+    try {
+      const items = await listAllFolderDetails()
+      // Rooms resolve sources only against live regular folders.
+      if (generation === workspacesGeneration.current)
+        setWorkspaces(items.filter((folder) => folder.kind === "regular"))
+    } catch (error) {
+      if (generation === workspacesGeneration.current)
+        setWorkspacesError(roundtableError(error))
+    } finally {
+      if (generation === workspacesGeneration.current)
+        setWorkspacesLoading(false)
+    }
+  }, [])
+
+  useEffect(() => {
+    void loadWorkspaces()
+    return () => {
+      workspacesGeneration.current += 1
+    }
+  }, [loadWorkspaces])
 
   useEffect(() => {
     void loadProviders()
@@ -668,9 +721,28 @@ export function RoundtableWorkbench({
     preflight.enabled &&
     preflight.readiness === "ready" &&
     !preflight.error
+  const currentWorkspace = workspaces?.find(
+    (folder) => String(folder.id) === workspaceId
+  )
+  const workspaceUnavailable =
+    !!workspaceId && !!workspaces && !currentWorkspace
+  const selectWorkspace = (next: string) => {
+    if (next === workspaceId) return
+    setWorkspaceId(next)
+    invalidate()
+    setError(null)
+    // Keep the URL (and the room list links built from it) on the new workspace
+    // without remounting the form.
+    window.history.replaceState(
+      null,
+      "",
+      `/roundtable?workspace_id=${encodeURIComponent(next)}`
+    )
+  }
   const preflightDisabled =
     busy ||
     !workspaceId ||
+    (!roomId && workspaceUnavailable) ||
     (!!roomId && (!loaded || !!roomError || roomLoading)) ||
     !sourceSelectionValid ||
     editingDraft ||
@@ -771,7 +843,20 @@ export function RoundtableWorkbench({
   return (
     <main className="mx-auto flex w-full min-w-0 max-w-6xl flex-col gap-5 overflow-auto p-4 sm:p-6">
       <header className="flex flex-wrap items-center justify-between gap-3 border-b pb-4">
-        <h1 className="text-2xl font-semibold tracking-tight">{t("title")}</h1>
+        <div className="flex min-w-0 flex-wrap items-baseline gap-x-3 gap-y-1">
+          <h1 className="text-2xl font-semibold tracking-tight">
+            {t("title")}
+          </h1>
+          {currentWorkspace ? (
+            <span
+              className="flex min-w-0 items-center gap-1.5 text-sm text-muted-foreground"
+              title={currentWorkspace.path}
+            >
+              <FolderOpen aria-hidden="true" className="size-3.5 shrink-0" />
+              <span className="truncate">{currentWorkspace.name}</span>
+            </span>
+          ) : null}
+        </div>
         <Link
           href="/workspace"
           className="rounded-md text-sm text-muted-foreground hover:text-foreground focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring"
@@ -787,7 +872,9 @@ export function RoundtableWorkbench({
           {error}
         </p>
       ) : null}
-      {!workspaceId ? <p role="alert">{t("workspaceRequired")}</p> : null}
+      {!workspaceId && roomId ? (
+        <p role="alert">{t("workspaceRequired")}</p>
+      ) : null}
       {uncertainPaid ? (
         <section aria-label={t("pendingPaidOperation")}>
           <p role="status">{t("pendingPaidOperation")}</p>
@@ -870,6 +957,20 @@ export function RoundtableWorkbench({
                 </p>
               </div>
               <RoundtableComposer
+                workspaceField={
+                  !roomId ? (
+                    <RoundtableWorkspaceSelect
+                      workspaces={workspaces}
+                      loading={workspacesLoading}
+                      error={workspacesError}
+                      value={workspaceId}
+                      disabled={busy || uncertainPaid}
+                      onChange={selectWorkspace}
+                      onRetry={() => void loadWorkspaces()}
+                    />
+                  ) : undefined
+                }
+                sourceRoot={currentWorkspace?.path}
                 topic={topic}
                 onTopicChange={(value) => {
                   setTopic(value)
@@ -1042,7 +1143,7 @@ export function RoundtableWorkbench({
           ) : null}
           {!roomId ? (
             <RoundtableStep
-              step={4}
+              step={5}
               title={t("review")}
               description={t("reviewHelp")}
             >

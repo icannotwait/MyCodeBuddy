@@ -7567,6 +7567,17 @@
     "review": "Revisar y crear",
     "reviewHelp": "La comprobación resuelve los modelos, herramientas y presupuesto reales. Crear guarda un borrador; nada se ejecuta hasta que lo inicies.",
     "checking": "Comprobando… puede tardar unos segundos.",
-    "confirmToCreate": "Marca la confirmación de arriba para crear el borrador."
+    "confirmToCreate": "Marca la confirmación de arriba para crear el borrador.",
+    "workspace": "Espacio de trabajo",
+    "workspaceHelp": "La sala, su historial y los archivos de origen pertenecen a este espacio de trabajo.",
+    "workspacePlaceholder": "Elige un espacio de trabajo",
+    "workspacesLoading": "Cargando espacios de trabajo…",
+    "workspacesEmpty": "Aún no hay espacios de trabajo. Abre primero una carpeta de proyecto y vuelve.",
+    "workspacesError": "No se pudieron cargar los espacios de trabajo.",
+    "retryWorkspaces": "Reintentar",
+    "openFolder": "Abrir una carpeta",
+    "workspaceUnknown": "Espacio de trabajo n.º {id} (no disponible)",
+    "workspaceUnavailable": "Este espacio de trabajo ya no está disponible. Elige otro.",
+    "sourceRootHelp": "Las rutas son relativas a {path}."
   }
 }

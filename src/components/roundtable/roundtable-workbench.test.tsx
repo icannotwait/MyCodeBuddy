@@ -9,8 +9,36 @@ const call = vi.hoisted(() => vi.fn())
 vi.mock("@/lib/transport", () => ({
   getTransport: () => ({ call, subscribe: async () => () => undefined }),
 }))
+const folders = vi.hoisted(() => [
+  {
+    id: 7,
+    name: "project",
+    path: "/repo/project",
+    kind: "regular",
+    parent_id: null,
+    alias: null,
+  },
+  {
+    id: 9,
+    name: "other",
+    path: "/repo/other",
+    kind: "regular",
+    parent_id: null,
+    alias: "Other",
+  },
+  {
+    id: 11,
+    name: "chat",
+    path: "/tmp/chat",
+    kind: "chat",
+    parent_id: null,
+    alias: null,
+  },
+])
+const listAllFolderDetails = vi.hoisted(() => vi.fn(async () => folders))
 vi.mock("@/lib/api", () => ({
   listModelProviders: async () => [{ id: 1, name: "Provider", model: null }],
+  listAllFolderDetails,
 }))
 vi.mock("next-intl", () => ({
   useTranslations: () => (key: string) => key,
@@ -20,6 +48,8 @@ vi.mock("next-intl", () => ({
 describe("roundtable product page", () => {
   beforeEach(() => {
     call.mockReset()
+    listAllFolderDetails.mockReset()
+    listAllFolderDetails.mockResolvedValue(folders)
     vi.stubGlobal("crypto", webcrypto)
   })
 
@@ -410,7 +440,7 @@ describe("roundtable product page", () => {
               error: null,
             }
     )
-    render(<RoundtableWorkbench workspaceId="workspace" />)
+    render(<RoundtableWorkbench workspaceId="7" />)
     fireEvent.change(screen.getByLabelText("topic"), {
       target: { value: "Question" },
     })
@@ -431,7 +461,7 @@ describe("roundtable product page", () => {
       request: {
         config: expect.objectContaining({
           topic: "Question",
-          workspace_id: "workspace",
+          workspace_id: "7",
           participants: [
             expect.objectContaining({
               ordinal: 0,
@@ -626,7 +656,7 @@ it("includes only explicit relative source selections and invalidates changed se
         throw new Error("draft-created-test-stop")
     }
   )
-  render(<RoundtableWorkbench workspaceId="workspace" />)
+  render(<RoundtableWorkbench workspaceId="7" />)
   fireEvent.change(screen.getByLabelText("topic"), {
     target: { value: "Review selected source" },
   })
@@ -674,7 +704,7 @@ it("does not present a late preflight as confirmation for an edited selection", 
       })
     }
   )
-  render(<RoundtableWorkbench workspaceId="workspace" />)
+  render(<RoundtableWorkbench workspaceId="7" />)
   fireEvent.change(screen.getByLabelText("topic"), {
     target: { value: "Original" },
   })
@@ -720,7 +750,7 @@ it("removes a specific member card and keeps the moderator on the same seat", as
       return new Promise(() => undefined)
     }
   )
-  render(<RoundtableWorkbench workspaceId="workspace" />)
+  render(<RoundtableWorkbench workspaceId="7" />)
   expect(
     screen.queryByRole("button", { name: "removeMember 1" })
   ).not.toBeInTheDocument()

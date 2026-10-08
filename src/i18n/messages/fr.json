@@ -7567,6 +7567,17 @@
     "review": "Vérifier et créer",
     "reviewHelp": "La vérification détermine les modèles, outils et budget réels. Créer enregistre un brouillon ; rien ne s'exécute avant que vous ne le lanciez.",
     "checking": "Vérification en cours… cela peut prendre quelques secondes.",
-    "confirmToCreate": "Cochez la confirmation ci-dessus pour créer le brouillon."
+    "confirmToCreate": "Cochez la confirmation ci-dessus pour créer le brouillon.",
+    "workspace": "Espace de travail",
+    "workspaceHelp": "La salle, son historique et les fichiers sources appartiennent à cet espace de travail.",
+    "workspacePlaceholder": "Choisissez un espace de travail",
+    "workspacesLoading": "Chargement des espaces de travail…",
+    "workspacesEmpty": "Aucun espace de travail pour l'instant. Ouvrez d'abord un dossier de projet, puis revenez.",
+    "workspacesError": "Impossible de charger les espaces de travail.",
+    "retryWorkspaces": "Réessayer",
+    "openFolder": "Ouvrir un dossier",
+    "workspaceUnknown": "Espace de travail n° {id} (indisponible)",
+    "workspaceUnavailable": "Cet espace de travail n'est plus disponible. Choisissez-en un autre.",
+    "sourceRootHelp": "Les chemins sont relatifs à {path}."
   }
 }

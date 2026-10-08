@@ -78,6 +78,17 @@ const newMessages = [
   "reviewHelp",
   "checking",
   "confirmToCreate",
+  "workspace",
+  "workspaceHelp",
+  "workspacePlaceholder",
+  "workspacesLoading",
+  "workspacesEmpty",
+  "workspacesError",
+  "retryWorkspaces",
+  "openFolder",
+  "workspaceUnknown",
+  "workspaceUnavailable",
+  "sourceRootHelp",
 ]
 
 describe("roundtable loading and retry translations", () => {

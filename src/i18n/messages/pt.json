@@ -7567,6 +7567,17 @@
     "review": "Revisar e criar",
     "reviewHelp": "A verificação resolve os modelos, ferramentas e orçamento reais. Criar salva um rascunho; nada é executado até você iniciar.",
     "checking": "Verificando… pode levar alguns segundos.",
-    "confirmToCreate": "Marque a confirmação acima para criar o rascunho."
+    "confirmToCreate": "Marque a confirmação acima para criar o rascunho.",
+    "workspace": "Espaço de trabalho",
+    "workspaceHelp": "A sala, seu histórico e os arquivos de origem pertencem a este espaço de trabalho.",
+    "workspacePlaceholder": "Escolha um espaço de trabalho",
+    "workspacesLoading": "Carregando espaços de trabalho…",
+    "workspacesEmpty": "Ainda não há espaços de trabalho. Abra primeiro uma pasta de projeto e volte.",
+    "workspacesError": "Não foi possível carregar os espaços de trabalho.",
+    "retryWorkspaces": "Tentar novamente",
+    "openFolder": "Abrir uma pasta",
+    "workspaceUnknown": "Espaço de trabalho nº {id} (indisponível)",
+    "workspaceUnavailable": "Este espaço de trabalho não está mais disponível. Escolha outro.",
+    "sourceRootHelp": "Os caminhos são relativos a {path}."
   }
 }

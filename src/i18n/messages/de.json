@@ -7567,6 +7567,17 @@
     "review": "Prüfen und erstellen",
     "reviewHelp": "Die Prüfung ermittelt die tatsächlichen Modelle, Tools und das Budget. Erstellen speichert einen Entwurf; nichts läuft, bevor du ihn startest.",
     "checking": "Prüfung läuft… das kann einige Sekunden dauern.",
-    "confirmToCreate": "Setze oben das Häkchen zur Bestätigung, um den Entwurf zu erstellen."
+    "confirmToCreate": "Setze oben das Häkchen zur Bestätigung, um den Entwurf zu erstellen.",
+    "workspace": "Arbeitsbereich",
+    "workspaceHelp": "Der Raum, sein Verlauf und alle Quelldateien gehören zu diesem Arbeitsbereich.",
+    "workspacePlaceholder": "Arbeitsbereich wählen",
+    "workspacesLoading": "Arbeitsbereiche werden geladen…",
+    "workspacesEmpty": "Noch keine Arbeitsbereiche. Öffne zuerst einen Projektordner und komm dann zurück.",
+    "workspacesError": "Arbeitsbereiche konnten nicht geladen werden.",
+    "retryWorkspaces": "Erneut versuchen",
+    "openFolder": "Ordner öffnen",
+    "workspaceUnknown": "Arbeitsbereich #{id} (nicht verfügbar)",
+    "workspaceUnavailable": "Dieser Arbeitsbereich ist nicht mehr verfügbar. Wähle einen anderen.",
+    "sourceRootHelp": "Pfade sind relativ zu {path}."
   }
 }

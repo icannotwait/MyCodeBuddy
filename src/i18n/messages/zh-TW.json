@@ -7567,6 +7567,17 @@
     "review": "核對並建立",
     "reviewHelp": "預檢會解析實際的模型、工具和預算。建立只會儲存草稿，按「開始」之前不會執行。",
     "checking": "正在預檢，可能需要幾秒鐘…",
-    "confirmToCreate": "勾選上方確認後即可建立草稿。"
+    "confirmToCreate": "勾選上方確認後即可建立草稿。",
+    "workspace": "工作區",
+    "workspaceHelp": "圓桌、歷史紀錄和來源檔案都歸屬於此工作區。",
+    "workspacePlaceholder": "選擇工作區",
+    "workspacesLoading": "正在載入工作區…",
+    "workspacesEmpty": "還沒有工作區。請先開啟一個專案資料夾再回來。",
+    "workspacesError": "無法載入工作區。",
+    "retryWorkspaces": "重試",
+    "openFolder": "開啟資料夾",
+    "workspaceUnknown": "工作區 #{id}（無法使用）",
+    "workspaceUnavailable": "此工作區已無法使用，請選擇其他工作區。",
+    "sourceRootHelp": "路徑相對於 {path}。"
   }
 }

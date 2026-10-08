@@ -7567,6 +7567,17 @@
     "review": "確認して作成",
     "reviewHelp": "チェックで実際のモデル・ツール・予算を確定します。作成すると下書きとして保存され、開始するまで実行されません。",
     "checking": "準備状況を確認中…数秒かかることがあります。",
-    "confirmToCreate": "上の確認にチェックすると下書きを作成できます。"
+    "confirmToCreate": "上の確認にチェックすると下書きを作成できます。",
+    "workspace": "ワークスペース",
+    "workspaceHelp": "ルーム、履歴、ソースファイルはこのワークスペースに属します。",
+    "workspacePlaceholder": "ワークスペースを選択",
+    "workspacesLoading": "ワークスペースを読み込み中…",
+    "workspacesEmpty": "ワークスペースがまだありません。先にプロジェクトフォルダーを開いてから戻ってください。",
+    "workspacesError": "ワークスペースを読み込めませんでした。",
+    "retryWorkspaces": "再試行",
+    "openFolder": "フォルダーを開く",
+    "workspaceUnknown": "ワークスペース #{id}（利用不可）",
+    "workspaceUnavailable": "このワークスペースは利用できなくなりました。別のワークスペースを選んでください。",
+    "sourceRootHelp": "パスは {path} からの相対パスです。"
   }
 }

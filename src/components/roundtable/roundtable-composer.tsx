@@ -89,6 +89,8 @@ export function RoundtableStep({
 }
 
 export function RoundtableComposer({
+  workspaceField,
+  sourceRoot,
   topic,
   onTopicChange,
   showSources,
@@ -130,6 +132,10 @@ export function RoundtableComposer({
   concurrency: number
   onConcurrencyChange: (value: number) => void
   budgetMinutes: number
+  /** Workspace picker rendered as the first step of the create flow. */
+  workspaceField?: ReactNode
+  /** Absolute root that workspace-relative source paths resolve against. */
+  sourceRoot?: string
 }) {
   const t = useTranslations("Roundtable")
   const uid = useId()
@@ -139,10 +145,24 @@ export function RoundtableComposer({
   const sourceErrorId = `${uid}-source-error`
   const sourceHelpId = `${uid}-source-help`
   const canRemove = members.length > ROUNDTABLE_MIN_MEMBERS
+  const offset = workspaceField ? 1 : 0
 
   return (
     <>
-      <RoundtableStep step={1} title={t("topic")} description={t("topicHelp")}>
+      {workspaceField ? (
+        <RoundtableStep
+          step={1}
+          title={t("workspace")}
+          description={t("workspaceHelp")}
+        >
+          {workspaceField}
+        </RoundtableStep>
+      ) : null}
+      <RoundtableStep
+        step={1 + offset}
+        title={t("topic")}
+        description={t("topicHelp")}
+      >
         <div className="flex flex-col gap-2">
           <Textarea
             aria-label={t("topic")}
@@ -203,6 +223,11 @@ export function RoundtableComposer({
                   id={sourceHelpId}
                   className="space-y-1 text-xs leading-relaxed text-muted-foreground"
                 >
+                  {sourceRoot ? (
+                    <p className="[overflow-wrap:anywhere]">
+                      {t("sourceRootHelp", { path: sourceRoot })}
+                    </p>
+                  ) : null}
                   <p>{t("sourceSelectionHelp")}</p>
                   <p>{t("sourceRetentionNotice")}</p>
                 </div>
@@ -213,7 +238,7 @@ export function RoundtableComposer({
       </RoundtableStep>
 
       <RoundtableStep
-        step={2}
+        step={2 + offset}
         title={t("members")}
         description={t("membersHelp")}
         aside={
@@ -416,7 +441,7 @@ export function RoundtableComposer({
         </ol>
       </RoundtableStep>
 
-      <RoundtableStep step={3} title={t("settings")}>
+      <RoundtableStep step={3 + offset} title={t("settings")}>
         <div className="grid min-w-0 gap-3 sm:grid-cols-3">
           <label className="flex min-w-0 flex-col gap-1.5 rounded-xl border bg-background p-3">
             <span className="text-sm font-medium">{t("rounds")}</span>
