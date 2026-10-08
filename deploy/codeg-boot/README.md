@@ -66,6 +66,21 @@ or ACP caches. When scripts change, the watchdog reloads itself via
 
 Disable by removing execute bit: `chmod a-x /workspace/codeg-boot/auto-sync-boot.sh`.
 
+## WebDAV (`start-webdav.sh`)
+
+WsgiDAV listens on `:6065`; the watchdog calls `start-webdav.sh` every loop and
+expects an unauthenticated request to return `401`. Machine-local, never in
+git: `/workspace/webdav/wsgidav.yaml`, its credentials, `start.sh`, and `data/`.
+
+The venv `/workspace/webdav/venv` is regenerable. Box restores/updates can drop
+it (that left WebDAV down from 2026-09-29 to 2026-10-08), so when the port is
+down and the venv is missing or cannot `import wsgidav, cheroot`, the script
+rebuilds it from `CODEG_WEBDAV_PIP_SPEC` (default
+`WsgiDAV==4.3.5 cheroot==11.1.2`), at most once per
+`CODEG_WEBDAV_BOOTSTRAP_INTERVAL` seconds (default `3600`). Outcomes and errors
+go to `/workspace/webdav/webdav.log` (the watchdog discards stderr). Offline
+tests: `node --test scripts/start-webdav.test.mjs`.
+
 ## ACP versions
 
 `ensure-acp-agents.sh` does **not** hardcode agent versions. It asks the live
