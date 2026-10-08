@@ -197,7 +197,7 @@ port_up() {
     ss -ltn 2>/dev/null | grep -q ":${port}"
     return $?
   fi
-  (echo >/dev/tcp/127.0.0.1/$port) >/dev/null 2>&1
+  (echo >/dev/tcp/127.0.0.1/"$port") >/dev/null 2>&1
 }
 
 # Real UI probe: port-up alone misses "bound but static=/out" empty 404.
@@ -499,6 +499,7 @@ while true; do
   s3080=down
   scf=down
   swebdav=down
+  stailscale=missing
   broken=0
   http=down
   pub=unconfigured
@@ -559,8 +560,22 @@ while true; do
     broken=$((broken + 1))
   fi
 
+  # Tailscale (tailnet membership; start script is a no-op when Running).
+  # needs-login waits for a human or an auth key, so it is reported but never
+  # counted as broken; only down/missing count.
+  stailscale=missing
+  if [ -x "$BOOT/start-tailscale.sh" ]; then
+    "$BOOT/start-tailscale.sh" 9>&- || true
+    stailscale=$("$BOOT/start-tailscale.sh" --state 9>&- 2>/dev/null) || true
+    stailscale=${stailscale:-down}
+  fi
+  case $stailscale in
+    up | starting | needs-login | disabled) ;;
+    *) broken=$((broken + 1)) ;;
+  esac
+
   ts=$(TZ=Asia/Shanghai date '+%Y-%m-%d %H:%M:%S CST')
-  echo "$ts 3080=$s3080 http=$http cloudflared=$scf public=$pub pubcode=${pub_code:-na} webdav=$swebdav broken=$broken" >>"$LOG"
+  echo "$ts 3080=$s3080 http=$http cloudflared=$scf public=$pub pubcode=${pub_code:-na} webdav=$swebdav tailscale=$stailscale broken=$broken" >>"$LOG"
 
   loop=$((loop + 1))
   # Every ~10 min: restore/mirror ACP binaries if Update wiped ~/.cache

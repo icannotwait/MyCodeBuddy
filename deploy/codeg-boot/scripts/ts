@@ -1,0 +1,3 @@
+#!/bin/bash
+# Operator shortcut for this box's tailscaled (socket under ~box/tailscale).
+exec sudo /workspace/bin/tailscale --socket=/home/box/tailscale/tailscaled.sock "$@"

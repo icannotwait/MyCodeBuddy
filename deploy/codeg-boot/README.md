@@ -123,6 +123,46 @@ rebuilds it from `CODEG_WEBDAV_PIP_SPEC` (default
 go to `/workspace/webdav/webdav.log` (the watchdog discards stderr). Offline
 tests: `node --test scripts/start-webdav.test.mjs`.
 
+## Tailscale (`start-tailscale.sh`)
+
+The watchdog calls `start-tailscale.sh` every loop and logs
+`tailscale=up|starting|needs-login|down|missing|disabled`. Only `down` and
+`missing` count as broken. `needs-login` waits for a person or an auth key.
+
+The script (re)downloads verified static binaries into `/workspace/bin` when
+they are missing, and keeps `tailscaled` running as root. Networking uses the
+kernel TUN device, or userspace plus a SOCKS5/HTTP proxy on `localhost:1055`
+when `/dev/net/tun` is absent (`TS_USERSPACE=auto`). State and the socket live
+under `~box/tailscale`. A node that is already `Running` is left alone. When
+the node is logged out, the script runs
+`tailscale up --auth-key=file:~box/tailscale/authkey --hostname=$TS_HOSTNAME --ssh`.
+Without a key it does not block: it only logs the login URL.
+
+**Auth keys are never committed and never put in `env.example` or `local.env`.**
+They live only in a mode-`600` file on that machine:
+
+- this box: `/home/box/tailscale/authkey` (set once with `set-tailscale-key.sh`;
+  hidden prompt, stdin, or `TS_AUTHKEY_INPUT`)
+- other Linux hosts: `/etc/tailscale-join/authkey`
+- macOS: `~/.config/tailscale-join/authkey`
+
+Set the box key once, then the watchdog keeps the node joined. CLI on the box:
+`ts status` (`sudo /workspace/bin/tailscale --socket=/home/box/tailscale/tailscaled.sock`).
+`install-boot.sh` installs that `ts` wrapper into `/workspace/bin`.
+
+Other machines (VPS, laptop) join with one script. It installs Tailscale on
+Linux/macOS, prompts once for the key, and stores it only in the local key
+file above:
+
+```bash
+bash deploy/codeg-boot/scripts/join-tailnet.sh
+# curl -fsSL <raw-url>/join-tailnet.sh | bash -s -- [--hostname NAME] [--no-ssh]
+```
+
+Optional `TS_*` settings (env overrides the file) belong in the machine-local
+`local.env`, same path as the watchdog config. See `env.example`. The watchdog
+parser ignores `TS_*`; `start-tailscale.sh` reads them itself.
+
 ## ACP versions
 
 `ensure-acp-agents.sh` does **not** hardcode agent versions. It asks the live
@@ -187,7 +227,9 @@ cp deploy/codeg-boot/env.example /workspace/codeg-boot/local.env
   `export ` prefix, `KEY=VALUE` with optional matching quotes. Only
   `CODEG_PUBLIC_URL`, the numeric limits below, and the `WAKE_*` keys are read; other keys are
   ignored, malformed lines are warned about, and `CODEG_PUBLIC_URL` must be
-  `http(s)://...`.
+  `http(s)://...`. `start-tailscale.sh` reads `TS_*` from the same file on its
+  own; those keys are still ignored by the watchdog. Never put an auth key in
+  this file.
 - Precedence: non-empty launcher environment > local file > built-in default.
 - The watchdog re-checks the file every loop and re-parses it when it changes,
   so edits apply within ~60 s without a restart (`config reloaded` in the log).

@@ -49,6 +49,9 @@ SCRIPTS=(
   start-codeg-server.sh
   start-codeg-tunnel.sh
   start-webdav.sh
+  start-tailscale.sh
+  set-tailscale-key.sh
+  join-tailnet.sh
   reload-watchdog-once.sh
   auto-sync-boot.sh
 )
