@@ -66,6 +66,23 @@ or ACP caches. When scripts change, the watchdog reloads itself via
 
 Disable by removing execute bit: `chmod a-x /workspace/codeg-boot/auto-sync-boot.sh`.
 
+## Tunnel config and HOME
+
+`start-codeg-tunnel.sh` never depends on the caller's `$HOME`. It resolves the
+config as `CF_CONFIG` > `/home/box/.cloudflared/config.yml` >
+`$HOME/.cloudflared/config.yml` > `/etc/cloudflared/config.yml`, runs
+cloudflared with `HOME` set to the owner of that `.cloudflared` dir (the
+config's `credentials-file` stays absolute), and logs the resolved config on
+every start/force and on failure to `cloudflared.log`. Check without touching
+the tunnel: `start-codeg-tunnel.sh --force --print-config`.
+
+`codeg-watchdog.sh`, `reload-watchdog-once.sh`, and `codeg-supervisor.sh` pin
+`HOME=/home/box USER=box LOGNAME=box`, so a relaunch from a sandbox shell
+(e.g. `HOME=/workspace/agent-reach/home`) cannot redirect `$HOME`-based paths.
+On 2026-10-08 that made a forced 1033 recovery fail with
+`missing cloudflared config` until the edge dropped the zombie itself.
+Offline tests: `node --test scripts/start-codeg-tunnel.test.mjs`.
+
 ## WebDAV (`start-webdav.sh`)
 
 WsgiDAV listens on `:6065`; the watchdog calls `start-webdav.sh` every loop and
