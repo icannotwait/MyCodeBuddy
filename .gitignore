@@ -93,3 +93,7 @@ scripts/_schema_peek.py
 scripts/_build_apply_setup.py
 scripts/__pycache__/
 scripts/share/
+
+# Machine-local codeg boot/watchdog config (copy of deploy/codeg-boot/env.example)
+deploy/codeg-boot/local.env
+deploy/codeg-boot/*.local.env

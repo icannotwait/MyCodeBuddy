@@ -31,8 +31,108 @@ watchdog_config_uint() {
   printf -v "$name" '%s' "$((10#$value))"
 }
 
+# Keys the local config file may set. Anything else in the file is ignored, so
+# the same file can also document other boot settings (see env.example).
+watchdog_config_keys() {
+  printf '%s\n' CODEG_PUBLIC_URL PUBLIC_FAIL_THRESHOLD TUNNEL_RESTART_COOLDOWN \
+    TUNNEL_RESTART_BACKOFF_CAP TUNNEL_RESTART_DAILY_CAP TUNNEL_RESTART_GRACE
+}
+
+# Machine-local KEY=VALUE file, never tracked in git. CODEG_WATCHDOG_CONFIG
+# overrides the default location.
+watchdog_config_path() {
+  printf '%s' "${CODEG_WATCHDOG_CONFIG:-$BOOT/local.env}"
+}
+
+# Remember which keys the launcher's environment set (non-empty) so they keep
+# precedence over the file across config reloads.
+snapshot_watchdog_env() {
+  local key
+  while IFS= read -r key; do
+    if [ -n "${!key:-}" ]; then
+      printf -v "WATCHDOG_ENV_SET_$key" '%s' 1
+      printf -v "WATCHDOG_ENV_VAL_$key" '%s' "${!key}"
+    else
+      printf -v "WATCHDOG_ENV_SET_$key" '%s' ''
+    fi
+  done < <(watchdog_config_keys)
+  WATCHDOG_ENV_SNAPSHOT=1
+}
+
+# Parse the config file as data: never sourced or evaluated. Accepts blank
+# lines, # comments, an optional "export " prefix, KEY=VALUE with optional
+# matching single/double quotes, and " # comment" after unquoted values.
+load_watchdog_config_file() {
+  local file=$1 line key value lineno=0
+  while IFS= read -r key; do
+    printf -v "WATCHDOG_FILE_SET_$key" '%s' ''
+  done < <(watchdog_config_keys)
+  [ -e "$file" ] || return 0
+  if [ ! -f "$file" ] || [ ! -r "$file" ]; then
+    watchdog_warning "config $file is not a readable file; ignoring it"
+    return 0
+  fi
+  while IFS= read -r line || [ -n "$line" ]; do
+    lineno=$((lineno + 1))
+    line=${line%$'\r'}
+    line=${line#"${line%%[![:space:]]*}"}
+    if [ -z "$line" ] || [ "${line:0:1}" = "#" ]; then continue; fi
+    if [[ "$line" =~ ^export[[:space:]]+(.*)$ ]]; then line=${BASH_REMATCH[1]}; fi
+    if [[ ! "$line" =~ ^([A-Za-z_][A-Za-z0-9_]*)=(.*)$ ]]; then
+      watchdog_warning "config $file:$lineno: ignoring malformed line"
+      continue
+    fi
+    key=${BASH_REMATCH[1]}
+    value=${BASH_REMATCH[2]}
+    if [[ "$value" =~ ^\"([^\"]*)\"[[:space:]]*(#.*)?$ ]] ||
+      [[ "$value" =~ ^\'([^\']*)\'[[:space:]]*(#.*)?$ ]]; then
+      value=${BASH_REMATCH[1]}
+    else
+      value=${value%%[[:space:]]#*}
+      value=${value%"${value##*[![:space:]]}"}
+    fi
+    if ! watchdog_config_keys | grep -qxF "$key"; then continue; fi
+    printf -v "WATCHDOG_FILE_SET_$key" '%s' 1
+    printf -v "WATCHDOG_FILE_VAL_$key" '%s' "$value"
+  done <"$file"
+}
+
+watchdog_config_signature() {
+  local file
+  file=$(watchdog_config_path)
+  if [ -e "$file" ]; then
+    printf '%s|%s' "$file" "$(stat -L -c '%d:%i:%s:%y' "$file" 2>/dev/null)"
+  else
+    printf '%s|absent' "$file"
+  fi
+}
+
 configure_watchdog() {
+  local key file set_var
+  if [ -z "${WATCHDOG_ENV_SNAPSHOT:-}" ]; then snapshot_watchdog_env; fi
+  file=$(watchdog_config_path)
+  load_watchdog_config_file "$file"
+  # Precedence: non-empty launcher env > local config file > built-in default.
+  while IFS= read -r key; do
+    set_var=WATCHDOG_ENV_SET_$key
+    if [ -n "${!set_var:-}" ]; then
+      set_var=WATCHDOG_ENV_VAL_$key
+      printf -v "$key" '%s' "${!set_var}"
+      continue
+    fi
+    set_var=WATCHDOG_FILE_SET_$key
+    if [ -n "${!set_var:-}" ]; then
+      set_var=WATCHDOG_FILE_VAL_$key
+      printf -v "$key" '%s' "${!set_var}"
+    else
+      unset "$key"
+    fi
+  done < <(watchdog_config_keys)
   CODEG_PUBLIC_URL=${CODEG_PUBLIC_URL:-}
+  if [ -n "$CODEG_PUBLIC_URL" ] && [[ ! "$CODEG_PUBLIC_URL" =~ ^https?://[^[:space:]]+$ ]]; then
+    watchdog_warning "invalid CODEG_PUBLIC_URL (need http(s)://...); public probe unconfigured"
+    CODEG_PUBLIC_URL=
+  fi
   watchdog_config_uint PUBLIC_FAIL_THRESHOLD 2 1 1000
   watchdog_config_uint TUNNEL_RESTART_COOLDOWN 180 1 86400
   watchdog_config_uint TUNNEL_RESTART_BACKOFF_CAP 1800 1 86400
@@ -42,6 +142,29 @@ configure_watchdog() {
     watchdog_warning "backoff cap below cooldown; using $TUNNEL_RESTART_COOLDOWN"
     TUNNEL_RESTART_BACKOFF_CAP=$TUNNEL_RESTART_COOLDOWN
   fi
+  watchdog_config_sig=$(watchdog_config_signature)
+}
+
+# Called every loop: re-parse only when the config file changed, so edits apply
+# without a restart and validation warnings are not repeated every minute.
+reload_watchdog_config() {
+  local sig
+  sig=$(watchdog_config_signature)
+  if [ "$sig" = "${watchdog_config_sig:-}" ]; then return 0; fi
+  configure_watchdog
+  echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) config reloaded from $(watchdog_config_path) public_url=${CODEG_PUBLIC_URL:-unset}" >>"$LOG"
+}
+
+# Rate-limited (default hourly) reminder that 1033 zombies cannot self-heal.
+warn_public_unconfigured() {
+  local now interval=${PUBLIC_UNCONFIGURED_WARN_SECS:-3600}
+  now=$(date +%s)
+  if [ -n "${public_unconfigured_warned_at:-}" ] &&
+    [ $((now - public_unconfigured_warned_at)) -lt "$interval" ]; then
+    return 0
+  fi
+  public_unconfigured_warned_at=$now
+  watchdog_warning "CODEG_PUBLIC_URL is not configured (env or $(watchdog_config_path)); public edge probe disabled, a Cloudflare 530/1033 zombie tunnel will NOT be auto-restarted"
 }
 
 mkdir -p "$HB"
@@ -53,6 +176,7 @@ if ! flock -n 9; then
 fi
 
 configure_watchdog
+echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) watchdog start pid=$$ config=$(watchdog_config_path) public_url=${CODEG_PUBLIC_URL:-unset}" >>"$LOG"
 
 echo $$ > "$PIDFILE"
 loop=0
@@ -83,13 +207,14 @@ webdav_ok() {
   [ "$code" = "401" ] || [ "$code" = "200" ]
 }
 
-# Public edge probe. Sets globals: pub_status (skip|ok|bad|fail|other), pub_code, pub_detail.
-# Returns 0 if healthy/skipped, 1 if tunnel looks broken.
+# Public edge probe. Sets globals: pub_status (unconfigured|ok|bad|fail|other), pub_code, pub_detail.
+# Returns 0 if healthy/unconfigured, 1 if tunnel looks broken.
 probe_public() {
-  pub_status=skip
+  pub_status=unconfigured
   pub_code=000
   pub_detail=
   if [ -z "${CODEG_PUBLIC_URL:-}" ]; then
+    warn_public_unconfigured
     return 0
   fi
   local body=/tmp/codeg-watchdog-public.$$
@@ -295,12 +420,13 @@ check_public_tunnel() {
 }
 
 while true; do
+  reload_watchdog_config
   s3080=down
   scf=down
   swebdav=down
   broken=0
   http=down
-  pub=skip
+  pub=unconfigured
 
   if port_up 3080; then
     s3080=up

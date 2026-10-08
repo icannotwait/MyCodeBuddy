@@ -96,22 +96,31 @@ if the probed version is still wrong, `POST /api/acp_prepare_npx_agent`.
 ## Public tunnel probe
 
 `codeg-watchdog.sh` probes the public edge only when `CODEG_PUBLIC_URL` is
-explicitly configured. **Unset or empty skips the probe**; a new installation
-never probes another host's URL. `env.example` is documentation, not an
-automatically loaded environment file.
+configured. **Unset or empty disables the probe**: the status line shows
+`public=unconfigured` and an hourly warning is written to `watchdog.log`,
+because a Cloudflare 530/1033 zombie tunnel will then never be auto-restarted.
+A new installation never probes another host's URL.
 
-For the existing drawcode live box, add this export to the persistent launcher
-that starts `codeg-supervisor.sh` / `codeg-watchdog.sh` (or its service environment):
+Configure it in a machine-local file, not in git and not in the launcher:
 
 ```bash
-export CODEG_PUBLIC_URL=https://drawcode.20241021.best/
+cp deploy/codeg-boot/env.example /workspace/codeg-boot/local.env
+# then uncomment and set: CODEG_PUBLIC_URL=https://<this-box-public-host>/
 ```
 
-After setting it in the current shell, reload the installed watchdog with
-`/workspace/codeg-boot/reload-watchdog-once.sh`. The new process inherits the
-export; the persistent launcher setting is still needed after a reboot. Other
-hosts must use their own public Codeg URL. Installing/syncing scripts does not
-change the machine's environment.
+- Default path `/workspace/codeg-boot/local.env`; override with
+  `CODEG_WATCHDOG_CONFIG=/path/to/file`. `install-boot.sh` and
+  `auto-sync-boot.sh` only copy the known scripts, so they never overwrite it.
+- The file is **parsed, never sourced**: blank lines, `#` comments, an optional
+  `export ` prefix, `KEY=VALUE` with optional matching quotes. Only
+  `CODEG_PUBLIC_URL` and the numeric limits below are read; other keys are
+  ignored, malformed lines are warned about, and `CODEG_PUBLIC_URL` must be
+  `http(s)://...`.
+- Precedence: non-empty launcher environment > local file > built-in default.
+- The watchdog re-checks the file every loop and re-parses it when it changes,
+  so edits apply within ~60 s without a restart (`config reloaded` in the log).
+- `deploy/codeg-boot/local.env` / `*.local.env` are gitignored in case a copy
+  is made inside the repo; the real file holds this machine's hostname.
 
 A completed **HTTP 530** response, an explicit **Cloudflare Tunnel error / error
 1033** in an HTTP 4xx/5xx body, or a failed transfer while the local `:3080` UI is
