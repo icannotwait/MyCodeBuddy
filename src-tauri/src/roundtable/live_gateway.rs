@@ -28,6 +28,12 @@ impl std::fmt::Display for GatewayRevoked {
 }
 impl std::error::Error for GatewayRevoked {}
 
+/// Inbound request lacked the per-attempt bearer. Rejected locally without
+/// poisoning the attempt: Grok's CLI probes `GET /` without credentials, and
+/// treating that as fatal ends a turn that already sealed a valid submission.
+#[derive(Debug, Clone, Copy)]
+struct AttemptCredentialRejected;
+
 fn caused_by_owner_revocation(mut error: &(dyn std::error::Error + 'static)) -> bool {
     loop {
         if error.is::<GatewayRevoked>()
@@ -246,6 +252,10 @@ impl LiveModelGateway {
         log.push(format!("{} {} status={status}", method.as_str(), path));
     }
 
+    fn note_attempt_credential_rejected(&self, method: &axum::http::Method, path_and_query: &str) {
+        self.note_upstream(method, path_and_query, "401-local");
+    }
+
     pub(crate) fn with_execution_lease(
         mut self,
         lease: Option<Arc<super::resources::ExecutionLease>>,
@@ -277,8 +287,18 @@ impl LiveModelGateway {
     fn observe_failure(&self, error: &RtError) {
         // Revocation is normal during drain/cancel. It must not manufacture a
         // failed turn or erase a real provider/policy failure already observed.
-        if error.details.reason.as_deref() == Some("gateway_revoked") {
-            return;
+        // A missing attempt bearer is also non-fatal: the request is rejected
+        // locally (never proxied), logged, and the attempt keeps running.
+        match error.details.reason.as_deref() {
+            Some("gateway_revoked") => return,
+            Some("gateway_token") => {
+                tracing::warn!(
+                    reason = "gateway_token",
+                    "roundtable gateway rejected an unauthenticated inbound request without failing the attempt"
+                );
+                return;
+            }
+            _ => {}
         }
         let mut failure = self.fatal_failure.lock().expect("gateway failure");
         if failure.is_none() {
@@ -970,6 +990,10 @@ async fn observe_http_failure(
     // next.run was in flight. Exempt only an explicitly typed owner result.
     if (response.status().is_client_error() || response.status().is_server_error())
         && response.extensions().get::<GatewayRevoked>().is_none()
+        && response
+            .extensions()
+            .get::<AttemptCredentialRejected>()
+            .is_none()
     {
         gateway.observe_failure(&rt_error(
             ErrorCode::RuntimeUnavailable,
@@ -1002,14 +1026,21 @@ async fn reject_gateway_method(
 
 fn gateway_error_response(error: RtError) -> axum::response::Response {
     use axum::response::IntoResponse;
-    let revoked = error.details.reason.as_deref() == Some("gateway_revoked");
-    let mut response = (
-        axum::http::StatusCode::BAD_REQUEST,
-        axum::Json(json!({"error":error})),
-    )
-        .into_response();
+    let reason = error.details.reason.as_deref();
+    let revoked = reason == Some("gateway_revoked");
+    let unauthenticated = reason == Some("gateway_token");
+    let status = if unauthenticated {
+        axum::http::StatusCode::UNAUTHORIZED
+    } else {
+        axum::http::StatusCode::BAD_REQUEST
+    };
+    let mut response = (status, axum::Json(json!({"error": error}))).into_response();
     if revoked {
         response.extensions_mut().insert(GatewayRevoked);
+    }
+    if unauthenticated {
+        // observe_http_failure must not promote the 401 into a fatal attempt error.
+        response.extensions_mut().insert(AttemptCredentialRejected);
     }
     response
 }
@@ -1047,7 +1078,13 @@ async fn handle(
         Ok((content_type, bytes)) => {
             ([(axum::http::header::CONTENT_TYPE, content_type)], bytes).into_response()
         }
-        Err(error) => gateway_error_response(error),
+        Err(error) => {
+            if error.details.reason.as_deref() == Some("gateway_token") {
+                gateway
+                    .note_attempt_credential_rejected(&axum::http::Method::POST, "/v1/responses");
+            }
+            gateway_error_response(error)
+        }
     }
 }
 
@@ -1078,6 +1115,7 @@ async fn native_handle(
         .path_and_query()
         .map(|value| value.as_str().to_string())
         .unwrap_or_else(|| "/".to_string());
+    let method = parts.method.clone();
     let result = tokio::select! {
         biased;
         result = gateway.forward_native(parts.method, &path, parts.headers, bytes) => result,
@@ -1094,6 +1132,9 @@ async fn native_handle(
             response
         }
         Err(error) => {
+            if error.details.reason.as_deref() == Some("gateway_token") {
+                gateway.note_attempt_credential_rejected(&method, &path);
+            }
             gateway.observe_failure(&error);
             gateway_error_response(error)
         }
@@ -1828,6 +1869,103 @@ mod completion_drain_tests {
         assert_eq!(seen[0].1, "xai-grok-cli");
         assert!(seen[0].2.contains("grok-4.6"));
         assert!(!seen[0].0.contains("attempt-bearer"));
+    }
+
+    #[tokio::test]
+    async fn unauthenticated_native_probe_returns_401_without_failing_the_attempt() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let seen = Arc::new(Mutex::new(0usize));
+        let hits = seen.clone();
+        tokio::spawn(async move {
+            let app = axum::Router::new().fallback(move || {
+                let hits = hits.clone();
+                async move {
+                    *hits.lock().expect("hits") += 1;
+                    (axum::http::StatusCode::OK, "upstream")
+                }
+            });
+            axum::serve(listener, app).await.unwrap();
+        });
+        let upstream = super::super::host_model_auth::ResolvedUpstream {
+            origin: "https://cli-chat-proxy.grok.com".into(),
+            bearer: "host-oidc-token".into(),
+            headers: Vec::new(),
+            refresh: None,
+        };
+        let mut gateway =
+            LiveModelGateway::native_probe(upstream, "attempt-bearer".into()).unwrap();
+        gateway.fixture_origin = Some(format!("http://{address}"));
+        let gateway = Arc::new(gateway);
+
+        // Direct handler: bare GET / with no attempt bearer.
+        let rejected = native_handle(
+            axum::extract::State(gateway.clone()),
+            axum::extract::Request::builder()
+                .method("GET")
+                .uri("/")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(rejected.status(), axum::http::StatusCode::UNAUTHORIZED);
+        assert!(rejected
+            .extensions()
+            .get::<AttemptCredentialRejected>()
+            .is_some());
+        assert!(
+            gateway.completion_error().is_none(),
+            "missing attempt bearer must not fail the attempt"
+        );
+        assert_eq!(
+            *seen.lock().expect("hits"),
+            0,
+            "unauthenticated requests must never be forwarded upstream"
+        );
+        assert_eq!(
+            gateway.exchange_log(),
+            vec!["GET / status=401-local".to_string()]
+        );
+
+        // Full router including observe_http_failure: the 401 must stay non-fatal.
+        let router = gateway_router(gateway.clone());
+        let serve = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let serve_addr = serve.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(serve, router).await.unwrap();
+        });
+        let client = reqwest::Client::new();
+        let response = client
+            .get(format!("http://{serve_addr}/"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::UNAUTHORIZED);
+        assert!(
+            gateway.completion_error().is_none(),
+            "observe_http_failure must not promote the 401 into a fatal error"
+        );
+        assert_eq!(*seen.lock().expect("hits"), 0);
+
+        // Authenticated model call still forwards with the host credential.
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            axum::http::header::AUTHORIZATION,
+            "Bearer attempt-bearer".parse().unwrap(),
+        );
+        let (status, _, body) = gateway
+            .forward_native(
+                axum::http::Method::POST,
+                "/v1/responses",
+                headers,
+                br#"{"model":"grok-4.6"}"#.as_slice().into(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(status, axum::http::StatusCode::OK);
+        assert_eq!(body, b"upstream");
+        assert_eq!(*seen.lock().expect("hits"), 1);
+        assert!(gateway.completion_error().is_none());
     }
 }
 
