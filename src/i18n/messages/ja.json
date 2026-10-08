@@ -7537,6 +7537,7 @@
     "agreementExplicit": "明示的な同意",
     "agreementCompatible": "両立する立場",
     "agreementUnresolved": "未解決",
+    "supportedBy": "支持メンバー",
     "inference": "推論",
     "attemptBadge": "試行 {count} · {state}",
     "attemptId": "試行 ID",

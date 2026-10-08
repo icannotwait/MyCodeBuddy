@@ -48,6 +48,7 @@ const newMessages = [
   "agreementExplicit",
   "agreementCompatible",
   "agreementUnresolved",
+  "supportedBy",
   "inference",
   "attemptBadge",
   "attemptId",

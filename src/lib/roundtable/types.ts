@@ -168,7 +168,7 @@ export interface RoundtableMessage {
     summary?: string
     kind?: string
     speaker_id?: string
-    recommendation?: { text?: string }
+    recommendation?: { text?: string; [key: string]: unknown }
     [key: string]: unknown
   }
 }

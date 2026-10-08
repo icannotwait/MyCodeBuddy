@@ -4,7 +4,10 @@ import type {
   RoundtableMessage,
   RoundtableProjection,
 } from "@/lib/roundtable/types"
-import { buildRoundtableTranscript } from "@/lib/roundtable/transcript"
+import {
+  buildRoundtableTranscript,
+  replaceSeatAliases,
+} from "@/lib/roundtable/transcript"
 
 function config(): RoundtableConfig {
   return {
@@ -189,6 +192,7 @@ describe("roundtable transcript", () => {
       speaker: {
         role: "member",
         ordinal: 0,
+        seatOrdinal: 0,
         modelId: "grok-4.6",
         providerRef: "provider:grok",
         agent: "grok",
@@ -200,6 +204,7 @@ describe("roundtable transcript", () => {
       speaker: {
         role: "member",
         ordinal: 1,
+        seatOrdinal: 1,
         agent: "antigravity",
         modelId: "gemini-3.8-flash-high",
       },
@@ -209,7 +214,18 @@ describe("roundtable transcript", () => {
     ])
     expect(model.phases[2].turns[0]).toMatchObject({
       visibility: "published",
-      speaker: { role: "moderator", agent: "grok", modelId: "grok-4.6" },
+      speaker: {
+        role: "moderator",
+        seatOrdinal: 0,
+        agent: "grok",
+        modelId: "grok-4.6",
+        participantRole: null,
+      },
+    })
+    expect(model.seats).toMatchObject({
+      s0: { role: "member", seatOrdinal: 0, modelId: "grok-4.6" },
+      s1: { role: "member", seatOrdinal: 1, agent: "antigravity" },
+      s2: { role: "moderator", seatOrdinal: 0, agent: "grok" },
     })
     expect(model.phases[2].turns[0].recommendation?.text).toBe(
       "Keep the prepaid wall"
@@ -394,5 +410,26 @@ describe("roundtable transcript", () => {
       speaker: { ordinal: 1, agent: "antigravity" },
     })
     expect(JSON.stringify(model)).not.toContain("stale preview")
+  })
+})
+
+describe("replaceSeatAliases", () => {
+  it("maps seat aliases outside code, leaves code and unknown aliases alone", () => {
+    const label = (alias: string) =>
+      alias === "s0"
+        ? "Member 1 · grok-4.6"
+        : alias === "s1"
+          ? "Member 2 · gemini"
+          : null
+    expect(
+      replaceSeatAliases(
+        "s1 prefers Strict; s0 prefers Lax. Keep `s0` literal and ```\ns1\n```.",
+        label
+      )
+    ).toBe(
+      "Member 2 · gemini prefers Strict; Member 1 · grok-4.6 prefers Lax. Keep `s0` literal and ```\ns1\n```."
+    )
+    expect(replaceSeatAliases("s99 is unknown", label)).toBe("s99 is unknown")
+    expect(replaceSeatAliases("session_id s0x", label)).toBe("session_id s0x")
   })
 })

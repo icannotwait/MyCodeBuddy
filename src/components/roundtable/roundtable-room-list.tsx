@@ -6,6 +6,7 @@ import { useTranslations } from "next-intl"
 import { ChevronDown } from "lucide-react"
 import { Button } from "@/components/ui/button"
 import { cn } from "@/lib/utils"
+import { plainInlineText, RoundtableInlineText } from "./roundtable-inline-text"
 
 export type RoundtableRoomListProps = {
   workspaceId: string
@@ -98,12 +99,19 @@ export function RoundtableRoomList({
               <Link
                 href={`${workspaceHref}&room_id=${encodeURIComponent(room.room_id)}`}
                 aria-current={room.room_id === roomId ? "page" : undefined}
+                title={plainInlineText(room.config.topic)}
                 className={cn(
-                  "block rounded-md px-2 py-2 text-sm [overflow-wrap:anywhere] hover:bg-muted focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring",
-                  room.room_id === roomId && "bg-muted font-medium"
+                  "block rounded-md border-l-2 border-transparent px-2 py-2 text-sm [overflow-wrap:anywhere] hover:bg-muted focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring",
+                  room.room_id === roomId &&
+                    "border-l-primary bg-muted font-medium"
                 )}
               >
-                {room.config.topic}
+                <span
+                  data-testid="room-topic"
+                  className="line-clamp-3 leading-snug [overflow-wrap:anywhere]"
+                >
+                  <RoundtableInlineText text={room.config.topic} />
+                </span>
                 <span className="mt-1 block text-xs font-normal text-muted-foreground">
                   {room.status}
                 </span>

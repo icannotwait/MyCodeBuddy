@@ -7537,6 +7537,7 @@
     "agreementExplicit": "明确同意",
     "agreementCompatible": "相容立场",
     "agreementUnresolved": "未解决",
+    "supportedBy": "支持方",
     "inference": "推断",
     "attemptBadge": "第 {count} 次尝试 · {state}",
     "attemptId": "尝试 ID",

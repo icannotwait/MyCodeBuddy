@@ -41,7 +41,11 @@ import { Textarea } from "@/components/ui/textarea"
 import { PreflightConfirmation } from "./preflight-confirmation"
 import { RoundtableSafeContent } from "./roundtable-safe-content"
 import { RoundtableRoomList } from "./roundtable-room-list"
-import { RoundtableTranscript } from "./roundtable-transcript"
+import { RoundtableInlineText } from "./roundtable-inline-text"
+import {
+  RoundtableSpeakerAvatar,
+  RoundtableTranscript,
+} from "./roundtable-transcript"
 
 type LoadedRoom = Awaited<ReturnType<typeof loadRoundtable>>
 type RoomSummary = { room_id: string; status: string; config: RoundtableConfig }
@@ -842,8 +846,8 @@ export function RoundtableWorkbench({
             </>
           ) : projection ? (
             <>
-              <h2 className="text-xl font-semibold leading-relaxed tracking-tight">
-                {config.topic}
+              <h2 className="text-xl leading-relaxed font-semibold tracking-tight [overflow-wrap:anywhere]">
+                <RoundtableInlineText text={config.topic} />
               </h2>
               <p className="text-sm text-muted-foreground">
                 {t("status")}: {status}
@@ -851,26 +855,47 @@ export function RoundtableWorkbench({
               {projection.body.blocked_reason ? (
                 <p role="status">{projection.body.blocked_reason}</p>
               ) : null}
-              <ol className="space-y-2 rounded-lg bg-muted/40 p-3 text-sm leading-relaxed">
-                {projection.body.replay.speakers.map((speaker) => (
-                  <li key={speaker.speaker_id}>
-                    {speaker.role === "moderator"
-                      ? t("moderator")
-                      : `${t("member")} ${speaker.ordinal + 1}`}{" "}
-                    · {speaker.model_id}
-                    <span className="ml-2 text-muted-foreground">
-                      {projection.body.replay.attempts
-                        .filter((attempt) =>
-                          projection.body.replay.turns.some(
-                            (turn) =>
-                              turn.turn_id === attempt.turn_id &&
-                              turn.speaker_id === speaker.speaker_id
+              <ol className="flex flex-wrap gap-2 rounded-lg bg-muted/40 p-3 text-sm leading-relaxed">
+                {projection.body.replay.speakers.map((speaker) => {
+                  const replayConfig = projection.body.replay.config
+                  const seatOrdinal =
+                    speaker.role === "moderator"
+                      ? (replayConfig?.moderator_ordinal ?? null)
+                      : speaker.ordinal
+                  const agent =
+                    replayConfig?.participants.find(
+                      (participant) => participant.ordinal === seatOrdinal
+                    )?.agent ?? "codex"
+                  return (
+                    <li
+                      key={speaker.speaker_id}
+                      className="flex min-w-0 items-center gap-2 rounded-2xl border bg-background py-1 ps-1 pe-3"
+                    >
+                      <RoundtableSpeakerAvatar
+                        agent={agent}
+                        seatOrdinal={seatOrdinal}
+                        className="size-6 ring-1 [&_svg]:size-3.5"
+                      />
+                      <span className="min-w-0 [overflow-wrap:anywhere]">
+                        {speaker.role === "moderator"
+                          ? t("moderator")
+                          : `${t("member")} ${speaker.ordinal + 1}`}{" "}
+                        · {speaker.model_id}
+                      </span>
+                      <span className="text-xs whitespace-nowrap text-muted-foreground">
+                        {projection.body.replay.attempts
+                          .filter((attempt) =>
+                            projection.body.replay.turns.some(
+                              (turn) =>
+                                turn.turn_id === attempt.turn_id &&
+                                turn.speaker_id === speaker.speaker_id
+                            )
                           )
-                        )
-                        .at(-1)?.state ?? t("waiting")}
-                    </span>
-                  </li>
-                ))}
+                          .at(-1)?.state ?? t("waiting")}
+                      </span>
+                    </li>
+                  )
+                })}
               </ol>
               <RoundtableTranscript
                 projection={projection}

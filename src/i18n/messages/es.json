@@ -7537,6 +7537,7 @@
     "agreementExplicit": "Acuerdo explícito",
     "agreementCompatible": "Posiciones compatibles",
     "agreementUnresolved": "Sin resolver",
+    "supportedBy": "Respaldado por",
     "inference": "Inferido",
     "attemptBadge": "Intento {count} · {state}",
     "attemptId": "ID del intento",

@@ -7537,6 +7537,7 @@
     "agreementExplicit": "Ausdrückliche Zustimmung",
     "agreementCompatible": "Vereinbare Positionen",
     "agreementUnresolved": "Ungeklärt",
+    "supportedBy": "Unterstützt von",
     "inference": "Abgeleitet",
     "attemptBadge": "Versuch {count} · {state}",
     "attemptId": "Versuchs-ID",

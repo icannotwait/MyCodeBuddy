@@ -225,7 +225,11 @@ describe("roundtable transcript view", () => {
     expect(proposalTurn).toHaveTextContent("reviewer")
     expect(proposalTurn).toHaveTextContent("grok-4.6")
     expect(proposalTurn).toHaveTextContent("published")
-    expect(proposalTurn).toHaveTextContent(
+    // Happy-path attempt stays behind the details row.
+    expect(proposalTurn?.querySelector("header")).not.toHaveTextContent(
+      "attemptBadge"
+    )
+    expect(proposalTurn?.querySelector("details")).toHaveTextContent(
       'attemptBadge:{"count":1,"state":"accepted"}'
     )
     expect(proposalTurn?.querySelector("time")).toHaveAttribute(
@@ -323,10 +327,141 @@ describe("roundtable transcript view", () => {
     const article = container.querySelector("article")
     expect(article).toHaveClass("min-w-0")
     expect(article?.querySelector("header")).toHaveClass("flex-wrap")
-    expect(screen.getByText(provider)).toHaveClass("[overflow-wrap:anywhere]")
+    // Long provider refs live in the details row, which breaks anywhere.
+    expect(article?.querySelector("details")).toHaveTextContent(provider)
+    expect(article?.querySelector("[data-testid='turn-body']")).toHaveClass(
+      "border-l-[3px]"
+    )
     expect(container.querySelector("[data-testid='markdown']")).toHaveClass(
       "min-w-0",
       "[overflow-wrap:anywhere]"
     )
+  })
+
+  it("shows moderator on the synthesis turn and maps seat aliases at render time", () => {
+    const base = projection()
+    const { container } = render(
+      <RoundtableTranscript
+        projection={base}
+        messages={[
+          {
+            message_id: "synthesis",
+            body_hash: "c".repeat(64),
+            visibility: "published",
+            speaker_id: "speaker-mod",
+            phase_id: "phase-synthesis",
+            attempt_no: 1,
+            attempt_state: "accepted",
+            body: {
+              kind: "synthesis",
+              recommendation: {
+                text: "s0 and s1 agree; keep `s0` literal",
+                aliases: [],
+              },
+              consensus_items: [
+                {
+                  text: "HttpOnly cookies",
+                  agreement_level: "compatible_positions",
+                  inference: false,
+                  aliases: [],
+                  supporter_aliases: ["s0", "s1"],
+                },
+              ],
+              disagreements: [
+                {
+                  text: "s1 treats Lax as fine; s0 prefers Strict",
+                  inference: false,
+                  aliases: [],
+                },
+              ],
+            },
+          },
+        ]}
+      />
+    )
+    const synthesis = container.querySelector('[data-message-id="synthesis"]')
+    expect(synthesis).toHaveAttribute("data-speaker-role", "moderator")
+    expect(synthesis).toHaveAttribute("data-seat", "0")
+    // Name stays Member 1 (same seat), role badge is moderator.
+    expect(synthesis).toHaveTextContent("member 1")
+    expect(synthesis).toHaveTextContent("moderator")
+    expect(synthesis).not.toHaveTextContent("reviewer")
+    // Happy-path Attempt 1 · accepted is details-only.
+    expect(synthesis?.querySelector("header")).not.toHaveTextContent(
+      "attemptBadge"
+    )
+    expect(synthesis).toHaveTextContent("member 1 · grok-4.6")
+    expect(synthesis).toHaveTextContent("member 2 · gemini-3.8-flash-high")
+    expect(synthesis).toHaveTextContent("keep `s0` literal")
+    expect(
+      synthesis?.querySelector("[data-testid='turn-body'] > div")
+    ).not.toHaveTextContent("s1 treats")
+    expect(
+      container.querySelector("[data-testid='consensus-supporters']")
+    ).toHaveTextContent("supportedBy")
+  })
+
+  it("renders one turn per message when memberships carry staged and published versions", () => {
+    const base = projection()
+    const ids = ["m1", "m2", "m3", "m4", "m5"]
+    base.body.replay.message_memberships = ids.flatMap((id, index) => [
+      {
+        message_id: id,
+        membership_version: "1",
+        visibility: "staged",
+        published_seq: null,
+      },
+      {
+        message_id: id,
+        membership_version: "2",
+        visibility: "published",
+        published_seq: String(index + 10),
+      },
+    ])
+    const kinds = ["proposal", "proposal", "critique", "critique", "synthesis"]
+    const speakers = [
+      "speaker-1",
+      "speaker-2",
+      "speaker-1",
+      "speaker-2",
+      "speaker-mod",
+    ]
+    const { container } = render(
+      <RoundtableTranscript
+        projection={base}
+        messages={ids.map((id, index) => ({
+          message_id: id,
+          body_hash: String(index).repeat(64),
+          visibility: "published" as const,
+          speaker_id: speakers[index],
+          phase_id: `phase-${kinds[index]}`,
+          body: { kind: kinds[index], summary: `turn ${id}` },
+        }))}
+      />
+    )
+    const turns = container.querySelectorAll("article[data-message-id]")
+    expect(turns).toHaveLength(5)
+    // Turns within a phase are threaded; the last turn of each phase is not.
+    expect(
+      container.querySelectorAll("[data-testid='turn-connector']")
+    ).toHaveLength(2)
+    // The moderator turn keeps the moderating member's seat accent.
+    expect(container.querySelector("[data-message-id='m5']")).toHaveAttribute(
+      "data-seat",
+      "0"
+    )
+    expect(
+      container.querySelector("[data-message-id='m5'] [data-seat='0']")
+    ).toHaveClass("ring-sky-500/50")
+    expect(
+      [...turns].map((node) => node.getAttribute("data-message-id"))
+    ).toEqual(ids)
+    expect(
+      container.querySelectorAll("[data-visibility='staged']")
+    ).toHaveLength(0)
+    // Highest membership version supplies published_seq.
+    expect(
+      container.querySelector("[data-message-id='m1'] details")
+    ).toHaveTextContent("10")
   })
 })

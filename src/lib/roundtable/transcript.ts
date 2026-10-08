@@ -49,12 +49,21 @@ export interface TranscriptConsensus {
   agreement: string | null
   inference: boolean
   aliases: TranscriptAlias[]
+  /** Seat aliases (`s0`, `s1`, …) the moderator lists as supporters. */
+  supporterAliases: string[]
 }
 
 export interface TranscriptSpeaker {
   speakerId: string | null
   role: "member" | "moderator" | "unknown"
+  /** Member ordinal; null for the moderator seat. */
   ordinal: number | null
+  /**
+   * Configured participant behind this speaker. A moderator turn points at
+   * the member it was assigned to, so both seats share one identity color.
+   */
+  seatOrdinal: number | null
+  /** The member's configured role. Null on moderator turns. */
   participantRole: string | null
   providerRef: string | null
   modelId: string | null
@@ -104,6 +113,8 @@ export interface TranscriptPhase {
 export interface RoundtableTranscriptModel {
   phases: TranscriptPhase[]
   critiqueRoundCount: number
+  /** Seat aliases the runtime shows models (`s<ordinal>`), for display only. */
+  seats: Record<string, TranscriptSpeaker>
 }
 
 export interface RoundtablePreviewInput {
@@ -255,6 +266,7 @@ function readConsensus(value: unknown): TranscriptConsensus[] {
         agreement: asString(record.agreement_level),
         inference: record.inference === true,
         aliases: readAliases(record.aliases),
+        supporterAliases: asStringList(record.supporter_aliases),
       },
     ]
   })
@@ -325,6 +337,7 @@ function readSpeaker(
       speakerId,
       role: "unknown",
       ordinal: null,
+      seatOrdinal: null,
       participantRole: null,
       providerRef: null,
       modelId: null,
@@ -339,11 +352,19 @@ function readSpeaker(
         : "unknown"
   const config = projection.body.replay.config
   const participant = participantFor(config, role, speaker.ordinal)
+  const seatOrdinal =
+    role === "moderator"
+      ? (asCount(config?.moderator_ordinal) ?? null)
+      : role === "member"
+        ? speaker.ordinal
+        : null
   return {
     speakerId: speaker.speaker_id,
     role,
     ordinal: role === "member" ? speaker.ordinal : null,
-    participantRole: asString(participant?.role),
+    seatOrdinal,
+    // A moderator turn speaks as moderator, not in its member role.
+    participantRole: role === "member" ? asString(participant?.role) : null,
     providerRef: speaker.provider_ref,
     modelId: speaker.model_id,
     agent: participant?.agent || "codex",
@@ -683,5 +704,33 @@ export function buildRoundtableTranscript(
     if (phase.kind === "critique")
       phase.critiqueRound = roundByIndex.get(phase.index) ?? null
   }
-  return { phases, critiqueRoundCount: critiqueIndexes.length }
+  const seats: Record<string, TranscriptSpeaker> = {}
+  for (const speaker of projection.body.replay.speakers) {
+    if (!Number.isSafeInteger(speaker.ordinal) || speaker.ordinal < 0) continue
+    seats[`s${speaker.ordinal}`] = readSpeaker(projection, speaker.speaker_id)
+  }
+  return { phases, critiqueRoundCount: critiqueIndexes.length, seats }
+}
+
+const SEAT_ALIAS = /(?<![\w-])s(0|[1-9][0-9]{0,2})(?![\w-])/g
+const CODE_SEGMENT = /(```[\s\S]*?(?:```|$)|`[^`\n]*`)/g
+
+/**
+ * Replace seat aliases such as `s1` with a reader-facing label. Display only:
+ * the verified message body and its hash are never touched. Unknown aliases
+ * and anything inside code spans or fences stay as written.
+ */
+export function replaceSeatAliases(
+  text: string,
+  labelFor: (alias: string) => string | null
+): string {
+  if (!/s[0-9]/.test(text)) return text
+  return text
+    .split(CODE_SEGMENT)
+    .map((segment, index) =>
+      index % 2 === 1
+        ? segment
+        : segment.replace(SEAT_ALIAS, (match) => labelFor(match) ?? match)
+    )
+    .join("")
 }

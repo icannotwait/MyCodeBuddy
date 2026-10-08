@@ -7537,6 +7537,7 @@
     "agreementExplicit": "Accord explicite",
     "agreementCompatible": "Positions compatibles",
     "agreementUnresolved": "Non tranché",
+    "supportedBy": "Soutenu par",
     "inference": "Inféré",
     "attemptBadge": "Essai {count} · {state}",
     "attemptId": "Identifiant de tentative",

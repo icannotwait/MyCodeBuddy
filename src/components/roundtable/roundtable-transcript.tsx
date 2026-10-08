@@ -1,8 +1,16 @@
 "use client"
 
-import { useMemo, type ReactNode } from "react"
+import { createContext, useContext, useMemo, type ReactNode } from "react"
 import { useLocale, useTranslations } from "next-intl"
-import { ChevronRight } from "lucide-react"
+import {
+  ChevronRight,
+  CircleCheck,
+  CircleDot,
+  Gavel,
+  Lightbulb,
+  MessagesSquare,
+  Sparkles,
+} from "lucide-react"
 import { AgentIcon } from "@/components/agent-icon"
 import { MessageResponse } from "@/components/ai-elements/message"
 import { Badge } from "@/components/ui/badge"
@@ -13,6 +21,7 @@ import type {
 } from "@/lib/roundtable/types"
 import {
   buildRoundtableTranscript,
+  replaceSeatAliases,
   type TranscriptPhase,
   type TranscriptSpeaker,
   type TranscriptTurn,
@@ -20,6 +29,114 @@ import {
 import type { AgentType } from "@/lib/types"
 import { cn } from "@/lib/utils"
 import { RoundtableSafeContent } from "./roundtable-safe-content"
+
+/**
+ * Per-seat accent. Indexed by the configured participant ordinal, so a member
+ * keeps one color across proposal, critique and (when assigned) moderation.
+ * Every class is a literal so Tailwind keeps it; each pairs a light and a dark
+ * tone.
+ */
+const SEAT_ACCENTS = [
+  {
+    ring: "ring-sky-500/50",
+    bar: "border-l-sky-500/70",
+    name: "text-sky-700 dark:text-sky-300",
+  },
+  {
+    ring: "ring-violet-500/50",
+    bar: "border-l-violet-500/70",
+    name: "text-violet-700 dark:text-violet-300",
+  },
+  {
+    ring: "ring-emerald-500/50",
+    bar: "border-l-emerald-500/70",
+    name: "text-emerald-700 dark:text-emerald-300",
+  },
+  {
+    ring: "ring-amber-500/50",
+    bar: "border-l-amber-500/70",
+    name: "text-amber-700 dark:text-amber-300",
+  },
+  {
+    ring: "ring-rose-500/50",
+    bar: "border-l-rose-500/70",
+    name: "text-rose-700 dark:text-rose-300",
+  },
+  {
+    ring: "ring-indigo-500/50",
+    bar: "border-l-indigo-500/70",
+    name: "text-indigo-700 dark:text-indigo-300",
+  },
+  {
+    ring: "ring-teal-500/50",
+    bar: "border-l-teal-500/70",
+    name: "text-teal-700 dark:text-teal-300",
+  },
+] as const
+
+const NEUTRAL_ACCENT = {
+  ring: "ring-border",
+  bar: "border-l-border",
+  name: "text-foreground",
+} as const
+
+export function seatAccent(seatOrdinal: number | null) {
+  if (seatOrdinal === null || seatOrdinal < 0) return NEUTRAL_ACCENT
+  return SEAT_ACCENTS[seatOrdinal % SEAT_ACCENTS.length]
+}
+
+export function RoundtableSpeakerAvatar({
+  agent,
+  seatOrdinal,
+  className,
+}: {
+  agent: string
+  seatOrdinal: number | null
+  className?: string
+}) {
+  return (
+    <span
+      aria-hidden="true"
+      data-seat={seatOrdinal ?? undefined}
+      className={cn(
+        "flex size-8 shrink-0 items-center justify-center rounded-full bg-background ring-2",
+        seatAccent(seatOrdinal).ring,
+        className
+      )}
+    >
+      <AgentIcon agentType={agent as AgentType} className="size-4.5" />
+    </span>
+  )
+}
+
+type Translate = ReturnType<typeof useTranslations<"Roundtable">>
+
+/** Name shown for a speaker: the member seat, even when it moderates. */
+function speakerName(speaker: TranscriptSpeaker, t: Translate) {
+  if (speaker.seatOrdinal !== null)
+    return `${t("member")} ${speaker.seatOrdinal + 1}`
+  if (speaker.role === "moderator") return t("moderator")
+  return t("unknown")
+}
+
+/** Inline label used where model output refers to a seat alias. */
+function seatLabel(speaker: TranscriptSpeaker, t: Translate) {
+  const name =
+    speaker.role === "moderator"
+      ? t("moderator")
+      : speaker.ordinal !== null
+        ? `${t("member")} ${speaker.ordinal + 1}`
+        : t("unknown")
+  return speaker.modelId ? `${name} · ${speaker.modelId}` : name
+}
+
+function escapeMarkdown(text: string) {
+  return text.replace(/([\\`*_[\]<>#|~])/g, "\\$1")
+}
+
+const SeatLabelContext = createContext<(alias: string) => string | null>(
+  () => null
+)
 
 export function RoundtableTranscript({
   projection,
@@ -43,6 +160,15 @@ export function RoundtableTranscript({
     () => buildRoundtableTranscript(projection, messages, previewInputs),
     [projection, messages, previewInputs]
   )
+  const labelFor = useMemo(() => {
+    const labels = new Map(
+      Object.entries(model.seats).map(([alias, speaker]) => [
+        alias,
+        escapeMarkdown(seatLabel(speaker, t)),
+      ])
+    )
+    return (alias: string) => labels.get(alias) ?? null
+  }, [model.seats, t])
 
   const phaseTitle = (phase: TranscriptPhase) => {
     if (phase.kind === "synthesis") return t("conclusion")
@@ -60,55 +186,72 @@ export function RoundtableTranscript({
   }
 
   return (
-    <section
-      aria-label={t("results")}
-      role="log"
-      data-testid="roundtable-transcript"
-      className="flex min-w-0 flex-col gap-6"
-    >
-      <h3 className="text-sm font-semibold">{t("results")}</h3>
-      {model.phases.map((phase) => {
-        const title = phaseTitle(phase)
-        return (
-          <section
-            key={phase.id}
-            aria-label={title}
-            data-phase={phase.kind}
-            className={cn(
-              "flex min-w-0 flex-col gap-1",
-              phase.kind === "synthesis" &&
-                "rounded-xl border border-primary/30 bg-primary/5 p-3 sm:p-4"
-            )}
-          >
-            <div className="flex min-w-0 items-center gap-3">
-              <div className="h-px min-w-4 flex-1 bg-border" />
-              <h4 className="text-center text-xs font-semibold tracking-wide text-muted-foreground">
-                {title}
-              </h4>
-              <div className="h-px min-w-4 flex-1 bg-border" />
-            </div>
-            <ol className="min-w-0">
-              {phase.turns.map((turn) => (
-                <li key={turn.key} className="min-w-0 list-none">
-                  <TranscriptTurnView turn={turn} locale={locale} />
-                </li>
-              ))}
-            </ol>
-          </section>
-        )
-      })}
-    </section>
+    <SeatLabelContext.Provider value={labelFor}>
+      <section
+        aria-label={t("results")}
+        role="log"
+        data-testid="roundtable-transcript"
+        className="flex w-full max-w-3xl min-w-0 flex-col gap-5"
+      >
+        <h3 className="text-sm font-semibold">{t("results")}</h3>
+        {model.phases.map((phase) => {
+          const title = phaseTitle(phase)
+          const conclusion = phase.kind === "synthesis"
+          const Icon =
+            phase.kind === "proposal"
+              ? Lightbulb
+              : phase.kind === "critique"
+                ? MessagesSquare
+                : conclusion
+                  ? Sparkles
+                  : CircleDot
+          return (
+            <section
+              key={phase.id}
+              aria-label={title}
+              data-phase={phase.kind}
+              className={cn(
+                "flex min-w-0 flex-col gap-1",
+                conclusion &&
+                  "rounded-2xl border border-primary/30 bg-primary/5 p-3 shadow-xs sm:p-4"
+              )}
+            >
+              <div className="flex min-w-0 items-center gap-3">
+                {conclusion ? null : (
+                  <div className="h-px min-w-4 flex-1 bg-border" />
+                )}
+                <h4
+                  className={cn(
+                    "inline-flex shrink-0 items-center gap-1.5 text-xs font-semibold tracking-wide",
+                    conclusion
+                      ? "text-sm text-primary"
+                      : "rounded-full border bg-background px-3 py-1 text-muted-foreground"
+                  )}
+                >
+                  <Icon aria-hidden="true" className="size-3.5 shrink-0" />
+                  {title}
+                </h4>
+                <div className="h-px min-w-4 flex-1 bg-border" />
+              </div>
+              <ol className="min-w-0">
+                {phase.turns.map((turn, index) => (
+                  <li key={turn.key} className="min-w-0 list-none">
+                    <TranscriptTurnView
+                      turn={turn}
+                      locale={locale}
+                      seats={model.seats}
+                      last={index === phase.turns.length - 1}
+                      conclusion={conclusion}
+                    />
+                  </li>
+                ))}
+              </ol>
+            </section>
+          )
+        })}
+      </section>
+    </SeatLabelContext.Provider>
   )
-}
-
-function speakerLabel(
-  speaker: TranscriptSpeaker,
-  labels: { member: string; moderator: string; unknown: string }
-) {
-  if (speaker.role === "moderator") return labels.moderator
-  if (speaker.role === "member" && speaker.ordinal !== null)
-    return `${labels.member} ${speaker.ordinal + 1}`
-  return labels.unknown
 }
 
 function formatStamp(value: string, locale: string) {
@@ -121,28 +264,76 @@ function formatStamp(value: string, locale: string) {
 }
 
 function RoundtableMarkdown({ text }: { text: string }) {
-  const visible = redactRoundtableText(text).trim()
+  const labelFor = useContext(SeatLabelContext)
+  const visible = replaceSeatAliases(
+    redactRoundtableText(text).trim(),
+    labelFor
+  )
   if (!visible) return null
   return (
-    <MessageResponse className="max-w-full min-w-0 [overflow-wrap:anywhere] [&_pre]:max-w-full [&_pre]:overflow-x-auto">
+    <MessageResponse className="max-w-full min-w-0 leading-relaxed [overflow-wrap:anywhere] [&_pre]:max-w-full [&_pre]:overflow-x-auto">
       {visible}
     </MessageResponse>
   )
 }
 
+function Chip({
+  children,
+  className,
+}: {
+  children: ReactNode
+  className?: string
+}) {
+  return (
+    <span
+      className={cn(
+        "inline-flex items-center rounded-full px-2 py-0.5 text-[11px] leading-4 font-medium",
+        className
+      )}
+    >
+      {children}
+    </span>
+  )
+}
+
+const STANCE_TONES: Record<string, string> = {
+  support: "bg-emerald-500/10 text-emerald-700 dark:text-emerald-300",
+  challenge: "bg-rose-500/10 text-rose-700 dark:text-rose-300",
+  clarify: "bg-sky-500/10 text-sky-700 dark:text-sky-300",
+  revise: "bg-amber-500/10 text-amber-700 dark:text-amber-300",
+}
+
+const AGREEMENT_TONES: Record<string, string> = {
+  explicit_agreement:
+    "bg-emerald-500/10 text-emerald-700 dark:text-emerald-300",
+  compatible_positions: "bg-sky-500/10 text-sky-700 dark:text-sky-300",
+  unresolved: "bg-amber-500/10 text-amber-700 dark:text-amber-300",
+}
+
+const MUTED_TONE = "bg-muted text-muted-foreground"
+
+/** "normal" is the default; only call out a priority that differs. */
+function notablePriority(value: string | null) {
+  return value !== null && value !== "normal"
+}
+
 function TranscriptTurnView({
   turn,
   locale,
+  seats,
+  last,
+  conclusion,
 }: {
   turn: TranscriptTurn
   locale: string
+  seats: Record<string, TranscriptSpeaker>
+  last: boolean
+  conclusion: boolean
 }) {
   const t = useTranslations("Roundtable")
-  const label = speakerLabel(turn.speaker, {
-    member: t("member"),
-    moderator: t("moderator"),
-    unknown: t("unknown"),
-  })
+  const accent = seatAccent(turn.speaker.seatOrdinal)
+  const name = speakerName(turn.speaker, t)
+  const moderatorTurn = turn.speaker.role === "moderator"
   const confidence = (value: string) => {
     if (value === "low") return t("confidenceLow")
     if (value === "medium") return t("confidenceMedium")
@@ -167,6 +358,11 @@ function TranscriptTurnView({
     if (value === "unresolved") return t("agreementUnresolved")
     return value
   }
+  // The happy path (first attempt, accepted) stays in the details row.
+  const attemptWorthShowing =
+    turn.attemptState !== null &&
+    (turn.attemptState !== "accepted" ||
+      (turn.attemptNo !== null && turn.attemptNo > 1))
 
   return (
     <article
@@ -174,189 +370,266 @@ function TranscriptTurnView({
       data-message-id={turn.messageId ?? turn.key}
       data-visibility={turn.visibility}
       data-speaker-role={turn.speaker.role}
-      className="flex min-w-0 gap-3 py-3"
+      data-seat={turn.speaker.seatOrdinal ?? undefined}
+      className="relative flex min-w-0 gap-2 pt-4 sm:gap-3"
     >
-      <div
-        className="mt-0.5 flex size-7 shrink-0 items-center justify-center rounded-full bg-secondary text-secondary-foreground"
-        aria-hidden="true"
-      >
-        <AgentIcon
-          agentType={turn.speaker.agent as AgentType}
-          className="size-4"
+      <div className="flex shrink-0 flex-col items-center">
+        <RoundtableSpeakerAvatar
+          agent={turn.speaker.agent}
+          seatOrdinal={turn.speaker.seatOrdinal}
         />
+        {last ? null : (
+          <div
+            aria-hidden="true"
+            data-testid="turn-connector"
+            className="mt-2 -mb-4 w-px flex-1 bg-border"
+          />
+        )}
       </div>
-      <div className="min-w-0 flex-1 space-y-2">
-        <header className="flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1">
-          <span className="text-sm font-medium">{label}</span>
-          {turn.speaker.participantRole ? (
-            <span className="text-xs text-muted-foreground [overflow-wrap:anywhere]">
+      <div className="min-w-0 flex-1 space-y-2 pb-1">
+        <header className="flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1 pt-1 text-xs text-muted-foreground">
+          <span className={cn("text-sm font-semibold", accent.name)}>
+            {name}
+          </span>
+          {moderatorTurn ? (
+            <Chip className="gap-1 bg-primary/10 text-primary">
+              <Gavel aria-hidden="true" className="size-3" />
+              {t("moderator")}
+            </Chip>
+          ) : turn.speaker.participantRole ? (
+            <Chip className={cn(MUTED_TONE, "[overflow-wrap:anywhere]")}>
               {turn.speaker.participantRole}
-            </span>
+            </Chip>
           ) : null}
           {turn.speaker.modelId ? (
-            <span className="text-xs text-muted-foreground [overflow-wrap:anywhere]">
+            <span className="font-mono text-[11px] [overflow-wrap:anywhere]">
               {turn.speaker.modelId}
             </span>
           ) : null}
-          {turn.speaker.providerRef ? (
-            <span className="text-xs text-muted-foreground [overflow-wrap:anywhere]">
-              {turn.speaker.providerRef}
-            </span>
-          ) : null}
           {turn.finishedAt ? (
-            <time
-              dateTime={turn.finishedAt}
-              className="text-xs text-muted-foreground"
-            >
-              {formatStamp(turn.finishedAt, locale)}
-            </time>
+            <>
+              <span aria-hidden="true">·</span>
+              <time dateTime={turn.finishedAt} title={turn.finishedAt}>
+                {formatStamp(turn.finishedAt, locale)}
+              </time>
+            </>
           ) : null}
-          {turn.visibility === "published" ? (
-            <Badge variant="secondary">{t("published")}</Badge>
-          ) : null}
-          {turn.visibility === "staged" ? (
-            <Badge variant="outline">{t("staged")}</Badge>
-          ) : null}
-          {turn.kind === "abstain" ? (
-            <Badge variant="outline">{t("abstain")}</Badge>
-          ) : null}
-          {turn.attemptState ? (
-            <Badge variant="outline">
-              {turn.attemptNo !== null
-                ? t("attemptBadge", {
-                    count: turn.attemptNo,
-                    state: turn.attemptState,
-                  })
-                : turn.attemptState}
-            </Badge>
-          ) : null}
+          <span className="ms-auto flex flex-wrap items-center gap-1">
+            {turn.visibility === "published" ? (
+              <Badge
+                variant="outline"
+                className="border-emerald-500/30 bg-emerald-500/5 text-emerald-700 dark:text-emerald-300"
+              >
+                <CircleCheck aria-hidden="true" />
+                {t("published")}
+              </Badge>
+            ) : null}
+            {turn.visibility === "staged" ? (
+              <Badge
+                variant="outline"
+                className="h-auto border-amber-500/40 bg-amber-500/10 whitespace-normal text-amber-800 dark:text-amber-200"
+              >
+                {t("staged")}
+              </Badge>
+            ) : null}
+            {turn.kind === "abstain" ? (
+              <Badge variant="outline">{t("abstain")}</Badge>
+            ) : null}
+            {attemptWorthShowing ? (
+              <Badge variant="outline">
+                {turn.attemptNo !== null
+                  ? t("attemptBadge", {
+                      count: turn.attemptNo,
+                      state: turn.attemptState!,
+                    })
+                  : turn.attemptState}
+              </Badge>
+            ) : null}
+          </span>
         </header>
-        {turn.visibility === "preview" ? (
-          <RoundtableSafeContent text={turn.summary ?? ""} />
-        ) : (
-          <div className="min-w-0 space-y-3 text-sm">
-            {turn.summary ? <RoundtableMarkdown text={turn.summary} /> : null}
-            {turn.reason ? (
-              <section className="min-w-0 space-y-1">
-                <h5 className="text-xs font-medium text-muted-foreground">
-                  {t("reason")}
-                </h5>
-                <RoundtableMarkdown text={turn.reason} />
-              </section>
-            ) : null}
-            {turn.recommendation ? (
-              <div className="min-w-0 rounded-lg border border-primary/30 bg-background px-3 py-2">
-                <h5 className="mb-1 text-xs font-medium text-primary">
-                  {t("recommendation")}
-                </h5>
-                <RoundtableMarkdown text={turn.recommendation.text} />
-                {turn.recommendation.inference ? (
-                  <p className="mt-1 text-xs text-muted-foreground">
-                    {t("inference")}
-                  </p>
-                ) : null}
-              </div>
-            ) : null}
-            {turn.claims.length > 0 ? (
-              <TextList title={t("claims")}>
-                {turn.claims.map((claim, index) => (
-                  <li key={`${claim.text}:${index}`} className="min-w-0">
-                    <RoundtableMarkdown text={claim.text} />
-                    {claim.confidence ? (
-                      <p className="text-xs text-muted-foreground">
-                        {confidence(claim.confidence)}
-                      </p>
-                    ) : null}
-                  </li>
-                ))}
-              </TextList>
-            ) : null}
-            {turn.responses.length > 0 ? (
-              <TextList title={t("responses")}>
-                {turn.responses.map((response, index) => (
-                  <li key={`${response.text}:${index}`} className="min-w-0">
-                    <p className="text-xs text-muted-foreground">
-                      {[
-                        response.stance ? stance(response.stance) : null,
-                        response.priority ? priority(response.priority) : null,
-                      ]
-                        .filter(Boolean)
-                        .join(" · ")}
+        <div
+          data-testid="turn-body"
+          className={cn(
+            "min-w-0 rounded-xl border border-l-[3px] bg-card px-3 py-3 shadow-xs sm:px-4",
+            accent.bar,
+            conclusion && "bg-background"
+          )}
+        >
+          {turn.visibility === "preview" ? (
+            <RoundtableSafeContent text={turn.summary ?? ""} />
+          ) : (
+            <div className="min-w-0 space-y-4 text-sm">
+              {turn.recommendation ? (
+                <div className="min-w-0 rounded-lg border border-primary/30 bg-primary/5 px-3 py-2.5">
+                  <h5 className="mb-1 flex items-center gap-1.5 text-xs font-semibold text-primary">
+                    <Sparkles aria-hidden="true" className="size-3.5" />
+                    {t("recommendation")}
+                  </h5>
+                  <RoundtableMarkdown text={turn.recommendation.text} />
+                  {turn.recommendation.inference ? (
+                    <p className="mt-1 text-xs text-muted-foreground">
+                      {t("inference")}
                     </p>
-                    <RoundtableMarkdown text={response.text} />
+                  ) : null}
+                </div>
+              ) : null}
+              {turn.summary ? <RoundtableMarkdown text={turn.summary} /> : null}
+              {turn.reason ? (
+                <TextList title={t("reason")}>
+                  <li className="min-w-0">
+                    <RoundtableMarkdown text={turn.reason} />
                   </li>
-                ))}
-              </TextList>
-            ) : null}
-            {turn.openQuestions.length > 0 ? (
-              <TextList title={t("openQuestions")}>
-                {turn.openQuestions.map((question, index) => (
-                  <li key={`${question}:${index}`} className="min-w-0">
-                    <RoundtableMarkdown text={question} />
-                  </li>
-                ))}
-              </TextList>
-            ) : null}
-            {turn.positionChanges.length > 0 ? (
-              <TextList title={t("positionChanges")}>
-                {turn.positionChanges.map((change, index) => (
-                  <li key={`${change.reason}:${index}`} className="min-w-0">
-                    <RoundtableMarkdown text={change.reason} />
-                  </li>
-                ))}
-              </TextList>
-            ) : null}
-            <ConclusionList
-              title={t("alternatives")}
-              items={turn.alternatives}
-              inferredLabel={t("inference")}
-            />
-            {turn.consensus.length > 0 ? (
-              <TextList title={t("consensus")}>
-                {turn.consensus.map((item, index) => (
-                  <li key={`${item.text}:${index}`} className="min-w-0">
-                    {item.agreement ? (
-                      <p className="text-xs text-muted-foreground">
-                        {agreement(item.agreement)}
-                      </p>
-                    ) : null}
-                    <RoundtableMarkdown text={item.text} />
-                    {item.inference ? (
-                      <p className="text-xs text-muted-foreground">
-                        {t("inference")}
-                      </p>
-                    ) : null}
-                  </li>
-                ))}
-              </TextList>
-            ) : null}
-            <ConclusionList
-              title={t("disagreements")}
-              items={turn.disagreements}
-              inferredLabel={t("inference")}
-            />
-            <ConclusionList
-              title={t("risks")}
-              items={turn.risks}
-              inferredLabel={t("inference")}
-            />
-            <ConclusionList
-              title={t("decisionRequests")}
-              items={turn.decisionRequests}
-              inferredLabel={t("inference")}
-            />
-            {turn.coverage ? (
-              <p className="text-xs text-muted-foreground">
-                <span className="font-medium">{t("coverage")}: </span>
-                {t("coverageCounts", {
-                  succeeded: turn.coverage.succeeded,
-                  absent: turn.coverage.absent,
-                })}
-              </p>
-            ) : null}
-          </div>
-        )}
-        <TurnDetails turn={turn} />
+                </TextList>
+              ) : null}
+              {turn.claims.length > 0 ? (
+                <TextList title={t("claims")}>
+                  {turn.claims.map((claim, index) => (
+                    <li key={`${claim.text}:${index}`} className="min-w-0">
+                      <RoundtableMarkdown text={claim.text} />
+                      {claim.confidence ? (
+                        <Chip className={cn(MUTED_TONE, "mt-1")}>
+                          {confidence(claim.confidence)}
+                        </Chip>
+                      ) : null}
+                    </li>
+                  ))}
+                </TextList>
+              ) : null}
+              {turn.responses.length > 0 ? (
+                <TextList title={t("responses")}>
+                  {turn.responses.map((response, index) => (
+                    <li key={`${response.text}:${index}`} className="min-w-0">
+                      {response.stance || notablePriority(response.priority) ? (
+                        <p className="mb-1 flex flex-wrap gap-1">
+                          {response.stance ? (
+                            <Chip
+                              className={
+                                STANCE_TONES[response.stance] ?? MUTED_TONE
+                              }
+                            >
+                              {stance(response.stance)}
+                            </Chip>
+                          ) : null}
+                          {notablePriority(response.priority) ? (
+                            <Chip
+                              className={
+                                response.priority === "critical"
+                                  ? "bg-destructive/10 text-destructive"
+                                  : MUTED_TONE
+                              }
+                            >
+                              {priority(response.priority!)}
+                            </Chip>
+                          ) : null}
+                        </p>
+                      ) : null}
+                      <RoundtableMarkdown text={response.text} />
+                    </li>
+                  ))}
+                </TextList>
+              ) : null}
+              {turn.openQuestions.length > 0 ? (
+                <TextList title={t("openQuestions")}>
+                  {turn.openQuestions.map((question, index) => (
+                    <li key={`${question}:${index}`} className="min-w-0">
+                      <RoundtableMarkdown text={question} />
+                    </li>
+                  ))}
+                </TextList>
+              ) : null}
+              {turn.positionChanges.length > 0 ? (
+                <TextList title={t("positionChanges")}>
+                  {turn.positionChanges.map((change, index) => (
+                    <li key={`${change.reason}:${index}`} className="min-w-0">
+                      <RoundtableMarkdown text={change.reason} />
+                    </li>
+                  ))}
+                </TextList>
+              ) : null}
+              {turn.consensus.length > 0 ? (
+                <TextList title={t("consensus")}>
+                  {turn.consensus.map((item, index) => {
+                    const supporters = item.supporterAliases.flatMap(
+                      (alias) => {
+                        const seat = seats[alias]
+                        return seat ? [{ alias, seat }] : []
+                      }
+                    )
+                    return (
+                      <li key={`${item.text}:${index}`} className="min-w-0">
+                        {item.agreement ? (
+                          <Chip
+                            className={cn(
+                              "mb-1",
+                              AGREEMENT_TONES[item.agreement] ?? MUTED_TONE
+                            )}
+                          >
+                            {agreement(item.agreement)}
+                          </Chip>
+                        ) : null}
+                        <RoundtableMarkdown text={item.text} />
+                        {supporters.length > 0 ? (
+                          <p
+                            data-testid="consensus-supporters"
+                            className="mt-1 flex flex-wrap items-center gap-1 text-xs text-muted-foreground"
+                          >
+                            <span>{t("supportedBy")}</span>
+                            {supporters.map(({ alias, seat }) => (
+                              <Chip
+                                key={alias}
+                                className={cn(
+                                  "border bg-background",
+                                  seatAccent(seat.seatOrdinal).name
+                                )}
+                              >
+                                {seatLabel(seat, t)}
+                              </Chip>
+                            ))}
+                          </p>
+                        ) : null}
+                        {item.inference ? (
+                          <p className="text-xs text-muted-foreground">
+                            {t("inference")}
+                          </p>
+                        ) : null}
+                      </li>
+                    )
+                  })}
+                </TextList>
+              ) : null}
+              <ConclusionList
+                title={t("disagreements")}
+                items={turn.disagreements}
+                inferredLabel={t("inference")}
+              />
+              <ConclusionList
+                title={t("alternatives")}
+                items={turn.alternatives}
+                inferredLabel={t("inference")}
+              />
+              <ConclusionList
+                title={t("risks")}
+                items={turn.risks}
+                inferredLabel={t("inference")}
+              />
+              <ConclusionList
+                title={t("decisionRequests")}
+                items={turn.decisionRequests}
+                inferredLabel={t("inference")}
+              />
+              {turn.coverage ? (
+                <p className="text-xs text-muted-foreground">
+                  <span className="font-medium">{t("coverage")}: </span>
+                  {t("coverageCounts", {
+                    succeeded: turn.coverage.succeeded,
+                    absent: turn.coverage.absent,
+                  })}
+                </p>
+              ) : null}
+            </div>
+          )}
+          <TurnDetails turn={turn} />
+        </div>
       </div>
     </article>
   )
@@ -364,9 +637,13 @@ function TranscriptTurnView({
 
 function TextList({ title, children }: { title: string; children: ReactNode }) {
   return (
-    <section className="min-w-0 space-y-2">
-      <h5 className="text-xs font-medium text-muted-foreground">{title}</h5>
-      <ul className="min-w-0 space-y-2">{children}</ul>
+    <section className="min-w-0 space-y-1.5">
+      <h5 className="text-[11px] font-semibold tracking-wide text-muted-foreground uppercase">
+        {title}
+      </h5>
+      <ul className="min-w-0 space-y-2 [&>li]:border-l-2 [&>li]:border-border/70 [&>li]:ps-3">
+        {children}
+      </ul>
     </section>
   )
 }
@@ -401,10 +678,22 @@ function TurnDetails({ turn }: { turn: TranscriptTurn }) {
     turn.messageId ? [t("messageId"), turn.messageId] : null,
     turn.bodyHash ? [t("bodyHash"), turn.bodyHash] : null,
     turn.speaker.speakerId ? [t("speakerId"), turn.speaker.speakerId] : null,
+    turn.speaker.providerRef ? [t("provider"), turn.speaker.providerRef] : null,
     turn.phaseId && !turn.phaseId.startsWith("kind:")
       ? [t("phaseId"), turn.phaseId]
       : null,
     turn.attemptId ? [t("attemptId"), turn.attemptId] : null,
+    turn.attemptState
+      ? [
+          t("attempts"),
+          turn.attemptNo !== null
+            ? t("attemptBadge", {
+                count: turn.attemptNo,
+                state: turn.attemptState,
+              })
+            : turn.attemptState,
+        ]
+      : null,
     turn.publishedSeq ? [t("publishedSeq"), turn.publishedSeq] : null,
   ].filter((row): row is [string, string] => row !== null)
   if (
@@ -414,8 +703,8 @@ function TurnDetails({ turn }: { turn: TranscriptTurn }) {
   )
     return null
   return (
-    <details className="group min-w-0 border-t border-border/60 pt-2">
-      <summary className="flex cursor-pointer list-none items-center gap-1.5 rounded-sm text-xs text-muted-foreground focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring [&::-webkit-details-marker]:hidden">
+    <details className="group mt-3 min-w-0 border-t border-border/60 pt-2">
+      <summary className="flex cursor-pointer list-none items-center gap-1.5 rounded-sm text-xs text-muted-foreground hover:text-foreground focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring [&::-webkit-details-marker]:hidden">
         <ChevronRight
           aria-hidden="true"
           className="size-3.5 shrink-0 transition-transform group-open:rotate-90"
@@ -424,11 +713,11 @@ function TurnDetails({ turn }: { turn: TranscriptTurn }) {
       </summary>
       <div className="mt-2 min-w-0 space-y-3 [overflow-wrap:anywhere]">
         {rows.length > 0 ? (
-          <dl className="grid min-w-0 gap-1 text-xs text-muted-foreground">
+          <dl className="grid min-w-0 gap-1 text-xs text-muted-foreground sm:grid-cols-[max-content_1fr] sm:gap-x-4">
             {rows.map(([name, value]) => (
-              <div key={name} className="min-w-0">
+              <div key={name} className="contents">
                 <dt className="font-medium">{name}</dt>
-                <dd className="break-all">{value}</dd>
+                <dd className="mb-1 font-mono break-all sm:mb-0">{value}</dd>
               </div>
             ))}
           </dl>

@@ -459,6 +459,8 @@ describe("roundtable product page", () => {
   it("shows a verified message in the transcript with its phase and member", async () => {
     const summary = "Prepaid slices stay elapsed."
     const loaded = await room("completed", false, async (body) => {
+      ;(body.replay.config as { topic: string }).topic =
+        "Store tokens in `HttpOnly` cookies?"
       const message = { kind: "proposal", summary, claims: [] }
       const hash = await roundtableHash(message)
       body.messages = [{ message_id: "message-1", hash }]
@@ -534,6 +536,11 @@ describe("roundtable product page", () => {
     expect(transcript).toHaveTextContent("member 1")
     expect(transcript).toHaveTextContent("grok-4.6")
     expect(transcript).not.toHaveTextContent("staged")
+    const title = screen
+      .getAllByRole("heading", { level: 2 })
+      .find((node) => node.textContent?.includes("HttpOnly"))
+    expect(title?.querySelector("code")).toHaveTextContent("HttpOnly")
+    expect(title).not.toHaveTextContent("`")
   })
 })
 

@@ -7537,6 +7537,7 @@
     "agreementExplicit": "명시적 합의",
     "agreementCompatible": "양립하는 입장",
     "agreementUnresolved": "미해결",
+    "supportedBy": "지지 멤버",
     "inference": "추론",
     "attemptBadge": "시도 {count} · {state}",
     "attemptId": "시도 ID",

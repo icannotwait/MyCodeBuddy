@@ -7537,6 +7537,7 @@
     "agreementExplicit": "اتفاق صريح",
     "agreementCompatible": "مواقف متوافقة",
     "agreementUnresolved": "غير محسوم",
+    "supportedBy": "مدعوم من",
     "inference": "استنتاج",
     "attemptBadge": "المحاولة {count} · {state}",
     "attemptId": "معرّف المحاولة",
