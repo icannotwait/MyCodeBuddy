@@ -134,12 +134,13 @@ test("an unrelated error body containing the number 1033 is not a tunnel error",
   assert.equal(result.stdout, "0|other|404|code=404\n")
 })
 
-test("empty or unset public URL skips curl", () => {
+test("empty or unset public URL reports unconfigured without curl", () => {
   for (const setup of ["CODEG_PUBLIC_URL=", "unset CODEG_PUBLIC_URL"]) {
     const result = runWatchdog(`${setup}\n${probe}`)
     assert.equal(result.status, 0, result.stderr)
-    assert.equal(result.stdout, "0|skip|000|\n")
+    assert.equal(result.stdout, "0|unconfigured|000|\n")
     assert.equal(result.curls, "")
+    assert.match(result.log, /CODEG_PUBLIC_URL is not configured/)
   }
 })
 
@@ -344,7 +345,7 @@ test("unset URL remains opt-in after configuration is initialized", () => {
     `unset CODEG_PUBLIC_URL\nconfigure_watchdog\n${probe}`
   )
   assert.equal(result.status, 0, result.stderr)
-  assert.equal(result.stdout, "0|skip|000|\n")
+  assert.equal(result.stdout, "0|unconfigured|000|\n")
   assert.equal(result.curls, "")
 })
 
@@ -436,4 +437,371 @@ printf 'expired=%s|%s|%s|%s\\n' "$pub" "$pub_status" "$broken" "$pub_fail_streak
   assert.equal(result.status, 0, result.stderr)
   assert.equal(result.stdout, "grace=pending|bad|0|0\nexpired=bad|bad|1|1\n")
   assert.match(result.log, /public probe bad code=530.*readiness grace/)
+})
+
+// Local config file (default $BOOT/local.env, override CODEG_WATCHDOG_CONFIG).
+// The harness presets every key as if exported; drop them to model a launcher
+// that passes no environment.
+const unsetConfigEnv = `unset CODEG_PUBLIC_URL PUBLIC_FAIL_THRESHOLD TUNNEL_RESTART_COOLDOWN TUNNEL_RESTART_BACKOFF_CAP TUNNEL_RESTART_DAILY_CAP TUNNEL_RESTART_GRACE`
+const showConfig = `printf '%s|%s|%s|%s|%s|%s\\n' "$CODEG_PUBLIC_URL" "$PUBLIC_FAIL_THRESHOLD" "$TUNNEL_RESTART_COOLDOWN" "$TUNNEL_RESTART_BACKOFF_CAP" "$TUNNEL_RESTART_DAILY_CAP" "$TUNNEL_RESTART_GRACE"`
+
+test("local config file supplies the public URL and limits without env", () => {
+  const result = runWatchdog(`
+${unsetConfigEnv}
+cat >"$BOOT/local.env" <<'CFG'
+# comment line
+
+export CODEG_PUBLIC_URL="https://edge.example.test/"   # quoted + comment
+PUBLIC_FAIL_THRESHOLD=3 # inline comment
+  TUNNEL_RESTART_COOLDOWN='240'
+TUNNEL_RESTART_GRACE=30\r
+CODEG_TOKEN=must-be-ignored
+CFG
+configure_watchdog
+${showConfig}
+printf 'token=%s\\n' "\${CODEG_TOKEN:-unset}"
+CURL_CODE=200
+${probe}
+`)
+  assert.equal(result.status, 0, result.stderr)
+  assert.equal(
+    result.stdout,
+    "https://edge.example.test/|3|240|1800|0|30\ntoken=unset\n0|ok|200|\n"
+  )
+  assert.match(result.curls, /https:\/\/edge\.example\.test\//)
+  assert.equal(result.stderr, "")
+})
+
+test("config parser never executes file content and rejects bad values", () => {
+  const result = runWatchdog(`
+${unsetConfigEnv}
+cat >"$BOOT/local.env" <<'CFG'
+touch "$TEST_ROOT/pwned-line"
+CODEG_PUBLIC_URL=$(touch "$TEST_ROOT/pwned-url")
+PUBLIC_FAIL_THRESHOLD=\`touch "$TEST_ROOT/pwned-int"\`
+TUNNEL_RESTART_COOLDOWN=1+1
+CFG
+configure_watchdog
+${showConfig}
+[ -e "$TEST_ROOT/pwned-line" ] || [ -e "$TEST_ROOT/pwned-url" ] || [ -e "$TEST_ROOT/pwned-int" ] && echo EXECUTED
+${probe}
+`)
+  assert.equal(result.status, 0, result.stderr)
+  assert.equal(result.stdout, "|2|180|1800|0|60\n0|unconfigured|000|\n")
+  assert.match(result.log, /local\.env:1: ignoring malformed line/)
+  assert.match(result.log, /invalid CODEG_PUBLIC_URL/)
+  assert.match(result.log, /invalid PUBLIC_FAIL_THRESHOLD/)
+  assert.equal(result.curls, "")
+})
+
+test("non-empty launcher env overrides the config file; empty env does not", () => {
+  const result = runWatchdog(`
+${unsetConfigEnv}
+printf '%s\\n' CODEG_PUBLIC_URL=https://file.example.test/ PUBLIC_FAIL_THRESHOLD=5 >"$BOOT/local.env"
+CODEG_PUBLIC_URL=https://env.example.test/
+PUBLIC_FAIL_THRESHOLD=
+configure_watchdog
+${showConfig}
+`)
+  assert.equal(result.status, 0, result.stderr)
+  assert.equal(result.stdout, "https://env.example.test/|5|180|1800|0|60\n")
+})
+
+test("CODEG_WATCHDOG_CONFIG selects an alternate config path", () => {
+  const result = runWatchdog(
+    `
+${unsetConfigEnv}
+printf '%s\\n' CODEG_PUBLIC_URL=https://default.example.test/ >"$BOOT/local.env"
+printf '%s\\n' CODEG_PUBLIC_URL=https://alt.example.test/ >"$TEST_ROOT/alt.env"
+configure_watchdog
+${showConfig}
+`,
+    { CODEG_WATCHDOG_CONFIG: "" }
+  )
+  assert.equal(result.stdout, "https://default.example.test/|2|180|1800|0|60\n")
+  const alt = runWatchdog(`
+${unsetConfigEnv}
+printf '%s\\n' CODEG_PUBLIC_URL=https://default.example.test/ >"$BOOT/local.env"
+printf '%s\\n' CODEG_PUBLIC_URL=https://alt.example.test/ >"$TEST_ROOT/alt.env"
+CODEG_WATCHDOG_CONFIG=$TEST_ROOT/alt.env
+configure_watchdog
+${showConfig}
+`)
+  assert.equal(alt.status, 0, alt.stderr)
+  assert.equal(alt.stdout, "https://alt.example.test/|2|180|1800|0|60\n")
+})
+
+test("config edits apply on the next loop without a restart", () => {
+  const result = runWatchdog(`
+${unsetConfigEnv}
+configure_watchdog
+${showConfig}
+reload_watchdog_config
+printf 'CODEG_PUBLIC_URL=https://edge.example.test/\\nTUNNEL_RESTART_GRACE=5\\n' >"$BOOT/local.env"
+reload_watchdog_config
+${showConfig}
+reload_watchdog_config
+printf '# disabled\\n' >"$BOOT/local.env"
+reload_watchdog_config
+${showConfig}
+`)
+  assert.equal(result.status, 0, result.stderr)
+  assert.equal(
+    result.stdout,
+    "|2|180|1800|0|60\nhttps://edge.example.test/|2|180|1800|0|5\n|2|180|1800|0|60\n"
+  )
+  assert.equal(result.log.match(/config reloaded/g)?.length, 2)
+})
+
+test("unconfigured public probe warns at most hourly", () => {
+  const result = runWatchdog(`
+${unsetConfigEnv}
+configure_watchdog
+probe_public
+echo 2000003599 >"$TEST_ROOT/now"
+probe_public
+echo 2000003600 >"$TEST_ROOT/now"
+probe_public
+`)
+  assert.equal(result.status, 0, result.stderr)
+  assert.equal(result.log.match(/CODEG_PUBLIC_URL is not configured/g)?.length, 2)
+})
+
+function daemonLoopSetup(extra = "") {
+  return `
+loop=0
+port_up() { return 0; }
+http_ok() { return 0; }
+webdav_ok() { return 0; }
+cf_up() { return 0; }
+restart_server() { echo 'unexpected server restart' >&2; exit 90; }
+ps() { printf '123\\n'; }
+cat >"$BOOT/start-webdav.sh" <<'MOCK'
+#!/bin/bash
+exit 0
+MOCK
+chmod +x "$BOOT/start-webdav.sh"
+sleep_hook() { :; }
+sleep() {
+  if [ "$1" = 60 ]; then
+    sleep_hook
+    if [ "$loop" -ge 2 ]; then exit 0; fi
+    echo "$((2000000000 + loop * 60))" >"$TEST_ROOT/now"
+  fi
+}
+${unsetConfigEnv}
+configure_watchdog
+${extra}
+`
+}
+
+test("daemon loop reports public=unconfigured, then probes once config appears", () => {
+  const result = runWatchdog(
+    daemonLoopSetup(`
+CURL_CODE=530
+# Create the config after the first loop's status line, with no restart.
+sleep_hook() {
+  if [ "$loop" -eq 1 ]; then
+    printf 'CODEG_PUBLIC_URL=https://edge.example.test/\\n' >"$BOOT/local.env"
+  fi
+}
+`),
+    {},
+    true
+  )
+  assert.equal(result.status, 0, result.stderr)
+  const status = result.log.split("\n").filter((l) => /3080=up/.test(l))
+  assert.equal(status.length, 2)
+  assert.match(status[0], /public=unconfigured/)
+  assert.match(status[1], /public=bad pubcode=530/)
+  assert.match(result.log, /config reloaded .*public_url=https:\/\/edge\.example\.test\//)
+  // Routine start-if-missing only; one 530 is below the threshold of 2.
+  assert.doesNotMatch(result.starts, /--force/)
+})
+
+// Resume/wake detection. The VM is paused when idle; a pause shows up only as
+// a sleep that took far longer on the wall clock than requested. The fake
+// sleep advances the fake clock to model that.
+const wakeSetup = (sleptSeconds) => `
+configure_watchdog
+TUNNEL_RESTART_GRACE=0
+sleep() {
+  echo "$*" >>"$TEST_ROOT/sleeps"
+  if [ "$1" = 60 ] || [ "$1" = 15 ]; then
+    echo "$(( $(cat "$TEST_ROOT/now") + ${sleptSeconds} ))" >"$TEST_ROOT/now"
+  fi
+}
+watchdog_sleep
+`
+const wakeReport = `printf 'result=%s streak=%s used=%s pub=%s\\n' "$result" "$pub_fail_streak" "\${wake_restart_used:-unset}" "$pub"`
+
+test("a resume gap probes immediately and restarts cloudflared on the first 1033", () => {
+  const result = runWatchdog(`
+${wakeSetup(400)}
+CURL_CODE=530
+check_public_tunnel; result=$?
+${wakeReport}
+`)
+  assert.equal(result.status, 0, result.stderr)
+  assert.equal(result.stdout, "result=0 streak=1 used=1 pub=bad\n")
+  assert.equal(result.starts, "1 --force\n")
+  assert.match(result.log, /resume detected gap=340s \(slept 400s, expected 60s\)/)
+  assert.match(result.log, /resume: public probe bad code=530 mention=none; re-probing in 10s/)
+  assert.match(result.log, /restart cloudflared ONLY \(wake: cooldown bypassed\): resume: public code=530/)
+  assert.equal(result.curls.trim().split("\n").length, 2)
+})
+
+test("a normal loop interval is not a wake and keeps the 2-failure threshold", () => {
+  const result = runWatchdog(`
+${wakeSetup(100)}
+CURL_CODE=530
+check_public_tunnel; result=$?
+${wakeReport}
+`)
+  assert.equal(result.status, 0, result.stderr)
+  assert.equal(result.stdout, "result=0 streak=1 used=unset pub=bad\n")
+  assert.equal(result.starts, "")
+  assert.doesNotMatch(result.log, /resume/)
+})
+
+test("a resume with a healthy edge does not restart and switches to fast checks", () => {
+  const result = runWatchdog(`
+${wakeSetup(400)}
+CURL_CODE=200
+check_public_tunnel; result=$?
+${wakeReport}
+watchdog_sleep
+printf 'sleeps=%s\n' "$(tr '\n' ' ' <"$TEST_ROOT/sleeps")"
+`)
+  assert.equal(result.status, 0, result.stderr)
+  // First sleep is the normal 60s; inside the watch window the next is 15s.
+  assert.equal(result.stdout, "result=0 streak=0 used=0 pub=ok\nsleeps=60 15 \n")
+  assert.equal(result.starts, "")
+  assert.match(result.log, /resume: public probe ok code=200; no restart \(watching 300s\)/)
+})
+
+test("a re-probe that recovers (self-reconnect) avoids a restart", () => {
+  const result = runWatchdog(`
+${wakeSetup(400)}
+CURL_CODE=530
+sleep() { echo "$*" >>"$TEST_ROOT/sleeps"; CURL_CODE=200; }
+check_public_tunnel; result=$?
+${wakeReport}
+`)
+  assert.equal(result.status, 0, result.stderr)
+  assert.equal(result.stdout, "result=0 streak=0 used=0 pub=ok\n")
+  assert.equal(result.starts, "")
+  assert.match(result.log, /resume: re-probe ok code=200; no restart/)
+})
+
+test("a late zombie inside the watch window still gets the single fast restart", () => {
+  const result = runWatchdog(`
+${wakeSetup(400)}
+CURL_CODE=200
+check_public_tunnel
+echo $(( $(cat "$TEST_ROOT/now") + 120 )) >"$TEST_ROOT/now"
+CURL_CODE=530
+check_public_tunnel; result=$?
+${wakeReport}
+`)
+  assert.equal(result.status, 0, result.stderr)
+  assert.equal(result.stdout, "result=0 streak=1 used=1 pub=bad\n")
+  assert.equal(result.starts, "1 --force\n")
+})
+
+test("wake bypasses cooldown once, never the daily cap or readiness grace", () => {
+  const capped = runWatchdog(`
+TUNNEL_RESTART_DAILY_CAP=1
+printf '%s\\n' "1999999990 180 $((2000000000 / 86400)) 1 0" >"$TUNNEL_RESTART_STAMP"
+${wakeSetup(400)}
+TUNNEL_RESTART_DAILY_CAP=1
+CURL_CODE=530
+check_public_tunnel; result=$?
+${wakeReport}
+`)
+  assert.equal(capped.stdout, "result=2 streak=1 used=1 pub=bad\n")
+  assert.equal(capped.starts, "")
+  assert.match(capped.log, /tunnel restart skipped: daily cap 1\/1/)
+
+  const cooldown = runWatchdog(`
+printf '%s\\n' "2000000300 180 $((2000000000 / 86400)) 1 0" >"$TUNNEL_RESTART_STAMP"
+${wakeSetup(400)}
+CURL_CODE=530
+check_public_tunnel
+${wakeReport.replace("$result", "0")}
+check_public_tunnel; result=$?
+${wakeReport}
+`)
+  assert.equal(cooldown.status, 0, cooldown.stderr)
+  // Recent attempt (100s ago) is bypassed once; the next failure is normal.
+  assert.equal(cooldown.starts, "1 --force\n")
+  assert.equal(cooldown.stdout, "result=0 streak=1 used=1 pub=bad\nresult=2 streak=2 used=1 pub=bad\n")
+  assert.match(cooldown.log, /tunnel restart skipped: cooldown\/backoff/)
+
+  const grace = runWatchdog(`
+${wakeSetup(400)}
+printf '%s\\n' "2000000300 180 $((2000000000 / 86400)) 1 2000000430" >"$TUNNEL_RESTART_STAMP"
+CURL_CODE=530
+check_public_tunnel; result=$?
+${wakeReport}
+`)
+  assert.equal(grace.stdout, "result=0 streak=0 used=0 pub=pending\n")
+  assert.equal(grace.starts, "")
+})
+
+test("wake settings come from the local config whitelist with range checks", () => {
+  const result = runWatchdog(`
+${unsetConfigEnv}
+printf '%s\\n' WAKE_GAP_THRESHOLD=600 WAKE_REPROBE_DELAY=0 WAKE_WATCH_SECS=999999 WAKE_FAST_SLEEP=20 >"$BOOT/local.env"
+configure_watchdog
+printf '%s %s %s %s\\n' "$WAKE_GAP_THRESHOLD" "$WAKE_REPROBE_DELAY" "$WAKE_WATCH_SECS" "$WAKE_FAST_SLEEP"
+`)
+  assert.equal(result.status, 0, result.stderr)
+  assert.equal(result.stdout, "600 0 300 20\n")
+  assert.match(result.log, /invalid WAKE_WATCH_SECS/)
+})
+
+test("daemon loop: a pause during sleep triggers one immediate restart and fast re-checks", () => {
+  const result = runWatchdog(
+    `
+loop=0
+port_up() { return 0; }
+http_ok() { return 0; }
+webdav_ok() { return 0; }
+cf_up() { return 0; }
+restart_server() { echo 'unexpected server restart' >&2; exit 90; }
+ps() { printf '123\\n'; }
+cat >"$BOOT/start-webdav.sh" <<'MOCK'
+#!/bin/bash
+exit 0
+MOCK
+chmod +x "$BOOT/start-webdav.sh"
+TUNNEL_RESTART_GRACE=0
+sleep() {
+  echo "$*" >>"$TEST_ROOT/sleeps"
+  case $1 in
+    60|15)
+      if [ "$loop" -ge 3 ]; then
+        printf 'sleeps=%s\\n' "$(tr '\\n' ' ' <"$TEST_ROOT/sleeps")"
+        exit 0
+      fi
+      # Loop 1 sleeps through a 20-minute VM pause; later sleeps are normal.
+      if [ "$loop" -eq 1 ]; then step=1200; else step=$1; fi
+      echo "$(( $(cat "$TEST_ROOT/now") + step ))" >"$TEST_ROOT/now"
+      ;;
+  esac
+}
+CURL_CODE=530
+`,
+    {},
+    true
+  )
+  assert.equal(result.status, 0, result.stderr)
+  assert.equal(result.stderr, "")
+  assert.match(result.log, /resume detected gap=1140s/)
+  assert.match(result.log, /cooldown bypassed/)
+  // Loop 1: 530 x1 (below threshold). Wake after loop 1's sleep: immediate
+  // restart. Loop 2 sleeps 15s (watch window). No codeg-server restart.
+  assert.equal(result.starts.match(/1 --force/g)?.length, 1)
+  assert.equal(result.stdout, "sleeps=60 10 15 15 \n")
 })

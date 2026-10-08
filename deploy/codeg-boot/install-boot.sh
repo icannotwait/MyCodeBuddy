@@ -21,5 +21,5 @@ done
 echo "installed boot scripts -> $DEST"
 echo "secrets NOT touched. Ensure:"
 echo "  - /workspace/codeg-data/CODEG_TOKEN (mode 600; create with openssl rand -hex 16)"
-echo "  - cloudflared config at \${CF_CONFIG:-\$HOME/.cloudflared/config.yml}"
+echo "  - cloudflared config at \${CF_CONFIG:-/home/box/.cloudflared/config.yml} (check: start-codeg-tunnel.sh --print-config)"
 echo "Optional: restore ACP mirror tarball into /workspace/codeg-data/acp-binaries-mirror"

@@ -66,16 +66,88 @@ or ACP caches. When scripts change, the watchdog reloads itself via
 
 Disable by removing execute bit: `chmod a-x /workspace/codeg-boot/auto-sync-boot.sh`.
 
+## Resume / wake recovery
+
+The box VM is paused when idle. Wall clock keeps running, but uptime and the
+monotonic clock freeze, and on resume cloudflared (http2) still believes its 4
+connections are up while the edge has dropped them (530/1033). The watchdog
+therefore measures each loop **sleep** on the wall clock (loop work is not
+counted, so a slow WebDAV rebuild is never a "wake"):
+
+- Sleep took more than `WAKE_GAP_THRESHOLD` (default **180 s** for a 60 s
+  sleep): log `resume detected gap=Ns` and probe the public edge on the very
+  next iteration.
+- A failing probe (530 / 1033 / connect failure with local UI ok) is confirmed
+  by **one re-probe** after `WAKE_REPROBE_DELAY` (10 s), which also lets a
+  self-reconnecting cloudflared recover without a restart. If it still fails,
+  cloudflared **only** is force-restarted at once: no 2-failure threshold and
+  no cooldown/backoff (a long pause already elapsed), but the daily cap and the
+  60 s post-restart readiness grace still apply. This bypass is used at most
+  **once per wake**; afterwards normal threshold/cooldown rules resume.
+- No blind restart: a healthy probe after wake restarts nothing, but for
+  `WAKE_WATCH_SECS` (300 s) the loop sleeps `WAKE_FAST_SLEEP` (15 s) and a
+  late-appearing zombie can still use the single fast restart.
+- codeg-server is never restarted for public failures.
+
+All four keys are accepted from the local config file (see above).
+
+## Tunnel config and HOME
+
+`start-codeg-tunnel.sh` never depends on the caller's `$HOME`. It resolves the
+config as `CF_CONFIG` > `/home/box/.cloudflared/config.yml` >
+`$HOME/.cloudflared/config.yml` > `/etc/cloudflared/config.yml`, runs
+cloudflared with `HOME` set to the owner of that `.cloudflared` dir (the
+config's `credentials-file` stays absolute), and logs the resolved config on
+every start/force and on failure to `cloudflared.log`. Check without touching
+the tunnel: `start-codeg-tunnel.sh --force --print-config`.
+
+`codeg-watchdog.sh`, `reload-watchdog-once.sh`, and `codeg-supervisor.sh` pin
+`HOME=/home/box USER=box LOGNAME=box`, so a relaunch from a sandbox shell
+(e.g. `HOME=/workspace/agent-reach/home`) cannot redirect `$HOME`-based paths.
+On 2026-10-08 that made a forced 1033 recovery fail with
+`missing cloudflared config` until the edge dropped the zombie itself.
+Offline tests: `node --test scripts/start-codeg-tunnel.test.mjs`.
+
+## WebDAV (`start-webdav.sh`)
+
+WsgiDAV listens on `:6065`; the watchdog calls `start-webdav.sh` every loop and
+expects an unauthenticated request to return `401`. Machine-local, never in
+git: `/workspace/webdav/wsgidav.yaml`, its credentials, `start.sh`, and `data/`.
+
+The venv `/workspace/webdav/venv` is regenerable. Box restores/updates can drop
+it (that left WebDAV down from 2026-09-29 to 2026-10-08), so when the port is
+down and the venv is missing or cannot `import wsgidav, cheroot`, the script
+rebuilds it from `CODEG_WEBDAV_PIP_SPEC` (default
+`WsgiDAV==4.3.5 cheroot==11.1.2`), at most once per
+`CODEG_WEBDAV_BOOTSTRAP_INTERVAL` seconds (default `3600`). Outcomes and errors
+go to `/workspace/webdav/webdav.log` (the watchdog discards stderr). Offline
+tests: `node --test scripts/start-webdav.test.mjs`.
+
 ## ACP versions
 
 `ensure-acp-agents.sh` does **not** hardcode agent versions. It asks the live
 `codeg-server` (`POST /api/acp_list_agents`) for each enabled agent's
-`registry_version` (from the MyCodeBuddy registry baked into that build) and
-only downloads/upgrades when `installed_version` differs.
+`registry_version` (from the MyCodeBuddy registry baked into that build).
+
+The registry version is a **minimum, not an exact pin**. The script follows the
+version actually in use (`installed_version`, which for binary agents is the
+highest cached version, the same one the server launches):
+
+- installed **>=** registry (SemVer 2.0 precedence: numeric parts, prerelease
+  below release, `+build` ignored): kept, nothing downloaded or refreshed. A
+  user who upgraded early (e.g. Antigravity 1.3.0 while the registry pins
+  1.2.1) stays on it; the log notes `keep user-installed newer ...`.
+- installed missing, unparseable, or **older**: moved to the registry version.
 
 So after you deploy a new `codeg-dist` that bumps Cursor / Antigravity / Grok
-in registry, the next watchdog `ensure-acp` cycle pulls those versions.
-Optional overrides: `CODEG_ANTIGRAVITY_VER`, `CODEG_CURSOR_VER`, `CODEG_GROK_VER`.
+in registry, the next watchdog `ensure-acp` cycle upgrades anything below it.
+Exact pins (explicit choice, may downgrade): `CODEG_ANTIGRAVITY_VER`,
+`CODEG_CURSOR_VER`, `CODEG_GROK_VER`.
+
+Preview without side effects: `ENSURE_ACP_PLAN_ONLY=1 ensure-acp-agents.sh`
+(or `--plan-only`) prints `plan ...` / `keep ...` rows and exits before any
+restore, mirror, download, or mutating API call. Offline tests:
+`node --test scripts/ensure-acp-agents.test.mjs`.
 
 A failed direct download or failed API download backs off that agent only.
 The stamp `/workspace/heartbeat/ensure-acp-<agent>.fail` stores the failure
@@ -84,8 +156,8 @@ time and the next wait (start `3600` seconds, double each failure, cap
 and continues with the others. Success deletes the stamp. Overrides:
 `CODEG_ACP_BACKOFF_BASE_SECS`, `CODEG_ACP_BACKOFF_CAP_SECS`.
 
-If the wanted version is already on disk but `installed_version` still
-differs, the script does not stop at "already on disk". Antigravity and
+If the wanted (registry or pinned) version is already on disk but
+`installed_version` still differs from it, the script does not stop at "already on disk". Antigravity and
 Cursor call `POST /api/acp_download_agent_binary` for that version (a complete
 server cache hit does not re-download). After a direct Antigravity unzip, it
 re-reads `acp_list_agents` and uses the same API download when the server
@@ -96,22 +168,31 @@ if the probed version is still wrong, `POST /api/acp_prepare_npx_agent`.
 ## Public tunnel probe
 
 `codeg-watchdog.sh` probes the public edge only when `CODEG_PUBLIC_URL` is
-explicitly configured. **Unset or empty skips the probe**; a new installation
-never probes another host's URL. `env.example` is documentation, not an
-automatically loaded environment file.
+configured. **Unset or empty disables the probe**: the status line shows
+`public=unconfigured` and an hourly warning is written to `watchdog.log`,
+because a Cloudflare 530/1033 zombie tunnel will then never be auto-restarted.
+A new installation never probes another host's URL.
 
-For the existing drawcode live box, add this export to the persistent launcher
-that starts `codeg-supervisor.sh` / `codeg-watchdog.sh` (or its service environment):
+Configure it in a machine-local file, not in git and not in the launcher:
 
 ```bash
-export CODEG_PUBLIC_URL=https://drawcode.20241021.best/
+cp deploy/codeg-boot/env.example /workspace/codeg-boot/local.env
+# then uncomment and set: CODEG_PUBLIC_URL=https://<this-box-public-host>/
 ```
 
-After setting it in the current shell, reload the installed watchdog with
-`/workspace/codeg-boot/reload-watchdog-once.sh`. The new process inherits the
-export; the persistent launcher setting is still needed after a reboot. Other
-hosts must use their own public Codeg URL. Installing/syncing scripts does not
-change the machine's environment.
+- Default path `/workspace/codeg-boot/local.env`; override with
+  `CODEG_WATCHDOG_CONFIG=/path/to/file`. `install-boot.sh` and
+  `auto-sync-boot.sh` only copy the known scripts, so they never overwrite it.
+- The file is **parsed, never sourced**: blank lines, `#` comments, an optional
+  `export ` prefix, `KEY=VALUE` with optional matching quotes. Only
+  `CODEG_PUBLIC_URL`, the numeric limits below, and the `WAKE_*` keys are read; other keys are
+  ignored, malformed lines are warned about, and `CODEG_PUBLIC_URL` must be
+  `http(s)://...`.
+- Precedence: non-empty launcher environment > local file > built-in default.
+- The watchdog re-checks the file every loop and re-parses it when it changes,
+  so edits apply within ~60 s without a restart (`config reloaded` in the log).
+- `deploy/codeg-boot/local.env` / `*.local.env` are gitignored in case a copy
+  is made inside the repo; the real file holds this machine's hostname.
 
 A completed **HTTP 530** response, an explicit **Cloudflare Tunnel error / error
 1033** in an HTTP 4xx/5xx body, or a failed transfer while the local `:3080` UI is
@@ -152,6 +233,9 @@ Configuration (decimal integers; leading zeroes are accepted):
   if configured below it
 - `TUNNEL_RESTART_DAILY_CAP=0`: range 0–1000, where 0 disables the cap
 - `TUNNEL_RESTART_GRACE=60`: range 0–3600 seconds, where 0 disables grace
+- `WAKE_GAP_THRESHOLD=180` (90–86400), `WAKE_REPROBE_DELAY=10` (0–120),
+  `WAKE_WATCH_SECS=300` (0–3600), `WAKE_FAST_SLEEP=15` (5–60): see
+  [Resume / wake recovery](#resume--wake-recovery)
 
 Invalid/out-of-range values produce a warning and use the documented default.
 State is written before starting a force restart; if it cannot be persisted, the

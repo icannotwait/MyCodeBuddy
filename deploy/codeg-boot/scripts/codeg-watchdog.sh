@@ -1,6 +1,10 @@
 #!/bin/bash
 set -uo pipefail
 export PATH=/workspace/bin:/exec-daemon:$PATH
+# Box services run as box. Pin HOME/USER so a launch from a sandbox shell
+# (HOME=/workspace/agent-reach/home) cannot leak into $HOME-based paths
+# (cloudflared config, ~/.grok/bin, ~/.local/bin/pi).
+export HOME=/home/box USER=box LOGNAME=box
 
 BOOT=/workspace/codeg-boot
 HB=/workspace/heartbeat
@@ -31,17 +35,145 @@ watchdog_config_uint() {
   printf -v "$name" '%s' "$((10#$value))"
 }
 
+# Keys the local config file may set. Anything else in the file is ignored, so
+# the same file can also document other boot settings (see env.example).
+watchdog_config_keys() {
+  printf '%s\n' CODEG_PUBLIC_URL PUBLIC_FAIL_THRESHOLD TUNNEL_RESTART_COOLDOWN \
+    TUNNEL_RESTART_BACKOFF_CAP TUNNEL_RESTART_DAILY_CAP TUNNEL_RESTART_GRACE \
+    WAKE_GAP_THRESHOLD WAKE_REPROBE_DELAY WAKE_WATCH_SECS WAKE_FAST_SLEEP
+}
+
+# Machine-local KEY=VALUE file, never tracked in git. CODEG_WATCHDOG_CONFIG
+# overrides the default location.
+watchdog_config_path() {
+  printf '%s' "${CODEG_WATCHDOG_CONFIG:-$BOOT/local.env}"
+}
+
+# Remember which keys the launcher's environment set (non-empty) so they keep
+# precedence over the file across config reloads.
+snapshot_watchdog_env() {
+  local key
+  while IFS= read -r key; do
+    if [ -n "${!key:-}" ]; then
+      printf -v "WATCHDOG_ENV_SET_$key" '%s' 1
+      printf -v "WATCHDOG_ENV_VAL_$key" '%s' "${!key}"
+    else
+      printf -v "WATCHDOG_ENV_SET_$key" '%s' ''
+    fi
+  done < <(watchdog_config_keys)
+  WATCHDOG_ENV_SNAPSHOT=1
+}
+
+# Parse the config file as data: never sourced or evaluated. Accepts blank
+# lines, # comments, an optional "export " prefix, KEY=VALUE with optional
+# matching single/double quotes, and " # comment" after unquoted values.
+load_watchdog_config_file() {
+  local file=$1 line key value lineno=0
+  while IFS= read -r key; do
+    printf -v "WATCHDOG_FILE_SET_$key" '%s' ''
+  done < <(watchdog_config_keys)
+  [ -e "$file" ] || return 0
+  if [ ! -f "$file" ] || [ ! -r "$file" ]; then
+    watchdog_warning "config $file is not a readable file; ignoring it"
+    return 0
+  fi
+  while IFS= read -r line || [ -n "$line" ]; do
+    lineno=$((lineno + 1))
+    line=${line%$'\r'}
+    line=${line#"${line%%[![:space:]]*}"}
+    if [ -z "$line" ] || [ "${line:0:1}" = "#" ]; then continue; fi
+    if [[ "$line" =~ ^export[[:space:]]+(.*)$ ]]; then line=${BASH_REMATCH[1]}; fi
+    if [[ ! "$line" =~ ^([A-Za-z_][A-Za-z0-9_]*)=(.*)$ ]]; then
+      watchdog_warning "config $file:$lineno: ignoring malformed line"
+      continue
+    fi
+    key=${BASH_REMATCH[1]}
+    value=${BASH_REMATCH[2]}
+    if [[ "$value" =~ ^\"([^\"]*)\"[[:space:]]*(#.*)?$ ]] ||
+      [[ "$value" =~ ^\'([^\']*)\'[[:space:]]*(#.*)?$ ]]; then
+      value=${BASH_REMATCH[1]}
+    else
+      value=${value%%[[:space:]]#*}
+      value=${value%"${value##*[![:space:]]}"}
+    fi
+    if ! watchdog_config_keys | grep -qxF "$key"; then continue; fi
+    printf -v "WATCHDOG_FILE_SET_$key" '%s' 1
+    printf -v "WATCHDOG_FILE_VAL_$key" '%s' "$value"
+  done <"$file"
+}
+
+watchdog_config_signature() {
+  local file
+  file=$(watchdog_config_path)
+  if [ -e "$file" ]; then
+    printf '%s|%s' "$file" "$(stat -L -c '%d:%i:%s:%y' "$file" 2>/dev/null)"
+  else
+    printf '%s|absent' "$file"
+  fi
+}
+
 configure_watchdog() {
+  local key file set_var
+  if [ -z "${WATCHDOG_ENV_SNAPSHOT:-}" ]; then snapshot_watchdog_env; fi
+  file=$(watchdog_config_path)
+  load_watchdog_config_file "$file"
+  # Precedence: non-empty launcher env > local config file > built-in default.
+  while IFS= read -r key; do
+    set_var=WATCHDOG_ENV_SET_$key
+    if [ -n "${!set_var:-}" ]; then
+      set_var=WATCHDOG_ENV_VAL_$key
+      printf -v "$key" '%s' "${!set_var}"
+      continue
+    fi
+    set_var=WATCHDOG_FILE_SET_$key
+    if [ -n "${!set_var:-}" ]; then
+      set_var=WATCHDOG_FILE_VAL_$key
+      printf -v "$key" '%s' "${!set_var}"
+    else
+      unset "$key"
+    fi
+  done < <(watchdog_config_keys)
   CODEG_PUBLIC_URL=${CODEG_PUBLIC_URL:-}
+  if [ -n "$CODEG_PUBLIC_URL" ] && [[ ! "$CODEG_PUBLIC_URL" =~ ^https?://[^[:space:]]+$ ]]; then
+    watchdog_warning "invalid CODEG_PUBLIC_URL (need http(s)://...); public probe unconfigured"
+    CODEG_PUBLIC_URL=
+  fi
   watchdog_config_uint PUBLIC_FAIL_THRESHOLD 2 1 1000
   watchdog_config_uint TUNNEL_RESTART_COOLDOWN 180 1 86400
   watchdog_config_uint TUNNEL_RESTART_BACKOFF_CAP 1800 1 86400
   watchdog_config_uint TUNNEL_RESTART_DAILY_CAP 0 0 1000
   watchdog_config_uint TUNNEL_RESTART_GRACE 60 0 3600
+  watchdog_config_uint WAKE_GAP_THRESHOLD 180 90 86400
+  watchdog_config_uint WAKE_REPROBE_DELAY 10 0 120
+  watchdog_config_uint WAKE_WATCH_SECS 300 0 3600
+  watchdog_config_uint WAKE_FAST_SLEEP 15 5 60
   if [ "$TUNNEL_RESTART_BACKOFF_CAP" -lt "$TUNNEL_RESTART_COOLDOWN" ]; then
     watchdog_warning "backoff cap below cooldown; using $TUNNEL_RESTART_COOLDOWN"
     TUNNEL_RESTART_BACKOFF_CAP=$TUNNEL_RESTART_COOLDOWN
   fi
+  watchdog_config_sig=$(watchdog_config_signature)
+}
+
+# Called every loop: re-parse only when the config file changed, so edits apply
+# without a restart and validation warnings are not repeated every minute.
+reload_watchdog_config() {
+  local sig
+  sig=$(watchdog_config_signature)
+  if [ "$sig" = "${watchdog_config_sig:-}" ]; then return 0; fi
+  configure_watchdog
+  echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) config reloaded from $(watchdog_config_path) public_url=${CODEG_PUBLIC_URL:-unset}" >>"$LOG"
+}
+
+# Rate-limited (default hourly) reminder that 1033 zombies cannot self-heal.
+warn_public_unconfigured() {
+  local now interval=${PUBLIC_UNCONFIGURED_WARN_SECS:-3600}
+  now=$(date +%s)
+  if [ -n "${public_unconfigured_warned_at:-}" ] &&
+    [ $((now - public_unconfigured_warned_at)) -lt "$interval" ]; then
+    return 0
+  fi
+  public_unconfigured_warned_at=$now
+  watchdog_warning "CODEG_PUBLIC_URL is not configured (env or $(watchdog_config_path)); public edge probe disabled, a Cloudflare 530/1033 zombie tunnel will NOT be auto-restarted"
 }
 
 mkdir -p "$HB"
@@ -53,6 +185,7 @@ if ! flock -n 9; then
 fi
 
 configure_watchdog
+echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) watchdog start pid=$$ config=$(watchdog_config_path) public_url=${CODEG_PUBLIC_URL:-unset}" >>"$LOG"
 
 echo $$ > "$PIDFILE"
 loop=0
@@ -83,13 +216,14 @@ webdav_ok() {
   [ "$code" = "401" ] || [ "$code" = "200" ]
 }
 
-# Public edge probe. Sets globals: pub_status (skip|ok|bad|fail|other), pub_code, pub_detail.
-# Returns 0 if healthy/skipped, 1 if tunnel looks broken.
+# Public edge probe. Sets globals: pub_status (unconfigured|ok|bad|fail|other), pub_code, pub_detail.
+# Returns 0 if healthy/unconfigured, 1 if tunnel looks broken.
 probe_public() {
-  pub_status=skip
+  pub_status=unconfigured
   pub_code=000
   pub_detail=
   if [ -z "${CODEG_PUBLIC_URL:-}" ]; then
+    warn_public_unconfigured
     return 0
   fi
   local body=/tmp/codeg-watchdog-public.$$
@@ -172,8 +306,10 @@ write_tunnel_state() {
   return 1
 }
 
+# $1=wake: a resume event may skip cooldown/backoff (a long pause already
+# elapsed), never the daily cap or the post-restart readiness grace.
 tunnel_cooldown_ok() {
-  local now wait remaining
+  local mode=${1:-} now wait remaining
   now=$(date +%s)
   read_tunnel_state "$now"
   tunnel_block_reason=
@@ -185,6 +321,7 @@ tunnel_cooldown_ok() {
     tunnel_block_reason="readiness grace $((tunnel_grace_until - now))s remaining"
     return 1
   fi
+  if [ "$mode" = wake ]; then return 0; fi
   wait=$tunnel_backoff
   if [ "$wait" -lt "$TUNNEL_RESTART_COOLDOWN" ]; then wait=$TUNNEL_RESTART_COOLDOWN; fi
   remaining=$((tunnel_last_attempt + wait - now))
@@ -198,8 +335,8 @@ tunnel_cooldown_ok() {
 # Restart ONLY cloudflared (never codeg-server). Budget attempts, not successes:
 # a missing config or failed start must not turn into a tight retry loop.
 restart_tunnel() {
-  local reason=$1 status now
-  if ! tunnel_cooldown_ok; then
+  local reason=$1 mode=${2:-} status now
+  if ! tunnel_cooldown_ok "$mode"; then
     echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) tunnel restart skipped: $tunnel_block_reason" >>"$LOG"
     return 2
   fi
@@ -216,7 +353,7 @@ restart_tunnel() {
   tunnel_attempts=$((tunnel_attempts + 1))
   tunnel_grace_until=0
   write_tunnel_state || return 1
-  echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) restart cloudflared ONLY: $reason; backoff=${tunnel_backoff}s attempts_today=$tunnel_attempts" >>"$LOG"
+  echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) restart cloudflared ONLY${mode:+ ($mode: cooldown bypassed)}: $reason; backoff=${tunnel_backoff}s attempts_today=$tunnel_attempts" >>"$LOG"
   if FORCE_RESTART=1 "$BOOT/start-codeg-tunnel.sh" --force 9>&-; then
     # Launch acceptance is not readiness. Only a healthy probe clears failures.
     tunnel_grace_until=$(($(date +%s) + TUNNEL_RESTART_GRACE))
@@ -257,9 +394,18 @@ cf_up() {
   ps -C cloudflared >/dev/null 2>&1
 }
 
+# True while a resume event may still use its single fast restart.
+wake_window_open() {
+  [ "${wake_restart_used:-1}" = 0 ] && [ "$(date +%s)" -lt "${wake_watch_until:-0}" ]
+}
+
 check_public_tunnel() {
   local now restart_status=0
   if probe_public; then
+    if [ -n "${wake_pending:-}" ]; then
+      echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) resume: public probe $pub_status code=$pub_code; no restart (watching ${WAKE_WATCH_SECS}s)" >>"$LOG"
+      wake_pending=
+    fi
     pub=$pub_status
     # Only adjacent, counted failures qualify as consecutive failures.
     pub_fail_streak=0
@@ -282,6 +428,10 @@ check_public_tunnel() {
     echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) public probe $pub_status $pub_detail; readiness grace $((tunnel_grace_until - now))s remaining" >>"$LOG"
     return 0
   fi
+  if wake_window_open; then
+    check_public_after_wake
+    return $?
+  fi
   broken=$((broken + 1))
   pub_fail_streak=$((pub_fail_streak + 1))
   echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) public probe FAIL streak=$pub_fail_streak/$PUBLIC_FAIL_THRESHOLD url=$CODEG_PUBLIC_URL $pub_detail cloudflared=$scf http=$http" >>"$LOG"
@@ -294,13 +444,64 @@ check_public_tunnel() {
   return "$restart_status"
 }
 
+# After a resume, one failed probe (confirmed by a single re-probe, which also
+# gives a self-reconnecting cloudflared a moment) restarts cloudflared ONLY,
+# bypassing the consecutive-failure threshold and cooldown once per wake.
+check_public_after_wake() {
+  local restart_status=0 first=$pub_detail
+  wake_pending=
+  if [ "$WAKE_REPROBE_DELAY" -gt 0 ]; then
+    echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) resume: public probe $pub_status $first; re-probing in ${WAKE_REPROBE_DELAY}s" >>"$LOG"
+    sleep "$WAKE_REPROBE_DELAY" 9>&-
+    if probe_public; then
+      pub=$pub_status
+      pub_fail_streak=0
+      echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) resume: re-probe $pub_status code=$pub_code; no restart" >>"$LOG"
+      return 0
+    fi
+    pub=$pub_status
+  fi
+  broken=$((broken + 1))
+  pub_fail_streak=$((pub_fail_streak + 1))
+  wake_restart_used=1
+  echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) public probe FAIL after resume url=$CODEG_PUBLIC_URL $pub_detail cloudflared=$scf http=$http; immediate tunnel restart" >>"$LOG"
+  restart_tunnel "resume: public $pub_detail (local http=$http)" wake || restart_status=$?
+  if cf_up; then scf=up; else scf=down; broken=$((broken + 1)); fi
+  return "$restart_status"
+}
+
+# The VM is paused when idle and both wall-clock-vs-uptime and monotonic time
+# freeze, so a pause shows up only as a sleep that took far longer on the wall
+# clock than requested. Only the sleep is measured, so slow loop work (e.g. a
+# WebDAV venv rebuild) is never mistaken for a wake.
+note_wake() {
+  local slept=$1 interval=$2 now
+  now=$(date +%s)
+  wake_pending=1
+  wake_restart_used=0
+  wake_watch_until=$((now + WAKE_WATCH_SECS))
+  echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) resume detected gap=$((slept - interval))s (slept ${slept}s, expected ${interval}s); probing public edge now" >>"$LOG"
+}
+
+watchdog_sleep() {
+  local interval=60 before after
+  before=$(date +%s)
+  if [ "$before" -lt "${wake_watch_until:-0}" ]; then interval=$WAKE_FAST_SLEEP; fi
+  sleep "$interval" 9>&-
+  after=$(date +%s)
+  if [ $((after - before)) -gt "$WAKE_GAP_THRESHOLD" ]; then
+    note_wake "$((after - before))" "$interval"
+  fi
+}
+
 while true; do
+  reload_watchdog_config
   s3080=down
   scf=down
   swebdav=down
   broken=0
   http=down
-  pub=skip
+  pub=unconfigured
 
   if port_up 3080; then
     s3080=up
@@ -380,5 +581,5 @@ while true; do
     fi
   fi
 
-  sleep 60 9>&-
+  watchdog_sleep
 done

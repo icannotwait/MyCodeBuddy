@@ -3,28 +3,77 @@ set -euo pipefail
 export PATH=/workspace/bin:/exec-daemon:$PATH
 
 CF=/workspace/bin/cloudflared
-CFG=${CF_CONFIG:-$HOME/.cloudflared/config.yml}
 LOG=/workspace/heartbeat/cloudflared.log
+# Never depend on the caller's $HOME: a watchdog relaunched from a sandbox shell
+# with HOME=/workspace/agent-reach/home made a forced restart fail with
+# "missing cloudflared config" while the tunnel was a 1033 zombie (2026-10-08).
+# Resolution order: CF_CONFIG > box owner's ~/.cloudflared > $HOME/.cloudflared
+# > /etc/cloudflared. CODEG_CF_HOME (default /home/box) exists for tests.
+CF_HOME_DEFAULT=${CODEG_CF_HOME:-/home/box}
 PIDFILE=/workspace/heartbeat/cloudflared.pid
 # v2: old cloudflared.start.lock may still be held by a cloudflared that
 # inherited the flock fd from an earlier start (blocks every later start).
 LOCK=/workspace/heartbeat/cloudflared.start.lock.v2
 
 FORCE=0
-if [ "${FORCE_RESTART:-0}" = "1" ] || [ "${1:-}" = "--force" ]; then
+PRINT_CONFIG=0
+for arg in "$@"; do
+  case $arg in
+    --force) FORCE=1 ;;
+    --print-config) PRINT_CONFIG=1 ;;
+  esac
+done
+if [ "${FORCE_RESTART:-0}" = "1" ]; then
   FORCE=1
 fi
 
-if [ ! -x "$CF" ]; then
-  echo "missing cloudflared at $CF" >&2
-  exit 1
-fi
-if [ ! -f "$CFG" ]; then
-  echo "missing cloudflared config $CFG" >&2
-  exit 1
+resolve_cf_config() {
+  local candidate
+  if [ -n "${CF_CONFIG:-}" ]; then
+    printf '%s' "$CF_CONFIG"
+    return 0
+  fi
+  for candidate in "$CF_HOME_DEFAULT/.cloudflared/config.yml" \
+    "${HOME:+$HOME/.cloudflared/config.yml}" /etc/cloudflared/config.yml; do
+    if [ -n "$candidate" ] && [ -f "$candidate" ]; then
+      printf '%s' "$candidate"
+      return 0
+    fi
+  done
+  printf '%s' "$CF_HOME_DEFAULT/.cloudflared/config.yml"
+}
+
+CFG=$(resolve_cf_config)
+# cloudflared's own default lookups (e.g. cert.pem in ~/.cloudflared) must see
+# the same home as the config; credentials-file inside the config is absolute.
+case $CFG in
+  */.cloudflared/config.yml) CF_RUN_HOME=${CFG%/.cloudflared/config.yml} ;;
+  *) CF_RUN_HOME=$CF_HOME_DEFAULT ;;
+esac
+
+# Dry run: show what a (forced) start would use; never locks, kills or starts.
+if [ "$PRINT_CONFIG" = "1" ]; then
+  if [ -f "$CFG" ]; then state=found; else state=missing; fi
+  printf 'config=%s state=%s run_home=%s force=%s\n' "$CFG" "$state" "$CF_RUN_HOME" "$FORCE"
+  [ "$state" = found ]
+  exit $?
 fi
 
 mkdir -p /workspace/heartbeat
+
+# The watchdog discards stderr; keep start failures in cloudflared.log too.
+fail() {
+  echo "$*" >&2
+  echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) start-codeg-tunnel: $* (force=$FORCE caller_home=${HOME:-unset})" >>"$LOG"
+  exit 1
+}
+
+if [ ! -x "$CF" ]; then
+  fail "missing cloudflared at $CF"
+fi
+if [ ! -f "$CFG" ]; then
+  fail "missing cloudflared config $CFG"
+fi
 
 # Serialize starts so concurrent supervisor/watchdog/login hooks cannot race.
 # -w 15: never hang the watchdog forever if something else holds the lock.
@@ -89,8 +138,9 @@ if [ -n "$pids" ] && [ "$FORCE" = "1" ]; then
   fi
 fi
 
+echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) start-codeg-tunnel: starting force=$FORCE config=$CFG run_home=$CF_RUN_HOME" >>"$LOG"
 # Critical: close lock fd in the child so cloudflared does not inherit flock.
-nohup "$CF" tunnel --config "$CFG" --protocol http2 run 9>&- >>"$LOG" 2>&1 &
+HOME=$CF_RUN_HOME nohup "$CF" tunnel --config "$CFG" --protocol http2 run 9>&- >>"$LOG" 2>&1 &
 echo $! >"$PIDFILE"
-echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) started cloudflared pid=$! force=$FORCE" >>"$LOG"
+echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) started cloudflared pid=$! force=$FORCE config=$CFG" >>"$LOG"
 exit 0

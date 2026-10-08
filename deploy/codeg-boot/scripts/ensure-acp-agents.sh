@@ -35,8 +35,17 @@ LOG=$HB/ensure-acp-agents.log
 LOCK=$HB/ensure-acp-agents.lock
 TOKEN_FILE=$DATA/CODEG_TOKEN
 API=http://127.0.0.1:3080
-# Versions come from the running codeg-server registry (acp_list_agents.registry_version).
-# Optional overrides: CODEG_ANTIGRAVITY_VER / CODEG_CURSOR_VER / CODEG_GROK_VER
+# The registry_version from the running codeg-server (acp_list_agents) is a
+# MINIMUM, not an exact pin: when the installed version is semver >= registry
+# (e.g. the user upgraded early to 1.3.0 while the registry pins 1.2.1) the
+# agent is kept and nothing is downloaded or "refreshed". Only a missing,
+# unparseable, or older install is moved to the registry version.
+# Optional exact pins (explicit operator choice, may downgrade):
+#   CODEG_ANTIGRAVITY_VER / CODEG_CURSOR_VER / CODEG_GROK_VER
+# ENSURE_ACP_PLAN_ONLY=1 (or --plan-only): print the plan and exit without
+# restoring, mirroring, downloading, or calling any mutating endpoint.
+PLAN_ONLY=${ENSURE_ACP_PLAN_ONLY:-0}
+if [ "${1:-}" = "--plan-only" ]; then PLAN_ONLY=1; fi
 GROK_PKG_BASE='@xai-official/grok'
 
 
@@ -295,6 +304,100 @@ install_antigravity_direct() {
 }
 
 
+# stdout: acp_list_agents JSON from the live server (token read from file).
+fetch_agents_json() {
+  python3 /dev/fd/3 3<<'PY'
+import json, os, sys, urllib.request
+token = open(os.environ["CODEG_TOKEN_FILE"]).read().strip()
+req = urllib.request.Request(
+  "http://127.0.0.1:3080/api/acp_list_agents",
+  data=b"{}",
+  headers={"Authorization": "Bearer " + token, "Content-Type": "application/json"},
+  method="POST",
+)
+try:
+  json.dump(json.load(urllib.request.urlopen(req, timeout=30)), sys.stdout)
+except Exception as e:
+  sys.stderr.write(str(e))
+  sys.exit(1)
+PY
+}
+
+# stdin: acp_list_agents JSON. stdout, one row per managed enabled agent:
+#   plan <dist> <agent> <want> <installed_or_->   (needs install/upgrade)
+#   keep <dist> <agent> <installed> <registry> <reason>
+# Registry is a minimum; installed >= registry (SemVer 2.0 precedence, build
+# metadata ignored, prerelease < release) is kept. CODEG_<AGENT>_VER is exact.
+registry_plan() {
+  python3 /dev/fd/3 3<<'PY'
+import json, os, re, sys
+
+MANAGED = ("antigravity", "cursor", "grok")
+OVERRIDE = {a: os.environ.get("CODEG_%s_VER" % a.upper(), "").strip() for a in MANAGED}
+VERSION = re.compile(r"^(\d+(?:\.\d+)*)(?:-([0-9A-Za-z.-]+))?$")
+
+def parse(v):
+  v = v.strip()
+  if v[:1] in ("v", "V"):
+    v = v[1:]
+  m = VERSION.match(v.split("+", 1)[0])
+  if not m:
+    return None
+  core = [int(x) for x in m.group(1).split(".")]
+  return core, (m.group(2).split(".") if m.group(2) else None)
+
+def cmp_pre(a, b):
+  for x, y in zip(a, b):
+    if x.isdigit() and y.isdigit():
+      c = (int(x) > int(y)) - (int(x) < int(y))
+    elif x.isdigit() or y.isdigit():
+      c = -1 if x.isdigit() else 1
+    else:
+      c = (x > y) - (x < y)
+    if c:
+      return c
+  return (len(a) > len(b)) - (len(a) < len(b))
+
+def vcmp(a, b):
+  pa, pb = parse(a), parse(b)
+  if pa is None or pb is None:
+    return None
+  ca, cb = pa[0], pb[0]
+  n = max(len(ca), len(cb))
+  ca, cb = ca + [0] * (n - len(ca)), cb + [0] * (n - len(cb))
+  if ca != cb:
+    return (ca > cb) - (ca < cb)
+  if pa[1] == pb[1]:
+    return 0
+  if pa[1] is None or pb[1] is None:
+    return 1 if pa[1] is None else -1
+  return cmp_pre(pa[1], pb[1])
+
+for a in json.load(sys.stdin):
+  at = a.get("agent_type") or ""
+  dist = a.get("distribution_type") or ""
+  if not a.get("enabled") or dist not in ("binary", "npx") or at not in MANAGED:
+    continue
+  reg = (a.get("registry_version") or "").strip()
+  inst = (a.get("installed_version") or "").strip() or "-"
+  pin = OVERRIDE.get(at)
+  if pin:
+    if inst != pin:
+      print(f"plan {dist} {at} {pin} {inst}")
+    continue
+  if not reg:
+    continue
+  if inst == "-":
+    print(f"plan {dist} {at} {reg} {inst}")
+    continue
+  c = vcmp(inst, reg)
+  if c is None or c < 0:
+    print(f"plan {dist} {at} {reg} {inst}")
+  else:
+    print(f"keep {dist} {at} {inst} {reg} {'equal' if c == 0 else 'newer'}")
+PY
+}
+
 port_up() {
   if command -v ss >/dev/null 2>&1; then
     ss -ltn 2>/dev/null | grep -q ':3080'
@@ -315,6 +418,7 @@ sync_dir() {
   fi
 }
 
+if [ "$PLAN_ONLY" != "1" ]; then
 # --- 0) One-shot migrate legacy XDG caches into durable data dir ---
 for legacy in "$LEGACY_MY" "$LEGACY_CODEG"; do
   if [ -d "$legacy" ] && [ "$(ls -A "$legacy" 2>/dev/null)" ]; then
@@ -368,8 +472,9 @@ sync_dir "$CACHE" "$MIRROR"
 if [ -d "$GROK_BIN_DIR" ] && [ "$(ls -A "$GROK_BIN_DIR" 2>/dev/null)" ]; then
   sync_dir "$GROK_BIN_DIR" "$GROK_MIRROR"
 fi
+fi # PLAN_ONLY
 
-# --- 3) Downloads if server up: follow registry_version from live server ---
+# --- 3) Downloads if server up: registry_version is a minimum (see header) ---
 if ! port_up; then
   log "skip download: 3080 down"
   exit 0
@@ -385,50 +490,28 @@ if [ -z "$TOKEN" ]; then
 fi
 export CODEG_TOKEN_FILE="$TOKEN_FILE"
 
-# Emit lines: <dist> <agent_type> <registry_version> <installed_or_->
-# Need update when enabled and registry_version set and installed != registry.
-PLAN=$(python3 - <<'PY' 2>/dev/null || true
-import json, urllib.request, os, sys
-token = open(os.environ["CODEG_TOKEN_FILE"]).read().strip()
-req = urllib.request.Request(
-  "http://127.0.0.1:3080/api/acp_list_agents",
-  data=b"{}",
-  headers={"Authorization": "Bearer " + token, "Content-Type": "application/json"},
-  method="POST",
-)
-try:
-  agents = json.load(urllib.request.urlopen(req, timeout=30))
-except Exception as e:
-  sys.stderr.write(str(e))
-  sys.exit(1)
-ov = {
-  "antigravity": os.environ.get("CODEG_ANTIGRAVITY_VER", "").strip(),
-  "cursor": os.environ.get("CODEG_CURSOR_VER", "").strip(),
-  "grok": os.environ.get("CODEG_GROK_VER", "").strip(),
-}
-for a in agents:
-  if not a.get("enabled"):
-    continue
-  at = a.get("agent_type") or ""
-  dist = a.get("distribution_type") or ""
-  if dist not in ("binary", "npx"):
-    continue
-  if at not in ("antigravity", "cursor", "grok"):
-    continue
-  reg = (ov.get(at) or a.get("registry_version") or "").strip()
-  if not reg:
-    continue
-  inst = (a.get("installed_version") or "").strip() or "-"
-  if inst == reg:
-    continue
-  print(f"{dist} {at} {reg} {inst}")
-PY
-)
+ROWS=
+if AGENTS_JSON=$(fetch_agents_json 2>>"$LOG"); then
+  ROWS=$(printf '%s' "$AGENTS_JSON" | registry_plan 2>>"$LOG" || true)
+else
+  log "registry: acp_list_agents failed; no plan this cycle"
+fi
+PLAN=$(printf '%s\n' "$ROWS" | sed -n 's/^plan //p')
+KEEP=$(printf '%s\n' "$ROWS" | sed -n 's/^keep //p')
 
+NEWER=$(printf '%s\n' "$KEEP" | grep ' newer$' || true)
+if [ -n "${NEWER:-}" ]; then
+  log "registry: keep user-installed newer than registry minimum: $(echo "$NEWER" | tr '\n' ';')"
+fi
 if [ -z "${PLAN:-}" ]; then
-  log "registry: nothing to update (enabled agents match registry_version)"
+  log "registry: nothing to update (enabled agents at or above registry_version)"
 else
   log "registry plan: $(echo "$PLAN" | tr '\n' ';')"
+fi
+if [ "$PLAN_ONLY" = "1" ]; then
+  printf '%s\n' "$ROWS" | sed '/^$/d'
+  log "plan-only: exiting before downloads"
+  exit 0
 fi
 
 while IFS= read -r line; do

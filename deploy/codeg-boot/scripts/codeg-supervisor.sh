@@ -1,6 +1,10 @@
 #!/bin/bash
 set -uo pipefail
 export PATH=/workspace/bin:/exec-daemon:$PATH
+# Box services run as box. Pin HOME/USER so a launch from a sandbox shell
+# (HOME=/workspace/agent-reach/home) cannot leak into $HOME-based paths
+# (cloudflared config, ~/.grok/bin, ~/.local/bin/pi).
+export HOME=/home/box USER=box LOGNAME=box
 
 BOOT=/workspace/codeg-boot
 HB=/workspace/heartbeat

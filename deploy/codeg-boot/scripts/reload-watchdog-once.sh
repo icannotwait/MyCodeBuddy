@@ -1,5 +1,9 @@
 #!/bin/bash
 set -uo pipefail
+# Box services run as box. Pin HOME/USER so a launch from a sandbox shell
+# (HOME=/workspace/agent-reach/home) cannot leak into $HOME-based paths
+# (cloudflared config, ~/.grok/bin, ~/.local/bin/pi).
+export HOME=/home/box USER=box LOGNAME=box
 # Kill only processes whose argv0 path is exactly the watchdog script
 for p in /proc/[0-9]*; do
   pid=${p#/proc/}
