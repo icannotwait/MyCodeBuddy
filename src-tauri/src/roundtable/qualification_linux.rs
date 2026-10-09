@@ -1149,6 +1149,7 @@ async fn rpc(
             rejected_permission: &rejected,
             private_log,
             trace: None,
+            live: None,
         },
     )
     .await

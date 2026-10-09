@@ -335,6 +335,7 @@ impl AttemptTrace {
     /// requests. Used when an attempt is reaped without a normal finish.
     pub(crate) fn snapshot(&self, reason: &str, root_pid: Option<u32>, extra: Value) {
         let processes = root_pid.map(process_tree).unwrap_or_default();
+        let agent_netns = agent_netns_view(&processes);
         self.record(
             "snapshot",
             json!({
@@ -342,6 +343,7 @@ impl AttemptTrace {
                 "reason": reason,
                 "root_pid": root_pid,
                 "processes": processes,
+                "agent_netns": agent_netns,
                 "inflight_gateway": self.inflight_snapshot(),
                 "idle_ms_by_stream": self.idle_ms(),
                 "stderr_bytes": self.stderr_bytes.load(Ordering::Relaxed),
@@ -603,22 +605,73 @@ pub(crate) fn strip_query(path: &str) -> String {
     }
 }
 
-/// Header names whose values are never recorded.
+/// Splits a header or JSON key into lowercase segments on `-`, `_`, `.`,
+/// spaces and camelCase boundaries: `x-xai-token-auth` -> [x, xai, token,
+/// auth], `totalContextTokens` -> [total, context, tokens].
+fn key_segments(name: &str) -> Vec<String> {
+    let mut segments = Vec::new();
+    let mut current = String::new();
+    let mut previous_lower = false;
+    for ch in name.chars() {
+        if matches!(ch, '-' | '_' | '.' | ' ' | ':') {
+            if !current.is_empty() {
+                segments.push(std::mem::take(&mut current));
+            }
+            previous_lower = false;
+            continue;
+        }
+        if ch.is_ascii_uppercase() && previous_lower && !current.is_empty() {
+            segments.push(std::mem::take(&mut current));
+        }
+        previous_lower = ch.is_ascii_lowercase() || ch.is_ascii_digit();
+        current.push(ch.to_ascii_lowercase());
+    }
+    if !current.is_empty() {
+        segments.push(current);
+    }
+    segments
+}
+
+/// Whole-segment secret names. `token` matches `access_token` and
+/// `x-xai-token-auth` but not `input_tokens` or `tokenizer`.
+const SECRET_SEGMENTS: &[&str] = &[
+    "authorization",
+    "bearer",
+    "token",
+    "secret",
+    "password",
+    "passwd",
+    "credential",
+    "credentials",
+    "cookie",
+    "signature",
+    "apikey",
+    "auth",
+];
+
+fn segments_are_secret(segments: &[String]) -> bool {
+    segments
+        .iter()
+        .any(|segment| SECRET_SEGMENTS.contains(&segment.as_str()))
+        || segments.windows(2).any(|pair| {
+            matches!(pair[1].as_str(), "key")
+                && matches!(
+                    pair[0].as_str(),
+                    "api" | "private" | "access" | "secret" | "x"
+                )
+        })
+}
+
+/// Header names whose values are never recorded (whole-segment match).
+/// Rate-limit counters such as `x-ratelimit-remaining-tokens` stay visible.
 pub(crate) fn header_is_sensitive(name: &str) -> bool {
-    let lower = name.to_ascii_lowercase();
-    [
-        "authorization",
-        "cookie",
-        "key",
-        "token",
-        "secret",
-        "auth",
-        "credential",
-        "password",
-        "signature",
-    ]
-    .iter()
-    .any(|word| lower.contains(word))
+    let segments = key_segments(name);
+    segments_are_secret(&segments) || segments.iter().any(|segment| segment == "key")
+}
+
+/// JSON keys whose string values are never recorded (whole-segment match).
+pub(crate) fn key_is_secret(name: &str) -> bool {
+    segments_are_secret(&key_segments(name))
 }
 
 /// Header map as `{name: value}` with sensitive values replaced. Values of
@@ -928,12 +981,7 @@ fn process_entry(pid: u32, depth: u32) -> Value {
             }
         }
     }
-    let tcp = std::fs::read_to_string(format!("/proc/{pid}/net/tcp"))
-        .ok()
-        .map(|text| tcp_state_counts(&text));
-    let tcp6 = std::fs::read_to_string(format!("/proc/{pid}/net/tcp6"))
-        .ok()
-        .map(|text| tcp_state_counts(&text));
+    let netns = netns_id(&format!("/proc/{pid}/ns/net"));
     json!({
         "pid": pid,
         "depth": depth,
@@ -945,24 +993,133 @@ fn process_entry(pid: u32, depth: u32) -> Value {
         "wchan": wchan,
         "fds": fds,
         "socket_fds": sockets,
-        "netns_tcp_states": tcp,
-        "netns_tcp6_states": tcp6,
+        "netns": netns,
+        "netns_is_host": netns.is_some() && netns == netns_id("/proc/self/ns/net"),
     })
+}
+
+fn netns_id(link: &str) -> Option<String> {
+    std::fs::read_link(link)
+        .ok()
+        .map(|target| target.to_string_lossy().into_owned())
+}
+
+/// TCP state as seen from inside the agent container's network namespace.
+///
+/// The agent is the first process (in tree order) whose netns differs from
+/// codeg-server's. Its `/proc/<pid>/net/tcp{,6}` is read only after the netns
+/// identity proves it is not the host table; otherwise the view is reported as
+/// unavailable with a reason, never silently replaced by host counts (crun and
+/// slirp4netns live in the host netns).
+fn agent_netns_view(processes: &[Value]) -> Value {
+    let host = netns_id("/proc/self/ns/net");
+    let Some(host) = host else {
+        return json!({"available": false, "reason": "host_netns_unreadable"});
+    };
+    let candidate = processes.iter().find(|process| {
+        process["alive"] == true && process["netns"].as_str().is_some_and(|netns| netns != host)
+    });
+    let Some(process) = candidate else {
+        let unreadable = processes
+            .iter()
+            .any(|process| process["alive"] == true && process["netns"].is_null());
+        return json!({
+            "available": false,
+            "reason": if processes.is_empty() {
+                "no_process_tree"
+            } else if unreadable {
+                "netns_unreadable"
+            } else {
+                "no_process_outside_host_netns"
+            },
+        });
+    };
+    let pid = process["pid"].as_u64().unwrap_or(0);
+    let netns = process["netns"].clone();
+    let mut tables = Map::new();
+    for (name, path) in [("tcp", "net/tcp"), ("tcp6", "net/tcp6")] {
+        match std::fs::read_to_string(format!("/proc/{pid}/{path}")) {
+            Ok(text) => {
+                // Same netns check again at read time: the process may have
+                // exited and the pid been reused between the two reads.
+                if netns_id(&format!("/proc/{pid}/ns/net")).as_deref() != netns.as_str() {
+                    return json!({"available": false, "reason": "process_changed", "pid": pid});
+                }
+                tables.insert(
+                    name.into(),
+                    json!({"states": tcp_state_counts(&text), "connections": tcp_connections(&text)}),
+                );
+            }
+            Err(_) => {
+                tables.insert(name.into(), json!({"available": false}));
+            }
+        }
+    }
+    json!({
+        "available": true,
+        "pid": pid,
+        "comm": process["comm"],
+        "netns": netns,
+        "tables": tables,
+    })
+}
+
+/// Up to 32 sockets as `local -> remote state`. Addresses are endpoints of
+/// the agent's own network namespace (slirp gateway, proxy IPs), not secrets.
+fn tcp_connections(text: &str) -> Value {
+    let mut out = Vec::new();
+    for line in text.lines().skip(1).take(32) {
+        let mut fields = line.split_whitespace();
+        let (Some(_), Some(local), Some(remote), Some(state)) =
+            (fields.next(), fields.next(), fields.next(), fields.next())
+        else {
+            continue;
+        };
+        out.push(json!({
+            "local": decode_proc_addr(local),
+            "remote": decode_proc_addr(remote),
+            "state": tcp_state_name(state),
+        }));
+    }
+    Value::Array(out)
+}
+
+fn decode_proc_addr(field: &str) -> String {
+    let Some((addr, port)) = field.split_once(':') else {
+        return field.to_owned();
+    };
+    let port = u16::from_str_radix(port, 16).unwrap_or(0);
+    if addr.len() == 8 {
+        if let Ok(raw) = u32::from_str_radix(addr, 16) {
+            let bytes = raw.to_le_bytes();
+            return format!("{}.{}.{}.{}:{port}", bytes[0], bytes[1], bytes[2], bytes[3]);
+        }
+    }
+    format!("[{addr}]:{port}")
+}
+
+fn tcp_state_name(state: &str) -> &'static str {
+    match state {
+        "01" => "ESTABLISHED",
+        "02" => "SYN_SENT",
+        "03" => "SYN_RECV",
+        "04" => "FIN_WAIT1",
+        "05" => "FIN_WAIT2",
+        "06" => "TIME_WAIT",
+        "07" => "CLOSE",
+        "08" => "CLOSE_WAIT",
+        "09" => "LAST_ACK",
+        "0A" => "LISTEN",
+        "0B" => "CLOSING",
+        _ => "OTHER",
+    }
 }
 
 fn tcp_state_counts(text: &str) -> Value {
     let mut counts: BTreeMap<&'static str, u64> = BTreeMap::new();
     for line in text.lines().skip(1) {
         let state = line.split_whitespace().nth(3).unwrap_or("");
-        let name = match state {
-            "01" => "ESTABLISHED",
-            "02" => "SYN_SENT",
-            "06" => "TIME_WAIT",
-            "08" => "CLOSE_WAIT",
-            "0A" => "LISTEN",
-            _ => "OTHER",
-        };
-        *counts.entry(name).or_default() += 1;
+        *counts.entry(tcp_state_name(state)).or_default() += 1;
     }
     json!(counts)
 }
@@ -1092,5 +1249,54 @@ mod tests {
         assert_eq!(summary["stream"], true);
         assert_eq!(summary["input_items"], 2);
         assert!(!summary.to_string().contains("SECRET PROMPT"));
+    }
+
+    #[test]
+    fn secret_matching_is_by_whole_key_segment() {
+        for name in [
+            "authorization",
+            "Proxy-Authorization",
+            "x-api-key",
+            "x-goog-api-key",
+            "x-xai-token-auth",
+            "cookie",
+            "set-cookie",
+            "access_token",
+        ] {
+            assert!(header_is_sensitive(name), "{name}");
+        }
+        for name in [
+            "x-ratelimit-remaining-tokens",
+            "content-type",
+            "x-request-id",
+            "openai-processing-ms",
+        ] {
+            assert!(!header_is_sensitive(name), "{name}");
+        }
+        assert!(key_is_secret("refreshToken"));
+        assert!(key_is_secret("privateKey"));
+        assert!(!key_is_secret("input_tokens"));
+        assert!(!key_is_secret("totalContextTokens"));
+        assert!(!key_is_secret("max_output_tokens"));
+        assert!(!key_is_secret("sessionId"));
+    }
+
+    #[test]
+    fn proc_tcp_rows_decode_and_host_netns_is_never_reported_as_agent() {
+        let table = "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n   0: 0100007F:1F90 00000000:0000 0A 00000000:00000000 00:00000000 00000000  1000        0 1 1 0000000000000000 100 0 0 10 0\n   1: 0202000A:A1B2 330212C6:01BB 01 00000000:00000000 00:00000000 00000000  1000        0 2 1 0000000000000000 20 4 30 10 -1\n";
+        let connections = tcp_connections(table);
+        assert_eq!(connections[0]["local"], "127.0.0.1:8080");
+        assert_eq!(connections[0]["state"], "LISTEN");
+        assert_eq!(connections[1]["remote"], "198.18.2.51:443");
+        assert_eq!(connections[1]["state"], "ESTABLISHED");
+        assert_eq!(agent_netns_view(&[])["reason"], "no_process_tree");
+        // A tree that stays in the host netns (crun, slirp4netns) yields no
+        // agent view instead of host counts.
+        let me = std::process::id();
+        let host_only = vec![process_entry(me, 0)];
+        assert_eq!(host_only[0]["netns_is_host"], true);
+        let view = agent_netns_view(&host_only);
+        assert_eq!(view["available"], false);
+        assert_eq!(view["reason"], "no_process_outside_host_netns");
     }
 }
