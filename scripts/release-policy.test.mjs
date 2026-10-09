@@ -133,7 +133,7 @@ test("finds upstream URLs in runtime-owned files", () => {
 })
 
 test("repository identity matches the MyCodeBuddy release policy", () => {
-  const version = "0.33.0-mycodebuddy.1"
+  const version = "0.33.0-mycodebuddy.2"
   const packageJson = JSON.parse(readRepositoryFile("package.json"))
   const cargoToml = readRepositoryFile("src-tauri/Cargo.toml")
   const tauriConfig = JSON.parse(
