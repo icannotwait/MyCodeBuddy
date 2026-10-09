@@ -587,7 +587,19 @@ async fn prepaid_monitor(
     (boot_epoch, run_epoch): (Epoch, Epoch),
     stop: Arc<tokio::sync::Notify>,
 ) -> (super::budget_ledger::ActiveBudgetLease, MonitorExit) {
+    let mut suspended = store.host_suspended_ms();
     let exit = loop {
+        // The active clock excludes host suspend, so a suspended interval is
+        // neither charged nor counted toward expiry. Record it when seen.
+        let now_suspended = store.host_suspended_ms();
+        if now_suspended > suspended {
+            tracing::info!(
+                room = %room,
+                suspended_ms = now_suspended - suspended,
+                "roundtable host suspend excluded from active time"
+            );
+            suspended = now_suspended;
+        }
         let remaining = permission
             .prepaid_until()
             .saturating_sub(store.clock_sample().0);
@@ -616,6 +628,15 @@ async fn prepaid_monitor(
                 }
             }
             Ok(Ok(None)) => break MonitorExit::Finished,
+            // The writer lock outlasted busy_timeout (5s) inside a 10s slice.
+            // That is a host/writer stall, not a storage fault: keep sampling
+            // until the slice itself ends, then revoke as usual.
+            Ok(Err(error))
+                if error.details.reason.as_deref() == Some(super::store::STORAGE_BUSY) =>
+            {
+                tracing::warn!(room = %room, "roundtable budget checkpoint busy; retrying within the prepaid slice");
+                continue;
+            }
             Ok(Err(error)) => break MonitorExit::Failed(error),
             Err(_elapsed) => break MonitorExit::Expired,
         }
