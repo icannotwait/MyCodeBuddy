@@ -70,6 +70,7 @@ import {
   RoundtableTranscript,
   speakerSeatBrand,
 } from "./roundtable-transcript"
+import { RoundtableConclusionActions } from "./roundtable-conclusion-actions"
 
 type LoadedRoom = Awaited<ReturnType<typeof loadRoundtable>>
 type RoomSummary = { room_id: string; status: string; config: RoundtableConfig }
@@ -1143,6 +1144,11 @@ export function RoundtableWorkbench({
                 messages={loaded?.messages ?? []}
                 previews={previews}
                 live={liveInputs}
+                conclusionActions={
+                  status === "completed" && roomId ? (
+                    <RoundtableConclusionActions roomId={roomId} />
+                  ) : undefined
+                }
               />
               <section
                 aria-label={t("evidence")}

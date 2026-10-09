@@ -151,6 +151,8 @@ mod tauri_app {
                 crate::commands::roundtable::roundtable_clone,
                 crate::commands::roundtable::roundtable_attach,
                 crate::commands::roundtable::roundtable_detach,
+                crate::commands::roundtable::roundtable_conclusion_export,
+                crate::commands::roundtable::roundtable_conclusion_save,
                 conversations::list_conversations,
                 conversations::get_conversation,
                 conversations::list_all_conversations,

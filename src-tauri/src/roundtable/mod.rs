@@ -12,6 +12,7 @@ mod authorization;
 mod budget_ledger;
 pub(crate) mod capabilities;
 mod clock;
+mod conclusion;
 #[cfg(any(test, feature = "test-utils"))]
 mod command_processor;
 mod companion;

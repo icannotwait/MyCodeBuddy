@@ -2110,6 +2110,15 @@ pub fn build_router(
             "/roundtable_detach",
             post(handlers::roundtable::roundtable_detach),
         )
+        // Read-only conclusion export (outside the sealed protocol set).
+        .route(
+            "/roundtable_conclusion_export",
+            post(handlers::roundtable::roundtable_conclusion_export),
+        )
+        .route(
+            "/roundtable_conclusion_save",
+            post(handlers::roundtable::roundtable_conclusion_save),
+        )
         // Catch-all
         .fallback(api_not_found)
         .layer(middleware::from_fn(move |req, next| {

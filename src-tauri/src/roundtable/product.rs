@@ -56,6 +56,9 @@ impl RoundtableService {
         command: &str,
         body: Value,
     ) -> RtResult<Value> {
+        if super::conclusion::CONCLUSION_COMMANDS.contains(&command) {
+            return self.execute_conclusion(actor, command, body).await;
+        }
         let room = body
             .get("room_id")
             .and_then(Value::as_str)
