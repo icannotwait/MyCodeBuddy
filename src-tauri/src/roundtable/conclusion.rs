@@ -27,6 +27,7 @@ pub(crate) const CONCLUSION_COMMANDS: [&str; 2] =
     ["roundtable_conclusion_export", "roundtable_conclusion_save"];
 
 const EXPORT_DIR: [&str; 2] = ["docs", "roundtable"];
+#[cfg(unix)]
 const MAX_SAVE_AS: u32 = 99;
 const MIN_SECRET_LEN: usize = 12;
 
