@@ -72,3 +72,44 @@ describe("roundtable narrow-screen content", () => {
     expect(container.textContent).toContain(path)
   })
 })
+
+describe("preflight workspace mount", () => {
+  const base = {
+    recipients: [],
+    moderatorOrdinal: 0,
+    sourceManifests: [],
+    selectedPaths: [],
+    tools: [],
+    network: "model_gateway_only",
+    writes: "scratch_only",
+    budget: "1",
+  }
+  it("shows the read-only mount and warns when it cannot be mounted", () => {
+    const { rerender } = render(
+      <PreflightConfirmation
+        {...base}
+        workspaceMount={{
+          path: "/workspace-ro",
+          access: "read_only",
+          available: true,
+        }}
+      />
+    )
+    expect(screen.getByText("/workspace-ro")).toBeTruthy()
+    expect(screen.getByText("workspaceMountReadOnly")).toBeTruthy()
+    expect(screen.queryByRole("alert")).toBeNull()
+    rerender(
+      <PreflightConfirmation
+        {...base}
+        workspaceMount={{
+          path: "/workspace-ro",
+          access: "read_only",
+          available: false,
+        }}
+      />
+    )
+    expect(screen.getByRole("alert").textContent).toBe(
+      "workspaceMountUnavailable"
+    )
+  })
+})

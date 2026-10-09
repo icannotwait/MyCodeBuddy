@@ -7591,6 +7591,7 @@
     "liveTruncated": "Affichage en direct tronqué. Le texte complet apparaîtra après vérification.",
     "topicMentionHelp": "Tapez @ pour référencer un fichier ou un dossier de l'espace de travail. Les membres le lisent eux-mêmes depuis le montage en lecture seule /workspace-ro.",
     "workspaceMount": "Espace de travail (membres)",
-    "workspaceMountReadOnly": "Monté en lecture seule. Les membres peuvent lire et rechercher, mais rien ne peut être écrit."
+    "workspaceMountReadOnly": "Monté en lecture seule. Les membres peuvent lire et rechercher, mais rien ne peut être écrit.",
+    "workspaceMountUnavailable": "Cet espace de travail contient des chemins réservés à l’hôte (données de l’app, home ou identifiants) et ne peut pas être monté. Choisissez un dossier de projet ; l’exécution sera refusée."
   }
 }

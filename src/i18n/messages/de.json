@@ -7591,6 +7591,7 @@
     "liveTruncated": "Live-Ansicht gekürzt. Der vollständige Text erscheint nach der Prüfung.",
     "topicMentionHelp": "Tippe @, um eine Datei oder einen Ordner des Arbeitsbereichs zu referenzieren. Mitglieder lesen sie selbst aus dem schreibgeschützten Mount /workspace-ro.",
     "workspaceMount": "Arbeitsbereich (Mitglieder)",
-    "workspaceMountReadOnly": "Schreibgeschützt eingebunden. Mitglieder können lesen und suchen, aber nichts schreiben."
+    "workspaceMountReadOnly": "Schreibgeschützt eingebunden. Mitglieder können lesen und suchen, aber nichts schreiben.",
+    "workspaceMountUnavailable": "Dieser Workspace enthält reine Host-Pfade (App-Daten, Home oder Zugangsdaten) und kann nicht eingebunden werden. Wähle einen Projektordner; der Lauf wird sonst abgelehnt."
   }
 }

@@ -69,7 +69,7 @@ export function PreflightConfirmation({
   network: string
   writes: string
   /** Read-only workspace bind inside each member container. */
-  workspaceMount?: { path: string; access: string }
+  workspaceMount?: { path: string; access: string; available?: boolean }
   budget: string
   /**
    * Per-attempt time limit for proposal/critique turns. Synthesis has no
@@ -235,6 +235,14 @@ export function PreflightConfirmation({
             <span className="mt-0.5 block text-xs font-normal text-muted-foreground">
               {t("workspaceMountReadOnly")}
             </span>
+            {workspaceMount.available === false ? (
+              <span
+                role="alert"
+                className="mt-0.5 block text-xs font-normal text-destructive"
+              >
+                {t("workspaceMountUnavailable")}
+              </span>
+            ) : null}
           </Fact>
         ) : null}
         <Fact label={t("budget")}>{budget}</Fact>

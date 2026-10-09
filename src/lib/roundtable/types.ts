@@ -204,7 +204,13 @@ export interface RoundtablePreflight {
   network: string
   writes: string
   /** Where members see the registered workspace, always read-only. */
-  workspace_mount?: { path: string; access: "read_only" }
+  workspace_mount?: {
+    path: string
+    access: "read_only"
+    /** False when the workspace overlaps a host-only path; rooms fail closed. */
+    available?: boolean
+    reason?: string
+  }
   error: unknown
   capability: { recipients: RoundtableRecipient[] } | null
   source_manifests: RoundtableSourceManifest[]

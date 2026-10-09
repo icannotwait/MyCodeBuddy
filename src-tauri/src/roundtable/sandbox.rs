@@ -225,6 +225,15 @@ pub(crate) fn linux_workspace_mount_json(source: &Path) -> serde_json::Value {
 
 pub(crate) const WORKSPACE_MOUNT_DESTINATION: &str = linux_oci::WORKSPACE_MOUNT_DESTINATION;
 
+/// Same source checks the live plan applies, for preflight reporting.
+pub(crate) fn workspace_mount_check(
+    project: &Path,
+    home: Option<&Path>,
+    profile: &QualifiedOciProfile,
+) -> RtResult<()> {
+    linux_oci::workspace_mount_source(project, home, profile).map(|_| ())
+}
+
 pub(crate) fn linux_runtime_mounts_json() -> Vec<serde_json::Value> {
     linux_oci::runtime_mount_json()
 }
