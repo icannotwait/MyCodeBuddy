@@ -837,7 +837,11 @@ async fn grok_use_tool_and_antigravity_submit_follow_the_schema() {
         .as_array()
         .expect("denylist");
     assert!(denied.iter().any(|tool| tool == "run_terminal_command"));
-    assert!(denied.iter().any(|tool| tool == "read_file"));
+    // Native reads stay available for the read-only /workspace-ro mount.
+    for read in ["read_file", "grep", "list_dir"] {
+        assert!(denied.iter().all(|tool| tool != read), "{read}");
+    }
+    assert!(denied.iter().any(|tool| tool == "search_replace"));
     assert!(denied
         .iter()
         .all(|tool| tool != "use_tool" && tool != "search_tool"));
