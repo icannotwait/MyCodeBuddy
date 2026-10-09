@@ -1888,7 +1888,8 @@ fn trace_acp_frame(
             record["roundtable_tool"] = json!(tool_call_is_roundtable(&message["params"]));
             record["workspace_read"] = json!(tool_call_is_workspace_read(&message["params"]));
             record["tool_kind"] = message["params"]["toolCall"]["kind"].clone();
-            record["locations"] = clipped_redacted(&message["params"]["toolCall"]["locations"], 600);
+            record["locations"] =
+                clipped_redacted(&message["params"]["toolCall"]["locations"], 600);
         } else {
             let params = &message["params"];
             let inner = params.get("update").unwrap_or(params);
@@ -3451,7 +3452,10 @@ mod completion_contract_tests {
             "task",
             "spawn_subagent",
         ] {
-            assert!(GROK_ROUNDTABLE_DISALLOWED_TOOLS.contains(&denied), "{denied}");
+            assert!(
+                GROK_ROUNDTABLE_DISALLOWED_TOOLS.contains(&denied),
+                "{denied}"
+            );
         }
     }
 

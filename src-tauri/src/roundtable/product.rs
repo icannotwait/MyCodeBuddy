@@ -769,9 +769,7 @@ async fn workspace_mount_status(
     config: &RoundtableConfigV1,
 ) -> Value {
     let path = super::sandbox::WORKSPACE_MOUNT_DESTINATION;
-    let unavailable = |reason: &str| {
-        json!({"path": path, "access": "read_only", "available": false, "reason": reason})
-    };
+    let unavailable = |reason: &str| json!({"path": path, "access": "read_only", "available": false, "reason": reason});
     let Some(id) = config.workspace_id.parse::<i64>().ok().filter(|id| *id > 0) else {
         return unavailable("workspace_id");
     };
@@ -798,7 +796,9 @@ async fn workspace_mount_status(
                 if let Err(error) =
                     super::sandbox::workspace_mount_check(&root, home.as_deref(), &installed.oci)
                 {
-                    return unavailable(error.details.reason.as_deref().unwrap_or("workspace_mount"));
+                    return unavailable(
+                        error.details.reason.as_deref().unwrap_or("workspace_mount"),
+                    );
                 }
             }
         }

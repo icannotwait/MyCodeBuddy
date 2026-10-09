@@ -2729,7 +2729,9 @@ pub(super) fn verify_profile(plan: &SandboxPlan, profile: &QualifiedOciProfile) 
                     && workspace_mount_source(&mount.source, None, profile)
                         .is_ok_and(|source| source == mount.source)
                     && plan.oci["mounts"].as_array().is_some_and(|entries| {
-                        entries.iter().any(|entry| *entry == workspace_mount_json(&mount.source))
+                        entries
+                            .iter()
+                            .any(|entry| *entry == workspace_mount_json(&mount.source))
                     })
             }
             "/etc/resolv.conf" => {
@@ -5343,9 +5345,15 @@ mod workspace_mount_tests {
             (home.clone(), "workspace_mount_overlaps_host_path"),
             (root.clone(), "workspace_mount_overlaps_host_path"),
             (root.join("data"), "workspace_mount_overlaps_host_path"),
-            (root.join("data/roundtable/oci"), "workspace_mount_overlaps_host_path"),
+            (
+                root.join("data/roundtable/oci"),
+                "workspace_mount_overlaps_host_path",
+            ),
             (root.join("rootfs"), "workspace_mount_overlaps_host_path"),
-            (root.join("home/.grok"), "workspace_mount_overlaps_host_path"),
+            (
+                root.join("home/.grok"),
+                "workspace_mount_overlaps_host_path",
+            ),
             (PathBuf::from("/"), "workspace_mount_root"),
             (PathBuf::from("relative"), "workspace_mount_path"),
             (root.join("missing"), "workspace_mount_path"),

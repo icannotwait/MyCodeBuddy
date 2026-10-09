@@ -1725,7 +1725,14 @@ fn mint_probe_token() -> String {
 
 fn rootfs_layout_error(rootfs: &Path) -> Option<String> {
     for relative in [
-        "dev", "dev/pts", "dev/shm", "sys", "tmp", "proc", "scratch", "rt-home",
+        "dev",
+        "dev/pts",
+        "dev/shm",
+        "sys",
+        "tmp",
+        "proc",
+        "scratch",
+        "rt-home",
         "workspace-ro",
     ] {
         let path = rootfs.join(relative);
