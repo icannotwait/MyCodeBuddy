@@ -1307,8 +1307,33 @@ fn constraint_err(err: DbErr) -> roundtable_protocol::RtError {
 }
 
 pub(crate) fn storage_err(err: DbErr) -> roundtable_protocol::RtError {
-    let _ = err;
+    if is_busy(&err.to_string()) {
+        // Another writer held the lock past busy_timeout. Transient: the
+        // prepaid monitor retries it until its slice ends.
+        return rt_error(ErrorCode::StorageUnavailable, STORAGE_BUSY);
+    }
     rt_error(ErrorCode::StorageUnavailable, "roundtable_storage")
+}
+
+pub(crate) const STORAGE_BUSY: &str = "roundtable_storage_busy";
+
+fn is_busy(rendered: &str) -> bool {
+    rendered.contains("database is locked")
+        || rendered.contains("database table is locked")
+        || rendered.contains("SQLITE_BUSY")
+}
+
+#[cfg(test)]
+mod busy_tests {
+    #[test]
+    fn lock_timeouts_are_classified_as_busy() {
+        assert!(super::is_busy(
+            "error returned from database: (code: 5) database is locked"
+        ));
+        assert!(!super::is_busy(
+            "UNIQUE constraint failed: rt_rooms.room_id"
+        ));
+    }
 }
 
 fn migration_err(err: DbErr) -> roundtable_protocol::RtError {

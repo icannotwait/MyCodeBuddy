@@ -628,6 +628,15 @@ async fn prepaid_monitor(
                 }
             }
             Ok(Ok(None)) => break MonitorExit::Finished,
+            // The writer lock outlasted busy_timeout (5s) inside a 10s slice.
+            // That is a host/writer stall, not a storage fault: keep sampling
+            // until the slice itself ends, then revoke as usual.
+            Ok(Err(error))
+                if error.details.reason.as_deref() == Some(super::store::STORAGE_BUSY) =>
+            {
+                tracing::warn!(room = %room, "roundtable budget checkpoint busy; retrying within the prepaid slice");
+                continue;
+            }
             Ok(Err(error)) => break MonitorExit::Failed(error),
             Err(_elapsed) => break MonitorExit::Expired,
         }
