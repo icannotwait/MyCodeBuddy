@@ -89,6 +89,7 @@ function runEdgeResolve({
   env = {},
   getentIp = "",
   getentExit = 0,
+  getentHostsIp = "2606:4700:a0::1",
   doh = {},
   curlFail = false,
 } = {}) {
@@ -104,18 +105,27 @@ function runEdgeResolve({
     JSON.stringify({
       Answer: ips.map((ip) => ({ type: 1, data: ip })),
     })
+  const inherited = { ...process.env }
+  delete inherited.CODEG_TUNNEL_EDGE_DOH
+  delete inherited.CF_CONFIG
+  delete inherited.FORCE_RESTART
   const harness = `
 set -euo pipefail
 ${match[0]}
 LOG=${JSON.stringify(log)}
+timeout() { shift; "$@"; }
 getent() {
   printf '%s\\n' "$*" >>${JSON.stringify(join(root, "getent"))}
-  if [ "\${2:-}" = region1.v2.argotunnel.com ]; then
+  if [ "\${1:-}" = hosts ]; then
+    printf '%s %s\\n' ${JSON.stringify(getentHostsIp)} "\${2:-}"
+    return 0
+  fi
+  if [ "\${1:-}" = ahostsv4 ] && [ "\${2:-}" = region1.v2.argotunnel.com ]; then
     if [ ${getentExit} -ne 0 ]; then
       return ${getentExit}
     fi
     if [ -n ${JSON.stringify(getentIp)} ]; then
-      printf '%s region1.v2.argotunnel.com\\n' ${JSON.stringify(getentIp)}
+      printf '%s STREAM region1.v2.argotunnel.com\\n' ${JSON.stringify(getentIp)}
     fi
     return 0
   fi
@@ -139,7 +149,7 @@ printf '%s\\n' "$EDGE_ARGS"
 `
   try {
     const result = spawnSync("bash", ["-c", harness], {
-      env: { ...process.env, ...env },
+      env: { ...inherited, ...env },
       encoding: "utf8",
       timeout: 5000,
     })
@@ -182,8 +192,24 @@ test("auto mode uses DoH --edge when system DNS is a 198.18 fake-ip", () => {
   )
   assert.match(result.log, /fake-ip DNS \(198\.18\.0\.1\); using DoH edge:/)
   assert.match(result.log, /--edge 198\.41\.192\.7:7844/)
+  assert.match(result.getents, /ahostsv4 region1\.v2\.argotunnel\.com/)
+  assert.doesNotMatch(result.getents, /(^|\n)hosts /)
+  assert.match(result.curls, /--resolve cloudflare-dns\.com:443:1\.1\.1\.1/)
   assert.match(result.curls, /cloudflare-dns\.com\/dns-query\?name=region1\.v2\.argotunnel\.com&type=A/)
   assert.match(result.curls, /cloudflare-dns\.com\/dns-query\?name=region2\.v2\.argotunnel\.com&type=A/)
+})
+
+test("auto mode uses DoH when ahostsv4 is 198.19.x even if hosts is IPv6", () => {
+  const result = runEdgeResolve({
+    getentIp: "198.19.0.1",
+    getentHostsIp: "2606:4700:a0::1",
+    doh: {
+      "region1.v2.argotunnel.com": ["198.41.192.7"],
+    },
+  })
+  assert.equal(result.status, 0, result.stderr)
+  assert.equal(result.stdout.trim(), "--edge 198.41.192.7:7844")
+  assert.match(result.getents, /ahostsv4 /)
 })
 
 test("auto mode uses DoH --edge when system DNS is empty", () => {

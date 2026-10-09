@@ -104,11 +104,12 @@ config's `credentials-file` stays absolute), and logs the resolved config on
 every start/force and on failure to `cloudflared.log`. Check without touching
 the tunnel: `start-codeg-tunnel.sh --force --print-config`.
 
-If system DNS for `region1.v2.argotunnel.com` is a fake-ip (`198.18.x`) or
+If the IPv4 A record (`getent ahostsv4`) for `region1.v2.argotunnel.com`
+is a fake-ip (`198.18.x` / `198.19.x`, Clash/sing-box `198.18.0.0/15`) or
 empty, the start script resolves region1/region2 A records via Cloudflare
-DoH (`https://cloudflare-dns.com/dns-query`) and passes each as
-`--edge IP:7844`, so cloudflared does not dial the hijacked address (0
-connections, public 530/1033). `CODEG_TUNNEL_EDGE_DOH=auto|on|off`
+DoH (`https://cloudflare-dns.com/dns-query`, pinned to `1.1.1.1`) and
+passes each as `--edge IP:7844`, so cloudflared does not dial the hijacked
+address (0 connections, public 530/1033). `CODEG_TUNNEL_EDGE_DOH=auto|on|off`
 (default `auto`); empty DoH results fall back to a normal launch.
 
 `codeg-watchdog.sh`, `reload-watchdog-once.sh`, and `codeg-supervisor.sh` pin

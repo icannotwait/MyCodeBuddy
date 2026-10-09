@@ -106,9 +106,10 @@ kill_cloudflared() {
   sleep 1
 }
 
-# Gateway fake-ip DNS (Clash/sing-box) maps *.argotunnel.com to 198.18.0.x,
+# Gateway fake-ip DNS (Clash/sing-box) maps *.argotunnel.com to 198.18.0.0/15,
 # so cloudflared dials 198.18.0.1:7844, times out, registers 0 connections,
-# and the public hostname returns 530/1033. Resolve real edge A records via
+# and the public hostname returns 530/1033. Use ahostsv4 (getent hosts can
+# return only AAAA and hide a hijacked A). Resolve real edge A records via
 # DoH and pass --edge. CODEG_TUNNEL_EDGE_DOH=auto|on|off (default auto).
 # Empty DoH results leave EDGE_ARGS empty so launch is unchanged.
 resolve_tunnel_edge_args() {
@@ -117,18 +118,21 @@ resolve_tunnel_edge_args() {
   EDGE_ARGS=""
   [ "$mode" != "off" ] || return 0
 
-  sys_ip=$( { getent hosts region1.v2.argotunnel.com 2>/dev/null || true; } | awk '{print $1; exit}')
+  # ahostsv4: IPv4 only. timeout: a hung stub resolver must not hold the start lock.
+  sys_ip=$( { timeout 2 getent ahostsv4 region1.v2.argotunnel.com 2>/dev/null || true; } | awk '{print $1; exit}')
   case "$sys_ip" in
-    198.18.*|"") need_doh=1 ;;
+    198.18.*|198.19.*|"") need_doh=1 ;;
   esac
   [ "$mode" = "on" ] && need_doh=1
   [ "$need_doh" = 1 ] || return 0
 
   for host in region1.v2.argotunnel.com region2.v2.argotunnel.com; do
     # Ignore curl/grep failures so a blank DoH answer falls back.
+    # Pin 1.1.1.1 so DoH does not use the same fake-ip resolver.
     # shellcheck disable=SC2046
     for ip in $(
       curl -s -m 8 -H 'accept: application/dns-json' \
+        --resolve cloudflare-dns.com:443:1.1.1.1 \
         "https://cloudflare-dns.com/dns-query?name=${host}&type=A" \
         | grep -o '"data":"[0-9.]*"' \
         | cut -d'"' -f4 \
