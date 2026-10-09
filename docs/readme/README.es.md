@@ -317,7 +317,7 @@ Arrastra una pestaña de un grupo a otro y su sesión sigue transmitiendo durant
 # or:
 irm https://raw.githubusercontent.com/icannotwait/MyCodeBuddy/main/uninstall-server.ps1 | iex
 
-.\install.ps1 -Version v0.33.0-mycodebuddy.1
+.\install.ps1 -Version v0.33.0-mycodebuddy.2
 # or:
 irm https://raw.githubusercontent.com/icannotwait/MyCodeBuddy/main/install.ps1 | iex
 $env:CODEG_STATIC_DIR="$env:LOCALAPPDATA\codeg-server\web"; codeg-server

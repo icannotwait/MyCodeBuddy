@@ -36,7 +36,9 @@ For an upstream Codeg `0.33.0` sync, reset the fork version in `package.json`,
 `src-tauri/Cargo.toml`, `src-tauri/Cargo.lock`, and
 `src-tauri/tauri.conf.json` to `0.33.0-mycodebuddy.1`. Run
 `pnpm test:release` to verify that the versions and runtime URLs remain
-consistent. The server entrypoint stays `src-tauri/src/server_bin/main.rs`.
+consistent. A fork-only release on the same upstream base bumps only the
+suffix in those files, plus `install.ps1` and the README install examples
+(current: `0.33.0-mycodebuddy.2`). The server entrypoint stays `src-tauri/src/server_bin/main.rs`.
 Feature `server` still builds `codeg-server`; `server-bin` enables `server`.
 `codeg-mcp` requires `mcp-bin`, and computer use adds `computer-helper`.
 The previous cookbook remains at `docs/UPSTREAM_0.31.1_CONFLICT_RESOLUTION.md`.

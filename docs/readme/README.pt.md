@@ -317,7 +317,7 @@ Arraste uma aba de um grupo para outro e a sessão continua transmitindo durante
 # or:
 irm https://raw.githubusercontent.com/icannotwait/MyCodeBuddy/main/uninstall-server.ps1 | iex
 
-.\install.ps1 -Version v0.33.0-mycodebuddy.1
+.\install.ps1 -Version v0.33.0-mycodebuddy.2
 # or:
 irm https://raw.githubusercontent.com/icannotwait/MyCodeBuddy/main/install.ps1 | iex
 $env:CODEG_STATIC_DIR="$env:LOCALAPPDATA\codeg-server\web"; codeg-server
