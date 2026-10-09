@@ -607,6 +607,7 @@ fn required_denials(output: &str) -> bool {
         "WORKSPACE_READ_OK",
         "DENIED workspace_write",
         "DENIED workspace_symlink",
+        "DENIED workspace_exec",
         "PID1_OK",
         "ISOLATION_OK",
         "REAPED",
@@ -715,16 +716,33 @@ async fn run_isolation(request: &ProbeRequest) -> Result<String, String> {
     fs::write(&secret, b"probe-canary").map_err(|error| error.to_string())?;
     let script = scratch.join("probe.sh");
     fs::write(&script, ISOLATION_SCRIPT).map_err(|error| error.to_string())?;
-    // A stand-in workspace bound with the live read-only options: readable,
-    // not writable, and no symlink inside it resolves (nosymfollow).
+    // A stand-in workspace bound with the live read-only options. It must be
+    // readable, not writable, not executable, and a symlink planted in it
+    // must not reach a host file outside the workspace. `nosymfollow` is
+    // requested but not every crun applies it to binds, so the escape check
+    // tests the real boundary: the container's own mount namespace.
     let workspace = request.runtime_root.join("probe-workspace");
+    let outside = request.runtime_root.join("probe-outside");
     let _ = fs::remove_dir_all(&workspace);
+    let _ = fs::remove_dir_all(&outside);
     fs::create_dir_all(&workspace).map_err(|error| error.to_string())?;
+    fs::create_dir_all(&outside).map_err(|error| error.to_string())?;
     fs::write(workspace.join("readme.txt"), b"workspace-canary\n")
         .map_err(|error| error.to_string())?;
-    #[cfg(unix)]
-    std::os::unix::fs::symlink("readme.txt", workspace.join("link"))
+    fs::write(outside.join("host-only.txt"), b"host-only-canary\n")
         .map_err(|error| error.to_string())?;
+    fs::write(workspace.join("run.sh"), b"#!/bin/sh\necho EXECUTED\n")
+        .map_err(|error| error.to_string())?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(workspace.join("run.sh"), fs::Permissions::from_mode(0o755))
+            .map_err(|error| error.to_string())?;
+        std::os::unix::fs::symlink("readme.txt", workspace.join("link"))
+            .map_err(|error| error.to_string())?;
+        std::os::unix::fs::symlink(outside.join("host-only.txt"), workspace.join("escape"))
+            .map_err(|error| error.to_string())?;
+    }
     let mounts = vec![
         (scratch.clone(), "/scratch".into(), false),
         (
@@ -745,6 +763,7 @@ async fn run_isolation(request: &ProbeRequest) -> Result<String, String> {
     .await?;
     let _ = fs::remove_file(&secret);
     let _ = fs::remove_dir_all(&workspace);
+    let _ = fs::remove_dir_all(&outside);
     Ok(output)
 }
 
@@ -2183,9 +2202,14 @@ if [ -r /dev/mem ] || [ -e /dev/sda ]; then fail device; else echo "DENIED devic
 grep -q workspace-canary /workspace-ro/readme.txt 2>/dev/null || fail workspace_read
 echo "WORKSPACE_READ_OK"
 if touch /workspace-ro/codeg-probe-write 2>/dev/null; then fail workspace_write; fi
-if echo x >> /workspace-ro/readme.txt 2>/dev/null; then fail workspace_write; fi
+if (echo x >> /workspace-ro/readme.txt) 2>/dev/null; then fail workspace_write; fi
+if mkdir /workspace-ro/codeg-probe-dir 2>/dev/null; then fail workspace_write; fi
+if rm -f /workspace-ro/readme.txt 2>/dev/null && [ ! -e /workspace-ro/readme.txt ]; then fail workspace_write; fi
 echo "DENIED workspace_write"
-if cat /workspace-ro/link >/dev/null 2>&1; then fail workspace_symlink; else echo "DENIED workspace_symlink"; fi
+if /workspace-ro/run.sh 2>/dev/null | grep -q EXECUTED; then fail workspace_exec; else echo "DENIED workspace_exec"; fi
+if cat /workspace-ro/escape 2>/dev/null | grep -q host-only-canary; then fail workspace_symlink; fi
+echo "DENIED workspace_symlink"
+if grep -q workspace-canary /workspace-ro/link 2>/dev/null; then echo "INFO workspace_internal_symlink=resolves"; else echo "INFO workspace_internal_symlink=blocked"; fi
 echo canary > /scratch/canary || fail scratch
 echo "ISOLATION_OK"
 "#;

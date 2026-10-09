@@ -1500,9 +1500,9 @@ enum TurnStop {
 const EMPTY_EVIDENCE_INSTRUCTION: &str = "No frozen evidence is published. Do not call search_evidence or read_evidence. Submit or abstain from the topic, the read-only workspace and published_messages. evidence_aliases may be [].";
 
 /// Every phase: where the workspace is and what `@path` in the topic means.
-/// The bind is read-only and `nosymfollow`; the sentence is guidance, the
-/// mount is the enforcement.
-pub(crate) const WORKSPACE_INSTRUCTION: &str = "The registered workspace is mounted read-only at /workspace-ro. A reference written as @relative/path in the topic means the file or folder /workspace-ro/relative/path. Read, list or search files there with your own file tools (absolute /workspace-ro paths) and name the paths you relied on. Nothing there can be written, commands cannot run, and symlinks inside the workspace do not resolve. Only the roundtable tools record a result.";
+/// The bind is read-only and noexec; the sentence is guidance, the mount is
+/// the enforcement.
+pub(crate) const WORKSPACE_INSTRUCTION: &str = "The registered workspace is mounted read-only at /workspace-ro. A reference written as @relative/path in the topic means the file or folder /workspace-ro/relative/path. Read, list or search files there with your own file tools (absolute /workspace-ro paths) and name the paths you relied on. Nothing there can be written or executed, and symlinks cannot reach outside the container. Only the roundtable tools record a result.";
 
 fn frozen_evidence_is_empty(context: &Value) -> bool {
     let sources_empty = context

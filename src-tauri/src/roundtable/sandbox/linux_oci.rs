@@ -28,8 +28,11 @@ const CPU_PERIOD_US: u64 = 100_000;
 
 /// Fixed in-container path of the read-only workspace bind.
 pub(crate) const WORKSPACE_MOUNT_DESTINATION: &str = "/workspace-ro";
-/// Non-recursive bind (nested host mounts stay hidden), read-only, and
-/// `nosymfollow` so no symlink inside the workspace resolves at all.
+/// Non-recursive bind (nested host mounts stay hidden), read-only, no exec.
+/// `nosymfollow` is requested too, but crun 1.21 does not apply it to binds,
+/// so symlinks inside the workspace may resolve. They resolve in the
+/// container's own mount namespace and cannot reach a host path; the
+/// qualification probe proves that with an absolute host symlink.
 pub(crate) const WORKSPACE_MOUNT_OPTIONS: [&str; 6] =
     ["bind", "ro", "nosuid", "nodev", "noexec", "nosymfollow"];
 

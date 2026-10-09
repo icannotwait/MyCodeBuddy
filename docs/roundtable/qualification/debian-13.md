@@ -253,8 +253,12 @@ room's registered workspace over `/workspace-ro` with
 mounts stay hidden). The workspace may not contain or sit inside the host
 HOME, the runtime root, the rootfs, the cgroup root, or a held credential
 file. The isolation probe binds a stand-in workspace with the same options and
-requires `WORKSPACE_READ_OK`, `DENIED workspace_write` and
-`DENIED workspace_symlink`. An existing rootfs needs
+requires `WORKSPACE_READ_OK`, `DENIED workspace_write` (touch, append,
+mkdir, rm), `DENIED workspace_exec` (an executable script in the workspace)
+and `DENIED workspace_symlink` (a symlink in the workspace pointing at an
+absolute host file outside it must not return that file). crun 1.21 does not
+apply `nosymfollow` to binds, so the probe also prints
+`INFO workspace_internal_symlink=resolves|blocked` without requiring either. An existing rootfs needs
 `mkdir "$ROOTFS/workspace-ro"` and a fresh qualification (the digest
 changes). The socket paths, `/etc/resolv.conf`, and
 auth placeholders are empty regular files. The probe mounts a tmpfs on
