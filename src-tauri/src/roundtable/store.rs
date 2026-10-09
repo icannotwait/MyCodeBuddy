@@ -1323,19 +1323,6 @@ fn is_busy(rendered: &str) -> bool {
         || rendered.contains("SQLITE_BUSY")
 }
 
-#[cfg(test)]
-mod busy_tests {
-    #[test]
-    fn lock_timeouts_are_classified_as_busy() {
-        assert!(super::is_busy(
-            "error returned from database: (code: 5) database is locked"
-        ));
-        assert!(!super::is_busy(
-            "UNIQUE constraint failed: rt_rooms.room_id"
-        ));
-    }
-}
-
 fn migration_err(err: DbErr) -> roundtable_protocol::RtError {
     let _ = err;
     rt_error(ErrorCode::StorageUnavailable, "roundtable_migration")
@@ -1351,5 +1338,18 @@ fn block_on_db<T>(future: impl Future<Output = T>) -> T {
                 .expect("roundtable store runtime");
             runtime.block_on(future)
         }
+    }
+}
+
+#[cfg(test)]
+mod busy_tests {
+    #[test]
+    fn lock_timeouts_are_classified_as_busy() {
+        assert!(super::is_busy(
+            "error returned from database: (code: 5) database is locked"
+        ));
+        assert!(!super::is_busy(
+            "UNIQUE constraint failed: rt_rooms.room_id"
+        ));
     }
 }

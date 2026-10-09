@@ -621,6 +621,14 @@ async fn widen_prepaid_cap(conn: &impl ConnectionTrait) -> Result<(), DbErr> {
     }
 }
 
+pub async fn drop_roundtable_schema(conn: &impl ConnectionTrait) -> Result<(), DbErr> {
+    for table in TABLES.iter().rev() {
+        conn.execute_unprepared(&format!("DROP TABLE IF EXISTS {table}"))
+            .await?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod prepaid_cap_tests {
     use super::*;
@@ -684,12 +692,4 @@ mod prepaid_cap_tests {
         // Idempotent on the next startup.
         apply_roundtable_schema(&conn).await.unwrap();
     }
-}
-
-pub async fn drop_roundtable_schema(conn: &impl ConnectionTrait) -> Result<(), DbErr> {
-    for table in TABLES.iter().rev() {
-        conn.execute_unprepared(&format!("DROP TABLE IF EXISTS {table}"))
-            .await?;
-    }
-    Ok(())
 }
