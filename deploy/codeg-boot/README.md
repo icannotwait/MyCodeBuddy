@@ -31,7 +31,8 @@ secrets or binary caches.
    extract into `/workspace/codeg-data/acp-binaries-mirror`, then run
    `ensure-acp-agents.sh` (restores live cache; downloads only what is still
    missing). Prefer this over fresh Google downloads when `dl.google.com` is
-   flaky (fake-ip / egress).
+   flaky (fake-ip / egress). Install `rsync`: `sync_dir` prefers `rsync -a`
+   over `cp -a`.
 4. Create local-only secrets (`CODEG_TOKEN`, cloudflared creds) using the
    examples in this folder — never commit them.
 5. Last resort: build from source (`pnpm` + `cargo`).
@@ -51,8 +52,10 @@ See also the handoff doc pattern under your private notes
 
 ## Automatic updates (watchdog)
 
-`codeg-watchdog.sh` calls `auto-sync-boot.sh` on the same ~10 minute cadence as
-`ensure-acp-agents.sh`. The sync script itself rate-limits to once per hour
+`codeg-watchdog.sh` starts `ensure-acp-agents.sh` in the background every ~10
+minutes (same `nohup` pattern as `codeg-supervisor.sh`) so a slow ACP mirror
+copy cannot stall health checks. It calls `auto-sync-boot.sh` on that same
+cadence. The sync script itself rate-limits to once per hour
 (`CODEG_BOOT_SYNC_INTERVAL_SECS`, default `3600`).
 
 It prefers a local `MyCodeBuddy` checkout. After `git fetch` it copies each
@@ -100,6 +103,14 @@ cloudflared with `HOME` set to the owner of that `.cloudflared` dir (the
 config's `credentials-file` stays absolute), and logs the resolved config on
 every start/force and on failure to `cloudflared.log`. Check without touching
 the tunnel: `start-codeg-tunnel.sh --force --print-config`.
+
+If the IPv4 A record (`getent ahostsv4`) for `region1.v2.argotunnel.com`
+is a fake-ip (`198.18.x` / `198.19.x`, Clash/sing-box `198.18.0.0/15`) or
+empty, the start script resolves region1/region2 A records via Cloudflare
+DoH (`https://cloudflare-dns.com/dns-query`, pinned to `1.1.1.1`) and
+passes each as `--edge IP:7844`, so cloudflared does not dial the hijacked
+address (0 connections, public 530/1033). `CODEG_TUNNEL_EDGE_DOH=auto|on|off`
+(default `auto`); empty DoH results fall back to a normal launch.
 
 `codeg-watchdog.sh`, `reload-watchdog-once.sh`, and `codeg-supervisor.sh` pin
 `HOME=/home/box USER=box LOGNAME=box`, so a relaunch from a sandbox shell
@@ -168,6 +179,8 @@ parser ignores `TS_*`; `start-tailscale.sh` reads them itself.
 `ensure-acp-agents.sh` does **not** hardcode agent versions. It asks the live
 `codeg-server` (`POST /api/acp_list_agents`) for each enabled agent's
 `registry_version` (from the MyCodeBuddy registry baked into that build).
+Install `rsync` on the box: `sync_dir` prefers `rsync -a` and only falls back
+to `cp -a` when it is missing.
 
 The registry version is a **minimum, not an exact pin**. The script follows the
 version actually in use (`installed_version`, which for binary agents is the

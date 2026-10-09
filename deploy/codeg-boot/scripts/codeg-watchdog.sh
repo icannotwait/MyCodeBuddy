@@ -579,8 +579,9 @@ while true; do
 
   loop=$((loop + 1))
   # Every ~10 min: restore/mirror ACP binaries if Update wiped ~/.cache
+  # Background: a slow mirror copy must not stall health checks (own flock).
   if [ $((loop % 10)) -eq 0 ] && [ -x "$BOOT/ensure-acp-agents.sh" ]; then
-    "$BOOT/ensure-acp-agents.sh" 9>&- || true
+    nohup "$BOOT/ensure-acp-agents.sh" >/dev/null 2>&1 8>&- 9>&- &
   fi
   # Same cadence: sync boot scripts from git/GitHub (auto-sync self-rate-limits to 1h)
   if [ $((loop % 10)) -eq 0 ] && [ -x "$BOOT/auto-sync-boot.sh" ]; then
