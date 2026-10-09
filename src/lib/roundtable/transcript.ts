@@ -135,6 +135,13 @@ export interface RoundtablePreviewInput {
   attemptId: string
   text: string
   live?: RoundtableLivePreview
+  /**
+   * Seat and phase from the live frame, used only while the verified
+   * projection does not list the attempt yet (it is re-read on events).
+   */
+  speakerId?: string
+  phaseId?: string
+  phaseKind?: string
 }
 
 interface PhaseBucket {
@@ -639,9 +646,27 @@ export function buildRoundtableTranscript(
           (item) => item.turn_id === attempt.turn_id
         )
       : undefined
-    const phaseId = replayTurn?.phase_id ?? null
-    const speaker = readSpeaker(projection, replayTurn?.speaker_id ?? null)
-    const bucket = bucketFor(phaseId, null)
+    const phaseId = replayTurn?.phase_id ?? preview.phaseId ?? null
+    const speaker = readSpeaker(
+      projection,
+      replayTurn?.speaker_id ?? preview.speakerId ?? null
+    )
+    const liveKind = preview.phaseKind
+    const bucket =
+      phaseId &&
+      !phaseRefs.has(phaseId) &&
+      (liveKind === "proposal" ||
+        liveKind === "critique" ||
+        liveKind === "synthesis")
+        ? ensure(
+            phaseId,
+            liveKind,
+            Math.max(-1, ...[...phaseRefs.values()].map((ref) => ref.index)) +
+              1,
+            "0",
+            titleKeyFor(liveKind)
+          )
+        : bucketFor(phaseId, null)
     const turn = emptyTurn({
       key: `preview:${preview.attemptId}`,
       messageId: null,

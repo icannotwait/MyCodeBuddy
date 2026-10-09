@@ -483,6 +483,53 @@ describe("live preview turns", () => {
   })
 })
 
+describe("live preview before the projection lists the attempt", () => {
+  it("places it under its phase and seat from the live frame", () => {
+    const source = projection((body) => {
+      body.status = "running"
+      body.phase_refs = [
+        {
+          phase_id: "phase-proposal",
+          revision: "1",
+          state: "published",
+          index: 0,
+          kind: "proposal",
+        },
+      ]
+      body.replay.attempts = []
+      body.replay.turns = []
+    })
+    const model = buildRoundtableTranscript(
+      source,
+      [],
+      [
+        {
+          attemptId: "attempt-synth",
+          text: "Drafting the conclusion",
+          speakerId: "speaker-mod",
+          phaseId: "phase-synthesis",
+          phaseKind: "synthesis",
+          live: {
+            thought: "",
+            thoughtOmitted: false,
+            activity: null,
+            ended: false,
+            truncated: false,
+          },
+        },
+      ]
+    )
+    const last = model.phases.at(-1)!
+    expect(last.kind).toBe("synthesis")
+    expect(last.id).toBe("phase-synthesis")
+    expect(last.turns[0]).toMatchObject({
+      visibility: "preview",
+      summary: "Drafting the conclusion",
+      speaker: { role: "moderator" },
+    })
+  })
+})
+
 describe("replaceSeatAliases", () => {
   it("maps seat aliases outside code, leaves code and unknown aliases alone", () => {
     const label = (alias: string) =>

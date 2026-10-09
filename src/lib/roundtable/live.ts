@@ -153,9 +153,12 @@ const LIVE_ATTEMPT_STATES = new Set([
 ])
 
 /**
- * Live buffers the transcript may show for this projection: only attempts the
- * verified projection already lists, of a running room, that are not closed.
- * Claiming by a verified message is handled by the transcript itself.
+ * Live buffers the transcript may show for this projection, of a running
+ * room. An attempt the verified projection already lists must still be live.
+ * The projection is re-read on room events, so a just-started attempt may not
+ * be listed yet; its live output is shown only when its seat belongs to this
+ * room and its phase is not already published. Claiming by a verified message
+ * is handled by the transcript itself.
  */
 export function liveTranscriptInputs(
   state: RoundtableLiveState,
@@ -170,13 +173,29 @@ export function liveTranscriptInputs(
       attempt,
     ])
   )
+  const speakers = new Set(
+    projection.body.replay.speakers.map((speaker) => speaker.speaker_id)
+  )
+  const published = new Set(
+    projection.body.phase_refs
+      .filter((ref) => ref.state === "published")
+      .map((ref) => ref.phase_id)
+  )
   return Object.values(state).flatMap((live) => {
     const attempt = attempts.get(live.attemptId)
-    if (!attempt || !LIVE_ATTEMPT_STATES.has(attempt.state)) return []
+    if (attempt ? !LIVE_ATTEMPT_STATES.has(attempt.state) : false) return []
+    if (
+      !attempt &&
+      (!speakers.has(live.speakerId) || published.has(live.phaseId))
+    )
+      return []
     return [
       {
         attemptId: live.attemptId,
         text: live.message,
+        speakerId: live.speakerId,
+        phaseId: live.phaseId,
+        phaseKind: live.phaseKind,
         live: {
           thought: live.thought,
           thoughtOmitted: live.thoughtStart > 0,

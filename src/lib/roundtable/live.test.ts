@@ -43,14 +43,30 @@ function item(
 
 function projection(
   status: string,
-  attempts: { attempt_id: string; state: string }[]
+  attempts: { attempt_id: string; state: string }[],
+  speakers: string[] = [],
+  publishedPhases: string[] = []
 ): RoundtableProjection {
   return {
     projection_ref: { id: "p", hash: "h" },
     body: {
       status,
+      phase_refs: publishedPhases.map((phase_id, index) => ({
+        phase_id,
+        index,
+        revision: "1",
+        state: "published",
+        kind: "proposal",
+      })),
       replay: {
         attempts: attempts.map((attempt) => ({ ...attempt, turn_id: "t" })),
+        speakers: speakers.map((speaker_id, ordinal) => ({
+          speaker_id,
+          ordinal,
+          role: "member",
+          provider_ref: "provider:x",
+          model_id: "m",
+        })),
       },
     },
   } as unknown as RoundtableProjection
@@ -157,6 +173,9 @@ describe("roundtable live output", () => {
       {
         attemptId: "run",
         text: "streaming",
+        speakerId: "speaker-run",
+        phaseId: "phase",
+        phaseKind: "proposal",
         live: {
           thought: "hmm",
           thoughtOmitted: false,
@@ -172,5 +191,19 @@ describe("roundtable live output", () => {
         projection("completed", [{ attempt_id: "run", state: "streaming" }])
       )
     ).toEqual([])
+  })
+
+  it("shows a just-started attempt the projection does not list yet, only for a seat of this room in an unpublished phase", () => {
+    const state = applyRoundtableLive(
+      {},
+      frame([item("fresh", [0, "early words"]), item("stranger", [0, "x"])]),
+      "room"
+    ).state
+    const room = projection("running", [], ["speaker-fresh"])
+    expect(liveTranscriptInputs(state, room).map((i) => i.attemptId)).toEqual([
+      "fresh",
+    ])
+    const published = projection("running", [], ["speaker-fresh"], ["phase"])
+    expect(liveTranscriptInputs(state, published)).toEqual([])
   })
 })
