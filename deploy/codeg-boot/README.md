@@ -31,7 +31,8 @@ secrets or binary caches.
    extract into `/workspace/codeg-data/acp-binaries-mirror`, then run
    `ensure-acp-agents.sh` (restores live cache; downloads only what is still
    missing). Prefer this over fresh Google downloads when `dl.google.com` is
-   flaky (fake-ip / egress).
+   flaky (fake-ip / egress). Install `rsync`: `sync_dir` prefers `rsync -a`
+   over `cp -a`.
 4. Create local-only secrets (`CODEG_TOKEN`, cloudflared creds) using the
    examples in this folder — never commit them.
 5. Last resort: build from source (`pnpm` + `cargo`).
@@ -51,8 +52,10 @@ See also the handoff doc pattern under your private notes
 
 ## Automatic updates (watchdog)
 
-`codeg-watchdog.sh` calls `auto-sync-boot.sh` on the same ~10 minute cadence as
-`ensure-acp-agents.sh`. The sync script itself rate-limits to once per hour
+`codeg-watchdog.sh` starts `ensure-acp-agents.sh` in the background every ~10
+minutes (same `nohup` pattern as `codeg-supervisor.sh`) so a slow ACP mirror
+copy cannot stall health checks. It calls `auto-sync-boot.sh` on that same
+cadence. The sync script itself rate-limits to once per hour
 (`CODEG_BOOT_SYNC_INTERVAL_SECS`, default `3600`).
 
 It prefers a local `MyCodeBuddy` checkout. After `git fetch` it copies each
@@ -175,6 +178,8 @@ parser ignores `TS_*`; `start-tailscale.sh` reads them itself.
 `ensure-acp-agents.sh` does **not** hardcode agent versions. It asks the live
 `codeg-server` (`POST /api/acp_list_agents`) for each enabled agent's
 `registry_version` (from the MyCodeBuddy registry baked into that build).
+Install `rsync` on the box: `sync_dir` prefers `rsync -a` and only falls back
+to `cp -a` when it is missing.
 
 The registry version is a **minimum, not an exact pin**. The script follows the
 version actually in use (`installed_version`, which for binary agents is the

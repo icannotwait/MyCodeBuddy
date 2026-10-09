@@ -805,3 +805,12 @@ CURL_CODE=530
   assert.equal(result.starts.match(/1 --force/g)?.length, 1)
   assert.equal(result.stdout, "sleeps=60 10 15 15 \n")
 })
+
+test("watchdog starts ensure-acp in the background so health checks continue", () => {
+  const source = readFileSync(watchdogPath, "utf8")
+  assert.match(
+    source,
+    /nohup "\$BOOT\/ensure-acp-agents\.sh" >\/dev\/null 2>&1 8>&- 9>&- &/
+  )
+  assert.doesNotMatch(source, /"\$BOOT\/ensure-acp-agents\.sh" 9>&- \|\| true/)
+})
