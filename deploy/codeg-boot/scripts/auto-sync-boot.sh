@@ -52,7 +52,6 @@ SCRIPTS=(
   start-tailscale.sh
   set-tailscale-key.sh
   join-tailnet.sh
-  start-opencli-mcp.sh
   reload-watchdog-once.sh
   auto-sync-boot.sh
 )

@@ -216,16 +216,6 @@ webdav_ok() {
   [ "$code" = "401" ] || [ "$code" = "200" ]
 }
 
-# opencli-mcp: unauthenticated POST /mcp should be 401 (auth + listener).
-opencli_mcp_ok() {
-  local code
-  code=$(curl -sS -o /dev/null -w '%{http_code}' --connect-timeout 2 --max-time 5 \
-    -X POST -H 'Content-Type: application/json' \
-    --data '{"jsonrpc":"2.0","id":1,"method":"ping"}' \
-    http://127.0.0.1:18765/mcp 2>/dev/null) || code=000
-  [ "$code" = "401" ]
-}
-
 # Public edge probe. Sets globals: pub_status (unconfigured|ok|bad|fail|other), pub_code, pub_detail.
 # Returns 0 if healthy/unconfigured, 1 if tunnel looks broken.
 probe_public() {
@@ -509,7 +499,6 @@ while true; do
   s3080=down
   scf=down
   swebdav=down
-  sopenclimcp=down
   stailscale=missing
   broken=0
   http=down
@@ -571,22 +560,6 @@ while true; do
     broken=$((broken + 1))
   fi
 
-  # opencli-mcp (Streamable HTTP on :18765) — local MCP wrapper; Bearer auth required.
-  # Does not launch Chrome; start script only warns if Bridge Chrome profile is absent.
-  if [ -x "$BOOT/start-opencli-mcp.sh" ]; then
-    "$BOOT/start-opencli-mcp.sh" 9>&- || true
-    if port_up 18765 && opencli_mcp_ok; then
-      sopenclimcp=up
-    else
-      broken=$((broken + 1))
-      sleep 1
-      if port_up 18765 && opencli_mcp_ok; then sopenclimcp=up; fi
-    fi
-  else
-    sopenclimcp=missing
-    broken=$((broken + 1))
-  fi
-
   # Tailscale (tailnet membership; start script is a no-op when Running).
   # needs-login waits for a human or an auth key, so it is reported but never
   # counted as broken; only down/missing count.
@@ -602,7 +575,7 @@ while true; do
   esac
 
   ts=$(TZ=Asia/Shanghai date '+%Y-%m-%d %H:%M:%S CST')
-  echo "$ts 3080=$s3080 http=$http cloudflared=$scf public=$pub pubcode=${pub_code:-na} webdav=$swebdav opencli-mcp=$sopenclimcp tailscale=$stailscale broken=$broken" >>"$LOG"
+  echo "$ts 3080=$s3080 http=$http cloudflared=$scf public=$pub pubcode=${pub_code:-na} webdav=$swebdav tailscale=$stailscale broken=$broken" >>"$LOG"
 
   loop=$((loop + 1))
   # Every ~10 min: restore/mirror ACP binaries if Update wiped ~/.cache

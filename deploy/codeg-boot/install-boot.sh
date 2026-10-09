@@ -11,7 +11,6 @@ mkdir -p "$DEST" /workspace/heartbeat /workspace/codeg-data /workspace/codeg-dis
 for f in ensure-acp-agents.sh codeg-watchdog.sh codeg-supervisor.sh \
          start-codeg-server.sh start-codeg-tunnel.sh start-webdav.sh \
          start-tailscale.sh set-tailscale-key.sh join-tailnet.sh \
-         start-opencli-mcp.sh \
          reload-watchdog-once.sh auto-sync-boot.sh; do
   if [ ! -f "$SRC/$f" ]; then
     echo "missing $SRC/$f" >&2
