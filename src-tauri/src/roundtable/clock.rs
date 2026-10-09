@@ -63,6 +63,7 @@ fn clock_ms(clock: libc::clockid_t) -> u64 {
 }
 
 /// Pure suspend arithmetic over one clock-pair reading.
+#[cfg(any(target_os = "linux", test))]
 pub fn suspended_since(start_gap_ms: u64, boottime_ms: u64, monotonic_ms: u64) -> u64 {
     boottime_ms
         .saturating_sub(monotonic_ms)

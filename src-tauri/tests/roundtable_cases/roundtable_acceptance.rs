@@ -1731,14 +1731,15 @@ async fn storage_fix_resume_checks_new_concurrency_room_phase_and_attempt_budget
 
 #[tokio::test]
 async fn storage_fix_active_budget_prepays_room_once_and_refunds_only_known_unused() {
-    use codeg_lib::roundtable::ActiveBudgetLease;
+    use codeg_lib::roundtable::{ActiveBudgetLease, PREPAID_SLICE_MS};
+    let slice = PREPAID_SLICE_MS as i64;
     let ready = ready(10100, &[("member", 0, "failed")], 1, 1, 10).await;
     let mut lease = ActiveBudgetLease::begin(ready.store.clone(), ready.room, Epoch(1), Epoch(1))
         .await
         .unwrap();
     assert_eq!(
         scalar_i64(&ready.conn, "SELECT remaining_active_ms FROM rt_rooms").await,
-        1_799_000
+        1_800_000 - slice
     );
     assert!(
         ActiveBudgetLease::begin(ready.store.clone(), ready.room, Epoch(1), Epoch(1))
@@ -1747,8 +1748,11 @@ async fn storage_fix_active_budget_prepays_room_once_and_refunds_only_known_unus
     );
     ready.clock.set(1010).unwrap();
     let sampled = lease.checkpoint().await.unwrap();
-    assert_eq!(sampled.remaining_room_ms.0, 1_798_000);
-    assert_eq!(sampled.prepaid_until.0, 2010);
+    assert_eq!(
+        sampled.remaining_room_ms.0 as i64,
+        1_800_000 - 1_000 - slice
+    );
+    assert_eq!(sampled.prepaid_until.0, 1010 + PREPAID_SLICE_MS);
     ready.clock.set(1410).unwrap();
     let settled = lease.finish().await.unwrap();
     assert_eq!(settled.remaining_room_ms.0, 1_798_600);
@@ -1836,7 +1840,8 @@ async fn storage_fix_checkpoint_after_multi_second_stall_charges_gap_without_exh
 
 #[tokio::test]
 async fn storage_fix_crash_retains_prepaid_slice_and_old_owner_cannot_refund_new_lease() {
-    use codeg_lib::roundtable::ActiveBudgetLease;
+    use codeg_lib::roundtable::{ActiveBudgetLease, PREPAID_SLICE_MS};
+    let slice = PREPAID_SLICE_MS as i64;
     let ready = ready(10300, &[("member", 0, "failed")], 1, 1, 10).await;
     let mut old = ActiveBudgetLease::begin(ready.store.clone(), ready.room, Epoch(1), Epoch(1))
         .await
@@ -1852,13 +1857,13 @@ async fn storage_fix_crash_retains_prepaid_slice_and_old_owner_cannot_refund_new
         .unwrap();
     assert_eq!(
         scalar_i64(&ready.conn, "SELECT remaining_active_ms FROM rt_rooms").await,
-        1_798_000
+        1_800_000 - 2 * slice
     );
     assert!(old.finish().await.is_err());
     current.finish().await.unwrap();
     assert_eq!(
         scalar_i64(&ready.conn, "SELECT remaining_active_ms FROM rt_rooms").await,
-        1_799_000
+        1_800_000 - slice
     );
 }
 
@@ -2057,7 +2062,8 @@ async fn lifecycle_phase_budget_expiry_preserves_paid_room_cleanup_time() {
 
 #[tokio::test]
 async fn lifecycle_legacy_prepaid_upgrade_preserves_charge_and_phase_reservation() {
-    use codeg_lib::roundtable::ActiveBudgetLease;
+    use codeg_lib::roundtable::{ActiveBudgetLease, PREPAID_SLICE_MS};
+    let slice = PREPAID_SLICE_MS as i64;
     let ready = ready(11600, &[("member", 0, "active")], 1, 1, 10).await;
     let mut lease = ActiveBudgetLease::begin(ready.store.clone(), ready.room, Epoch(1), Epoch(1))
         .await
@@ -2071,7 +2077,7 @@ async fn lifecycle_legacy_prepaid_upgrade_preserves_charge_and_phase_reservation
     migrate_roundtable(&ready.conn).await.unwrap();
     assert_eq!(
         scalar_i64(&ready.conn, "SELECT prepaid_ms FROM rt_active_time_leases").await,
-        1000
+        slice
     );
     assert_eq!(
         scalar_i64(
@@ -2079,15 +2085,15 @@ async fn lifecycle_legacy_prepaid_upgrade_preserves_charge_and_phase_reservation
             "SELECT phase_prepaid_ms FROM rt_active_time_leases"
         )
         .await,
-        1000
+        slice
     );
     assert_eq!(
         scalar_i64(&ready.conn, "SELECT remaining_active_ms FROM rt_rooms").await,
-        1_799_000
+        1_800_000 - slice
     );
     assert_eq!(
         scalar_i64(&ready.conn, "SELECT remaining_ms FROM rt_phases").await,
-        1_799_000
+        1_800_000 - slice
     );
     ready.clock.set(260).unwrap();
     lease.finish().await.unwrap();
