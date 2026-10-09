@@ -742,6 +742,13 @@ async fn run_isolation(request: &ProbeRequest) -> Result<String, String> {
             .map_err(|error| error.to_string())?;
         std::os::unix::fs::symlink(outside.join("host-only.txt"), workspace.join("escape"))
             .map_err(|error| error.to_string())?;
+        // The same host canary through a relative `../` climb.
+        let climb = format!(
+            "../../../../../../../..{}",
+            outside.join("host-only.txt").display()
+        );
+        std::os::unix::fs::symlink(climb, workspace.join("climb"))
+            .map_err(|error| error.to_string())?;
     }
     let mounts = vec![
         (scratch.clone(), "/scratch".into(), false),
@@ -1190,6 +1197,7 @@ async fn rpc(
             private_log,
             trace: None,
             live: None,
+            workspace_root: None,
         },
     )
     .await
@@ -2208,6 +2216,7 @@ if rm -f /workspace-ro/readme.txt 2>/dev/null && [ ! -e /workspace-ro/readme.txt
 echo "DENIED workspace_write"
 if /workspace-ro/run.sh 2>/dev/null | grep -q EXECUTED; then fail workspace_exec; else echo "DENIED workspace_exec"; fi
 if cat /workspace-ro/escape 2>/dev/null | grep -q host-only-canary; then fail workspace_symlink; fi
+if cat /workspace-ro/climb 2>/dev/null | grep -q host-only-canary; then fail workspace_symlink; fi
 echo "DENIED workspace_symlink"
 if grep -q workspace-canary /workspace-ro/link 2>/dev/null; then echo "INFO workspace_internal_symlink=resolves"; else echo "INFO workspace_internal_symlink=blocked"; fi
 echo canary > /scratch/canary || fail scratch

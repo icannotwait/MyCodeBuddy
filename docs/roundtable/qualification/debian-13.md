@@ -256,7 +256,7 @@ file. The isolation probe binds a stand-in workspace with the same options and
 requires `WORKSPACE_READ_OK`, `DENIED workspace_write` (touch, append,
 mkdir, rm), `DENIED workspace_exec` (an executable script in the workspace)
 and `DENIED workspace_symlink` (a symlink in the workspace pointing at an
-absolute host file outside it must not return that file). crun 1.21 does not
+absolute host file outside it, or a relative `../` climb to it, must not return that file). crun 1.21 does not
 apply `nosymfollow` to binds, so the probe also prints
 `INFO workspace_internal_symlink=resolves|blocked` without requiring either. An existing rootfs needs
 `mkdir "$ROOTFS/workspace-ro"` and a fresh qualification (the digest

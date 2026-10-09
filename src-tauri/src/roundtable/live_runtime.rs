@@ -43,6 +43,9 @@ struct Active {
     trace: Option<Arc<AttemptTrace>>,
     /// Display-only live output for the room page. Never read back.
     live: Arc<super::live_stream::LiveSink>,
+    /// Host path behind `/workspace-ro`, set once the room's folder is
+    /// resolved. Native read permissions are checked against it.
+    workspace_root: std::sync::OnceLock<PathBuf>,
 }
 
 pub(crate) struct LiveParticipantExecutor {
@@ -773,6 +776,7 @@ impl RoundtableTurnExecutor for LiveParticipantExecutor {
             agent: agent.clone(),
             trace: trace.clone(),
             live,
+            workspace_root: std::sync::OnceLock::new(),
         });
         self.active
             .lock()
@@ -805,6 +809,7 @@ impl RoundtableTurnExecutor for LiveParticipantExecutor {
         let project = PathBuf::from(column::<String>(&folder, 0)?)
             .canonicalize()
             .map_err(|_| rt_error(ErrorCode::InvalidArgument, "workspace_path"))?;
+        let _ = active.workspace_root.set(project.clone());
         let home = std::env::var_os("HOME")
             .map(PathBuf::from)
             .ok_or_else(|| rt_error(ErrorCode::PolicyUnenforceable, "host_home"))?
@@ -1172,6 +1177,7 @@ async fn drive_acp(
             gateway: Some(&active.gateway),
             trace: active.trace.as_deref(),
             live: Some(&active.live),
+            workspace_root: active.workspace_root.get().map(PathBuf::as_path),
         },
     )
     .await?;
@@ -1286,6 +1292,7 @@ struct SeatPromptControl<'a> {
     gateway: Option<&'a LiveModelGateway>,
     trace: Option<&'a AttemptTrace>,
     live: Option<&'a super::live_stream::LiveSink>,
+    workspace_root: Option<&'a Path>,
 }
 impl SeatPromptControl<'_> {
     fn check_completion(&self) -> RtResult<()> {
@@ -1332,6 +1339,7 @@ where
                 private_log: None,
                 trace: control.trace,
                 live: control.live,
+                workspace_root: control.workspace_root,
             },
         )
         .await?;
@@ -1372,6 +1380,8 @@ pub(crate) struct AcpExchange<'a> {
     pub(crate) trace: Option<&'a AttemptTrace>,
     /// Display-only live output sink. Live seats pass theirs; probes `None`.
     pub(crate) live: Option<&'a super::live_stream::LiveSink>,
+    /// Host path behind `/workspace-ro` for live seats; `None` in probes.
+    pub(crate) workspace_root: Option<&'a Path>,
 }
 
 async fn rpc(
@@ -1398,6 +1408,7 @@ async fn rpc(
             private_log: None,
             trace: active.trace.as_deref(),
             live: Some(&active.live),
+            workspace_root: active.workspace_root.get().map(PathBuf::as_path),
         },
     )
     .await
@@ -1584,11 +1595,11 @@ where
             if let Some(request_id) = message.get("id").cloned() {
                 let response = if message["method"] == "session/request_permission" {
                     if !tool_call_is_roundtable(&message["params"])
-                        && !tool_call_is_workspace_read(&message["params"])
+                        && !tool_call_is_workspace_read(&message["params"], exchange.workspace_root)
                     {
                         exchange.rejected_permission.store(true, Ordering::Relaxed);
                     }
-                    permission_reply(&message["params"], &request_id)
+                    permission_reply_in(&message["params"], &request_id, exchange.workspace_root)
                 } else {
                     json!({
                         "jsonrpc": "2.0",
@@ -1886,7 +1897,7 @@ fn trace_acp_frame(
         if method == "session/request_permission" {
             record["tool_title"] = message["params"]["toolCall"]["title"].clone();
             record["roundtable_tool"] = json!(tool_call_is_roundtable(&message["params"]));
-            record["workspace_read"] = json!(tool_call_is_workspace_read(&message["params"]));
+            record["workspace_read"] = json!(tool_call_is_workspace_read(&message["params"], None));
             record["tool_kind"] = message["params"]["toolCall"]["kind"].clone();
             record["locations"] =
                 clipped_redacted(&message["params"]["toolCall"]["locations"], 600);
@@ -1956,8 +1967,14 @@ fn parse_acp_frame(line: &[u8]) -> RtResult<Value> {
 
 const ROUNDTABLE_TOOL_NAMES: [&str; 3] = ["submit_result", "read_evidence", "search_evidence"];
 
+#[cfg(test)]
 fn permission_reply(params: &Value, request_id: &Value) -> Value {
-    let allow = tool_call_is_roundtable(params) || tool_call_is_workspace_read(params);
+    permission_reply_in(params, request_id, None)
+}
+
+fn permission_reply_in(params: &Value, request_id: &Value, workspace_root: Option<&Path>) -> Value {
+    let allow =
+        tool_call_is_roundtable(params) || tool_call_is_workspace_read(params, workspace_root);
     // ACP does not prove that allow_always is confined to this sealed attempt.
     // If one-shot consent is unavailable, select a rejection instead.
     let selected = selected_option(params, allow).or_else(|| {
@@ -2004,7 +2021,7 @@ fn selected_option(params: &Value, allow: bool) -> Option<String> {
 /// A native read or search whose every declared location lies inside the
 /// read-only workspace bind. Anything without locations, with a relative or
 /// `..` path, or of any other kind (execute, edit, fetch, ...) is not one.
-fn tool_call_is_workspace_read(params: &Value) -> bool {
+fn tool_call_is_workspace_read(params: &Value, workspace_root: Option<&Path>) -> bool {
     let call = &params["toolCall"];
     if !matches!(
         call.get("kind").and_then(Value::as_str),
@@ -2020,8 +2037,31 @@ fn tool_call_is_workspace_read(params: &Value) -> bool {
             location
                 .get("path")
                 .and_then(Value::as_str)
-                .is_some_and(path_is_in_workspace_mount)
+                .is_some_and(|path| {
+                    path_is_in_workspace_mount(path)
+                        && workspace_root.is_none_or(|root| workspace_path_is_plain(root, path))
+                })
         })
+}
+
+/// Live seats: the host file behind a `/workspace-ro` location exists and no
+/// component under the workspace root is a symlink. A planted symlink would
+/// resolve inside the container (for example to the seat's own `/rt-home`
+/// credential overlay) and is never approved, even though it cannot reach
+/// the host.
+fn workspace_path_is_plain(root: &Path, path: &str) -> bool {
+    let Some(rest) = path.strip_prefix(super::sandbox::WORKSPACE_MOUNT_DESTINATION) else {
+        return false;
+    };
+    let mut current = root.to_path_buf();
+    for part in rest.split('/').filter(|part| !part.is_empty()) {
+        current.push(part);
+        match std::fs::symlink_metadata(&current) {
+            Ok(metadata) if !metadata.file_type().is_symlink() => {}
+            _ => return false,
+        }
+    }
+    true
 }
 
 fn path_is_in_workspace_mount(path: &str) -> bool {
@@ -2671,6 +2711,7 @@ pub async fn exercise_live_acp_rpc() -> RtResult<LiveAcpRpcObservation> {
                 private_log: None,
                 trace: None,
                 live: None,
+                workspace_root: None,
             },
         )
         .await?;
@@ -2691,6 +2732,7 @@ pub async fn exercise_live_acp_rpc() -> RtResult<LiveAcpRpcObservation> {
                 private_log: None,
                 trace: None,
                 live: None,
+                workspace_root: None,
             },
         )
         .await
@@ -2854,7 +2896,7 @@ async fn write_lenient<W: AsyncWrite + Unpin>(write: &mut W, value: &Value) -> R
 
 #[cfg(any(test, feature = "test-utils"))]
 pub fn permission_reply_fixture(params: Value) -> Value {
-    permission_reply(&params, &json!(7))
+    permission_reply_in(&params, &json!(7), None)
 }
 
 #[cfg(any(test, feature = "test-utils"))]
@@ -2975,6 +3017,7 @@ pub async fn prepared_live_cleanup_fixture(
             "fixture-incarnation",
             Vec::new(),
         ),
+        workspace_root: std::sync::OnceLock::new(),
     });
     executor
         .active
@@ -3014,6 +3057,7 @@ pub async fn drive_prompt_frames_fixture(frames: &[Value]) -> RtResult<u64> {
             private_log: None,
             trace: None,
             live: None,
+            workspace_root: None,
         },
     )
     .await?;
@@ -3064,6 +3108,7 @@ pub async fn exercise_schema_seat_rpc() -> RtResult<SchemaSeatObservation> {
                 private_log: None,
                 trace: None,
                 live: None,
+                workspace_root: None,
             },
         )
         .await?;
@@ -3086,6 +3131,7 @@ pub async fn exercise_schema_seat_rpc() -> RtResult<SchemaSeatObservation> {
                 private_log: None,
                 trace: None,
                 live: None,
+                workspace_root: None,
             },
         )
         .await?;
@@ -3101,6 +3147,7 @@ pub async fn exercise_schema_seat_rpc() -> RtResult<SchemaSeatObservation> {
                 gateway: None,
                 trace: None,
                 live: None,
+                workspace_root: None,
             },
         )
         .await
@@ -3367,6 +3414,7 @@ pub(crate) async fn permission_repair_frames_fixture(
             gateway,
             trace: None,
             live: None,
+            workspace_root: None,
         },
     )
     .await
@@ -3435,6 +3483,27 @@ mod completion_contract_tests {
         ] {
             assert_eq!(reply(rejected.clone()), "reject", "{rejected}");
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn live_reads_through_a_planted_symlink_are_rejected() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join("src")).unwrap();
+        std::fs::write(root.path().join("src/a.rs"), b"fn a() {}").unwrap();
+        std::os::unix::fs::symlink("/rt-home/.grok/auth.json", root.path().join("creds")).unwrap();
+        std::os::unix::fs::symlink("src", root.path().join("alias")).unwrap();
+        let reply = |path: &str| {
+            let params = json!({"toolCall":{"title":"view_file","kind":"read","locations":[{"path":path}]},"options":[{"optionId":"allow","kind":"allow_once"},{"optionId":"reject","kind":"reject_once"}]});
+            permission_reply_in(&params, &json!(1), Some(root.path()))["result"]["outcome"]
+                ["optionId"]
+                .clone()
+        };
+        assert_eq!(reply("/workspace-ro/src/a.rs"), "allow");
+        assert_eq!(reply("/workspace-ro"), "allow");
+        assert_eq!(reply("/workspace-ro/creds"), "reject");
+        assert_eq!(reply("/workspace-ro/alias/a.rs"), "reject");
+        assert_eq!(reply("/workspace-ro/missing.rs"), "reject");
     }
 
     #[test]
