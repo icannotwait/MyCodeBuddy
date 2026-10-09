@@ -854,12 +854,9 @@ async fn grok_use_tool_and_antigravity_submit_follow_the_schema() {
         &serde_json::json!([]),
     );
     assert!(antigravity.get("_meta").is_none());
-    assert_eq!(antigravity["cwd"], "/scratch");
-    assert_eq!(
-        antigravity["additionalDirectories"],
-        serde_json::json!(["/workspace-ro"])
-    );
-    assert!(grok.get("additionalDirectories").is_none());
+    assert_eq!(antigravity["cwd"], "/workspace-ro");
+    assert!(antigravity.get("additionalDirectories").is_none());
+    assert_eq!(grok["cwd"], "/scratch");
 
     let proposal =
         roundtable_protocol::submit_result_input_schema(roundtable_protocol::PhaseKind::Proposal);

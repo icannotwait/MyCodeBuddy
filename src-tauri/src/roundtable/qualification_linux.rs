@@ -880,6 +880,16 @@ async fn run_acp(
     let scratch = request.runtime_root.join("probe-scratch");
     let _ = fs::create_dir_all(&scratch);
     let mut mounts = vec![(scratch.clone(), "/scratch".into(), false)];
+    // Seats run with the read-only workspace bind; Antigravity's session cwd
+    // is that bind, so qualify against the same layout.
+    let workspace = request.runtime_root.join("probe-acp-workspace");
+    let _ = fs::create_dir_all(&workspace);
+    let _ = fs::write(workspace.join("readme.txt"), "roundtable probe workspace\n");
+    mounts.push((
+        workspace,
+        super::sandbox::WORKSPACE_MOUNT_DESTINATION.into(),
+        true,
+    ));
     let socket_path = super::companion::transport::short_socket_path("a");
     super::companion::transport::ensure_unix_socket_path(&socket_path.to_string_lossy()).map_err(
         |error| {

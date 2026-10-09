@@ -1219,11 +1219,14 @@ pub(crate) fn roundtable_session_params_for(
         params["_meta"] = grok_roundtable_session_meta();
     }
     if agent == crate::models::AgentType::Antigravity {
-        // Antigravity's own file tools (view_file, ...) refuse any path
-        // outside `cwd` + `additionalDirectories` and ask no permission. The
-        // read-only bind is the only extra root; writes there still fail on
-        // the mount and edit/terminal permissions stay rejected.
-        params["additionalDirectories"] = json!([super::sandbox::WORKSPACE_MOUNT_DESTINATION]);
+        // Antigravity 1.3.0 hard-scopes its own file tools (view_file, ...) to
+        // `cwd` + its GEMINI_HOME + skills dirs, by realpath, and asks no
+        // permission for them. It accepts `additionalDirectories` but ignores
+        // it. The session cwd is therefore the read-only bind; the process cwd
+        // stays /scratch. Writes there fail on the mount, terminals and edits
+        // still need a permission that is rejected, and realpath keeps every
+        // symlink out of `/workspace-ro` outside its scope.
+        params["cwd"] = json!(super::sandbox::WORKSPACE_MOUNT_DESTINATION);
     }
     params
 }
