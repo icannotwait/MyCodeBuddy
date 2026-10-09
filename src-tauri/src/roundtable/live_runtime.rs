@@ -1218,6 +1218,13 @@ pub(crate) fn roundtable_session_params_for(
     if agent == crate::models::AgentType::Grok {
         params["_meta"] = grok_roundtable_session_meta();
     }
+    if agent == crate::models::AgentType::Antigravity {
+        // Antigravity's own file tools (view_file, ...) refuse any path
+        // outside `cwd` + `additionalDirectories` and ask no permission. The
+        // read-only bind is the only extra root; writes there still fail on
+        // the mount and edit/terminal permissions stay rejected.
+        params["additionalDirectories"] = json!([super::sandbox::WORKSPACE_MOUNT_DESTINATION]);
+    }
     params
 }
 
