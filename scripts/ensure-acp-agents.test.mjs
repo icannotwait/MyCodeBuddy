@@ -16,22 +16,35 @@ function plan(agents, env = {}) {
   const fn = source.match(/^registry_plan\(\) \{\n[\s\S]*?^\}/m)
   assert.ok(fn, "registry_plan() not found")
   const cleanEnv = { ...process.env }
-  for (const key of ["CODEG_ANTIGRAVITY_VER", "CODEG_CURSOR_VER", "CODEG_GROK_VER"]) {
+  for (const key of [
+    "CODEG_ANTIGRAVITY_VER",
+    "CODEG_CURSOR_VER",
+    "CODEG_GROK_VER",
+  ]) {
     delete cleanEnv[key]
   }
-  const result = spawnSync("bash", ["-c", `set -uo pipefail\n${fn[0]}\nregistry_plan`], {
-    input: JSON.stringify(agents),
-    env: { ...cleanEnv, ...env },
-    encoding: "utf8",
-    timeout: 5000,
-  })
+  const result = spawnSync(
+    "bash",
+    ["-c", `set -uo pipefail\n${fn[0]}\nregistry_plan`],
+    {
+      input: JSON.stringify(agents),
+      env: { ...cleanEnv, ...env },
+      encoding: "utf8",
+      timeout: 5000,
+    }
+  )
   assert.ifError(result.error)
   assert.equal(result.status, 0, result.stderr)
   assert.equal(result.stderr, "")
   return result.stdout.trim().split("\n").filter(Boolean)
 }
 
-const agent = (agent_type, installed_version, registry_version, extra = {}) => ({
+const agent = (
+  agent_type,
+  installed_version,
+  registry_version,
+  extra = {}
+) => ({
   agent_type,
   distribution_type: agent_type === "grok" ? "npx" : "binary",
   enabled: true,
@@ -85,7 +98,10 @@ test("an unparseable installed version is still repaired to the registry version
 })
 
 test("explicit CODEG_<AGENT>_VER is an exact pin and may downgrade", () => {
-  const agents = [agent("antigravity", "1.3.0", "1.2.1"), agent("grok", "1.0.46", "1.0.46")]
+  const agents = [
+    agent("antigravity", "1.3.0", "1.2.1"),
+    agent("grok", "1.0.46", "1.0.46"),
+  ]
   assert.deepEqual(plan(agents, { CODEG_ANTIGRAVITY_VER: "1.2.1" }), [
     "plan binary antigravity 1.2.1 1.3.0",
     "keep npx grok 1.0.46 1.0.46 equal",

@@ -1,12 +1,20 @@
 import assert from "node:assert/strict"
 import { spawnSync } from "node:child_process"
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs"
+import {
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import test from "node:test"
 
-const scriptPath = new URL("../deploy/codeg-boot/scripts/start-codeg-tunnel.sh", import.meta.url)
-  .pathname
+const scriptPath = new URL(
+  "../deploy/codeg-boot/scripts/start-codeg-tunnel.sh",
+  import.meta.url
+).pathname
 
 // --print-config resolves the config and exits before the lock, any ps/kill,
 // or launching cloudflared. resolve_tunnel_edge_args is sourced with fake
@@ -40,7 +48,9 @@ function withHomes(fn) {
 
 test("a sandbox HOME without a config still resolves the box owner's config", () => {
   withHomes(({ box, sandbox }) => {
-    const result = printConfig({ HOME: sandbox, CODEG_CF_HOME: box }, ["--force"])
+    const result = printConfig({ HOME: sandbox, CODEG_CF_HOME: box }, [
+      "--force",
+    ])
     assert.equal(result.status, 0, result.stderr)
     assert.equal(
       result.stdout,
@@ -51,7 +61,10 @@ test("a sandbox HOME without a config still resolves the box owner's config", ()
 
 test("the built-in box home is /home/box, independent of HOME", () => {
   const result = printConfig({ HOME: "/tmp/no-such-home", CODEG_CF_HOME: "" })
-  assert.match(result.stdout, /^config=\/home\/box\/\.cloudflared\/config\.yml /)
+  assert.match(
+    result.stdout,
+    /^config=\/home\/box\/\.cloudflared\/config\.yml /
+  )
   assert.match(result.stdout, / run_home=\/home\/box /)
 })
 
@@ -59,9 +72,16 @@ test("CF_CONFIG overrides every default", () => {
   withHomes(({ root, box, sandbox }) => {
     const custom = join(root, "custom.yml")
     writeFileSync(custom, "tunnel: other\n")
-    const result = printConfig({ HOME: sandbox, CODEG_CF_HOME: box, CF_CONFIG: custom })
+    const result = printConfig({
+      HOME: sandbox,
+      CODEG_CF_HOME: box,
+      CF_CONFIG: custom,
+    })
     assert.equal(result.status, 0, result.stderr)
-    assert.equal(result.stdout, `config=${custom} state=found run_home=${box} force=0\n`)
+    assert.equal(
+      result.stdout,
+      `config=${custom} state=found run_home=${box} force=0\n`
+    )
   })
 })
 
@@ -71,7 +91,10 @@ test("falls back to $HOME only when the box config is absent; missing is reporte
     mkdirSync(emptyBox)
     const missing = printConfig({ HOME: sandbox, CODEG_CF_HOME: emptyBox })
     assert.equal(missing.status, 1)
-    assert.match(missing.stdout, /config=.*empty-box\/\.cloudflared\/config\.yml state=missing/)
+    assert.match(
+      missing.stdout,
+      /config=.*empty-box\/\.cloudflared\/config\.yml state=missing/
+    )
 
     mkdirSync(join(sandbox, ".cloudflared"))
     writeFileSync(join(sandbox, ".cloudflared", "config.yml"), "tunnel: x\n")
@@ -195,8 +218,14 @@ test("auto mode uses DoH --edge when system DNS is a 198.18 fake-ip", () => {
   assert.match(result.getents, /ahostsv4 region1\.v2\.argotunnel\.com/)
   assert.doesNotMatch(result.getents, /(^|\n)hosts /)
   assert.match(result.curls, /--resolve cloudflare-dns\.com:443:1\.1\.1\.1/)
-  assert.match(result.curls, /cloudflare-dns\.com\/dns-query\?name=region1\.v2\.argotunnel\.com&type=A/)
-  assert.match(result.curls, /cloudflare-dns\.com\/dns-query\?name=region2\.v2\.argotunnel\.com&type=A/)
+  assert.match(
+    result.curls,
+    /cloudflare-dns\.com\/dns-query\?name=region1\.v2\.argotunnel\.com&type=A/
+  )
+  assert.match(
+    result.curls,
+    /cloudflare-dns\.com\/dns-query\?name=region2\.v2\.argotunnel\.com&type=A/
+  )
 })
 
 test("auto mode uses DoH when ahostsv4 is 198.19.x even if hosts is IPv6", () => {
@@ -284,11 +313,18 @@ test("launch keeps http2, lock-fd close, and optional --edge", () => {
     source,
     /nohup "\$CF" tunnel --config "\$CFG" --protocol http2 \$EDGE_ARGS run 9>&-/
   )
-  assert.match(source, /CODEG_TUNNEL_EDGE_DOH:-\s*auto|CODEG_TUNNEL_EDGE_DOH:-auto/)
+  assert.match(
+    source,
+    /CODEG_TUNNEL_EDGE_DOH:-\s*auto|CODEG_TUNNEL_EDGE_DOH:-auto/
+  )
 })
 
 test("launchers pin HOME/USER to the box owner before starting services", () => {
-  for (const name of ["reload-watchdog-once.sh", "codeg-supervisor.sh", "codeg-watchdog.sh"]) {
+  for (const name of [
+    "reload-watchdog-once.sh",
+    "codeg-supervisor.sh",
+    "codeg-watchdog.sh",
+  ]) {
     const source = readFileSync(
       new URL(`../deploy/codeg-boot/scripts/${name}`, import.meta.url),
       "utf8"
@@ -296,6 +332,9 @@ test("launchers pin HOME/USER to the box owner before starting services", () => 
     const pin = source.indexOf("export HOME=/home/box USER=box LOGNAME=box\n")
     assert.ok(pin > 0, `${name} must pin HOME`)
     const firstLaunch = source.search(/nohup |\n\s*"\$BOOT\/|\nexec 9>/)
-    assert.ok(firstLaunch === -1 || pin < firstLaunch, `${name} pins HOME before launching`)
+    assert.ok(
+      firstLaunch === -1 || pin < firstLaunch,
+      `${name} pins HOME before launching`
+    )
   }
 })
