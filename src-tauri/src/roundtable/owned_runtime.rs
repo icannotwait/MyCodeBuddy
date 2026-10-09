@@ -2200,3 +2200,25 @@ mod synthesis_limit_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod workspace_prompt_tests {
+    use super::*;
+
+    #[test]
+    fn every_phase_tells_members_where_the_read_only_workspace_is() {
+        let context = json!({"topic":"Review @src/a.rs","sources":[],"aliases":{"evidence":{}}});
+        for kind in [PhaseKind::Proposal, PhaseKind::Critique, PhaseKind::Synthesis] {
+            let annotated = member_prompt_context(kind, &context).expect("annotated");
+            let note = annotated["workspace"].as_str().unwrap();
+            assert!(note.contains("/workspace-ro"));
+            assert!(note.contains("@relative/path"));
+            assert!(note.contains("read-only"));
+            assert_eq!(annotated["topic"], context["topic"]);
+            assert_eq!(
+                annotated.get("instruction").is_some(),
+                kind != PhaseKind::Synthesis
+            );
+        }
+    }
+}

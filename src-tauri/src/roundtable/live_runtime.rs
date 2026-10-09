@@ -3408,6 +3408,54 @@ mod completion_contract_tests {
     }
 
     #[test]
+    fn native_reads_are_allowed_only_inside_the_read_only_workspace() {
+        let reply = |tool_call: Value| {
+            let params = json!({"toolCall":tool_call,"options":[{"optionId":"allow","kind":"allow_once"},{"optionId":"reject","kind":"reject_once"}]});
+            permission_reply(&params, &json!(3))["result"]["outcome"]["optionId"].clone()
+        };
+        for allowed in [
+            json!({"title":"view_file","kind":"read","locations":[{"path":"/workspace-ro/src/main.rs"}]}),
+            json!({"title":"grep","kind":"search","locations":[{"path":"/workspace-ro"},{"path":"/workspace-ro/docs/a.md","line":3}]}),
+        ] {
+            assert_eq!(reply(allowed.clone()), "allow", "{allowed}");
+        }
+        for rejected in [
+            json!({"title":"view_file","kind":"read"}),
+            json!({"title":"view_file","kind":"read","locations":[]}),
+            json!({"title":"view_file","kind":"read","locations":[{"path":"/rt-home/.grok/auth.json"}]}),
+            json!({"title":"view_file","kind":"read","locations":[{"path":"/workspace-ro/../rt-home/x"}]}),
+            json!({"title":"view_file","kind":"read","locations":[{"path":"/workspace-rogue/x"}]}),
+            json!({"title":"view_file","kind":"read","locations":[{"path":"workspace-ro/x"}]}),
+            json!({"title":"view_file","kind":"read","locations":[{"path":"/workspace-ro/a"},{"path":"/scratch/b"}]}),
+            json!({"title":"edit","kind":"edit","locations":[{"path":"/workspace-ro/a"}]}),
+            json!({"title":"rm","kind":"delete","locations":[{"path":"/workspace-ro/a"}]}),
+            json!({"title":"cat /workspace-ro/a","kind":"execute","locations":[{"path":"/workspace-ro/a"}]}),
+            json!({"title":"fetch","kind":"fetch","locations":[{"path":"/workspace-ro/a"}]}),
+        ] {
+            assert_eq!(reply(rejected.clone()), "reject", "{rejected}");
+        }
+    }
+
+    #[test]
+    fn grok_keeps_read_tools_and_denies_writes_terminals_and_network() {
+        for kept in ["read_file", "grep", "list_dir", "use_tool", "search_tool"] {
+            assert!(!GROK_ROUNDTABLE_DISALLOWED_TOOLS.contains(&kept), "{kept}");
+        }
+        for denied in [
+            "run_terminal_cmd",
+            "run_terminal_command",
+            "search_replace",
+            "write",
+            "web_search",
+            "web_fetch",
+            "task",
+            "spawn_subagent",
+        ] {
+            assert!(GROK_ROUNDTABLE_DISALLOWED_TOOLS.contains(&denied), "{denied}");
+        }
+    }
+
+    #[test]
     fn permission_identity_cannot_be_supplied_by_descriptive_text_or_arguments() {
         for tool_call in [
             json!({"title":"run_terminal_command submit_result","kind":"execute"}),
