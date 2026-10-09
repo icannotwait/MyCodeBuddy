@@ -7578,6 +7578,16 @@
     "openFolder": "폴더 열기",
     "workspaceUnknown": "워크스페이스 #{id} (사용 불가)",
     "workspaceUnavailable": "이 워크스페이스는 더 이상 사용할 수 없습니다. 다른 워크스페이스를 선택하세요.",
-    "sourceRootHelp": "경로는 {path} 기준 상대 경로입니다."
+    "sourceRootHelp": "경로는 {path} 기준 상대 경로입니다.",
+    "memberAttemptLimit": "시도당 제한(제안, 비평)",
+    "synthesisAttemptLimit": "종합 시간 제한",
+    "noLimit": "제한 없음",
+    "synthesisLimitHint": "종합은 끝날 때까지 실행됩니다. 룸 예산, 일시 중지, 중지만 이를 끝냅니다.",
+    "liveBadge": "실시간 · 미검증",
+    "liveHint": "실시간 출력 중입니다. 검증되지 않았으며 게시된 메시지로 대체됩니다.",
+    "liveEnded": "출력이 끝났습니다. 검증을 기다리는 중입니다.",
+    "liveThinking": "생각",
+    "liveWaiting": "출력을 기다리는 중…",
+    "liveTruncated": "실시간 보기가 잘렸습니다. 검증 후 전체 텍스트가 표시됩니다."
   }
 }

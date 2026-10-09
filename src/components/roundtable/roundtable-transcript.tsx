@@ -14,7 +14,9 @@ import {
   CircleDot,
   Gavel,
   Lightbulb,
+  LoaderCircle,
   MessagesSquare,
+  Radio,
   Sparkles,
 } from "lucide-react"
 import { AgentIcon } from "@/components/agent-icon"
@@ -35,6 +37,7 @@ import {
 import {
   buildRoundtableTranscript,
   replaceSeatAliases,
+  type RoundtablePreviewInput,
   type TranscriptPhase,
   type TranscriptSpeaker,
   type TranscriptTurn,
@@ -161,20 +164,28 @@ export function RoundtableTranscript({
   projection,
   messages,
   previews,
+  live,
 }: {
   projection: RoundtableProjection
   messages: RoundtableMessage[]
   previews?: Record<string, { preview: string | null }>
+  /** Unverified, display-only live output of in-flight attempts. */
+  live?: RoundtablePreviewInput[]
 }) {
   const t = useTranslations("Roundtable")
   const locale = useLocale()
-  const previewInputs = useMemo(
-    () =>
-      Object.entries(previews ?? {}).flatMap(([attemptId, view]) =>
-        view.preview === null ? [] : [{ attemptId, text: view.preview }]
+  const previewInputs = useMemo(() => {
+    const liveInputs = live ?? []
+    const liveIds = new Set(liveInputs.map((item) => item.attemptId))
+    return [
+      ...Object.entries(previews ?? {}).flatMap(([attemptId, view]) =>
+        view.preview === null || liveIds.has(attemptId)
+          ? []
+          : [{ attemptId, text: view.preview }]
       ),
-    [previews]
-  )
+      ...liveInputs,
+    ]
+  }, [previews, live])
   const model = useMemo(
     () => buildRoundtableTranscript(projection, messages, previewInputs),
     [projection, messages, previewInputs]
@@ -463,6 +474,16 @@ function TranscriptTurnView({
                 {t("published")}
               </Badge>
             ) : null}
+            {turn.live ? (
+              <Badge
+                variant="outline"
+                data-testid="live-badge"
+                className="h-auto border-sky-500/40 bg-sky-500/10 whitespace-normal text-sky-800 dark:text-sky-200"
+              >
+                <Radio aria-hidden="true" />
+                {t("liveBadge")}
+              </Badge>
+            ) : null}
             {turn.visibility === "staged" ? (
               <Badge
                 variant="outline"
@@ -494,7 +515,9 @@ function TranscriptTurnView({
             conclusion && "bg-background"
           )}
         >
-          {turn.visibility === "preview" ? (
+          {turn.visibility === "preview" && turn.live ? (
+            <LiveTurnBody turn={turn} />
+          ) : turn.visibility === "preview" ? (
             <RoundtableSafeContent text={turn.summary ?? ""} />
           ) : (
             <div className="min-w-0 space-y-4 text-sm">
@@ -790,5 +813,81 @@ function TurnDetails({ turn }: { turn: TranscriptTurn }) {
         ) : null}
       </div>
     </details>
+  )
+}
+
+/**
+ * Unverified live output of an in-flight attempt. Display only: it is replaced
+ * by the verified message as soon as one claims the attempt.
+ */
+function LiveTurnBody({ turn }: { turn: TranscriptTurn }) {
+  const t = useTranslations("Roundtable")
+  const live = turn.live!
+  const text = redactRoundtableText(turn.summary ?? "")
+  const thought = redactRoundtableText(live.thought)
+  return (
+    <div
+      data-testid="live-turn"
+      aria-live="polite"
+      aria-busy={!live.ended}
+      className="min-w-0 space-y-2 text-sm"
+    >
+      <p className="text-xs text-muted-foreground">
+        {live.ended ? t("liveEnded") : t("liveHint")}
+      </p>
+      {live.activity ? (
+        <p
+          data-testid="live-activity"
+          className="flex min-w-0 items-center gap-1.5 text-xs text-muted-foreground [overflow-wrap:anywhere]"
+        >
+          {live.ended ? null : (
+            <LoaderCircle
+              aria-hidden="true"
+              className="size-3 shrink-0 animate-spin motion-reduce:animate-none"
+            />
+          )}
+          {live.activity}
+        </p>
+      ) : null}
+      {thought ? (
+        <details
+          data-testid="live-thinking"
+          className="group min-w-0 rounded-lg border border-border/60 bg-muted/30 px-2.5 py-1.5"
+        >
+          <summary className="flex cursor-pointer list-none items-center gap-1.5 rounded-sm text-xs text-muted-foreground hover:text-foreground focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring [&::-webkit-details-marker]:hidden">
+            <ChevronRight
+              aria-hidden="true"
+              className="size-3.5 shrink-0 transition-transform group-open:rotate-90"
+            />
+            {t("liveThinking")}
+          </summary>
+          <p className="mt-1.5 max-h-64 overflow-y-auto text-xs whitespace-pre-wrap text-muted-foreground [overflow-wrap:anywhere]">
+            {live.thoughtOmitted ? `… ${thought}` : thought}
+          </p>
+        </details>
+      ) : null}
+      {text ? (
+        <p
+          dir="auto"
+          data-testid="live-text"
+          className="whitespace-pre-wrap [overflow-wrap:anywhere]"
+        >
+          {text}
+          {live.truncated ? (
+            <span className="block pt-1 text-xs text-muted-foreground">
+              {t("liveTruncated")}
+            </span>
+          ) : null}
+        </p>
+      ) : live.ended ? null : (
+        <p className="flex items-center gap-1.5 text-xs text-muted-foreground">
+          <LoaderCircle
+            aria-hidden="true"
+            className="size-3 shrink-0 animate-spin motion-reduce:animate-none"
+          />
+          {t("liveWaiting")}
+        </p>
+      )}
+    </div>
   )
 }

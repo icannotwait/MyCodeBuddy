@@ -7578,6 +7578,16 @@
     "openFolder": "Ordner öffnen",
     "workspaceUnknown": "Arbeitsbereich #{id} (nicht verfügbar)",
     "workspaceUnavailable": "Dieser Arbeitsbereich ist nicht mehr verfügbar. Wähle einen anderen.",
-    "sourceRootHelp": "Pfade sind relativ zu {path}."
+    "sourceRootHelp": "Pfade sind relativ zu {path}.",
+    "memberAttemptLimit": "Limit pro Versuch (Vorschläge, Kritik)",
+    "synthesisAttemptLimit": "Zeitlimit der Synthese",
+    "noLimit": "Kein Limit",
+    "synthesisLimitHint": "Die Synthese läuft bis zum Ende. Nur das Raumbudget, Pause und Stopp beenden sie.",
+    "liveBadge": "Live · ungeprüft",
+    "liveHint": "Wird gerade gestreamt. Ungeprüft; die veröffentlichte Nachricht ersetzt dies.",
+    "liveEnded": "Streaming beendet. Wartet auf Prüfung.",
+    "liveThinking": "Denkprozess",
+    "liveWaiting": "Warte auf Ausgabe…",
+    "liveTruncated": "Live-Ansicht gekürzt. Der vollständige Text erscheint nach der Prüfung."
   }
 }

@@ -530,4 +530,112 @@ describe("roundtable transcript view", () => {
       second.querySelector("[data-testid='seat-number']")
     ).toHaveTextContent("2")
   })
+
+  it("shows live output as unverified with thinking collapsed, then the verified message", () => {
+    const running = projection()
+    running.body.phase_refs[1].state = "running"
+    running.body.replay.attempts.push({
+      attempt_id: "attempt-live",
+      state: "streaming",
+      turn_id: "turn-live",
+      attempt_no: 1,
+    })
+    running.body.replay.turns.push({
+      turn_id: "turn-live",
+      phase_id: "phase-critique",
+      speaker_id: "speaker-2",
+      accepted_attempt_id: null,
+    })
+    const live = [
+      {
+        attemptId: "attempt-live",
+        text: "Draft critique so far",
+        live: {
+          thought: "weighing the lease",
+          thoughtOmitted: true,
+          activity: "Read src/lib.rs",
+          ended: false,
+          truncated: false,
+        },
+      },
+    ]
+    const { rerender } = render(
+      <RoundtableTranscript
+        projection={running}
+        messages={[proposal()]}
+        live={live}
+      />
+    )
+    expect(screen.getByTestId("live-badge").textContent).toContain("liveBadge")
+    expect(screen.getByTestId("live-text").textContent).toBe(
+      "Draft critique so far"
+    )
+    expect(screen.getByTestId("live-activity").textContent).toContain(
+      "Read src/lib.rs"
+    )
+    const thinking = screen.getByTestId("live-thinking") as HTMLDetailsElement
+    expect(thinking.open).toBe(false)
+    expect(thinking.textContent).toContain("… weighing the lease")
+    fireEvent.click(screen.getByText("liveThinking"))
+    expect(thinking.open).toBe(true)
+
+    running.body.replay.attempts[1].state = "accepted"
+    rerender(
+      <RoundtableTranscript
+        projection={running}
+        messages={[
+          proposal(),
+          {
+            message_id: "critique",
+            body_hash: "b".repeat(64),
+            visibility: "staged",
+            speaker_id: "speaker-2",
+            attempt_id: "attempt-live",
+            phase_id: "phase-critique",
+            body: { kind: "critique", summary: "Verified critique" },
+          },
+        ]}
+        live={live}
+      />
+    )
+    expect(screen.queryByTestId("live-turn")).toBeNull()
+    expect(screen.queryByText("Draft critique so far")).toBeNull()
+    expect(screen.getByText("Verified critique")).toBeTruthy()
+  })
+
+  it("marks finished live output as awaiting verification", () => {
+    const running = projection()
+    running.body.replay.attempts.push({
+      attempt_id: "attempt-live",
+      state: "validating",
+      turn_id: "turn-live",
+    })
+    running.body.replay.turns.push({
+      turn_id: "turn-live",
+      phase_id: "phase-critique",
+      speaker_id: "speaker-2",
+      accepted_attempt_id: null,
+    })
+    render(
+      <RoundtableTranscript
+        projection={running}
+        messages={[]}
+        live={[
+          {
+            attemptId: "attempt-live",
+            text: "",
+            live: {
+              thought: "",
+              thoughtOmitted: false,
+              activity: null,
+              ended: true,
+              truncated: false,
+            },
+          },
+        ]}
+      />
+    )
+    expect(screen.getByTestId("live-turn").textContent).toContain("liveEnded")
+    expect(screen.queryByText("liveWaiting")).toBeNull()
+  })
 })

@@ -1,12 +1,17 @@
 "use client"
 
 import Link from "next/link"
-import { useCallback, useEffect, useRef, useState } from "react"
+import { useCallback, useEffect, useMemo, useRef, useState } from "react"
 import { useTranslations } from "next-intl"
 import { listAllFolderDetails, listModelProviders } from "@/lib/api"
 import { getTransport } from "@/lib/transport"
 import { initialRoundtableView } from "@/lib/roundtable/reducer"
 import { applyRoundtablePreview } from "@/lib/roundtable/stream"
+import {
+  applyRoundtableLive,
+  liveTranscriptInputs,
+  type RoundtableLiveState,
+} from "@/lib/roundtable/live"
 import {
   loadRoundtable,
   loadRoundtableEvidence,
@@ -69,6 +74,13 @@ import {
 type LoadedRoom = Awaited<ReturnType<typeof loadRoundtable>>
 type RoomSummary = { room_id: string; status: string; config: RoundtableConfig }
 
+/** Per-attempt limit for proposal and critique turns (`timeouts.attempt_timeout`). */
+const MEMBER_ATTEMPT_TIMEOUT_MS = 225_000
+/**
+ * Room-budget allowance for the synthesis phase. Synthesis has no attempt or
+ * phase limit of its own; it is bounded by the room budget, pause and stop.
+ */
+const SYNTHESIS_ROOM_ALLOWANCE_MS = 450_000
 export function RoundtableWorkbench({
   workspaceId: urlWorkspaceId,
   roomId,
@@ -133,6 +145,8 @@ export function RoundtableWorkbench({
   const [operation, setOperation] = useState<RoundtableOperation | null>(null)
   const [usage, setUsage] = useState<RoundtableUsage | null>(null)
   const [previews, setPreviews] = useState<Record<string, RoundtableView>>({})
+  // Display-only live output; never verified, never part of the projection.
+  const [liveOutput, setLiveOutput] = useState<RoundtableLiveState>({})
   const mutationScope = JSON.stringify([workspaceId, roomId])
   const mutation = useRef<PendingRoundtableMutation | null>(
     pendingPaidMutation(mutationScope)
@@ -280,6 +294,9 @@ export function RoundtableWorkbench({
     setRoomLoading(true)
     setRoomError(null)
     setStreamError(null)
+    setLiveOutput({})
+    let liveState: RoundtableLiveState = {}
+    let resyncing = false
     const transport = getTransport()
     const subscriptionId = crypto.randomUUID()
     const attach = () =>
@@ -337,6 +354,9 @@ export function RoundtableWorkbench({
       if (!live) return
       previous = null
       setPreviews({})
+      // A fresh attach resends every live buffer in full.
+      liveState = {}
+      setLiveOutput({})
       void sync()
       void attach()
         .then(() => {
@@ -351,6 +371,28 @@ export function RoundtableWorkbench({
         `roundtable://${subscriptionId}`,
         (payload: unknown) => {
           if (!live) return
+          if (
+            payload &&
+            typeof payload === "object" &&
+            "type" in payload &&
+            payload.type === "roundtable_live"
+          ) {
+            const applied = applyRoundtableLive(liveState, payload, roomId)
+            liveState = applied.state
+            setLiveOutput(applied.state)
+            if (applied.resync && !resyncing) {
+              // A delta did not line up: re-attach for whole buffers.
+              resyncing = true
+              liveState = {}
+              setLiveOutput({})
+              void attach()
+                .catch(() => undefined)
+                .finally(() => {
+                  resyncing = false
+                })
+            }
+            return
+          }
           if (
             previous &&
             payload &&
@@ -409,7 +451,10 @@ export function RoundtableWorkbench({
   const formConfig = (): RoundtableConfig => {
     const original = editingDraft ? loaded?.projection.body.replay.config : null
     const waves = Math.ceil(roles.length / concurrency)
-    const phaseBudget = 2 * waves * 225000
+    // Proposal and critique attempts keep a per-attempt limit. Synthesis has
+    // none (the server runs it to the room budget), so it only adds a room
+    // allowance here and never sizes phase_budget.
+    const phaseBudget = 2 * waves * MEMBER_ATTEMPT_TIMEOUT_MS
     return {
       schema_version: 1,
       ...(original?.display_name
@@ -452,14 +497,16 @@ export function RoundtableWorkbench({
         room_budget: String(
           Math.max(
             Number(original?.budgets.room_budget ?? 0),
-            (rounds + 1) * phaseBudget + 450000
+            (rounds + 1) * phaseBudget + SYNTHESIS_ROOM_ALLOWANCE_MS
           )
         ),
         phase_budget: String(
           Math.max(Number(original?.budgets.phase_budget ?? 0), phaseBudget)
         ),
       },
-      timeouts: original?.timeouts ?? { attempt_timeout: "225000" },
+      timeouts: original?.timeouts ?? {
+        attempt_timeout: String(MEMBER_ATTEMPT_TIMEOUT_MS),
+      },
       quotas: original?.quotas ?? {
         output_byte_limit: 8192,
         input_byte_limit: 16384,
@@ -615,6 +662,10 @@ export function RoundtableWorkbench({
     !editingDraft
   const projection = loaded?.projection
   const status = projection?.body.status
+  const liveInputs = useMemo(
+    () => liveTranscriptInputs(liveOutput, projection),
+    [liveOutput, projection]
+  )
   // Keep the room list's status in step with the verified room snapshot.
   useEffect(() => {
     if (!roomId || !status) return
@@ -825,6 +876,7 @@ export function RoundtableWorkbench({
             network={preflight.network}
             writes={preflight.writes}
             budget={`${Math.ceil(Number(config.budgets.room_budget) / 60000)} ${t("minutes")}`}
+            attemptLimit={`${Math.ceil(Number(config.timeouts.attempt_timeout) / 60000)} ${t("minutes")}`}
           />
           <label className="flex min-w-0 cursor-pointer items-start gap-3 rounded-lg border bg-background p-3 text-sm leading-relaxed transition-colors has-checked:border-primary/60 has-checked:bg-primary/5 has-[:focus-visible]:ring-[3px] has-[:focus-visible]:ring-ring/50">
             <input
@@ -1090,6 +1142,7 @@ export function RoundtableWorkbench({
                 projection={projection}
                 messages={loaded?.messages ?? []}
                 previews={previews}
+                live={liveInputs}
               />
               <section
                 aria-label={t("evidence")}

@@ -7578,6 +7578,16 @@
     "openFolder": "打开文件夹",
     "workspaceUnknown": "工作区 #{id}（不可用）",
     "workspaceUnavailable": "此工作区已不可用，请选择其他工作区。",
-    "sourceRootHelp": "路径相对于 {path}。"
+    "sourceRootHelp": "路径相对于 {path}。",
+    "memberAttemptLimit": "单次尝试时限（提案、评审）",
+    "synthesisAttemptLimit": "综合时限",
+    "noLimit": "不限时",
+    "synthesisLimitHint": "综合会一直运行到完成，只有房间预算、暂停和停止会结束它。",
+    "liveBadge": "实时 · 未验证",
+    "liveHint": "正在实时输出，尚未验证；发布的消息将替换此内容。",
+    "liveEnded": "输出已结束，等待验证。",
+    "liveThinking": "思考过程",
+    "liveWaiting": "等待输出…",
+    "liveTruncated": "实时内容已截断，验证后将显示完整内容。"
   }
 }

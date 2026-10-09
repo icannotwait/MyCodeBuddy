@@ -7578,6 +7578,16 @@
     "openFolder": "Ouvrir un dossier",
     "workspaceUnknown": "Espace de travail n° {id} (indisponible)",
     "workspaceUnavailable": "Cet espace de travail n'est plus disponible. Choisissez-en un autre.",
-    "sourceRootHelp": "Les chemins sont relatifs à {path}."
+    "sourceRootHelp": "Les chemins sont relatifs à {path}.",
+    "memberAttemptLimit": "Limite par tentative (propositions, critiques)",
+    "synthesisAttemptLimit": "Limite de temps de la synthèse",
+    "noLimit": "Aucune limite",
+    "synthesisLimitHint": "La synthèse se poursuit jusqu’à son terme. Seuls le budget du salon, Pause et Arrêt l’interrompent.",
+    "liveBadge": "En direct · non vérifié",
+    "liveHint": "Diffusion en cours. Non vérifié ; le message publié le remplacera.",
+    "liveEnded": "Diffusion terminée. En attente de vérification.",
+    "liveThinking": "Réflexion",
+    "liveWaiting": "En attente de sortie…",
+    "liveTruncated": "Affichage en direct tronqué. Le texte complet apparaîtra après vérification."
   }
 }

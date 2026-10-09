@@ -7578,6 +7578,16 @@
     "openFolder": "フォルダーを開く",
     "workspaceUnknown": "ワークスペース #{id}（利用不可）",
     "workspaceUnavailable": "このワークスペースは利用できなくなりました。別のワークスペースを選んでください。",
-    "sourceRootHelp": "パスは {path} からの相対パスです。"
+    "sourceRootHelp": "パスは {path} からの相対パスです。",
+    "memberAttemptLimit": "試行ごとの制限（提案・批評）",
+    "synthesisAttemptLimit": "統合の時間制限",
+    "noLimit": "制限なし",
+    "synthesisLimitHint": "統合は完了するまで続きます。終了させるのはルーム予算、一時停止、停止のみです。",
+    "liveBadge": "ライブ · 未検証",
+    "liveHint": "ストリーミング中。未検証です。公開メッセージに置き換わります。",
+    "liveEnded": "ストリーミング完了。検証待ちです。",
+    "liveThinking": "思考",
+    "liveWaiting": "出力を待っています…",
+    "liveTruncated": "ライブ表示は切り詰められています。検証後に全文が表示されます。"
   }
 }

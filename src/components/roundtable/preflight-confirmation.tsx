@@ -55,6 +55,7 @@ export function PreflightConfirmation({
   network,
   writes,
   budget,
+  attemptLimit,
   seatBrands,
 }: {
   recipients: RoundtableRecipient[]
@@ -67,6 +68,11 @@ export function PreflightConfirmation({
   network: string
   writes: string
   budget: string
+  /**
+   * Per-attempt time limit for proposal/critique turns. Synthesis has no
+   * per-attempt limit; the room budget, pause and stop still bound it.
+   */
+  attemptLimit?: string
   /** Seat brands; when given, recipients show the same avatar as the room. */
   seatBrands?: Map<number, SeatBrand>
 }) {
@@ -221,6 +227,15 @@ export function PreflightConfirmation({
           <code className="text-xs">{writes}</code>
         </Fact>
         <Fact label={t("budget")}>{budget}</Fact>
+        {attemptLimit ? (
+          <Fact label={t("memberAttemptLimit")}>{attemptLimit}</Fact>
+        ) : null}
+        <Fact label={t("synthesisAttemptLimit")}>
+          <span>{t("noLimit")}</span>
+          <span className="mt-0.5 block text-xs font-normal text-muted-foreground">
+            {t("synthesisLimitHint")}
+          </span>
+        </Fact>
       </dl>
     </div>
   )

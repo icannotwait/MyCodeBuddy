@@ -98,6 +98,8 @@ export interface TranscriptTurn {
   coverage: { succeeded: number; absent: number } | null
   evidenceAliases: TranscriptAlias[]
   raw: unknown
+  /** Present only on unverified live preview turns. */
+  live?: RoundtableLivePreview
 }
 
 export interface TranscriptPhase {
@@ -117,9 +119,22 @@ export interface RoundtableTranscriptModel {
   seats: Record<string, TranscriptSpeaker>
 }
 
+/** Display-only live output attached to a preview turn (never verified). */
+export interface RoundtableLivePreview {
+  thought: string
+  /** Older thinking was dropped by the buffer cap. */
+  thoughtOmitted: boolean
+  activity: string | null
+  /** The member finished streaming; verification is pending. */
+  ended: boolean
+  /** The message buffer hit its cap; later text is not shown. */
+  truncated: boolean
+}
+
 export interface RoundtablePreviewInput {
   attemptId: string
   text: string
+  live?: RoundtableLivePreview
 }
 
 interface PhaseBucket {
@@ -643,6 +658,7 @@ export function buildRoundtableTranscript(
       summary: preview.text,
       raw: null,
     })
+    if (preview.live) turn.live = preview.live
     bucket.turns.push({
       turn,
       seq: null,

@@ -7578,6 +7578,16 @@
     "openFolder": "開啟資料夾",
     "workspaceUnknown": "工作區 #{id}（無法使用）",
     "workspaceUnavailable": "此工作區已無法使用，請選擇其他工作區。",
-    "sourceRootHelp": "路徑相對於 {path}。"
+    "sourceRootHelp": "路徑相對於 {path}。",
+    "memberAttemptLimit": "單次嘗試時限（提案、評審）",
+    "synthesisAttemptLimit": "綜合時限",
+    "noLimit": "不限時",
+    "synthesisLimitHint": "綜合會一直執行到完成，只有房間預算、暫停和停止會結束它。",
+    "liveBadge": "即時 · 未驗證",
+    "liveHint": "正在即時輸出，尚未驗證；發布的訊息將取代此內容。",
+    "liveEnded": "輸出已結束，等待驗證。",
+    "liveThinking": "思考過程",
+    "liveWaiting": "等待輸出…",
+    "liveTruncated": "即時內容已截斷，驗證後將顯示完整內容。"
   }
 }

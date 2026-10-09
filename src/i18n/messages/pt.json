@@ -7578,6 +7578,16 @@
     "openFolder": "Abrir uma pasta",
     "workspaceUnknown": "Espaço de trabalho nº {id} (indisponível)",
     "workspaceUnavailable": "Este espaço de trabalho não está mais disponível. Escolha outro.",
-    "sourceRootHelp": "Os caminhos são relativos a {path}."
+    "sourceRootHelp": "Os caminhos são relativos a {path}.",
+    "memberAttemptLimit": "Limite por tentativa (propostas, críticas)",
+    "synthesisAttemptLimit": "Limite de tempo da síntese",
+    "noLimit": "Sem limite",
+    "synthesisLimitHint": "A síntese continua até terminar. Apenas o orçamento da sala, Pausar e Parar a encerram.",
+    "liveBadge": "Ao vivo · não verificado",
+    "liveHint": "Transmitindo agora. Não verificado; a mensagem publicada vai substituí-lo.",
+    "liveEnded": "Transmissão concluída. Aguardando verificação.",
+    "liveThinking": "Raciocínio",
+    "liveWaiting": "Aguardando saída…",
+    "liveTruncated": "Visualização ao vivo truncada. O texto completo aparece após a verificação."
   }
 }

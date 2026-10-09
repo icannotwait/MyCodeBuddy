@@ -6,8 +6,18 @@ import { roundtableHash } from "@/lib/roundtable/api"
 import { webcrypto } from "node:crypto"
 
 const call = vi.hoisted(() => vi.fn())
+const subscribers = vi.hoisted(() => [] as ((payload: unknown) => void)[])
 vi.mock("@/lib/transport", () => ({
-  getTransport: () => ({ call, subscribe: async () => () => undefined }),
+  getTransport: () => ({
+    call,
+    subscribe: async (
+      _channel: string,
+      handler: (payload: unknown) => void
+    ) => {
+      subscribers.push(handler)
+      return () => undefined
+    },
+  }),
 }))
 const folders = vi.hoisted(() => [
   {
@@ -48,6 +58,7 @@ vi.mock("next-intl", () => ({
 describe("roundtable product page", () => {
   beforeEach(() => {
     call.mockReset()
+    subscribers.length = 0
     listAllFolderDetails.mockReset()
     listAllFolderDetails.mockResolvedValue(folders)
     vi.stubGlobal("crypto", webcrypto)
@@ -575,6 +586,87 @@ describe("roundtable product page", () => {
       .find((node) => node.textContent?.includes("HttpOnly"))
     expect(title?.querySelector("code")).toHaveTextContent("HttpOnly")
     expect(title).not.toHaveTextContent("`")
+  })
+
+  it("streams unverified live output and re-attaches when a delta is lost", async () => {
+    const loaded = await room("running", false, async (body) => {
+      body.phase_refs = [
+        {
+          phase_id: "phase-proposal",
+          revision: "1",
+          state: "running",
+          index: 0,
+          kind: "proposal",
+        },
+      ]
+      body.replay.speakers = [
+        {
+          speaker_id: "speaker-1",
+          ordinal: 0,
+          role: "member",
+          provider_ref: "provider:grok",
+          model_id: "grok-4.6",
+        },
+      ]
+      body.replay.turns = [
+        {
+          turn_id: "turn-1",
+          phase_id: "phase-proposal",
+          speaker_id: "speaker-1",
+          accepted_attempt_id: null,
+        },
+      ]
+      body.replay.attempts = [
+        {
+          attempt_id: "attempt-1",
+          state: "streaming",
+          turn_id: "turn-1",
+          attempt_no: 1,
+        },
+      ]
+      return []
+    })
+    render(
+      <RoundtableWorkbench workspaceId="workspace" roomId={loaded.room_id} />
+    )
+    await screen.findByTestId("roundtable-transcript")
+    await waitFor(() => expect(subscribers.length).toBeGreaterThan(0))
+    const push = (offset: number, text: string) =>
+      act(() => {
+        for (const handler of subscribers)
+          handler({
+            type: "roundtable_live",
+            room_id: loaded.room_id,
+            verified: false,
+            removed: [],
+            attempts: [
+              {
+                attempt_id: "attempt-1",
+                speaker_id: "speaker-1",
+                phase_id: "phase-proposal",
+                phase_kind: "proposal",
+                incarnation: "inc",
+                ended: false,
+                activity: null,
+                message: { offset, text, truncated: false },
+                thought: { offset: 0, text: "", start: 0 },
+              },
+            ],
+          })
+      })
+    push(0, "Live draft")
+    push(10, " grows")
+    expect(await screen.findByTestId("live-text")).toHaveTextContent(
+      "Live draft grows"
+    )
+    expect(screen.getByTestId("live-badge")).toHaveTextContent("liveBadge")
+    const attaches = () =>
+      call.mock.calls.filter(([command]) => command === "roundtable_attach")
+        .length
+    const before = attaches()
+    push(99, "lost")
+    await waitFor(() => expect(attaches()).toBe(before + 1))
+    expect(screen.queryByTestId("live-text")).toBeNull()
   })
 
   it("labels an unpinned draft seat by its agent instead of default", async () => {
