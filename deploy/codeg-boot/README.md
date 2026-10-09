@@ -74,15 +74,6 @@ per line) in `/workspace/heartbeat/boot-sync.local-hold`; the sync logs
 `hold: skip <file>` and leaves it alone. Remove the line once the change is on
 `main`.
 
-## opencli-mcp (`start-opencli-mcp.sh`)
-
-The watchdog calls `start-opencli-mcp.sh` every loop and logs
-`opencli-mcp=up|down|missing`; `down` and `missing` count as broken. Healthy
-means an unauthenticated `POST http://127.0.0.1:18765/mcp` returns `401`. The
-server itself (`/workspace/agent-reach/opencli-mcp/run.sh`) and its bearer token
-are machine-local, never in git. The script never launches Chrome; it only
-warns when the Browser Bridge profile is not running.
-
 ## Roundtable cgroup (`start-codeg-server.sh`)
 
 Roundtable members run in crun containers under
