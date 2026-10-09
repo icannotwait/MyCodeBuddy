@@ -178,7 +178,7 @@ pub use relay::{
 pub use request_accounting::{
     AccountingSnapshot, EncodedModelRequest, RequestAccounting, RequestPermit,
 };
-pub use resources::{ExecutionLease, PermitBundle, ResourceAllocator};
+pub use resources::{ExecutionLease, PermitBundle, ResourceAllocator, PREPAID_SLICE_MS};
 pub use rollout::{disable_and_drain, may_start, Rollout};
 pub use runtime::{
     prepare_roundtable_connection, try_enqueue, AdmittedPrompt, ConnectionOwner,

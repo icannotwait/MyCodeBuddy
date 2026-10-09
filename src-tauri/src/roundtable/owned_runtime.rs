@@ -587,7 +587,19 @@ async fn prepaid_monitor(
     (boot_epoch, run_epoch): (Epoch, Epoch),
     stop: Arc<tokio::sync::Notify>,
 ) -> (super::budget_ledger::ActiveBudgetLease, MonitorExit) {
+    let mut suspended = store.host_suspended_ms();
     let exit = loop {
+        // The active clock excludes host suspend, so a suspended interval is
+        // neither charged nor counted toward expiry. Record it when seen.
+        let now_suspended = store.host_suspended_ms();
+        if now_suspended > suspended {
+            tracing::info!(
+                room = %room,
+                suspended_ms = now_suspended - suspended,
+                "roundtable host suspend excluded from active time"
+            );
+            suspended = now_suspended;
+        }
         let remaining = permission
             .prepaid_until()
             .saturating_sub(store.clock_sample().0);

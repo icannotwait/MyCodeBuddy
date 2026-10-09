@@ -776,6 +776,12 @@ impl RoundtableStore {
             .take()
     }
 
+    /// Host suspend excluded from active time since the clock started.
+    pub(crate) fn host_suspended_ms(&self) -> u64 {
+        let clock = Arc::clone(&self.clock.lock().expect("clock"));
+        clock.suspended_ms()
+    }
+
     pub(crate) fn clock_sample(&self) -> (u64, String) {
         let clock = Arc::clone(&self.clock.lock().expect("clock"));
         (clock.now_ms(), clock.utc())
