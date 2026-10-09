@@ -5058,6 +5058,7 @@ mod control_tests {
 mod verify_once_tests {
     use super::*;
 
+    #[cfg(unix)]
     fn walks(root: &Path) -> u64 {
         ROOTFS_WALKS
             .lock()
