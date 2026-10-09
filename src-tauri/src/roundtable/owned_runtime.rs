@@ -194,28 +194,17 @@ impl RoundtableTurnExecutor for LeasedExecutor {
         request: RoundtableTurnRequest,
     ) -> RtResult<RoundtableTurnOutcome> {
         let incarnation = request.fence.incarnation;
-        if let Some(lease) = request.execution_lease.as_ref() {
-            if lease.admit_enqueue(request.store.clock_sample().0) == 0 {
-                // Brief wait for the room monitor to renew an elapsed 1s slice
-                // when durable room budget remains. Genuine exhaustion still
-                // fails as InsufficientBudget.
-                for _ in 0..20 {
-                    let remaining =
-                        room_remaining_active_ms(&request.store, &request.room_id).await?;
-                    if remaining == 0 {
-                        return Err(lease_renewal_failure(0));
-                    }
-                    if lease.admit_enqueue(request.store.clock_sample().0) > 0 {
-                        break;
-                    }
-                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                }
-                if lease.admit_enqueue(request.store.clock_sample().0) == 0 {
-                    return Err(lease_renewal_failure(
-                        room_remaining_active_ms(&request.store, &request.room_id).await?,
-                    ));
-                }
-            }
+        if request
+            .execution_lease
+            .as_ref()
+            .is_some_and(|lease| lease.admit_enqueue(request.store.clock_sample().0) == 0)
+        {
+            // Permission ends only through the room monitor, which is already
+            // stopping this run. Never wait on SQLite here.
+            return Err(rt_error(
+                ErrorCode::InsufficientBudget,
+                "prepaid_lease_expired",
+            ));
         }
         let lease = self
             .allocator
@@ -356,7 +345,7 @@ impl ParticipantRuntime for OwnedParticipantRuntime {
         .await?;
         let boot_epoch = Epoch(nonnegative(column(&row, 0)?)?);
         let run_epoch = Epoch(nonnegative(column(&row, 1)?)?);
-        let mut lease = super::budget_ledger::ActiveBudgetLease::begin(
+        let lease = super::budget_ledger::ActiveBudgetLease::begin(
             store.clone(),
             room,
             boot_epoch,
@@ -373,114 +362,69 @@ impl ParticipantRuntime for OwnedParticipantRuntime {
             .expect("room permissions")
             .insert(room, permission.clone());
         let _revoke_on_drop = RevokeOnDrop(permission.clone());
-        let result = {
+        let _clear_live = ClearLiveOnDrop(room.to_string());
+        // The prepaid monitor runs as its own task. Nothing the scheduler does
+        // on the room task (SQLite waits, launch preparation, a slow poll) can
+        // keep it from sampling, and an expired slice is revoked without
+        // waiting for anyone.
+        let stop = Arc::new(tokio::sync::Notify::new());
+        let mut monitor = MonitorTask(tokio::spawn(prepaid_monitor(
+            lease,
+            permission.clone(),
+            store.clone(),
+            room,
+            (boot_epoch, run_epoch),
+            stop.clone(),
+        )));
+        let (outcome, joined) = {
             let executor: Arc<dyn RoundtableTurnExecutor> = executor.clone();
             let run = run_room(store.clone(), room, config, executor, permission.clone());
-            // Both futures stay polled: the scheduler may own the writer
-            // transaction that a checkpoint is waiting to acquire. A crun
-            // launch can also block this task for longer than the one-second
-            // slice. That gap is sampled and charged instead of pausing the
-            // room as soon as the old deadline passes.
-            let monitor = async {
-                loop {
-                    let remaining = permission
-                        .prepaid_until()
-                        .saturating_sub(store.clock_sample().0);
-                    if remaining == 0 {
-                        match account_elapsed_slice(
-                            &mut lease,
-                            &permission,
-                            &store,
-                            &room,
-                            boot_epoch,
-                            run_epoch,
-                        )
-                        .await?
-                        {
-                            SliceRenewal::Renewed => continue,
-                            SliceRenewal::Finished => return Ok(()),
-                        }
-                    }
-                    tokio::time::sleep(std::time::Duration::from_millis(remaining.min(250))).await;
-                    let remaining = permission
-                        .prepaid_until()
-                        .saturating_sub(store.clock_sample().0);
-                    if remaining == 0 {
-                        match account_elapsed_slice(
-                            &mut lease,
-                            &permission,
-                            &store,
-                            &room,
-                            boot_epoch,
-                            run_epoch,
-                        )
-                        .await?
-                        {
-                            SliceRenewal::Renewed => continue,
-                            SliceRenewal::Finished => return Ok(()),
-                        }
-                    }
-                    let checkpoint =
-                        sample_budget(&mut lease, &store, &room, boot_epoch, run_epoch);
-                    let sampled = tokio::time::timeout(
-                        std::time::Duration::from_millis(remaining),
-                        checkpoint,
-                    )
-                    .await;
-                    match sampled {
-                        Ok(Ok(Some(ledger))) => {
-                            if !grant_prepaid_slice(
-                                &permission,
-                                store.clock_sample().0,
-                                ledger.prepaid_until.0,
-                            ) {
-                                return Err(lease_renewal_failure(
-                                    room_remaining_active_ms(&store, &room).await?,
-                                ));
-                            }
-                        }
-                        Ok(Ok(None)) => {
-                            permission.revoke_local();
-                            return Ok(());
-                        }
-                        Ok(Err(error)) => return Err(error),
-                        Err(_elapsed) => {
-                            // Checkpoint waited past the local prepaid deadline
-                            // (often while the scheduler held SQLite during
-                            // admit/launch). Charge the gap and renew when the
-                            // room still has budget; do not mislabel that as
-                            // InsufficientBudget.
-                            match account_elapsed_slice(
-                                &mut lease,
-                                &permission,
-                                &store,
-                                &room,
-                                boot_epoch,
-                                run_epoch,
-                            )
-                            .await?
-                            {
-                                SliceRenewal::Renewed => continue,
-                                SliceRenewal::Finished => return Ok(()),
-                            }
-                        }
-                    }
-                }
-            };
-            tokio::pin!(run, monitor);
+            tokio::pin!(run);
             tokio::select! {
-                result = &mut run => result,
-                result = &mut monitor => match result {
+                result = &mut run => {
+                    stop.notify_one();
+                    (Some(result), (&mut monitor.0).await)
+                }
+                joined = &mut monitor.0 => match joined {
                     // Durable completion stops renewal, but it cannot replace
                     // the scheduler's result or hide its final storage error.
-                    Ok(()) => (&mut run).await,
-                    Err(error) => Err(error),
+                    Ok((lease, MonitorExit::Finished)) => {
+                        (Some((&mut run).await), Ok((lease, MonitorExit::Finished)))
+                    }
+                    other => (None, other),
                 },
             }
         }; // Drop all turn futures before local cleanup, regardless of SQLite.
         permission.revoke_local();
         self.cleanup_local_room(room).await?;
-        lease.finish().await?;
+        let stopped_at = store.clock_sample().0;
+        let (mut lease, exit) =
+            joined.map_err(|_| rt_error(ErrorCode::RuntimeUnavailable, "budget_monitor"))?;
+        let result = match exit {
+            MonitorExit::Expired => {
+                // Local execution is already revoked and reaped. Only now
+                // account the slice, charged up to the proven stop time.
+                match tokio::time::timeout(PREPAID_ACCOUNTING_TIMEOUT, lease.finish_at(stopped_at))
+                    .await
+                {
+                    Ok(Ok(ledger)) => Err(lease_renewal_failure(ledger.remaining_room_ms.0)),
+                    Ok(Err(_)) | Err(_) => Err(rt_error(
+                        ErrorCode::RuntimeUnavailable,
+                        "execution_lease_stalled",
+                    )),
+                }
+            }
+            MonitorExit::Failed(error) => {
+                lease.finish().await?;
+                Err(error)
+            }
+            MonitorExit::Finished | MonitorExit::Stopped => {
+                lease.finish().await?;
+                outcome.unwrap_or_else(|| {
+                    Err(rt_error(ErrorCode::RuntimeUnavailable, "budget_monitor"))
+                })
+            }
+        };
         self.permissions
             .lock()
             .expect("room permissions")
@@ -533,6 +477,14 @@ impl ParticipantRuntime for OwnedParticipantRuntime {
     }
 }
 
+/// Live display buffers belong to one run; drop them however it ends.
+struct ClearLiveOnDrop(String);
+impl Drop for ClearLiveOnDrop {
+    fn drop(&mut self) {
+        super::live_stream::clear_room(&self.0);
+    }
+}
+
 struct RevokeOnDrop(Arc<super::resources::ExecutionLease>);
 impl Drop for RevokeOnDrop {
     fn drop(&mut self) {
@@ -560,14 +512,9 @@ fn nonnegative(value: i64) -> RtResult<u64> {
     u64::try_from(value).map_err(|_| rt_error(ErrorCode::StorageUnavailable, "runtime_counter"))
 }
 
-enum SliceRenewal {
-    Renewed,
-    Finished,
-}
-
-/// Extend local permission from a durable sample. A sample that arrives after
-/// the old one-second slice still counts when it charges the gap and grants a
-/// fresh slice. A revoked lease does not come back.
+/// Extend local permission to a committed sample's reservation. The sample's
+/// own deadline must still be in the future; a revoked lease does not come
+/// back.
 fn grant_prepaid_slice(
     permission: &super::resources::ExecutionLease,
     now_ms: u64,
@@ -601,28 +548,82 @@ async fn sample_budget(
     }
 }
 
-async fn account_elapsed_slice(
-    lease: &mut super::budget_ledger::ActiveBudgetLease,
-    permission: &super::resources::ExecutionLease,
-    store: &RoundtableStore,
-    room: &RoomId,
-    boot_epoch: Epoch,
-    run_epoch: Epoch,
-) -> RtResult<SliceRenewal> {
-    match sample_budget(lease, store, room, boot_epoch, run_epoch).await? {
-        Some(ledger)
-            if grant_prepaid_slice(permission, store.clock_sample().0, ledger.prepaid_until.0) =>
-        {
-            Ok(SliceRenewal::Renewed)
-        }
-        Some(_) => Err(lease_renewal_failure(
-            room_remaining_active_ms(store, room).await?,
-        )),
-        None => {
-            permission.revoke_local();
-            Ok(SliceRenewal::Finished)
-        }
+/// How long the post-expiry settlement may wait for SQLite before the run is
+/// failed as `execution_lease_stalled`. Local cleanup is already complete.
+const PREPAID_ACCOUNTING_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+enum MonitorExit {
+    /// The room committed completion for this exact owner.
+    Finished,
+    /// The local prepaid slice elapsed before a durable sample renewed it.
+    /// Permission is already revoked.
+    Expired,
+    /// A checkpoint failed (storage error, budget fence after a control).
+    Failed(roundtable_protocol::RtError),
+    /// The scheduler finished first and asked the monitor to stop.
+    Stopped,
+}
+
+/// Aborts the monitor when `run_room` itself is dropped (a control aborting
+/// the room task). The lease then stays charged for settlement, as before.
+struct MonitorTask(tokio::task::JoinHandle<(super::budget_ledger::ActiveBudgetLease, MonitorExit)>);
+impl Drop for MonitorTask {
+    fn drop(&mut self) {
+        self.0.abort();
     }
+}
+
+/// Keep local permission no longer than the last durable reservation.
+///
+/// Every renewal comes from a committed sample. If the slice elapses first
+/// (SQLite stalled past the slice, or a sample arrived after its own grant
+/// window), permission is revoked here without touching SQLite again; the
+/// caller stops and reaps before it accounts the elapsed slice.
+async fn prepaid_monitor(
+    mut lease: super::budget_ledger::ActiveBudgetLease,
+    permission: Arc<super::resources::ExecutionLease>,
+    store: RoundtableStore,
+    room: RoomId,
+    (boot_epoch, run_epoch): (Epoch, Epoch),
+    stop: Arc<tokio::sync::Notify>,
+) -> (super::budget_ledger::ActiveBudgetLease, MonitorExit) {
+    let exit = loop {
+        let remaining = permission
+            .prepaid_until()
+            .saturating_sub(store.clock_sample().0);
+        if remaining == 0 {
+            break MonitorExit::Expired;
+        }
+        tokio::select! {
+            biased;
+            _ = stop.notified() => break MonitorExit::Stopped,
+            _ = tokio::time::sleep(std::time::Duration::from_millis(remaining.min(250))) => {}
+        }
+        let remaining = permission
+            .prepaid_until()
+            .saturating_sub(store.clock_sample().0);
+        if remaining == 0 {
+            break MonitorExit::Expired;
+        }
+        let checkpoint = sample_budget(&mut lease, &store, &room, boot_epoch, run_epoch);
+        match tokio::time::timeout(std::time::Duration::from_millis(remaining), checkpoint).await {
+            Ok(Ok(Some(ledger))) => {
+                if !grant_prepaid_slice(&permission, store.clock_sample().0, ledger.prepaid_until.0)
+                {
+                    // No budget left to reserve, or the sample's own window
+                    // already passed. Either way local permission has ended.
+                    break MonitorExit::Expired;
+                }
+            }
+            Ok(Ok(None)) => break MonitorExit::Finished,
+            Ok(Err(error)) => break MonitorExit::Failed(error),
+            Err(_elapsed) => break MonitorExit::Expired,
+        }
+    };
+    if !matches!(exit, MonitorExit::Stopped) {
+        permission.revoke_local();
+    }
+    (lease, exit)
 }
 
 /// Classify a failed local prepaid renew. Room wall time at zero is genuine
@@ -633,16 +634,6 @@ pub(crate) fn lease_renewal_failure(remaining_active_ms: u64) -> roundtable_prot
     } else {
         rt_error(ErrorCode::RuntimeUnavailable, "execution_lease_stalled")
     }
-}
-
-async fn room_remaining_active_ms(store: &RoundtableStore, room: &RoomId) -> RtResult<u64> {
-    let remaining = super::store::query_i64(
-        store.connection(),
-        "SELECT remaining_active_ms FROM rt_rooms WHERE room_id=?",
-        vec![text(&room.to_string())],
-    )
-    .await?;
-    u64::try_from(remaining).map_err(|_| rt_error(ErrorCode::StorageUnavailable, "budget_counter"))
 }
 
 async fn run_room(
@@ -781,19 +772,21 @@ async fn run_room(
             members.clone()
         };
         budget.current_phase_index = index;
-        let mut phase_deadline = store
-            .clock_sample()
-            .0
-            .saturating_add(config.budgets.phase_budget.0)
-            .min(room_deadline);
+        let mut phase_deadline = phase_deadline_for(
+            kind,
+            store.clock_sample().0,
+            config.budgets.phase_budget.0,
+            room_deadline,
+        );
         let phase_id: PhaseId = fresh()?;
         let current=optional_row(store.connection(),"SELECT p.phase_id,p.remaining_ms,c.snapshot_json,c.context_json FROM rt_rooms r JOIN rt_phases p ON p.room_id=r.room_id AND p.phase_id=r.current_phase_id LEFT JOIN rt_phase_contexts c ON c.room_id=p.room_id AND c.phase_id=p.phase_id WHERE r.room_id=? AND p.phase_index=? AND p.status='running'",vec![text(&room_text),num(index as i64)]).await?;
         let (snapshot, context, aliases) = if let Some(current) = current {
-            phase_deadline = store
-                .clock_sample()
-                .0
-                .saturating_add(nonnegative(column(&current, 1)?)?)
-                .min(room_deadline);
+            phase_deadline = phase_deadline_for(
+                kind,
+                store.clock_sample().0,
+                nonnegative(column(&current, 1)?)?,
+                room_deadline,
+            );
             let snapshot: PhaseSnapshotV1 = from_json(&column::<String>(&current, 2)?)?;
             let context: Value = from_json(&column::<String>(&current, 3)?)?;
             let aliases: VisibleAliases = serde_json::from_value(context["aliases"].clone())
@@ -801,7 +794,7 @@ async fn run_room(
             (snapshot, context, aliases)
         } else {
             if let Some(ready)=optional_row(store.connection(),"SELECT remaining_ms FROM rt_phases WHERE room_id=? AND phase_index=? AND status='ready' ORDER BY revision DESC LIMIT 1",vec![text(&room_text),num(index as i64)]).await? {
-                phase_deadline=phase_deadline.min(store.clock_sample().0.saturating_add(nonnegative(column(&ready,0)?)?));
+                phase_deadline=phase_deadline.min(phase_deadline_for(kind,store.clock_sample().0,nonnegative(column(&ready,0)?)?,room_deadline));
             }
             freeze_phase(
                 &store,
@@ -931,11 +924,7 @@ async fn run_room(
                     request.execution_lease = Some(permission.clone());
                     closing_fence = Some(request.fence.clone());
                     pending.push(run_turn(Arc::clone(&executor), request));
-                    // Let the prepaid monitor checkpoint between admits so a
-                    // dual launch cannot starve renewals behind SQLite writes.
-                    tokio::task::yield_now().await;
                 }
-                tokio::task::yield_now().await;
                 for result in futures::future::join_all(pending).await {
                     let (speaker, outcome) = result?;
                     if let Some(slot) = slots
@@ -968,6 +957,8 @@ async fn run_room(
                 cleanup_confirmed: true,
             })
             .await?;
+        // Verified messages for this phase now replace its live buffers.
+        super::live_stream::clear_phase(&room.to_string(), &phase_id.to_string());
         #[cfg(any(test, feature = "test-utils"))]
         if kind == PhaseKind::Synthesis {
             if let Some(gate) = store.take_completed_run_gate() {
@@ -1717,13 +1708,36 @@ async fn prepare_turn(
         scope,
         prompt,
         execution_lease: None,
-        deadline_mono: deadline.min(
-            store
-                .clock_sample()
-                .0
-                .saturating_add(config.timeouts.attempt_timeout.0),
+        deadline_mono: attempt_deadline(
+            phase.kind,
+            deadline,
+            store.clock_sample().0,
+            config.timeouts.attempt_timeout.0,
         ),
     })
+}
+
+/// Synthesis has no per-attempt time limit (operator choice): the moderator
+/// runs until it ends its turn, the room's active-time budget runs out, or an
+/// operator stops/pauses the room. Its `deadline` is the room deadline (see
+/// `phase_deadline_for`). Proposal and critique attempts keep
+/// `attempt_timeout`.
+fn attempt_deadline(kind: PhaseKind, deadline: u64, now: u64, attempt_timeout: u64) -> u64 {
+    if kind == PhaseKind::Synthesis {
+        deadline
+    } else {
+        deadline.min(now.saturating_add(attempt_timeout))
+    }
+}
+
+/// Synthesis is bounded only by the room budget, never by `phase_budget`.
+/// Other phases get `phase_budget` (or what remains of it), capped by the room.
+fn phase_deadline_for(kind: PhaseKind, now: u64, phase_remaining: u64, room_deadline: u64) -> u64 {
+    if kind == PhaseKind::Synthesis {
+        room_deadline
+    } else {
+        now.saturating_add(phase_remaining).min(room_deadline)
+    }
 }
 
 async fn run_turn(
@@ -2117,6 +2131,44 @@ mod prepaid_lease_renewal_tests {
         assert_eq!(
             lease_renewal_failure(500).details.reason.as_deref(),
             Some("execution_lease_stalled")
+        );
+    }
+}
+
+#[cfg(test)]
+mod synthesis_limit_tests {
+    use super::{attempt_deadline, phase_deadline_for};
+    use roundtable_protocol::PhaseKind;
+
+    #[test]
+    fn synthesis_attempt_runs_to_the_room_deadline() {
+        assert_eq!(
+            attempt_deadline(PhaseKind::Synthesis, 1_800_000, 1_000, 225_000),
+            1_800_000
+        );
+        assert_eq!(
+            attempt_deadline(PhaseKind::Proposal, 1_800_000, 1_000, 225_000),
+            226_000
+        );
+        assert_eq!(
+            attempt_deadline(PhaseKind::Critique, 100_000, 1_000, 225_000),
+            100_000
+        );
+    }
+
+    #[test]
+    fn synthesis_phase_is_not_capped_by_phase_budget() {
+        assert_eq!(
+            phase_deadline_for(PhaseKind::Synthesis, 1_000, 450_000, 1_800_000),
+            1_800_000
+        );
+        assert_eq!(
+            phase_deadline_for(PhaseKind::Critique, 1_000, 450_000, 1_800_000),
+            451_000
+        );
+        assert_eq!(
+            phase_deadline_for(PhaseKind::Proposal, 1_000, 450_000, 300_000),
+            300_000
         );
     }
 }

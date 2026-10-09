@@ -39,7 +39,7 @@ impl ActiveBudgetLease {
             }
             let now=store.clock_sample().0;
             exec(&txn,"INSERT INTO rt_active_time_leases(room_id,lease_id,boot_epoch,run_epoch,phase_id,prepaid_ms,last_sample_mono) VALUES(?,?,?,?,NULL,0,?)",vec![text(&room.to_string()),text(&id),num(as_i64(boot.0)?),num(as_i64(run.0)?),num(as_i64(now)?)]).await?;
-            let ledger=tick_in(&txn,&store,&room,&id,boot,run,false).await?;
+            let ledger=tick_in(&txn,&store,&room,&id,boot,run,(false,None)).await?;
             if ledger.prepaid_until.0<=ledger.last_sample_mono.0 {return Err(rt_error(ErrorCode::InsufficientBudget,"active_budget_exhausted"));}
             Ok::<_,roundtable_protocol::RtError>(ledger.prepaid_until.0)
         }.await;
@@ -75,7 +75,20 @@ impl ActiveBudgetLease {
         self.tick(true).await
     }
 
+    /// Settle this owner as of `stopped_at`, the monotonic time local
+    /// execution was proven stopped (permission revoked and processes reaped).
+    /// A later SQLite stall then cannot charge active time for work that no
+    /// longer runs. `stopped_at` is clamped to the sample clock and never moves
+    /// before the last durable sample.
+    pub async fn finish_at(&mut self, stopped_at: u64) -> RtResult<TimeLedger> {
+        self.tick_at(true, Some(stopped_at)).await
+    }
+
     async fn tick(&mut self, finish: bool) -> RtResult<TimeLedger> {
+        self.tick_at(finish, None).await
+    }
+
+    async fn tick_at(&mut self, finish: bool, stopped_at: Option<u64>) -> RtResult<TimeLedger> {
         if self.finished {
             return Err(rt_error(ErrorCode::InvalidState, "budget_lease_finished"));
         }
@@ -87,7 +100,7 @@ impl ActiveBudgetLease {
             &self.id,
             self.boot,
             self.run,
-            finish,
+            (finish, stopped_at),
         )
         .await;
         match result {
@@ -128,7 +141,7 @@ pub(crate) async fn settle_room_in(
             &column::<String>(&row, 0)?,
             Epoch(nonnegative(column(&row, 1)?)?),
             Epoch(nonnegative(column(&row, 2)?)?),
-            true,
+            (true, None),
         )
         .await?;
     }
@@ -142,7 +155,7 @@ async fn tick_in(
     id: &str,
     boot: Epoch,
     run: Epoch,
-    finish: bool,
+    (finish, stopped_at): (bool, Option<u64>),
 ) -> RtResult<TimeLedger> {
     let room_text = room.to_string();
     let lease=one_row(txn,"SELECT phase_id,prepaid_ms,last_sample_mono,phase_prepaid_ms FROM rt_active_time_leases WHERE room_id=? AND lease_id=? AND boot_epoch=? AND run_epoch=?",vec![text(&room_text),text(id),num(as_i64(boot.0)?),num(as_i64(run.0)?)]).await?;
@@ -157,8 +170,12 @@ async fn tick_in(
     {
         return Err(rt_error(ErrorCode::InvalidState, "budget_fence"));
     }
-    let (now, utc) = store.clock_sample();
+    let (sampled_now, utc) = store.clock_sample();
     let last = nonnegative(column(&lease, 2)?)?;
+    let now = match stopped_at {
+        Some(stopped) => stopped.min(sampled_now).max(last),
+        None => sampled_now,
+    };
     let elapsed = now
         .checked_sub(last)
         .ok_or_else(|| rt_error(ErrorCode::InvalidState, "budget_clock"))?;
