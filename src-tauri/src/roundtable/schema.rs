@@ -66,7 +66,7 @@ pub const TABLES: &[&str] = &[
 
 const STATEMENTS: &[&str] = &[
     "CREATE TABLE IF NOT EXISTS rt_metric_counters(room_id TEXT NOT NULL,key TEXT NOT NULL,value INTEGER NOT NULL,PRIMARY KEY(room_id,key),FOREIGN KEY(room_id) REFERENCES rt_rooms(room_id))",
-    "CREATE TABLE IF NOT EXISTS rt_active_time_leases(room_id TEXT NOT NULL PRIMARY KEY, lease_id TEXT NOT NULL, boot_epoch INTEGER NOT NULL, run_epoch INTEGER NOT NULL, phase_id TEXT, prepaid_ms INTEGER NOT NULL CHECK(prepaid_ms>=0 AND prepaid_ms<=1000), phase_prepaid_ms INTEGER NOT NULL DEFAULT 0 CHECK(phase_prepaid_ms>=0 AND phase_prepaid_ms<=1000), last_sample_mono INTEGER NOT NULL, FOREIGN KEY(room_id) REFERENCES rt_rooms(room_id), FOREIGN KEY(room_id,phase_id) REFERENCES rt_phases(room_id,phase_id))",
+    "CREATE TABLE IF NOT EXISTS rt_active_time_leases(room_id TEXT NOT NULL PRIMARY KEY, lease_id TEXT NOT NULL, boot_epoch INTEGER NOT NULL, run_epoch INTEGER NOT NULL, phase_id TEXT, prepaid_ms INTEGER NOT NULL CHECK(prepaid_ms>=0 AND prepaid_ms<=10000), phase_prepaid_ms INTEGER NOT NULL DEFAULT 0 CHECK(phase_prepaid_ms>=0 AND phase_prepaid_ms<=10000), last_sample_mono INTEGER NOT NULL, FOREIGN KEY(room_id) REFERENCES rt_rooms(room_id), FOREIGN KEY(room_id,phase_id) REFERENCES rt_phases(room_id,phase_id))",
     "CREATE TABLE IF NOT EXISTS rt_closing_sets (room_id TEXT NOT NULL, phase_id TEXT NOT NULL, body_json TEXT NOT NULL, recovery_boot_epoch INTEGER, recovery_operation_id TEXT, PRIMARY KEY(room_id,phase_id), FOREIGN KEY(room_id,phase_id) REFERENCES rt_phases(room_id,phase_id), FOREIGN KEY(room_id,recovery_operation_id) REFERENCES rt_control_operations(room_id,operation_id))",
     "CREATE TABLE IF NOT EXISTS rt_phase_contexts (room_id TEXT NOT NULL, phase_id TEXT NOT NULL, snapshot_json TEXT NOT NULL, context_json TEXT NOT NULL, PRIMARY KEY(room_id,phase_id), FOREIGN KEY(room_id,phase_id) REFERENCES rt_phases(room_id,phase_id))",
     "CREATE TABLE IF NOT EXISTS rt_deliveries (room_id TEXT NOT NULL, attempt_id TEXT NOT NULL, body_json TEXT NOT NULL, prompt_utf8 TEXT NOT NULL, PRIMARY KEY(room_id,attempt_id), FOREIGN KEY(room_id,attempt_id) REFERENCES rt_attempts(room_id,attempt_id))",
@@ -553,10 +553,72 @@ pub async fn apply_roundtable_schema(conn: &impl ConnectionTrait) -> Result<(), 
     if !columns.iter().any(|column| {
         column.try_get_by_index::<String>(1).ok().as_deref() == Some("phase_prepaid_ms")
     }) {
-        conn.execute_unprepared("ALTER TABLE rt_active_time_leases ADD COLUMN phase_prepaid_ms INTEGER NOT NULL DEFAULT 0 CHECK(phase_prepaid_ms>=0 AND phase_prepaid_ms<=1000)").await?;
+        conn.execute_unprepared("ALTER TABLE rt_active_time_leases ADD COLUMN phase_prepaid_ms INTEGER NOT NULL DEFAULT 0 CHECK(phase_prepaid_ms>=0 AND phase_prepaid_ms<=10000)").await?;
         conn.execute_unprepared("UPDATE rt_active_time_leases SET phase_prepaid_ms=CASE WHEN phase_id IS NULL THEN 0 ELSE prepaid_ms END").await?;
     }
-    Ok(())
+    widen_prepaid_cap(conn).await
+}
+
+/// The renew-ahead slice reserves up to `PREPAID_SLICE_MS` per sample. Older
+/// databases capped a reservation at 1000ms in a CHECK constraint, which
+/// SQLite cannot alter in place, so the (transient, one row per running room)
+/// lease table is rebuilt with every row preserved. Older binaries only ever
+/// write <=1000ms, so the wider cap is rollback-safe.
+async fn widen_prepaid_cap(conn: &impl ConnectionTrait) -> Result<(), DbErr> {
+    let sql = conn
+        .query_one(sea_orm::Statement::from_string(
+            sea_orm::DatabaseBackend::Sqlite,
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='rt_active_time_leases'"
+                .to_owned(),
+        ))
+        .await?
+        .and_then(|row| row.try_get_by_index::<String>(0).ok())
+        .unwrap_or_default();
+    if !sql.contains("prepaid_ms<=1000)") {
+        return Ok(());
+    }
+    let create = STATEMENTS
+        .iter()
+        .find(|statement| statement.contains("TABLE IF NOT EXISTS rt_active_time_leases("))
+        .expect("lease table statement")
+        .replace(
+            "TABLE IF NOT EXISTS rt_active_time_leases(",
+            "TABLE rt_active_time_leases_widened(",
+        );
+    let columns = "room_id,lease_id,boot_epoch,run_epoch,phase_id,prepaid_ms,phase_prepaid_ms,last_sample_mono";
+    conn.execute_unprepared("SAVEPOINT rt_widen_prepaid_cap")
+        .await?;
+    let rebuilt = async {
+        conn.execute_unprepared(&create).await?;
+        conn.execute_unprepared(&format!(
+            "INSERT INTO rt_active_time_leases_widened({columns}) SELECT {columns} FROM rt_active_time_leases"
+        ))
+        .await?;
+        conn.execute_unprepared("DROP TABLE rt_active_time_leases")
+            .await?;
+        conn.execute_unprepared(
+            "ALTER TABLE rt_active_time_leases_widened RENAME TO rt_active_time_leases",
+        )
+        .await?;
+        Ok::<_, DbErr>(())
+    }
+    .await;
+    match rebuilt {
+        Ok(()) => {
+            conn.execute_unprepared("RELEASE rt_widen_prepaid_cap")
+                .await?;
+            Ok(())
+        }
+        Err(error) => {
+            let _ = conn
+                .execute_unprepared("ROLLBACK TO rt_widen_prepaid_cap")
+                .await;
+            let _ = conn
+                .execute_unprepared("RELEASE rt_widen_prepaid_cap")
+                .await;
+            Err(error)
+        }
+    }
 }
 
 pub async fn drop_roundtable_schema(conn: &impl ConnectionTrait) -> Result<(), DbErr> {
@@ -565,4 +627,69 @@ pub async fn drop_roundtable_schema(conn: &impl ConnectionTrait) -> Result<(), D
             .await?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod prepaid_cap_tests {
+    use super::*;
+
+    #[test]
+    fn schema_cap_matches_the_prepaid_slice() {
+        let lease = STATEMENTS
+            .iter()
+            .find(|statement| statement.contains("TABLE IF NOT EXISTS rt_active_time_leases("))
+            .unwrap();
+        let cap = format!(
+            "prepaid_ms<={})",
+            crate::roundtable::resources::PREPAID_SLICE_MS
+        );
+        assert!(lease.contains(&cap), "{lease}");
+    }
+
+    #[tokio::test]
+    async fn an_old_one_second_cap_is_widened_with_rows_preserved() {
+        let conn = sea_orm::Database::connect("sqlite::memory:").await.unwrap();
+        apply_roundtable_schema(&conn).await.unwrap();
+        // Recreate the pre-widening table exactly as older installs have it.
+        let old = STATEMENTS
+            .iter()
+            .find(|statement| statement.contains("TABLE IF NOT EXISTS rt_active_time_leases("))
+            .unwrap()
+            .replace("<=10000)", "<=1000)");
+        conn.execute_unprepared("PRAGMA foreign_keys=OFF")
+            .await
+            .unwrap();
+        conn.execute_unprepared("DROP TABLE rt_active_time_leases")
+            .await
+            .unwrap();
+        conn.execute_unprepared(&old).await.unwrap();
+        conn.execute_unprepared("INSERT INTO rt_active_time_leases(room_id,lease_id,boot_epoch,run_epoch,phase_id,prepaid_ms,phase_prepaid_ms,last_sample_mono) VALUES('r','l',1,2,NULL,900,0,77)").await.unwrap();
+        assert!(conn
+            .execute_unprepared("UPDATE rt_active_time_leases SET prepaid_ms=5000")
+            .await
+            .is_err());
+        apply_roundtable_schema(&conn).await.unwrap();
+        conn.execute_unprepared(
+            "UPDATE rt_active_time_leases SET prepaid_ms=10000, phase_prepaid_ms=10000",
+        )
+        .await
+        .unwrap();
+        let row = conn
+            .query_one(sea_orm::Statement::from_string(
+                sea_orm::DatabaseBackend::Sqlite,
+                "SELECT lease_id,run_epoch,last_sample_mono FROM rt_active_time_leases".to_owned(),
+            ))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.try_get_by_index::<String>(0).unwrap(), "l");
+        assert_eq!(row.try_get_by_index::<i64>(1).unwrap(), 2);
+        assert_eq!(row.try_get_by_index::<i64>(2).unwrap(), 77);
+        assert!(conn
+            .execute_unprepared("UPDATE rt_active_time_leases SET prepaid_ms=10001")
+            .await
+            .is_err());
+        // Idempotent on the next startup.
+        apply_roundtable_schema(&conn).await.unwrap();
+    }
 }

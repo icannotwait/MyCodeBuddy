@@ -875,7 +875,8 @@ async fn exercise_storage_failure(mode: u8) {
             .await
             .unwrap();
     }
-    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+    // A stalled writer ends permission only after a whole prepaid slice.
+    tokio::time::timeout(slice_plus(5_000), async {
         while executor
             .cancelled
             .load(std::sync::atomic::Ordering::Acquire)
@@ -939,6 +940,10 @@ async fn exercise_storage_failure(mode: u8) {
         0
     );
     assert!(!dir.path().join("roundtable/execution-policy.json").exists());
+}
+
+fn slice_plus(ms: u64) -> std::time::Duration {
+    std::time::Duration::from_millis(codeg_lib::roundtable::PREPAID_SLICE_MS + ms)
 }
 
 fn hanging_executor(launch_block_ms: u64) -> Arc<HangingExecutor> {
@@ -1055,6 +1060,106 @@ async fn lifecycle_slow_synchronous_launch_does_not_stall_the_prepaid_lease() {
     assert!(executor.active.lock().unwrap().is_empty());
 }
 
+// A whole-process host stall (CPU starvation, swap, I/O, balloon) shorter than
+// the renew-ahead slice: the writer is held for 3s on the multi-thread runtime
+// the server uses. The room keeps running, nothing is cancelled, and the stall
+// is charged once, never more than it lasted.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn lifecycle_host_stall_shorter_than_the_slice_keeps_the_room_running() {
+    use sea_orm::TransactionTrait;
+    let (dir, conn) = support::open_pool(5).await;
+    migrate_roundtable(&conn).await.unwrap();
+    let store = open_roundtable_store(conn.clone()).await.unwrap();
+    let executor = hanging_executor(0);
+    let runtime = Arc::new(OwnedParticipantRuntime::with_executor(
+        dir.path().into(),
+        Arc::new(ConnectionManager::new()),
+        executor.clone(),
+    ));
+    let service = RoundtableService::open(
+        ServiceConfig {
+            data_dir: dir.path().into(),
+            db_path: dir.path().join("roundtable.db"),
+            db_identity: DbIdentity::new("host-stall-runtime").unwrap(),
+            discover: Some(Arc::new(NoUntrackedOwners)),
+        },
+        store,
+        runtime,
+    )
+    .await
+    .unwrap();
+    let actor = ActorContext::from_trusted_entry(
+        "00000000-0000-4000-8000-000000000001".parse().unwrap(),
+        OperatorScope::SingleOperator,
+        ClientIdentity {
+            kind: ClientKind::Web,
+            session_ref: "host-stall".into(),
+        },
+    );
+    let created = service
+        .execute_fake_command(
+            &actor,
+            "roundtable_create",
+            json!({"request_id":uuid::Uuid::new_v4().to_string(),"config":config()}),
+        )
+        .await
+        .unwrap();
+    let room = created["room_id"].clone();
+    conn.execute_unprepared("UPDATE rt_rooms SET status='paused'")
+        .await
+        .unwrap();
+    service.execute_fake_command(&actor,"roundtable_resume",json!({"room_id":room,"request_id":uuid::Uuid::new_v4().to_string(),"expected_revision":created["revision"],"recovery_consent":true})).await.unwrap();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        executor.started.notified(),
+    )
+    .await
+    .unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+    let stall_ms = 3_000_u64;
+    let writer = conn.begin().await.unwrap();
+    writer
+        .execute_unprepared("UPDATE rt_rooms SET revision=revision")
+        .await
+        .unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(stall_ms)).await;
+    writer.commit().await.unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(800)).await;
+    assert_eq!(
+        support::scalar_text(&conn, "SELECT status FROM rt_rooms").await,
+        "running",
+        "a 3s host stall must not pause the room"
+    );
+    let permission = executor.permissions.lock().unwrap()[0].clone();
+    assert!(!permission.revoked(), "permission survived the stall");
+    assert_eq!(
+        executor
+            .cancelled
+            .load(std::sync::atomic::Ordering::Relaxed),
+        0
+    );
+    let deltas = active_sample_deltas(&conn).await;
+    let worst = deltas.iter().copied().max().unwrap_or(0) as u64;
+    assert!(
+        worst >= stall_ms - 300,
+        "the stall was observed as one checkpoint gap: {deltas:?}"
+    );
+    assert!(
+        worst <= stall_ms + 500,
+        "the stall is charged at most once and never more than it lasted: {deltas:?}"
+    );
+    assert_eq!(
+        support::scalar_i64(
+            &conn,
+            "SELECT COUNT(*) FROM rt_measurements WHERE kind='cleanup_overrun'"
+        )
+        .await,
+        0
+    );
+    service.shutdown().await.unwrap();
+    assert!(executor.active.lock().unwrap().is_empty());
+}
+
 #[tokio::test]
 async fn lifecycle_prepaid_expiry_never_spends_past_remaining_active_ms() {
     use sea_orm::TransactionTrait;
@@ -1120,13 +1225,13 @@ async fn lifecycle_prepaid_expiry_never_spends_past_remaining_active_ms() {
     .await as u64;
     let prepaid_ms =
         support::scalar_i64(&conn, "SELECT prepaid_ms FROM rt_active_time_leases").await;
-    assert!(prepaid_ms <= 1_000);
+    assert!(prepaid_ms <= codeg_lib::roundtable::PREPAID_SLICE_MS as i64);
     let permission = executor.permissions.lock().unwrap()[0].clone();
     assert!(
         permission.prepaid_until() <= reserved_until,
         "local permission never extends past the last durable reservation"
     );
-    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+    tokio::time::timeout(slice_plus(5_000), async {
         while executor
             .cancelled
             .load(std::sync::atomic::Ordering::Acquire)

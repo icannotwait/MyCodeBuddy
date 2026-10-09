@@ -159,6 +159,15 @@ fn incarnation_for(lease: u64, index: u32) -> IncarnationId {
     text.parse().expect("incarnation")
 }
 
+/// Renew-ahead prepaid slice. The monitor samples every 250ms and each
+/// committed sample reserves up to this much room time ahead
+/// (`min(slice, remaining)`). Local permission ends only when no sample has
+/// committed for a whole slice, so routine host stalls (CPU, swap, I/O,
+/// balloon) shorter than this never pause a room. A longer stall revokes
+/// first; worst-case overspend per stall is one slice, bounded by
+/// `remaining_active_ms` and recorded as `cleanup_overrun`.
+pub const PREPAID_SLICE_MS: u64 = 10_000;
+
 /// Local execution permission. It expires without waiting for SQLite.
 pub struct ExecutionLease {
     generation: AtomicU64,
@@ -170,7 +179,7 @@ pub struct ExecutionLease {
 
 impl ExecutionLease {
     pub fn issue(now_ms: u64, slice_ms: u64) -> Self {
-        let slice = slice_ms.min(1_000);
+        let slice = slice_ms.min(PREPAID_SLICE_MS);
         Self {
             generation: AtomicU64::new(1),
             prepaid_until: AtomicU64::new(now_ms.saturating_add(slice)),
@@ -238,12 +247,12 @@ impl ExecutionLease {
 
     /// Replace an elapsed slice with a checkpoint that already sampled the gap.
     /// The room pays for that gap in the ledger. A revoked lease stays revoked,
-    /// and the new deadline cannot reach past the one-second prepaid cap.
+    /// and the new deadline cannot reach past the prepaid slice cap.
     pub fn renew_accounted(&self, now_ms: u64, prepaid_until: u64) -> bool {
         if self.revoked() || prepaid_until <= now_ms {
             return false;
         }
-        if prepaid_until.saturating_sub(now_ms) > 1_000 {
+        if prepaid_until.saturating_sub(now_ms) > PREPAID_SLICE_MS {
             return false;
         }
         self.prepaid_until.store(prepaid_until, Ordering::SeqCst);
@@ -275,13 +284,18 @@ mod prepaid_slice_tests {
     use super::ExecutionLease;
 
     #[test]
-    fn accounted_sample_replaces_an_elapsed_slice_and_keeps_the_one_second_cap() {
+    fn accounted_sample_replaces_an_elapsed_slice_and_keeps_the_slice_cap() {
+        use super::PREPAID_SLICE_MS;
+        assert!(ExecutionLease::issue(0, u64::MAX).prepaid_until() == PREPAID_SLICE_MS);
+        assert!(
+            !ExecutionLease::issue(0, 1_000).renew_accounted(1_000, 1_000 + PREPAID_SLICE_MS + 1)
+        );
+        assert!(ExecutionLease::issue(0, 1_000).renew_accounted(1_000, 1_000 + PREPAID_SLICE_MS));
         let lease = ExecutionLease::issue(0, 1_000);
         assert!(!lease.renew_until(1_000, 2_000));
         assert!(lease.renew_accounted(1_000, 2_000));
         assert_eq!(lease.prepaid_until(), 2_000);
         assert_eq!(lease.admit_enqueue(1_999), 1);
-        assert!(!ExecutionLease::issue(0, 1_000).renew_accounted(1_000, 2_001));
         let revoked = ExecutionLease::issue(0, 1_000);
         revoked.revoke_local();
         assert!(!revoked.renew_accounted(1_000, 2_000));

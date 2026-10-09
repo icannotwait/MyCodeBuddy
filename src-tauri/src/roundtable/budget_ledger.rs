@@ -6,7 +6,8 @@ use roundtable_protocol::{
 };
 use sea_orm::ConnectionTrait;
 
-const SLICE_MS: u64 = 1000;
+/// Reservation per committed sample: `min(SLICE_MS, remaining)`.
+const SLICE_MS: u64 = super::resources::PREPAID_SLICE_MS;
 
 /// One process-local owner of a persisted prepaid time slice. Dropping the
 /// owner deliberately leaves the reservation charged for crash recovery.
