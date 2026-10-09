@@ -7588,6 +7588,9 @@
     "liveEnded": "출력이 끝났습니다. 검증을 기다리는 중입니다.",
     "liveThinking": "생각",
     "liveWaiting": "출력을 기다리는 중…",
-    "liveTruncated": "실시간 보기가 잘렸습니다. 검증 후 전체 텍스트가 표시됩니다."
+    "liveTruncated": "실시간 보기가 잘렸습니다. 검증 후 전체 텍스트가 표시됩니다.",
+    "topicMentionHelp": "@를 입력하면 워크스페이스 파일이나 폴더를 참조할 수 있습니다. 멤버는 읽기 전용으로 마운트된 /workspace-ro에서 직접 읽습니다.",
+    "workspaceMount": "워크스페이스(멤버)",
+    "workspaceMountReadOnly": "읽기 전용으로 마운트됩니다. 멤버는 읽고 검색할 수만 있으며 쓸 수 없습니다."
   }
 }

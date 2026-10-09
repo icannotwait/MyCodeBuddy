@@ -94,7 +94,10 @@ pub struct SandboxPlan {
     pub host_network: bool,
     pub docker_socket_mounted: bool,
     pub home_mounted: bool,
+    /// A writable project mount. Always refused.
     pub project_mounted: bool,
+    /// The registered workspace bound read-only at `/workspace-ro`.
+    pub project_read_only_mounted: bool,
     pub host_proc_mounted: bool,
     pub inherited_fds: bool,
     pub devices_allowed: bool,
@@ -115,6 +118,41 @@ pub struct SandboxPlan {
 
 pub fn build_sandbox_plan(input: &SandboxInput) -> RtResult<SandboxPlan> {
     linux_oci::build_plan(input)
+}
+
+/// The only project exposure a plan may carry is one read-only bind at
+/// `/workspace-ro` with the certified options. Any other mount whose source
+/// is that workspace, or a writable workspace mount, is refused.
+pub(crate) fn workspace_mount_is_read_only(plan: &SandboxPlan) -> bool {
+    let workspace: Vec<&PlanMount> = plan
+        .mounts
+        .iter()
+        .filter(|mount| mount.destination == linux_oci::WORKSPACE_MOUNT_DESTINATION)
+        .collect();
+    if !plan.project_read_only_mounted {
+        return workspace.is_empty();
+    }
+    let [mount] = workspace.as_slice() else {
+        return false;
+    };
+    let entries = plan.oci["mounts"].as_array();
+    mount.read_only
+        && plan
+            .mounts
+            .iter()
+            .filter(|other| other.source == mount.source)
+            .count()
+            == 1
+        && entries.is_some_and(|entries| {
+            entries
+                .iter()
+                .filter(|entry| entry["destination"] == linux_oci::WORKSPACE_MOUNT_DESTINATION)
+                .count()
+                == 1
+                && entries
+                    .iter()
+                    .any(|entry| *entry == linux_oci::workspace_mount_json(&mount.source))
+        })
 }
 
 /// Installed execution paths. This is configuration, never a qualification pass.
@@ -179,6 +217,13 @@ pub fn verify_qualified_oci_profile(
 ) -> RtResult<()> {
     linux_oci::verify_installed_profile(profile, certificate)
 }
+
+/// Read-only workspace bind entry, shared by live plans and the probe.
+pub(crate) fn linux_workspace_mount_json(source: &Path) -> serde_json::Value {
+    linux_oci::workspace_mount_json(source)
+}
+
+pub(crate) const WORKSPACE_MOUNT_DESTINATION: &str = linux_oci::WORKSPACE_MOUNT_DESTINATION;
 
 pub(crate) fn linux_runtime_mounts_json() -> Vec<serde_json::Value> {
     linux_oci::runtime_mount_json()
@@ -933,6 +978,7 @@ impl IsolationProvider for LinuxOciIsolator {
             || plan.seccomp_default.is_empty()
             || plan.cgroup.memory_max_bytes == 0
             || plan.cgroup.pids_max == 0
+            || !workspace_mount_is_read_only(plan)
         {
             return Err(rt_error(ErrorCode::InvalidArgument, "plan_incomplete"));
         }

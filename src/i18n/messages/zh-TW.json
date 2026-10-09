@@ -7588,6 +7588,9 @@
     "liveEnded": "輸出已結束，等待驗證。",
     "liveThinking": "思考過程",
     "liveWaiting": "等待輸出…",
-    "liveTruncated": "即時內容已截斷，驗證後將顯示完整內容。"
+    "liveTruncated": "即時內容已截斷，驗證後將顯示完整內容。",
+    "topicMentionHelp": "輸入 @ 可引用工作區中的檔案或資料夾。成員會在唯讀掛載的 /workspace-ro 中自行讀取。",
+    "workspaceMount": "工作區（成員可見）",
+    "workspaceMountReadOnly": "唯讀掛載。成員可以讀取與搜尋，無法寫入任何內容。"
   }
 }

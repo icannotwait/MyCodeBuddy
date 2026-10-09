@@ -7588,6 +7588,9 @@
     "liveEnded": "Streaming beendet. Wartet auf Prüfung.",
     "liveThinking": "Denkprozess",
     "liveWaiting": "Warte auf Ausgabe…",
-    "liveTruncated": "Live-Ansicht gekürzt. Der vollständige Text erscheint nach der Prüfung."
+    "liveTruncated": "Live-Ansicht gekürzt. Der vollständige Text erscheint nach der Prüfung.",
+    "topicMentionHelp": "Tippe @, um eine Datei oder einen Ordner des Arbeitsbereichs zu referenzieren. Mitglieder lesen sie selbst aus dem schreibgeschützten Mount /workspace-ro.",
+    "workspaceMount": "Arbeitsbereich (Mitglieder)",
+    "workspaceMountReadOnly": "Schreibgeschützt eingebunden. Mitglieder können lesen und suchen, aber nichts schreiben."
   }
 }

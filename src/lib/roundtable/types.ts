@@ -203,6 +203,8 @@ export interface RoundtablePreflight {
   tools: string[]
   network: string
   writes: string
+  /** Where members see the registered workspace, always read-only. */
+  workspace_mount?: { path: string; access: "read_only" }
   error: unknown
   capability: { recipients: RoundtableRecipient[] } | null
   source_manifests: RoundtableSourceManifest[]

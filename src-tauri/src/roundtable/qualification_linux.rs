@@ -604,6 +604,9 @@ fn required_denials(output: &str) -> bool {
         "DENIED proc_host",
         "DENIED network",
         "DENIED device",
+        "WORKSPACE_READ_OK",
+        "DENIED workspace_write",
+        "DENIED workspace_symlink",
         "PID1_OK",
         "ISOLATION_OK",
         "REAPED",
@@ -712,7 +715,24 @@ async fn run_isolation(request: &ProbeRequest) -> Result<String, String> {
     fs::write(&secret, b"probe-canary").map_err(|error| error.to_string())?;
     let script = scratch.join("probe.sh");
     fs::write(&script, ISOLATION_SCRIPT).map_err(|error| error.to_string())?;
-    let mounts = vec![(scratch.clone(), "/scratch".into(), false)];
+    // A stand-in workspace bound with the live read-only options: readable,
+    // not writable, and no symlink inside it resolves (nosymfollow).
+    let workspace = request.runtime_root.join("probe-workspace");
+    let _ = fs::remove_dir_all(&workspace);
+    fs::create_dir_all(&workspace).map_err(|error| error.to_string())?;
+    fs::write(workspace.join("readme.txt"), b"workspace-canary\n")
+        .map_err(|error| error.to_string())?;
+    #[cfg(unix)]
+    std::os::unix::fs::symlink("readme.txt", workspace.join("link"))
+        .map_err(|error| error.to_string())?;
+    let mounts = vec![
+        (scratch.clone(), "/scratch".into(), false),
+        (
+            workspace.clone(),
+            super::sandbox::WORKSPACE_MOUNT_DESTINATION.into(),
+            true,
+        ),
+    ];
     let output = run_container(
         request,
         &["/bin/sh".into(), "/scratch/probe.sh".into()],
@@ -724,6 +744,7 @@ async fn run_isolation(request: &ProbeRequest) -> Result<String, String> {
     )
     .await?;
     let _ = fs::remove_file(&secret);
+    let _ = fs::remove_dir_all(&workspace);
     Ok(output)
 }
 
@@ -1427,6 +1448,13 @@ fn prepare_bundle(
     let mut oci_mounts = super::sandbox::linux_runtime_mounts_json();
     let host_mounts = mounts;
     for (source, destination, read_only) in host_mounts {
+        if destination == super::sandbox::WORKSPACE_MOUNT_DESTINATION {
+            if !*read_only {
+                return Err("workspace mount must be read-only".into());
+            }
+            oci_mounts.push(super::sandbox::linux_workspace_mount_json(source));
+            continue;
+        }
         let mut options = vec!["bind", "nosuid", "nodev"];
         options.push(if *read_only { "ro" } else { "rw" });
         oci_mounts.push(serde_json::json!({
@@ -1698,6 +1726,7 @@ fn mint_probe_token() -> String {
 fn rootfs_layout_error(rootfs: &Path) -> Option<String> {
     for relative in [
         "dev", "dev/pts", "dev/shm", "sys", "tmp", "proc", "scratch", "rt-home",
+        "workspace-ro",
     ] {
         let path = rootfs.join(relative);
         match fs::symlink_metadata(&path) {
@@ -2144,6 +2173,12 @@ case "$nets" in
   *) fail network ;;
 esac
 if [ -r /dev/mem ] || [ -e /dev/sda ]; then fail device; else echo "DENIED device"; fi
+grep -q workspace-canary /workspace-ro/readme.txt 2>/dev/null || fail workspace_read
+echo "WORKSPACE_READ_OK"
+if touch /workspace-ro/codeg-probe-write 2>/dev/null; then fail workspace_write; fi
+if echo x >> /workspace-ro/readme.txt 2>/dev/null; then fail workspace_write; fi
+echo "DENIED workspace_write"
+if cat /workspace-ro/link >/dev/null 2>&1; then fail workspace_symlink; else echo "DENIED workspace_symlink"; fi
 echo canary > /scratch/canary || fail scratch
 echo "ISOLATION_OK"
 "#;

@@ -24,6 +24,7 @@ const transport = vi.hoisted(() => ({
   onReconnect: vi.fn(),
 }))
 const listModelProviders = vi.hoisted(() => vi.fn())
+vi.mock("./roundtable-topic-input")
 vi.mock("@/lib/transport", () => ({ getTransport: () => transport }))
 const recoveryFolders = vi.hoisted(() => [
   {

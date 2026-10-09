@@ -7588,6 +7588,9 @@
     "liveEnded": "Finished streaming. Awaiting verification.",
     "liveThinking": "Thinking",
     "liveWaiting": "Waiting for output…",
-    "liveTruncated": "Live view truncated. The full text appears once verified."
+    "liveTruncated": "Live view truncated. The full text appears once verified.",
+    "topicMentionHelp": "Type @ to reference a workspace file or folder. Members read it themselves from the read-only mount at /workspace-ro.",
+    "workspaceMount": "Workspace (members)",
+    "workspaceMountReadOnly": "Mounted read-only. Members can read and search it; nothing can be written."
   }
 }

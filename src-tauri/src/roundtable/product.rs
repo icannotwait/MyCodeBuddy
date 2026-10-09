@@ -204,7 +204,8 @@ impl RoundtableService {
                     "capability": runtime.as_ref().ok(),
                     "error": runtime.err(),
                     "tools": super::service_tool_names(),
-                    "network": "model_gateway_only", "writes":"scratch_only"
+                    "network": "model_gateway_only", "writes":"scratch_only",
+                    "workspace_mount": {"path": super::sandbox::WORKSPACE_MOUNT_DESTINATION, "access": "read_only"}
                 }))
             }
             "roundtable_create" => {

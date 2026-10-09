@@ -17,6 +17,7 @@ import {
 import type { ModelProviderInfo } from "@/lib/types"
 import { cn } from "@/lib/utils"
 import { BRAND_CLASSES, RoundtableSpeakerAvatar } from "./roundtable-transcript"
+import { RoundtableTopicInput } from "./roundtable-topic-input"
 
 export const ROUNDTABLE_AGENTS = [
   "grok",
@@ -91,6 +92,7 @@ export function RoundtableStep({
 export function RoundtableComposer({
   workspaceField,
   sourceRoot,
+  workspaceId,
   topic,
   onTopicChange,
   showSources,
@@ -136,6 +138,8 @@ export function RoundtableComposer({
   workspaceField?: ReactNode
   /** Absolute root that workspace-relative source paths resolve against. */
   sourceRoot?: string
+  /** Registered folder id; scopes the `@` file picker. */
+  workspaceId?: string
 }) {
   const t = useTranslations("Roundtable")
   const uid = useId()
@@ -164,16 +168,20 @@ export function RoundtableComposer({
         description={t("topicHelp")}
       >
         <div className="flex flex-col gap-2">
-          <Textarea
-            aria-label={t("topic")}
-            aria-invalid={topicMissing || undefined}
-            aria-describedby={topicMissing ? topicErrorId : undefined}
-            placeholder={t("topicPlaceholder")}
-            className="min-h-28 bg-background text-[15px] leading-relaxed md:text-[15px]"
+          <RoundtableTopicInput
             value={topic}
+            invalid={topicMissing}
+            describedBy={topicMissing ? topicErrorId : undefined}
+            workspaceId={workspaceId}
+            workspacePath={sourceRoot}
             onBlur={() => setTopicTouched(true)}
-            onChange={(event) => onTopicChange(event.target.value)}
+            onChange={onTopicChange}
           />
+          {sourceRoot ? (
+            <p className="text-xs leading-relaxed text-muted-foreground">
+              {t("topicMentionHelp")}
+            </p>
+          ) : null}
           {topicMissing ? (
             <p id={topicErrorId} className="text-sm text-destructive">
               {t("topicRequired")}

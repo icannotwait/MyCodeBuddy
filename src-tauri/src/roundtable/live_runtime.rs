@@ -1216,16 +1216,16 @@ pub(crate) fn roundtable_session_params_for(
 }
 
 /// Native Grok tools. Copied from the hidden-generation catalog minus the MCP
-/// meta-tools `search_tool` and `use_tool`. CLI `--disallowed-tools` is
+/// meta-tools `search_tool` and `use_tool`, and minus the read-only file tools
+/// `read_file`, `grep` and `list_dir`: members read the workspace themselves
+/// through the read-only `/workspace-ro` bind. Writes, terminals, network and
+/// subagents stay denied; the mount is read-only regardless. CLI `--disallowed-tools` is
 /// headless-only and does not apply to `grok agent stdio`.
 const GROK_ROUNDTABLE_DISALLOWED_TOOLS: &[&str] = &[
     "run_terminal_cmd",
     "run_terminal_command",
-    "read_file",
     "search_replace",
     "write",
-    "grep",
-    "list_dir",
     "web_search",
     "x_search",
     "web_fetch",
@@ -1583,7 +1583,9 @@ where
         if message.get("method").is_some() {
             if let Some(request_id) = message.get("id").cloned() {
                 let response = if message["method"] == "session/request_permission" {
-                    if !tool_call_is_roundtable(&message["params"]) {
+                    if !tool_call_is_roundtable(&message["params"])
+                        && !tool_call_is_workspace_read(&message["params"])
+                    {
                         exchange.rejected_permission.store(true, Ordering::Relaxed);
                     }
                     permission_reply(&message["params"], &request_id)
@@ -1884,6 +1886,9 @@ fn trace_acp_frame(
         if method == "session/request_permission" {
             record["tool_title"] = message["params"]["toolCall"]["title"].clone();
             record["roundtable_tool"] = json!(tool_call_is_roundtable(&message["params"]));
+            record["workspace_read"] = json!(tool_call_is_workspace_read(&message["params"]));
+            record["tool_kind"] = message["params"]["toolCall"]["kind"].clone();
+            record["locations"] = clipped_redacted(&message["params"]["toolCall"]["locations"], 600);
         } else {
             let params = &message["params"];
             let inner = params.get("update").unwrap_or(params);
@@ -1951,7 +1956,7 @@ fn parse_acp_frame(line: &[u8]) -> RtResult<Value> {
 const ROUNDTABLE_TOOL_NAMES: [&str; 3] = ["submit_result", "read_evidence", "search_evidence"];
 
 fn permission_reply(params: &Value, request_id: &Value) -> Value {
-    let allow = tool_call_is_roundtable(params);
+    let allow = tool_call_is_roundtable(params) || tool_call_is_workspace_read(params);
     // ACP does not prove that allow_always is confined to this sealed attempt.
     // If one-shot consent is unavailable, select a rejection instead.
     let selected = selected_option(params, allow).or_else(|| {
@@ -1993,6 +1998,40 @@ fn selected_option(params: &Value, allow: bool) -> Option<String> {
         }
     }
     None
+}
+
+/// A native read or search whose every declared location lies inside the
+/// read-only workspace bind. Anything without locations, with a relative or
+/// `..` path, or of any other kind (execute, edit, fetch, ...) is not one.
+fn tool_call_is_workspace_read(params: &Value) -> bool {
+    let call = &params["toolCall"];
+    if !matches!(
+        call.get("kind").and_then(Value::as_str),
+        Some("read" | "search")
+    ) {
+        return false;
+    }
+    let Some(locations) = call.get("locations").and_then(Value::as_array) else {
+        return false;
+    };
+    !locations.is_empty()
+        && locations.iter().all(|location| {
+            location
+                .get("path")
+                .and_then(Value::as_str)
+                .is_some_and(path_is_in_workspace_mount)
+        })
+}
+
+fn path_is_in_workspace_mount(path: &str) -> bool {
+    let root = super::sandbox::WORKSPACE_MOUNT_DESTINATION;
+    let Some(rest) = path.strip_prefix(root) else {
+        return false;
+    };
+    (rest.is_empty() || rest.starts_with('/'))
+        && !rest
+            .split('/')
+            .any(|part| part == ".." || part == "." || part.contains('\0'))
 }
 
 /// Structured identity only. A free-text command such as `echo submit_result`

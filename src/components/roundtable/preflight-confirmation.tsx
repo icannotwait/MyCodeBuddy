@@ -54,6 +54,7 @@ export function PreflightConfirmation({
   tools,
   network,
   writes,
+  workspaceMount,
   budget,
   attemptLimit,
   seatBrands,
@@ -67,6 +68,8 @@ export function PreflightConfirmation({
   tools: string[]
   network: string
   writes: string
+  /** Read-only workspace bind inside each member container. */
+  workspaceMount?: { path: string; access: string }
   budget: string
   /**
    * Per-attempt time limit for proposal/critique turns. Synthesis has no
@@ -226,6 +229,14 @@ export function PreflightConfirmation({
         <Fact label={t("writes")}>
           <code className="text-xs">{writes}</code>
         </Fact>
+        {workspaceMount ? (
+          <Fact label={t("workspaceMount")}>
+            <code className="text-xs">{workspaceMount.path}</code>
+            <span className="mt-0.5 block text-xs font-normal text-muted-foreground">
+              {t("workspaceMountReadOnly")}
+            </span>
+          </Fact>
+        ) : null}
         <Fact label={t("budget")}>{budget}</Fact>
         {attemptLimit ? (
           <Fact label={t("memberAttemptLimit")}>{attemptLimit}</Fact>
