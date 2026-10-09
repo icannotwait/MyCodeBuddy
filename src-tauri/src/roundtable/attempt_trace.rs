@@ -1012,6 +1012,9 @@ fn netns_id(link: &str) -> Option<String> {
 /// unavailable with a reason, never silently replaced by host counts (crun and
 /// slirp4netns live in the host netns).
 fn agent_netns_view(processes: &[Value]) -> Value {
+    if processes.is_empty() {
+        return json!({"available": false, "reason": "no_process_tree"});
+    }
     let host = netns_id("/proc/self/ns/net");
     let Some(host) = host else {
         return json!({"available": false, "reason": "host_netns_unreadable"});
@@ -1025,9 +1028,7 @@ fn agent_netns_view(processes: &[Value]) -> Value {
             .any(|process| process["alive"] == true && process["netns"].is_null());
         return json!({
             "available": false,
-            "reason": if processes.is_empty() {
-                "no_process_tree"
-            } else if unreadable {
+            "reason": if unreadable {
                 "netns_unreadable"
             } else {
                 "no_process_outside_host_netns"
@@ -1236,6 +1237,8 @@ mod tests {
         trace.snapshot("attempt_timeout", Some(std::process::id()), json!({}));
         let text = std::fs::read_to_string(trace.dir().join("snapshot.jsonl")).unwrap();
         assert!(text.contains("awaiting_upstream_headers"));
+        // Process-tree liveness comes from /proc (Linux, where the sandbox runs).
+        #[cfg(target_os = "linux")]
         assert!(text.contains("\"alive\":true"));
         trace.end_request(seq);
         assert!(trace.inflight_snapshot().is_empty());
@@ -1290,6 +1293,10 @@ mod tests {
         assert_eq!(connections[1]["remote"], "198.18.2.51:443");
         assert_eq!(connections[1]["state"], "ESTABLISHED");
         assert_eq!(agent_netns_view(&[])["reason"], "no_process_tree");
+        if !cfg!(target_os = "linux") {
+            // Network namespaces are read from /proc (Linux only).
+            return;
+        }
         // A tree that stays in the host netns (crun, slirp4netns) yields no
         // agent view instead of host counts.
         let me = std::process::id();

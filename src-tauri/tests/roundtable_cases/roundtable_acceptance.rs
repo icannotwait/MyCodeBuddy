@@ -1775,7 +1775,8 @@ async fn storage_fix_checkpoint_after_multi_second_stall_charges_gap_without_exh
     let mut lease = ActiveBudgetLease::begin(ready.store.clone(), ready.room, Epoch(1), Epoch(1))
         .await
         .unwrap();
-    let permission = ExecutionLease::issue(start_ms, lease.prepaid_until().saturating_sub(start_ms));
+    let permission =
+        ExecutionLease::issue(start_ms, lease.prepaid_until().saturating_sub(start_ms));
     assert_eq!(permission.prepaid_until(), start_ms + 1_000);
     // Simulate a dual-crun / SQLite stall longer than the one-second prepaid slice.
     let after_stall = start_ms + 3_500;

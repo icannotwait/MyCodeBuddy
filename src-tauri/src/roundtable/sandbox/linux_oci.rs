@@ -816,17 +816,40 @@ fn verify_component_once(
     {
         return Ok(true);
     }
+    let hash_started = std::time::SystemTime::now();
     if compute()? != *expected {
         return Ok(false);
     }
-    // Only cache if the file did not change while it was being hashed.
-    if component_stamp(path, expected)? == stamp {
+    // Only cache if the file did not change while it was being hashed and
+    // its timestamps are settled (see `stamp_is_settled`).
+    if component_stamp(path, expected)? == stamp && stamp_is_settled(&stamp, hash_started) {
         verified_components()
             .lock()
             .expect("verified components")
             .insert(stamp);
     }
     Ok(true)
+}
+
+/// Margin, in nanoseconds, that a cached stamp's mtime/ctime must be older than
+/// the start of the hash. Filesystem timestamps are coarse (one kernel tick
+/// on Linux, up to 1-2s on some filesystems). A same-length, in-place rewrite
+/// in the same tick as the verified write would otherwise produce an
+/// identical stamp and be accepted from the cache ("racily clean", as in git).
+/// With the margin, any write after caching carries a later ctime, so the
+/// stamp changes and the next launch re-hashes.
+const STAMP_SETTLE_NS: i128 = 2_000_000_000;
+
+fn stamp_is_settled(stamp: &ComponentStamp, hash_started: std::time::SystemTime) -> bool {
+    if !cfg!(unix) {
+        // No inode/ctime identity: every launch re-hashes.
+        return false;
+    }
+    let Ok(since_epoch) = hash_started.duration_since(std::time::UNIX_EPOCH) else {
+        return false;
+    };
+    let cutoff = since_epoch.as_nanos() as i128 - STAMP_SETTLE_NS;
+    stamp.mtime_ns < cutoff && stamp.ctime_ns < cutoff
 }
 
 fn verify_runtime_binary(path: &Path, expected: &Hash256) -> RtResult<bool> {
@@ -5045,6 +5068,19 @@ mod verify_once_tests {
     }
 
     #[test]
+    fn a_fresh_component_is_never_served_from_the_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        let crun = dir.path().join("crun");
+        fs::write(&crun, b"crun-v1").unwrap();
+        let crun_sha = file_hash(&crun).unwrap();
+        assert!(verify_runtime_binary(&crun, &crun_sha).unwrap());
+        // Same length, same inode, very likely the same timestamp tick.
+        fs::write(&crun, b"crun-v2").unwrap();
+        assert!(!verify_runtime_binary(&crun, &crun_sha).unwrap());
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn launches_reuse_the_verified_profile_and_rehash_only_on_change() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().canonicalize().unwrap();
@@ -5084,6 +5120,11 @@ mod verify_once_tests {
                 sha256: agent_sha,
             },
         ];
+        // Pinned components are installed well before launch; let their
+        // timestamps settle past the cache margin.
+        std::thread::sleep(std::time::Duration::from_millis(
+            (STAMP_SETTLE_NS / 1_000_000) as u64 + 100,
+        ));
         let baseline = walks(&rootfs);
         // First use verifies; every later launch step (preflight, plan build,
         // prepare, spawn, control, reap) reuses that result.
