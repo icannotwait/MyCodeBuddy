@@ -247,6 +247,11 @@ async fn dispatch(
     store: &dyn ToolStore,
 ) -> Option<Value> {
     let id = request.get("id")?.clone();
+    if let Some(method) = request.get("method").and_then(Value::as_str) {
+        if method != "tools/call" {
+            authority.trace_tool_event(json!({"event":"mcp_request","method":method}));
+        }
+    }
     let result = match request.get("method").and_then(Value::as_str) {
         Some("initialize") => {
             json!({"protocolVersion":"2024-11-05","capabilities":{"tools":{}},"serverInfo":{"name":"codeg-roundtable","version":"1"}})

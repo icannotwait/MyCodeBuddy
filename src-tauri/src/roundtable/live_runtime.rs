@@ -1,5 +1,6 @@
 //! Qualified OCI + ACP participant implementation. No ordinary conversation
 //! event bus is attached; the only data capabilities are the private brokers.
+use super::attempt_trace::AttemptTrace;
 use super::installed_runtime::InstalledRuntime;
 use super::live_gateway::{LiveGatewayServer, LiveModelGateway};
 use super::owned_runtime::{
@@ -38,6 +39,8 @@ struct Active {
     stderr: tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
     assistant: Mutex<Option<super::DiagnosticCapture>>,
     finish_reason: Mutex<Option<String>>,
+    /// Diagnostics-only per-attempt trace (observability; no behaviour).
+    trace: Option<Arc<AttemptTrace>>,
 }
 
 pub(crate) struct LiveParticipantExecutor {
@@ -347,6 +350,7 @@ impl LiveParticipantExecutor {
             // pending durable facts; never rerun a process to retry storage.
             return self.persist_reaped(&active, proof).await;
         }
+        trace_reap_snapshot(&active).await;
         active.authority.stop();
         active.gateway.revoke();
         if let Some(broker) = active.broker.lock().await.take() {
@@ -670,6 +674,33 @@ impl RoundtableTurnExecutor for LiveParticipantExecutor {
             gateway = gateway.with_native_upstream(upstream)?;
         }
         let gateway = Arc::new(gateway.with_execution_lease(request.execution_lease.clone()));
+        let trace = AttemptTrace::open(
+            &self.data_dir,
+            &request.room_id.to_string(),
+            &request.fence.attempt_id.to_string(),
+            diagnostic_secrets.clone(),
+        )
+        .map(Arc::new);
+        if let Some(trace) = &trace {
+            gateway.set_trace(trace.clone());
+            authority.set_trace(trace.clone());
+            trace.record(
+                "acp",
+                json!({
+                    "event": "attempt_start",
+                    "agent": agent,
+                    "phase_kind": format!("{:?}", authority.pinned_phase_kind()),
+                    "model": provider.model,
+                    "native_relay": matches!(agent.as_str(), "grok" | "antigravity"),
+                    "phase_id": request.phase.phase_id.to_string(),
+                    "speaker_id": request.speaker_id.to_string(),
+                    "incarnation": request.fence.incarnation.to_string(),
+                    "binding_id": request.fence.binding_id.to_string(),
+                    "prompt_bytes": request.prompt.len(),
+                    "deadline_in_ms": request.deadline_mono.saturating_sub(request.store.clock_sample().0),
+                }),
+            );
+        }
         let principal_row = one_row(
             request.store.connection(),
             "SELECT principal_id FROM rt_rooms WHERE room_id=?",
@@ -728,6 +759,7 @@ impl RoundtableTurnExecutor for LiveParticipantExecutor {
             assistant: Mutex::new(Some(super::DiagnosticCapture::new(diagnostic_secrets))),
             finish_reason: Mutex::new(None),
             agent: agent.clone(),
+            trace: trace.clone(),
         });
         self.active
             .lock()
@@ -814,10 +846,26 @@ impl RoundtableTurnExecutor for LiveParticipantExecutor {
             .stdout
             .take()
             .ok_or_else(|| rt_error(ErrorCode::RuntimeUnavailable, "acp_stdout"))?;
+        if let Some(trace) = &trace {
+            trace.record("acp", json!({"event":"spawned","child_pid":child.id()}));
+        }
         if let Some(mut stderr) = child.stderr.take() {
+            let stderr_trace = trace.clone();
             *active.stderr.lock().await = Some(tokio::spawn(async move {
                 let mut buf = [0u8; 4096];
-                while stderr.read(&mut buf).await.is_ok_and(|count| count > 0) {}
+                loop {
+                    match stderr.read(&mut buf).await {
+                        Ok(count) if count > 0 => {
+                            if let Some(trace) = &stderr_trace {
+                                trace.stderr_chunk(&buf[..count]);
+                            }
+                        }
+                        _ => break,
+                    }
+                }
+                if let Some(trace) = &stderr_trace {
+                    trace.stderr_finish();
+                }
             }));
         }
         *active.child.lock().await = Some(child);
@@ -851,6 +899,18 @@ impl RoundtableTurnExecutor for LiveParticipantExecutor {
                 .unwrap_or("completed")
                 .to_owned(),
         );
+        if let Some(trace) = &trace {
+            trace.record(
+                "acp",
+                json!({
+                    "event": "drive_acp_returned",
+                    "ok": result.is_ok(),
+                    "reason": result.as_ref().err().and_then(|error| error.details.reason.clone()),
+                    "message": result.as_ref().err().map(|error| error.message.clone()),
+                    "inflight_gateway": trace.inflight_snapshot(),
+                }),
+            );
+        }
         let cleanup = self.reap_active(request.fence.incarnation).await?;
         let watermark = complete_after_gateway_drain(result, &active.gateway)?;
         let row = optional_row(
@@ -876,6 +936,56 @@ impl RoundtableTurnExecutor for LiveParticipantExecutor {
             cleanup,
         })
     }
+}
+
+/// Diagnostics only. When an attempt is reaped before `drive_acp` returned
+/// (attempt_timeout, room stop), record the agent process tree, in-flight
+/// gateway requests and per-stream idle times before anything is torn down.
+async fn trace_reap_snapshot(active: &Active) {
+    let Some(trace) = &active.trace else {
+        return;
+    };
+    let finished = active
+        .finish_reason
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .clone();
+    let db_reason = match optional_row(
+        active.store.connection(),
+        "SELECT finish_reason FROM rt_attempts WHERE room_id=? AND attempt_id=?",
+        vec![
+            text(&active.room.to_string()),
+            text(&active.attempt.to_string()),
+        ],
+    )
+    .await
+    {
+        Ok(Some(row)) => column::<Option<String>>(&row, 0).ok().flatten(),
+        _ => None,
+    };
+    let pid = active
+        .child
+        .lock()
+        .await
+        .as_ref()
+        .and_then(tokio::process::Child::id);
+    let reason = if finished.is_some() {
+        "reap_after_finish"
+    } else {
+        db_reason.as_deref().unwrap_or("reaped_without_finish")
+    };
+    trace.stderr_flush_partial();
+    trace.snapshot(
+        reason,
+        pid,
+        json!({
+            "drive_acp_finish_reason": finished,
+            "db_finish_reason": db_reason,
+            "gateway_exchange_log": active.gateway.exchange_log(),
+            "gateway_completion_error": active.gateway.completion_error().and_then(|error| error.details.reason),
+            "pending_tool_handlers": active.authority.pending_handlers(),
+        }),
+    );
 }
 
 struct StoreClock(RoundtableStore);
@@ -1039,6 +1149,7 @@ async fn drive_acp(
             assistant: Some(&active.assistant),
             deadline: None,
             gateway: Some(&active.gateway),
+            trace: active.trace.as_deref(),
         },
     )
     .await?;
@@ -1151,6 +1262,7 @@ struct SeatPromptControl<'a> {
     assistant: Option<&'a Mutex<Option<super::DiagnosticCapture>>>,
     deadline: Option<Duration>,
     gateway: Option<&'a LiveModelGateway>,
+    trace: Option<&'a AttemptTrace>,
 }
 impl SeatPromptControl<'_> {
     fn check_completion(&self) -> RtResult<()> {
@@ -1195,6 +1307,7 @@ where
                 deadline: control.deadline,
                 rejected_permission: &rejected,
                 private_log: None,
+                trace: control.trace,
             },
         )
         .await?;
@@ -1231,6 +1344,8 @@ pub(crate) struct AcpExchange<'a> {
     pub(crate) rejected_permission: &'a AtomicBool,
     /// Qualification probe log of private ACP frames. Live seats pass `None`.
     pub(crate) private_log: Option<&'a std::sync::Mutex<Vec<String>>>,
+    /// Diagnostics-only attempt trace. Live seats pass the attempt trace.
+    pub(crate) trace: Option<&'a AttemptTrace>,
 }
 
 async fn rpc(
@@ -1255,6 +1370,7 @@ async fn rpc(
             deadline: None,
             rejected_permission: &rejected,
             private_log: None,
+            trace: active.trace.as_deref(),
         },
     )
     .await
@@ -1375,6 +1491,18 @@ where
         }),
     )
     .await?;
+    if let Some(trace) = exchange.trace {
+        trace.record(
+            "acp",
+            json!({
+                "event": "send",
+                "id": exchange.id,
+                "method": exchange.method,
+                "prompt_bytes": exchange.params.pointer("/prompt/0/text").and_then(Value::as_str).map(str::len),
+            }),
+        );
+    }
+    let mut chunks = ChunkAgg::new(exchange.trace);
     let started = tokio::time::Instant::now();
     loop {
         if let Some(limit) = exchange.deadline {
@@ -1412,6 +1540,9 @@ where
             return Err(rt_error(ErrorCode::RuntimeUnavailable, "acp_frame"));
         }
         let message = parse_acp_frame(&line)?;
+        if exchange.trace.is_some() {
+            trace_acp_frame(&mut chunks, &message, line.len(), exchange.id);
+        }
         *exchange.seq = exchange
             .seq
             .checked_add(1)
@@ -1479,6 +1610,177 @@ where
             return Ok(result);
         }
     }
+}
+
+/// Coalesces consecutive message/thought chunks into one trace record
+/// (count, bytes, first/last time, short text preview for message chunks).
+struct ChunkAgg<'a> {
+    trace: Option<&'a AttemptTrace>,
+    kind: Option<String>,
+    count: u64,
+    bytes: u64,
+    first_ms: u64,
+    last_ms: u64,
+    preview: String,
+}
+
+impl<'a> ChunkAgg<'a> {
+    fn new(trace: Option<&'a AttemptTrace>) -> Self {
+        Self {
+            trace,
+            kind: None,
+            count: 0,
+            bytes: 0,
+            first_ms: 0,
+            last_ms: 0,
+            preview: String::new(),
+        }
+    }
+
+    fn add(&mut self, kind: &str, text: &str) {
+        let Some(trace) = self.trace else {
+            return;
+        };
+        if self.kind.as_deref() != Some(kind) {
+            self.flush();
+            self.kind = Some(kind.to_owned());
+            self.first_ms = trace.elapsed_ms();
+        }
+        self.count += 1;
+        self.bytes += text.len() as u64;
+        self.last_ms = trace.elapsed_ms();
+        if kind == "agent_message_chunk" && self.preview.len() < 400 {
+            self.preview.push_str(text);
+        }
+    }
+
+    fn flush(&mut self) {
+        let (Some(trace), Some(kind)) = (self.trace, self.kind.take()) else {
+            return;
+        };
+        trace.record(
+            "acp",
+            json!({
+                "event": "chunks",
+                "update": kind,
+                "count": self.count,
+                "bytes": self.bytes,
+                "first_t_ms": self.first_ms,
+                "last_t_ms": self.last_ms,
+                "preview": if self.preview.is_empty() { None } else { Some(self.preview.clone()) },
+            }),
+        );
+        self.count = 0;
+        self.bytes = 0;
+        self.preview.clear();
+    }
+}
+
+impl Drop for ChunkAgg<'_> {
+    fn drop(&mut self) {
+        self.flush();
+    }
+}
+
+fn clipped_redacted(value: &Value, limit: usize) -> Value {
+    let mut copy = value.clone();
+    redact_acp_value(&mut copy);
+    let text = serde_json::to_string(&copy).unwrap_or_default();
+    if text.len() <= limit {
+        copy
+    } else {
+        let mut cut = limit;
+        while !text.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        Value::String(format!("{}…(+{} bytes)", &text[..cut], text.len() - cut))
+    }
+}
+
+/// Records one ACP frame as types, ids and sizes (diagnostics only).
+fn trace_acp_frame(
+    chunks: &mut ChunkAgg<'_>,
+    message: &Value,
+    line_bytes: usize,
+    exchange_id: u64,
+) {
+    let Some(trace) = chunks.trace else {
+        return;
+    };
+    let method = message.get("method").and_then(Value::as_str);
+    if method == Some("session/update") {
+        let update = &message["params"]["update"];
+        let kind = update["sessionUpdate"].as_str().unwrap_or("?");
+        if matches!(
+            kind,
+            "agent_message_chunk" | "agent_thought_chunk" | "user_message_chunk"
+        ) {
+            chunks.add(kind, update["content"]["text"].as_str().unwrap_or(""));
+            return;
+        }
+        chunks.flush();
+        let mut record = json!({"event":"update","update":kind,"line_bytes":line_bytes});
+        match kind {
+            "tool_call" | "tool_call_update" => {
+                for key in ["toolCallId", "title", "kind", "status"] {
+                    if let Some(value) = update.get(key) {
+                        record[key] = value.clone();
+                    }
+                }
+                if let Some(raw) = update.get("rawInput") {
+                    record["raw_input_bytes"] = json!(raw.to_string().len());
+                    if let Some(name) = raw
+                        .get("name")
+                        .or_else(|| raw.get("tool_name"))
+                        .or_else(|| raw.get("toolName"))
+                    {
+                        record["raw_input_tool"] = name.clone();
+                    }
+                }
+                if let Some(raw) = update.get("rawOutput") {
+                    record["raw_output_bytes"] = json!(raw.to_string().len());
+                }
+                if let Some(content) = update.get("content") {
+                    record["content_bytes"] = json!(content.to_string().len());
+                }
+            }
+            "plan" => {
+                record["entries"] = json!(update["entries"].as_array().map(Vec::len));
+            }
+            _ => {
+                record["detail"] = clipped_redacted(update, 800);
+            }
+        }
+        trace.record("acp", record);
+        return;
+    }
+    chunks.flush();
+    if let Some(method) = method {
+        let mut record = json!({"event":"notification","method":method,"line_bytes":line_bytes});
+        if let Some(id) = message.get("id") {
+            record["event"] = json!("agent_request");
+            record["id"] = id.clone();
+        }
+        if method == "session/request_permission" {
+            record["tool_title"] = message["params"]["toolCall"]["title"].clone();
+            record["roundtable_tool"] = json!(tool_call_is_roundtable(&message["params"]));
+        } else {
+            let params = &message["params"];
+            let inner = params.get("update").unwrap_or(params);
+            record["update"] = inner.get("sessionUpdate").cloned().unwrap_or(Value::Null);
+            record["detail"] = clipped_redacted(inner, 1500);
+        }
+        trace.record("acp", record);
+        return;
+    }
+    let mut record = json!({"event":"response","id":message.get("id"),"line_bytes":line_bytes,"for_exchange": message.get("id") == Some(&json!(exchange_id))});
+    if let Some(error) = message.get("error") {
+        record["error"] = json!(describe_acp_rejection(error));
+    } else if let Some(result) = message.get("result") {
+        record["stop_reason"] = result.get("stopReason").cloned().unwrap_or(Value::Null);
+        record["result"] = clipped_redacted(result, 1200);
+    }
+    trace.record("acp", record);
 }
 
 fn note_private_frame(exchange: &AcpExchange<'_>, label: &str) {
@@ -2207,6 +2509,7 @@ pub async fn exercise_live_acp_rpc() -> RtResult<LiveAcpRpcObservation> {
                 deadline: Some(Duration::from_secs(5)),
                 rejected_permission: &rejected,
                 private_log: None,
+                trace: None,
             },
         )
         .await?;
@@ -2225,6 +2528,7 @@ pub async fn exercise_live_acp_rpc() -> RtResult<LiveAcpRpcObservation> {
                 deadline: Some(Duration::from_secs(5)),
                 rejected_permission: &rejected,
                 private_log: None,
+                trace: None,
             },
         )
         .await
@@ -2499,6 +2803,7 @@ pub async fn prepared_live_cleanup_fixture(
         stderr: tokio::sync::Mutex::new(None),
         assistant: Mutex::new(Some(diagnostic)),
         finish_reason: Mutex::new(Some("completed".into())),
+        trace: None,
     });
     executor
         .active
@@ -2536,6 +2841,7 @@ pub async fn drive_prompt_frames_fixture(frames: &[Value]) -> RtResult<u64> {
             deadline: None,
             rejected_permission: &rejected,
             private_log: None,
+            trace: None,
         },
     )
     .await?;
@@ -2584,6 +2890,7 @@ pub async fn exercise_schema_seat_rpc() -> RtResult<SchemaSeatObservation> {
                 deadline: Some(Duration::from_secs(5)),
                 rejected_permission: &rejected,
                 private_log: None,
+                trace: None,
             },
         )
         .await?;
@@ -2604,6 +2911,7 @@ pub async fn exercise_schema_seat_rpc() -> RtResult<SchemaSeatObservation> {
                 deadline: Some(Duration::from_secs(5)),
                 rejected_permission: &rejected,
                 private_log: None,
+                trace: None,
             },
         )
         .await?;
@@ -2617,6 +2925,7 @@ pub async fn exercise_schema_seat_rpc() -> RtResult<SchemaSeatObservation> {
                 assistant: Some(&capture),
                 deadline: Some(Duration::from_secs(5)),
                 gateway: None,
+                trace: None,
             },
         )
         .await
@@ -2881,6 +3190,7 @@ pub(crate) async fn permission_repair_frames_fixture(
             assistant: None,
             deadline: None,
             gateway,
+            trace: None,
         },
     )
     .await
@@ -3191,5 +3501,67 @@ mod completion_contract_tests {
         assert!(!text.contains("secret-value"), "{text}");
         assert!(!text.to_ascii_lowercase().contains("token"), "{text}");
         assert!(!text.contains("sk-"), "{text}");
+    }
+}
+
+#[cfg(test)]
+mod attempt_trace_acp_tests {
+    use super::*;
+
+    #[test]
+    fn acp_frames_are_traced_as_shapes_and_chunks_coalesce() {
+        let dir = tempfile::tempdir().unwrap();
+        let trace = AttemptTrace::open(
+            dir.path(),
+            "room-a",
+            "attempt-a",
+            vec!["seat-secret-123456".into()],
+        )
+        .unwrap();
+        {
+            let mut chunks = ChunkAgg::new(Some(&trace));
+            for text in ["Synthesis ", "submitted."] {
+                trace_acp_frame(
+                    &mut chunks,
+                    &json!({"method":"session/update","params":{"update":{"sessionUpdate":"agent_message_chunk","content":{"text":text}}}}),
+                    10,
+                    5,
+                );
+            }
+            trace_acp_frame(
+                &mut chunks,
+                &json!({"method":"_x.ai/session_notification","params":{"update":{"sessionUpdate":"retry_state","type":"retrying","attempt":1,"reason":"API error seat-secret-123456","token":"sk-abc"}}}),
+                10,
+                5,
+            );
+            trace_acp_frame(
+                &mut chunks,
+                &json!({"method":"session/update","params":{"update":{"sessionUpdate":"tool_call","toolCallId":"t1","title":"use_tool","status":"pending","rawInput":{"name":"submit_result","arguments":{"x":"BODY"}}}}}),
+                10,
+                5,
+            );
+            trace_acp_frame(
+                &mut chunks,
+                &json!({"id":5,"result":{"stopReason":"end_turn"}}),
+                10,
+                5,
+            );
+        }
+        let text = std::fs::read_to_string(
+            dir.path()
+                .join("roundtable/diag/room-a/attempt-a/acp.jsonl"),
+        )
+        .unwrap();
+        assert!(text.contains("\"count\":2"), "{text}");
+        assert!(text.contains("Synthesis submitted."), "{text}");
+        assert!(text.contains("retry_state"), "{text}");
+        assert!(text.contains("\"stop_reason\":\"end_turn\""), "{text}");
+        assert!(
+            text.contains("\"raw_input_tool\":\"submit_result\""),
+            "{text}"
+        );
+        assert!(!text.contains("seat-secret-123456"), "{text}");
+        assert!(!text.contains("sk-abc"), "{text}");
+        assert!(!text.contains("BODY"), "{text}");
     }
 }

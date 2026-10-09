@@ -7,6 +7,7 @@
 mod acceptance;
 mod actor;
 mod api;
+mod attempt_trace;
 mod authorization;
 mod budget_ledger;
 pub(crate) mod capabilities;

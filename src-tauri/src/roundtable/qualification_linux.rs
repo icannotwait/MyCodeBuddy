@@ -1148,6 +1148,7 @@ async fn rpc(
             deadline: Some(Duration::from_secs(90)),
             rejected_permission: &rejected,
             private_log,
+            trace: None,
         },
     )
     .await

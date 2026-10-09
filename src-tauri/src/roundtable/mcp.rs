@@ -170,6 +170,8 @@ pub struct GateToolAuthority {
     interjection_used: Mutex<u64>,
     linear: Mutex<Linear>,
     attempt_io: tokio::sync::Mutex<()>,
+    /// Diagnostics-only per-attempt trace (observability; no behaviour).
+    trace: std::sync::OnceLock<Arc<super::attempt_trace::AttemptTrace>>,
 }
 
 impl GateToolAuthority {
@@ -204,6 +206,19 @@ impl GateToolAuthority {
                 returned_bytes: 0,
             }),
             attempt_io: tokio::sync::Mutex::new(()),
+            trace: std::sync::OnceLock::new(),
+        }
+    }
+
+    /// Attaches the diagnostics-only attempt trace. Observability only.
+    pub(crate) fn set_trace(&self, trace: Arc<super::attempt_trace::AttemptTrace>) {
+        let _ = self.trace.set(trace);
+    }
+
+    /// Records a tool-broker event on the attempt trace, if any.
+    pub(crate) fn trace_tool_event(&self, value: serde_json::Value) {
+        if let Some(trace) = self.trace.get() {
+            trace.record("tools", value);
         }
     }
 
@@ -424,8 +439,36 @@ pub async fn invoke_scoped_tool(
     authority: &GateToolAuthority,
     store: &dyn ToolStore,
 ) -> RtResult<RoundtableToolResponse> {
+    let traced = authority.trace.get().cloned();
+    let call_started = std::time::Instant::now();
+    if let Some(trace) = &traced {
+        trace.record(
+            "tools",
+            serde_json::json!({
+                "event": "tool_call_received",
+                "tool": call.name,
+                "arguments_bytes": serde_json::to_string(&call.arguments).map(|text| text.len()).unwrap_or(0),
+                "submission_id": call.arguments.get("submission_id"),
+            }),
+        );
+    }
     let _guard = authority.attempt_io.lock().await;
+    if let Some(trace) = &traced {
+        let waited = call_started.elapsed().as_millis();
+        if waited > 50 {
+            trace.record(
+                "tools",
+                serde_json::json!({"event":"tool_call_lock_wait","tool":call.name,"waited_ms":waited}),
+            );
+        }
+    }
     if !service_tool_names().contains(&call.name.as_str()) {
+        if let Some(trace) = &traced {
+            trace.record(
+                "tools",
+                serde_json::json!({"event":"tool_call_result","tool":call.name,"ok":false,"error":"tool_not_admitted"}),
+            );
+        }
         return Err(rt_error(ErrorCode::Forbidden, "tool_not_admitted"));
     }
     let (scope, handler) = authority.begin_admission(token)?;
@@ -444,7 +487,71 @@ pub async fn invoke_scoped_tool(
     let mut guard = guard;
     guard.evidence_bytes = charged;
     drop(guard);
+    if let Some(trace) = &traced {
+        trace.record("tools", tool_result_record(&result, call_started));
+        if let Ok(response) = &result {
+            let staged = response.receipt.is_some()
+                && serde_json::from_slice::<serde_json::Value>(&response.body)
+                    .ok()
+                    .and_then(|body| {
+                        body.get("kind")
+                            .and_then(|kind| kind.as_str())
+                            .map(str::to_owned)
+                    })
+                    .as_deref()
+                    == Some("staged");
+            if response.tool == "submit_result" && staged {
+                // Seal timestamp side log: rt_submissions has no timestamp.
+                trace.record(
+                    "tools",
+                    serde_json::json!({
+                        "event": "submission_sealed",
+                        "candidate_id": response.receipt.as_ref().map(|receipt| receipt.candidate_id.as_str()),
+                        "seal_wall": super::attempt_trace::wall_now(),
+                    }),
+                );
+            }
+        }
+    }
     result
+}
+
+/// Diagnostics-only summary of a tool result: tool, outcome, kind,
+/// field-error paths/reasons, error reason. No result content.
+fn tool_result_record(
+    result: &RtResult<RoundtableToolResponse>,
+    started: std::time::Instant,
+) -> serde_json::Value {
+    let elapsed = started.elapsed().as_millis();
+    match result {
+        Ok(response) => {
+            let body: serde_json::Value =
+                serde_json::from_slice(&response.body).unwrap_or(serde_json::Value::Null);
+            let field_errors: Vec<serde_json::Value> = body
+                .get("field_errors")
+                .and_then(|value| value.as_array())
+                .map(|items| items.iter().take(20).cloned().collect())
+                .unwrap_or_default();
+            serde_json::json!({
+                "event": "tool_call_result",
+                "tool": response.tool,
+                "ok": true,
+                "kind": body.get("kind"),
+                "candidate_id": body.get("candidate_id"),
+                "field_error_count": body.get("field_errors").and_then(|value| value.as_array()).map(Vec::len),
+                "field_errors": field_errors,
+                "reply_bytes": response.body.len(),
+                "elapsed_ms": elapsed,
+            })
+        }
+        Err(error) => serde_json::json!({
+            "event": "tool_call_result",
+            "ok": false,
+            "error_code": format!("{:?}", error.code),
+            "error": error.details.reason,
+            "elapsed_ms": elapsed,
+        }),
+    }
 }
 
 struct AdmittedHandler<'a> {
