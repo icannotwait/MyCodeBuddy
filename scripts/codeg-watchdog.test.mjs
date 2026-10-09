@@ -564,7 +564,10 @@ echo 2000003600 >"$TEST_ROOT/now"
 probe_public
 `)
   assert.equal(result.status, 0, result.stderr)
-  assert.equal(result.log.match(/CODEG_PUBLIC_URL is not configured/g)?.length, 2)
+  assert.equal(
+    result.log.match(/CODEG_PUBLIC_URL is not configured/g)?.length,
+    2
+  )
 })
 
 function daemonLoopSetup(extra = "") {
@@ -614,7 +617,10 @@ sleep_hook() {
   assert.equal(status.length, 2)
   assert.match(status[0], /public=unconfigured/)
   assert.match(status[1], /public=bad pubcode=530/)
-  assert.match(result.log, /config reloaded .*public_url=https:\/\/edge\.example\.test\//)
+  assert.match(
+    result.log,
+    /config reloaded .*public_url=https:\/\/edge\.example\.test\//
+  )
   // Routine start-if-missing only; one 530 is below the threshold of 2.
   assert.doesNotMatch(result.starts, /--force/)
 })
@@ -645,9 +651,18 @@ ${wakeReport}
   assert.equal(result.status, 0, result.stderr)
   assert.equal(result.stdout, "result=0 streak=1 used=1 pub=bad\n")
   assert.equal(result.starts, "1 --force\n")
-  assert.match(result.log, /resume detected gap=340s \(slept 400s, expected 60s\)/)
-  assert.match(result.log, /resume: public probe bad code=530 mention=none; re-probing in 10s/)
-  assert.match(result.log, /restart cloudflared ONLY \(wake: cooldown bypassed\): resume: public code=530/)
+  assert.match(
+    result.log,
+    /resume detected gap=340s \(slept 400s, expected 60s\)/
+  )
+  assert.match(
+    result.log,
+    /resume: public probe bad code=530 mention=none; re-probing in 10s/
+  )
+  assert.match(
+    result.log,
+    /restart cloudflared ONLY \(wake: cooldown bypassed\): resume: public code=530/
+  )
   assert.equal(result.curls.trim().split("\n").length, 2)
 })
 
@@ -675,9 +690,15 @@ printf 'sleeps=%s\n' "$(tr '\n' ' ' <"$TEST_ROOT/sleeps")"
 `)
   assert.equal(result.status, 0, result.stderr)
   // First sleep is the normal 60s; inside the watch window the next is 15s.
-  assert.equal(result.stdout, "result=0 streak=0 used=0 pub=ok\nsleeps=60 15 \n")
+  assert.equal(
+    result.stdout,
+    "result=0 streak=0 used=0 pub=ok\nsleeps=60 15 \n"
+  )
   assert.equal(result.starts, "")
-  assert.match(result.log, /resume: public probe ok code=200; no restart \(watching 300s\)/)
+  assert.match(
+    result.log,
+    /resume: public probe ok code=200; no restart \(watching 300s\)/
+  )
 })
 
 test("a re-probe that recovers (self-reconnect) avoids a restart", () => {
@@ -735,7 +756,10 @@ ${wakeReport}
   assert.equal(cooldown.status, 0, cooldown.stderr)
   // Recent attempt (100s ago) is bypassed once; the next failure is normal.
   assert.equal(cooldown.starts, "1 --force\n")
-  assert.equal(cooldown.stdout, "result=0 streak=1 used=1 pub=bad\nresult=2 streak=2 used=1 pub=bad\n")
+  assert.equal(
+    cooldown.stdout,
+    "result=0 streak=1 used=1 pub=bad\nresult=2 streak=2 used=1 pub=bad\n"
+  )
   assert.match(cooldown.log, /tunnel restart skipped: cooldown\/backoff/)
 
   const grace = runWatchdog(`
@@ -804,4 +828,13 @@ CURL_CODE=530
   // restart. Loop 2 sleeps 15s (watch window). No codeg-server restart.
   assert.equal(result.starts.match(/1 --force/g)?.length, 1)
   assert.equal(result.stdout, "sleeps=60 10 15 15 \n")
+})
+
+test("watchdog starts ensure-acp in the background so health checks continue", () => {
+  const source = readFileSync(watchdogPath, "utf8")
+  assert.match(
+    source,
+    /nohup "\$BOOT\/ensure-acp-agents\.sh" >\/dev\/null 2>&1 8>&- 9>&- &/
+  )
+  assert.doesNotMatch(source, /"\$BOOT\/ensure-acp-agents\.sh" 9>&- \|\| true/)
 })

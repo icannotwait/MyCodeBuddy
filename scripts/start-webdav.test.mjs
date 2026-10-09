@@ -13,8 +13,10 @@ import { tmpdir } from "node:os"
 import { join } from "node:path"
 import test from "node:test"
 
-const scriptPath = new URL("../deploy/codeg-boot/scripts/start-webdav.sh", import.meta.url)
-  .pathname
+const scriptPath = new URL(
+  "../deploy/codeg-boot/scripts/start-webdav.sh",
+  import.meta.url
+).pathname
 
 // Everything runs in a temp root: fake python/venv/pip/start.sh, a port that
 // nothing listens on, and no real WsgiDAV, network, or /workspace paths.
@@ -24,7 +26,10 @@ function setup({ cfg = true, pipExit = 0 } = {}) {
   const hb = join(root, "hb")
   mkdirSync(dav, { recursive: true })
   if (cfg) writeFileSync(join(dav, "wsgidav.yaml"), "port: 1\n")
-  writeFileSync(join(dav, "start.sh"), `#!/bin/bash\necho started >>"${root}/starts"\n`)
+  writeFileSync(
+    join(dav, "start.sh"),
+    `#!/bin/bash\necho started >>"${root}/starts"\n`
+  )
   chmodSync(join(dav, "start.sh"), 0o755)
   const fakePython = join(root, "python3")
   writeFileSync(
@@ -61,8 +66,17 @@ chmod +x "$3/bin/python" "$3/bin/pip"
       Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 20)
     }
   }
-  const read = (name) => (existsSync(join(root, name)) ? readFileSync(join(root, name), "utf8") : "")
-  return { root, dav, hb, run, read, waitFor, cleanup: () => rmSync(root, { recursive: true, force: true }) }
+  const read = (name) =>
+    existsSync(join(root, name)) ? readFileSync(join(root, name), "utf8") : ""
+  return {
+    root,
+    dav,
+    hb,
+    run,
+    read,
+    waitFor,
+    cleanup: () => rmSync(root, { recursive: true, force: true }),
+  }
 }
 
 test("a missing venv is rebuilt from the pinned spec, then WsgiDAV starts", () => {
@@ -71,10 +85,16 @@ test("a missing venv is rebuilt from the pinned spec, then WsgiDAV starts", () =
     const result = t.run()
     assert.equal(result.status, 0, result.stderr)
     assert.match(t.read("python-calls"), /^-m venv .*\/webdav\/venv\n$/)
-    assert.match(t.read("pip-calls"), /install .*WsgiDAV==4\.3\.5 cheroot==11\.1\.2/)
+    assert.match(
+      t.read("pip-calls"),
+      /install .*WsgiDAV==4\.3\.5 cheroot==11\.1\.2/
+    )
     t.waitFor("starts")
     assert.equal(t.read("starts"), "started\n")
-    assert.match(readFileSync(join(t.dav, "webdav.log"), "utf8"), /venv rebuilt/)
+    assert.match(
+      readFileSync(join(t.dav, "webdav.log"), "utf8"),
+      /venv rebuilt/
+    )
     // Healthy venv afterwards: the next call (port still down) only restarts.
     t.run()
     const deadline = Date.now() + 3000
@@ -115,7 +135,10 @@ test("a missing config fails visibly without touching the venv", () => {
     const result = t.run()
     assert.equal(result.status, 1)
     assert.match(result.stderr, /missing .*wsgidav\.yaml/)
-    assert.match(readFileSync(join(t.dav, "webdav.log"), "utf8"), /missing .*wsgidav\.yaml/)
+    assert.match(
+      readFileSync(join(t.dav, "webdav.log"), "utf8"),
+      /missing .*wsgidav\.yaml/
+    )
     assert.equal(t.read("python-calls"), "")
   } finally {
     t.cleanup()

@@ -49,6 +49,9 @@ SCRIPTS=(
   start-codeg-server.sh
   start-codeg-tunnel.sh
   start-webdav.sh
+  start-tailscale.sh
+  set-tailscale-key.sh
+  join-tailnet.sh
   reload-watchdog-once.sh
   auto-sync-boot.sh
 )
@@ -102,9 +105,15 @@ fetch_via_github() {
 }
 
 apply_staged() {
-  local f changed=0
+  local f changed=0 hold=$HB/boot-sync.local-hold
   for f in "${SCRIPTS[@]}"; do
     [ -f "$TMP/$f" ] || continue
+    # Skip files listed in boot-sync.local-hold (basename per line) so local
+    # box edits can survive until they are merged into MyCodeBuddy.
+    if [ -f "$hold" ] && grep -qxF "$f" "$hold"; then
+      log "hold: skip $f (listed in boot-sync.local-hold)"
+      continue
+    fi
     if [ -f "$BOOT/$f" ] && cmp -s "$TMP/$f" "$BOOT/$f"; then
       continue
     fi

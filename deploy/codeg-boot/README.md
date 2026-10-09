@@ -31,7 +31,8 @@ secrets or binary caches.
    extract into `/workspace/codeg-data/acp-binaries-mirror`, then run
    `ensure-acp-agents.sh` (restores live cache; downloads only what is still
    missing). Prefer this over fresh Google downloads when `dl.google.com` is
-   flaky (fake-ip / egress).
+   flaky (fake-ip / egress). Install `rsync`: `sync_dir` prefers `rsync -a`
+   over `cp -a`.
 4. Create local-only secrets (`CODEG_TOKEN`, cloudflared creds) using the
    examples in this folder — never commit them.
 5. Last resort: build from source (`pnpm` + `cargo`).
@@ -51,8 +52,10 @@ See also the handoff doc pattern under your private notes
 
 ## Automatic updates (watchdog)
 
-`codeg-watchdog.sh` calls `auto-sync-boot.sh` on the same ~10 minute cadence as
-`ensure-acp-agents.sh`. The sync script itself rate-limits to once per hour
+`codeg-watchdog.sh` starts `ensure-acp-agents.sh` in the background every ~10
+minutes (same `nohup` pattern as `codeg-supervisor.sh`) so a slow ACP mirror
+copy cannot stall health checks. It calls `auto-sync-boot.sh` on that same
+cadence. The sync script itself rate-limits to once per hour
 (`CODEG_BOOT_SYNC_INTERVAL_SECS`, default `3600`).
 
 It prefers a local `MyCodeBuddy` checkout. After `git fetch` it copies each
@@ -65,6 +68,19 @@ or ACP caches. When scripts change, the watchdog reloads itself via
 `reload-watchdog-once.sh`.
 
 Disable by removing execute bit: `chmod a-x /workspace/codeg-boot/auto-sync-boot.sh`.
+
+To keep a local edit of one script until it is merged, list its basename (one
+per line) in `/workspace/heartbeat/boot-sync.local-hold`; the sync logs
+`hold: skip <file>` and leaves it alone. Remove the line once the change is on
+`main`.
+
+## Roundtable cgroup (`start-codeg-server.sh`)
+
+Roundtable members run in crun containers under
+`/sys/fs/cgroup/codeg-roundtable`. When that delegated cgroup exists,
+`start-codeg-server.sh` moves itself (and so the exec'd `codeg-server`) into
+`codeg-roundtable/launcher` with one narrow `sudo -n tee`. Missing cgroup is a
+no-op; a failed join only warns.
 
 ## Resume / wake recovery
 
@@ -101,6 +117,14 @@ config's `credentials-file` stays absolute), and logs the resolved config on
 every start/force and on failure to `cloudflared.log`. Check without touching
 the tunnel: `start-codeg-tunnel.sh --force --print-config`.
 
+If the IPv4 A record (`getent ahostsv4`) for `region1.v2.argotunnel.com`
+is a fake-ip (`198.18.x` / `198.19.x`, Clash/sing-box `198.18.0.0/15`) or
+empty, the start script resolves region1/region2 A records via Cloudflare
+DoH (`https://cloudflare-dns.com/dns-query`, pinned to `1.1.1.1`) and
+passes each as `--edge IP:7844`, so cloudflared does not dial the hijacked
+address (0 connections, public 530/1033). `CODEG_TUNNEL_EDGE_DOH=auto|on|off`
+(default `auto`); empty DoH results fall back to a normal launch.
+
 `codeg-watchdog.sh`, `reload-watchdog-once.sh`, and `codeg-supervisor.sh` pin
 `HOME=/home/box USER=box LOGNAME=box`, so a relaunch from a sandbox shell
 (e.g. `HOME=/workspace/agent-reach/home`) cannot redirect `$HOME`-based paths.
@@ -123,11 +147,53 @@ rebuilds it from `CODEG_WEBDAV_PIP_SPEC` (default
 go to `/workspace/webdav/webdav.log` (the watchdog discards stderr). Offline
 tests: `node --test scripts/start-webdav.test.mjs`.
 
+## Tailscale (`start-tailscale.sh`)
+
+The watchdog calls `start-tailscale.sh` every loop and logs
+`tailscale=up|starting|needs-login|down|missing|disabled`. Only `down` and
+`missing` count as broken. `needs-login` waits for a person or an auth key.
+
+The script (re)downloads verified static binaries into `/workspace/bin` when
+they are missing, and keeps `tailscaled` running as root. Networking uses the
+kernel TUN device, or userspace plus a SOCKS5/HTTP proxy on `localhost:1055`
+when `/dev/net/tun` is absent (`TS_USERSPACE=auto`). State and the socket live
+under `~box/tailscale`. A node that is already `Running` is left alone. When
+the node is logged out, the script runs
+`tailscale up --auth-key=file:~box/tailscale/authkey --hostname=$TS_HOSTNAME --ssh`.
+Without a key it does not block: it only logs the login URL.
+
+**Auth keys are never committed and never put in `env.example` or `local.env`.**
+They live only in a mode-`600` file on that machine:
+
+- this box: `/home/box/tailscale/authkey` (set once with `set-tailscale-key.sh`;
+  hidden prompt, stdin, or `TS_AUTHKEY_INPUT`)
+- other Linux hosts: `/etc/tailscale-join/authkey`
+- macOS: `~/.config/tailscale-join/authkey`
+
+Set the box key once, then the watchdog keeps the node joined. CLI on the box:
+`ts status` (`sudo /workspace/bin/tailscale --socket=/home/box/tailscale/tailscaled.sock`).
+`install-boot.sh` installs that `ts` wrapper into `/workspace/bin`.
+
+Other machines (VPS, laptop) join with one script. It installs Tailscale on
+Linux/macOS, prompts once for the key, and stores it only in the local key
+file above:
+
+```bash
+bash deploy/codeg-boot/scripts/join-tailnet.sh
+# curl -fsSL <raw-url>/join-tailnet.sh | bash -s -- [--hostname NAME] [--no-ssh]
+```
+
+Optional `TS_*` settings (env overrides the file) belong in the machine-local
+`local.env`, same path as the watchdog config. See `env.example`. The watchdog
+parser ignores `TS_*`; `start-tailscale.sh` reads them itself.
+
 ## ACP versions
 
 `ensure-acp-agents.sh` does **not** hardcode agent versions. It asks the live
 `codeg-server` (`POST /api/acp_list_agents`) for each enabled agent's
 `registry_version` (from the MyCodeBuddy registry baked into that build).
+Install `rsync` on the box: `sync_dir` prefers `rsync -a` and only falls back
+to `cp -a` when it is missing.
 
 The registry version is a **minimum, not an exact pin**. The script follows the
 version actually in use (`installed_version`, which for binary agents is the
@@ -187,7 +253,9 @@ cp deploy/codeg-boot/env.example /workspace/codeg-boot/local.env
   `export ` prefix, `KEY=VALUE` with optional matching quotes. Only
   `CODEG_PUBLIC_URL`, the numeric limits below, and the `WAKE_*` keys are read; other keys are
   ignored, malformed lines are warned about, and `CODEG_PUBLIC_URL` must be
-  `http(s)://...`.
+  `http(s)://...`. `start-tailscale.sh` reads `TS_*` from the same file on its
+  own; those keys are still ignored by the watchdog. Never put an auth key in
+  this file.
 - Precedence: non-empty launcher environment > local file > built-in default.
 - The watchdog re-checks the file every loop and re-parses it when it changes,
   so edits apply within ~60 s without a restart (`config reloaded` in the log).
