@@ -97,9 +97,14 @@ impl RoundtableService {
         match command {
             "roundtable_conclusion_export" => {
                 let request: ExportRequest = decode(body)?;
-                let rendered =
-                    render_room(&store, actor, &request.room_id, request.locale.as_deref(), &self.data_dir)
-                        .await?;
+                let rendered = render_room(
+                    &store,
+                    actor,
+                    &request.room_id,
+                    request.locale.as_deref(),
+                    &self.data_dir,
+                )
+                .await?;
                 let saves = read_ledger(&self.data_dir, &request.room_id)?.saves;
                 Ok(json!({
                     "room_id": request.room_id,
@@ -121,16 +126,22 @@ impl RoundtableService {
                     .get_or_init(|| tokio::sync::Mutex::new(()))
                     .lock()
                     .await;
-                let rendered =
-                    render_room(&store, actor, &request.room_id, request.locale.as_deref(), &self.data_dir)
-                        .await?;
+                let rendered = render_room(
+                    &store,
+                    actor,
+                    &request.room_id,
+                    request.locale.as_deref(),
+                    &self.data_dir,
+                )
+                .await?;
                 let mut ledger = read_ledger(&self.data_dir, &request.room_id)?;
                 let request_key = request.request_id.to_string();
                 if let Some(previous) = ledger.saves.iter().find(|s| s.request_id == request_key) {
                     if previous.mode != request.mode {
                         return Err(rt_error(ErrorCode::IdempotencyConflict, "request_id"));
                     }
-                    let mut replay = serde_json::to_value(previous).map_err(|_| storage("ledger"))?;
+                    let mut replay =
+                        serde_json::to_value(previous).map_err(|_| storage("ledger"))?;
                     replay["replayed"] = json!(true);
                     return Ok(replay);
                 }
@@ -138,8 +149,12 @@ impl RoundtableService {
                     .workspace
                     .clone()
                     .ok_or_else(|| rt_error(ErrorCode::Forbidden, "workspace_not_found"))?;
-                let (relative_path, status) =
-                    write_conclusion(&root, &rendered.file_name, rendered.markdown.as_bytes(), request.mode)?;
+                let (relative_path, status) = write_conclusion(
+                    &root,
+                    &rendered.file_name,
+                    rendered.markdown.as_bytes(),
+                    request.mode,
+                )?;
                 let record = SaveRecord {
                     request_id: request_key,
                     mode: request.mode,
@@ -186,8 +201,8 @@ async fn render_room(
     )
     .await?
     .ok_or_else(|| rt_error(ErrorCode::Forbidden, "not_found"))?;
-    let config: RoundtableConfigV1 = serde_json::from_str(&column::<String>(&row, 0)?)
-        .map_err(|_| storage("room_config"))?;
+    let config: RoundtableConfigV1 =
+        serde_json::from_str(&column::<String>(&row, 0)?).map_err(|_| storage("room_config"))?;
     if column::<String>(&row, 1)? != "completed" {
         return Err(rt_error(ErrorCode::InvalidState, "conclusion_unavailable"));
     }
@@ -265,7 +280,11 @@ async fn render_room(
     let title = config.display_name.as_deref().unwrap_or(&config.topic);
     Ok(Rendered {
         markdown,
-        file_name: file_name(&now.format("%Y-%m-%d").to_string(), title, &room.to_string()),
+        file_name: file_name(
+            &now.format("%Y-%m-%d").to_string(),
+            title,
+            &room.to_string(),
+        ),
         redactions,
         message_id,
         body_hash,
@@ -389,9 +408,18 @@ pub(crate) fn render(doc: &Document<'_>) -> String {
     let mut out = String::new();
     out.push_str("---\n");
     out.push_str(&format!("roundtable_room: {}\n", yaml_string(&doc.room_id)));
-    out.push_str(&format!("synthesis_message: {}\n", yaml_string(&doc.message_id)));
-    out.push_str(&format!("synthesis_hash: {}\n", yaml_string(&doc.body_hash)));
-    out.push_str(&format!("generated_at: {}\n", yaml_string(&doc.generated_at)));
+    out.push_str(&format!(
+        "synthesis_message: {}\n",
+        yaml_string(&doc.message_id)
+    ));
+    out.push_str(&format!(
+        "synthesis_hash: {}\n",
+        yaml_string(&doc.body_hash)
+    ));
+    out.push_str(&format!(
+        "generated_at: {}\n",
+        yaml_string(&doc.generated_at)
+    ));
     out.push_str("participants:\n");
     for seat in &doc.seats {
         out.push_str(&format!(
@@ -400,7 +428,11 @@ pub(crate) fn render(doc: &Document<'_>) -> String {
             yaml_string(&seat.agent),
             yaml_string(&seat.role),
             yaml_string(seat.model.as_deref().unwrap_or("")),
-            if seat.moderator { ", moderator: true" } else { "" },
+            if seat.moderator {
+                ", moderator: true"
+            } else {
+                ""
+            },
         ));
     }
     let refs = topic_references(&doc.topic);
@@ -447,12 +479,19 @@ pub(crate) fn render(doc: &Document<'_>) -> String {
         marker(recommendation)
     ));
     out.push_str(&format!("\n## {}\n\n", l.consensus));
-    let consensus = doc.body["consensus_items"].as_array().cloned().unwrap_or_default();
+    let consensus = doc.body["consensus_items"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
     if consensus.is_empty() {
         out.push_str(&format!("{}\n", l.none));
     }
     for item in &consensus {
-        out.push_str(&format!("- {}{}", names(item["text"].as_str().unwrap_or("").trim()), marker(item)));
+        out.push_str(&format!(
+            "- {}{}",
+            names(item["text"].as_str().unwrap_or("").trim()),
+            marker(item)
+        ));
         let supporters = item["supporter_aliases"]
             .as_array()
             .map(|aliases| {
@@ -521,7 +560,11 @@ pub(crate) fn file_name(date: &str, title: &str, room: &str) -> String {
     }
     let slug = slug.trim_matches('-');
     let slug = if slug.is_empty() { "roundtable" } else { slug };
-    let room8: String = room.chars().filter(|c| c.is_ascii_hexdigit()).take(8).collect();
+    let room8: String = room
+        .chars()
+        .filter(|c| c.is_ascii_hexdigit())
+        .take(8)
+        .collect();
     format!("{date}-{slug}-{room8}.md")
 }
 
@@ -694,7 +737,12 @@ pub(crate) fn write_conclusion(
         // SAFETY: stat buffer is zeroed and owned; fd and path are valid.
         let mut stat: libc::stat = unsafe { std::mem::zeroed() };
         let result = unsafe {
-            libc::fstatat(dir.as_raw_fd(), path.as_ptr(), &mut stat, libc::AT_SYMLINK_NOFOLLOW)
+            libc::fstatat(
+                dir.as_raw_fd(),
+                path.as_ptr(),
+                &mut stat,
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
         };
         if result != 0 {
             return Ok(None);
@@ -703,9 +751,11 @@ pub(crate) fn write_conclusion(
     };
     let create = |name: &str| -> RtResult<Option<std::fs::File>> {
         let path = cstr(name)?;
-        let flags = libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+        let flags =
+            libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC;
         // SAFETY: dir is a live directory fd; the returned fd is owned below.
-        let fd = unsafe { libc::openat(dir.as_raw_fd(), path.as_ptr(), flags, 0o644 as libc::c_uint) };
+        let fd =
+            unsafe { libc::openat(dir.as_raw_fd(), path.as_ptr(), flags, 0o644 as libc::c_uint) };
         if fd < 0 {
             if std::io::Error::last_os_error().raw_os_error() == Some(libc::EEXIST) {
                 return Ok(None);
@@ -716,7 +766,8 @@ pub(crate) fn write_conclusion(
         Ok(Some(unsafe { std::fs::File::from_raw_fd(fd) }))
     };
     let write_all = |mut file: std::fs::File| -> RtResult<()> {
-        file.write_all(bytes).map_err(|_| storage("conclusion_write"))?;
+        file.write_all(bytes)
+            .map_err(|_| storage("conclusion_write"))?;
         file.sync_all().map_err(|_| storage("conclusion_write"))
     };
     let relative = |name: &str| format!("{}/{name}", EXPORT_DIR.join("/"));
@@ -755,7 +806,12 @@ pub(crate) fn write_conclusion(
             let target = cstr(file_name)?;
             // SAFETY: both names are relative to the same verified directory fd.
             let renamed = unsafe {
-                libc::renameat(dir.as_raw_fd(), temp_c.as_ptr(), dir.as_raw_fd(), target.as_ptr())
+                libc::renameat(
+                    dir.as_raw_fd(),
+                    temp_c.as_ptr(),
+                    dir.as_raw_fd(),
+                    target.as_ptr(),
+                )
             };
             if renamed != 0 {
                 unsafe { libc::unlinkat(dir.as_raw_fd(), temp_c.as_ptr(), 0) };
@@ -773,7 +829,10 @@ pub(crate) fn write_conclusion(
     _bytes: &[u8],
     _mode: SaveMode,
 ) -> RtResult<(String, &'static str)> {
-    Err(rt_error(ErrorCode::PolicyUnenforceable, "workspace_write_unsupported"))
+    Err(rt_error(
+        ErrorCode::PolicyUnenforceable,
+        "workspace_write_unsupported",
+    ))
 }
 
 #[cfg(test)]
@@ -828,9 +887,13 @@ mod tests {
         let body = body();
         let markdown = render(&doc(&body, false));
         assert!(markdown.starts_with("---\nroundtable_room: \"f268e2bd"));
-        assert!(markdown.contains("Adopt cookies; Antigravity (Critic) agreed with Grok (Proposer)."));
+        assert!(
+            markdown.contains("Adopt cookies; Antigravity (Critic) agreed with Grok (Proposer).")
+        );
         assert!(markdown.contains("supported by: Grok (Proposer), Antigravity (Critic)"));
-        assert!(markdown.contains("Antigravity (Critic) doubts SameSite=Lax; store in an s3 bucket? s9 _(inference)_"));
+        assert!(markdown.contains(
+            "Antigravity (Critic) doubts SameSite=Lax; store in an s3 bucket? s9 _(inference)_"
+        ));
         assert!(markdown.contains("- Grok (Proposer) · `grok-4.6` · moderator"));
         assert!(markdown.contains("## Risks\n\nNone."));
         assert!(markdown.contains("references:\n  - \"src/auth.rs\"\n  - \"docs/plan.md\"\n"));
@@ -852,11 +915,21 @@ mod tests {
     #[test]
     fn file_names_are_dated_slugged_and_room_scoped() {
         assert_eq!(
-            file_name("2026-10-09", "Should we store tokens in HttpOnly cookies?", "f268e2bd-355f"),
+            file_name(
+                "2026-10-09",
+                "Should we store tokens in HttpOnly cookies?",
+                "f268e2bd-355f"
+            ),
             "2026-10-09-should-we-store-tokens-in-httponly-cookies-f268e2bd.md"
         );
-        assert_eq!(file_name("2026-10-09", "登录 令牌/存储", "ab12cd34ef"), "2026-10-09-登录-令牌-存储-ab12cd34.md");
-        assert_eq!(file_name("2026-10-09", "../../", "ab12cd34"), "2026-10-09-roundtable-ab12cd34.md");
+        assert_eq!(
+            file_name("2026-10-09", "登录 令牌/存储", "ab12cd34ef"),
+            "2026-10-09-登录-令牌-存储-ab12cd34.md"
+        );
+        assert_eq!(
+            file_name("2026-10-09", "../../", "ab12cd34"),
+            "2026-10-09-roundtable-ab12cd34.md"
+        );
         let long = file_name("2026-10-09", &"x".repeat(500), "ab12cd34");
         assert!(long.len() < 80 && !long.contains('/'));
     }
@@ -892,17 +965,28 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let name = "2026-10-09-topic-ab12cd34.md";
         let (path, status) = write_conclusion(root.path(), name, b"one", SaveMode::Create).unwrap();
-        assert_eq!((path.as_str(), status), ("docs/roundtable/2026-10-09-topic-ab12cd34.md", "created"));
+        assert_eq!(
+            (path.as_str(), status),
+            ("docs/roundtable/2026-10-09-topic-ab12cd34.md", "created")
+        );
         let error = write_conclusion(root.path(), name, b"two", SaveMode::Create).unwrap_err();
         assert_eq!(error.details.reason.as_deref(), Some("already_exists"));
         let (copy, _) = write_conclusion(root.path(), name, b"two", SaveMode::SaveAs).unwrap();
         assert_eq!(copy, "docs/roundtable/2026-10-09-topic-ab12cd34-2.md");
-        let (same, status) = write_conclusion(root.path(), name, b"three", SaveMode::Overwrite).unwrap();
+        let (same, status) =
+            write_conclusion(root.path(), name, b"three", SaveMode::Overwrite).unwrap();
         assert_eq!((same.as_str(), status), (path.as_str(), "overwritten"));
         let dir = root.path().join("docs/roundtable");
         assert_eq!(std::fs::read(dir.join(name)).unwrap(), b"three");
-        assert_eq!(std::fs::read(dir.join("2026-10-09-topic-ab12cd34-2.md")).unwrap(), b"two");
-        assert!(std::fs::read_dir(&dir).unwrap().all(|e| !e.unwrap().file_name().to_string_lossy().ends_with(".tmp")));
+        assert_eq!(
+            std::fs::read(dir.join("2026-10-09-topic-ab12cd34-2.md")).unwrap(),
+            b"two"
+        );
+        assert!(std::fs::read_dir(&dir).unwrap().all(|e| !e
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .ends_with(".tmp")));
 
         // A planted symlink as the target is never followed or replaced.
         let outside = tempfile::tempdir().unwrap();
@@ -917,11 +1001,17 @@ mod tests {
         let other = tempfile::tempdir().unwrap();
         symlink(outside.path(), other.path().join("docs")).unwrap();
         let error = write_conclusion(other.path(), name, b"x", SaveMode::Create).unwrap_err();
-        assert_eq!(error.details.reason.as_deref(), Some("workspace_path_refused"));
+        assert_eq!(
+            error.details.reason.as_deref(),
+            Some("workspace_path_refused")
+        );
         assert!(!outside.path().join("roundtable").exists());
 
         for bad in ["../x.md", ".hidden.md", "a/b.md", "x.txt"] {
-            assert!(write_conclusion(root.path(), bad, b"x", SaveMode::Create).is_err(), "{bad}");
+            assert!(
+                write_conclusion(root.path(), bad, b"x", SaveMode::Create).is_err(),
+                "{bad}"
+            );
         }
     }
 
