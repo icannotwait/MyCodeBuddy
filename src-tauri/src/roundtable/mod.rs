@@ -26,6 +26,7 @@ pub(crate) mod ingress;
 mod installed_runtime;
 mod live_gateway;
 mod live_runtime;
+pub(crate) mod live_stream;
 mod maintenance;
 mod mcp;
 mod objects;
