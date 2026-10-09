@@ -106,6 +106,46 @@ kill_cloudflared() {
   sleep 1
 }
 
+# Gateway fake-ip DNS (Clash/sing-box) maps *.argotunnel.com to 198.18.0.x,
+# so cloudflared dials 198.18.0.1:7844, times out, registers 0 connections,
+# and the public hostname returns 530/1033. Resolve real edge A records via
+# DoH and pass --edge. CODEG_TUNNEL_EDGE_DOH=auto|on|off (default auto).
+# Empty DoH results leave EDGE_ARGS empty so launch is unchanged.
+resolve_tunnel_edge_args() {
+  local mode=${CODEG_TUNNEL_EDGE_DOH:-auto}
+  local sys_ip="" need_doh=0 host ip
+  EDGE_ARGS=""
+  [ "$mode" != "off" ] || return 0
+
+  sys_ip=$( { getent hosts region1.v2.argotunnel.com 2>/dev/null || true; } | awk '{print $1; exit}')
+  case "$sys_ip" in
+    198.18.*|"") need_doh=1 ;;
+  esac
+  [ "$mode" = "on" ] && need_doh=1
+  [ "$need_doh" = 1 ] || return 0
+
+  for host in region1.v2.argotunnel.com region2.v2.argotunnel.com; do
+    # Ignore curl/grep failures so a blank DoH answer falls back.
+    # shellcheck disable=SC2046
+    for ip in $(
+      curl -s -m 8 -H 'accept: application/dns-json' \
+        "https://cloudflare-dns.com/dns-query?name=${host}&type=A" \
+        | grep -o '"data":"[0-9.]*"' \
+        | cut -d'"' -f4 \
+        | head -4 \
+        || true
+    ); do
+      EDGE_ARGS="$EDGE_ARGS --edge ${ip}:7844"
+    done
+  done
+
+  if [ -n "$EDGE_ARGS" ]; then
+    echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) start-codeg-tunnel: fake-ip DNS (${sys_ip}); using DoH edge:$EDGE_ARGS" >>"$LOG"
+  else
+    echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) start-codeg-tunnel: fake-ip DNS (${sys_ip}); DoH returned no edges, launching without --edge" >>"$LOG"
+  fi
+}
+
 pids=$(cf_pids)
 if [ -n "$pids" ] && [ "$FORCE" = "0" ]; then
   # Oldest by elapsed time (ps etimes descending).
@@ -139,8 +179,10 @@ if [ -n "$pids" ] && [ "$FORCE" = "1" ]; then
 fi
 
 echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) start-codeg-tunnel: starting force=$FORCE config=$CFG run_home=$CF_RUN_HOME" >>"$LOG"
+resolve_tunnel_edge_args
 # Critical: close lock fd in the child so cloudflared does not inherit flock.
-HOME=$CF_RUN_HOME nohup "$CF" tunnel --config "$CFG" --protocol http2 run 9>&- >>"$LOG" 2>&1 &
+# shellcheck disable=SC2086
+HOME=$CF_RUN_HOME nohup "$CF" tunnel --config "$CFG" --protocol http2 $EDGE_ARGS run 9>&- >>"$LOG" 2>&1 &
 echo $! >"$PIDFILE"
 echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) started cloudflared pid=$! force=$FORCE config=$CFG" >>"$LOG"
 exit 0
