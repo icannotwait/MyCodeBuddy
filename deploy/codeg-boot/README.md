@@ -69,6 +69,28 @@ or ACP caches. When scripts change, the watchdog reloads itself via
 
 Disable by removing execute bit: `chmod a-x /workspace/codeg-boot/auto-sync-boot.sh`.
 
+To keep a local edit of one script until it is merged, list its basename (one
+per line) in `/workspace/heartbeat/boot-sync.local-hold`; the sync logs
+`hold: skip <file>` and leaves it alone. Remove the line once the change is on
+`main`.
+
+## opencli-mcp (`start-opencli-mcp.sh`)
+
+The watchdog calls `start-opencli-mcp.sh` every loop and logs
+`opencli-mcp=up|down|missing`; `down` and `missing` count as broken. Healthy
+means an unauthenticated `POST http://127.0.0.1:18765/mcp` returns `401`. The
+server itself (`/workspace/agent-reach/opencli-mcp/run.sh`) and its bearer token
+are machine-local, never in git. The script never launches Chrome; it only
+warns when the Browser Bridge profile is not running.
+
+## Roundtable cgroup (`start-codeg-server.sh`)
+
+Roundtable members run in crun containers under
+`/sys/fs/cgroup/codeg-roundtable`. When that delegated cgroup exists,
+`start-codeg-server.sh` moves itself (and so the exec'd `codeg-server`) into
+`codeg-roundtable/launcher` with one narrow `sudo -n tee`. Missing cgroup is a
+no-op; a failed join only warns.
+
 ## Resume / wake recovery
 
 The box VM is paused when idle. Wall clock keeps running, but uptime and the

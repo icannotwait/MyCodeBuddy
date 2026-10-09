@@ -50,4 +50,18 @@ if [ "$ready" != "1" ]; then
   exit 1
 fi
 
+# Roundtable: crun must create containers under codeg-roundtable, so put this
+# process (which becomes codeg-server via exec) into the delegated launcher
+# cgroup. Narrow sudo: one tee to that one file with our own PID. No-op when
+# the cgroup dir is missing; never fatal.
+RT_LAUNCHER=/sys/fs/cgroup/codeg-roundtable/launcher
+if [ -d "$RT_LAUNCHER" ] && [ -f "$RT_LAUNCHER/cgroup.procs" ]; then
+  if echo $$ | sudo -n /usr/bin/tee "$RT_LAUNCHER/cgroup.procs" >/dev/null 2>&1; then
+    echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) start-codeg-server: pid $$ -> codeg-roundtable/launcher"
+  else
+    echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) start-codeg-server: WARN could not join codeg-roundtable/launcher (roundtable containers will fail)" >&2
+  fi
+fi
+unset RT_LAUNCHER
+
 exec "$BIN"
