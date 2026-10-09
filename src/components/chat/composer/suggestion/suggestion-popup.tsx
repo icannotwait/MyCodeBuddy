@@ -313,9 +313,8 @@ export const SuggestionPopup = forwardRef<
 
   const firstNonEmpty = useMemo(
     () =>
-      tabOrder.find(
-        (kind) => (groupByKind.get(kind)?.items.length ?? 0) > 0
-      ) ?? tabOrder[0],
+      tabOrder.find((kind) => (groupByKind.get(kind)?.items.length ?? 0) > 0) ??
+      tabOrder[0],
     [groupByKind, tabOrder]
   )
 
