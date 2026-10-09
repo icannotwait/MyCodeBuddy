@@ -316,9 +316,21 @@ async fn handle_ws_connection(
                                     let handle=tokio::spawn(async move {
                                         let mut seq=0;
                                         if crate::roundtable::advance_private_watermark(&mut seq,&initial).is_err(){return;}
-                                        let mut interval=tokio::time::interval(std::time::Duration::from_secs(1));
+                                        // Live output (display-only) every 400ms; verified
+                                        // snapshots keep their one-second cadence. A new
+                                        // attach starts a new cursor, so reconnects and
+                                        // refreshes receive each attempt's whole buffer.
+                                        let mut interval=tokio::time::interval(std::time::Duration::from_millis(400));
+                                        let mut live=crate::roundtable::live_stream::LiveCursor::default();
+                                        let room_text=room.to_string();
+                                        let mut ticks=0u32;
                                         loop {
                                             interval.tick().await;
+                                            if let Some(frame)=crate::roundtable::live_stream::live_frame(&room_text,&mut live) {
+                                                if tx.send(ServerMsg::RoundtablePrivate{channel:channel.clone(),payload:frame}).await.is_err(){break;}
+                                            }
+                                            ticks=ticks.wrapping_add(1);
+                                            if ticks%3!=1 {continue;}
                                             match service.execute_command(&actor,"roundtable_get",serde_json::json!({"room_id":room})).await {
                                                 Ok(snapshot)=>{
                                                     if crate::roundtable::advance_private_watermark(&mut seq,&snapshot).unwrap_or(false)

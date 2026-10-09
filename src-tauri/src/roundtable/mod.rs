@@ -7,6 +7,7 @@
 mod acceptance;
 mod actor;
 mod api;
+mod attempt_trace;
 mod authorization;
 mod budget_ledger;
 pub(crate) mod capabilities;
@@ -25,6 +26,7 @@ pub(crate) mod ingress;
 mod installed_runtime;
 mod live_gateway;
 mod live_runtime;
+pub(crate) mod live_stream;
 mod maintenance;
 mod mcp;
 mod objects;

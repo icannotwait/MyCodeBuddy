@@ -2,6 +2,9 @@
 //! provider credentials never cross it. Rollout and expiry are rechecked on
 //! every request, and the actual JSON transcript is bounded before forwarding.
 
+use super::attempt_trace::{
+    classify_upstream_body, summarize_request_body, AttemptTrace, RequestObs,
+};
 use super::feature_gate::{AdmissionFacts, ExecutionGate, ExecutionScope};
 use super::gateway::{ApprovedOrigin, ClientPolicy, HostCredential};
 use super::request_accounting::{EncodedModelRequest, RequestAccounting};
@@ -27,6 +30,12 @@ impl std::fmt::Display for GatewayRevoked {
     }
 }
 impl std::error::Error for GatewayRevoked {}
+
+/// Inbound request lacked the per-attempt bearer. Rejected locally without
+/// poisoning the attempt: Grok's CLI probes `GET /` without credentials, and
+/// treating that as fatal ends a turn that already sealed a valid submission.
+#[derive(Debug, Clone, Copy)]
+struct AttemptCredentialRejected;
 
 fn caused_by_owner_revocation(mut error: &(dyn std::error::Error + 'static)) -> bool {
     loop {
@@ -76,6 +85,8 @@ pub(crate) struct LiveModelGateway {
     /// Method, path, and upstream status for each native forward. No
     /// credentials and no request body.
     exchanges: Mutex<Vec<String>>,
+    /// Diagnostics-only per-attempt trace (observability; no behaviour).
+    trace: std::sync::OnceLock<Arc<AttemptTrace>>,
     #[cfg(any(test, feature = "test-utils"))]
     fixture_origin: Option<String>,
 }
@@ -133,6 +144,7 @@ impl LiveModelGateway {
             skip_admission: false,
             native: None,
             exchanges: Mutex::new(Vec::new()),
+            trace: std::sync::OnceLock::new(),
             #[cfg(any(test, feature = "test-utils"))]
             fixture_origin: None,
         })
@@ -217,9 +229,26 @@ impl LiveModelGateway {
                 refresh: upstream.refresh,
             }),
             exchanges: Mutex::new(Vec::new()),
+            trace: std::sync::OnceLock::new(),
             #[cfg(any(test, feature = "test-utils"))]
             fixture_origin: None,
         })
+    }
+
+    /// Attaches the diagnostics-only attempt trace. Observability only.
+    pub(crate) fn set_trace(&self, trace: Arc<AttemptTrace>) {
+        let _ = self.trace.set(trace);
+    }
+
+    fn begin_obs(
+        &self,
+        method: &str,
+        path: &str,
+        headers: &axum::http::HeaderMap,
+    ) -> Option<RequestObs> {
+        self.trace
+            .get()
+            .map(|trace| RequestObs::begin(trace.clone(), method, path, headers))
     }
 
     pub(crate) fn exchange_log(&self) -> Vec<String> {
@@ -244,6 +273,10 @@ impl LiveModelGateway {
         }
         let path = path_and_query.split('#').next().unwrap_or(path_and_query);
         log.push(format!("{} {} status={status}", method.as_str(), path));
+    }
+
+    fn note_attempt_credential_rejected(&self, method: &axum::http::Method, path_and_query: &str) {
+        self.note_upstream(method, path_and_query, "401-local");
     }
 
     pub(crate) fn with_execution_lease(
@@ -277,20 +310,40 @@ impl LiveModelGateway {
     fn observe_failure(&self, error: &RtError) {
         // Revocation is normal during drain/cancel. It must not manufacture a
         // failed turn or erase a real provider/policy failure already observed.
-        if error.details.reason.as_deref() == Some("gateway_revoked") {
-            return;
+        // A missing attempt bearer is also non-fatal: the request is rejected
+        // locally (never proxied), logged, and the attempt keeps running.
+        match error.details.reason.as_deref() {
+            Some("gateway_revoked") => return,
+            Some("gateway_token") => {
+                tracing::warn!(
+                    reason = "gateway_token",
+                    "roundtable gateway rejected an unauthenticated inbound request without failing the attempt"
+                );
+                return;
+            }
+            _ => {}
         }
         let mut failure = self.fatal_failure.lock().expect("gateway failure");
         if failure.is_none() {
             *failure = Some(error.clone());
         }
     }
+    #[cfg_attr(not(any(test, feature = "test-utils")), allow(dead_code))]
     async fn forward(
         &self,
         headers: axum::http::HeaderMap,
         bytes: axum::body::Bytes,
     ) -> RtResult<(String, Vec<u8>)> {
-        let result = self.forward_inner(headers, bytes).await;
+        self.forward_traced(headers, bytes, None).await
+    }
+
+    async fn forward_traced(
+        &self,
+        headers: axum::http::HeaderMap,
+        bytes: axum::body::Bytes,
+        obs: Option<&mut RequestObs>,
+    ) -> RtResult<(String, Vec<u8>)> {
+        let result = self.forward_inner(headers, bytes, obs).await;
         if let Err(error) = &result {
             self.observe_failure(error);
         }
@@ -321,6 +374,7 @@ impl LiveModelGateway {
         &self,
         headers: axum::http::HeaderMap,
         bytes: axum::body::Bytes,
+        mut obs: Option<&mut RequestObs>,
     ) -> RtResult<(String, Vec<u8>)> {
         let expected = format!("Bearer {}", self.bearer);
         let supplied = headers
@@ -328,7 +382,15 @@ impl LiveModelGateway {
             .and_then(|header| header.to_str().ok())
             .unwrap_or("");
         if !constant_eq(supplied.as_bytes(), expected.as_bytes()) {
+            if let Some(obs) = obs.as_deref_mut() {
+                obs.set("inbound_auth", json!("rejected"));
+            }
             return Err(rt_error(ErrorCode::Unauthenticated, "gateway_token"));
+        }
+        if let Some(obs) = obs.as_deref_mut() {
+            obs.set("inbound_auth", json!("ok"));
+            obs.set("request_bytes", json!(bytes.len()));
+            obs.set("request", summarize_request_body(&bytes));
         }
         if self.revoked.load(Ordering::Acquire) {
             return Err(rt_error(ErrorCode::RuntimeUnavailable, "gateway_revoked"));
@@ -472,7 +534,10 @@ impl LiveModelGateway {
         let origin = self.origin.as_str();
         #[cfg(any(test, feature = "test-utils"))]
         let origin = self.fixture_origin.as_deref().unwrap_or(origin);
-        let response = self
+        if let Some(obs) = obs.as_deref_mut() {
+            obs.upstream_start(origin, encoded_body.len());
+        }
+        let response = match self
             .client
             .post(format!("{origin}/v1/responses"))
             .bearer_auth(self.credential.value_for_gateway())
@@ -480,7 +545,22 @@ impl LiveModelGateway {
             .body(encoded_body)
             .send()
             .await
-            .map_err(|_| rt_error(ErrorCode::RuntimeUnavailable, "upstream_transport"))?;
+        {
+            Ok(response) => response,
+            Err(error) => {
+                if let Some(obs) = obs.as_deref_mut() {
+                    obs.upstream_end("send_error", Some(describe_reqwest(&error)), None);
+                }
+                return Err(rt_error(
+                    ErrorCode::RuntimeUnavailable,
+                    "upstream_transport",
+                ));
+            }
+        };
+        if let Some(obs) = obs.as_deref_mut() {
+            obs.upstream_headers(response.status().as_u16(), response.headers());
+        }
+        let content_length = response.content_length();
         if response.status().is_redirection() {
             return Err(rt_error(
                 ErrorCode::PolicyUnenforceable,
@@ -505,7 +585,17 @@ impl LiveModelGateway {
         let mut stream = response.bytes_stream();
         let mut received = Vec::new();
         while let Some(chunk) = stream.next().await {
+            if let (Err(error), Some(obs)) = (&chunk, obs.as_deref_mut()) {
+                obs.upstream_end(
+                    "stream_error",
+                    Some(describe_reqwest(error)),
+                    Some(json!({"bytes_before_error": received.len()})),
+                );
+            }
             let chunk = self.admit_upstream_chunk(chunk)?;
+            if let Some(obs) = obs.as_deref_mut() {
+                obs.upstream_chunk(chunk.len(), received.len() + chunk.len());
+            }
             transcript
                 .accounting
                 .consume_generated(chunk.len() as u64, &self.profile)?;
@@ -517,6 +607,17 @@ impl LiveModelGateway {
                 return Err(rt_error(ErrorCode::ContextTooLarge, "generated_utf8_limit"));
             }
             received.extend_from_slice(&chunk);
+        }
+        if let Some(obs) = obs {
+            obs.upstream_end(
+                "body_complete",
+                None,
+                Some(classify_upstream_body(
+                    &content_type,
+                    &received,
+                    content_length,
+                )),
+            );
         }
         if std::str::from_utf8(&received).is_err()
             || contains(&received, self.credential.value_for_gateway().as_bytes())
@@ -579,6 +680,7 @@ impl LiveModelGateway {
         Ok(())
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     async fn forward_native(
         &self,
         method: axum::http::Method,
@@ -586,14 +688,56 @@ impl LiveModelGateway {
         headers: axum::http::HeaderMap,
         body: axum::body::Bytes,
     ) -> RtResult<(axum::http::StatusCode, String, Vec<u8>)> {
-        self.admit_native(&headers, path_and_query, body.len())?;
+        self.forward_native_traced(method, path_and_query, headers, body, None)
+            .await
+    }
+
+    async fn forward_native_traced(
+        &self,
+        method: axum::http::Method,
+        path_and_query: &str,
+        headers: axum::http::HeaderMap,
+        body: axum::body::Bytes,
+        mut obs: Option<&mut RequestObs>,
+    ) -> RtResult<(axum::http::StatusCode, String, Vec<u8>)> {
+        if let Err(error) = self.admit_native(&headers, path_and_query, body.len()) {
+            if let Some(obs) = obs.as_deref_mut() {
+                obs.set(
+                    "inbound_auth",
+                    json!(
+                        if error.details.reason.as_deref() == Some("gateway_token") {
+                            "rejected"
+                        } else {
+                            "ok_but_not_admitted"
+                        }
+                    ),
+                );
+            }
+            return Err(error);
+        }
+        if let Some(obs) = obs.as_deref_mut() {
+            obs.set("inbound_auth", json!("ok"));
+            obs.set("request_bytes", json!(body.len()));
+            if !body.is_empty() {
+                obs.set("request", summarize_request_body(&body));
+            }
+        }
         let path_and_query = strip_attempt_key_query(path_and_query);
         let sent = self
-            .dispatch_native(method.clone(), &path_and_query, &headers, body.clone())
+            .dispatch_native(
+                method.clone(),
+                &path_and_query,
+                &headers,
+                body.clone(),
+                obs.as_deref_mut(),
+            )
             .await?;
         if sent.0 == axum::http::StatusCode::UNAUTHORIZED && self.refresh_native().await.is_ok() {
+            if let Some(obs) = obs.as_deref_mut() {
+                obs.set("refreshed_after_401", json!(true));
+            }
             return self
-                .dispatch_native(method, &path_and_query, &headers, body)
+                .dispatch_native(method, &path_and_query, &headers, body, obs)
                 .await;
         }
         Ok(sent)
@@ -605,6 +749,7 @@ impl LiveModelGateway {
         path_and_query: &str,
         headers: &axum::http::HeaderMap,
         body: axum::body::Bytes,
+        mut obs: Option<&mut RequestObs>,
     ) -> RtResult<(axum::http::StatusCode, String, Vec<u8>)> {
         if !matches!(
             method,
@@ -638,12 +783,18 @@ impl LiveModelGateway {
             request = request.header(key, value);
         }
         request = request.bearer_auth(&host_bearer);
+        if let Some(obs) = obs.as_deref_mut() {
+            obs.upstream_start(origin, body.len());
+        }
         if !body.is_empty() {
             request = request.body(body);
         }
         let response = match request.send().await {
             Ok(response) => response,
-            Err(_) => {
+            Err(error) => {
+                if let Some(obs) = obs.as_deref_mut() {
+                    obs.upstream_end("send_error", Some(describe_reqwest(&error)), None);
+                }
                 self.note_upstream(&method, path_and_query, "upstream_transport");
                 return Err(rt_error(
                     ErrorCode::RuntimeUnavailable,
@@ -651,7 +802,14 @@ impl LiveModelGateway {
                 ));
             }
         };
+        if let Some(obs) = obs.as_deref_mut() {
+            obs.upstream_headers(response.status().as_u16(), response.headers());
+        }
+        let content_length = response.content_length();
         if response.status().is_redirection() {
+            if let Some(obs) = obs.as_deref_mut() {
+                obs.upstream_end("redirect_forbidden", None, None);
+            }
             self.note_upstream(&method, path_and_query, response.status().as_str());
             return Err(rt_error(
                 ErrorCode::PolicyUnenforceable,
@@ -669,12 +827,44 @@ impl LiveModelGateway {
         let mut received = Vec::new();
         let mut stream = response.bytes_stream();
         while let Some(chunk) = stream.next().await {
-            let chunk =
-                chunk.map_err(|_| rt_error(ErrorCode::RuntimeUnavailable, "upstream_transport"))?;
+            let chunk = match chunk {
+                Ok(chunk) => chunk,
+                Err(error) => {
+                    if let Some(obs) = obs.as_deref_mut() {
+                        let body = classify_upstream_body(&content_type, &received, content_length);
+                        obs.upstream_end(
+                            "stream_error",
+                            Some(describe_reqwest(&error)),
+                            Some(json!({"bytes_before_error": received.len(), "partial": body})),
+                        );
+                    }
+                    return Err(rt_error(
+                        ErrorCode::RuntimeUnavailable,
+                        "upstream_transport",
+                    ));
+                }
+            };
             if received.len().saturating_add(chunk.len()) > 8 * 1024 * 1024 {
+                if let Some(obs) = obs.as_deref_mut() {
+                    obs.upstream_end("body_limit", None, None);
+                }
                 return Err(rt_error(ErrorCode::ContextTooLarge, "generated_utf8_limit"));
             }
+            if let Some(obs) = obs.as_deref_mut() {
+                obs.upstream_chunk(chunk.len(), received.len() + chunk.len());
+            }
             received.extend_from_slice(&chunk);
+        }
+        if let Some(obs) = obs {
+            obs.upstream_end(
+                "body_complete",
+                None,
+                Some(classify_upstream_body(
+                    &content_type,
+                    &received,
+                    content_length,
+                )),
+            );
         }
         if contains(&received, host_bearer.as_bytes())
             || contains(&received, self.bearer.as_bytes())
@@ -970,6 +1160,10 @@ async fn observe_http_failure(
     // next.run was in flight. Exempt only an explicitly typed owner result.
     if (response.status().is_client_error() || response.status().is_server_error())
         && response.extensions().get::<GatewayRevoked>().is_none()
+        && response
+            .extensions()
+            .get::<AttemptCredentialRejected>()
+            .is_none()
     {
         gateway.observe_failure(&rt_error(
             ErrorCode::RuntimeUnavailable,
@@ -1002,14 +1196,21 @@ async fn reject_gateway_method(
 
 fn gateway_error_response(error: RtError) -> axum::response::Response {
     use axum::response::IntoResponse;
-    let revoked = error.details.reason.as_deref() == Some("gateway_revoked");
-    let mut response = (
-        axum::http::StatusCode::BAD_REQUEST,
-        axum::Json(json!({"error":error})),
-    )
-        .into_response();
+    let reason = error.details.reason.as_deref();
+    let revoked = reason == Some("gateway_revoked");
+    let unauthenticated = reason == Some("gateway_token");
+    let status = if unauthenticated {
+        axum::http::StatusCode::UNAUTHORIZED
+    } else {
+        axum::http::StatusCode::BAD_REQUEST
+    };
+    let mut response = (status, axum::Json(json!({"error": error}))).into_response();
     if revoked {
         response.extensions_mut().insert(GatewayRevoked);
+    }
+    if unauthenticated {
+        // observe_http_failure must not promote the 401 into a fatal attempt error.
+        response.extensions_mut().insert(AttemptCredentialRejected);
     }
     response
 }
@@ -1020,13 +1221,14 @@ async fn handle(
     body: Result<axum::body::Bytes, axum::extract::rejection::BytesRejection>,
 ) -> axum::response::Response {
     use axum::response::IntoResponse;
+    let mut obs = gateway.begin_obs("POST", "/v1/responses", &headers);
     let body = match body {
         Ok(body) => body,
         Err(error) if caused_by_owner_revocation(&error) => {
-            return gateway_error_response(rt_error(
-                ErrorCode::RuntimeUnavailable,
-                "gateway_revoked",
-            ))
+            let response =
+                gateway_error_response(rt_error(ErrorCode::RuntimeUnavailable, "gateway_revoked"));
+            finish_obs(obs, &response, 0, "inbound_body_revoked");
+            return response;
         }
         Err(error) => {
             // Observe before generating the response, not after middleware
@@ -1035,20 +1237,69 @@ async fn handle(
                 ErrorCode::RuntimeUnavailable,
                 "gateway_http_error",
             ));
-            return error.into_response();
+            let response = error.into_response();
+            finish_obs(obs, &response, 0, "inbound_body_error");
+            return response;
         }
     };
     let result = tokio::select! {
         biased;
-        result = gateway.forward(headers, body) => result,
+        result = gateway.forward_traced(headers, body, obs.as_mut()) => result,
         _ = gateway.cancelled.cancelled() => Err(rt_error(ErrorCode::RuntimeUnavailable,"gateway_revoked")),
     };
     match result {
         Ok((content_type, bytes)) => {
-            ([(axum::http::header::CONTENT_TYPE, content_type)], bytes).into_response()
+            let len = bytes.len();
+            let response =
+                ([(axum::http::header::CONTENT_TYPE, content_type)], bytes).into_response();
+            finish_obs(obs, &response, len, "ok");
+            response
         }
-        Err(error) => gateway_error_response(error),
+        Err(error) => {
+            if error.details.reason.as_deref() == Some("gateway_token") {
+                gateway
+                    .note_attempt_credential_rejected(&axum::http::Method::POST, "/v1/responses");
+            }
+            let outcome = format!(
+                "gateway_error:{}",
+                error.details.reason.as_deref().unwrap_or("unknown")
+            );
+            let response = gateway_error_response(error);
+            finish_obs(obs, &response, 0, &outcome);
+            response
+        }
     }
+}
+
+fn finish_obs(
+    obs: Option<RequestObs>,
+    response: &axum::response::Response,
+    bytes: usize,
+    outcome: &str,
+) {
+    if let Some(obs) = obs {
+        obs.finish(response.status().as_u16(), bytes, outcome);
+    }
+}
+
+/// reqwest error text with its source chain and kind flags (no secrets:
+/// the URL carries no credential; the trace redacts registered secrets).
+fn describe_reqwest(error: &reqwest::Error) -> String {
+    let mut text = format!(
+        "{error} [timeout={} connect={} body={} decode={} request={}]",
+        error.is_timeout(),
+        error.is_connect(),
+        error.is_body(),
+        error.is_decode(),
+        error.is_request()
+    );
+    let mut source = std::error::Error::source(error);
+    while let Some(inner) = source {
+        text.push_str(" <- ");
+        text.push_str(&inner.to_string());
+        source = inner.source();
+    }
+    text
 }
 
 async fn native_handle(
@@ -1057,45 +1308,60 @@ async fn native_handle(
 ) -> axum::response::Response {
     use axum::response::IntoResponse;
     let (parts, body) = request.into_parts();
+    let path = parts
+        .uri
+        .path_and_query()
+        .map(|value| value.as_str().to_string())
+        .unwrap_or_else(|| "/".to_string());
+    let mut obs = gateway.begin_obs(parts.method.as_str(), &path, &parts.headers);
     let bytes = match axum::body::to_bytes(body, 8 * 1024 * 1024).await {
         Ok(bytes) => bytes,
         Err(error) if caused_by_owner_revocation(&error) => {
-            return gateway_error_response(rt_error(
-                ErrorCode::RuntimeUnavailable,
-                "gateway_revoked",
-            ))
+            let response =
+                gateway_error_response(rt_error(ErrorCode::RuntimeUnavailable, "gateway_revoked"));
+            finish_obs(obs, &response, 0, "inbound_body_revoked");
+            return response;
         }
         Err(_) => {
             gateway.observe_failure(&rt_error(
                 ErrorCode::RuntimeUnavailable,
                 "gateway_http_error",
             ));
-            return axum::http::StatusCode::PAYLOAD_TOO_LARGE.into_response();
+            let response = axum::http::StatusCode::PAYLOAD_TOO_LARGE.into_response();
+            finish_obs(obs, &response, 0, "inbound_body_error");
+            return response;
         }
     };
-    let path = parts
-        .uri
-        .path_and_query()
-        .map(|value| value.as_str().to_string())
-        .unwrap_or_else(|| "/".to_string());
+    let method = parts.method.clone();
     let result = tokio::select! {
         biased;
-        result = gateway.forward_native(parts.method, &path, parts.headers, bytes) => result,
+        result = gateway.forward_native_traced(parts.method, &path, parts.headers, bytes, obs.as_mut()) => result,
         _ = gateway.cancelled.cancelled() => Err(rt_error(ErrorCode::RuntimeUnavailable, "gateway_revoked")),
     };
     match result {
         Ok((status, content_type, bytes)) => {
+            let len = bytes.len();
             let mut response = (status, bytes).into_response();
             if let Ok(value) = axum::http::HeaderValue::from_str(&content_type) {
                 response
                     .headers_mut()
                     .insert(axum::http::header::CONTENT_TYPE, value);
             }
+            finish_obs(obs, &response, len, "relayed");
             response
         }
         Err(error) => {
+            if error.details.reason.as_deref() == Some("gateway_token") {
+                gateway.note_attempt_credential_rejected(&method, &path);
+            }
             gateway.observe_failure(&error);
-            gateway_error_response(error)
+            let outcome = format!(
+                "gateway_error:{}",
+                error.details.reason.as_deref().unwrap_or("unknown")
+            );
+            let response = gateway_error_response(error);
+            finish_obs(obs, &response, 0, &outcome);
+            response
         }
     }
 }
@@ -1370,6 +1636,7 @@ fn fixture_gateway(root: &Path, profile: QualifiedContextProfile) -> RtResult<Li
         skip_admission: false,
         native: None,
         exchanges: Mutex::new(Vec::new()),
+        trace: std::sync::OnceLock::new(),
         fixture_origin: None,
     })
 }
@@ -1828,6 +2095,212 @@ mod completion_drain_tests {
         assert_eq!(seen[0].1, "xai-grok-cli");
         assert!(seen[0].2.contains("grok-4.6"));
         assert!(!seen[0].0.contains("attempt-bearer"));
+    }
+
+    #[tokio::test]
+    async fn native_relay_trace_records_timings_and_truncation_without_secrets() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let app = axum::Router::new().route(
+                "/v1/responses",
+                axum::routing::post(|| async {
+                    (
+                        axum::http::StatusCode::OK,
+                        [(axum::http::header::CONTENT_TYPE, "text/event-stream")],
+                        "data: {\"type\":\"response.output_text.delta\",\"delta\":\"partial\"}\n\n",
+                    )
+                }),
+            );
+            axum::serve(listener, app).await.unwrap();
+        });
+        let upstream = super::super::host_model_auth::ResolvedUpstream {
+            origin: "https://cli-chat-proxy.grok.com".into(),
+            bearer: "host-oidc-token-value".into(),
+            headers: vec![("X-XAI-Token-Auth".into(), "xai-grok-cli".into())],
+            refresh: None,
+        };
+        let mut gateway =
+            LiveModelGateway::native_probe(upstream, "attempt-bearer-value".into()).unwrap();
+        gateway.fixture_origin = Some(format!("http://{address}"));
+        let gateway = Arc::new(gateway);
+        let dir = tempfile::tempdir().unwrap();
+        // No registered secrets: header filtering alone must keep bearers out.
+        let trace =
+            Arc::new(AttemptTrace::open(dir.path(), "room-t", "attempt-t", Vec::new()).unwrap());
+        gateway.set_trace(trace.clone());
+        let request = axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/responses?api_key=query-secret-value")
+            .header("authorization", "Bearer attempt-bearer-value")
+            .header("x-api-key", "attempt-bearer-value")
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(
+                r#"{"model":"grok-4.6","stream":true,"input":[{"role":"user","content":"PROMPT TEXT"}]}"#,
+            ))
+            .unwrap();
+        let response = native_handle(axum::extract::State(gateway.clone()), request).await;
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        let text = std::fs::read_to_string(trace.dir().join("gateway.jsonl")).unwrap();
+        for leaked in [
+            "attempt-bearer-value",
+            "host-oidc-token-value",
+            "query-secret-value",
+            "PROMPT TEXT",
+        ] {
+            assert!(!text.contains(leaked), "{leaked} leaked: {text}");
+        }
+        for expected in [
+            "request_start",
+            "upstream_send",
+            "upstream_headers",
+            "upstream_first_byte",
+            "request_end",
+            "truncated_no_terminal_event",
+            "\"inbound_auth\":\"ok\"",
+            "\"stream\":true",
+        ] {
+            assert!(text.contains(expected), "missing {expected}: {text}");
+        }
+        assert!(trace.inflight_snapshot().is_empty());
+    }
+
+    #[tokio::test]
+    async fn dropped_native_request_still_leaves_an_end_record() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let app = axum::Router::new().fallback(|| async {
+                tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+                "late"
+            });
+            axum::serve(listener, app).await.unwrap();
+        });
+        let upstream = super::super::host_model_auth::ResolvedUpstream {
+            origin: "https://cli-chat-proxy.grok.com".into(),
+            bearer: "host-oidc-token-value".into(),
+            headers: Vec::new(),
+            refresh: None,
+        };
+        let mut gateway =
+            LiveModelGateway::native_probe(upstream, "attempt-bearer-value".into()).unwrap();
+        gateway.fixture_origin = Some(format!("http://{address}"));
+        let gateway = Arc::new(gateway);
+        let dir = tempfile::tempdir().unwrap();
+        let trace =
+            Arc::new(AttemptTrace::open(dir.path(), "room-d", "attempt-d", Vec::new()).unwrap());
+        gateway.set_trace(trace.clone());
+        let request = axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/responses")
+            .header("authorization", "Bearer attempt-bearer-value")
+            .body(axum::body::Body::from("{}"))
+            .unwrap();
+        let pending = native_handle(axum::extract::State(gateway.clone()), request);
+        let timed_out = tokio::time::timeout(std::time::Duration::from_millis(300), pending).await;
+        assert!(timed_out.is_err());
+        // While waiting, the snapshot showed the request; dropping it wrote the end.
+        assert!(trace.inflight_snapshot().is_empty());
+        let text = std::fs::read_to_string(trace.dir().join("gateway.jsonl")).unwrap();
+        assert!(text.contains("\"outcome\":\"dropped\""), "{text}");
+        assert!(text.contains("dropped_in_flight"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn unauthenticated_native_probe_returns_401_without_failing_the_attempt() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let seen = Arc::new(Mutex::new(0usize));
+        let hits = seen.clone();
+        tokio::spawn(async move {
+            let app = axum::Router::new().fallback(move || {
+                let hits = hits.clone();
+                async move {
+                    *hits.lock().expect("hits") += 1;
+                    (axum::http::StatusCode::OK, "upstream")
+                }
+            });
+            axum::serve(listener, app).await.unwrap();
+        });
+        let upstream = super::super::host_model_auth::ResolvedUpstream {
+            origin: "https://cli-chat-proxy.grok.com".into(),
+            bearer: "host-oidc-token".into(),
+            headers: Vec::new(),
+            refresh: None,
+        };
+        let mut gateway =
+            LiveModelGateway::native_probe(upstream, "attempt-bearer".into()).unwrap();
+        gateway.fixture_origin = Some(format!("http://{address}"));
+        let gateway = Arc::new(gateway);
+
+        // Direct handler: bare GET / with no attempt bearer.
+        let rejected = native_handle(
+            axum::extract::State(gateway.clone()),
+            axum::extract::Request::builder()
+                .method("GET")
+                .uri("/")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(rejected.status(), axum::http::StatusCode::UNAUTHORIZED);
+        assert!(rejected
+            .extensions()
+            .get::<AttemptCredentialRejected>()
+            .is_some());
+        assert!(
+            gateway.completion_error().is_none(),
+            "missing attempt bearer must not fail the attempt"
+        );
+        assert_eq!(
+            *seen.lock().expect("hits"),
+            0,
+            "unauthenticated requests must never be forwarded upstream"
+        );
+        assert_eq!(
+            gateway.exchange_log(),
+            vec!["GET / status=401-local".to_string()]
+        );
+
+        // Full router including observe_http_failure: the 401 must stay non-fatal.
+        let router = gateway_router(gateway.clone());
+        let serve = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let serve_addr = serve.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(serve, router).await.unwrap();
+        });
+        let client = reqwest::Client::new();
+        let response = client
+            .get(format!("http://{serve_addr}/"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::UNAUTHORIZED);
+        assert!(
+            gateway.completion_error().is_none(),
+            "observe_http_failure must not promote the 401 into a fatal error"
+        );
+        assert_eq!(*seen.lock().expect("hits"), 0);
+
+        // Authenticated model call still forwards with the host credential.
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            axum::http::header::AUTHORIZATION,
+            "Bearer attempt-bearer".parse().unwrap(),
+        );
+        let (status, _, body) = gateway
+            .forward_native(
+                axum::http::Method::POST,
+                "/v1/responses",
+                headers,
+                br#"{"model":"grok-4.6"}"#.as_slice().into(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(status, axum::http::StatusCode::OK);
+        assert_eq!(body, b"upstream");
+        assert_eq!(*seen.lock().expect("hits"), 1);
+        assert!(gateway.completion_error().is_none());
     }
 }
 

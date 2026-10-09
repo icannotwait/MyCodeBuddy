@@ -10,7 +10,8 @@ function RoundtableRoute() {
   const workspaceId = params.get("workspace_id") ?? ""
   return (
     <RoundtableWorkbench
-      key={`${workspaceId}:${roomId ?? "new"}`}
+      // The create form switches workspace in place, so only rooms remount.
+      key={roomId ? `${workspaceId}:${roomId}` : "new"}
       workspaceId={workspaceId}
       roomId={roomId}
     />

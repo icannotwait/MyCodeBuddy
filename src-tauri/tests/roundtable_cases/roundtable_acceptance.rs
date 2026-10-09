@@ -1768,6 +1768,39 @@ async fn storage_fix_active_budget_prepays_room_once_and_refunds_only_known_unus
 }
 
 #[tokio::test]
+async fn storage_fix_checkpoint_after_multi_second_stall_charges_gap_without_exhausting_room() {
+    use codeg_lib::roundtable::{ActiveBudgetLease, ExecutionLease};
+    let start_ms = 10_u64;
+    let ready = ready(10150, &[("member", 0, "failed")], 1, 1, start_ms).await;
+    let mut lease = ActiveBudgetLease::begin(ready.store.clone(), ready.room, Epoch(1), Epoch(1))
+        .await
+        .unwrap();
+    let permission =
+        ExecutionLease::issue(start_ms, lease.prepaid_until().saturating_sub(start_ms));
+    assert_eq!(permission.prepaid_until(), start_ms + 1_000);
+    // Simulate a dual-crun / SQLite stall longer than the one-second prepaid slice.
+    let after_stall = start_ms + 3_500;
+    ready.clock.set(after_stall).unwrap();
+    let sampled = lease.checkpoint().await.unwrap();
+    assert!(
+        sampled.remaining_room_ms.0 > 1_700_000,
+        "room wall budget must remain after charging the stall gap"
+    );
+    assert_eq!(sampled.prepaid_until.0, after_stall + 1_000);
+    assert!(
+        permission.renew_accounted(after_stall, sampled.prepaid_until.0),
+        "accounted renew must recover the local execution lease after the stall"
+    );
+    assert_eq!(
+        permission.admit_enqueue(after_stall),
+        1,
+        "turn admission must succeed after renewing past the stall"
+    );
+    lease.finish().await.unwrap();
+    assert!(scalar_i64(&ready.conn, "SELECT remaining_active_ms FROM rt_rooms").await > 1_700_000);
+}
+
+#[tokio::test]
 async fn storage_fix_crash_retains_prepaid_slice_and_old_owner_cannot_refund_new_lease() {
     use codeg_lib::roundtable::ActiveBudgetLease;
     let ready = ready(10300, &[("member", 0, "failed")], 1, 1, 10).await;

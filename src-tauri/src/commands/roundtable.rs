@@ -59,10 +59,20 @@ macro_rules! commands {
                 crate::roundtable::advance_private_watermark(&mut seq,&result)?;
                 let task=tokio::spawn(async move {
                     use tauri::{Emitter,Manager};
-                    let mut interval=tokio::time::interval(std::time::Duration::from_secs(1));
+                    // Live output (display-only) every 400ms; verified
+                    // snapshots keep their one-second cadence.
+                    let mut interval=tokio::time::interval(std::time::Duration::from_millis(400));
+                    let mut live=crate::roundtable::live_stream::LiveCursor::default();
+                    let room_text=attach.room_id.to_string();
+                    let mut ticks=0u32;
                     loop {
                         interval.tick().await;
                         if app.get_webview_window(&label).is_none(){break;}
+                        if let Some(frame)=crate::roundtable::live_stream::live_frame(&room_text,&mut live) {
+                            if app.emit_to(&label,&channel,&frame).is_err(){break;}
+                        }
+                        ticks=ticks.wrapping_add(1);
+                        if ticks%3!=1 {continue;}
                         match cloned.execute_command(&actor,"roundtable_get",serde_json::json!({"room_id":attach.room_id})).await {
                             Ok(snapshot)=>{
                                 if crate::roundtable::advance_private_watermark(&mut seq,&snapshot).unwrap_or(false) {

@@ -1,12 +1,17 @@
 "use client"
 
 import Link from "next/link"
-import { useCallback, useEffect, useRef, useState } from "react"
+import { useCallback, useEffect, useMemo, useRef, useState } from "react"
 import { useTranslations } from "next-intl"
-import { listModelProviders } from "@/lib/api"
+import { listAllFolderDetails, listModelProviders } from "@/lib/api"
 import { getTransport } from "@/lib/transport"
 import { initialRoundtableView } from "@/lib/roundtable/reducer"
 import { applyRoundtablePreview } from "@/lib/roundtable/stream"
+import {
+  applyRoundtableLive,
+  liveTranscriptInputs,
+  type RoundtableLiveState,
+} from "@/lib/roundtable/live"
 import {
   loadRoundtable,
   loadRoundtableEvidence,
@@ -25,7 +30,7 @@ import {
   clearPendingPaidMutation,
 } from "@/lib/roundtable/mutation"
 import type { PendingRoundtableMutation } from "@/lib/roundtable/mutation"
-import type { ModelProviderInfo } from "@/lib/types"
+import type { FolderDetail, ModelProviderInfo } from "@/lib/types"
 import type {
   RoundtableConfig,
   RoundtablePreflight,
@@ -35,12 +40,27 @@ import type {
   RoundtableUsage,
   RoundtableView,
 } from "@/lib/roundtable/types"
+import {
+  CircleCheck,
+  FolderOpen,
+  Loader2,
+  ShieldCheck,
+  TriangleAlert,
+} from "lucide-react"
 import { Button } from "@/components/ui/button"
-import { Input } from "@/components/ui/input"
 import { Textarea } from "@/components/ui/textarea"
 import { PreflightConfirmation } from "./preflight-confirmation"
+import {
+  ROUNDTABLE_MAX_MEMBERS,
+  ROUNDTABLE_MIN_MEMBERS,
+  RoundtableComposer,
+  RoundtableStep,
+  roundtableAgentLabel,
+  type ComposerMember,
+} from "./roundtable-composer"
 import { RoundtableSafeContent } from "./roundtable-safe-content"
 import { RoundtableRoomList } from "./roundtable-room-list"
+import { RoundtableWorkspaceSelect } from "./roundtable-workspace-select"
 import { brandStyle, roundtableSeatBrands } from "@/lib/roundtable/brand"
 import { cn } from "@/lib/utils"
 import { RoundtableInlineText } from "./roundtable-inline-text"
@@ -54,16 +74,29 @@ import {
 type LoadedRoom = Awaited<ReturnType<typeof loadRoundtable>>
 type RoomSummary = { room_id: string; status: string; config: RoundtableConfig }
 
-const ROUNDTABLE_AGENTS = ["grok", "cursor", "antigravity", "codex"] as const
-
+/** Per-attempt limit for proposal and critique turns (`timeouts.attempt_timeout`). */
+const MEMBER_ATTEMPT_TIMEOUT_MS = 225_000
+/**
+ * Room-budget allowance for the synthesis phase. Synthesis has no attempt or
+ * phase limit of its own; it is bounded by the room budget, pause and stop.
+ */
+const SYNTHESIS_ROOM_ALLOWANCE_MS = 450_000
 export function RoundtableWorkbench({
-  workspaceId,
+  workspaceId: urlWorkspaceId,
   roomId,
 }: {
   workspaceId: string
   roomId?: string
 }) {
   const t = useTranslations("Roundtable")
+  // The create flow can switch workspace in place (keeping the form); an open
+  // room stays bound to the workspace in its URL.
+  const [workspaceId, setWorkspaceId] = useState(urlWorkspaceId)
+  useEffect(() => setWorkspaceId(urlWorkspaceId), [urlWorkspaceId])
+  const [workspaces, setWorkspaces] = useState<FolderDetail[] | null>(null)
+  const [workspacesLoading, setWorkspacesLoading] = useState(true)
+  const [workspacesError, setWorkspacesError] = useState<string | null>(null)
+  const workspacesGeneration = useRef(0)
   const [providers, setProviders] = useState<ModelProviderInfo[]>([])
   const [rooms, setRooms] = useState<RoomSummary[]>([])
   const [listCursor, setListCursor] = useState<string | null>(null)
@@ -84,15 +117,14 @@ export function RoundtableWorkbench({
   const [sourcePreviews, setSourcePreviews] = useState<Record<string, string>>(
     {}
   )
-  const [roles, setRoles] = useState(["", "", ""])
-  const [agents, setAgents] = useState<string[]>([
-    "grok",
-    "cursor",
-    "antigravity",
-  ])
+  // Default seats match the adapters most installs qualify first; members can
+  // switch agents or add seats before the readiness check.
+  const [roles, setRoles] = useState(["", ""])
+  const [agents, setAgents] = useState<string[]>(["grok", "antigravity"])
+  // Empty id = the agent's qualified default binding (`provider:<agent>`).
   const [providerIds, setProviderIds] = useState<string[]>([])
   const [rounds, setRounds] = useState(2)
-  const [concurrency, setConcurrency] = useState(3)
+  const [concurrency, setConcurrency] = useState(2)
   const [moderator, setModerator] = useState(0)
   const [preflight, setPreflight] = useState<RoundtablePreflight | null>(null)
   const [confirmed, setConfirmed] = useState(false)
@@ -104,6 +136,7 @@ export function RoundtableWorkbench({
     {}
   )
   const [busy, setBusy] = useState(false)
+  const [checking, setChecking] = useState(false)
   const actionInFlight = useRef(false)
   const [error, setError] = useState<string | null>(null)
   const [interjection, setInterjection] = useState("")
@@ -112,6 +145,8 @@ export function RoundtableWorkbench({
   const [operation, setOperation] = useState<RoundtableOperation | null>(null)
   const [usage, setUsage] = useState<RoundtableUsage | null>(null)
   const [previews, setPreviews] = useState<Record<string, RoundtableView>>({})
+  // Display-only live output; never verified, never part of the projection.
+  const [liveOutput, setLiveOutput] = useState<RoundtableLiveState>({})
   const mutationScope = JSON.stringify([workspaceId, roomId])
   const mutation = useRef<PendingRoundtableMutation | null>(
     pendingPaidMutation(mutationScope)
@@ -119,6 +154,13 @@ export function RoundtableWorkbench({
   const [uncertainPaid, setUncertainPaid] = useState(
     () => !!pendingPaidMutation(mutationScope)
   )
+  const lastScope = useRef(mutationScope)
+  useEffect(() => {
+    if (lastScope.current === mutationScope) return
+    lastScope.current = mutationScope
+    mutation.current = pendingPaidMutation(mutationScope)
+    setUncertainPaid(!!mutation.current)
+  }, [mutationScope])
 
   const run = useCallback(async (action: () => Promise<void>) => {
     if (actionInFlight.current) return
@@ -177,6 +219,12 @@ export function RoundtableWorkbench({
   )
 
   useEffect(() => {
+    setRooms([])
+    setListCursor(null)
+    setListError(null)
+  }, [workspaceId])
+
+  useEffect(() => {
     void listRooms()
     return () => {
       listGeneration.current += 1
@@ -204,6 +252,31 @@ export function RoundtableWorkbench({
     }
   }, [])
 
+  const loadWorkspaces = useCallback(async () => {
+    const generation = ++workspacesGeneration.current
+    setWorkspacesLoading(true)
+    setWorkspacesError(null)
+    try {
+      const items = await listAllFolderDetails()
+      // Rooms resolve sources only against live regular folders.
+      if (generation === workspacesGeneration.current)
+        setWorkspaces(items.filter((folder) => folder.kind === "regular"))
+    } catch (error) {
+      if (generation === workspacesGeneration.current)
+        setWorkspacesError(roundtableError(error))
+    } finally {
+      if (generation === workspacesGeneration.current)
+        setWorkspacesLoading(false)
+    }
+  }, [])
+
+  useEffect(() => {
+    void loadWorkspaces()
+    return () => {
+      workspacesGeneration.current += 1
+    }
+  }, [loadWorkspaces])
+
   useEffect(() => {
     void loadProviders()
     return () => {
@@ -221,6 +294,9 @@ export function RoundtableWorkbench({
     setRoomLoading(true)
     setRoomError(null)
     setStreamError(null)
+    setLiveOutput({})
+    let liveState: RoundtableLiveState = {}
+    let resyncing = false
     const transport = getTransport()
     const subscriptionId = crypto.randomUUID()
     const attach = () =>
@@ -278,6 +354,9 @@ export function RoundtableWorkbench({
       if (!live) return
       previous = null
       setPreviews({})
+      // A fresh attach resends every live buffer in full.
+      liveState = {}
+      setLiveOutput({})
       void sync()
       void attach()
         .then(() => {
@@ -292,6 +371,28 @@ export function RoundtableWorkbench({
         `roundtable://${subscriptionId}`,
         (payload: unknown) => {
           if (!live) return
+          if (
+            payload &&
+            typeof payload === "object" &&
+            "type" in payload &&
+            payload.type === "roundtable_live"
+          ) {
+            const applied = applyRoundtableLive(liveState, payload, roomId)
+            liveState = applied.state
+            setLiveOutput(applied.state)
+            if (applied.resync && !resyncing) {
+              // A delta did not line up: re-attach for whole buffers.
+              resyncing = true
+              liveState = {}
+              setLiveOutput({})
+              void attach()
+                .catch(() => undefined)
+                .finally(() => {
+                  resyncing = false
+                })
+            }
+            return
+          }
           if (
             previous &&
             payload &&
@@ -345,10 +446,15 @@ export function RoundtableWorkbench({
     }
   }, [roomId, refresh])
 
+  const providerRefAt = (ordinal: number) =>
+    `provider:${providerIds[ordinal] || agents[ordinal] || "codex"}`
   const formConfig = (): RoundtableConfig => {
     const original = editingDraft ? loaded?.projection.body.replay.config : null
     const waves = Math.ceil(roles.length / concurrency)
-    const phaseBudget = 2 * waves * 225000
+    // Proposal and critique attempts keep a per-attempt limit. Synthesis has
+    // none (the server runs it to the room budget), so it only adds a room
+    // allowance here and never sizes phase_budget.
+    const phaseBudget = 2 * waves * MEMBER_ATTEMPT_TIMEOUT_MS
     return {
       schema_version: 1,
       ...(original?.display_name
@@ -360,12 +466,12 @@ export function RoundtableWorkbench({
       participants: roles.map((role, ordinal) => ({
         ordinal,
         role: role.trim() || `${t("member")} ${ordinal + 1}`,
-        provider_ref: `provider:${providerIds[ordinal] || providers[0]?.id || ""}`,
+        provider_ref: providerRefAt(ordinal),
         agent: agents[ordinal] || "codex",
         ...(original?.participants.find((member) => member.ordinal === ordinal)
           ?.model &&
         original.participants.find((member) => member.ordinal === ordinal)
-          ?.provider_ref === `provider:${providerIds[ordinal]}`
+          ?.provider_ref === providerRefAt(ordinal)
           ? {
               model: original.participants.find(
                 (member) => member.ordinal === ordinal
@@ -375,7 +481,7 @@ export function RoundtableWorkbench({
         ...(original?.participants.find((member) => member.ordinal === ordinal)
           ?.effort &&
         original.participants.find((member) => member.ordinal === ordinal)
-          ?.provider_ref === `provider:${providerIds[ordinal]}`
+          ?.provider_ref === providerRefAt(ordinal)
           ? {
               effort: original.participants.find(
                 (member) => member.ordinal === ordinal
@@ -391,14 +497,16 @@ export function RoundtableWorkbench({
         room_budget: String(
           Math.max(
             Number(original?.budgets.room_budget ?? 0),
-            (rounds + 1) * phaseBudget + 450000
+            (rounds + 1) * phaseBudget + SYNTHESIS_ROOM_ALLOWANCE_MS
           )
         ),
         phase_budget: String(
           Math.max(Number(original?.budgets.phase_budget ?? 0), phaseBudget)
         ),
       },
-      timeouts: original?.timeouts ?? { attempt_timeout: "225000" },
+      timeouts: original?.timeouts ?? {
+        attempt_timeout: String(MEMBER_ATTEMPT_TIMEOUT_MS),
+      },
       quotas: original?.quotas ?? {
         output_byte_limit: 8192,
         input_byte_limit: 16384,
@@ -449,6 +557,7 @@ export function RoundtableWorkbench({
     run(async () => {
       invalidate()
       const generation = preflightGeneration.current
+      setChecking(true)
       const result = await roundtableCall<RoundtablePreflight>(
         "roundtable_preflight",
         {
@@ -457,7 +566,7 @@ export function RoundtableWorkbench({
             ? { room_id: roomId, revision: loaded?.projection.body.revision }
             : {}),
         }
-      )
+      ).finally(() => setChecking(false))
       if (generation !== preflightGeneration.current) return
       if (result.config_hash !== (await roundtableHash(config)))
         throw new Error("preflight_config")
@@ -553,6 +662,21 @@ export function RoundtableWorkbench({
     !editingDraft
   const projection = loaded?.projection
   const status = projection?.body.status
+  const liveInputs = useMemo(
+    () => liveTranscriptInputs(liveOutput, projection),
+    [liveOutput, projection]
+  )
+  // Keep the room list's status in step with the verified room snapshot.
+  useEffect(() => {
+    if (!roomId || !status) return
+    setRooms((current) =>
+      current.some((room) => room.room_id === roomId && room.status !== status)
+        ? current.map((room) =>
+            room.room_id === roomId ? { ...room, status } : room
+          )
+        : current
+    )
+  }, [roomId, status])
   const buttonClass =
     "h-auto min-h-9 max-w-full justify-start whitespace-normal py-2 text-start"
   const editDraft = () => {
@@ -562,7 +686,10 @@ export function RoundtableWorkbench({
     setTopic(config.topic)
     setRoles(members.map((member) => member.role))
     setProviderIds(
-      members.map((member) => member.provider_ref.replace(/^provider:/, ""))
+      members.map((member) => {
+        const id = member.provider_ref.replace(/^provider:/, "")
+        return id === (member.agent || "codex") ? "" : id
+      })
     )
     setAgents(members.map((member) => member.agent || "codex"))
     setRounds(config.strategy.critique_rounds)
@@ -572,10 +699,216 @@ export function RoundtableWorkbench({
     invalidate()
   }
 
+  const members: ComposerMember[] = roles.map((role, index) => ({
+    role,
+    agent: agents[index] || "codex",
+    providerId: providerIds[index] || "",
+  }))
+  const updateMember = (index: number, patch: Partial<ComposerMember>) => {
+    if (patch.role !== undefined) {
+      const role = patch.role
+      setRoles(roles.map((old, i) => (i === index ? role : old)))
+    }
+    if (patch.agent !== undefined) {
+      const agent = patch.agent
+      setAgents(
+        members.map((member, i) => (i === index ? agent : member.agent))
+      )
+    }
+    if (patch.providerId !== undefined) {
+      const providerId = patch.providerId
+      setProviderIds(
+        members.map((member, i) =>
+          i === index ? providerId : member.providerId
+        )
+      )
+    }
+    invalidate()
+  }
+  const addMember = () => {
+    if (roles.length >= ROUNDTABLE_MAX_MEMBERS) return
+    const used = new Set(members.map((member) => member.agent))
+    const next =
+      ["grok", "antigravity", "cursor", "codex"].find(
+        (agent) => !used.has(agent)
+      ) ?? "grok"
+    setRoles([...roles, ""])
+    setAgents([...members.map((member) => member.agent), next])
+    setProviderIds([...members.map((member) => member.providerId), ""])
+    invalidate()
+  }
+  const removeMember = (index: number) => {
+    if (roles.length <= ROUNDTABLE_MIN_MEMBERS) return
+    const keep = (_: unknown, i: number) => i !== index
+    setRoles(roles.filter(keep))
+    setAgents(members.map((member) => member.agent).filter(keep))
+    setProviderIds(members.map((member) => member.providerId).filter(keep))
+    setConcurrency(Math.min(concurrency, roles.length - 1))
+    setModerator(
+      moderator === index ? 0 : moderator > index ? moderator - 1 : moderator
+    )
+    invalidate()
+  }
+  // Drafts created without a pinned model store "default" until the run
+  // resolves the seat's binding; show the checked model or the agent instead.
+  const speakerModelLabel = (
+    modelId: string,
+    seatOrdinal: number | null,
+    agent: string
+  ) => {
+    if (modelId && modelId !== "default") return modelId
+    const resolved =
+      preflight && preflightKey === configKey && seatOrdinal !== null
+        ? preflight.capability?.recipients.find(
+            (recipient) => recipient.ordinal === seatOrdinal
+          )?.model
+        : undefined
+    return resolved || roundtableAgentLabel(agent)
+  }
+  const budgetMinutes = Math.ceil(Number(config.budgets.room_budget) / 60000)
+  const preflightCurrent = !!preflight && preflightKey === configKey
+  const preflightOk =
+    preflightCurrent &&
+    preflight.enabled &&
+    preflight.readiness === "ready" &&
+    !preflight.error
+  const currentWorkspace = workspaces?.find(
+    (folder) => String(folder.id) === workspaceId
+  )
+  const workspaceUnavailable =
+    !!workspaceId && !!workspaces && !currentWorkspace
+  const selectWorkspace = (next: string) => {
+    if (next === workspaceId) return
+    setWorkspaceId(next)
+    invalidate()
+    setError(null)
+    // Keep the URL (and the room list links built from it) on the new workspace
+    // without remounting the form.
+    window.history.replaceState(
+      null,
+      "",
+      `/roundtable?workspace_id=${encodeURIComponent(next)}`
+    )
+  }
+  const preflightDisabled =
+    busy ||
+    !workspaceId ||
+    (!roomId && workspaceUnavailable) ||
+    (!!roomId && (!loaded || !!roomError || roomLoading)) ||
+    !sourceSelectionValid ||
+    editingDraft ||
+    (!roomId && !topic.trim())
+  const preflightPanel = (
+    <div className="flex min-w-0 flex-col gap-3">
+      <div className="flex min-w-0 flex-wrap items-center gap-x-3 gap-y-2">
+        <Button
+          variant="outline"
+          disabled={preflightDisabled}
+          onClick={() => void check()}
+        >
+          {checking ? (
+            <Loader2 aria-hidden="true" className="animate-spin" />
+          ) : (
+            <ShieldCheck aria-hidden="true" />
+          )}
+          {t("preflight")}
+        </Button>
+        {checking ? (
+          <p role="status" className="text-sm text-muted-foreground">
+            {t("checking")}
+          </p>
+        ) : !roomId && !topic.trim() ? (
+          <p className="text-sm text-muted-foreground">{t("topicRequired")}</p>
+        ) : null}
+      </div>
+      {preflight && preflightCurrent ? (
+        <>
+          <div
+            role="status"
+            className={cn(
+              "flex min-w-0 items-start gap-2 rounded-lg border p-3 text-sm",
+              preflightOk
+                ? "border-emerald-600/30 bg-emerald-500/5 text-emerald-800 dark:border-emerald-400/30 dark:text-emerald-300"
+                : "border-amber-600/30 bg-amber-500/5 text-amber-900 dark:border-amber-400/30 dark:text-amber-200"
+            )}
+          >
+            {preflightOk ? (
+              <CircleCheck
+                aria-hidden="true"
+                className="mt-0.5 size-4 shrink-0"
+              />
+            ) : (
+              <TriangleAlert
+                aria-hidden="true"
+                className="mt-0.5 size-4 shrink-0"
+              />
+            )}
+            <span>{preflight.enabled ? t("enabled") : t("disabled")}</span>
+          </div>
+          {preflight.error ? (
+            <p
+              role="alert"
+              className="rounded-lg border border-destructive/30 bg-destructive/5 p-3 text-sm text-destructive [overflow-wrap:anywhere]"
+            >
+              {roundtableError(preflight.error)}
+            </p>
+          ) : null}
+          <PreflightConfirmation
+            recipients={preflight.capability?.recipients ?? []}
+            moderatorOrdinal={config.moderator_ordinal}
+            seatBrands={roundtableSeatBrands(config)}
+            sourceManifests={preflight.source_manifests ?? []}
+            selectedPaths={selectedPaths}
+            sourcePreviews={sourcePreviews}
+            onPreview={
+              roomId
+                ? (entry) =>
+                    void run(async () => {
+                      const text = await loadRoundtableSource(roomId, entry)
+                      setSourcePreviews((previous) => ({
+                        ...previous,
+                        [entry.content_hash]: text,
+                      }))
+                    })
+                : undefined
+            }
+            tools={preflight.tools}
+            network={preflight.network}
+            writes={preflight.writes}
+            budget={`${Math.ceil(Number(config.budgets.room_budget) / 60000)} ${t("minutes")}`}
+            attemptLimit={`${Math.ceil(Number(config.timeouts.attempt_timeout) / 60000)} ${t("minutes")}`}
+          />
+          <label className="flex min-w-0 cursor-pointer items-start gap-3 rounded-lg border bg-background p-3 text-sm leading-relaxed transition-colors has-checked:border-primary/60 has-checked:bg-primary/5 has-[:focus-visible]:ring-[3px] has-[:focus-visible]:ring-ring/50">
+            <input
+              type="checkbox"
+              className="mt-0.5 size-4 shrink-0 accent-primary"
+              checked={confirmed}
+              onChange={(event) => setConfirmed(event.target.checked)}
+            />
+            <span>{t("confirm")}</span>
+          </label>
+        </>
+      ) : null}
+    </div>
+  )
+
   return (
     <main className="mx-auto flex w-full min-w-0 max-w-6xl flex-col gap-5 overflow-auto p-4 sm:p-6">
       <header className="flex flex-wrap items-center justify-between gap-3 border-b pb-4">
-        <h1 className="text-2xl font-semibold tracking-tight">{t("title")}</h1>
+        <div className="flex min-w-0 flex-wrap items-baseline gap-x-3 gap-y-1">
+          <h1 className="text-2xl font-semibold tracking-tight">
+            {t("title")}
+          </h1>
+          {currentWorkspace ? (
+            <span
+              className="flex min-w-0 items-center gap-1.5 text-sm text-muted-foreground"
+              title={currentWorkspace.path}
+            >
+              <FolderOpen aria-hidden="true" className="size-3.5 shrink-0" />
+              <span className="truncate">{currentWorkspace.name}</span>
+            </span>
+          ) : null}
+        </div>
         <Link
           href="/workspace"
           className="rounded-md text-sm text-muted-foreground hover:text-foreground focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring"
@@ -591,7 +924,9 @@ export function RoundtableWorkbench({
           {error}
         </p>
       ) : null}
-      {!workspaceId ? <p role="alert">{t("workspaceRequired")}</p> : null}
+      {!workspaceId && roomId ? (
+        <p role="alert">{t("workspaceRequired")}</p>
+      ) : null}
       {uncertainPaid ? (
         <section aria-label={t("pendingPaidOperation")}>
           <p role="status">{t("pendingPaidOperation")}</p>
@@ -665,188 +1000,65 @@ export function RoundtableWorkbench({
           ) : null}
           {!roomId || editingDraft ? (
             <>
-              <label>
-                {t("topic")}
-                <Textarea
-                  aria-label={t("topic")}
-                  value={topic}
-                  onChange={(event) => {
-                    setTopic(event.target.value)
-                    invalidate()
-                  }}
-                />
-              </label>
-              {!roomId ? (
-                <label>
-                  {t("selectedSourcePaths")}
-                  <Textarea
-                    aria-label={t("selectedSourcePaths")}
-                    value={selectedSourcePaths}
-                    placeholder={t("sourcePathsPlaceholder")}
-                    onChange={(event) => {
-                      setSelectedSourcePaths(event.target.value)
-                      invalidate()
-                    }}
-                  />
-                  <p className="text-sm text-muted-foreground">
-                    {t("sourceSelectionHelp")}
-                  </p>
-                  <p className="text-sm text-muted-foreground">
-                    {t("sourceRetentionNotice")}
-                  </p>
-                  {!sourceSelectionValid ? (
-                    <p role="alert">{t("invalidSourceSelection")}</p>
-                  ) : null}
-                </label>
-              ) : null}
-              {roles.map((role, index) => (
-                <fieldset
-                  key={index}
-                  className="grid min-w-0 gap-3 rounded-lg border p-3"
-                >
-                  <legend>
-                    {t("member")} {index + 1}
-                  </legend>
-                  <Input
-                    aria-label={`${t("role")} ${index + 1}`}
-                    value={role}
-                    onChange={(event) => {
-                      setRoles(
-                        roles.map((old, i) =>
-                          i === index ? event.target.value : old
-                        )
-                      )
-                      invalidate()
-                    }}
-                  />
-                  <label>
-                    {t("agent")}
-                    <select
-                      aria-label={`${t("agent")} ${index + 1}`}
-                      className="ml-2 rounded border bg-background p-2"
-                      value={agents[index] || "codex"}
-                      onChange={(event) => {
-                        setAgents(
-                          roles.map((_, i) =>
-                            i === index
-                              ? event.target.value
-                              : agents[i] || "codex"
-                          )
-                        )
-                        invalidate()
-                      }}
-                    >
-                      {ROUNDTABLE_AGENTS.map((agent) => (
-                        <option key={agent} value={agent}>
-                          {agent}
-                        </option>
-                      ))}
-                    </select>
-                  </label>
-                  <label>
-                    {t("provider")}
-                    <select
-                      aria-label={`${t("provider")} ${index + 1}`}
-                      className="ml-2 rounded border bg-background p-2"
-                      value={providerIds[index] || providers[0]?.id || ""}
-                      onChange={(event) => {
-                        setProviderIds(
-                          roles.map((_, i) =>
-                            i === index
-                              ? event.target.value
-                              : providerIds[i] || String(providers[0]?.id || "")
-                          )
-                        )
-                        invalidate()
-                      }}
-                    >
-                      {providers.map((provider) => (
-                        <option key={provider.id} value={provider.id}>
-                          {provider.name}
-                        </option>
-                      ))}
-                    </select>
-                  </label>
-                </fieldset>
-              ))}
-              <div className="flex flex-wrap gap-2">
-                <Button
-                  variant="outline"
-                  disabled={roles.length >= 7}
-                  onClick={() => {
-                    setRoles([...roles, ""])
-                    setAgents([...agents, "codex"])
-                    invalidate()
-                  }}
-                >
-                  {t("addMember")}
-                </Button>
-                <Button
-                  variant="outline"
-                  disabled={roles.length <= 2}
-                  onClick={() => {
-                    setRoles(roles.slice(0, -1))
-                    setAgents(agents.slice(0, -1))
-                    setConcurrency(Math.min(concurrency, roles.length - 1))
-                    setModerator(Math.min(moderator, roles.length - 2))
-                    invalidate()
-                  }}
-                >
-                  {t("removeMember")}
-                </Button>
+              <div className="min-w-0 space-y-1">
+                <h2 className="text-xl font-semibold tracking-tight">
+                  {editingDraft ? t("editDraft") : t("new")}
+                </h2>
+                <p className="text-sm leading-relaxed text-muted-foreground">
+                  {t("newSubtitle")}
+                </p>
               </div>
-              <div className="flex flex-wrap gap-4">
-                <label>
-                  {t("rounds")}
-                  <Input
-                    type="number"
-                    min={0}
-                    max={5}
-                    value={rounds}
-                    onChange={(event) => {
-                      setRounds(
-                        Math.max(0, Math.min(5, Number(event.target.value)))
-                      )
-                      invalidate()
-                    }}
-                  />
-                </label>
-                <label>
-                  {t("concurrency")}
-                  <Input
-                    type="number"
-                    min={1}
-                    max={roles.length}
-                    value={concurrency}
-                    onChange={(event) => {
-                      setConcurrency(
-                        Math.max(
-                          1,
-                          Math.min(roles.length, Number(event.target.value))
-                        )
-                      )
-                      invalidate()
-                    }}
-                  />
-                </label>
-                <label>
-                  {t("moderator")}
-                  <select
-                    className="ml-2 rounded border bg-background p-2"
-                    value={moderator}
-                    onChange={(event) => {
-                      setModerator(Number(event.target.value))
-                      invalidate()
-                    }}
-                  >
-                    {roles.map((role, index) => (
-                      <option key={index} value={index}>
-                        {role || `${t("member")} ${index + 1}`}
-                      </option>
-                    ))}
-                  </select>
-                </label>
-              </div>
+              <RoundtableComposer
+                workspaceField={
+                  !roomId ? (
+                    <RoundtableWorkspaceSelect
+                      workspaces={workspaces}
+                      loading={workspacesLoading}
+                      error={workspacesError}
+                      value={workspaceId}
+                      disabled={busy || uncertainPaid}
+                      onChange={selectWorkspace}
+                      onRetry={() => void loadWorkspaces()}
+                    />
+                  ) : undefined
+                }
+                sourceRoot={currentWorkspace?.path}
+                topic={topic}
+                onTopicChange={(value) => {
+                  setTopic(value)
+                  invalidate()
+                }}
+                showSources={!roomId}
+                sourcePaths={selectedSourcePaths}
+                onSourcePathsChange={(value) => {
+                  setSelectedSourcePaths(value)
+                  invalidate()
+                }}
+                sourceCount={selectedPaths.length}
+                sourceValid={sourceSelectionValid}
+                members={members}
+                seatBrands={roundtableSeatBrands(config)}
+                providers={providers}
+                onMemberChange={updateMember}
+                onAddMember={addMember}
+                onRemoveMember={removeMember}
+                moderator={moderator}
+                onModeratorChange={(index) => {
+                  setModerator(index)
+                  invalidate()
+                }}
+                rounds={rounds}
+                onRoundsChange={(value) => {
+                  setRounds(value)
+                  invalidate()
+                }}
+                concurrency={concurrency}
+                onConcurrencyChange={(value) => {
+                  setConcurrency(value)
+                  invalidate()
+                }}
+                budgetMinutes={budgetMinutes}
+              />
             </>
           ) : projection ? (
             <>
@@ -904,7 +1116,12 @@ export function RoundtableWorkbench({
                         {speaker.role === "moderator"
                           ? t("moderator")
                           : `${t("member")} ${speaker.ordinal + 1}`}{" "}
-                        · {speaker.model_id}
+                        ·{" "}
+                        {speakerModelLabel(
+                          speaker.model_id,
+                          seatOrdinal,
+                          agent
+                        )}
                       </span>
                       <span className="text-xs whitespace-nowrap text-muted-foreground">
                         {projection.body.replay.attempts
@@ -925,6 +1142,7 @@ export function RoundtableWorkbench({
                 projection={projection}
                 messages={loaded?.messages ?? []}
                 previews={previews}
+                live={liveInputs}
               />
               <section
                 aria-label={t("evidence")}
@@ -976,75 +1194,44 @@ export function RoundtableWorkbench({
           ) : !roomError ? (
             <p role="status">{t("loading")}</p>
           ) : null}
-          <Button
-            variant="outline"
-            disabled={
-              busy ||
-              !workspaceId ||
-              (!!roomId && (!loaded || !!roomError || roomLoading)) ||
-              !sourceSelectionValid ||
-              editingDraft ||
-              (!roomId && (!topic.trim() || providers.length === 0))
-            }
-            onClick={() => void check()}
-          >
-            {t("preflight")}
-          </Button>
-          {preflight && preflightKey === configKey ? (
-            <>
-              <p role="status">
-                {preflight.enabled ? t("enabled") : t("disabled")}
-              </p>
-              {preflight.error ? (
-                <p role="alert">{roundtableError(preflight.error)}</p>
-              ) : null}
-              <PreflightConfirmation
-                recipients={preflight.capability?.recipients ?? []}
-                moderatorOrdinal={config.moderator_ordinal}
-                sourceManifests={preflight.source_manifests ?? []}
-                selectedPaths={selectedPaths}
-                sourcePreviews={sourcePreviews}
-                onPreview={
-                  roomId
-                    ? (entry) =>
-                        void run(async () => {
-                          const text = await loadRoundtableSource(roomId, entry)
-                          setSourcePreviews((previous) => ({
-                            ...previous,
-                            [entry.content_hash]: text,
-                          }))
-                        })
-                    : undefined
-                }
-                tools={preflight.tools}
-                network={preflight.network}
-                writes={preflight.writes}
-                budget={`${Math.ceil(Number(config.budgets.room_budget) / 60000)} ${t("minutes")}`}
-              />
-              <label>
-                <input
-                  type="checkbox"
-                  checked={confirmed}
-                  onChange={(event) => setConfirmed(event.target.checked)}
-                />{" "}
-                {t("confirm")}
-              </label>
-            </>
-          ) : null}
+          {!roomId ? (
+            <RoundtableStep
+              step={5}
+              title={t("review")}
+              description={t("reviewHelp")}
+            >
+              {preflightPanel}
+              <div className="mt-4 flex flex-wrap items-center gap-3 border-t pt-4">
+                <Button
+                  size="lg"
+                  className="w-full sm:w-auto sm:min-w-40"
+                  disabled={busy || !canRun}
+                  onClick={() =>
+                    void mutate("roundtable_create", {
+                      config,
+                      selected_source_paths: selectedPaths,
+                    })
+                  }
+                >
+                  {busy && !checking ? (
+                    <Loader2 aria-hidden="true" className="animate-spin" />
+                  ) : null}
+                  {t("create")}
+                </Button>
+                {!canRun && preflightOk && !confirmed ? (
+                  <p className="text-sm text-muted-foreground">
+                    {t("confirmToCreate")}
+                  </p>
+                ) : null}
+              </div>
+            </RoundtableStep>
+          ) : (
+            <div className="min-w-0 rounded-xl border bg-muted/20 p-3 sm:p-4">
+              {preflightPanel}
+            </div>
+          )}
           <div className="flex flex-wrap gap-2">
-            {!roomId ? (
-              <Button
-                disabled={busy || !canRun}
-                onClick={() =>
-                  void mutate("roundtable_create", {
-                    config,
-                    selected_source_paths: selectedPaths,
-                  })
-                }
-              >
-                {t("create")}
-              </Button>
-            ) : (
+            {!roomId ? null : (
               <>
                 {status === "draft" || status === "ready" ? (
                   <>

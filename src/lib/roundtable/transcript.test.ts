@@ -413,6 +413,123 @@ describe("roundtable transcript", () => {
   })
 })
 
+describe("live preview turns", () => {
+  it("carries live output until a verified message claims the attempt", () => {
+    const source = projection((body) => {
+      body.status = "running"
+      body.phase_refs = [
+        {
+          phase_id: "phase-proposal",
+          revision: "1",
+          state: "running",
+          index: 0,
+          kind: "proposal",
+        },
+      ]
+      body.replay.attempts = [
+        { attempt_id: "attempt-a", state: "streaming", turn_id: "turn-a" },
+        { attempt_id: "attempt-b", state: "accepted", turn_id: "turn-b" },
+      ]
+      body.replay.turns = [
+        {
+          turn_id: "turn-a",
+          phase_id: "phase-proposal",
+          speaker_id: "speaker-1",
+          accepted_attempt_id: null,
+        },
+        {
+          turn_id: "turn-b",
+          phase_id: "phase-proposal",
+          speaker_id: "speaker-2",
+          accepted_attempt_id: "attempt-b",
+        },
+      ]
+    })
+    const live = {
+      thought: "considering",
+      thoughtOmitted: false,
+      activity: null,
+      ended: false,
+      truncated: false,
+    }
+    const model = buildRoundtableTranscript(
+      source,
+      [
+        message({
+          message_id: "verified-b",
+          attempt_id: "attempt-b",
+          speaker_id: "speaker-2",
+          phase_id: "phase-proposal",
+          visibility: "staged",
+          body: { kind: "proposal", summary: "Verified B" },
+        }),
+      ],
+      [
+        { attemptId: "attempt-a", text: "A so far", live },
+        { attemptId: "attempt-b", text: "B unverified", live },
+      ]
+    )
+    const turns = model.phases.flatMap((phase) => phase.turns)
+    expect(turns.find((turn) => turn.attemptId === "attempt-a")).toMatchObject({
+      visibility: "preview",
+      summary: "A so far",
+      live,
+    })
+    const b = turns.filter((turn) => turn.attemptId === "attempt-b")
+    expect(b).toHaveLength(1)
+    expect(b[0].visibility).toBe("staged")
+    expect(b[0].live).toBeUndefined()
+    expect(JSON.stringify(model)).not.toContain("B unverified")
+  })
+})
+
+describe("live preview before the projection lists the attempt", () => {
+  it("places it under its phase and seat from the live frame", () => {
+    const source = projection((body) => {
+      body.status = "running"
+      body.phase_refs = [
+        {
+          phase_id: "phase-proposal",
+          revision: "1",
+          state: "published",
+          index: 0,
+          kind: "proposal",
+        },
+      ]
+      body.replay.attempts = []
+      body.replay.turns = []
+    })
+    const model = buildRoundtableTranscript(
+      source,
+      [],
+      [
+        {
+          attemptId: "attempt-synth",
+          text: "Drafting the conclusion",
+          speakerId: "speaker-mod",
+          phaseId: "phase-synthesis",
+          phaseKind: "synthesis",
+          live: {
+            thought: "",
+            thoughtOmitted: false,
+            activity: null,
+            ended: false,
+            truncated: false,
+          },
+        },
+      ]
+    )
+    const last = model.phases.at(-1)!
+    expect(last.kind).toBe("synthesis")
+    expect(last.id).toBe("phase-synthesis")
+    expect(last.turns[0]).toMatchObject({
+      visibility: "preview",
+      summary: "Drafting the conclusion",
+      speaker: { role: "moderator" },
+    })
+  })
+})
+
 describe("replaceSeatAliases", () => {
   it("maps seat aliases outside code, leaves code and unknown aliases alone", () => {
     const label = (alias: string) =>

@@ -746,10 +746,135 @@ pub(super) fn rootfs_digest(root: &Path) -> RtResult<Hash256> {
         .map_err(|_| rt_error(ErrorCode::CapabilityUnqualified, "rootfs_unreadable"))
 }
 
+/// Full rootfs walks per image root (tests assert that the per-launch path
+/// does not add any once a qualified image has been verified).
+#[cfg(test)]
+static ROOTFS_WALKS: std::sync::Mutex<BTreeMap<PathBuf, u64>> =
+    std::sync::Mutex::new(BTreeMap::new());
+
+/// Identity of a pinned component on disk. Any write to a file changes its
+/// ctime; replacing it changes the inode. For the rootfs this is the image
+/// root directory: the image is frozen and mounted read-only in containers.
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct ComponentStamp {
+    path: PathBuf,
+    expected: Hash256,
+    dev: u64,
+    ino: u64,
+    len: u64,
+    mtime_ns: i128,
+    ctime_ns: i128,
+}
+
+fn component_stamp(path: &Path, expected: &Hash256) -> RtResult<ComponentStamp> {
+    let metadata = fs::metadata(path)
+        .map_err(|_| rt_error(ErrorCode::CapabilityUnqualified, "binary_unreadable"))?;
+    #[cfg(unix)]
+    let (dev, ino, mtime_ns, ctime_ns) = {
+        use std::os::unix::fs::MetadataExt;
+        (
+            metadata.dev(),
+            metadata.ino(),
+            i128::from(metadata.mtime()) * 1_000_000_000 + i128::from(metadata.mtime_nsec()),
+            i128::from(metadata.ctime()) * 1_000_000_000 + i128::from(metadata.ctime_nsec()),
+        )
+    };
+    #[cfg(not(unix))]
+    let (dev, ino, mtime_ns, ctime_ns) = (0, 0, 0, 0);
+    Ok(ComponentStamp {
+        path: path.to_path_buf(),
+        expected: *expected,
+        dev,
+        ino,
+        len: metadata.len(),
+        mtime_ns,
+        ctime_ns,
+    })
+}
+
+fn verified_components() -> &'static std::sync::Mutex<std::collections::HashSet<ComponentStamp>> {
+    static VERIFIED: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashSet<ComponentStamp>>,
+    > = std::sync::OnceLock::new();
+    VERIFIED.get_or_init(Default::default)
+}
+
+/// Hash a pinned component once per process and qualified hash. Later
+/// launches only compare its on-disk identity; a new qualification (new
+/// expected hash) or any change to the file re-runs the full hash. Failures
+/// are never cached.
+fn verify_component_once(
+    path: &Path,
+    expected: &Hash256,
+    compute: impl FnOnce() -> RtResult<Hash256>,
+) -> RtResult<bool> {
+    let stamp = component_stamp(path, expected)?;
+    if verified_components()
+        .lock()
+        .expect("verified components")
+        .contains(&stamp)
+    {
+        return Ok(true);
+    }
+    let hash_started = std::time::SystemTime::now();
+    if compute()? != *expected {
+        return Ok(false);
+    }
+    // Only cache if the file did not change while it was being hashed and
+    // its timestamps are settled (see `stamp_is_settled`).
+    if component_stamp(path, expected)? == stamp && stamp_is_settled(&stamp, hash_started) {
+        verified_components()
+            .lock()
+            .expect("verified components")
+            .insert(stamp);
+    }
+    Ok(true)
+}
+
+/// Margin, in nanoseconds, that a cached stamp's mtime/ctime must be older than
+/// the start of the hash. Filesystem timestamps are coarse (one kernel tick
+/// on Linux, up to 1-2s on some filesystems). A same-length, in-place rewrite
+/// in the same tick as the verified write would otherwise produce an
+/// identical stamp and be accepted from the cache ("racily clean", as in git).
+/// With the margin, any write after caching carries a later ctime, so the
+/// stamp changes and the next launch re-hashes.
+const STAMP_SETTLE_NS: i128 = 2_000_000_000;
+
+fn stamp_is_settled(stamp: &ComponentStamp, hash_started: std::time::SystemTime) -> bool {
+    if !cfg!(unix) {
+        // No inode/ctime identity: every launch re-hashes.
+        return false;
+    }
+    let Ok(since_epoch) = hash_started.duration_since(std::time::UNIX_EPOCH) else {
+        return false;
+    };
+    let cutoff = since_epoch.as_nanos() as i128 - STAMP_SETTLE_NS;
+    stamp.mtime_ns < cutoff && stamp.ctime_ns < cutoff
+}
+
+fn verify_runtime_binary(path: &Path, expected: &Hash256) -> RtResult<bool> {
+    verify_component_once(path, expected, || file_hash(path))
+}
+
+fn verify_rootfs(rootfs: &Path, expected: &Hash256) -> RtResult<bool> {
+    let root = rootfs
+        .canonicalize()
+        .map_err(|_| rt_error(ErrorCode::CapabilityUnqualified, "rootfs_unreadable"))?;
+    verify_component_once(&root, expected, || rootfs_digest(&root))
+}
+
 pub(super) fn rootfs_digest_detail(root: &Path) -> Result<Hash256, String> {
     let root = root
         .canonicalize()
         .map_err(|error| format!("rootfs_unreadable: {}: {error}", root.display()))?;
+    #[cfg(test)]
+    {
+        *ROOTFS_WALKS
+            .lock()
+            .expect("rootfs walks")
+            .entry(root.clone())
+            .or_default() += 1;
+    }
     if !root.is_dir() {
         return Err(format!(
             "rootfs_unreadable: {} is not a directory",
@@ -2459,8 +2584,8 @@ pub(super) fn verify_profile(plan: &SandboxPlan, profile: &QualifiedOciProfile) 
         || profile.runtime.role != "crun"
         || Path::new(&profile.runtime.absolute_path) != plan.runtime_path
         || profile.runtime.sha256 != plan.runtime_sha256
-        || file_hash(&plan.runtime_path)? != plan.runtime_sha256
-        || rootfs_digest(&profile.rootfs)? != profile.rootfs_sha256
+        || !verify_runtime_binary(&plan.runtime_path, &plan.runtime_sha256)?
+        || !verify_rootfs(&profile.rootfs, &profile.rootfs_sha256)?
         || plan.oci["root"]["path"] != json!(profile.rootfs)
     {
         return Err(rt_error(
@@ -2629,7 +2754,7 @@ fn verify_container_binaries(
                     .canonicalize()
                     .map_err(|_| rt_error(ErrorCode::CapabilityUnqualified, "rootfs_unreadable"))?,
             )
-            || file_hash(&path)? != binary.sha256
+            || !verify_runtime_binary(&path, &binary.sha256)?
         {
             return Err(rt_error(
                 ErrorCode::CapabilityUnqualified,
@@ -2648,7 +2773,7 @@ pub(super) fn verify_installed_profile(
         || binary(&key.binaries, "crun")? != &profile.runtime
         || !profile.rootfs.is_absolute()
         || !profile.runtime_root.is_absolute()
-        || rootfs_digest(&profile.rootfs)? != profile.rootfs_sha256
+        || !verify_rootfs(&profile.rootfs, &profile.rootfs_sha256)?
     {
         return Err(rt_error(
             ErrorCode::CapabilityUnqualified,
@@ -2805,7 +2930,10 @@ fn verify_runtime(profile: &QualifiedOciProfile) -> RtResult<()> {
     verify_cgroup_root(&profile.cgroup_root)?;
     if !Path::new(&profile.runtime.absolute_path).is_absolute()
         || profile.runtime.role != "crun"
-        || file_hash(Path::new(&profile.runtime.absolute_path))? != profile.runtime.sha256
+        || !verify_runtime_binary(
+            Path::new(&profile.runtime.absolute_path),
+            &profile.runtime.sha256,
+        )?
     {
         return Err(rt_error(ErrorCode::CapabilityUnqualified, "runtime_drift"));
     }
@@ -4923,5 +5051,106 @@ mod control_tests {
             Some("runtime_control_bytes")
         );
         assert_eq!(cursor.position(), 1024 * 1024 + 1);
+    }
+}
+
+#[cfg(test)]
+mod verify_once_tests {
+    use super::*;
+
+    #[cfg(unix)]
+    fn walks(root: &Path) -> u64 {
+        ROOTFS_WALKS
+            .lock()
+            .unwrap()
+            .get(&root.canonicalize().unwrap())
+            .copied()
+            .unwrap_or(0)
+    }
+
+    #[test]
+    fn a_fresh_component_is_never_served_from_the_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        let crun = dir.path().join("crun");
+        fs::write(&crun, b"crun-v1").unwrap();
+        let crun_sha = file_hash(&crun).unwrap();
+        assert!(verify_runtime_binary(&crun, &crun_sha).unwrap());
+        // Same length, same inode, very likely the same timestamp tick.
+        fs::write(&crun, b"crun-v2").unwrap();
+        assert!(!verify_runtime_binary(&crun, &crun_sha).unwrap());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn launches_reuse_the_verified_profile_and_rehash_only_on_change() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let rootfs = root.join("rootfs");
+        fs::create_dir_all(rootfs.join("usr/bin")).unwrap();
+        fs::write(rootfs.join("usr/bin/agent"), b"agent-v1").unwrap();
+        fs::write(rootfs.join("etc-file"), b"frozen").unwrap();
+        let crun = root.join("crun");
+        fs::write(&crun, b"crun-v1").unwrap();
+        let rootfs_sha = rootfs_digest(&rootfs).unwrap();
+        let crun_sha = file_hash(&crun).unwrap();
+        let agent_sha = file_hash(&rootfs.join("usr/bin/agent")).unwrap();
+        let profile = QualifiedOciProfile {
+            runtime: CertifiedBinary {
+                role: "crun".into(),
+                absolute_path: crun.to_string_lossy().into_owned(),
+                version: "pinned".into(),
+                sha256: crun_sha,
+            },
+            rootfs: rootfs.clone(),
+            rootfs_sha256: rootfs_sha,
+            runtime_root: root.join("runtime"),
+            cgroup_root: root.join("cgroup"),
+            cli_args: Vec::new(),
+            service_socket: None,
+            gateway_socket: None,
+            auth_mounts: Vec::new(),
+            host_held_credentials: Vec::new(),
+            container_env: BTreeMap::new(),
+        };
+        let binaries = vec![
+            profile.runtime.clone(),
+            CertifiedBinary {
+                role: "cli".into(),
+                absolute_path: "/usr/bin/agent".into(),
+                version: "pinned".into(),
+                sha256: agent_sha,
+            },
+        ];
+        // Pinned components are installed well before launch; let their
+        // timestamps settle past the cache margin.
+        std::thread::sleep(std::time::Duration::from_millis(
+            (STAMP_SETTLE_NS / 1_000_000) as u64 + 100,
+        ));
+        let baseline = walks(&rootfs);
+        // First use verifies; every later launch step (preflight, plan build,
+        // prepare, spawn, control, reap) reuses that result.
+        for _ in 0..4 {
+            assert!(verify_rootfs(&profile.rootfs, &profile.rootfs_sha256).unwrap());
+            assert!(verify_runtime_binary(&crun, &crun_sha).unwrap());
+            verify_container_binaries(&profile, &binaries).unwrap();
+        }
+        assert_eq!(walks(&rootfs), baseline + 1, "rootfs hashed once");
+
+        // A new qualification (different pinned hash) re-verifies in full.
+        let other = Hash256::from_bytes([9; 32]);
+        assert!(!verify_rootfs(&profile.rootfs, &other).unwrap());
+        assert_eq!(walks(&rootfs), baseline + 2);
+        assert!(verify_rootfs(&profile.rootfs, &profile.rootfs_sha256).unwrap());
+        assert_eq!(walks(&rootfs), baseline + 2, "still cached");
+
+        // Any write to a pinned file is caught on the next launch.
+        fs::write(&crun, b"crun-v2").unwrap();
+        assert!(!verify_runtime_binary(&crun, &crun_sha).unwrap());
+        fs::write(rootfs.join("usr/bin/agent"), b"agent-v2").unwrap();
+        assert!(verify_container_binaries(&profile, &binaries).is_err());
+        // Image root changes (entries added/removed) are re-hashed.
+        fs::write(rootfs.join("planted"), b"x").unwrap();
+        assert!(!verify_rootfs(&profile.rootfs, &profile.rootfs_sha256).unwrap());
+        assert_eq!(walks(&rootfs), baseline + 3);
     }
 }

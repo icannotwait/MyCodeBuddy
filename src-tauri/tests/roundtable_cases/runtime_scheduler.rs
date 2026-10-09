@@ -512,6 +512,9 @@ struct HangingExecutor {
     cleanup_release: tokio::sync::Notify,
     cancelled: std::sync::atomic::AtomicUsize,
     dropped: Arc<std::sync::atomic::AtomicUsize>,
+    /// Synchronous work before the turn parks, standing in for a launch that
+    /// blocks the room task (plan hashing, crun preparation).
+    launch_block_ms: u64,
 }
 struct DroppedTurn(Arc<std::sync::atomic::AtomicUsize>);
 impl Drop for DroppedTurn {
@@ -556,6 +559,9 @@ impl RoundtableTurnExecutor for HangingExecutor {
                 .expect("production prepaid lease"),
         );
         let _drop = DroppedTurn(self.dropped.clone());
+        if self.launch_block_ms > 0 {
+            std::thread::sleep(std::time::Duration::from_millis(self.launch_block_ms));
+        }
         self.started.notify_one();
         std::future::pending().await
     }
@@ -648,6 +654,7 @@ async fn exercise_storage_failure(mode: u8) {
         cleanup_release: tokio::sync::Notify::new(),
         cancelled: std::sync::atomic::AtomicUsize::new(0),
         dropped: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        launch_block_ms: 0,
     });
     let runtime = Arc::new(OwnedParticipantRuntime::with_executor(
         dir.path().into(),
@@ -932,6 +939,247 @@ async fn exercise_storage_failure(mode: u8) {
         0
     );
     assert!(!dir.path().join("roundtable/execution-policy.json").exists());
+}
+
+fn hanging_executor(launch_block_ms: u64) -> Arc<HangingExecutor> {
+    Arc::new(HangingExecutor {
+        started: tokio::sync::Notify::new(),
+        active: Mutex::new(Vec::new()),
+        permissions: Mutex::new(Vec::new()),
+        wait_cleanup: false,
+        cleanup_entered: tokio::sync::Notify::new(),
+        cleanup_release: tokio::sync::Notify::new(),
+        cancelled: std::sync::atomic::AtomicUsize::new(0),
+        dropped: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        launch_block_ms,
+    })
+}
+
+/// Consecutive `active` ledger samples since the run began, as charged deltas.
+async fn active_sample_deltas(conn: &sea_orm::DatabaseConnection) -> Vec<i64> {
+    let rows = conn
+        .query_all(sea_orm::Statement::from_string(
+            sea_orm::DbBackend::Sqlite,
+            "SELECT sampled_active_ms FROM rt_measurements WHERE kind='active' ORDER BY ledger_seq",
+        ))
+        .await
+        .unwrap();
+    let samples: Vec<i64> = rows
+        .iter()
+        .map(|row| row.try_get_by_index::<i64>(0).unwrap())
+        .collect();
+    samples.windows(2).map(|pair| pair[1] - pair[0]).collect()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn lifecycle_slow_synchronous_launch_does_not_stall_the_prepaid_lease() {
+    let (dir, conn) = support::open_pool(5).await;
+    migrate_roundtable(&conn).await.unwrap();
+    let store = open_roundtable_store(conn.clone()).await.unwrap();
+    // Longer than two prepaid slices. Before the monitor ran as its own task
+    // this froze every checkpoint for the whole launch (2.4-3.4s live).
+    let executor = hanging_executor(2_500);
+    let runtime = Arc::new(OwnedParticipantRuntime::with_executor(
+        dir.path().into(),
+        Arc::new(ConnectionManager::new()),
+        executor.clone(),
+    ));
+    let service = RoundtableService::open(
+        ServiceConfig {
+            data_dir: dir.path().into(),
+            db_path: dir.path().join("roundtable.db"),
+            db_identity: DbIdentity::new("slow-launch-runtime").unwrap(),
+            discover: Some(Arc::new(NoUntrackedOwners)),
+        },
+        store,
+        runtime,
+    )
+    .await
+    .unwrap();
+    let actor = ActorContext::from_trusted_entry(
+        "00000000-0000-4000-8000-000000000001".parse().unwrap(),
+        OperatorScope::SingleOperator,
+        ClientIdentity {
+            kind: ClientKind::Web,
+            session_ref: "slow-launch".into(),
+        },
+    );
+    let created = service
+        .execute_fake_command(
+            &actor,
+            "roundtable_create",
+            json!({"request_id":uuid::Uuid::new_v4().to_string(),"config":config()}),
+        )
+        .await
+        .unwrap();
+    let room = created["room_id"].clone();
+    conn.execute_unprepared("UPDATE rt_rooms SET status='paused'")
+        .await
+        .unwrap();
+    service.execute_fake_command(&actor,"roundtable_resume",json!({"room_id":room,"request_id":uuid::Uuid::new_v4().to_string(),"expected_revision":created["revision"],"recovery_consent":true})).await.unwrap();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        executor.started.notified(),
+    )
+    .await
+    .expect("the blocking launch finishes");
+    // Let at least one more sample land after the launch returned.
+    tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+    assert_eq!(
+        support::scalar_text(&conn, "SELECT status FROM rt_rooms").await,
+        "running",
+        "a slow launch must not pause the room"
+    );
+    let permission = executor.permissions.lock().unwrap()[0].clone();
+    assert!(
+        !permission.revoked(),
+        "the lease kept renewing during launch"
+    );
+    assert_eq!(
+        executor
+            .cancelled
+            .load(std::sync::atomic::Ordering::Relaxed),
+        0
+    );
+    let deltas = active_sample_deltas(&conn).await;
+    assert!(
+        deltas.len() >= 10,
+        "the monitor kept sampling during the launch: {deltas:?}"
+    );
+    let worst = deltas.iter().copied().max().unwrap_or(0);
+    assert!(
+        worst < 1_000,
+        "no checkpoint gap may reach the one-second slice during a launch: {deltas:?}"
+    );
+    service.shutdown().await.unwrap();
+    assert!(executor.active.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn lifecycle_prepaid_expiry_never_spends_past_remaining_active_ms() {
+    use sea_orm::TransactionTrait;
+    let (dir, conn) = support::open_pool(5).await;
+    migrate_roundtable(&conn).await.unwrap();
+    let store = open_roundtable_store(conn.clone()).await.unwrap();
+    let executor = hanging_executor(0);
+    let runtime = Arc::new(OwnedParticipantRuntime::with_executor(
+        dir.path().into(),
+        Arc::new(ConnectionManager::new()),
+        executor.clone(),
+    ));
+    let service = RoundtableService::open(
+        ServiceConfig {
+            data_dir: dir.path().into(),
+            db_path: dir.path().join("roundtable.db"),
+            db_identity: DbIdentity::new("prepaid-spend-runtime").unwrap(),
+            discover: Some(Arc::new(NoUntrackedOwners)),
+        },
+        store,
+        runtime,
+    )
+    .await
+    .unwrap();
+    let actor = ActorContext::from_trusted_entry(
+        "00000000-0000-4000-8000-000000000001".parse().unwrap(),
+        OperatorScope::SingleOperator,
+        ClientIdentity {
+            kind: ClientKind::Web,
+            session_ref: "prepaid-spend".into(),
+        },
+    );
+    let created = service
+        .execute_fake_command(
+            &actor,
+            "roundtable_create",
+            json!({"request_id":uuid::Uuid::new_v4().to_string(),"config":config()}),
+        )
+        .await
+        .unwrap();
+    let room = created["room_id"].clone();
+    conn.execute_unprepared("UPDATE rt_rooms SET status='paused'")
+        .await
+        .unwrap();
+    service.execute_fake_command(&actor,"roundtable_resume",json!({"room_id":room,"request_id":uuid::Uuid::new_v4().to_string(),"expected_revision":created["revision"],"recovery_consent":true})).await.unwrap();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        executor.started.notified(),
+    )
+    .await
+    .unwrap();
+    // Stall the writer and, in the same uncommitted write, exhaust the room:
+    // whatever is already prepaid is all that may ever be spent.
+    let writer = conn.begin().await.unwrap();
+    writer
+        .execute_unprepared("UPDATE rt_rooms SET remaining_active_ms=0")
+        .await
+        .unwrap();
+    let reserved_until = support::scalar_i64(
+        &conn,
+        "SELECT last_sample_mono+prepaid_ms FROM rt_active_time_leases",
+    )
+    .await as u64;
+    let prepaid_ms =
+        support::scalar_i64(&conn, "SELECT prepaid_ms FROM rt_active_time_leases").await;
+    assert!(prepaid_ms <= 1_000);
+    let permission = executor.permissions.lock().unwrap()[0].clone();
+    assert!(
+        permission.prepaid_until() <= reserved_until,
+        "local permission never extends past the last durable reservation"
+    );
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while executor
+            .cancelled
+            .load(std::sync::atomic::Ordering::Acquire)
+            != 1
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("expiry stops and reaps without the DB");
+    assert_eq!(permission.admit_forward(reserved_until), 0);
+    assert_eq!(permission.admit_tool(0), 0);
+    assert!(permission.revoked());
+    // Keep SQLite stalled well past the local stop. None of this may be charged.
+    tokio::time::sleep(std::time::Duration::from_millis(2_000)).await;
+    writer.commit().await.unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            if support::scalar_i64(&conn, "SELECT COUNT(*) FROM rt_active_time_leases").await == 0
+                && support::scalar_text(&conn, "SELECT status FROM rt_rooms").await == "paused"
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("settles and pauses once SQLite returns");
+    assert_eq!(
+        support::scalar_i64(&conn, "SELECT remaining_active_ms FROM rt_rooms").await,
+        0
+    );
+    let budget = 900_000;
+    assert!(
+        support::scalar_i64(
+            &conn,
+            "SELECT MAX(sampled_active_ms) FROM rt_measurements WHERE kind='active'"
+        )
+        .await
+            <= budget
+    );
+    // Only the gap between the last durable sample and the proven local stop
+    // may exceed the prepaid slice, and it is bounded by local cleanup.
+    let overrun = support::scalar_i64(
+        &conn,
+        "SELECT COALESCE(SUM(sampled_active_ms),0) FROM rt_measurements WHERE kind='cleanup_overrun'",
+    )
+    .await;
+    assert!(
+        overrun < 500,
+        "the 2s SQLite stall after local stop must not be charged (overrun {overrun}ms)"
+    );
+    assert!(executor.active.lock().unwrap().is_empty());
 }
 
 #[tokio::test]
@@ -1561,7 +1809,12 @@ impl RoundtableTurnExecutor for DispatchStallExecutor {
     }
 }
 
-#[tokio::test]
+// The server runs a multi-thread runtime. The prepaid monitor is its own task,
+// so a scheduler task blocked by synchronous launch work cannot starve it. On a
+// current-thread runtime a 2.5s block freezes every task, the 1s prepaid slice
+// genuinely expires, and execution is refused (as it must be) instead of
+// silently re-charging the stall.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn dispatch_stall_longer_than_the_prepaid_slice_still_completes() {
     let (dir, conn) = support::open_pool(5).await;
     migrate_roundtable(&conn).await.unwrap();

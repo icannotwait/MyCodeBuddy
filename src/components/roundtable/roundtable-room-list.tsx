@@ -3,7 +3,7 @@
 import Link from "next/link"
 import { useId, useState } from "react"
 import { useTranslations } from "next-intl"
-import { ChevronDown } from "lucide-react"
+import { ChevronDown, Plus } from "lucide-react"
 import { Button } from "@/components/ui/button"
 import { cn } from "@/lib/utils"
 import { plainInlineText, RoundtableInlineText } from "./roundtable-inline-text"
@@ -65,8 +65,10 @@ export function RoundtableRoomList({
       >
         <Link
           href={workspaceHref}
-          className="rounded-md px-2 py-1 text-sm font-medium [overflow-wrap:anywhere] hover:bg-muted focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring"
+          aria-current={!roomId ? "page" : undefined}
+          className="inline-flex min-h-9 items-center justify-center gap-1.5 rounded-4xl bg-primary px-3 py-2 text-sm font-medium text-primary-foreground [overflow-wrap:anywhere] transition-colors hover:bg-primary/85 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring"
         >
+          <Plus aria-hidden="true" className="size-4 shrink-0" />
           {t("new")}
         </Link>
         <Button

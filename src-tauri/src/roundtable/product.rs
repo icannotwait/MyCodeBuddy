@@ -1273,7 +1273,7 @@ async fn fail_run(
             .emit_current_in(&txn, &room.to_string(), "terminal")
             .await?;
     }
-    tracing::warn!(code=?error.code,"roundtable run ended before completion");
+    tracing::warn!(code=?error.code, reason=?error.details.reason, "roundtable run ended before completion");
     txn.commit().await.map_err(storage_err)?;
     Ok(fenced)
 }

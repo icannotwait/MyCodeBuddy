@@ -98,6 +98,8 @@ export interface TranscriptTurn {
   coverage: { succeeded: number; absent: number } | null
   evidenceAliases: TranscriptAlias[]
   raw: unknown
+  /** Present only on unverified live preview turns. */
+  live?: RoundtableLivePreview
 }
 
 export interface TranscriptPhase {
@@ -117,9 +119,29 @@ export interface RoundtableTranscriptModel {
   seats: Record<string, TranscriptSpeaker>
 }
 
+/** Display-only live output attached to a preview turn (never verified). */
+export interface RoundtableLivePreview {
+  thought: string
+  /** Older thinking was dropped by the buffer cap. */
+  thoughtOmitted: boolean
+  activity: string | null
+  /** The member finished streaming; verification is pending. */
+  ended: boolean
+  /** The message buffer hit its cap; later text is not shown. */
+  truncated: boolean
+}
+
 export interface RoundtablePreviewInput {
   attemptId: string
   text: string
+  live?: RoundtableLivePreview
+  /**
+   * Seat and phase from the live frame, used only while the verified
+   * projection does not list the attempt yet (it is re-read on events).
+   */
+  speakerId?: string
+  phaseId?: string
+  phaseKind?: string
 }
 
 interface PhaseBucket {
@@ -624,9 +646,27 @@ export function buildRoundtableTranscript(
           (item) => item.turn_id === attempt.turn_id
         )
       : undefined
-    const phaseId = replayTurn?.phase_id ?? null
-    const speaker = readSpeaker(projection, replayTurn?.speaker_id ?? null)
-    const bucket = bucketFor(phaseId, null)
+    const phaseId = replayTurn?.phase_id ?? preview.phaseId ?? null
+    const speaker = readSpeaker(
+      projection,
+      replayTurn?.speaker_id ?? preview.speakerId ?? null
+    )
+    const liveKind = preview.phaseKind
+    const bucket =
+      phaseId &&
+      !phaseRefs.has(phaseId) &&
+      (liveKind === "proposal" ||
+        liveKind === "critique" ||
+        liveKind === "synthesis")
+        ? ensure(
+            phaseId,
+            liveKind,
+            Math.max(-1, ...[...phaseRefs.values()].map((ref) => ref.index)) +
+              1,
+            "0",
+            titleKeyFor(liveKind)
+          )
+        : bucketFor(phaseId, null)
     const turn = emptyTurn({
       key: `preview:${preview.attemptId}`,
       messageId: null,
@@ -643,6 +683,7 @@ export function buildRoundtableTranscript(
       summary: preview.text,
       raw: null,
     })
+    if (preview.live) turn.live = preview.live
     bucket.turns.push({
       turn,
       seq: null,
