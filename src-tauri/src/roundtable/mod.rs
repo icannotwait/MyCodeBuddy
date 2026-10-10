@@ -15,6 +15,7 @@ mod clock;
 #[cfg(any(test, feature = "test-utils"))]
 mod command_processor;
 mod companion;
+mod conclusion;
 mod control;
 mod diagnostics;
 mod e2e;

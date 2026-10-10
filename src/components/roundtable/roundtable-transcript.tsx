@@ -165,12 +165,15 @@ export function RoundtableTranscript({
   messages,
   previews,
   live,
+  conclusionActions,
 }: {
   projection: RoundtableProjection
   messages: RoundtableMessage[]
   previews?: Record<string, { preview: string | null }>
   /** Unverified, display-only live output of in-flight attempts. */
   live?: RoundtablePreviewInput[]
+  /** Rendered under the accepted conclusion (save / download / copy). */
+  conclusionActions?: ReactNode
 }) {
   const t = useTranslations("Roundtable")
   const locale = useLocale()
@@ -281,6 +284,7 @@ export function RoundtableTranscript({
                     </li>
                   ))}
                 </ol>
+                {conclusion ? conclusionActions : null}
               </section>
             )
           })}

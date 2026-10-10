@@ -81,5 +81,7 @@ handlers!(
     roundtable_operation,
     roundtable_clone,
     roundtable_attach,
-    roundtable_detach
+    roundtable_detach,
+    roundtable_conclusion_export,
+    roundtable_conclusion_save
 );
