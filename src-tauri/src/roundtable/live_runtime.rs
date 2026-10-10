@@ -3637,6 +3637,10 @@ mod completion_contract_tests {
             json!({"title":"roundtable: submit_result"}),
             json!({"name":"run_terminal_command","title":"roundtable: submit_result","kind":"other"}),
             json!({"title":"roundtable:  submit_result","kind":"other"}),
+            json!({"title":"roundtable: read_file","kind":"other"}),
+            json!({"title":"roundtable: view_file","kind":"other"}),
+            json!({"title":"roundtable: submit_result ","kind":"other"}),
+            json!({"title":"Roundtable: submit_result","kind":"other"}),
         ] {
             let params = json!({"toolCall":tool_call,"options":[{"optionId":"allow","kind":"allow_once"},{"optionId":"reject","kind":"reject_once"}]});
             assert_eq!(
@@ -3651,6 +3655,7 @@ mod completion_contract_tests {
             "search_evidence",
             "roundtable: submit_result",
             "roundtable: read_evidence",
+            "roundtable: search_evidence",
         ] {
             let params = json!({"toolCall":{"title":name,"kind":"other"},"options":[{"optionId":"allow","kind":"allow_once"},{"optionId":"reject","kind":"reject_once"}]});
             assert_eq!(
