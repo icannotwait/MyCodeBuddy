@@ -2161,6 +2161,9 @@ fn tool_call_is_roundtable(params: &Value) -> bool {
     if antigravity_roundtable_meta(call) {
         return true;
     }
+    if cursor_roundtable_title(call) {
+        return true;
+    }
     // A machine name wins over display text. Only the explicit Grok use_tool
     // wrapper may route through its arguments, and only to a scoped MCP name.
     let Some(identity) = call
@@ -2221,6 +2224,20 @@ fn antigravity_roundtable_meta(call: &Value) -> bool {
         Some(title) => single_underscore_title_agrees(title, tool),
         None => true,
     }
+}
+
+/// cursor-agent ACP asks for MCP consent with no machine name: kind
+/// `other` and the title `"<server>: <tool>"` built from the session's
+/// mcpServers key. Native cursor tools title themselves differently
+/// ("Read `path`", "Edit `path`"), so only this exact shape counts.
+fn cursor_roundtable_title(call: &Value) -> bool {
+    if call.get("name").is_some() || call.get("kind").and_then(Value::as_str) != Some("other") {
+        return false;
+    }
+    call.get("title")
+        .and_then(Value::as_str)
+        .and_then(|title| title.strip_prefix("roundtable: "))
+        .is_some_and(|tool| ROUNDTABLE_TOOL_NAMES.contains(&tool))
 }
 
 fn single_underscore_title_agrees(title: &str, tool: &str) -> bool {
@@ -3613,6 +3630,13 @@ mod completion_contract_tests {
             json!({"title":"use_tool","rawInput":{"tool_name":"run_terminal_command","tool_input":{}}}),
             json!({"title":"use_tool","rawInput":{"tool_name":"roundtable__read_evidence","tool_input":{},"server":"other"}}),
             json!({"title":"use_tool","rawInput":{"tool_name":"roundtable__read_evidence","tool_input":[]}}),
+            // Cursor consent shape: only `roundtable: <roundtable tool>`, kind other, no name.
+            json!({"title":"roundtable: run_terminal_command","kind":"other"}),
+            json!({"title":"other: submit_result","kind":"other"}),
+            json!({"title":"roundtable: submit_result","kind":"execute"}),
+            json!({"title":"roundtable: submit_result"}),
+            json!({"name":"run_terminal_command","title":"roundtable: submit_result","kind":"other"}),
+            json!({"title":"roundtable:  submit_result","kind":"other"}),
         ] {
             let params = json!({"toolCall":tool_call,"options":[{"optionId":"allow","kind":"allow_once"},{"optionId":"reject","kind":"reject_once"}]});
             assert_eq!(
@@ -3625,6 +3649,8 @@ mod completion_contract_tests {
             "roundtable/submit_result",
             "mcp__roundtable__read_evidence",
             "search_evidence",
+            "roundtable: submit_result",
+            "roundtable: read_evidence",
         ] {
             let params = json!({"toolCall":{"title":name,"kind":"other"},"options":[{"optionId":"allow","kind":"allow_once"},{"optionId":"reject","kind":"reject_once"}]});
             assert_eq!(
