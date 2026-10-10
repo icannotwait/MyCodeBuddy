@@ -26,6 +26,16 @@ const PIDS_MAX: u64 = 64;
 const CPU_QUOTA_US: u64 = 100_000;
 const CPU_PERIOD_US: u64 = 100_000;
 
+/// Fixed in-container path of the read-only workspace bind.
+pub(crate) const WORKSPACE_MOUNT_DESTINATION: &str = "/workspace-ro";
+/// Non-recursive bind (nested host mounts stay hidden), read-only, no exec.
+/// `nosymfollow` is requested too, but crun 1.21 does not apply it to binds,
+/// so symlinks inside the workspace may resolve. They resolve in the
+/// container's own mount namespace and cannot reach a host path; the
+/// qualification probe proves that with an absolute host symlink.
+pub(crate) const WORKSPACE_MOUNT_OPTIONS: [&str; 6] =
+    ["bind", "ro", "nosuid", "nodev", "noexec", "nosymfollow"];
+
 pub(super) fn build_plan(input: &SandboxInput) -> RtResult<SandboxPlan> {
     let scratch = reject_host_path(&input.scratch, input)?;
     build_plan_with_scratch(input, scratch)
@@ -82,6 +92,7 @@ fn build_plan_with_scratch(input: &SandboxInput, scratch: PathBuf) -> RtResult<S
         docker_socket_mounted: false,
         home_mounted: false,
         project_mounted: false,
+        project_read_only_mounted: false,
         host_proc_mounted: false,
         inherited_fds: false,
         devices_allowed: false,
@@ -642,7 +653,8 @@ pub(super) fn profile_hash(
     key: &QualificationKey,
 ) -> RtResult<Hash256> {
     roundtable_protocol::canonical_hash(&json!({
-        "isolator_contract":"codeg-linux-oci-v2", "runtime":profile.runtime,
+        "isolator_contract":"codeg-linux-oci-v3", "runtime":profile.runtime,
+        "workspace_mount":{"destination":WORKSPACE_MOUNT_DESTINATION,"options":WORKSPACE_MOUNT_OPTIONS},
         "rootfs":profile.rootfs,"rootfs_sha256":profile.rootfs_sha256,
         "runtime_root":profile.runtime_root,"cgroup_root":profile.cgroup_root,
         "cli_args":profile.cli_args,"socket_destinations":["/run/codeg/roundtable.sock","/run/codeg/gateway.sock"],
@@ -709,12 +721,97 @@ pub(super) fn build_qualified_plan(
                 .push(json!({"source":source,"destination":destination,"type":"bind","options":["bind","ro","nosuid","nodev","noexec"]}));
         }
     }
+    let workspace = workspace_mount_source(&input.project, Some(&input.home), profile)?;
+    plan.mounts.push(PlanMount {
+        source: workspace.clone(),
+        destination: WORKSPACE_MOUNT_DESTINATION.into(),
+        read_only: true,
+    });
+    plan.oci["mounts"]
+        .as_array_mut()
+        .ok_or_else(|| rt_error(ErrorCode::InvalidArgument, "oci_mounts"))?
+        .push(workspace_mount_json(&workspace));
+    plan.project_read_only_mounted = true;
     install_home_upper(&mut plan)?;
     apply_auth_mounts(&mut plan, profile)?;
     install_slirp_hook(&mut plan, profile, &id)?;
     plan.plan_hash = document_hash(&plan.oci)?;
     verify_profile(&plan, profile)?;
     Ok(plan)
+}
+
+/// OCI entry for the read-only workspace bind. Shared with the qualification
+/// probe so the certified options are exactly the live ones.
+pub(crate) fn workspace_mount_json(source: &Path) -> Value {
+    json!({
+        "destination": WORKSPACE_MOUNT_DESTINATION,
+        "type": "bind",
+        "source": source,
+        "options": WORKSPACE_MOUNT_OPTIONS,
+    })
+}
+
+/// The registered workspace root, canonical and symlink-free, that does not
+/// contain or sit inside any host path the sandbox must never see: the host
+/// HOME (agent credentials), the runtime root (attempt scratch, sockets and
+/// the codeg data directory around it), the rootfs, the cgroup root, or a
+/// held credential file.
+pub(crate) fn workspace_mount_source(
+    project: &Path,
+    home: Option<&Path>,
+    profile: &QualifiedOciProfile,
+) -> RtResult<PathBuf> {
+    let deny = |reason: &'static str| rt_error(ErrorCode::PolicyUnenforceable, reason);
+    if !project.is_absolute() {
+        return Err(deny("workspace_mount_path"));
+    }
+    let metadata = fs::symlink_metadata(project).map_err(|_| deny("workspace_mount_path"))?;
+    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+        return Err(deny("workspace_mount_path"));
+    }
+    for ancestor in project.ancestors() {
+        if fs::symlink_metadata(ancestor)
+            .map_err(|_| deny("workspace_mount_path"))?
+            .file_type()
+            .is_symlink()
+        {
+            return Err(deny("workspace_mount_symlink"));
+        }
+    }
+    let workspace = project
+        .canonicalize()
+        .map_err(|_| deny("workspace_mount_path"))?;
+    if workspace.parent().is_none() {
+        return Err(deny("workspace_mount_root"));
+    }
+    // A project inside HOME is normal; HOME itself or an ancestor of it would
+    // expose every agent credential directory.
+    if let Some(home) = home {
+        let home = home.canonicalize().unwrap_or_else(|_| home.to_path_buf());
+        if home.starts_with(&workspace) {
+            return Err(deny("workspace_mount_overlaps_host_path"));
+        }
+    }
+    let mut protected: Vec<PathBuf> = Vec::new();
+    protected.extend([
+        profile.runtime_root.clone(),
+        profile.rootfs.clone(),
+        profile.cgroup_root.clone(),
+    ]);
+    protected.extend(
+        profile
+            .host_held_credentials
+            .iter()
+            .chain(&profile.auth_mounts)
+            .map(|held| held.source.clone()),
+    );
+    for path in protected {
+        let canonical = path.canonicalize().unwrap_or(path);
+        if canonical.starts_with(&workspace) || workspace.starts_with(&canonical) {
+            return Err(deny("workspace_mount_overlaps_host_path"));
+        }
+    }
+    Ok(workspace)
 }
 
 fn file_hash(path: &Path) -> RtResult<Hash256> {
@@ -2630,6 +2727,16 @@ pub(super) fn verify_profile(plan: &SandboxPlan, profile: &QualifiedOciProfile) 
             "/run/codeg/gateway.sock" => {
                 profile.gateway_socket.as_ref() == Some(&mount.source) && mount.read_only
             }
+            WORKSPACE_MOUNT_DESTINATION => {
+                mount.read_only
+                    && workspace_mount_source(&mount.source, None, profile)
+                        .is_ok_and(|source| source == mount.source)
+                    && plan.oci["mounts"].as_array().is_some_and(|entries| {
+                        entries
+                            .iter()
+                            .any(|entry| *entry == workspace_mount_json(&mount.source))
+                    })
+            }
             "/etc/resolv.conf" => {
                 mount.read_only
                     && mount.source == slirp_resolv_path(&profile.runtime_root)
@@ -2708,6 +2815,7 @@ pub(super) fn verify_profile(plan: &SandboxPlan, profile: &QualifiedOciProfile) 
         "/scratch",
         "/rt-home",
         "/etc/resolv.conf",
+        WORKSPACE_MOUNT_DESTINATION,
     ] {
         if !plan
             .mounts
@@ -5152,5 +5260,110 @@ mod verify_once_tests {
         fs::write(rootfs.join("planted"), b"x").unwrap();
         assert!(!verify_rootfs(&profile.rootfs, &profile.rootfs_sha256).unwrap());
         assert_eq!(walks(&rootfs), baseline + 3);
+    }
+}
+
+#[cfg(all(test, unix))]
+mod workspace_mount_tests {
+    use super::*;
+    use crate::roundtable::sandbox::AuthMount;
+
+    fn profile(root: &Path) -> QualifiedOciProfile {
+        QualifiedOciProfile {
+            runtime: CertifiedBinary {
+                role: "crun".into(),
+                absolute_path: "/usr/bin/crun".into(),
+                version: "pinned".into(),
+                sha256: Hash256::from_bytes([1; 32]),
+            },
+            rootfs: root.join("rootfs"),
+            rootfs_sha256: Hash256::from_bytes([2; 32]),
+            runtime_root: root.join("data/roundtable/oci"),
+            cgroup_root: root.join("cgroup"),
+            cli_args: Vec::new(),
+            service_socket: None,
+            gateway_socket: None,
+            auth_mounts: Vec::new(),
+            host_held_credentials: vec![AuthMount {
+                source: root.join("home/.grok/auth.json"),
+                destination: "/rt-home/.grok/auth.json".into(),
+            }],
+            container_env: BTreeMap::new(),
+        }
+    }
+
+    fn layout() -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        for path in [
+            "rootfs",
+            "data/roundtable/oci",
+            "cgroup",
+            "home/.grok",
+            "home/project",
+            "work/repo/.git",
+        ] {
+            fs::create_dir_all(root.join(path)).unwrap();
+        }
+        fs::write(root.join("home/.grok/auth.json"), b"{}").unwrap();
+        (dir, root)
+    }
+
+    #[test]
+    fn a_registered_project_mounts_read_only_with_the_certified_options() {
+        let (_dir, root) = layout();
+        let profile = profile(&root);
+        let home = root.join("home");
+        for project in [root.join("work/repo"), root.join("home/project")] {
+            assert_eq!(
+                workspace_mount_source(&project, Some(&home), &profile).unwrap(),
+                project
+            );
+        }
+        let entry = workspace_mount_json(&root.join("work/repo"));
+        assert_eq!(entry["destination"], WORKSPACE_MOUNT_DESTINATION);
+        assert_eq!(
+            entry["options"],
+            json!(["bind", "ro", "nosuid", "nodev", "noexec", "nosymfollow"])
+        );
+        assert!(
+            !entry["options"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|option| option == "rbind" || option == "rw"),
+            "nested host mounts and writes stay out"
+        );
+    }
+
+    #[test]
+    fn host_paths_and_symlinks_are_never_the_workspace() {
+        let (_dir, root) = layout();
+        let profile = profile(&root);
+        let home = root.join("home");
+        std::os::unix::fs::symlink(root.join("work/repo"), root.join("alias")).unwrap();
+        for (project, reason) in [
+            (root.join("alias"), "workspace_mount_path"),
+            (root.join("alias/.git"), "workspace_mount_symlink"),
+            (home.clone(), "workspace_mount_overlaps_host_path"),
+            (root.clone(), "workspace_mount_overlaps_host_path"),
+            (root.join("data"), "workspace_mount_overlaps_host_path"),
+            (
+                root.join("data/roundtable/oci"),
+                "workspace_mount_overlaps_host_path",
+            ),
+            (root.join("rootfs"), "workspace_mount_overlaps_host_path"),
+            (
+                root.join("home/.grok"),
+                "workspace_mount_overlaps_host_path",
+            ),
+            (PathBuf::from("/"), "workspace_mount_root"),
+            (PathBuf::from("relative"), "workspace_mount_path"),
+            (root.join("missing"), "workspace_mount_path"),
+        ] {
+            let error = workspace_mount_source(&project, Some(&home), &profile)
+                .expect_err(&format!("{} must be refused", project.display()));
+            assert_eq!(error.details.reason.as_deref(), Some(reason), "{project:?}");
+        }
     }
 }

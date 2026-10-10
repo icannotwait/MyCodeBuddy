@@ -247,6 +247,7 @@ function mountPopup(
     countLabel?: (count: number) => string
     tabLabels?: Partial<Record<string, string>>
     onActiveOptionChange?: (optionId: string | null) => void
+    allowedKinds?: ReferenceGroupKind[]
   } = {}
 ) {
   const ref = createRef<SuggestionPopupHandle>()
@@ -268,6 +269,7 @@ function mountPopup(
       countLabel={overrides.countLabel}
       tabLabels={overrides.tabLabels}
       onActiveOptionChange={overrides.onActiveOptionChange}
+      allowedKinds={overrides.allowedKinds}
     />
   )
   return { ref, onSelect, onClose, controller }
@@ -303,6 +305,22 @@ describe("SuggestionPopup", () => {
     expect(screen.getAllByRole("tab")).toHaveLength(4)
     expect(screen.getByRole("tab", { selected: true })).toHaveAccessibleName(
       /Agents/
+    )
+  })
+
+  it("limits tabs and auto-targeting to allowedKinds", async () => {
+    const { ref } = mountPopup({ allowedKinds: ["file"] })
+    expect(await screen.findByText("alpha.md")).toBeInTheDocument()
+    expect(screen.queryByText("Codex Helper")).toBeNull()
+    expect(screen.getAllByRole("tab")).toHaveLength(1)
+    expect(screen.getByRole("tab", { selected: true })).toHaveAccessibleName(
+      /Files/
+    )
+    act(() => {
+      ref.current?.onKeyDown(key("Tab"))
+    })
+    expect(screen.getByRole("tab", { selected: true })).toHaveAccessibleName(
+      /Files/
     )
   })
 

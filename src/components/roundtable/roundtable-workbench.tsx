@@ -876,6 +876,7 @@ export function RoundtableWorkbench({
             tools={preflight.tools}
             network={preflight.network}
             writes={preflight.writes}
+            workspaceMount={preflight.workspace_mount}
             budget={`${Math.ceil(Number(config.budgets.room_budget) / 60000)} ${t("minutes")}`}
             attemptLimit={`${Math.ceil(Number(config.timeouts.attempt_timeout) / 60000)} ${t("minutes")}`}
           />
@@ -1024,6 +1025,7 @@ export function RoundtableWorkbench({
                   ) : undefined
                 }
                 sourceRoot={currentWorkspace?.path}
+                workspaceId={workspaceId}
                 topic={topic}
                 onTopicChange={(value) => {
                   setTopic(value)

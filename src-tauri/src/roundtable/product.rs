@@ -207,7 +207,8 @@ impl RoundtableService {
                     "capability": runtime.as_ref().ok(),
                     "error": runtime.err(),
                     "tools": super::service_tool_names(),
-                    "network": "model_gateway_only", "writes":"scratch_only"
+                    "network": "model_gateway_only", "writes":"scratch_only",
+                    "workspace_mount": workspace_mount_status(&store, &self.data_dir, &request.config).await,
                 }))
             }
             "roundtable_create" => {
@@ -760,6 +761,52 @@ fn json_text(body: &str) -> RtResult<Value> {
 }
 fn config_hash(config: &RoundtableConfigV1) -> RtResult<String> {
     Ok(roundtable_protocol::Hash256::sha256(&canonical_bytes(config)?).to_hex())
+}
+
+/// Whether every seat's qualified sandbox will mount this workspace. Rooms
+/// whose workspace overlaps a host-only path (codeg data, HOME, credentials)
+/// fail closed at run time; preflight says so before anything is spent.
+async fn workspace_mount_status(
+    store: &RoundtableStore,
+    data_dir: &std::path::Path,
+    config: &RoundtableConfigV1,
+) -> Value {
+    let path = super::sandbox::WORKSPACE_MOUNT_DESTINATION;
+    let unavailable = |reason: &str| json!({"path": path, "access": "read_only", "available": false, "reason": reason});
+    let Some(id) = config.workspace_id.parse::<i64>().ok().filter(|id| *id > 0) else {
+        return unavailable("workspace_id");
+    };
+    let root = match optional_row(
+        store.connection(),
+        "SELECT path FROM folder WHERE id=? AND deleted_at IS NULL",
+        vec![num(id)],
+    )
+    .await
+    {
+        Ok(Some(row)) => column::<String>(&row, 0).ok().map(std::path::PathBuf::from),
+        _ => None,
+    };
+    let Some(root) = root.and_then(|root| root.canonicalize().ok()) else {
+        return unavailable("workspace_mount_path");
+    };
+    let home = std::env::var_os("HOME")
+        .map(std::path::PathBuf::from)
+        .and_then(|home| home.canonicalize().ok());
+    if let Ok(catalog) = super::installed_runtime::InstalledRuntime::load_catalog(data_dir) {
+        for participant in &config.participants {
+            let agent = participant.agent.as_deref().unwrap_or("codex");
+            if let Some(installed) = catalog.get(agent) {
+                if let Err(error) =
+                    super::sandbox::workspace_mount_check(&root, home.as_deref(), &installed.oci)
+                {
+                    return unavailable(
+                        error.details.reason.as_deref().unwrap_or("workspace_mount"),
+                    );
+                }
+            }
+        }
+    }
+    json!({"path": path, "access": "read_only", "available": true})
 }
 
 struct RoomRow {

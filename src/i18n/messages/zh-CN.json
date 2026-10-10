@@ -7606,6 +7606,10 @@
     "liveEnded": "输出已结束，等待验证。",
     "liveThinking": "思考过程",
     "liveWaiting": "等待输出…",
-    "liveTruncated": "实时内容已截断，验证后将显示完整内容。"
+    "liveTruncated": "实时内容已截断，验证后将显示完整内容。",
+    "topicMentionHelp": "输入 @ 可引用工作区中的文件或文件夹。成员会在只读挂载的 /workspace-ro 中自行读取。",
+    "workspaceMount": "工作区（成员可见）",
+    "workspaceMountReadOnly": "只读挂载。成员可以读取和搜索，无法写入任何内容。",
+    "workspaceMountUnavailable": "该工作区包含仅限主机的路径（应用数据、主目录或凭据），无法挂载。请改选具体项目目录，否则运行会被拒绝。"
   }
 }
