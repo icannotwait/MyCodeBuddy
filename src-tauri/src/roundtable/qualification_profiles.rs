@@ -236,11 +236,21 @@ const PROFILES: &[AdapterProfile] = &[
         container_cli: "/usr/local/bin/codex-acp",
         cli_args: &[],
         container_mcp: "/usr/local/bin/codeg-mcp",
-        auth_files: &[AuthFile {
-            home_relative: ".codex/auth.json",
-            destination: "/rt-home/.codex/auth.json",
-            required: true,
-        }],
+        auth_files: &[
+            AuthFile {
+                home_relative: ".codex/auth.json",
+                destination: "/rt-home/.codex/auth.json",
+                required: true,
+            },
+            // Routing only (model_provider + that provider's base_url and
+            // wire_api), derived by Codeg from ~/.codex/config.toml; see
+            // agent_credentials::refresh_codex_routing.
+            AuthFile {
+                home_relative: super::agent_credentials::CODEX_ROUTING_RELATIVE,
+                destination: "/rt-home/.codex/config.toml",
+                required: false,
+            },
+        ],
         container_env: COMMON_ENV,
         // API-key mode stores the key in `~/.codex/auth.json`. Codex sends
         // that key itself, so it cannot ride the attempt-bearer gateway; it

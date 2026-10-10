@@ -864,6 +864,13 @@ impl RoundtableTurnExecutor for LiveParticipantExecutor {
             .ok_or_else(|| rt_error(ErrorCode::PolicyUnenforceable, "host_home"))?
             .canonicalize()
             .map_err(|_| rt_error(ErrorCode::PolicyUnenforceable, "host_home"))?;
+        if agent == "codex" {
+            // Fresh routing copy each turn, so a provider the user just
+            // changed in Codeg's Codex settings applies; the mount source
+            // named on the certificate must exist.
+            super::agent_credentials::refresh_codex_routing(&home)
+                .map_err(|_| rt_error(ErrorCode::StorageUnavailable, "codex_routing"))?;
+        }
         let mut decoy_paths = Vec::new();
         for row in super::store::rows(
             request.store.connection(),
@@ -1813,7 +1820,7 @@ impl<'a> ChunkAgg<'a> {
         self.count += 1;
         self.bytes += text.len() as u64;
         self.last_ms = now;
-        if kind == "agent_message_chunk" && self.preview.len() < 400 {
+        if kind == "agent_message_chunk" && self.preview.len() < 400 && !trace.metadata_only() {
             self.preview.push_str(text);
         }
     }

@@ -278,6 +278,100 @@ fn policy_keys(data_dir: &Path) -> Option<Vec<Value>> {
 }
 
 /// Read-only status for the five candidates. Presence flags only.
+/// Home-relative path of the Codex routing file the sandbox mounts at
+/// `/rt-home/.codex/config.toml`. Codeg owns it; the user's own
+/// `~/.codex/config.toml` never enters the container.
+pub(crate) const CODEX_ROUTING_RELATIVE: &str = ".codeg-roundtable/codex-config.toml";
+
+/// Codex keys that only choose where requests go. Everything else in the
+/// user's config (approval/sandbox policy, MCP servers, headers, profiles,
+/// projects) stays on the host.
+const CODEX_PROVIDER_KEYS: [&str; 4] = ["name", "base_url", "wire_api", "requires_openai_auth"];
+
+/// The routing part of a Codex `config.toml`: `model_provider`, `model`, and
+/// that one provider's name/base_url/wire_api/requires_openai_auth. Codeg's
+/// API-key mode stores the key in `auth.json` and points `model_provider` at
+/// its own gateway entry; without this the sandboxed Codex sends that key
+/// to the default OpenAI endpoint and the turn fails `Authentication
+/// required`. Returns an empty document when no custom provider is set or
+/// the base URL is not https. Never copies http_headers/env_http_headers or
+/// query params (they can carry secrets).
+pub(crate) fn codex_routing_config(user_config: &str) -> String {
+    let Ok(parsed) = user_config.parse::<toml::Table>() else {
+        return String::new();
+    };
+    let mut out = toml::Table::new();
+    if let Some(model) = parsed.get("model").and_then(toml::Value::as_str) {
+        out.insert("model".into(), toml::Value::String(model.into()));
+    }
+    let provider = parsed.get("model_provider").and_then(toml::Value::as_str);
+    let table = provider.and_then(|name| {
+        parsed
+            .get("model_providers")
+            .and_then(toml::Value::as_table)
+            .and_then(|providers| providers.get(name))
+            .and_then(toml::Value::as_table)
+    });
+    if let (Some(name), Some(table)) = (provider, table) {
+        let https = table
+            .get("base_url")
+            .and_then(toml::Value::as_str)
+            .is_some_and(|url| url.starts_with("https://"));
+        if https {
+            let mut kept = toml::Table::new();
+            for key in CODEX_PROVIDER_KEYS {
+                if let Some(value) = table.get(key) {
+                    if value.is_str() || value.is_bool() {
+                        kept.insert(key.into(), value.clone());
+                    }
+                }
+            }
+            let mut providers = toml::Table::new();
+            providers.insert(name.into(), toml::Value::Table(kept));
+            out.insert("model_provider".into(), toml::Value::String(name.into()));
+            out.insert("model_providers".into(), toml::Value::Table(providers));
+        }
+    }
+    toml::to_string(&out).unwrap_or_default()
+}
+
+/// The https origin Codex will call, from the same routing data, so a
+/// provider binding can be checked against it.
+pub(crate) fn codex_routing_origin(user_config: &str) -> Option<String> {
+    let routed = codex_routing_config(user_config)
+        .parse::<toml::Table>()
+        .ok()?;
+    let name = routed.get("model_provider")?.as_str()?;
+    let url = routed
+        .get("model_providers")?
+        .get(name)?
+        .get("base_url")?
+        .as_str()?;
+    let rest = url.strip_prefix("https://")?;
+    let host = rest.split(['/', '?', '#']).next()?;
+    (!host.is_empty()).then(|| format!("https://{host}"))
+}
+
+/// Rewrites `<home>/CODEX_ROUTING_RELATIVE` (0600, dir 0700) from
+/// `<home>/.codex/config.toml`. Always leaves a file (possibly empty) so the
+/// declared mount source exists. Reads routing keys only.
+pub(crate) fn refresh_codex_routing(home: &Path) -> std::io::Result<PathBuf> {
+    let user = std::fs::read_to_string(home.join(".codex/config.toml")).unwrap_or_default();
+    let target = home.join(CODEX_ROUTING_RELATIVE);
+    let dir = target.parent().unwrap_or(home);
+    std::fs::create_dir_all(dir)?;
+    let tmp = dir.join(".codex-config.toml.tmp");
+    std::fs::write(&tmp, codex_routing_config(&user))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))?;
+    }
+    std::fs::rename(&tmp, &target)?;
+    Ok(target)
+}
+
 pub(crate) fn roundtable_agents_status(data_dir: &Path, home: Option<&Path>) -> Value {
     let catalog =
         super::installed_runtime::InstalledRuntime::load_catalog(data_dir).unwrap_or_default();
@@ -350,6 +444,67 @@ pub(crate) fn roundtable_agents_status(data_dir: &Path, home: Option<&Path>) -> 
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn codex_routing_keeps_only_the_selected_provider_route() {
+        let user = r#"
+model_provider = "codeg"
+approval_policy = "never"
+sandbox_mode = "danger-full-access"
+[model_providers.codeg]
+name = "codeg"
+base_url = "https://gw.example.test/v1"
+wire_api = "responses"
+requires_openai_auth = true
+http_headers = { "X-Key" = "secret-header" }
+env_http_headers = { "X-Other" = "SOME_ENV" }
+query_params = { k = "secret-query" }
+[model_providers.other]
+base_url = "https://other.example.test"
+[mcp_servers.x]
+command = "/bin/x"
+"#;
+        let routed = codex_routing_config(user);
+        let table: toml::Table = routed.parse().expect("toml");
+        assert_eq!(table["model_provider"].as_str(), Some("codeg"));
+        let providers = table["model_providers"].as_table().expect("providers");
+        assert_eq!(providers.len(), 1);
+        let codeg = providers["codeg"].as_table().expect("codeg");
+        assert_eq!(
+            codeg["base_url"].as_str(),
+            Some("https://gw.example.test/v1")
+        );
+        assert_eq!(codeg["wire_api"].as_str(), Some("responses"));
+        assert_eq!(codeg["requires_openai_auth"].as_bool(), Some(true));
+        for leaked in [
+            "secret-header",
+            "secret-query",
+            "SOME_ENV",
+            "approval_policy",
+            "sandbox_mode",
+            "mcp_servers",
+            "other.example",
+        ] {
+            assert!(!routed.contains(leaked), "{leaked} leaked");
+        }
+        assert_eq!(
+            codex_routing_origin(user).as_deref(),
+            Some("https://gw.example.test")
+        );
+    }
+
+    #[test]
+    fn codex_routing_is_empty_without_an_https_custom_provider() {
+        assert_eq!(codex_routing_config(""), "");
+        assert_eq!(codex_routing_config("not toml ["), "");
+        let plain = "model_provider = \"codeg\"\n[model_providers.codeg]\nbase_url = \"http://gw.example.test\"\n";
+        assert!(!codex_routing_config(plain).contains("model_provider"));
+        assert_eq!(codex_routing_origin(plain), None);
+        let home = tempfile::tempdir().expect("home");
+        let path = refresh_codex_routing(home.path()).expect("refresh");
+        assert!(path.ends_with(CODEX_ROUTING_RELATIVE));
+        assert_eq!(std::fs::read_to_string(path).expect("read"), "");
+    }
+
     use super::*;
 
     fn write_db(dir: &Path, rows: &[(&str, bool, Option<&str>, Option<&str>)]) -> PathBuf {
