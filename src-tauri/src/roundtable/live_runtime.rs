@@ -153,11 +153,17 @@ fn file_auth_ready(installed: &InstalledRuntime) -> bool {
 fn host_gateway_secret(
     installed: &InstalledRuntime,
     binding: &super::installed_runtime::ProviderBinding,
+    settings_env: Option<&[(String, String)]>,
 ) -> RtResult<String> {
     if let Ok(value) = std::env::var(&binding.credential_env) {
         if !value.is_empty() {
             return Ok(value);
         }
+    }
+    // Direct-egress adapters (Cursor custom mode, CodeBuddy) send their own
+    // settings key; the gateway only needs a host credential for its origin.
+    if let Some((_, value)) = settings_env.and_then(|env| env.first()) {
+        return Ok(value.clone());
     }
     for mount in &installed.oci.host_held_credentials {
         if let Ok(text) = std::fs::read_to_string(&mount.source) {
@@ -175,15 +181,19 @@ fn host_gateway_secret(
 fn credential_ready(
     installed: &InstalledRuntime,
     binding: &super::installed_runtime::ProviderBinding,
+    settings_credential: bool,
 ) -> bool {
-    std::env::var_os(&binding.credential_env).is_some() || file_auth_ready(installed)
+    settings_credential
+        || std::env::var_os(&binding.credential_env).is_some()
+        || file_auth_ready(installed)
 }
 
 fn require_provider_credential(
     installed: &InstalledRuntime,
     binding: &super::installed_runtime::ProviderBinding,
+    settings_credential: bool,
 ) -> RtResult<()> {
-    if !credential_ready(installed, binding) {
+    if !credential_ready(installed, binding, settings_credential) {
         return Err(rt_error(
             ErrorCode::CapabilityUnqualified,
             "provider_credential_missing",
@@ -218,6 +228,31 @@ impl LiveParticipantExecutor {
             launches: Mutex::new(HashMap::new()),
             registry: tokio::sync::Mutex::new(None),
         })
+    }
+
+    /// The seat's settings credential (Codeg agent settings), read fresh for
+    /// every turn so a key the user just saved applies without a restart.
+    fn settings_env(&self, agent: &str) -> Option<Vec<(String, String)>> {
+        let profile = super::qualification_profiles::profile_for_agent(agent)?;
+        let settings = super::agent_credentials::read_agent_settings(&self.data_dir, agent);
+        super::agent_credentials::settings_credential_env(profile, &settings)
+    }
+
+    /// The seat's saved CodeBuddy profile (read fresh each turn), or the
+    /// named reason it cannot run: missing, disabled, or not a CodeBuddy seat.
+    fn seat_profile(
+        &self,
+        participant: &ParticipantV1,
+    ) -> RtResult<Option<super::agent_credentials::CodeBuddyProfile>> {
+        let Some(id) = participant.profile_id.as_deref() else {
+            return Ok(None);
+        };
+        if participant.agent.as_deref() != Some("code_buddy") {
+            return Err(rt_error(ErrorCode::InvalidArgument, "profile"));
+        }
+        super::agent_credentials::codebuddy_profile(&self.data_dir, id)
+            .map(Some)
+            .map_err(|reason| rt_error(ErrorCode::CapabilityUnqualified, reason))
     }
 
     fn adapter(&self, agent: &str) -> RtResult<InstalledRuntime> {
@@ -491,34 +526,47 @@ impl RoundtableTurnExecutor for LiveParticipantExecutor {
         let mut policy_hash = None;
         let mut profile = None;
         for participant in &config.participants {
-            let agent = participant_agent(participant)?;
-            let installed = self.verified(&agent).await?;
-            let binding = installed
-                .providers
-                .iter()
-                .find(|binding| {
-                    binding.provider_ref == participant.provider_ref
-                        && participant
-                            .model
-                            .as_ref()
-                            .is_none_or(|model| model == &binding.model)
-                })
-                .ok_or_else(|| {
-                    rt_error(ErrorCode::CapabilityUnqualified, "provider_unqualified")
-                })?;
-            if participant
-                .effort
-                .as_ref()
-                .is_some_and(|effort| !binding.supported_efforts.contains(effort))
-            {
-                return Err(rt_error(
-                    ErrorCode::CapabilityUnqualified,
-                    "effort_unqualified",
-                ));
-            }
-            self.policy(&installed, &binding.model)?;
-            super::ApprovedOrigin::parse(&binding.origin)?;
-            require_provider_credential(&installed, binding)?;
+            let named = |error| {
+                super::agent_credentials::name_seat(
+                    error,
+                    participant.ordinal,
+                    participant.agent.as_deref().unwrap_or("codex"),
+                )
+            };
+            let agent = participant_agent(participant).map_err(named)?;
+            let installed = self.verified(&agent).await.map_err(named)?;
+            let settings_credential = self.settings_env(&agent).is_some();
+            self.seat_profile(participant).map_err(named)?;
+            let checked: RtResult<_> = (|| {
+                let binding = installed
+                    .providers
+                    .iter()
+                    .find(|binding| {
+                        binding.provider_ref == participant.provider_ref
+                            && participant
+                                .model
+                                .as_ref()
+                                .is_none_or(|model| model == &binding.model)
+                    })
+                    .ok_or_else(|| {
+                        rt_error(ErrorCode::CapabilityUnqualified, "provider_unqualified")
+                    })?;
+                if participant
+                    .effort
+                    .as_ref()
+                    .is_some_and(|effort| !binding.supported_efforts.contains(effort))
+                {
+                    return Err(rt_error(
+                        ErrorCode::CapabilityUnqualified,
+                        "effort_unqualified",
+                    ));
+                }
+                self.policy(&installed, &binding.model)?;
+                super::ApprovedOrigin::parse(&binding.origin)?;
+                require_provider_credential(&installed, binding, settings_credential)?;
+                Ok(binding)
+            })();
+            let binding = checked.map_err(named)?;
             if policy_hash.is_some_and(|hash| hash != installed.qualification_key.policy_hash) {
                 return Err(rt_error(
                     ErrorCode::CapabilityUnqualified,
@@ -583,11 +631,17 @@ impl RoundtableTurnExecutor for LiveParticipantExecutor {
             })
             .cloned()
             .ok_or_else(|| rt_error(ErrorCode::CapabilityUnqualified, "provider_unqualified"))?;
-        require_provider_credential(&installed, &provider)?;
-        let mut diagnostic_secrets = auth_denylist(
-            &installed,
-            &[std::env::var(&provider.credential_env).unwrap_or_default()],
-        )?;
+        let settings_env = self.settings_env(&agent);
+        require_provider_credential(&installed, &provider, settings_env.is_some())?;
+        let seat_profile = self.seat_profile(&request.participant)?;
+        let mut seeds = vec![std::env::var(&provider.credential_env).unwrap_or_default()];
+        seeds.extend(
+            settings_env
+                .iter()
+                .flatten()
+                .map(|(_, value)| value.clone()),
+        );
+        let mut diagnostic_secrets = auth_denylist(&installed, &seeds)?;
         let (execution, facts) = self.policy(&installed, &provider.model)?;
         let directory = installed
             .oci
@@ -636,16 +690,30 @@ impl RoundtableTurnExecutor for LiveParticipantExecutor {
             provider_token.clone(),
             token.reveal_for_same_sandbox().to_owned(),
         ]);
-        let env_allowlist: BTreeMap<String, String> =
+        let mut env_allowlist: BTreeMap<String, String> =
             super::qualification_profiles::live_model_env(agent.as_str(), &provider_token)
                 .into_iter()
                 .collect();
+        // Settings credential (Cursor custom mode, CodeBuddy): into the
+        // container env only. Values are already on the redaction list.
+        for (key, value) in settings_env.iter().flatten() {
+            env_allowlist.insert(key.clone(), value.clone());
+        }
+        let scrub_keys: Vec<String> = settings_env
+            .iter()
+            .flatten()
+            .map(|(key, _)| key.clone())
+            .collect();
         let store_clock = request.store.clone();
         let mut gateway = LiveModelGateway::new(
             self.data_dir.clone(),
             (
                 super::ApprovedOrigin::parse(&provider.origin)?,
-                super::HostCredential::injected(host_gateway_secret(&installed, &provider)?),
+                super::HostCredential::injected(host_gateway_secret(
+                    &installed,
+                    &provider,
+                    settings_env.as_deref(),
+                )?),
                 provider.model.clone(),
                 request.participant.effort.clone(),
             ),
@@ -815,6 +883,13 @@ impl RoundtableTurnExecutor for LiveParticipantExecutor {
             .ok_or_else(|| rt_error(ErrorCode::PolicyUnenforceable, "host_home"))?
             .canonicalize()
             .map_err(|_| rt_error(ErrorCode::PolicyUnenforceable, "host_home"))?;
+        if agent == "codex" {
+            // Fresh routing copy each turn, so a provider the user just
+            // changed in Codeg's Codex settings applies; the mount source
+            // named on the certificate must exist.
+            super::agent_credentials::refresh_codex_routing(&home)
+                .map_err(|_| rt_error(ErrorCode::StorageUnavailable, "codex_routing"))?;
+        }
         let mut decoy_paths = Vec::new();
         for row in super::store::rows(
             request.store.connection(),
@@ -863,6 +938,17 @@ impl RoundtableTurnExecutor for LiveParticipantExecutor {
             .expect("launch lifecycle")
             .insert(request.fence.incarnation, true);
         let (instance, mut child) = attempt_isolator.spawn_attached(&prepared, &intent).await?;
+        // crun has read the bundle; the copied credential values must not
+        // outlive the attempt in config.json.
+        let _bundle_scrub = super::agent_credentials::BundleScrub {
+            config: installed
+                .oci
+                .runtime_root
+                .join("bundles")
+                .join(&instance.runtime_id)
+                .join("config.json"),
+            keys: scrub_keys,
+        };
         *active.instance.lock().expect("runtime instance") = Some(instance.clone());
         let stdin = child
             .stdin
@@ -914,7 +1000,10 @@ impl RoundtableTurnExecutor for LiveParticipantExecutor {
             token.reveal_for_same_sandbox(),
             &active,
             &self.registry,
-            agent_type_for(&agent)?,
+            SeatAgent {
+                agent: agent_type_for(&agent)?,
+                profile: seat_profile.as_ref(),
+            },
         )
         .await;
         *active.finish_reason.lock().expect("finish reason") = Some(
@@ -1043,6 +1132,12 @@ fn evidence_objects(prompt: &[u8]) -> RtResult<BTreeMap<String, roundtable_proto
     Ok(objects)
 }
 
+/// The seat's agent and its saved CodeBuddy profile (if any).
+struct SeatAgent<'a> {
+    agent: crate::models::AgentType,
+    profile: Option<&'a super::agent_credentials::CodeBuddyProfile>,
+}
+
 async fn drive_acp(
     (mut stdin, stdout): (tokio::process::ChildStdin, tokio::process::ChildStdout),
     request: &RoundtableTurnRequest,
@@ -1050,8 +1145,9 @@ async fn drive_acp(
     token: &str,
     active: &Active,
     registry: &tokio::sync::Mutex<Option<super::RoundtableSessionRegistry>>,
-    agent: crate::models::AgentType,
+    seat: SeatAgent<'_>,
 ) -> RtResult<u64> {
+    let SeatAgent { agent, profile } = seat;
     let mut stdout = BufReader::new(stdout);
     let mut seq = 0;
     let initialize = rpc(
@@ -1162,6 +1258,17 @@ async fn drive_acp(
         .await?;
         verify_confirmed_option(&selected, "model", requested_model)?;
         verify_confirmed_option(&selected, "reasoning_effort", effort)?;
+    }
+    if let Some(profile) = profile {
+        apply_seat_profile(
+            &mut stdin,
+            &mut stdout,
+            session_id,
+            profile,
+            &mut seq,
+            active,
+        )
+        .await?;
     }
     let prompt = std::str::from_utf8(&request.prompt)
         .map_err(|_| rt_error(ErrorCode::InvalidArgument, "prompt_encoding"))?;
@@ -1547,6 +1654,7 @@ where
         );
     }
     let mut chunks = ChunkAgg::new(exchange.trace);
+    let mut announced_mcp = std::collections::HashMap::new();
     let started = tokio::time::Instant::now();
     loop {
         if let Some(limit) = exchange.deadline {
@@ -1597,6 +1705,7 @@ where
         // Ordered failure observations are consumed before any terminal
         // response can release a previously staged submission for acceptance.
         if message["method"] == "session/update" {
+            note_announced_mcp_title(&mut announced_mcp, &message["params"]["update"]);
             note_private_frame(exchange, "session/update");
             check_failure_metadata(&message["params"]["update"], super::FailureSource::Update)?;
             check_failure_metadata(&message["params"], super::FailureSource::Update)?;
@@ -1604,12 +1713,35 @@ where
         if message.get("method").is_some() {
             if let Some(request_id) = message.get("id").cloned() {
                 let response = if message["method"] == "session/request_permission" {
-                    if !tool_call_is_roundtable(&message["params"])
+                    let codex_mcp =
+                        codex_mcp_approval_is_roundtable(&message["params"], &announced_mcp);
+                    if !codex_mcp
+                        && !tool_call_is_roundtable(&message["params"])
                         && !tool_call_is_workspace_read(&message["params"], exchange.workspace_root)
                     {
                         exchange.rejected_permission.store(true, Ordering::Relaxed);
                     }
-                    permission_reply_in(&message["params"], &request_id, exchange.workspace_root)
+                    let reply = if codex_mcp {
+                        permission_reply_decided(&message["params"], &request_id, true)
+                    } else {
+                        permission_reply_in(
+                            &message["params"],
+                            &request_id,
+                            exchange.workspace_root,
+                        )
+                    };
+                    if let Some(trace) = exchange.trace {
+                        trace.record(
+                            "acp",
+                            json!({
+                                "event": "permission_reply",
+                                "id": request_id,
+                                "option_id": reply["result"]["outcome"]["optionId"],
+                                "outcome": reply["result"]["outcome"]["outcome"],
+                            }),
+                        );
+                    }
+                    reply
                 } else {
                     json!({
                         "jsonrpc": "2.0",
@@ -1753,7 +1885,7 @@ impl<'a> ChunkAgg<'a> {
         self.count += 1;
         self.bytes += text.len() as u64;
         self.last_ms = now;
-        if kind == "agent_message_chunk" && self.preview.len() < 400 {
+        if kind == "agent_message_chunk" && self.preview.len() < 400 && !trace.metadata_only() {
             self.preview.push_str(text);
         }
     }
@@ -1885,6 +2017,17 @@ fn trace_acp_frame(
                 }
                 if let Some(content) = update.get("content") {
                     record["content_bytes"] = json!(content.to_string().len());
+                    // A failed call's content is the adapter's error text
+                    // (e.g. MCP startup, reviewer failure): kept, redacted
+                    // and clipped, because it is the diagnosis.
+                    if update.get("status").and_then(Value::as_str) == Some("failed") {
+                        record["failure"] = clipped_redacted(content, 600);
+                    }
+                }
+                if update.get("status").and_then(Value::as_str) == Some("failed") {
+                    if let Some(raw) = update.get("rawOutput") {
+                        record["failure_output"] = clipped_redacted(raw, 600);
+                    }
                 }
             }
             "plan" => {
@@ -1909,6 +2052,16 @@ fn trace_acp_frame(
             record["roundtable_tool"] = json!(tool_call_is_roundtable(&message["params"]));
             record["workspace_read"] = json!(tool_call_is_workspace_read(&message["params"], None));
             record["tool_kind"] = message["params"]["toolCall"]["kind"].clone();
+            record["tool_call_id"] = message["params"]["toolCall"]["toolCallId"].clone();
+            record["mcp_tool_approval"] =
+                message["params"]["_meta"]["is_mcp_tool_approval"].clone();
+            record["option_kinds"] =
+                json!(message["params"]["options"]
+                    .as_array()
+                    .map(|options| options
+                        .iter()
+                        .map(|option| json!([option["optionId"], option["kind"]]))
+                        .collect::<Vec<_>>()));
             record["locations"] =
                 clipped_redacted(&message["params"]["toolCall"]["locations"], 600);
         } else {
@@ -1985,6 +2138,63 @@ fn permission_reply(params: &Value, request_id: &Value) -> Value {
 fn permission_reply_in(params: &Value, request_id: &Value, workspace_root: Option<&Path>) -> Value {
     let allow =
         tool_call_is_roundtable(params) || tool_call_is_workspace_read(params, workspace_root);
+    permission_reply_decided(params, request_id, allow)
+}
+
+/// Largest number of announced MCP tool-call titles an exchange remembers.
+const ANNOUNCED_MCP_TITLES_MAX: usize = 256;
+
+/// Remembers `toolCallId -> title` for MCP tool calls the agent announced in
+/// this exchange (`tool_call` / `tool_call_update` with a `mcp.` title), so a
+/// later consent request that only names the id can be matched.
+fn note_announced_mcp_title(
+    titles: &mut std::collections::HashMap<String, String>,
+    update: &Value,
+) {
+    if !matches!(
+        update["sessionUpdate"].as_str(),
+        Some("tool_call" | "tool_call_update")
+    ) {
+        return;
+    }
+    let (Some(id), Some(title)) = (update["toolCallId"].as_str(), update["title"].as_str()) else {
+        return;
+    };
+    if title.starts_with("mcp.")
+        && (titles.len() < ANNOUNCED_MCP_TITLES_MAX || titles.contains_key(id))
+    {
+        titles.insert(id.to_owned(), title.to_owned());
+    }
+}
+
+/// codex-acp 2.1.1 MCP tool approval (`buildMcpPermissionRequest`, form mode,
+/// correlated): `_meta.is_mcp_tool_approval: true` and a toolCall of only
+/// `{toolCallId, kind: "execute", status: "pending"}`. The id is the MCP item
+/// codex-acp announced as `mcp.<server>.<tool>` from the app-server's
+/// structured item (not model text). Approve only when that announced title
+/// is exactly `mcp.roundtable.<read_evidence|search_evidence|submit_result>`
+/// and the request carries no title/name/locations of its own.
+fn codex_mcp_approval_is_roundtable(
+    params: &Value,
+    titles: &std::collections::HashMap<String, String>,
+) -> bool {
+    let call = &params["toolCall"];
+    if params["_meta"]["is_mcp_tool_approval"] != true
+        || call.get("kind").and_then(Value::as_str) != Some("execute")
+        || call.get("title").is_some()
+        || call.get("name").is_some()
+        || call.get("locations").is_some()
+    {
+        return false;
+    }
+    call.get("toolCallId")
+        .and_then(Value::as_str)
+        .and_then(|id| titles.get(id))
+        .and_then(|title| title.strip_prefix("mcp.roundtable."))
+        .is_some_and(|tool| ROUNDTABLE_TOOL_NAMES.contains(&tool))
+}
+
+fn permission_reply_decided(params: &Value, request_id: &Value, allow: bool) -> Value {
     // ACP does not prove that allow_always is confined to this sealed attempt.
     // If one-shot consent is unavailable, select a rejection instead.
     let selected = selected_option(params, allow).or_else(|| {
@@ -2101,6 +2311,9 @@ fn tool_call_is_roundtable(params: &Value) -> bool {
     if antigravity_roundtable_meta(call) {
         return true;
     }
+    if cursor_roundtable_title(call) {
+        return true;
+    }
     // A machine name wins over display text. Only the explicit Grok use_tool
     // wrapper may route through its arguments, and only to a scoped MCP name.
     let Some(identity) = call
@@ -2161,6 +2374,32 @@ fn antigravity_roundtable_meta(call: &Value) -> bool {
         Some(title) => single_underscore_title_agrees(title, tool),
         None => true,
     }
+}
+
+/// cursor-agent ACP asks for MCP consent with no machine name: kind
+/// `other` and the title `"<server>: <tool>"` built from the session's
+/// mcpServers key. Native cursor tools title themselves differently
+/// ("Read `path`", "Edit `path`"), so only this exact shape counts.
+fn cursor_roundtable_title(call: &Value) -> bool {
+    if call.get("name").is_some() || call.get("kind").and_then(Value::as_str) != Some("other") {
+        return false;
+    }
+    let Some(title) = call.get("title").and_then(Value::as_str) else {
+        return false;
+    };
+    // Tool-call updates title the call `"roundtable: <tool>"`; the consent
+    // request of cursor-agent 2026.09.28 titles it
+    // `"roundtable-<tool>: <tool>"` (probe trace, 2026-10-10). Both name the
+    // same tool twice or under the session's own server key; nothing looser.
+    if let Some(tool) = title.strip_prefix("roundtable: ") {
+        return ROUNDTABLE_TOOL_NAMES.contains(&tool);
+    }
+    title
+        .strip_prefix("roundtable-")
+        .and_then(|rest| rest.split_once(": "))
+        .is_some_and(|(server_tool, tool)| {
+            server_tool == tool && ROUNDTABLE_TOOL_NAMES.contains(&tool)
+        })
 }
 
 fn single_underscore_title_agrees(title: &str, tool: &str) -> bool {
@@ -2659,6 +2898,66 @@ fn unqualified_live_fixture(
     }
     // Actual constructor must retain cleanup despite the missing report.
     Ok(Arc::new(LiveParticipantExecutor::load(root)?))
+}
+
+/// Applies a saved CodeBuddy profile to the fresh session: its mode, then
+/// every saved config option (model, ...), each confirmed by the agent. The
+/// adapter was qualified once; a profile only selects among the options the
+/// agent itself advertises, so an option it rejects fails the seat.
+async fn apply_seat_profile(
+    stdin: &mut tokio::process::ChildStdin,
+    stdout: &mut BufReader<tokio::process::ChildStdout>,
+    session_id: &str,
+    profile: &super::agent_credentials::CodeBuddyProfile,
+    seq: &mut u64,
+    active: &Active,
+) -> RtResult<()> {
+    let mut id = 100;
+    if let Some(mode) = profile.mode_id.as_deref().filter(|mode| !mode.is_empty()) {
+        rpc(
+            stdin,
+            stdout,
+            id,
+            "session/set_mode",
+            json!({"sessionId": session_id, "modeId": mode}),
+            seq,
+            active,
+        )
+        .await
+        .map_err(|_| {
+            rt_error(
+                ErrorCode::CapabilityUnqualified,
+                "codebuddy_profile_rejected",
+            )
+        })?;
+        id += 1;
+    }
+    for (key, value) in &profile.config_values {
+        let selected = rpc(
+            stdin,
+            stdout,
+            id,
+            "session/set_config_option",
+            json!({"sessionId": session_id, "configId": key, "value": value}),
+            seq,
+            active,
+        )
+        .await
+        .map_err(|_| {
+            rt_error(
+                ErrorCode::CapabilityUnqualified,
+                "codebuddy_profile_rejected",
+            )
+        })?;
+        verify_confirmed_option(&selected, key, value).map_err(|_| {
+            rt_error(
+                ErrorCode::CapabilityUnqualified,
+                "codebuddy_profile_rejected",
+            )
+        })?;
+        id += 1;
+    }
+    Ok(())
 }
 
 fn verify_confirmed_option(response: &Value, id: &str, value: &str) -> RtResult<()> {
@@ -3553,6 +3852,23 @@ mod completion_contract_tests {
             json!({"title":"use_tool","rawInput":{"tool_name":"run_terminal_command","tool_input":{}}}),
             json!({"title":"use_tool","rawInput":{"tool_name":"roundtable__read_evidence","tool_input":{},"server":"other"}}),
             json!({"title":"use_tool","rawInput":{"tool_name":"roundtable__read_evidence","tool_input":[]}}),
+            // Cursor consent shape: only `roundtable: <roundtable tool>`, kind other, no name.
+            json!({"title":"roundtable: run_terminal_command","kind":"other"}),
+            json!({"title":"other: submit_result","kind":"other"}),
+            json!({"title":"roundtable: submit_result","kind":"execute"}),
+            json!({"title":"roundtable: submit_result"}),
+            json!({"name":"run_terminal_command","title":"roundtable: submit_result","kind":"other"}),
+            json!({"title":"roundtable:  submit_result","kind":"other"}),
+            json!({"title":"roundtable-run_terminal_command: run_terminal_command","kind":"other"}),
+            json!({"title":"roundtable-submit_result: read_evidence","kind":"other"}),
+            json!({"title":"other-submit_result: submit_result","kind":"other"}),
+            json!({"title":"roundtable-submit_result:submit_result","kind":"other"}),
+            json!({"title":"roundtable-submit_result: submit_result","kind":"execute"}),
+            json!({"name":"shell","title":"roundtable-submit_result: submit_result","kind":"other"}),
+            json!({"title":"roundtable: read_file","kind":"other"}),
+            json!({"title":"roundtable: view_file","kind":"other"}),
+            json!({"title":"roundtable: submit_result ","kind":"other"}),
+            json!({"title":"Roundtable: submit_result","kind":"other"}),
         ] {
             let params = json!({"toolCall":tool_call,"options":[{"optionId":"allow","kind":"allow_once"},{"optionId":"reject","kind":"reject_once"}]});
             assert_eq!(
@@ -3565,6 +3881,12 @@ mod completion_contract_tests {
             "roundtable/submit_result",
             "mcp__roundtable__read_evidence",
             "search_evidence",
+            "roundtable: submit_result",
+            "roundtable: read_evidence",
+            "roundtable: search_evidence",
+            "roundtable-submit_result: submit_result",
+            "roundtable-read_evidence: read_evidence",
+            "roundtable-search_evidence: search_evidence",
         ] {
             let params = json!({"toolCall":{"title":name,"kind":"other"},"options":[{"optionId":"allow","kind":"allow_once"},{"optionId":"reject","kind":"reject_once"}]});
             assert_eq!(
@@ -3667,12 +3989,14 @@ mod completion_contract_tests {
         let installed = InstalledRuntime::load(dir.path()).unwrap();
         let mut provider = installed.providers[0].clone();
         provider.credential_env = format!("ABSENT_FIXTURE_{}", uuid::Uuid::new_v4().simple());
-        let error = require_provider_credential(&installed, &provider).unwrap_err();
+        let error = require_provider_credential(&installed, &provider, false).unwrap_err();
         assert_eq!(error.code, ErrorCode::CapabilityUnqualified);
         assert_eq!(
             error.details.reason.as_deref(),
             Some("provider_credential_missing")
         );
+        // A key saved in the agent's Codeg settings satisfies the seat.
+        assert!(require_provider_credential(&installed, &provider, true).is_ok());
     }
 
     #[tokio::test]
@@ -3812,6 +4136,78 @@ mod completion_contract_tests {
 
 #[cfg(test)]
 mod attempt_trace_acp_tests {
+    #[test]
+    fn codex_mcp_approval_matches_only_announced_roundtable_tools() {
+        let mut titles = std::collections::HashMap::new();
+        super::note_announced_mcp_title(
+            &mut titles,
+            &json!({"sessionUpdate":"tool_call","toolCallId":"exec-1","title":"mcp.roundtable.read_evidence","kind":"execute","status":"in_progress"}),
+        );
+        super::note_announced_mcp_title(
+            &mut titles,
+            &json!({"sessionUpdate":"tool_call","toolCallId":"exec-2","title":"mcp.other.read_evidence","kind":"execute"}),
+        );
+        super::note_announced_mcp_title(
+            &mut titles,
+            &json!({"sessionUpdate":"tool_call","toolCallId":"exec-3","title":"mcp.roundtable.shell","kind":"execute"}),
+        );
+        super::note_announced_mcp_title(
+            &mut titles,
+            &json!({"sessionUpdate":"tool_call","toolCallId":"cmd-4","title":"Run ls","kind":"execute"}),
+        );
+        let request = |id: &str| {
+            json!({
+                "sessionId":"s","_meta":{"is_mcp_tool_approval":true},
+                "toolCall":{"toolCallId":id,"kind":"execute","status":"pending"},
+                "options":[
+                    {"optionId":"allow_once","name":"Allow","kind":"allow_once"},
+                    {"optionId":"cancel","name":"Cancel","kind":"reject_once"}
+                ]
+            })
+        };
+        assert!(super::codex_mcp_approval_is_roundtable(
+            &request("exec-1"),
+            &titles
+        ));
+        for id in ["exec-2", "exec-3", "cmd-4", "unknown"] {
+            assert!(
+                !super::codex_mcp_approval_is_roundtable(&request(id), &titles),
+                "{id}"
+            );
+        }
+        let mut no_meta = request("exec-1");
+        no_meta["_meta"] = json!({});
+        assert!(!super::codex_mcp_approval_is_roundtable(&no_meta, &titles));
+        let mut titled = request("exec-1");
+        titled["toolCall"]["title"] = json!("Run rm -rf /");
+        assert!(!super::codex_mcp_approval_is_roundtable(&titled, &titles));
+        let mut located = request("exec-1");
+        located["toolCall"]["locations"] = json!([{"path":"/etc"}]);
+        assert!(!super::codex_mcp_approval_is_roundtable(&located, &titles));
+        let mut edit = request("exec-1");
+        edit["toolCall"]["kind"] = json!("edit");
+        assert!(!super::codex_mcp_approval_is_roundtable(&edit, &titles));
+        // Generic matcher still refuses the bare execute request.
+        assert_eq!(
+            super::permission_reply(&request("exec-1"), &json!(1))["result"]["outcome"]["optionId"],
+            "cancel"
+        );
+        assert_eq!(
+            super::permission_reply_decided(&request("exec-1"), &json!(1), true)["result"]
+                ["outcome"]["optionId"],
+            "allow_once"
+        );
+        // Bounded memory.
+        let mut many = std::collections::HashMap::new();
+        for n in 0..(super::ANNOUNCED_MCP_TITLES_MAX + 10) {
+            super::note_announced_mcp_title(
+                &mut many,
+                &json!({"sessionUpdate":"tool_call","toolCallId":format!("e{n}"),"title":"mcp.roundtable.read_evidence"}),
+            );
+        }
+        assert_eq!(many.len(), super::ANNOUNCED_MCP_TITLES_MAX);
+    }
+
     use super::*;
 
     #[test]

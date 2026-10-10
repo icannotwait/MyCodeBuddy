@@ -130,8 +130,28 @@ pub async fn measure_host(request: &ProbeRequest) -> ProbeFacts {
         failures.push(fail("roundtable_mcp", "codeg-mcp missing from rootfs"));
     }
 
+    // A key saved in the agent's Codeg settings (Cursor custom mode,
+    // CodeBuddy) rides the container env; with it the profile's host login
+    // files are neither required nor mounted. Presence only is recorded.
+    let settings_env = probe_settings_env(request);
+    let files_replaced = settings_env.is_some() && profile.settings_credential.replaces_auth_files;
+    if profile.auth_files.is_empty() && settings_env.is_none() {
+        let keys = profile.settings_credential.required.join(", ");
+        failures.push(fail(
+            "api_credential_scope",
+            &format!("settings credential missing: save {keys} in Codeg's agent settings"),
+        ));
+    }
+    if profile.agent == "codex" {
+        if let Err(error) = super::agent_credentials::refresh_codex_routing(&request.home) {
+            failures.push(fail(
+                "endpoint_compatibility",
+                &format!("codex routing file not written: {error}"),
+            ));
+        }
+    }
     let mut host_held = Vec::new();
-    for file in profile.auth_files {
+    for file in profile.auth_files.iter().filter(|_| !files_replaced) {
         let source = request.home.join(file.home_relative);
         if !source.is_file() {
             if file.required {
@@ -164,7 +184,7 @@ pub async fn measure_host(request: &ProbeRequest) -> ProbeFacts {
             destination: file.destination.to_string(),
         });
     }
-    if let Some(filename) = profile.require_one_filename {
+    if let Some(filename) = profile.require_one_filename.filter(|_| !files_replaced) {
         if !host_held
             .iter()
             .any(|mount| mount.destination.rsplit('/').next() == Some(filename))
@@ -228,6 +248,24 @@ pub async fn measure_host(request: &ProbeRequest) -> ProbeFacts {
         failures.push(fail("api_credential_scope", &reason));
         Vec::new()
     });
+    if profile.agent == "codex" {
+        // The provider binding must name the origin Codex actually calls
+        // (Codeg's configured provider, else the OpenAI default).
+        let user = fs::read_to_string(request.home.join(".codex/config.toml")).unwrap_or_default();
+        let routed = super::agent_credentials::codex_routing_origin(&user)
+            .unwrap_or_else(|| "https://api.openai.com".to_string());
+        let bound = provider_for_agent(&facts.providers, "codex")
+            .map(|provider| provider.origin.trim_end_matches('/').to_string());
+        if bound.as_deref() != Some(routed.as_str()) {
+            failures.push(fail(
+                "endpoint_compatibility",
+                &format!(
+                    "codex provider binding origin {} does not match the configured provider origin {routed}",
+                    bound.as_deref().unwrap_or("(none)")
+                ),
+            ));
+        }
+    }
     let mut container_env = BTreeMap::new();
     for (key, value) in profile.container_env {
         container_env.insert((*key).to_string(), (*value).to_string());
@@ -813,6 +851,7 @@ async fn run_mcp(request: &ProbeRequest, token: &str) -> Result<(), String> {
             &ProbeModelInput {
                 env: &[],
                 auth_overlays: &[],
+                credential_env: &[],
             },
         )?;
         let mut container = ProbeContainer {
@@ -933,6 +972,7 @@ async fn run_acp(
         Some(started)
     };
     let auth_overlays = host_auth_overlays(request);
+    let credential_env = probe_settings_env(request).unwrap_or_default();
     let output = run_acp_session(
         request,
         &argv,
@@ -943,6 +983,7 @@ async fn run_acp(
         &ProbeModelInput {
             env: &model_env,
             auth_overlays: &auth_overlays,
+            credential_env: &credential_env,
         },
     )
     .await;
@@ -995,11 +1036,13 @@ struct AcpProbe {
 /// Grok keeps the loopback gateway. Antigravity with no `AGY_*` variables
 /// is measured against the provider origin the host oauth client calls.
 fn measured_endpoint(request: &ProbeRequest, model_env: &[(String, String)]) -> (String, bool) {
-    if request.agent == "antigravity" && model_env.is_empty() {
+    // No gateway variables: the adapter calls its provider origin through
+    // slirp (Antigravity oauth, Cursor, Codex, CodeBuddy).
+    if model_env.is_empty() {
         let origin = read_providers(&request.provider_bindings)
             .ok()
             .and_then(|providers| {
-                provider_for_agent(&providers, "antigravity")
+                provider_for_agent(&providers, &request.agent)
                     .map(|provider| provider.origin.clone())
             })
             .unwrap_or_default();
@@ -1088,6 +1131,17 @@ impl Drop for ProbeContainer<'_> {
 struct ProbeModelInput<'a> {
     env: &'a [(String, String)],
     auth_overlays: &'a [(PathBuf, String)],
+    /// Settings credential copied into the ACP container env. Scrubbed from
+    /// the bundle when the session ends.
+    credential_env: &'a [(String, String)],
+}
+
+/// The probed adapter's settings credential, read from Codeg's database in
+/// the probe's data dir. `None` when the gate is closed or a key is missing.
+fn probe_settings_env(request: &ProbeRequest) -> Option<Vec<(String, String)>> {
+    let profile = select_profile(request)?;
+    let settings = super::agent_credentials::read_agent_settings(&request.data_dir, &request.agent);
+    super::agent_credentials::settings_credential_env(profile, &settings)
 }
 
 async fn run_acp_session(
@@ -1100,6 +1154,14 @@ async fn run_acp_session(
     model: &ProbeModelInput<'_>,
 ) -> Result<TurnOutcome, String> {
     let prepared = prepare_bundle(request, argv, mounts, None, true, None, model)?;
+    let _bundle_scrub = super::agent_credentials::BundleScrub {
+        config: prepared.bundle.join("config.json"),
+        keys: model
+            .credential_env
+            .iter()
+            .map(|(key, _)| key.clone())
+            .collect(),
+    };
     let mut container = ProbeContainer {
         request,
         id: prepared.id.clone(),
@@ -1124,7 +1186,28 @@ async fn run_acp_session(
     let child = container.child.as_mut().ok_or("acp child")?;
     let mut stdin = child.stdin.take().ok_or("acp stdin")?;
     let stdout = child.stdout.take().ok_or("acp stdout")?;
+    let stderr = child.stderr.take();
     let mut reader = BufReader::new(stdout);
+    // Redacted probe trace under diag/qualify-<agent>/<run>/: the same
+    // metadata-only records a live attempt writes (methods, permission
+    // titles/kinds, tool-call titles/states, stop reasons, timings) with
+    // every copied credential value and the MCP token registered as secrets.
+    let trace = probe_trace(request, token, model).map(std::sync::Arc::new);
+    let stderr_task = match (stderr, trace.clone()) {
+        (Some(mut stderr), Some(trace)) => Some(tokio::spawn(async move {
+            use tokio::io::AsyncReadExt;
+            let mut buf = [0u8; 4096];
+            while let Ok(read) = stderr.read(&mut buf).await {
+                if read == 0 {
+                    break;
+                }
+                trace.stderr_chunk(&buf[..read]);
+            }
+            trace.stderr_finish();
+        })),
+        _ => None,
+    };
+    let trace_ref = trace.as_deref();
     let init = rpc(
         &mut stdin,
         &mut reader,
@@ -1132,6 +1215,7 @@ async fn run_acp_session(
         "initialize",
         super::live_runtime::roundtable_initialize_params("codeg-roundtable-qualify"),
         private_log,
+        trace_ref,
     )
     .await?;
     if init["protocolVersion"] != 1 {
@@ -1152,6 +1236,7 @@ async fn run_acp_session(
             "env": mcp_env(token, !model.env.is_empty())
         }])),
         private_log,
+        trace_ref,
     )
     .await?;
     let session_id = session["sessionId"]
@@ -1172,15 +1257,67 @@ async fn run_acp_session(
             "prompt": [{"type": "text", "text": prompt}]
         }),
         private_log,
+        trace_ref,
     )
-    .await?;
+    .await;
+    if let (Some(trace), Err(reason)) = (trace_ref, result.as_ref()) {
+        trace.record(
+            "acp",
+            serde_json::json!({"event":"probe_exchange_failed","reason":trace.redact(reason)}),
+        );
+    }
+    let result = result?;
+    if let Some(trace) = trace_ref {
+        trace.record("acp", serde_json::json!({"event":"probe_turn_done","stop_reason":result.get("stopReason"),"elapsed_ms":trace.elapsed_ms()}));
+    }
     container.finish().await?;
+    if let Some(task) = stderr_task {
+        let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+    }
     Ok(TurnOutcome {
         completed: result["stopReason"] == "end_turn",
         session_id,
         session,
         egress_note,
     })
+}
+
+/// Opens the probe's redacted ACP trace. Best effort: `None` simply means
+/// the probe runs untraced.
+fn probe_trace(
+    request: &ProbeRequest,
+    token: &str,
+    model: &ProbeModelInput<'_>,
+) -> Option<super::attempt_trace::AttemptTrace> {
+    let run = format!(
+        "{}-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_millis())
+            .unwrap_or_default(),
+        std::process::id()
+    );
+    let mut secrets = vec![token.to_string()];
+    secrets.extend(
+        model
+            .credential_env
+            .iter()
+            .chain(model.env.iter())
+            .map(|(_, value)| value.clone())
+            .filter(|value| !value.is_empty()),
+    );
+    let trace = super::attempt_trace::AttemptTrace::open(
+        &request.data_dir,
+        &format!("qualify-{}", request.agent),
+        &run,
+        secrets,
+    )?;
+    trace.set_metadata_only();
+    trace.record(
+        "acp",
+        serde_json::json!({"event":"probe_session","agent":request.agent}),
+    );
+    Some(trace)
 }
 
 async fn rpc(
@@ -1190,6 +1327,7 @@ async fn rpc(
     method: &str,
     params: serde_json::Value,
     private_log: Option<&std::sync::Mutex<Vec<String>>>,
+    trace: Option<&super::attempt_trace::AttemptTrace>,
 ) -> Result<serde_json::Value, String> {
     let mut seq = 0;
     let rejected = std::sync::atomic::AtomicBool::new(false);
@@ -1205,7 +1343,7 @@ async fn rpc(
             deadline: Some(Duration::from_secs(90)),
             rejected_permission: &rejected,
             private_log,
-            trace: None,
+            trace,
             live: None,
             workspace_root: None,
         },
@@ -1240,6 +1378,7 @@ async fn run_container(
         &ProbeModelInput {
             env: &[],
             auth_overlays: &[],
+            credential_env: &[],
         },
     )?;
     let mut container = ProbeContainer {
@@ -1533,7 +1672,7 @@ fn prepare_bundle(
         env.push(format!("{ATTEMPT_TOKEN_ENV}={token}"));
     }
     if slirp {
-        for (key, value) in model.env {
+        for (key, value) in model.env.iter().chain(model.credential_env) {
             if key != "PATH" && key != "HOME" && !value.is_empty() {
                 env.push(format!("{key}={value}"));
             }
@@ -1611,7 +1750,7 @@ fn prepare_bundle(
             "seccomp": super::sandbox::linux_seccomp_json(),
             "resources": {
                 "memory": {"limit": 512 * 1024 * 1024},
-                "pids": {"limit": 64},
+                "pids": {"limit": super::sandbox::PIDS_MAX},
                 "cpu": {"quota": 100000, "period": 100000},
                 "devices": [{"allow": false, "access": "rwm"}]
             }
@@ -1675,6 +1814,11 @@ fn host_auth_overlays(request: &ProbeRequest) -> Vec<(PathBuf, String)> {
     let Some(profile) = select_profile(request) else {
         return Vec::new();
     };
+    if profile.settings_credential.replaces_auth_files && probe_settings_env(request).is_some() {
+        // Cursor clears a login file it finds next to an API key; with the
+        // settings key active no host login file enters the container.
+        return Vec::new();
+    }
     profile
         .auth_files
         .iter()

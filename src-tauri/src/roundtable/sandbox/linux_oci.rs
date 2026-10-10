@@ -22,7 +22,14 @@ use crate::roundtable::qualification::{CertifiedBinary, QualificationKey};
 use crate::roundtable::rt_error;
 
 const MEMORY_MAX_BYTES: u64 = 512 * 1024 * 1024;
-const PIDS_MAX: u64 = 64;
+/// Tasks (processes + threads; cgroup pids counts both) per member
+/// container. 64 was too low: codex-acp 2.1.1 + codex app-server reach 64
+/// tasks ~0.7 s after start on an 8-CPU host (tokio worker pools), so the
+/// roundtable MCP server spawn fails with EAGAIN (pids.events max=15,
+/// probe 2026-10-10 09:47 PT) and Codex runs with no roundtable tools. Grok
+/// and Cursor members already peak at 43-50. 256 still bounds fork bombs;
+/// memory stays capped at 512 MiB.
+pub(crate) const PIDS_MAX: u64 = 256;
 const CPU_QUOTA_US: u64 = 100_000;
 const CPU_PERIOD_US: u64 = 100_000;
 
@@ -2625,6 +2632,7 @@ fn container_env_allowed(key: &str, value: &str) -> bool {
         "GEMINI_HOME" => value == "/rt-home/.gemini",
         "CURSOR_CONFIG_DIR" => value == "/rt-home/.cursor",
         "XDG_CONFIG_HOME" => value == "/rt-home/.config",
+        "INITIAL_AGENT_MODE" => value == "read-only",
         _ => false,
     }
 }

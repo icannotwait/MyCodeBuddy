@@ -463,18 +463,40 @@ pub struct ParticipantV1 {
     )]
     pub effort: Option<String>,
     /// ACP agent for this seat. Absent means Codex, so older rooms keep working.
-    /// `grok`, `cursor`, and `antigravity` select the other qualified adapters.
+    /// `grok`, `cursor`, `antigravity`, and `code_buddy` select the other
+    /// qualified adapters.
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
         deserialize_with = "de_optional"
     )]
     pub agent: Option<String>,
+    /// Saved CodeBuddy profile (Codeg `delegation.profiles.v1` id) whose ACP
+    /// options (mode, model, ...) the seat applies after `session/new`. Only
+    /// `code_buddy` seats may name one; absent keeps the agent defaults.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "de_optional"
+    )]
+    pub profile_id: Option<String>,
+}
+
+/// Profile ids are Codeg-generated UUIDs; accept only that alphabet.
+pub fn is_profile_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= 128
+        && id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
 }
 
 /// Agents a roundtable seat may name. Absent is Codex.
 pub fn is_roundtable_agent(agent: &str) -> bool {
-    matches!(agent, "codex" | "grok" | "cursor" | "antigravity")
+    matches!(
+        agent,
+        "codex" | "grok" | "cursor" | "antigravity" | "code_buddy"
+    )
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -585,6 +607,11 @@ pub fn validate_config(config: &RoundtableConfigV1, limits: &ResourceLimits) -> 
             .is_some_and(|agent| !is_roundtable_agent(agent))
         {
             return Err(RtError::from_reason(InternalReason::UnknownAgent));
+        }
+        if let Some(profile) = participant.profile_id.as_deref() {
+            if participant.agent.as_deref() != Some("code_buddy") || !is_profile_id(profile) {
+                return Err(RtError::from_reason(InternalReason::Profile));
+            }
         }
     }
     if config.strategy.version != 1 {
@@ -906,6 +933,7 @@ pub enum InternalReason {
     SubmissionConflict,
     ResultAlreadySealed,
     UnknownAgent,
+    Profile,
 }
 
 impl InternalReason {
@@ -953,6 +981,7 @@ impl InternalReason {
             Self::SubmissionConflict => "submission_conflict",
             Self::ResultAlreadySealed => "result_already_sealed",
             Self::UnknownAgent => "unknown_agent",
+            Self::Profile => "profile",
         }
     }
 

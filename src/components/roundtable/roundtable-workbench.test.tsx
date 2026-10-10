@@ -502,6 +502,303 @@ describe("roundtable product page", () => {
     ).toBe(false)
   })
 
+  it("defaults to qualified agents, greys out the rest, and names the seat in readiness errors", async () => {
+    const row = (
+      agent: string,
+      status: string,
+      extra: Record<string, unknown> = {}
+    ) => ({
+      agent,
+      label: agent,
+      status,
+      enabled: status !== "disabled",
+      installed: true,
+      installed_version: "1",
+      profile_version: "1",
+      version_matches_profile: true,
+      qualified: status === "ready",
+      credential: status === "credential_missing" ? "missing" : "settings",
+      credential_keys: [],
+      last_qualification: {
+        verdict: null,
+        failed_checks: [],
+        observed_at: null,
+      },
+      ...extra,
+    })
+    call.mockImplementation(
+      async (command: string, args: { request: { config: unknown } }) => {
+        if (command === "roundtable_list") return { rooms: [], cursor: null }
+        if (command === "roundtable_agents")
+          return {
+            schema_version: 1,
+            agents: [
+              row("grok", "unqualified", { failed_checks: ["new_session"] }),
+              row("antigravity", "ready"),
+              row("cursor", "ready"),
+              row("codex", "disabled"),
+              row("code_buddy", "credential_missing", {
+                credential_keys: ["CODEBUDDY_API_KEY"],
+              }),
+            ],
+          }
+        return {
+          enabled: true,
+          readiness: "ready",
+          tools: [],
+          network: "model_gateway_only",
+          writes: "scratch_only",
+          confirmed_preflight_id: null,
+          config_hash: await roundtableHash(args.request.config),
+          capability: null,
+          error: {
+            code: "capability_unqualified",
+            message: "capability_unqualified",
+            retryable: false,
+            current_revision: null,
+            details: {
+              reason: "adapter_unqualified",
+              field_errors: [
+                { path: "participants[1].agent", reason: "cursor" },
+              ],
+            },
+          },
+        }
+      }
+    )
+    render(<RoundtableWorkbench workspaceId="7" />)
+    const availability = await screen.findByTestId(
+      "roundtable-agent-availability"
+    )
+    // Disabled agents sort last; enabled-but-blocked agents keep a Re-check.
+    const listed = [...availability.querySelectorAll("li")].map((item) =>
+      item.getAttribute("data-agent")
+    )
+    expect(listed).toEqual(["grok", "code_buddy", "codex"])
+    expect(
+      availability.querySelector('li[data-agent="codex"] button')
+    ).toBeNull()
+    expect(
+      screen.getByRole("button", { name: "agentRecheck CodeBuddy" })
+    ).toBeEnabled()
+    const cards = () => screen.getAllByTestId("roundtable-member-card")
+    const checkedAgent = (card: HTMLElement) =>
+      (card.querySelector("input[type=radio]:checked") as HTMLInputElement)
+        ?.value
+    await waitFor(() => expect(checkedAgent(cards()[0])).toBe("antigravity"))
+    expect(checkedAgent(cards()[1])).toBe("cursor")
+    const chips = (card: HTMLElement) =>
+      [...card.querySelectorAll("label[data-agent]")].map((label) => [
+        label.getAttribute("data-agent"),
+        label.getAttribute("data-available"),
+      ])
+    expect(chips(cards()[0])).toEqual([
+      ["antigravity", "true"],
+      ["cursor", "true"],
+      ["grok", "false"],
+      ["code_buddy", "false"],
+      ["codex", "false"],
+    ])
+    expect(
+      (
+        cards()[0].querySelector(
+          'input[type=radio][value="codex"]'
+        ) as HTMLInputElement
+      ).disabled
+    ).toBe(true)
+    fireEvent.change(screen.getByLabelText("topic"), {
+      target: { value: "Question" },
+    })
+    fireEvent.click(screen.getByRole("button", { name: "preflight" }))
+    await screen.findByText("seatError")
+    expect(call).toHaveBeenCalledWith("roundtable_preflight", {
+      request: {
+        config: expect.objectContaining({
+          participants: [
+            expect.objectContaining({ ordinal: 0, agent: "antigravity" }),
+            expect.objectContaining({ ordinal: 1, agent: "cursor" }),
+          ],
+        }),
+      },
+    })
+    const before = call.mock.calls.filter(
+      ([command]) => command === "roundtable_agents"
+    ).length
+    fireEvent.click(screen.getByRole("button", { name: "agentRecheck Grok" }))
+    await waitFor(() =>
+      expect(
+        call.mock.calls.filter(([command]) => command === "roundtable_agents")
+          .length
+      ).toBe(before + 1)
+    )
+  })
+
+  it("lets each CodeBuddy seat pick a saved profile and sends its id", async () => {
+    const row = (agent: string, status: string, profiles: unknown[] = []) => ({
+      agent,
+      label: agent,
+      status,
+      enabled: true,
+      installed: true,
+      installed_version: "1",
+      profile_version: "1",
+      version_matches_profile: true,
+      qualified: status === "ready",
+      credential: "settings",
+      credential_keys: [],
+      last_qualification: {
+        verdict: null,
+        failed_checks: [],
+        observed_at: null,
+      },
+      profiles,
+    })
+    call.mockImplementation(
+      async (command: string, args: { request: { config: unknown } }) => {
+        if (command === "roundtable_list") return { rooms: [], cursor: null }
+        if (command === "roundtable_agents")
+          return {
+            schema_version: 1,
+            agents: [
+              row("grok", "ready"),
+              row("code_buddy", "ready", [
+                {
+                  id: "p-fast",
+                  name: "Fast",
+                  enabled: true,
+                  model: "m-fast",
+                  mode_id: null,
+                },
+                {
+                  id: "p-deep",
+                  name: "Deep",
+                  enabled: true,
+                  model: null,
+                  mode_id: "plan",
+                },
+                {
+                  id: "p-off",
+                  name: "Off",
+                  enabled: false,
+                  model: null,
+                  mode_id: null,
+                },
+              ]),
+            ],
+          }
+        return {
+          enabled: true,
+          readiness: "ready",
+          tools: [],
+          network: "model_gateway_only",
+          writes: "scratch_only",
+          confirmed_preflight_id: null,
+          config_hash: await roundtableHash(args.request.config),
+          capability: null,
+        }
+      }
+    )
+    render(<RoundtableWorkbench workspaceId="7" />)
+    const cards = () => screen.getAllByTestId("roundtable-member-card")
+    await waitFor(() =>
+      expect(
+        cards()[0].querySelector('input[type=radio][value="code_buddy"]')
+      ).not.toBeNull()
+    )
+    for (const card of cards()) {
+      fireEvent.click(
+        card.querySelector(
+          'input[type=radio][value="code_buddy"]'
+        ) as HTMLInputElement
+      )
+    }
+    const first = (await screen.findByLabelText(
+      "codeBuddyProfile 1"
+    )) as HTMLSelectElement
+    const options = [...first.options].map((option) => option.value)
+    // Disabled profiles are not offered.
+    expect(options).toEqual(["", "p-fast", "p-deep"])
+    expect(first.options[1].textContent).toBe("Fast · m-fast")
+    fireEvent.change(first, { target: { value: "p-fast" } })
+    fireEvent.change(screen.getByLabelText("codeBuddyProfile 2"), {
+      target: { value: "p-deep" },
+    })
+    fireEvent.change(screen.getByLabelText("topic"), {
+      target: { value: "Question" },
+    })
+    fireEvent.click(screen.getByRole("button", { name: "preflight" }))
+    await waitFor(() =>
+      expect(call).toHaveBeenCalledWith("roundtable_preflight", {
+        request: {
+          config: expect.objectContaining({
+            participants: [
+              expect.objectContaining({
+                ordinal: 0,
+                agent: "code_buddy",
+                profile_id: "p-fast",
+              }),
+              expect.objectContaining({
+                ordinal: 1,
+                agent: "code_buddy",
+                profile_id: "p-deep",
+              }),
+            ],
+          }),
+        },
+      })
+    )
+  })
+
+  it("shows 'no profile saved' for a CodeBuddy seat without profiles", async () => {
+    call.mockImplementation(async (command: string) => {
+      if (command === "roundtable_list") return { rooms: [], cursor: null }
+      if (command === "roundtable_agents")
+        return {
+          schema_version: 1,
+          agents: [
+            {
+              agent: "code_buddy",
+              label: "code_buddy",
+              status: "ready",
+              enabled: true,
+              installed: true,
+              installed_version: "1",
+              profile_version: "1",
+              version_matches_profile: true,
+              qualified: true,
+              credential: "settings",
+              credential_keys: [],
+              last_qualification: {
+                verdict: null,
+                failed_checks: [],
+                observed_at: null,
+              },
+              profiles: [],
+            },
+          ],
+        }
+      return {}
+    })
+    render(<RoundtableWorkbench workspaceId="7" />)
+    const card = (await screen.findAllByTestId("roundtable-member-card"))[0]
+    await waitFor(() =>
+      expect(
+        card.querySelector('input[type=radio][value="code_buddy"]')
+      ).not.toBeNull()
+    )
+    fireEvent.click(
+      card.querySelector(
+        'input[type=radio][value="code_buddy"]'
+      ) as HTMLInputElement
+    )
+    const select = (await screen.findByLabelText(
+      "codeBuddyProfile 1"
+    )) as HTMLSelectElement
+    expect(select.disabled).toBe(true)
+    expect(select.options[0].textContent).toBe("codeBuddyProfileNone")
+    expect(screen.queryByLabelText("codeBuddyProfile 2")).toBeNull()
+  })
+
   it("shows a verified message in the transcript with its phase and member", async () => {
     const summary = "Prepaid slices stay elapsed."
     const loaded = await room("completed", false, async (body) => {
