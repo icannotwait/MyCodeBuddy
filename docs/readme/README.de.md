@@ -317,7 +317,7 @@ Zieh einen Tab von einer Gruppe in die andere: Seine Sitzung streamt während de
 # or:
 irm https://raw.githubusercontent.com/icannotwait/MyCodeBuddy/main/uninstall-server.ps1 | iex
 
-.\install.ps1 -Version v0.33.0-mycodebuddy.1
+.\install.ps1 -Version v0.33.0-mycodebuddy.2
 # or:
 irm https://raw.githubusercontent.com/icannotwait/MyCodeBuddy/main/install.ps1 | iex
 $env:CODEG_STATIC_DIR="$env:LOCALAPPDATA\codeg-server\web"; codeg-server
