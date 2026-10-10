@@ -1750,7 +1750,7 @@ fn prepare_bundle(
             "seccomp": super::sandbox::linux_seccomp_json(),
             "resources": {
                 "memory": {"limit": 512 * 1024 * 1024},
-                "pids": {"limit": 64},
+                "pids": {"limit": super::sandbox::PIDS_MAX},
                 "cpu": {"quota": 100000, "period": 100000},
                 "devices": [{"allow": false, "access": "rwm"}]
             }
