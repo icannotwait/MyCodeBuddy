@@ -1646,6 +1646,7 @@ where
         );
     }
     let mut chunks = ChunkAgg::new(exchange.trace);
+    let mut announced_mcp = std::collections::HashMap::new();
     let started = tokio::time::Instant::now();
     loop {
         if let Some(limit) = exchange.deadline {
@@ -1696,6 +1697,7 @@ where
         // Ordered failure observations are consumed before any terminal
         // response can release a previously staged submission for acceptance.
         if message["method"] == "session/update" {
+            note_announced_mcp_title(&mut announced_mcp, &message["params"]["update"]);
             note_private_frame(exchange, "session/update");
             check_failure_metadata(&message["params"]["update"], super::FailureSource::Update)?;
             check_failure_metadata(&message["params"], super::FailureSource::Update)?;
@@ -1703,16 +1705,23 @@ where
         if message.get("method").is_some() {
             if let Some(request_id) = message.get("id").cloned() {
                 let response = if message["method"] == "session/request_permission" {
-                    if !tool_call_is_roundtable(&message["params"])
+                    let codex_mcp =
+                        codex_mcp_approval_is_roundtable(&message["params"], &announced_mcp);
+                    if !codex_mcp
+                        && !tool_call_is_roundtable(&message["params"])
                         && !tool_call_is_workspace_read(&message["params"], exchange.workspace_root)
                     {
                         exchange.rejected_permission.store(true, Ordering::Relaxed);
                     }
-                    let reply = permission_reply_in(
-                        &message["params"],
-                        &request_id,
-                        exchange.workspace_root,
-                    );
+                    let reply = if codex_mcp {
+                        permission_reply_decided(&message["params"], &request_id, true)
+                    } else {
+                        permission_reply_in(
+                            &message["params"],
+                            &request_id,
+                            exchange.workspace_root,
+                        )
+                    };
                     if let Some(trace) = exchange.trace {
                         trace.record(
                             "acp",
@@ -2035,6 +2044,16 @@ fn trace_acp_frame(
             record["roundtable_tool"] = json!(tool_call_is_roundtable(&message["params"]));
             record["workspace_read"] = json!(tool_call_is_workspace_read(&message["params"], None));
             record["tool_kind"] = message["params"]["toolCall"]["kind"].clone();
+            record["tool_call_id"] = message["params"]["toolCall"]["toolCallId"].clone();
+            record["mcp_tool_approval"] =
+                message["params"]["_meta"]["is_mcp_tool_approval"].clone();
+            record["option_kinds"] =
+                json!(message["params"]["options"]
+                    .as_array()
+                    .map(|options| options
+                        .iter()
+                        .map(|option| json!([option["optionId"], option["kind"]]))
+                        .collect::<Vec<_>>()));
             record["locations"] =
                 clipped_redacted(&message["params"]["toolCall"]["locations"], 600);
         } else {
@@ -2111,6 +2130,63 @@ fn permission_reply(params: &Value, request_id: &Value) -> Value {
 fn permission_reply_in(params: &Value, request_id: &Value, workspace_root: Option<&Path>) -> Value {
     let allow =
         tool_call_is_roundtable(params) || tool_call_is_workspace_read(params, workspace_root);
+    permission_reply_decided(params, request_id, allow)
+}
+
+/// Largest number of announced MCP tool-call titles an exchange remembers.
+const ANNOUNCED_MCP_TITLES_MAX: usize = 256;
+
+/// Remembers `toolCallId -> title` for MCP tool calls the agent announced in
+/// this exchange (`tool_call` / `tool_call_update` with a `mcp.` title), so a
+/// later consent request that only names the id can be matched.
+fn note_announced_mcp_title(
+    titles: &mut std::collections::HashMap<String, String>,
+    update: &Value,
+) {
+    if !matches!(
+        update["sessionUpdate"].as_str(),
+        Some("tool_call" | "tool_call_update")
+    ) {
+        return;
+    }
+    let (Some(id), Some(title)) = (update["toolCallId"].as_str(), update["title"].as_str()) else {
+        return;
+    };
+    if title.starts_with("mcp.")
+        && (titles.len() < ANNOUNCED_MCP_TITLES_MAX || titles.contains_key(id))
+    {
+        titles.insert(id.to_owned(), title.to_owned());
+    }
+}
+
+/// codex-acp 2.1.1 MCP tool approval (`buildMcpPermissionRequest`, form mode,
+/// correlated): `_meta.is_mcp_tool_approval: true` and a toolCall of only
+/// `{toolCallId, kind: "execute", status: "pending"}`. The id is the MCP item
+/// codex-acp announced as `mcp.<server>.<tool>` from the app-server's
+/// structured item (not model text). Approve only when that announced title
+/// is exactly `mcp.roundtable.<read_evidence|search_evidence|submit_result>`
+/// and the request carries no title/name/locations of its own.
+fn codex_mcp_approval_is_roundtable(
+    params: &Value,
+    titles: &std::collections::HashMap<String, String>,
+) -> bool {
+    let call = &params["toolCall"];
+    if params["_meta"]["is_mcp_tool_approval"] != true
+        || call.get("kind").and_then(Value::as_str) != Some("execute")
+        || call.get("title").is_some()
+        || call.get("name").is_some()
+        || call.get("locations").is_some()
+    {
+        return false;
+    }
+    call.get("toolCallId")
+        .and_then(Value::as_str)
+        .and_then(|id| titles.get(id))
+        .and_then(|title| title.strip_prefix("mcp.roundtable."))
+        .is_some_and(|tool| ROUNDTABLE_TOOL_NAMES.contains(&tool))
+}
+
+fn permission_reply_decided(params: &Value, request_id: &Value, allow: bool) -> Value {
     // ACP does not prove that allow_always is confined to this sealed attempt.
     // If one-shot consent is unavailable, select a rejection instead.
     let selected = selected_option(params, allow).or_else(|| {
@@ -4052,6 +4128,78 @@ mod completion_contract_tests {
 
 #[cfg(test)]
 mod attempt_trace_acp_tests {
+    #[test]
+    fn codex_mcp_approval_matches_only_announced_roundtable_tools() {
+        let mut titles = std::collections::HashMap::new();
+        super::note_announced_mcp_title(
+            &mut titles,
+            &json!({"sessionUpdate":"tool_call","toolCallId":"exec-1","title":"mcp.roundtable.read_evidence","kind":"execute","status":"in_progress"}),
+        );
+        super::note_announced_mcp_title(
+            &mut titles,
+            &json!({"sessionUpdate":"tool_call","toolCallId":"exec-2","title":"mcp.other.read_evidence","kind":"execute"}),
+        );
+        super::note_announced_mcp_title(
+            &mut titles,
+            &json!({"sessionUpdate":"tool_call","toolCallId":"exec-3","title":"mcp.roundtable.shell","kind":"execute"}),
+        );
+        super::note_announced_mcp_title(
+            &mut titles,
+            &json!({"sessionUpdate":"tool_call","toolCallId":"cmd-4","title":"Run ls","kind":"execute"}),
+        );
+        let request = |id: &str| {
+            json!({
+                "sessionId":"s","_meta":{"is_mcp_tool_approval":true},
+                "toolCall":{"toolCallId":id,"kind":"execute","status":"pending"},
+                "options":[
+                    {"optionId":"allow_once","name":"Allow","kind":"allow_once"},
+                    {"optionId":"cancel","name":"Cancel","kind":"reject_once"}
+                ]
+            })
+        };
+        assert!(super::codex_mcp_approval_is_roundtable(
+            &request("exec-1"),
+            &titles
+        ));
+        for id in ["exec-2", "exec-3", "cmd-4", "unknown"] {
+            assert!(
+                !super::codex_mcp_approval_is_roundtable(&request(id), &titles),
+                "{id}"
+            );
+        }
+        let mut no_meta = request("exec-1");
+        no_meta["_meta"] = json!({});
+        assert!(!super::codex_mcp_approval_is_roundtable(&no_meta, &titles));
+        let mut titled = request("exec-1");
+        titled["toolCall"]["title"] = json!("Run rm -rf /");
+        assert!(!super::codex_mcp_approval_is_roundtable(&titled, &titles));
+        let mut located = request("exec-1");
+        located["toolCall"]["locations"] = json!([{"path":"/etc"}]);
+        assert!(!super::codex_mcp_approval_is_roundtable(&located, &titles));
+        let mut edit = request("exec-1");
+        edit["toolCall"]["kind"] = json!("edit");
+        assert!(!super::codex_mcp_approval_is_roundtable(&edit, &titles));
+        // Generic matcher still refuses the bare execute request.
+        assert_eq!(
+            super::permission_reply(&request("exec-1"), &json!(1))["result"]["outcome"]["optionId"],
+            "cancel"
+        );
+        assert_eq!(
+            super::permission_reply_decided(&request("exec-1"), &json!(1), true)["result"]
+                ["outcome"]["optionId"],
+            "allow_once"
+        );
+        // Bounded memory.
+        let mut many = std::collections::HashMap::new();
+        for n in 0..(super::ANNOUNCED_MCP_TITLES_MAX + 10) {
+            super::note_announced_mcp_title(
+                &mut many,
+                &json!({"sessionUpdate":"tool_call","toolCallId":format!("e{n}"),"title":"mcp.roundtable.read_evidence"}),
+            );
+        }
+        assert_eq!(many.len(), super::ANNOUNCED_MCP_TITLES_MAX);
+    }
+
     use super::*;
 
     #[test]
