@@ -463,7 +463,8 @@ pub struct ParticipantV1 {
     )]
     pub effort: Option<String>,
     /// ACP agent for this seat. Absent means Codex, so older rooms keep working.
-    /// `grok`, `cursor`, and `antigravity` select the other qualified adapters.
+    /// `grok`, `cursor`, `antigravity`, and `code_buddy` select the other
+    /// qualified adapters.
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
@@ -474,7 +475,10 @@ pub struct ParticipantV1 {
 
 /// Agents a roundtable seat may name. Absent is Codex.
 pub fn is_roundtable_agent(agent: &str) -> bool {
-    matches!(agent, "codex" | "grok" | "cursor" | "antigravity")
+    matches!(
+        agent,
+        "codex" | "grok" | "cursor" | "antigravity" | "code_buddy"
+    )
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

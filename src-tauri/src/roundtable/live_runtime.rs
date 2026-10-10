@@ -153,11 +153,17 @@ fn file_auth_ready(installed: &InstalledRuntime) -> bool {
 fn host_gateway_secret(
     installed: &InstalledRuntime,
     binding: &super::installed_runtime::ProviderBinding,
+    settings_env: Option<&[(String, String)]>,
 ) -> RtResult<String> {
     if let Ok(value) = std::env::var(&binding.credential_env) {
         if !value.is_empty() {
             return Ok(value);
         }
+    }
+    // Direct-egress adapters (Cursor custom mode, CodeBuddy) send their own
+    // settings key; the gateway only needs a host credential for its origin.
+    if let Some((_, value)) = settings_env.and_then(|env| env.first()) {
+        return Ok(value.clone());
     }
     for mount in &installed.oci.host_held_credentials {
         if let Ok(text) = std::fs::read_to_string(&mount.source) {
@@ -175,15 +181,19 @@ fn host_gateway_secret(
 fn credential_ready(
     installed: &InstalledRuntime,
     binding: &super::installed_runtime::ProviderBinding,
+    settings_credential: bool,
 ) -> bool {
-    std::env::var_os(&binding.credential_env).is_some() || file_auth_ready(installed)
+    settings_credential
+        || std::env::var_os(&binding.credential_env).is_some()
+        || file_auth_ready(installed)
 }
 
 fn require_provider_credential(
     installed: &InstalledRuntime,
     binding: &super::installed_runtime::ProviderBinding,
+    settings_credential: bool,
 ) -> RtResult<()> {
-    if !credential_ready(installed, binding) {
+    if !credential_ready(installed, binding, settings_credential) {
         return Err(rt_error(
             ErrorCode::CapabilityUnqualified,
             "provider_credential_missing",
@@ -218,6 +228,14 @@ impl LiveParticipantExecutor {
             launches: Mutex::new(HashMap::new()),
             registry: tokio::sync::Mutex::new(None),
         })
+    }
+
+    /// The seat's settings credential (Codeg agent settings), read fresh for
+    /// every turn so a key the user just saved applies without a restart.
+    fn settings_env(&self, agent: &str) -> Option<Vec<(String, String)>> {
+        let profile = super::qualification_profiles::profile_for_agent(agent)?;
+        let settings = super::agent_credentials::read_agent_settings(&self.data_dir, agent);
+        super::agent_credentials::settings_credential_env(profile, &settings)
     }
 
     fn adapter(&self, agent: &str) -> RtResult<InstalledRuntime> {
@@ -491,34 +509,46 @@ impl RoundtableTurnExecutor for LiveParticipantExecutor {
         let mut policy_hash = None;
         let mut profile = None;
         for participant in &config.participants {
-            let agent = participant_agent(participant)?;
-            let installed = self.verified(&agent).await?;
-            let binding = installed
-                .providers
-                .iter()
-                .find(|binding| {
-                    binding.provider_ref == participant.provider_ref
-                        && participant
-                            .model
-                            .as_ref()
-                            .is_none_or(|model| model == &binding.model)
-                })
-                .ok_or_else(|| {
-                    rt_error(ErrorCode::CapabilityUnqualified, "provider_unqualified")
-                })?;
-            if participant
-                .effort
-                .as_ref()
-                .is_some_and(|effort| !binding.supported_efforts.contains(effort))
-            {
-                return Err(rt_error(
-                    ErrorCode::CapabilityUnqualified,
-                    "effort_unqualified",
-                ));
-            }
-            self.policy(&installed, &binding.model)?;
-            super::ApprovedOrigin::parse(&binding.origin)?;
-            require_provider_credential(&installed, binding)?;
+            let named = |error| {
+                super::agent_credentials::name_seat(
+                    error,
+                    participant.ordinal,
+                    participant.agent.as_deref().unwrap_or("codex"),
+                )
+            };
+            let agent = participant_agent(participant).map_err(named)?;
+            let installed = self.verified(&agent).await.map_err(named)?;
+            let settings_credential = self.settings_env(&agent).is_some();
+            let checked: RtResult<_> = (|| {
+                let binding = installed
+                    .providers
+                    .iter()
+                    .find(|binding| {
+                        binding.provider_ref == participant.provider_ref
+                            && participant
+                                .model
+                                .as_ref()
+                                .is_none_or(|model| model == &binding.model)
+                    })
+                    .ok_or_else(|| {
+                        rt_error(ErrorCode::CapabilityUnqualified, "provider_unqualified")
+                    })?;
+                if participant
+                    .effort
+                    .as_ref()
+                    .is_some_and(|effort| !binding.supported_efforts.contains(effort))
+                {
+                    return Err(rt_error(
+                        ErrorCode::CapabilityUnqualified,
+                        "effort_unqualified",
+                    ));
+                }
+                self.policy(&installed, &binding.model)?;
+                super::ApprovedOrigin::parse(&binding.origin)?;
+                require_provider_credential(&installed, binding, settings_credential)?;
+                Ok(binding)
+            })();
+            let binding = checked.map_err(named)?;
             if policy_hash.is_some_and(|hash| hash != installed.qualification_key.policy_hash) {
                 return Err(rt_error(
                     ErrorCode::CapabilityUnqualified,
@@ -583,11 +613,16 @@ impl RoundtableTurnExecutor for LiveParticipantExecutor {
             })
             .cloned()
             .ok_or_else(|| rt_error(ErrorCode::CapabilityUnqualified, "provider_unqualified"))?;
-        require_provider_credential(&installed, &provider)?;
-        let mut diagnostic_secrets = auth_denylist(
-            &installed,
-            &[std::env::var(&provider.credential_env).unwrap_or_default()],
-        )?;
+        let settings_env = self.settings_env(&agent);
+        require_provider_credential(&installed, &provider, settings_env.is_some())?;
+        let mut seeds = vec![std::env::var(&provider.credential_env).unwrap_or_default()];
+        seeds.extend(
+            settings_env
+                .iter()
+                .flatten()
+                .map(|(_, value)| value.clone()),
+        );
+        let mut diagnostic_secrets = auth_denylist(&installed, &seeds)?;
         let (execution, facts) = self.policy(&installed, &provider.model)?;
         let directory = installed
             .oci
@@ -636,16 +671,30 @@ impl RoundtableTurnExecutor for LiveParticipantExecutor {
             provider_token.clone(),
             token.reveal_for_same_sandbox().to_owned(),
         ]);
-        let env_allowlist: BTreeMap<String, String> =
+        let mut env_allowlist: BTreeMap<String, String> =
             super::qualification_profiles::live_model_env(agent.as_str(), &provider_token)
                 .into_iter()
                 .collect();
+        // Settings credential (Cursor custom mode, CodeBuddy): into the
+        // container env only. Values are already on the redaction list.
+        for (key, value) in settings_env.iter().flatten() {
+            env_allowlist.insert(key.clone(), value.clone());
+        }
+        let scrub_keys: Vec<String> = settings_env
+            .iter()
+            .flatten()
+            .map(|(key, _)| key.clone())
+            .collect();
         let store_clock = request.store.clone();
         let mut gateway = LiveModelGateway::new(
             self.data_dir.clone(),
             (
                 super::ApprovedOrigin::parse(&provider.origin)?,
-                super::HostCredential::injected(host_gateway_secret(&installed, &provider)?),
+                super::HostCredential::injected(host_gateway_secret(
+                    &installed,
+                    &provider,
+                    settings_env.as_deref(),
+                )?),
                 provider.model.clone(),
                 request.participant.effort.clone(),
             ),
@@ -863,6 +912,17 @@ impl RoundtableTurnExecutor for LiveParticipantExecutor {
             .expect("launch lifecycle")
             .insert(request.fence.incarnation, true);
         let (instance, mut child) = attempt_isolator.spawn_attached(&prepared, &intent).await?;
+        // crun has read the bundle; the copied credential values must not
+        // outlive the attempt in config.json.
+        let _bundle_scrub = super::agent_credentials::BundleScrub {
+            config: installed
+                .oci
+                .runtime_root
+                .join("bundles")
+                .join(&instance.runtime_id)
+                .join("config.json"),
+            keys: scrub_keys,
+        };
         *active.instance.lock().expect("runtime instance") = Some(instance.clone());
         let stdin = child
             .stdin
@@ -3667,12 +3727,14 @@ mod completion_contract_tests {
         let installed = InstalledRuntime::load(dir.path()).unwrap();
         let mut provider = installed.providers[0].clone();
         provider.credential_env = format!("ABSENT_FIXTURE_{}", uuid::Uuid::new_v4().simple());
-        let error = require_provider_credential(&installed, &provider).unwrap_err();
+        let error = require_provider_credential(&installed, &provider, false).unwrap_err();
         assert_eq!(error.code, ErrorCode::CapabilityUnqualified);
         assert_eq!(
             error.details.reason.as_deref(),
             Some("provider_credential_missing")
         );
+        // A key saved in the agent's Codeg settings satisfies the seat.
+        assert!(require_provider_credential(&installed, &provider, true).is_ok());
     }
 
     #[tokio::test]

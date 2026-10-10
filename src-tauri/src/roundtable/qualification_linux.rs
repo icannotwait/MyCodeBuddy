@@ -130,8 +130,20 @@ pub async fn measure_host(request: &ProbeRequest) -> ProbeFacts {
         failures.push(fail("roundtable_mcp", "codeg-mcp missing from rootfs"));
     }
 
+    // A key saved in the agent's Codeg settings (Cursor custom mode,
+    // CodeBuddy) rides the container env; with it the profile's host login
+    // files are neither required nor mounted. Presence only is recorded.
+    let settings_env = probe_settings_env(request);
+    let files_replaced = settings_env.is_some() && profile.settings_credential.replaces_auth_files;
+    if profile.auth_files.is_empty() && settings_env.is_none() {
+        let keys = profile.settings_credential.required.join(", ");
+        failures.push(fail(
+            "api_credential_scope",
+            &format!("settings credential missing: save {keys} in Codeg's agent settings"),
+        ));
+    }
     let mut host_held = Vec::new();
-    for file in profile.auth_files {
+    for file in profile.auth_files.iter().filter(|_| !files_replaced) {
         let source = request.home.join(file.home_relative);
         if !source.is_file() {
             if file.required {
@@ -164,7 +176,7 @@ pub async fn measure_host(request: &ProbeRequest) -> ProbeFacts {
             destination: file.destination.to_string(),
         });
     }
-    if let Some(filename) = profile.require_one_filename {
+    if let Some(filename) = profile.require_one_filename.filter(|_| !files_replaced) {
         if !host_held
             .iter()
             .any(|mount| mount.destination.rsplit('/').next() == Some(filename))
@@ -813,6 +825,7 @@ async fn run_mcp(request: &ProbeRequest, token: &str) -> Result<(), String> {
             &ProbeModelInput {
                 env: &[],
                 auth_overlays: &[],
+                credential_env: &[],
             },
         )?;
         let mut container = ProbeContainer {
@@ -933,6 +946,7 @@ async fn run_acp(
         Some(started)
     };
     let auth_overlays = host_auth_overlays(request);
+    let credential_env = probe_settings_env(request).unwrap_or_default();
     let output = run_acp_session(
         request,
         &argv,
@@ -943,6 +957,7 @@ async fn run_acp(
         &ProbeModelInput {
             env: &model_env,
             auth_overlays: &auth_overlays,
+            credential_env: &credential_env,
         },
     )
     .await;
@@ -995,11 +1010,13 @@ struct AcpProbe {
 /// Grok keeps the loopback gateway. Antigravity with no `AGY_*` variables
 /// is measured against the provider origin the host oauth client calls.
 fn measured_endpoint(request: &ProbeRequest, model_env: &[(String, String)]) -> (String, bool) {
-    if request.agent == "antigravity" && model_env.is_empty() {
+    // No gateway variables: the adapter calls its provider origin through
+    // slirp (Antigravity oauth, Cursor, Codex, CodeBuddy).
+    if model_env.is_empty() {
         let origin = read_providers(&request.provider_bindings)
             .ok()
             .and_then(|providers| {
-                provider_for_agent(&providers, "antigravity")
+                provider_for_agent(&providers, &request.agent)
                     .map(|provider| provider.origin.clone())
             })
             .unwrap_or_default();
@@ -1088,6 +1105,17 @@ impl Drop for ProbeContainer<'_> {
 struct ProbeModelInput<'a> {
     env: &'a [(String, String)],
     auth_overlays: &'a [(PathBuf, String)],
+    /// Settings credential copied into the ACP container env. Scrubbed from
+    /// the bundle when the session ends.
+    credential_env: &'a [(String, String)],
+}
+
+/// The probed adapter's settings credential, read from Codeg's database in
+/// the probe's data dir. `None` when the gate is closed or a key is missing.
+fn probe_settings_env(request: &ProbeRequest) -> Option<Vec<(String, String)>> {
+    let profile = select_profile(request)?;
+    let settings = super::agent_credentials::read_agent_settings(&request.data_dir, &request.agent);
+    super::agent_credentials::settings_credential_env(profile, &settings)
 }
 
 async fn run_acp_session(
@@ -1100,6 +1128,14 @@ async fn run_acp_session(
     model: &ProbeModelInput<'_>,
 ) -> Result<TurnOutcome, String> {
     let prepared = prepare_bundle(request, argv, mounts, None, true, None, model)?;
+    let _bundle_scrub = super::agent_credentials::BundleScrub {
+        config: prepared.bundle.join("config.json"),
+        keys: model
+            .credential_env
+            .iter()
+            .map(|(key, _)| key.clone())
+            .collect(),
+    };
     let mut container = ProbeContainer {
         request,
         id: prepared.id.clone(),
@@ -1240,6 +1276,7 @@ async fn run_container(
         &ProbeModelInput {
             env: &[],
             auth_overlays: &[],
+            credential_env: &[],
         },
     )?;
     let mut container = ProbeContainer {
@@ -1533,7 +1570,7 @@ fn prepare_bundle(
         env.push(format!("{ATTEMPT_TOKEN_ENV}={token}"));
     }
     if slirp {
-        for (key, value) in model.env {
+        for (key, value) in model.env.iter().chain(model.credential_env) {
             if key != "PATH" && key != "HOME" && !value.is_empty() {
                 env.push(format!("{key}={value}"));
             }
@@ -1675,6 +1712,11 @@ fn host_auth_overlays(request: &ProbeRequest) -> Vec<(PathBuf, String)> {
     let Some(profile) = select_profile(request) else {
         return Vec::new();
     };
+    if profile.settings_credential.replaces_auth_files && probe_settings_env(request).is_some() {
+        // Cursor clears a login file it finds next to an API key; with the
+        // settings key active no host login file enters the container.
+        return Vec::new();
+    }
     profile
         .auth_files
         .iter()

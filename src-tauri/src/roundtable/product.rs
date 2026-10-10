@@ -59,6 +59,21 @@ impl RoundtableService {
         if super::conclusion::CONCLUSION_COMMANDS.contains(&command) {
             return self.execute_conclusion(actor, command, body).await;
         }
+        if command == super::agent_credentials::AGENTS_COMMAND {
+            // Read-only: agent settings presence, installed versions and the
+            // qualified catalog. No room, no mutation, no setting values.
+            if !body.is_object() || body.get("principal_id").is_some() {
+                return Err(rt_error(ErrorCode::InvalidArgument, "principal"));
+            }
+            let _ = actor;
+            let data_dir = self.data_dir.clone();
+            let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+            return tokio::task::spawn_blocking(move || {
+                super::agent_credentials::roundtable_agents_status(&data_dir, home.as_deref())
+            })
+            .await
+            .map_err(|_| rt_error(ErrorCode::RuntimeUnavailable, "agents_status_worker"));
+        }
         let room = body
             .get("room_id")
             .and_then(Value::as_str)
