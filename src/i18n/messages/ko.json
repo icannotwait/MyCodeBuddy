@@ -7632,6 +7632,14 @@
     "readiness_product_disabled": "이 호스트에서 라운드테이블이 비활성화됨",
     "readiness_unknown_agent": "라운드테이블 에이전트가 아님",
     "readiness_effort_unqualified": "이 추론 강도는 인증되지 않음",
-    "readiness_unknown": "준비되지 않음"
+    "readiness_unknown": "준비되지 않음",
+    "codeBuddyProfile": "CodeBuddy 프로필",
+    "codeBuddyProfileDefault": "에이전트 기본값",
+    "codeBuddyProfileNone": "저장된 프로필 없음",
+    "codeBuddyProfileMissing": "저장된 프로필이 더 이상 없습니다",
+    "readiness_codebuddy_profile_missing": "선택한 CodeBuddy 프로필이 더 이상 없습니다",
+    "readiness_codebuddy_profile_disabled": "선택한 CodeBuddy 프로필이 비활성화되었습니다",
+    "readiness_codebuddy_profile_rejected": "CodeBuddy가 선택한 프로필의 옵션을 거부했습니다",
+    "readiness_profile": "프로필은 CodeBuddy 좌석만 사용할 수 있습니다"
   }
 }

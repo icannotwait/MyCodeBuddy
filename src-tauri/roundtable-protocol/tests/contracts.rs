@@ -60,6 +60,30 @@ fn config_ranges_and_closed_commands() {
             .as_deref(),
         Some("unknown_agent")
     );
+    mixed.participants[0].agent = Some("code_buddy".into());
+    mixed.participants[0].profile_id = Some("0f6c2a8e-4b1d-4c3a-9e2f-1a2b3c4d5e6f".into());
+    assert!(validate_config(&mixed, &limits).is_ok());
+    let wire = serde_json::to_value(&mixed.participants[0]).expect("participant");
+    assert_eq!(wire["profile_id"], "0f6c2a8e-4b1d-4c3a-9e2f-1a2b3c4d5e6f");
+    assert!(serde_json::to_value(&mixed.participants[1])
+        .expect("participant")
+        .get("profile_id")
+        .is_none());
+    for (agent, profile) in [("cursor", "abc"), ("code_buddy", "../x"), ("code_buddy", "")] {
+        mixed.participants[0].agent = Some(agent.into());
+        mixed.participants[0].profile_id = Some(profile.into());
+        assert_eq!(
+            validate_config(&mixed, &limits)
+                .unwrap_err()
+                .details
+                .reason
+                .as_deref(),
+            Some("profile"),
+            "{agent} {profile}"
+        );
+    }
+    mixed.participants[0].profile_id = None;
+    mixed.participants[0].agent = Some("grok".into());
     assert_eq!(
         validate_config(&support::config(1, 0, 1), &limits)
             .unwrap_err()

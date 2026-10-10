@@ -7632,6 +7632,14 @@
     "readiness_product_disabled": "Roundtables sind auf diesem Host deaktiviert",
     "readiness_unknown_agent": "kein Roundtable-Agent",
     "readiness_effort_unqualified": "diese Denkstufe ist nicht qualifiziert",
-    "readiness_unknown": "nicht bereit"
+    "readiness_unknown": "nicht bereit",
+    "codeBuddyProfile": "CodeBuddy-Profil",
+    "codeBuddyProfileDefault": "Agent-Standard",
+    "codeBuddyProfileNone": "Kein Profil gespeichert",
+    "codeBuddyProfileMissing": "Gespeichertes Profil existiert nicht mehr",
+    "readiness_codebuddy_profile_missing": "das gewählte CodeBuddy-Profil existiert nicht mehr",
+    "readiness_codebuddy_profile_disabled": "das gewählte CodeBuddy-Profil ist deaktiviert",
+    "readiness_codebuddy_profile_rejected": "CodeBuddy hat eine Option des gewählten Profils abgelehnt",
+    "readiness_profile": "nur CodeBuddy-Sitze können ein Profil nutzen"
   }
 }

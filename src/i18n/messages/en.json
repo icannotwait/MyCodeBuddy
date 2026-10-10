@@ -7632,6 +7632,14 @@
     "readiness_product_disabled": "roundtables are disabled on this host",
     "readiness_unknown_agent": "not a roundtable agent",
     "readiness_effort_unqualified": "this reasoning effort is not qualified",
-    "readiness_unknown": "not ready"
+    "readiness_unknown": "not ready",
+    "codeBuddyProfile": "CodeBuddy profile",
+    "codeBuddyProfileDefault": "Agent defaults",
+    "codeBuddyProfileNone": "No profile saved",
+    "codeBuddyProfileMissing": "Saved profile no longer exists",
+    "readiness_codebuddy_profile_missing": "the chosen CodeBuddy profile no longer exists",
+    "readiness_codebuddy_profile_disabled": "the chosen CodeBuddy profile is disabled",
+    "readiness_codebuddy_profile_rejected": "CodeBuddy rejected an option from the chosen profile",
+    "readiness_profile": "only CodeBuddy seats can use a profile"
   }
 }

@@ -7632,6 +7632,14 @@
     "readiness_product_disabled": "الطاولات المستديرة معطّلة على هذا المضيف",
     "readiness_unknown_agent": "ليس وكيل طاولة مستديرة",
     "readiness_effort_unqualified": "مستوى الاستدلال هذا غير مؤهَّل",
-    "readiness_unknown": "غير جاهز"
+    "readiness_unknown": "غير جاهز",
+    "codeBuddyProfile": "ملف تعريف CodeBuddy",
+    "codeBuddyProfileDefault": "الإعدادات الافتراضية للوكيل",
+    "codeBuddyProfileNone": "لا يوجد ملف تعريف محفوظ",
+    "codeBuddyProfileMissing": "ملف التعريف المحفوظ لم يعد موجودًا",
+    "readiness_codebuddy_profile_missing": "ملف تعريف CodeBuddy المختار لم يعد موجودًا",
+    "readiness_codebuddy_profile_disabled": "ملف تعريف CodeBuddy المختار معطّل",
+    "readiness_codebuddy_profile_rejected": "رفض CodeBuddy خيارًا من ملف التعريف المختار",
+    "readiness_profile": "مقاعد CodeBuddy فقط يمكنها استخدام ملف تعريف"
   }
 }

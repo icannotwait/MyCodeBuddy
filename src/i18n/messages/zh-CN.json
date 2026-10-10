@@ -7632,6 +7632,14 @@
     "readiness_product_disabled": "本机已停用圆桌讨论",
     "readiness_unknown_agent": "不是圆桌智能体",
     "readiness_effort_unqualified": "该推理强度未通过认证",
-    "readiness_unknown": "未就绪"
+    "readiness_unknown": "未就绪",
+    "codeBuddyProfile": "CodeBuddy 配置档案",
+    "codeBuddyProfileDefault": "智能体默认配置",
+    "codeBuddyProfileNone": "尚未保存配置档案",
+    "codeBuddyProfileMissing": "已保存的配置档案不存在",
+    "readiness_codebuddy_profile_missing": "所选 CodeBuddy 配置档案已不存在",
+    "readiness_codebuddy_profile_disabled": "所选 CodeBuddy 配置档案已停用",
+    "readiness_codebuddy_profile_rejected": "CodeBuddy 拒绝了所选配置档案中的某个选项",
+    "readiness_profile": "只有 CodeBuddy 席位可以使用配置档案"
   }
 }

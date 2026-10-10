@@ -140,6 +140,8 @@ export function RoundtableWorkbench({
   const agentsTouched = useRef(false)
   // Empty id = the agent's qualified default binding (`provider:<agent>`).
   const [providerIds, setProviderIds] = useState<string[]>([])
+  // Saved CodeBuddy profile per seat; empty = agent defaults.
+  const [profileIds, setProfileIds] = useState<string[]>([])
   const [rounds, setRounds] = useState(2)
   const [concurrency, setConcurrency] = useState(2)
   const [moderator, setModerator] = useState(0)
@@ -523,6 +525,9 @@ export function RoundtableWorkbench({
         role: role.trim() || `${t("member")} ${ordinal + 1}`,
         provider_ref: providerRefAt(ordinal),
         agent: agents[ordinal] || "codex",
+        ...(agents[ordinal] === "code_buddy" && profileIds[ordinal]
+          ? { profile_id: profileIds[ordinal] }
+          : {}),
         ...(original?.participants.find((member) => member.ordinal === ordinal)
           ?.model &&
         original.participants.find((member) => member.ordinal === ordinal)
@@ -746,6 +751,7 @@ export function RoundtableWorkbench({
         return id === (member.agent || "codex") ? "" : id
       })
     )
+    setProfileIds(members.map((member) => member.profile_id || ""))
     agentsTouched.current = true
     setAgents(members.map((member) => member.agent || "codex"))
     setRounds(config.strategy.critique_rounds)
@@ -759,6 +765,7 @@ export function RoundtableWorkbench({
     role,
     agent: agents[index] || "codex",
     providerId: providerIds[index] || "",
+    profileId: profileIds[index] || "",
   }))
   const updateMember = (index: number, patch: Partial<ComposerMember>) => {
     if (patch.role !== undefined) {
@@ -770,6 +777,13 @@ export function RoundtableWorkbench({
       agentsTouched.current = true
       setAgents(
         members.map((member, i) => (i === index ? agent : member.agent))
+      )
+    }
+    if (patch.profileId !== undefined || patch.agent !== undefined) {
+      // A profile belongs to its CodeBuddy seat; changing the agent clears it.
+      const profileId = patch.profileId ?? ""
+      setProfileIds(
+        members.map((member, i) => (i === index ? profileId : member.profileId))
       )
     }
     if (patch.providerId !== undefined) {
@@ -791,6 +805,7 @@ export function RoundtableWorkbench({
     setRoles([...roles, ""])
     setAgents([...members.map((member) => member.agent), next])
     setProviderIds([...members.map((member) => member.providerId), ""])
+    setProfileIds([...members.map((member) => member.profileId), ""])
     invalidate()
   }
   const removeMember = (index: number) => {
@@ -799,6 +814,7 @@ export function RoundtableWorkbench({
     setRoles(roles.filter(keep))
     setAgents(members.map((member) => member.agent).filter(keep))
     setProviderIds(members.map((member) => member.providerId).filter(keep))
+    setProfileIds(members.map((member) => member.profileId).filter(keep))
     setConcurrency(Math.min(concurrency, roles.length - 1))
     setModerator(
       moderator === index ? 0 : moderator > index ? moderator - 1 : moderator

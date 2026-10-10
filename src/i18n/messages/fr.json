@@ -7632,6 +7632,14 @@
     "readiness_product_disabled": "les tables rondes sont désactivées sur cet hôte",
     "readiness_unknown_agent": "pas un agent de table ronde",
     "readiness_effort_unqualified": "ce niveau de raisonnement n'est pas qualifié",
-    "readiness_unknown": "pas prêt"
+    "readiness_unknown": "pas prêt",
+    "codeBuddyProfile": "Profil CodeBuddy",
+    "codeBuddyProfileDefault": "Valeurs de l’agent",
+    "codeBuddyProfileNone": "Aucun profil enregistré",
+    "codeBuddyProfileMissing": "Le profil enregistré n’existe plus",
+    "readiness_codebuddy_profile_missing": "le profil CodeBuddy choisi n’existe plus",
+    "readiness_codebuddy_profile_disabled": "le profil CodeBuddy choisi est désactivé",
+    "readiness_codebuddy_profile_rejected": "CodeBuddy a refusé une option du profil choisi",
+    "readiness_profile": "seuls les sièges CodeBuddy peuvent utiliser un profil"
   }
 }

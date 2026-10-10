@@ -7632,6 +7632,14 @@
     "readiness_product_disabled": "as mesas-redondas estão desativadas neste host",
     "readiness_unknown_agent": "não é um agente de mesa-redonda",
     "readiness_effort_unqualified": "este nível de raciocínio não está qualificado",
-    "readiness_unknown": "não está pronto"
+    "readiness_unknown": "não está pronto",
+    "codeBuddyProfile": "Perfil do CodeBuddy",
+    "codeBuddyProfileDefault": "Padrões do agente",
+    "codeBuddyProfileNone": "Nenhum perfil salvo",
+    "codeBuddyProfileMissing": "O perfil salvo não existe mais",
+    "readiness_codebuddy_profile_missing": "o perfil do CodeBuddy escolhido não existe mais",
+    "readiness_codebuddy_profile_disabled": "o perfil do CodeBuddy escolhido está desativado",
+    "readiness_codebuddy_profile_rejected": "O CodeBuddy rejeitou uma opção do perfil escolhido",
+    "readiness_profile": "só assentos do CodeBuddy podem usar um perfil"
   }
 }

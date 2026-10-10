@@ -238,6 +238,23 @@ impl LiveParticipantExecutor {
         super::agent_credentials::settings_credential_env(profile, &settings)
     }
 
+    /// The seat's saved CodeBuddy profile (read fresh each turn), or the
+    /// named reason it cannot run: missing, disabled, or not a CodeBuddy seat.
+    fn seat_profile(
+        &self,
+        participant: &ParticipantV1,
+    ) -> RtResult<Option<super::agent_credentials::CodeBuddyProfile>> {
+        let Some(id) = participant.profile_id.as_deref() else {
+            return Ok(None);
+        };
+        if participant.agent.as_deref() != Some("code_buddy") {
+            return Err(rt_error(ErrorCode::InvalidArgument, "profile"));
+        }
+        super::agent_credentials::codebuddy_profile(&self.data_dir, id)
+            .map(Some)
+            .map_err(|reason| rt_error(ErrorCode::CapabilityUnqualified, reason))
+    }
+
     fn adapter(&self, agent: &str) -> RtResult<InstalledRuntime> {
         self.adapters
             .get(agent)
@@ -519,6 +536,7 @@ impl RoundtableTurnExecutor for LiveParticipantExecutor {
             let agent = participant_agent(participant).map_err(named)?;
             let installed = self.verified(&agent).await.map_err(named)?;
             let settings_credential = self.settings_env(&agent).is_some();
+            self.seat_profile(participant).map_err(named)?;
             let checked: RtResult<_> = (|| {
                 let binding = installed
                     .providers
@@ -615,6 +633,7 @@ impl RoundtableTurnExecutor for LiveParticipantExecutor {
             .ok_or_else(|| rt_error(ErrorCode::CapabilityUnqualified, "provider_unqualified"))?;
         let settings_env = self.settings_env(&agent);
         require_provider_credential(&installed, &provider, settings_env.is_some())?;
+        let seat_profile = self.seat_profile(&request.participant)?;
         let mut seeds = vec![std::env::var(&provider.credential_env).unwrap_or_default()];
         seeds.extend(
             settings_env
@@ -982,6 +1001,7 @@ impl RoundtableTurnExecutor for LiveParticipantExecutor {
             &active,
             &self.registry,
             agent_type_for(&agent)?,
+            seat_profile.as_ref(),
         )
         .await;
         *active.finish_reason.lock().expect("finish reason") = Some(
@@ -1118,6 +1138,7 @@ async fn drive_acp(
     active: &Active,
     registry: &tokio::sync::Mutex<Option<super::RoundtableSessionRegistry>>,
     agent: crate::models::AgentType,
+    profile: Option<&super::agent_credentials::CodeBuddyProfile>,
 ) -> RtResult<u64> {
     let mut stdout = BufReader::new(stdout);
     let mut seq = 0;
@@ -1229,6 +1250,9 @@ async fn drive_acp(
         .await?;
         verify_confirmed_option(&selected, "model", requested_model)?;
         verify_confirmed_option(&selected, "reasoning_effort", effort)?;
+    }
+    if let Some(profile) = profile {
+        apply_seat_profile(&mut stdin, &mut stdout, session_id, profile, &mut seq, active).await?;
     }
     let prompt = std::str::from_utf8(&request.prompt)
         .map_err(|_| rt_error(ErrorCode::InvalidArgument, "prompt_encoding"))?;
@@ -2782,6 +2806,52 @@ fn unqualified_live_fixture(
     }
     // Actual constructor must retain cleanup despite the missing report.
     Ok(Arc::new(LiveParticipantExecutor::load(root)?))
+}
+
+/// Applies a saved CodeBuddy profile to the fresh session: its mode, then
+/// every saved config option (model, ...), each confirmed by the agent. The
+/// adapter was qualified once; a profile only selects among the options the
+/// agent itself advertises, so an option it rejects fails the seat.
+async fn apply_seat_profile(
+    stdin: &mut tokio::process::ChildStdin,
+    stdout: &mut BufReader<tokio::process::ChildStdout>,
+    session_id: &str,
+    profile: &super::agent_credentials::CodeBuddyProfile,
+    seq: &mut u64,
+    active: &Active,
+) -> RtResult<()> {
+    let mut id = 100;
+    if let Some(mode) = profile.mode_id.as_deref().filter(|mode| !mode.is_empty()) {
+        rpc(
+            stdin,
+            stdout,
+            id,
+            "session/set_mode",
+            json!({"sessionId": session_id, "modeId": mode}),
+            seq,
+            active,
+        )
+        .await
+        .map_err(|_| rt_error(ErrorCode::CapabilityUnqualified, "codebuddy_profile_rejected"))?;
+        id += 1;
+    }
+    for (key, value) in &profile.config_values {
+        let selected = rpc(
+            stdin,
+            stdout,
+            id,
+            "session/set_config_option",
+            json!({"sessionId": session_id, "configId": key, "value": value}),
+            seq,
+            active,
+        )
+        .await
+        .map_err(|_| rt_error(ErrorCode::CapabilityUnqualified, "codebuddy_profile_rejected"))?;
+        verify_confirmed_option(&selected, key, value)
+            .map_err(|_| rt_error(ErrorCode::CapabilityUnqualified, "codebuddy_profile_rejected"))?;
+        id += 1;
+    }
+    Ok(())
 }
 
 fn verify_confirmed_option(response: &Value, id: &str, value: &str) -> RtResult<()> {

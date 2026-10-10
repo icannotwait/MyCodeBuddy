@@ -35,6 +35,28 @@ export interface RoundtableAgentStatus {
     failed_checks: string[]
     observed_at: string | null
   }
+  /** Saved CodeBuddy profiles (ACP options only; empty for other agents). */
+  profiles?: RoundtableSeatProfile[]
+}
+
+/** A saved CodeBuddy profile as the seat dropdown shows it. */
+export interface RoundtableSeatProfile {
+  id: string
+  name: string
+  enabled: boolean
+  model: string | null
+  mode_id: string | null
+}
+
+/** Profiles a seat of `agent` may pick: enabled ones, in saved order. */
+export function seatProfiles(
+  agent: string,
+  status: Map<string, RoundtableAgentStatus>
+): RoundtableSeatProfile[] {
+  if (agent !== "code_buddy") return []
+  return (status.get(agent)?.profiles ?? []).filter(
+    (profile) => profile.enabled
+  )
 }
 
 export interface RoundtableAgentsResponse {

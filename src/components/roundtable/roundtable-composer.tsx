@@ -27,6 +27,7 @@ import {
   agentStatusReasonKey,
   errorReason,
   isAgentSelectable,
+  seatProfiles,
   namedSeat,
   sortRoundtableAgents,
   type RoundtableAgentStatus,
@@ -71,6 +72,10 @@ const READINESS_REASONS = new Set([
   "product_disabled",
   "unknown_agent",
   "effort_unqualified",
+  "codebuddy_profile_missing",
+  "codebuddy_profile_disabled",
+  "codebuddy_profile_rejected",
+  "profile",
 ])
 
 /** Inline reason for an agent that cannot take a seat yet. */
@@ -125,6 +130,8 @@ export interface ComposerMember {
   agent: string
   /** Codeg model provider id; empty means the agent's qualified default. */
   providerId: string
+  /** Saved CodeBuddy profile id; empty means the agent's defaults. */
+  profileId: string
 }
 
 /** Native select styled like the shared Input. */
@@ -596,6 +603,53 @@ export function RoundtableComposer({
                       ) : null}
                     </select>
                   </label>
+                  {member.agent === "code_buddy"
+                    ? (() => {
+                        const profiles = seatProfiles(member.agent, status)
+                        const known = profiles.some(
+                          (profile) => profile.id === member.profileId
+                        )
+                        return (
+                          <label className="grid min-w-40 flex-1 gap-1.5 text-xs font-medium text-muted-foreground">
+                            {t("codeBuddyProfile")}
+                            <select
+                              aria-label={`${t("codeBuddyProfile")} ${index + 1}`}
+                              className={cn(
+                                SELECT_CLASS,
+                                "bg-background text-foreground"
+                              )}
+                              value={member.profileId}
+                              disabled={
+                                profiles.length === 0 && !member.profileId
+                              }
+                              onChange={(event) =>
+                                onMemberChange(index, {
+                                  profileId: event.target.value,
+                                })
+                              }
+                            >
+                              <option value="">
+                                {profiles.length === 0
+                                  ? t("codeBuddyProfileNone")
+                                  : t("codeBuddyProfileDefault")}
+                              </option>
+                              {profiles.map((profile) => (
+                                <option key={profile.id} value={profile.id}>
+                                  {profile.model
+                                    ? `${profile.name} · ${profile.model}`
+                                    : profile.name}
+                                </option>
+                              ))}
+                              {member.profileId && !known ? (
+                                <option value={member.profileId}>
+                                  {t("codeBuddyProfileMissing")}
+                                </option>
+                              ) : null}
+                            </select>
+                          </label>
+                        )
+                      })()
+                    : null}
                   <label
                     className={cn(
                       "flex h-9 cursor-pointer items-center gap-2 rounded-full border px-3 text-xs font-medium transition-colors select-none hover:bg-muted has-[:focus-visible]:ring-[3px] has-[:focus-visible]:ring-ring/50",

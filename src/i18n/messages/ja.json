@@ -7632,6 +7632,14 @@
     "readiness_product_disabled": "このホストではラウンドテーブルが無効です",
     "readiness_unknown_agent": "ラウンドテーブル用のエージェントではありません",
     "readiness_effort_unqualified": "この推論レベルは認定されていません",
-    "readiness_unknown": "準備ができていません"
+    "readiness_unknown": "準備ができていません",
+    "codeBuddyProfile": "CodeBuddy プロファイル",
+    "codeBuddyProfileDefault": "エージェントの既定",
+    "codeBuddyProfileNone": "保存済みプロファイルなし",
+    "codeBuddyProfileMissing": "保存済みプロファイルが見つかりません",
+    "readiness_codebuddy_profile_missing": "選択した CodeBuddy プロファイルは存在しません",
+    "readiness_codebuddy_profile_disabled": "選択した CodeBuddy プロファイルは無効です",
+    "readiness_codebuddy_profile_rejected": "CodeBuddy が選択したプロファイルのオプションを拒否しました",
+    "readiness_profile": "プロファイルを使えるのは CodeBuddy の席だけです"
   }
 }

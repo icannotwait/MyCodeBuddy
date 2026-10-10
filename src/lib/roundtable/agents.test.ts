@@ -5,6 +5,7 @@ import {
   isAgentSelectable,
   namedSeat,
   nextRoundtableAgent,
+  seatProfiles,
   ROUNDTABLE_CANDIDATES,
   sortRoundtableAgents,
   statusByAgent,
@@ -106,5 +107,22 @@ describe("roundtable agent availability", () => {
     ).toEqual({ ordinal: 1, agent: "cursor" })
     expect(namedSeat({ details: { reason: "x", field_errors: [] } })).toBe(null)
     expect(namedSeat(new Error("x"))).toBe(null)
+  })
+})
+
+describe("seatProfiles", () => {
+  it("offers enabled CodeBuddy profiles only, and none for other agents", () => {
+    const status = statusByAgent([
+      agentRow("code_buddy", "ready", {
+        profiles: [
+          { id: "a", name: "A", enabled: true, model: "m", mode_id: null },
+          { id: "b", name: "B", enabled: false, model: null, mode_id: null },
+        ],
+      }),
+      agentRow("cursor", "ready"),
+    ])
+    expect(seatProfiles("code_buddy", status).map((p) => p.id)).toEqual(["a"])
+    expect(seatProfiles("cursor", status)).toEqual([])
+    expect(seatProfiles("code_buddy", statusByAgent([]))).toEqual([])
   })
 })

@@ -372,6 +372,118 @@ pub(crate) fn refresh_codex_routing(home: &Path) -> std::io::Result<PathBuf> {
     Ok(target)
 }
 
+/// Codeg app_metadata key holding the saved agent profiles
+/// (`commands::delegation::KEY_DELEGATION_PROFILES_V1`).
+const PROFILES_KEY: &str = "delegation.profiles.v1";
+
+/// One saved CodeBuddy profile: ACP session options only (mode + config
+/// option values such as `model`). Credentials stay agent-level.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct CodeBuddyProfile {
+    pub id: String,
+    pub name: String,
+    pub enabled: bool,
+    pub mode_id: Option<String>,
+    pub config_values: BTreeMap<String, String>,
+}
+
+/// Reads the saved CodeBuddy profiles straight from the settings DB,
+/// read-only. Missing table/key/unparsable document reads as no profiles.
+pub(crate) fn read_codebuddy_profiles(data_dir: &Path) -> Vec<CodeBuddyProfile> {
+    read_codebuddy_profiles_at(&data_dir.join(crate::db::database_file_name()))
+}
+
+pub(crate) fn read_codebuddy_profiles_at(db_path: &Path) -> Vec<CodeBuddyProfile> {
+    use rusqlite::{Connection, OpenFlags, OptionalExtension};
+    let Ok(conn) = Connection::open_with_flags(
+        db_path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    ) else {
+        return Vec::new();
+    };
+    let _ = conn.busy_timeout(std::time::Duration::from_secs(2));
+    let document: Option<String> = conn
+        .query_row(
+            "SELECT value FROM app_metadata WHERE key=?1 AND deleted_at IS NULL",
+            [PROFILES_KEY],
+            |row| row.get(0),
+        )
+        .optional()
+        .ok()
+        .flatten();
+    let Some(document) = document else {
+        return Vec::new();
+    };
+    parse_codebuddy_profiles(&document)
+}
+
+fn parse_codebuddy_profiles(document: &str) -> Vec<CodeBuddyProfile> {
+    let Ok(value) = serde_json::from_str::<Value>(document) else {
+        return Vec::new();
+    };
+    value["profiles"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|profile| profile["agent_type"] == "code_buddy")
+        .filter_map(|profile| {
+            let id = profile["id"].as_str()?.to_string();
+            if !roundtable_protocol::is_profile_id(&id) {
+                return None;
+            }
+            let config_values = profile["config_values"]
+                .as_object()
+                .map(|values| {
+                    values
+                        .iter()
+                        .filter_map(|(key, value)| {
+                            value.as_str().map(|text| (key.clone(), text.to_string()))
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            Some(CodeBuddyProfile {
+                id,
+                name: profile["name"].as_str().unwrap_or_default().to_string(),
+                enabled: profile["enabled"].as_bool().unwrap_or(false),
+                mode_id: profile["mode_id"].as_str().map(str::to_string),
+                config_values,
+            })
+        })
+        .collect()
+}
+
+/// The seat's chosen profile, or the reason it cannot be used.
+pub(crate) fn codebuddy_profile(
+    data_dir: &Path,
+    id: &str,
+) -> Result<CodeBuddyProfile, &'static str> {
+    let profile = read_codebuddy_profiles(data_dir)
+        .into_iter()
+        .find(|profile| profile.id == id)
+        .ok_or("codebuddy_profile_missing")?;
+    if !profile.enabled {
+        return Err("codebuddy_profile_disabled");
+    }
+    Ok(profile)
+}
+
+/// Profile summary for the seat dropdown: names and the model option only.
+fn profile_summaries(profiles: &[CodeBuddyProfile]) -> Vec<Value> {
+    profiles
+        .iter()
+        .map(|profile| {
+            json!({
+                "id": profile.id,
+                "name": profile.name,
+                "enabled": profile.enabled,
+                "model": profile.config_values.get("model"),
+                "mode_id": profile.mode_id,
+            })
+        })
+        .collect()
+}
+
 pub(crate) fn roundtable_agents_status(data_dir: &Path, home: Option<&Path>) -> Value {
     let catalog =
         super::installed_runtime::InstalledRuntime::load_catalog(data_dir).unwrap_or_default();
@@ -436,6 +548,11 @@ pub(crate) fn roundtable_agents_status(data_dir: &Path, home: Option<&Path>) -> 
                     "failed_checks": failed_checks,
                     "observed_at": observed_at,
                 },
+                "profiles": if *agent == "code_buddy" {
+                    profile_summaries(&read_codebuddy_profiles(data_dir))
+                } else {
+                    Vec::new()
+                },
             })
         })
         .collect();
@@ -444,6 +561,46 @@ pub(crate) fn roundtable_agents_status(data_dir: &Path, home: Option<&Path>) -> 
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn codebuddy_profiles_parse_only_codebuddy_entries_with_safe_ids() {
+        let doc = r#"{"profiles":[
+            {"id":"p-1","agent_type":"code_buddy","name":"Fast","mode_id":"default","config_values":{"model":"m-fast","n":1},"enabled":true,"created_at":1,"updated_at":1},
+            {"id":"p-2","agent_type":"code_buddy","name":"Off","config_values":{},"enabled":false,"created_at":2,"updated_at":2},
+            {"id":"../bad","agent_type":"code_buddy","name":"Bad","enabled":true,"created_at":3,"updated_at":3},
+            {"id":"c-1","agent_type":"codex","name":"Codex","enabled":true,"created_at":4,"updated_at":4}
+        ]}"#;
+        let profiles = super::parse_codebuddy_profiles(doc);
+        assert_eq!(profiles.len(), 2);
+        assert_eq!(profiles[0].id, "p-1");
+        assert_eq!(profiles[0].mode_id.as_deref(), Some("default"));
+        assert_eq!(profiles[0].config_values.get("model").map(String::as_str), Some("m-fast"));
+        assert!(!profiles[0].config_values.contains_key("n"));
+        assert!(!profiles[1].enabled);
+        assert!(super::parse_codebuddy_profiles("not json").is_empty());
+        assert!(super::parse_codebuddy_profiles("{}").is_empty());
+        let summary = super::profile_summaries(&profiles);
+        assert_eq!(summary[0]["model"], "m-fast");
+        assert!(summary[1]["model"].is_null());
+    }
+
+    #[test]
+    fn codebuddy_profile_lookup_names_missing_and_disabled() {
+        let dir = tempfile::tempdir().expect("dir");
+        let db = dir.path().join(crate::db::database_file_name());
+        let conn = rusqlite::Connection::open(&db).expect("db");
+        conn.execute_batch("CREATE TABLE app_metadata (id INTEGER PRIMARY KEY, key TEXT, value TEXT, created_at TEXT, updated_at TEXT, deleted_at TEXT);").expect("schema");
+        assert_eq!(super::codebuddy_profile(dir.path(), "p-1"), Err("codebuddy_profile_missing"));
+        conn.execute(
+            "INSERT INTO app_metadata(key,value) VALUES('delegation.profiles.v1',?1)",
+            [r#"{"profiles":[{"id":"p-1","agent_type":"code_buddy","name":"A","enabled":true,"created_at":1,"updated_at":1},{"id":"p-2","agent_type":"code_buddy","name":"B","enabled":false,"created_at":1,"updated_at":1}]}"#],
+        )
+        .expect("insert");
+        drop(conn);
+        assert_eq!(super::codebuddy_profile(dir.path(), "p-1").map(|p| p.name), Ok("A".into()));
+        assert_eq!(super::codebuddy_profile(dir.path(), "p-2"), Err("codebuddy_profile_disabled"));
+        assert_eq!(super::codebuddy_profile(dir.path(), "p-3"), Err("codebuddy_profile_missing"));
+    }
+
     #[test]
     fn codex_routing_keeps_only_the_selected_provider_route() {
         let user = r#"
