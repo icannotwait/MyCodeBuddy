@@ -51,6 +51,7 @@ const folders = vi.hoisted(() => [
   },
 ])
 const listAllFolderDetails = vi.hoisted(() => vi.fn())
+vi.mock("./roundtable-topic-input")
 vi.mock("@/lib/transport", () => ({
   getTransport: () => ({ call, subscribe: async () => () => undefined }),
 }))

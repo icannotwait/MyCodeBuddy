@@ -4,6 +4,7 @@ import { describe, expect, it, vi } from "vitest"
 import { CreateRoundtable } from "@/components/roundtable/create-roundtable"
 import { PreflightConfirmation } from "@/components/roundtable/preflight-confirmation"
 import messages from "@/i18n/messages/zh-CN.json"
+vi.mock("./roundtable-topic-input")
 vi.mock("next-intl", () => ({
   useTranslations: () => (key: keyof typeof messages.Roundtable) =>
     messages.Roundtable[key],

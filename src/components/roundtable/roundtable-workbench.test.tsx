@@ -7,6 +7,7 @@ import { webcrypto } from "node:crypto"
 
 const call = vi.hoisted(() => vi.fn())
 const subscribers = vi.hoisted(() => [] as ((payload: unknown) => void)[])
+vi.mock("./roundtable-topic-input")
 vi.mock("@/lib/transport", () => ({
   getTransport: () => ({
     call,

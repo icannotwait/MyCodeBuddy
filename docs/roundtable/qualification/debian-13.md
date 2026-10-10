@@ -217,7 +217,7 @@ sudo debootstrap --variant=minbase trixie "$ROOTFS" http://deb.debian.org/debian
 sudo chroot "$ROOTFS" apt-get update
 sudo chroot "$ROOTFS" apt-get install -y nodejs ca-certificates
 sudo mkdir -p "$ROOTFS/usr/local/bin" "$ROOTFS/proc" "$ROOTFS/scratch" \
-  "$ROOTFS/dev/pts" "$ROOTFS/dev/shm" "$ROOTFS/sys" "$ROOTFS/tmp" \
+  "$ROOTFS/workspace-ro" "$ROOTFS/dev/pts" "$ROOTFS/dev/shm" "$ROOTFS/sys" "$ROOTFS/tmp" \
   "$ROOTFS/run/codeg" \
   "$ROOTFS/rt-home/.codex" "$ROOTFS/rt-home/.grok" \
   "$ROOTFS/rt-home/.cursor" "$ROOTFS/rt-home/.config/cursor" \
@@ -246,8 +246,21 @@ nodes, fifos, and sockets contribute type and device numbers; they are
 not opened. A file the probing user cannot read fails the probe and
 names the path.
 
-`/proc`, `/dev`, `/dev/pts`, `/dev/shm`, `/sys`, `/tmp`, `/scratch`, and
-`/rt-home` are directories. The socket paths, `/etc/resolv.conf`, and
+`/proc`, `/dev`, `/dev/pts`, `/dev/shm`, `/sys`, `/tmp`, `/scratch`,
+`/workspace-ro`, and `/rt-home` are directories. A live attempt binds the
+room's registered workspace over `/workspace-ro` with
+`bind,ro,nosuid,nodev,noexec,nosymfollow` (not recursive, so nested host
+mounts stay hidden). The workspace may not contain or sit inside the host
+HOME, the runtime root, the rootfs, the cgroup root, or a held credential
+file. The isolation probe binds a stand-in workspace with the same options and
+requires `WORKSPACE_READ_OK`, `DENIED workspace_write` (touch, append,
+mkdir, rm), `DENIED workspace_exec` (an executable script in the workspace)
+and `DENIED workspace_symlink` (a symlink in the workspace pointing at an
+absolute host file outside it, or a relative `../` climb to it, must not return that file). crun 1.21 does not
+apply `nosymfollow` to binds, so the probe also prints
+`INFO workspace_internal_symlink=resolves|blocked` without requiring either. An existing rootfs needs
+`mkdir "$ROOTFS/workspace-ro"` and a fresh qualification (the digest
+changes). The socket paths, `/etc/resolv.conf`, and
 auth placeholders are empty regular files. The probe mounts a tmpfs on
 `/dev` (with `/dev/pts` and `/dev/shm`) so rootless crun does not create
 device nodes in the image and change the digest. `/sys` is mounted

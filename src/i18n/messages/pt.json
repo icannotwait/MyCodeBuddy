@@ -7588,6 +7588,10 @@
     "liveEnded": "Transmissão concluída. Aguardando verificação.",
     "liveThinking": "Raciocínio",
     "liveWaiting": "Aguardando saída…",
-    "liveTruncated": "Visualização ao vivo truncada. O texto completo aparece após a verificação."
+    "liveTruncated": "Visualização ao vivo truncada. O texto completo aparece após a verificação.",
+    "topicMentionHelp": "Digite @ para referenciar um arquivo ou pasta do espaço de trabalho. Os membros o leem por conta própria a partir da montagem somente leitura /workspace-ro.",
+    "workspaceMount": "Espaço de trabalho (membros)",
+    "workspaceMountReadOnly": "Montado somente leitura. Os membros podem ler e pesquisar, mas nada pode ser gravado.",
+    "workspaceMountUnavailable": "Este workspace contém caminhos exclusivos do host (dados do app, home ou credenciais) e não pode ser montado. Escolha uma pasta de projeto; a execução será recusada."
   }
 }

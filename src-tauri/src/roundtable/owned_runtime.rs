@@ -1497,7 +1497,12 @@ enum TurnStop {
 /// Shown on proposal and critique prompts when the frozen corpus has no
 /// source entries and no evidence aliases. Searching that corpus only burns
 /// the attempt timeout.
-const EMPTY_EVIDENCE_INSTRUCTION: &str = "No frozen evidence is published. Do not call search_evidence or read_evidence. Submit or abstain from the topic and published_messages only. evidence_aliases may be [].";
+const EMPTY_EVIDENCE_INSTRUCTION: &str = "No frozen evidence is published. Do not call search_evidence or read_evidence. Submit or abstain from the topic, the read-only workspace and published_messages. evidence_aliases may be [].";
+
+/// Every phase: where the workspace is and what `@path` in the topic means.
+/// The bind is read-only and noexec; the sentence is guidance, the mount is
+/// the enforcement.
+pub(crate) const WORKSPACE_INSTRUCTION: &str = "The registered workspace is mounted read-only at /workspace-ro. A reference written as @relative/path in the topic means the file or folder /workspace-ro/relative/path. Read, list or search files there with your own file tools (absolute /workspace-ro paths) and name the paths you relied on. Nothing there can be written or executed, and symlinks cannot reach outside the container. Only the roundtable tools record a result.";
 
 fn frozen_evidence_is_empty(context: &Value) -> bool {
     let sources_empty = context
@@ -1520,13 +1525,15 @@ fn frozen_evidence_is_empty(context: &Value) -> bool {
 }
 
 fn member_prompt_context(kind: PhaseKind, context: &Value) -> Option<Value> {
-    if !matches!(kind, PhaseKind::Proposal | PhaseKind::Critique)
-        || !frozen_evidence_is_empty(context)
-    {
-        return None;
-    }
     let mut copy = context.clone();
-    if let Some(object) = copy.as_object_mut() {
+    let object = copy.as_object_mut()?;
+    object.insert(
+        "workspace".to_string(),
+        Value::String(WORKSPACE_INSTRUCTION.to_string()),
+    );
+    if matches!(kind, PhaseKind::Proposal | PhaseKind::Critique)
+        && frozen_evidence_is_empty(context)
+    {
         object.insert(
             "instruction".to_string(),
             Value::String(EMPTY_EVIDENCE_INSTRUCTION.to_string()),
@@ -2191,5 +2198,31 @@ mod synthesis_limit_tests {
             phase_deadline_for(PhaseKind::Proposal, 1_000, 450_000, 300_000),
             300_000
         );
+    }
+}
+
+#[cfg(test)]
+mod workspace_prompt_tests {
+    use super::*;
+
+    #[test]
+    fn every_phase_tells_members_where_the_read_only_workspace_is() {
+        let context = json!({"topic":"Review @src/a.rs","sources":[],"aliases":{"evidence":{}}});
+        for kind in [
+            PhaseKind::Proposal,
+            PhaseKind::Critique,
+            PhaseKind::Synthesis,
+        ] {
+            let annotated = member_prompt_context(kind, &context).expect("annotated");
+            let note = annotated["workspace"].as_str().unwrap();
+            assert!(note.contains("/workspace-ro"));
+            assert!(note.contains("@relative/path"));
+            assert!(note.contains("read-only"));
+            assert_eq!(annotated["topic"], context["topic"]);
+            assert_eq!(
+                annotated.get("instruction").is_some(),
+                kind != PhaseKind::Synthesis
+            );
+        }
     }
 }

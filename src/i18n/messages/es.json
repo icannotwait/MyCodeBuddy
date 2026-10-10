@@ -7588,6 +7588,10 @@
     "liveEnded": "Transmisión terminada. Pendiente de verificación.",
     "liveThinking": "Razonamiento",
     "liveWaiting": "Esperando salida…",
-    "liveTruncated": "Vista en vivo truncada. El texto completo aparecerá tras la verificación."
+    "liveTruncated": "Vista en vivo truncada. El texto completo aparecerá tras la verificación.",
+    "topicMentionHelp": "Escribe @ para referenciar un archivo o carpeta del espacio de trabajo. Los miembros lo leen por sí mismos desde el montaje de solo lectura /workspace-ro.",
+    "workspaceMount": "Espacio de trabajo (miembros)",
+    "workspaceMountReadOnly": "Montado en solo lectura. Los miembros pueden leer y buscar, pero no pueden escribir nada.",
+    "workspaceMountUnavailable": "Este espacio de trabajo contiene rutas exclusivas del host (datos de la app, home o credenciales) y no se puede montar. Elige una carpeta de proyecto; la ejecución se rechazará."
   }
 }

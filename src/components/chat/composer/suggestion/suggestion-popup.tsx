@@ -209,6 +209,12 @@ export interface SuggestionPopupProps {
    * confirmation has no KeyboardEvent, so the host supplies this check.
    */
   isEditorComposing?: () => boolean
+  /**
+   * Restrict the panel to these groups (tabs and auto-targeting). Omitted means
+   * every group. A host that only accepts files (the roundtable topic) passes
+   * `["file"]`.
+   */
+  allowedKinds?: readonly ReferenceGroupKind[]
 }
 
 /**
@@ -238,9 +244,15 @@ export const SuggestionPopup = forwardRef<
     anchorRef,
     onActiveOptionChange,
     isEditorComposing,
+    allowedKinds,
   },
   ref
 ) {
+  const tabOrder = useMemo<readonly ReferenceGroupKind[]>(() => {
+    if (!allowedKinds) return TAB_ORDER
+    const filtered = TAB_ORDER.filter((kind) => allowedKinds.includes(kind))
+    return filtered.length > 0 ? filtered : TAB_ORDER
+  }, [allowedKinds])
   const subscribe = useCallback(
     (listener: () => void) => controller.subscribe(listener),
     [controller]
@@ -267,7 +279,7 @@ export const SuggestionPopup = forwardRef<
   const [anchorHidden, setAnchorHidden] = useState(false)
   const listRef = useRef<HTMLDivElement>(null)
   const selectedIndexRef = useRef(0)
-  const autoTabRef = useRef<ReferenceGroupKind>(TAB_ORDER[0])
+  const autoTabRef = useRef<ReferenceGroupKind>(tabOrder[0])
   const captureRef = useRef<ConfirmationCapture | null>(null)
   const confirmingUriRef = useRef<string | null>(null)
   const stateRef = useRef(state)
@@ -301,10 +313,9 @@ export const SuggestionPopup = forwardRef<
 
   const firstNonEmpty = useMemo(
     () =>
-      TAB_ORDER.find(
-        (kind) => (groupByKind.get(kind)?.items.length ?? 0) > 0
-      ) ?? TAB_ORDER[0],
-    [groupByKind]
+      tabOrder.find((kind) => (groupByKind.get(kind)?.items.length ?? 0) > 0) ??
+      tabOrder[0],
+    [groupByKind, tabOrder]
   )
 
   // Auto-target the first non-empty tab until the user pins one, but never jump
@@ -650,9 +661,9 @@ export const SuggestionPopup = forwardRef<
             return true
           case "Tab": {
             const dir = event.shiftKey ? -1 : 1
-            const at = TAB_ORDER.indexOf(activeTab)
+            const at = tabOrder.indexOf(activeTab)
             const next =
-              TAB_ORDER[(at + dir + TAB_ORDER.length) % TAB_ORDER.length]
+              tabOrder[(at + dir + tabOrder.length) % tabOrder.length]
             switchTab(next)
             return true
           }
@@ -684,6 +695,7 @@ export const SuggestionPopup = forwardRef<
       onClose,
       isEditorComposing,
       state.range,
+      tabOrder,
     ]
   )
 
@@ -748,7 +760,7 @@ export const SuggestionPopup = forwardRef<
           aria-orientation="horizontal"
           className="flex shrink-0 gap-0.5 overflow-x-auto border-b border-border p-1"
         >
-          {TAB_ORDER.map((kind) => {
+          {tabOrder.map((kind) => {
             const isActive = kind === activeTab
             const count = groupByKind.get(kind)?.items.length ?? 0
             return (

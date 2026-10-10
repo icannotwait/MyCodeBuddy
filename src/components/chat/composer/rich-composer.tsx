@@ -41,7 +41,10 @@ import {
   MENTION_LISTBOX_ID,
   SuggestionPopup,
 } from "./suggestion/suggestion-popup"
-import type { ReferenceSearchController } from "./reference-search-controller"
+import type {
+  ReferenceGroupKind,
+  ReferenceSearchController,
+} from "./reference-search-controller"
 import type { MentionUiLabels, SuggestionPopupHandle } from "./suggestion/types"
 import type { ReferenceAttrs, ReferenceKind } from "./types"
 
@@ -149,6 +152,8 @@ export interface RichComposerProps {
    * Commits/Skills). English fallbacks apply when omitted. Render-only.
    */
   tabLabels?: Partial<Record<ReferenceKind, string>>
+  /** Limit the `@` panel to these groups (e.g. `["file"]`). Default: all. */
+  mentionKinds?: readonly ReferenceGroupKind[]
   /**
    * Box the `@` panel lines up with: it adopts this element's width and left
    * edge and opens above it. Point it at the composer's outer chrome so the
@@ -255,6 +260,7 @@ export const RichComposer = forwardRef<RichComposerHandle, RichComposerProps>(
       referenceController = null,
       mentionUiLabels,
       tabLabels,
+      mentionKinds,
       mentionAnchorRef,
       knownInvocations,
       submitShortcut,
@@ -763,6 +769,7 @@ export const RichComposer = forwardRef<RichComposerHandle, RichComposerProps>(
             sourceErrorLabel={mentionUiLabels?.sourceError}
             profileErrorLabel={mentionUiLabels?.profileError}
             tabLabels={tabLabels}
+            allowedKinds={mentionKinds}
           />
         )}
       </div>
