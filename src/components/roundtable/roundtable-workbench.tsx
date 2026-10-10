@@ -23,6 +23,13 @@ import {
 } from "@/lib/roundtable/api"
 import type { RoundtableCommandName } from "@/lib/roundtable/api"
 import {
+  defaultRoundtableAgents,
+  loadRoundtableAgents,
+  nextRoundtableAgent,
+  statusByAgent,
+  type RoundtableAgentStatus,
+} from "@/lib/roundtable/agents"
+import {
   prepareRoundtableMutation,
   isDefinitiveRoundtableRejection,
   pendingPaidMutation,
@@ -56,6 +63,7 @@ import {
   RoundtableComposer,
   RoundtableStep,
   roundtableAgentLabel,
+  seatErrorMessage,
   type ComposerMember,
 } from "./roundtable-composer"
 import { RoundtableSafeContent } from "./roundtable-safe-content"
@@ -118,10 +126,18 @@ export function RoundtableWorkbench({
   const [sourcePreviews, setSourcePreviews] = useState<Record<string, string>>(
     {}
   )
-  // Default seats match the adapters most installs qualify first; members can
-  // switch agents or add seats before the readiness check.
+  // Default seats: the first two qualified agents once `roundtable_agents`
+  // answers (Grok + Antigravity until then). Members can switch agents or add
+  // seats before the readiness check.
   const [roles, setRoles] = useState(["", ""])
   const [agents, setAgents] = useState<string[]>(["grok", "antigravity"])
+  const [agentRows, setAgentRows] = useState<RoundtableAgentStatus[] | null>(
+    null
+  )
+  const [agentsLoading, setAgentsLoading] = useState(false)
+  const agentsGeneration = useRef(0)
+  // Defaults apply once, and never after the user picked an agent.
+  const agentsTouched = useRef(false)
   // Empty id = the agent's qualified default binding (`provider:<agent>`).
   const [providerIds, setProviderIds] = useState<string[]>([])
   const [rounds, setRounds] = useState(2)
@@ -163,20 +179,27 @@ export function RoundtableWorkbench({
     setUncertainPaid(!!mutation.current)
   }, [mutationScope])
 
-  const run = useCallback(async (action: () => Promise<void>) => {
-    if (actionInFlight.current) return
-    actionInFlight.current = true
-    setBusy(true)
-    setError(null)
-    try {
-      await action()
-    } catch (error) {
-      setError(roundtableError(error))
-    } finally {
-      actionInFlight.current = false
-      setBusy(false)
-    }
-  }, [])
+  const describeError = useCallback(
+    (error: unknown) => seatErrorMessage(error, t) ?? roundtableError(error),
+    [t]
+  )
+  const run = useCallback(
+    async (action: () => Promise<void>) => {
+      if (actionInFlight.current) return
+      actionInFlight.current = true
+      setBusy(true)
+      setError(null)
+      try {
+        await action()
+      } catch (error) {
+        setError(describeError(error))
+      } finally {
+        actionInFlight.current = false
+        setBusy(false)
+      }
+    },
+    [describeError]
+  )
 
   const listRooms = useCallback(
     async (cursor?: string) => {
@@ -285,6 +308,37 @@ export function RoundtableWorkbench({
       providersInFlight.current = false
     }
   }, [loadProviders])
+
+  // Read-only agent availability (enabled, installed, credential presence,
+  // qualification). A failure keeps every chip selectable; preflight decides.
+  const loadAgents = useCallback(async () => {
+    const generation = ++agentsGeneration.current
+    setAgentsLoading(true)
+    try {
+      const result = await loadRoundtableAgents()
+      if (generation !== agentsGeneration.current) return
+      setAgentRows(result.agents)
+      if (!agentsTouched.current && !roomId) {
+        agentsTouched.current = true
+        const picks = defaultRoundtableAgents(statusByAgent(result.agents))
+        setAgents((current) =>
+          current.map((agent, index) => picks[index] ?? agent)
+        )
+      }
+    } catch {
+      if (generation === agentsGeneration.current) setAgentRows(null)
+    } finally {
+      if (generation === agentsGeneration.current) setAgentsLoading(false)
+    }
+  }, [roomId])
+
+  useEffect(() => {
+    void loadAgents()
+    return () => {
+      agentsGeneration.current += 1
+    }
+  }, [loadAgents])
+  const agentStatus = useMemo(() => statusByAgent(agentRows), [agentRows])
 
   useEffect(() => {
     if (!roomId) return
@@ -692,6 +746,7 @@ export function RoundtableWorkbench({
         return id === (member.agent || "codex") ? "" : id
       })
     )
+    agentsTouched.current = true
     setAgents(members.map((member) => member.agent || "codex"))
     setRounds(config.strategy.critique_rounds)
     setConcurrency(config.concurrency)
@@ -712,6 +767,7 @@ export function RoundtableWorkbench({
     }
     if (patch.agent !== undefined) {
       const agent = patch.agent
+      agentsTouched.current = true
       setAgents(
         members.map((member, i) => (i === index ? agent : member.agent))
       )
@@ -728,11 +784,10 @@ export function RoundtableWorkbench({
   }
   const addMember = () => {
     if (roles.length >= ROUNDTABLE_MAX_MEMBERS) return
-    const used = new Set(members.map((member) => member.agent))
-    const next =
-      ["grok", "antigravity", "cursor", "codex"].find(
-        (agent) => !used.has(agent)
-      ) ?? "grok"
+    const next = nextRoundtableAgent(
+      members.map((member) => member.agent),
+      agentStatus
+    )
     setRoles([...roles, ""])
     setAgents([...members.map((member) => member.agent), next])
     setProviderIds([...members.map((member) => member.providerId), ""])
@@ -851,7 +906,7 @@ export function RoundtableWorkbench({
               role="alert"
               className="rounded-lg border border-destructive/30 bg-destructive/5 p-3 text-sm text-destructive [overflow-wrap:anywhere]"
             >
-              {roundtableError(preflight.error)}
+              {describeError(preflight.error)}
             </p>
           ) : null}
           <PreflightConfirmation
@@ -1040,6 +1095,12 @@ export function RoundtableWorkbench({
                 sourceCount={selectedPaths.length}
                 sourceValid={sourceSelectionValid}
                 members={members}
+                agentStatus={agentStatus}
+                agentStatusLoading={agentsLoading}
+                onRecheckAgents={() => {
+                  invalidate()
+                  void loadAgents()
+                }}
                 seatBrands={roundtableSeatBrands(config)}
                 providers={providers}
                 onMemberChange={updateMember}
