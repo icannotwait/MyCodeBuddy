@@ -813,11 +813,28 @@ async fn seed_graph(
     Ok(())
 }
 
+/// The one evidence alias the probe publishes (`e0`). The token binding and
+/// the durable tool store must validate against the same aliases: the store
+/// used to get an alias-less scope, so a seat that cited `e0` (Codex,
+/// 2026-10-10 probe) was refused `unknown_alias` while seats citing nothing
+/// passed.
+fn qualification_aliases() -> VisibleAliases {
+    let mut aliases = VisibleAliases::default();
+    aliases.evidence.insert(
+        "e0".into(),
+        EvidenceRef {
+            evidence_id: id::<EvidenceId>(9),
+            visibility: AliasVisibility::Published,
+        },
+    );
+    aliases
+}
+
 fn result_scope(speaker_id: SpeakerId) -> ResultScope {
     ResultScope {
         phase_kind: PhaseKind::Proposal,
         speaker_id,
-        aliases: VisibleAliases::default(),
+        aliases: qualification_aliases(),
         mandatory_targets: Vec::new(),
         published: roundtable_protocol::PublishedHistory::default(),
         quota_bytes: 8_192,
@@ -833,14 +850,7 @@ fn token_binding(
     mut scope: ResultScope,
     published: &ObjectRefV1,
 ) -> TokenBinding {
-    let mut aliases = VisibleAliases::default();
-    aliases.evidence.insert(
-        "e0".into(),
-        EvidenceRef {
-            evidence_id: id::<EvidenceId>(9),
-            visibility: AliasVisibility::Published,
-        },
-    );
+    let aliases = qualification_aliases();
     scope.aliases = aliases.clone();
     let mut evidence = BTreeMap::new();
     evidence.insert("e0".into(), published.clone());
@@ -913,6 +923,19 @@ mod tests {
             host_files_ready: true,
             secret_visible_in_env: false,
         }
+    }
+
+    #[test]
+    fn tool_store_scope_and_token_binding_publish_the_same_e0_alias() {
+        let speaker = super::id::<super::SpeakerId>(3);
+        let store_scope = super::result_scope(speaker);
+        let evidence = store_scope
+            .aliases
+            .evidence
+            .get("e0")
+            .expect("e0 in store scope");
+        assert_eq!(evidence.visibility, super::AliasVisibility::Published);
+        assert_eq!(store_scope.aliases, super::qualification_aliases());
     }
 
     #[test]

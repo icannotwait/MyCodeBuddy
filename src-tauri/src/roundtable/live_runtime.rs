@@ -1000,8 +1000,10 @@ impl RoundtableTurnExecutor for LiveParticipantExecutor {
             token.reveal_for_same_sandbox(),
             &active,
             &self.registry,
-            agent_type_for(&agent)?,
-            seat_profile.as_ref(),
+            SeatAgent {
+                agent: agent_type_for(&agent)?,
+                profile: seat_profile.as_ref(),
+            },
         )
         .await;
         *active.finish_reason.lock().expect("finish reason") = Some(
@@ -1130,6 +1132,12 @@ fn evidence_objects(prompt: &[u8]) -> RtResult<BTreeMap<String, roundtable_proto
     Ok(objects)
 }
 
+/// The seat's agent and its saved CodeBuddy profile (if any).
+struct SeatAgent<'a> {
+    agent: crate::models::AgentType,
+    profile: Option<&'a super::agent_credentials::CodeBuddyProfile>,
+}
+
 async fn drive_acp(
     (mut stdin, stdout): (tokio::process::ChildStdin, tokio::process::ChildStdout),
     request: &RoundtableTurnRequest,
@@ -1137,9 +1145,9 @@ async fn drive_acp(
     token: &str,
     active: &Active,
     registry: &tokio::sync::Mutex<Option<super::RoundtableSessionRegistry>>,
-    agent: crate::models::AgentType,
-    profile: Option<&super::agent_credentials::CodeBuddyProfile>,
+    seat: SeatAgent<'_>,
 ) -> RtResult<u64> {
+    let SeatAgent { agent, profile } = seat;
     let mut stdout = BufReader::new(stdout);
     let mut seq = 0;
     let initialize = rpc(
