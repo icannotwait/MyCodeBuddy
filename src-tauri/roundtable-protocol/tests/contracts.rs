@@ -69,7 +69,11 @@ fn config_ranges_and_closed_commands() {
         .expect("participant")
         .get("profile_id")
         .is_none());
-    for (agent, profile) in [("cursor", "abc"), ("code_buddy", "../x"), ("code_buddy", "")] {
+    for (agent, profile) in [
+        ("cursor", "abc"),
+        ("code_buddy", "../x"),
+        ("code_buddy", ""),
+    ] {
         mixed.participants[0].agent = Some(agent.into());
         mixed.participants[0].profile_id = Some(profile.into());
         assert_eq!(

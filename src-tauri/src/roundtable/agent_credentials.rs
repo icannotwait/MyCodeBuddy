@@ -573,7 +573,10 @@ mod tests {
         assert_eq!(profiles.len(), 2);
         assert_eq!(profiles[0].id, "p-1");
         assert_eq!(profiles[0].mode_id.as_deref(), Some("default"));
-        assert_eq!(profiles[0].config_values.get("model").map(String::as_str), Some("m-fast"));
+        assert_eq!(
+            profiles[0].config_values.get("model").map(String::as_str),
+            Some("m-fast")
+        );
         assert!(!profiles[0].config_values.contains_key("n"));
         assert!(!profiles[1].enabled);
         assert!(super::parse_codebuddy_profiles("not json").is_empty());
@@ -589,16 +592,28 @@ mod tests {
         let db = dir.path().join(crate::db::database_file_name());
         let conn = rusqlite::Connection::open(&db).expect("db");
         conn.execute_batch("CREATE TABLE app_metadata (id INTEGER PRIMARY KEY, key TEXT, value TEXT, created_at TEXT, updated_at TEXT, deleted_at TEXT);").expect("schema");
-        assert_eq!(super::codebuddy_profile(dir.path(), "p-1"), Err("codebuddy_profile_missing"));
+        assert_eq!(
+            super::codebuddy_profile(dir.path(), "p-1"),
+            Err("codebuddy_profile_missing")
+        );
         conn.execute(
             "INSERT INTO app_metadata(key,value) VALUES('delegation.profiles.v1',?1)",
             [r#"{"profiles":[{"id":"p-1","agent_type":"code_buddy","name":"A","enabled":true,"created_at":1,"updated_at":1},{"id":"p-2","agent_type":"code_buddy","name":"B","enabled":false,"created_at":1,"updated_at":1}]}"#],
         )
         .expect("insert");
         drop(conn);
-        assert_eq!(super::codebuddy_profile(dir.path(), "p-1").map(|p| p.name), Ok("A".into()));
-        assert_eq!(super::codebuddy_profile(dir.path(), "p-2"), Err("codebuddy_profile_disabled"));
-        assert_eq!(super::codebuddy_profile(dir.path(), "p-3"), Err("codebuddy_profile_missing"));
+        assert_eq!(
+            super::codebuddy_profile(dir.path(), "p-1").map(|p| p.name),
+            Ok("A".into())
+        );
+        assert_eq!(
+            super::codebuddy_profile(dir.path(), "p-2"),
+            Err("codebuddy_profile_disabled")
+        );
+        assert_eq!(
+            super::codebuddy_profile(dir.path(), "p-3"),
+            Err("codebuddy_profile_missing")
+        );
     }
 
     #[test]

@@ -1252,7 +1252,15 @@ async fn drive_acp(
         verify_confirmed_option(&selected, "reasoning_effort", effort)?;
     }
     if let Some(profile) = profile {
-        apply_seat_profile(&mut stdin, &mut stdout, session_id, profile, &mut seq, active).await?;
+        apply_seat_profile(
+            &mut stdin,
+            &mut stdout,
+            session_id,
+            profile,
+            &mut seq,
+            active,
+        )
+        .await?;
     }
     let prompt = std::str::from_utf8(&request.prompt)
         .map_err(|_| rt_error(ErrorCode::InvalidArgument, "prompt_encoding"))?;
@@ -2832,7 +2840,12 @@ async fn apply_seat_profile(
             active,
         )
         .await
-        .map_err(|_| rt_error(ErrorCode::CapabilityUnqualified, "codebuddy_profile_rejected"))?;
+        .map_err(|_| {
+            rt_error(
+                ErrorCode::CapabilityUnqualified,
+                "codebuddy_profile_rejected",
+            )
+        })?;
         id += 1;
     }
     for (key, value) in &profile.config_values {
@@ -2846,9 +2859,18 @@ async fn apply_seat_profile(
             active,
         )
         .await
-        .map_err(|_| rt_error(ErrorCode::CapabilityUnqualified, "codebuddy_profile_rejected"))?;
-        verify_confirmed_option(&selected, key, value)
-            .map_err(|_| rt_error(ErrorCode::CapabilityUnqualified, "codebuddy_profile_rejected"))?;
+        .map_err(|_| {
+            rt_error(
+                ErrorCode::CapabilityUnqualified,
+                "codebuddy_profile_rejected",
+            )
+        })?;
+        verify_confirmed_option(&selected, key, value).map_err(|_| {
+            rt_error(
+                ErrorCode::CapabilityUnqualified,
+                "codebuddy_profile_rejected",
+            )
+        })?;
         id += 1;
     }
     Ok(())
