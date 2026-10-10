@@ -206,6 +206,19 @@ const COMMON_ENV: &[(&str, &str)] = &[
     ("PATH", "/usr/local/bin:/usr/bin:/bin"),
 ];
 
+/// codex-acp 2.1.1 starts sessions in mode `agent` ("Auto review"): every
+/// approval goes to Codex's own guardian reviewer, which failed every MCP
+/// call in the sandbox (probe trace 2026-10-10: `Guardian Review` failed,
+/// then `mcp.roundtable.*` failed, no `session/request_permission`). Mode
+/// `read-only` is approval `on-request` with reviewer `user` and a read-only
+/// sandbox, so consent comes to Codeg's permission_reply (roundtable tools
+/// only) like every other adapter.
+const CODEX_ENV: &[(&str, &str)] = &[
+    ("HOME", "/rt-home"),
+    ("PATH", "/usr/local/bin:/usr/bin:/bin"),
+    ("INITIAL_AGENT_MODE", "read-only"),
+];
+
 pub fn adapter_profiles() -> &'static [AdapterProfile] {
     PROFILES
 }
@@ -251,7 +264,7 @@ const PROFILES: &[AdapterProfile] = &[
                 required: false,
             },
         ],
-        container_env: COMMON_ENV,
+        container_env: CODEX_ENV,
         // API-key mode stores the key in `~/.codex/auth.json`. Codex sends
         // that key itself, so it cannot ride the attempt-bearer gateway; it
         // leaves through slirp like Cursor and Antigravity.

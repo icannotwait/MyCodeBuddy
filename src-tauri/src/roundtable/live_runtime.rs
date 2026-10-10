@@ -1676,7 +1676,23 @@ where
                     {
                         exchange.rejected_permission.store(true, Ordering::Relaxed);
                     }
-                    permission_reply_in(&message["params"], &request_id, exchange.workspace_root)
+                    let reply = permission_reply_in(
+                        &message["params"],
+                        &request_id,
+                        exchange.workspace_root,
+                    );
+                    if let Some(trace) = exchange.trace {
+                        trace.record(
+                            "acp",
+                            json!({
+                                "event": "permission_reply",
+                                "id": request_id,
+                                "option_id": reply["result"]["outcome"]["optionId"],
+                                "outcome": reply["result"]["outcome"]["outcome"],
+                            }),
+                        );
+                    }
+                    reply
                 } else {
                     json!({
                         "jsonrpc": "2.0",
@@ -1952,6 +1968,17 @@ fn trace_acp_frame(
                 }
                 if let Some(content) = update.get("content") {
                     record["content_bytes"] = json!(content.to_string().len());
+                    // A failed call's content is the adapter's error text
+                    // (e.g. MCP startup, reviewer failure): kept, redacted
+                    // and clipped, because it is the diagnosis.
+                    if update.get("status").and_then(Value::as_str) == Some("failed") {
+                        record["failure"] = clipped_redacted(content, 600);
+                    }
+                }
+                if update.get("status").and_then(Value::as_str) == Some("failed") {
+                    if let Some(raw) = update.get("rawOutput") {
+                        record["failure_output"] = clipped_redacted(raw, 600);
+                    }
                 }
             }
             "plan" => {
@@ -2241,10 +2268,22 @@ fn cursor_roundtable_title(call: &Value) -> bool {
     if call.get("name").is_some() || call.get("kind").and_then(Value::as_str) != Some("other") {
         return false;
     }
-    call.get("title")
-        .and_then(Value::as_str)
-        .and_then(|title| title.strip_prefix("roundtable: "))
-        .is_some_and(|tool| ROUNDTABLE_TOOL_NAMES.contains(&tool))
+    let Some(title) = call.get("title").and_then(Value::as_str) else {
+        return false;
+    };
+    // Tool-call updates title the call `"roundtable: <tool>"`; the consent
+    // request of cursor-agent 2026.09.28 titles it
+    // `"roundtable-<tool>: <tool>"` (probe trace, 2026-10-10). Both name the
+    // same tool twice or under the session's own server key; nothing looser.
+    if let Some(tool) = title.strip_prefix("roundtable: ") {
+        return ROUNDTABLE_TOOL_NAMES.contains(&tool);
+    }
+    title
+        .strip_prefix("roundtable-")
+        .and_then(|rest| rest.split_once(": "))
+        .is_some_and(|(server_tool, tool)| {
+            server_tool == tool && ROUNDTABLE_TOOL_NAMES.contains(&tool)
+        })
 }
 
 fn single_underscore_title_agrees(title: &str, tool: &str) -> bool {
@@ -3644,6 +3683,12 @@ mod completion_contract_tests {
             json!({"title":"roundtable: submit_result"}),
             json!({"name":"run_terminal_command","title":"roundtable: submit_result","kind":"other"}),
             json!({"title":"roundtable:  submit_result","kind":"other"}),
+            json!({"title":"roundtable-run_terminal_command: run_terminal_command","kind":"other"}),
+            json!({"title":"roundtable-submit_result: read_evidence","kind":"other"}),
+            json!({"title":"other-submit_result: submit_result","kind":"other"}),
+            json!({"title":"roundtable-submit_result:submit_result","kind":"other"}),
+            json!({"title":"roundtable-submit_result: submit_result","kind":"execute"}),
+            json!({"name":"shell","title":"roundtable-submit_result: submit_result","kind":"other"}),
             json!({"title":"roundtable: read_file","kind":"other"}),
             json!({"title":"roundtable: view_file","kind":"other"}),
             json!({"title":"roundtable: submit_result ","kind":"other"}),
@@ -3663,6 +3708,9 @@ mod completion_contract_tests {
             "roundtable: submit_result",
             "roundtable: read_evidence",
             "roundtable: search_evidence",
+            "roundtable-submit_result: submit_result",
+            "roundtable-read_evidence: read_evidence",
+            "roundtable-search_evidence: search_evidence",
         ] {
             let params = json!({"toolCall":{"title":name,"kind":"other"},"options":[{"optionId":"allow","kind":"allow_once"},{"optionId":"reject","kind":"reject_once"}]});
             assert_eq!(

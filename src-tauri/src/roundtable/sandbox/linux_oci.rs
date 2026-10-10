@@ -2625,6 +2625,7 @@ fn container_env_allowed(key: &str, value: &str) -> bool {
         "GEMINI_HOME" => value == "/rt-home/.gemini",
         "CURSOR_CONFIG_DIR" => value == "/rt-home/.cursor",
         "XDG_CONFIG_HOME" => value == "/rt-home/.config",
+        "INITIAL_AGENT_MODE" => value == "read-only",
         _ => false,
     }
 }
