@@ -2119,6 +2119,10 @@ pub fn build_router(
             "/roundtable_conclusion_save",
             post(handlers::roundtable::roundtable_conclusion_save),
         )
+        .route(
+            "/roundtable_agents",
+            post(handlers::roundtable::roundtable_agents),
+        )
         // Catch-all
         .fallback(api_not_found)
         .layer(middleware::from_fn(move |req, next| {

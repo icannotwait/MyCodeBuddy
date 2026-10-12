@@ -18,6 +18,7 @@ pub fn config(n: u32, r: u32, c: u32) -> RoundtableConfigV1 {
             model: None,
             effort: None,
             agent: None,
+            profile_id: None,
         })
         .collect();
     RoundtableConfigV1 {

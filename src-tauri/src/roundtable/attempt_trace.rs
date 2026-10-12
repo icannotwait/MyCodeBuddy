@@ -52,6 +52,8 @@ pub(crate) struct AttemptTrace {
     stderr_key_events: AtomicU64,
     stderr_partial: Mutex<Vec<u8>>,
     stderr_file_bytes: Mutex<u64>,
+    /// Metadata-only mode (qualification probe): no message text previews.
+    metadata_only: std::sync::atomic::AtomicBool,
 }
 
 pub(crate) fn wall_now() -> String {
@@ -96,6 +98,7 @@ impl AttemptTrace {
             stderr_key_events: AtomicU64::new(0),
             stderr_partial: Mutex::new(Vec::new()),
             stderr_file_bytes: Mutex::new(0),
+            metadata_only: std::sync::atomic::AtomicBool::new(false),
         };
         for secret in all {
             trace.add_secret(secret);
@@ -105,6 +108,16 @@ impl AttemptTrace {
             json!({"event":"trace_open","room_id":room,"attempt_id":attempt,"pid":std::process::id()}),
         );
         Some(trace)
+    }
+
+    pub(crate) fn set_metadata_only(&self) {
+        self.metadata_only
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub(crate) fn metadata_only(&self) -> bool {
+        self.metadata_only
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     #[cfg(test)]

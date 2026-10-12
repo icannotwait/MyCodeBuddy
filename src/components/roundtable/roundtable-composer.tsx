@@ -2,7 +2,16 @@
 
 import { useId, useState, type ReactNode } from "react"
 import { useTranslations } from "next-intl"
-import { Clock, FileText, Gavel, Plus, X } from "lucide-react"
+import {
+  CircleAlert,
+  Clock,
+  FileText,
+  Gavel,
+  Loader2,
+  Plus,
+  RefreshCw,
+  X,
+} from "lucide-react"
 import { AgentIcon } from "@/components/agent-icon"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
@@ -14,16 +23,27 @@ import {
   roundtableBrandKey,
   type SeatBrand,
 } from "@/lib/roundtable/brand"
+import {
+  agentStatusReasonKey,
+  errorReason,
+  isAgentSelectable,
+  seatProfiles,
+  namedSeat,
+  sortRoundtableAgents,
+  type RoundtableAgentStatus,
+} from "@/lib/roundtable/agents"
 import type { ModelProviderInfo } from "@/lib/types"
 import { cn } from "@/lib/utils"
 import { BRAND_CLASSES, RoundtableSpeakerAvatar } from "./roundtable-transcript"
 import { RoundtableTopicInput } from "./roundtable-topic-input"
 
+/** Fixed candidates. Availability comes from `roundtable_agents`. */
 export const ROUNDTABLE_AGENTS = [
   "grok",
   "antigravity",
   "cursor",
   "codex",
+  "code_buddy",
 ] as const
 
 export const ROUNDTABLE_MIN_MEMBERS = 2
@@ -34,10 +54,75 @@ const AGENT_LABELS: Record<string, string> = {
   antigravity: "Antigravity",
   cursor: "Cursor",
   codex: "Codex",
+  code_buddy: "CodeBuddy",
 }
 
 export function roundtableAgentLabel(agent: string) {
   return AGENT_LABELS[agent] ?? agent
+}
+
+type Translate = ReturnType<typeof useTranslations<"Roundtable">>
+type TranslateKey = Parameters<Translate>[0]
+
+const READINESS_REASONS = new Set([
+  "adapter_unqualified",
+  "provider_unqualified",
+  "provider_credential_missing",
+  "qualification_policy_changed",
+  "product_disabled",
+  "unknown_agent",
+  "effort_unqualified",
+  "codebuddy_profile_missing",
+  "codebuddy_profile_disabled",
+  "codebuddy_profile_rejected",
+  "profile",
+])
+
+/** Inline reason for an agent that cannot take a seat yet. */
+export function agentStatusReason(row: RoundtableAgentStatus, t: Translate) {
+  const key = agentStatusReasonKey(row)
+  switch (key) {
+    case "credential_missing":
+      return row.credential_keys.length
+        ? t("agentStatus_credential_missing", {
+            keys: row.credential_keys.join(", "),
+          })
+        : t("agentStatus_credential_missing_login")
+    case "unqualified":
+      return row.last_qualification.failed_checks.length
+        ? t("agentStatus_unqualified", {
+            checks: row.last_qualification.failed_checks.slice(0, 3).join(", "),
+          })
+        : t("agentStatus_unqualified_plain")
+    case "version_mismatch":
+      return t("agentStatus_version_mismatch", {
+        installed: row.installed_version ?? "?",
+        profile: row.profile_version ?? "?",
+      })
+    case "disabled":
+    case "not_installed":
+    case "unsupported":
+      return t(`agentStatus_${key}` as TranslateKey)
+    default:
+      return t("agentStatus_unqualified_plain")
+  }
+}
+
+/** A readiness or run error that names its seat: "Seat 2 (Cursor): …".
+ * Returns null when the error carries no seat. */
+export function seatErrorMessage(error: unknown, t: Translate): string | null {
+  const seat = namedSeat(error)
+  if (!seat) return null
+  const reason = errorReason(error)
+  const text =
+    reason && READINESS_REASONS.has(reason)
+      ? t(`readiness_${reason}` as TranslateKey)
+      : (reason ?? t("readiness_unknown"))
+  return t("seatError", {
+    seat: seat.ordinal + 1,
+    agent: roundtableAgentLabel(seat.agent),
+    reason: text,
+  })
 }
 
 export interface ComposerMember {
@@ -45,6 +130,8 @@ export interface ComposerMember {
   agent: string
   /** Codeg model provider id; empty means the agent's qualified default. */
   providerId: string
+  /** Saved CodeBuddy profile id; empty means the agent's defaults. */
+  profileId: string
 }
 
 /** Native select styled like the shared Input. */
@@ -113,7 +200,15 @@ export function RoundtableComposer({
   concurrency,
   onConcurrencyChange,
   budgetMinutes,
+  agentStatus,
+  agentStatusLoading = false,
+  onRecheckAgents,
 }: {
+  /** `roundtable_agents` rows by agent; empty until loaded. */
+  agentStatus?: Map<string, RoundtableAgentStatus>
+  agentStatusLoading?: boolean
+  /** Reload the agent status (settings, installs, qualification). */
+  onRecheckAgents?: () => void
   topic: string
   onTopicChange: (value: string) => void
   showSources: boolean
@@ -150,6 +245,13 @@ export function RoundtableComposer({
   const sourceHelpId = `${uid}-source-help`
   const canRemove = members.length > ROUNDTABLE_MIN_MEMBERS
   const offset = workspaceField ? 1 : 0
+  const status = agentStatus ?? new Map<string, RoundtableAgentStatus>()
+  const orderedAgents = sortRoundtableAgents(ROUNDTABLE_AGENTS, status)
+  const notReady = orderedAgents
+    .map((agent) => status.get(agent))
+    .filter(
+      (row): row is RoundtableAgentStatus => !!row && row.status !== "ready"
+    )
 
   return (
     <>
@@ -255,6 +357,65 @@ export function RoundtableComposer({
           </Badge>
         }
       >
+        {notReady.length > 0 ? (
+          <div
+            data-testid="roundtable-agent-availability"
+            className="mb-3 flex min-w-0 flex-col gap-1.5 rounded-xl border border-dashed bg-muted/20 p-3"
+          >
+            <p className="text-xs font-medium text-muted-foreground">
+              {t("agentAvailability")}
+            </p>
+            <ul className="flex min-w-0 flex-col gap-1.5">
+              {notReady.map((row) => {
+                const unqualified =
+                  row.status === "unqualified" ||
+                  row.status === "credential_missing"
+                return (
+                  <li
+                    key={row.agent}
+                    data-agent={row.agent}
+                    data-status={row.status}
+                    className="flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1 text-xs"
+                  >
+                    <AgentIcon
+                      agentType={row.agent}
+                      className="size-3.5 shrink-0 opacity-60"
+                    />
+                    <span className="font-medium text-muted-foreground">
+                      {roundtableAgentLabel(row.agent)}
+                    </span>
+                    <span className="min-w-0 flex-1 text-muted-foreground [overflow-wrap:anywhere]">
+                      {agentStatusReason(row, t)}
+                    </span>
+                    {unqualified && onRecheckAgents ? (
+                      <Button
+                        type="button"
+                        variant="outline"
+                        size="xs"
+                        disabled={agentStatusLoading}
+                        aria-label={`${t("agentRecheck")} ${roundtableAgentLabel(row.agent)}`}
+                        title={t("agentRecheckHelp")}
+                        onClick={onRecheckAgents}
+                      >
+                        {agentStatusLoading ? (
+                          <Loader2
+                            aria-hidden="true"
+                            className="animate-spin"
+                          />
+                        ) : (
+                          <RefreshCw aria-hidden="true" />
+                        )}
+                        {agentStatusLoading
+                          ? t("agentRechecking")
+                          : t("agentRecheck")}
+                      </Button>
+                    ) : null}
+                  </li>
+                )
+              })}
+            </ul>
+          </div>
+        ) : null}
         <ol className="grid min-w-0 gap-3 lg:grid-cols-2">
           {members.map((member, index) => {
             const seat = seatBrands.get(index) ?? {
@@ -338,16 +499,28 @@ export function RoundtableComposer({
                       {t("agent")} {index + 1}
                     </span>
                   </legend>
-                  <div className="grid grid-cols-2 gap-1.5 @md:grid-cols-4">
-                    {ROUNDTABLE_AGENTS.map((agent) => {
+                  <div className="grid grid-cols-2 gap-1.5 @md:grid-cols-3 @xl:grid-cols-5">
+                    {orderedAgents.map((agent) => {
                       const key = roundtableBrandKey(agent)
                       const checked = member.agent === agent
+                      const row = status.get(agent)
+                      const selectable = isAgentSelectable(agent, status)
                       return (
                         <label
                           key={agent}
+                          data-agent={agent}
+                          data-available={selectable ? "true" : "false"}
+                          title={
+                            row && !selectable
+                              ? agentStatusReason(row, t)
+                              : undefined
+                          }
                           style={brandStyle(roundtableBrand(key))}
                           className={cn(
-                            "relative flex min-h-9 min-w-0 cursor-pointer items-center gap-1.5 rounded-full border px-2.5 py-1.5 text-xs font-medium transition-colors select-none hover:bg-muted has-[:focus-visible]:ring-[3px] has-[:focus-visible]:ring-ring/50",
+                            "relative flex min-h-9 min-w-0 items-center gap-1.5 rounded-full border px-2.5 py-1.5 text-xs font-medium transition-colors select-none has-[:focus-visible]:ring-[3px] has-[:focus-visible]:ring-ring/50",
+                            selectable
+                              ? "cursor-pointer hover:bg-muted"
+                              : "cursor-not-allowed border-dashed opacity-50",
                             checked
                               ? cn(
                                   "border-(--rt-c) bg-(--rt-c)/8 dark:border-(--rt-c-dark) dark:bg-(--rt-c-dark)/15",
@@ -362,6 +535,7 @@ export function RoundtableComposer({
                             name={`${uid}-agent-${index}`}
                             value={agent}
                             checked={checked}
+                            disabled={!selectable && !checked}
                             onChange={() => onMemberChange(index, { agent })}
                           />
                           <AgentIcon
@@ -378,6 +552,27 @@ export function RoundtableComposer({
                       )
                     })}
                   </div>
+                  {(() => {
+                    const row = status.get(member.agent)
+                    if (!row || row.status === "ready") return null
+                    return (
+                      <p
+                        role="note"
+                        className="mt-1.5 flex items-start gap-1.5 text-xs text-amber-700 dark:text-amber-300"
+                      >
+                        <CircleAlert
+                          aria-hidden="true"
+                          className="mt-0.5 size-3.5 shrink-0"
+                        />
+                        <span className="[overflow-wrap:anywhere]">
+                          {t("agentNotReadySeat", {
+                            agent: roundtableAgentLabel(member.agent),
+                            reason: agentStatusReason(row, t),
+                          })}
+                        </span>
+                      </p>
+                    )
+                  })()}
                 </fieldset>
                 <div className="flex min-w-0 flex-wrap items-end gap-3">
                   <label className="grid min-w-40 flex-1 gap-1.5 text-xs font-medium text-muted-foreground">
@@ -408,6 +603,53 @@ export function RoundtableComposer({
                       ) : null}
                     </select>
                   </label>
+                  {member.agent === "code_buddy"
+                    ? (() => {
+                        const profiles = seatProfiles(member.agent, status)
+                        const known = profiles.some(
+                          (profile) => profile.id === member.profileId
+                        )
+                        return (
+                          <label className="grid min-w-40 flex-1 gap-1.5 text-xs font-medium text-muted-foreground">
+                            {t("codeBuddyProfile")}
+                            <select
+                              aria-label={`${t("codeBuddyProfile")} ${index + 1}`}
+                              className={cn(
+                                SELECT_CLASS,
+                                "bg-background text-foreground"
+                              )}
+                              value={member.profileId}
+                              disabled={
+                                profiles.length === 0 && !member.profileId
+                              }
+                              onChange={(event) =>
+                                onMemberChange(index, {
+                                  profileId: event.target.value,
+                                })
+                              }
+                            >
+                              <option value="">
+                                {profiles.length === 0
+                                  ? t("codeBuddyProfileNone")
+                                  : t("codeBuddyProfileDefault")}
+                              </option>
+                              {profiles.map((profile) => (
+                                <option key={profile.id} value={profile.id}>
+                                  {profile.model
+                                    ? `${profile.name} · ${profile.model}`
+                                    : profile.name}
+                                </option>
+                              ))}
+                              {member.profileId && !known ? (
+                                <option value={member.profileId}>
+                                  {t("codeBuddyProfileMissing")}
+                                </option>
+                              ) : null}
+                            </select>
+                          </label>
+                        )
+                      })()
+                    : null}
                   <label
                     className={cn(
                       "flex h-9 cursor-pointer items-center gap-2 rounded-full border px-3 text-xs font-medium transition-colors select-none hover:bg-muted has-[:focus-visible]:ring-[3px] has-[:focus-visible]:ring-ring/50",

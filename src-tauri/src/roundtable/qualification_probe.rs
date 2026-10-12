@@ -198,7 +198,7 @@ pub fn qualify_cli(args: &[String]) -> Result<Vec<ProbeOutcome>, String> {
         return Err("--profile cannot be combined with --agent all".into());
     }
     let agents: Vec<String> = if agent == "all" {
-        ["grok", "cursor", "antigravity", "codex"]
+        ["grok", "cursor", "antigravity", "codex", "code_buddy"]
             .into_iter()
             .map(str::to_string)
             .collect()

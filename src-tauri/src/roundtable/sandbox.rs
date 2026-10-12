@@ -21,6 +21,7 @@ use super::rt_error;
 use crate::roundtable::feature_gate::fsync_dir;
 
 mod linux_oci;
+pub(crate) use linux_oci::PIDS_MAX;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(transparent)]

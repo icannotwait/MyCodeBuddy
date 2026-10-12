@@ -6,6 +6,7 @@
 
 mod acceptance;
 mod actor;
+mod agent_credentials;
 mod api;
 mod attempt_trace;
 mod authorization;
