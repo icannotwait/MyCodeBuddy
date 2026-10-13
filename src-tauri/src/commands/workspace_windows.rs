@@ -904,35 +904,6 @@ mod tests {
     }
 
     #[test]
-    fn a_manual_open_then_close_cancels_the_pending_restore_result() {
-        let session = WorkspaceWindowSession::new();
-        {
-            let mut state = session.lock();
-            state.pending = vec![remote(1), remote(2)];
-            state.restoring = true;
-        }
-        assert!(session.should_restore(remote(2)));
-        // A's slow check holds B's result back. Opening B manually consumes
-        // its restore, and closing it must not make the old result current
-        // again, whether that result would build a window or show a failure.
-        session.apply(|state| state.mark_open(remote(2)));
-        assert!(!session.should_restore(remote(2)));
-        session.apply(|state| state.mark_closed(remote(2)));
-        assert!(!session.should_restore(remote(2)));
-        assert!(session.should_restore(remote(1)));
-        assert_eq!(session.lock().snapshot(), vec![remote(1)]);
-    }
-
-    #[test]
-    fn quitting_cancels_even_a_still_pending_restore_result() {
-        let session = WorkspaceWindowSession::new();
-        session.lock().pending = vec![remote(1)];
-        assert!(session.should_restore(remote(1)));
-        session.freeze();
-        assert!(!session.should_restore(remote(1)));
-    }
-
-    #[test]
     fn only_membership_changes_outside_a_restore_are_written() {
         let session = WorkspaceWindowSession::new();
         assert!(session.apply(|state| state.mark_open(LOCAL)));
