@@ -246,7 +246,9 @@ pub(crate) fn cap_normalized_turn_payload(mut turn: MessageTurn) -> Option<Messa
         let overflow = normalized_turn_payload_len(&turn) - EPISODE_PAYLOAD_MAX_BYTES;
         let block = turn.blocks.last_mut()?;
         let reduced = match block {
-            ContentBlock::Text { text } | ContentBlock::Thinking { text } => {
+            ContentBlock::Text { text }
+            | ContentBlock::Thinking { text }
+            | ContentBlock::TurnError { message: text } => {
                 truncate_payload_string(text, overflow.saturating_add(256))
             }
             ContentBlock::Image { .. } => false,

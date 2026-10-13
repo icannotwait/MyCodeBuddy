@@ -38,8 +38,8 @@ import {
 import { GrokSessionImage } from "./grok-session-image"
 import { useGrokSessionImageScope } from "./grok-session-image-context"
 import { markdownLinkComponents } from "./markdown-link"
+import { messageBlockComponents } from "./json-render-pre"
 import { maskLiteralSpans } from "./markdown-mask"
-import { mermaidComponents } from "./mermaid-block"
 import { rehypePluginsAllowingCodeg } from "./rehype-allow-codeg"
 import { remarkAutolinkLocalPaths } from "./remark-autolink-local-paths"
 import { remarkTrimCjkAutolinkTail } from "./remark-cjk-autolink-tail"
@@ -542,7 +542,7 @@ type StreamdownComponents = NonNullable<
 const linkComponents = {
   ...markdownLinkComponents,
   ...markdownLocalImageComponents,
-  ...mermaidComponents,
+  ...messageBlockComponents,
 } as StreamdownComponents
 const grokSessionImageComponents = {
   ...linkComponents,

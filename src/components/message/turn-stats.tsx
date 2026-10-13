@@ -21,6 +21,7 @@ import {
   TooltipTrigger,
 } from "@/components/ui/tooltip"
 import { useMessageScroll } from "@/components/message/message-scroll-context"
+import { useChatAnimationsEnabled } from "@/hooks/use-appearance"
 import { useModelLabel } from "@/components/message/model-label-context"
 import { useCreateTaskFromMessage } from "./use-create-task-from-message"
 import { formatElapsedLabel } from "@/lib/format-elapsed"
@@ -84,6 +85,7 @@ export function TurnStats({
   const tLive = useTranslations("Folder.chat.liveTurnStats")
   const tTasks = useTranslations("Tasks")
   const scroll = useMessageScroll()
+  const chatAnimations = useChatAnimationsEnabled()
   const modelLabel = useModelLabel()
   const [isCopied, setIsCopied] = useState(false)
   const timeoutRef = useRef<number>(0)
@@ -183,8 +185,12 @@ export function TurnStats({
 
   const handleJump = useCallback(() => {
     if (typeof previousUserIndex !== "number") return
-    scroll?.scrollToIndex(previousUserIndex, { align: "start", smooth: true })
-  }, [previousUserIndex, scroll])
+    scroll?.scrollToIndex(previousUserIndex, {
+      align: "start",
+      // Settings → Appearance → "Chat animations" off jumps instead of gliding.
+      smooth: chatAnimations,
+    })
+  }, [previousUserIndex, scroll, chatAnimations])
 
   const getTaskText = useCallback(() => copyText ?? "", [copyText])
   const handleCreateTask = useCreateTaskFromMessage(getTaskText)

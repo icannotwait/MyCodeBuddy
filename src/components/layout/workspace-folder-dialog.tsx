@@ -406,6 +406,9 @@ export function WorkspaceFolderDialog({
               onValueChange={setRootPath}
               onQuickSelect={commitRoot}
               onBusyChange={setBrowserBusy}
+              // A new project often starts as an empty folder: make it here,
+              // land in it, and "Next" opens it.
+              allowCreateFolder
               pathInputAction={
                 nativePickerAvailable ? (
                   <NativePickerButton

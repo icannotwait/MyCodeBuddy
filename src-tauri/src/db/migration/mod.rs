@@ -94,6 +94,7 @@ pub(crate) async fn install_for_historical_completion_fixture(
     m20260829_000001_folder_group::install_for_historical_completion_fixture(db).await
 }
 
+mod m20261006_000001_conversation_tag;
 pub struct Migrator;
 
 #[async_trait::async_trait]
@@ -179,6 +180,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20260930_000001_agent_setting_drop_adapter_channel::Migration),
             Box::new(m20261003_000001_simple_workflow_design_binding::Migration),
             Box::new(m20261003_000001_roundtable::Migration),
+            Box::new(m20261006_000001_conversation_tag::Migration),
         ]
     }
 }

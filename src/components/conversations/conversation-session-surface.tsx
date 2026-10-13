@@ -99,7 +99,7 @@ import {
   extractUserImagesFromDraft,
   getPromptDraftDisplayText,
 } from "@/lib/prompt-draft"
-import { isNoActiveTurnRejection } from "@/lib/turn-busy"
+import { deliverQueuedSteer } from "@/lib/queued-steer"
 import {
   type AgentType,
   type ContentBlock,
@@ -298,6 +298,10 @@ export interface ConversationSessionSurfaceProps {
    * ACP connect stamps the incarnation so window-close can reap it.
    */
   ownerOperationId?: string | null
+  /** Whether this view is on screen (the active tab, or a tiled group's
+   *  member). A hidden view defers only its FIRST detail fetch until it is
+   *  shown; see the fetch gate below. Defaults to true (pop-out windows). */
+  isVisible?: boolean
 }
 
 function buildOptimisticUserTurnFromDraft(
@@ -350,6 +354,7 @@ export const ConversationSessionSurface = memo(
     showActiveFlow,
     reloadSignal,
     groupId = null,
+    isVisible = true,
     ownerOperationId = null,
   }: ConversationSessionSurfaceProps) {
     // One-shot intent from openDelegatedChildSession (live ownership + turn focus).
@@ -633,12 +638,20 @@ export const ConversationSessionSurface = memo(
       setAgentConnectError(null)
     }, [agentType, conversationId])
 
+    // A hidden tab waits for its first show before fetching its detail; once
+    // it has held its detail it keeps fetching while hidden, so a session
+    // dropped under a hidden tab is reloaded before its live connection can
+    // refill it with only the turn in progress.
+    const [heldDetail, setHeldDetail] = useState(false)
     const {
       detail,
       loading: detailLoading,
       error: detailError,
       acpLoadError,
-    } = useConversationDetail(effectiveConversationId)
+    } = useConversationDetail(effectiveConversationId, {
+      enabled: isVisible || isActive || heldDetail,
+    })
+    if (detail != null && !heldDetail) setHeldDetail(true)
 
     // Cold detail: surface a redacted continuation failure exactly once per
     // (code, finished_at) identity while this panel is mounted. Uses the same
@@ -841,6 +854,7 @@ export const ConversationSessionSurface = memo(
       getQueueLength: mqGetQueueLength,
       dequeue: mqDequeue,
       remove: mqRemove,
+      moveToFront: mqMoveToFront,
       reorder: mqReorder,
       updateItem: mqUpdateItem,
       editingItemId: mqEditingItemId,
@@ -2687,6 +2701,9 @@ export const ConversationSessionSurface = memo(
     const messageListNode = (
       <GoalControlProvider value={goalControlValue}>
         <MessageListView
+          availableCommands={
+            connIsForOtherAgent ? null : conn.availableCommands
+          }
           conversationId={effectiveConversationId}
           agentType={selectedAgent}
           workspaceRootPath={folder?.path ?? null}
@@ -2774,14 +2791,15 @@ export const ConversationSessionSurface = memo(
         // when the turn-end edge lands mid-round-trip.
         setQueueSteerInFlight(true)
         try {
-          await feedbackSteer(payload.text, payload.blocks)
-          mqRemove(id)
+          const delivered = await deliverQueuedSteer(
+            () => feedbackSteer(payload.text, payload.blocks),
+            () => mqMoveToFront(id)
+          )
+          // Not delivered means the turn ended first, so the row goes out as
+          // the next turn instead; say so, as the composer's steer does.
+          if (delivered) mqRemove(id)
+          else toast.info(tCmp("steerQueuedInstead"))
         } catch (err: unknown) {
-          if (isNoActiveTurnRejection(err)) {
-            // The turn ended mid-click — the queue flush will deliver it.
-            toast.info(tCmp("steerQueuedInstead"))
-            return
-          }
           toast.error(
             tCmp(
               feedback.channel === "pull" ? "steerNoteFailed" : "steerFailed"
@@ -2792,11 +2810,12 @@ export const ConversationSessionSurface = memo(
           setQueueSteerInFlight(false)
         }
       },
-      [msgQueue, feedbackSteer, mqRemove, feedback.channel, tCmp]
+      [msgQueue, feedbackSteer, mqRemove, feedback.channel, tCmp, mqMoveToFront]
     )
 
     return (
       <ConversationShell
+        resizableWidth
         topBanner={
           <>
             <SessionConfigStaleBanner contextKey={tabId} />
@@ -2946,7 +2965,7 @@ export const ConversationSessionSurface = memo(
           >
             <div className="flex min-h-full flex-col">
               <div className="flex-1" />
-              <div className="mx-auto flex w-full max-w-3xl shrink-0 flex-col gap-6 px-4 py-4">
+              <div className="mx-auto flex w-full chat-content-w shrink-0 flex-col gap-6 px-4 py-4">
                 <WelcomeHero />
                 <QuickActions
                   onSelect={handleQuickAction}
@@ -3034,7 +3053,7 @@ export const ConversationSessionSurface = memo(
                 />
               </div>
               <div className="flex-1" />
-              <div className="mx-auto w-full max-w-3xl shrink-0 px-4 pb-6">
+              <div className="mx-auto w-full chat-content-w shrink-0 px-4 pb-6">
                 <WelcomeTip />
               </div>
             </div>

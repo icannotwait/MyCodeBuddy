@@ -24,21 +24,21 @@ history without rebasing:
 git fetch upstream
 git switch main
 git pull --ff-only origin main
-git switch -c sync/codeg-0.33.0
-git merge --no-ff upstream/main
+git switch -c sync/codeg-0.35.1
+git merge --no-ff v0.35.1
 ```
 
 Resolve conflicts on the sync branch, then open a pull request into
 MyCodeBuddy `main`. Do not rebase published MyCodeBuddy history. Run the full
 repository verification suite before merging the pull request.
 
-For an upstream Codeg `0.33.0` sync, reset the fork version in `package.json`,
+For an upstream Codeg `0.35.1` sync, reset the fork version in `package.json`,
 `src-tauri/Cargo.toml`, `src-tauri/Cargo.lock`, and
-`src-tauri/tauri.conf.json` to `0.33.0-mycodebuddy.1`. Run
+`src-tauri/tauri.conf.json` to `0.35.1-mycodebuddy.1`. Run
 `pnpm test:release` to verify that the versions and runtime URLs remain
 consistent. A fork-only release on the same upstream base bumps only the
 suffix in those files, plus `install.ps1` and the README install examples
-(current: `0.33.0-mycodebuddy.2`). The server entrypoint stays `src-tauri/src/server_bin/main.rs`.
+(current: `0.35.1-mycodebuddy.1`). The server entrypoint stays `src-tauri/src/server_bin/main.rs`.
 Feature `server` still builds `codeg-server`; `server-bin` enables `server`.
 `codeg-mcp` requires `mcp-bin`, and computer use adds `computer-helper`.
 The previous cookbook remains at `docs/UPSTREAM_0.31.1_CONFLICT_RESOLUTION.md`.

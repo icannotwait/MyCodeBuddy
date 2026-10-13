@@ -176,6 +176,19 @@
       "sectionDescription": "Les cartes de raccourci « Développement / Bureautique » affichées au-dessus du champ de saisie sur la page de nouvelle conversation.",
       "showQuickActions": "Afficher sur la page de nouvelle conversation"
     },
+    "chatAnimations": {
+      "sectionTitle": "Animations du chat",
+      "sectionDescription": "Animations de pliage/dépliage, d'appels d'outils et d'état de travail dans la zone de conversation, ainsi que le défilement fluide. Désactivez-les pour des mises à jour instantanées. Les indicateurs de chargement continuent de tourner.",
+      "enable": "Activer les animations du chat"
+    },
+    "chatWidth": {
+      "sectionTitle": "Largeur du chat",
+      "sectionDescription": "Largeur maximale de la colonne de conversation et de la zone de saisie. Vous pouvez aussi faire glisser les bords du chat pour l'ajuster.",
+      "label": "Largeur du contenu",
+      "default": "Par défaut ({width}px)",
+      "hint": "Mesurée avec un zoom de la fenêtre à 100% et mise à l'échelle avec lui. Les valeurs très grandes sont limitées pour tenir dans la fenêtre.",
+      "reset": "Réinitialiser"
+    },
     "workspaceBackground": {
       "sectionTitle": "Arrière-plan de l'espace de travail",
       "sectionDescription": "Affiche une image derrière tout l'espace de travail. La barre latérale et les panneaux deviennent translucides et dépolis pour laisser transparaître l'image, et un masque préserve la lisibilité du texte.",
@@ -2084,7 +2097,8 @@
         "assistant": "Assistant",
         "system": "Système",
         "toolResult": "Résultat",
-        "toolError": "Erreur"
+        "toolError": "Erreur",
+        "turnFailed": "Échec du tour"
       },
       "moreActions": "Plus d’actions",
       "copyText": "Copier le texte",
@@ -2136,6 +2150,8 @@
     "conversationCard": {
       "untitledConversation": "Conversation sans titre",
       "newConversation": "Nouvelle conversation",
+      "maximize": "Agrandir",
+      "restore": "Restaurer",
       "attachToCurrentSession": "Ajouter à la session",
       "rename": "Renommer",
       "status": "Statut",
@@ -2365,6 +2381,9 @@
       "closeAll": "Tout fermer",
       "hideTerminal": "Masquer le terminal ({shortcut})",
       "openFolderFirst": "Ouvrez d'abord un dossier",
+      "processExited": "Processus terminé",
+      "processExitedWithCode": "Processus terminé (code {code})",
+      "unavailable": "Session de terminal indisponible. Elle s'est peut-être terminée ou le serveur a redémarré.",
       "keybar": {
         "label": "Touches virtuelles du terminal",
         "show": "Afficher les touches virtuelles",
@@ -3547,6 +3566,7 @@
         "errorActionCommandCopied": "Copié",
         "emptyConversation": "Aucun message dans cette conversation.",
         "systemMessage": "Message système",
+        "turnFailed": "Échec du tour : {message}",
         "copyMessage": "Copier",
         "forkFromHere": "Bifurquer d'ici",
         "forkBusy": "Impossible de bifurquer pendant qu'un tour est en cours",
@@ -3585,6 +3605,7 @@
         "jumpToPreviousUserMessage": "Aller au message utilisateur",
         "showMore": "Afficher plus",
         "showLess": "Afficher moins",
+        "resizeWidth": "Faites glisser pour ajuster la largeur du chat · double-clic pour réinitialiser",
         "reasoningEffort": "Effort de raisonnement",
         "responseInterrupted": "Réponse interrompue",
         "waitingForSubagents": "En attente des sous-agents…",
@@ -3753,6 +3774,7 @@
         "nameLabel": "Nom :",
         "agentPromptLabel": "Instruction",
         "agentModelLabel": "Modèle",
+        "agentEffortLabel": "Effort",
         "agentRunning": "En cours...",
         "agentLiveTranscript": "Activité en direct",
         "agentProgressTools": "{count} appels d'outils",
@@ -4547,7 +4569,25 @@
     "loading": "Chargement...",
     "emptyDirectory": "Ce répertoire est vide",
     "errorLoadingDir": "Échec du chargement du répertoire",
-    "permissionDenied": "Permission refusée"
+    "permissionDenied": "Permission refusée",
+    "newFolder": {
+      "button": "Nouveau dossier",
+      "placeholder": "Nom du dossier",
+      "create": "Créer le dossier",
+      "location": "Dans {path}",
+      "errors": {
+        "empty": "Saisissez un nom pour le dossier.",
+        "reservedName": "« {name} » ne peut pas servir de nom de dossier.",
+        "separator": "Un nom de dossier ne peut contenir ni / ni \\.",
+        "controlCharacter": "Un nom de dossier ne peut contenir ni caractères de contrôle ni sauts de ligne.",
+        "reservedCharacter": "Un nom de dossier ne peut pas contenir {character}.",
+        "invalidParent": "Impossible de créer un dossier dans {path}.",
+        "parentNotFound": "{path} n’existe plus.",
+        "alreadyExists": "« {name} » existe déjà ici.",
+        "permissionDenied": "Vous n’avez pas l’autorisation de créer un dossier ici.",
+        "failed": "Impossible de créer le dossier : {reason}"
+      }
+    }
   },
   "ServerFileBrowser": {
     "title": "Sélectionner un fichier serveur",
@@ -4941,6 +4981,7 @@
       "experts": "Experts",
       "science": "Science",
       "office": "Outils bureautiques",
+      "ui": "Interface",
       "custom": "Personnalisées"
     },
     "actions": {
@@ -4949,6 +4990,25 @@
     },
     "toasts": {
       "openFolderFailed": "Échec de l'ouverture du dossier"
+    }
+  },
+  "GenerativeUiSettings": {
+    "loading": "Chargement…",
+    "category": "Interface générative",
+    "skillName": "Rendu d'interface",
+    "skillDescription": "Permet à l'agent de répondre avec des cartes, des tableaux et des graphiques interactifs dans le chat de Codeg.",
+    "usage": "Tapez /ui-render suivi de votre demande, par exemple /ui-render présente dans un tableau les fichiers modifiés. Dans Codex, utilisez $ui-render. Vous pouvez aussi simplement demander à l'agent de présenter le résultat en cartes, en tableau ou en graphique. La compétence est disponible dans les conversations démarrées après l'activation.",
+    "conflict": "Votre dossier central contient déjà une compétence personnelle nommée ui-render. Renommez-la dans l'onglet Personnalisées pour utiliser la version intégrée.",
+    "notReadyHint": "Une compétence personnelle nommée ui-render occupe ce nom. Renommez-la dans l'onglet Personnalisées.",
+    "badges": {
+      "nameTaken": "Nom déjà pris"
+    },
+    "states": {
+      "not_linked": "Non activé",
+      "linked_to_codeg": "Activé",
+      "linked_elsewhere": "Bloqué — un autre lien existe",
+      "blocked_by_real_directory": "Bloqué — une compétence personnalisée occupe ce nom",
+      "broken": "Lien cassé"
     }
   },
   "QuickMessagesSettings": {
@@ -4987,6 +5047,97 @@
       "created": "Message rapide créé",
       "saved": "Message rapide enregistré",
       "deleted": "Message rapide supprimé"
+    }
+  },
+  "ConversationTags": {
+    "tags": "Étiquettes",
+    "moreTags": "{count, plural, one {# étiquette de plus} other {# étiquettes de plus}}",
+    "addTags": "Ajouter des étiquettes",
+    "editTags": "Modifier les étiquettes",
+    "global": "Globales",
+    "noTagsYet": "Aucune étiquette pour l’instant",
+    "newTag": "Nouvelle étiquette…",
+    "manageTags": "Gérer les étiquettes…",
+    "branchChip": "Branche : {branch}",
+    "picker": {
+      "searchPlaceholder": "Rechercher ou créer une étiquette…",
+      "noResults": "Aucune étiquette correspondante",
+      "empty": "Aucune étiquette pour l’instant. Saisissez un nom pour en créer une.",
+      "createGlobal": "Créer l’étiquette globale « {name} »",
+      "createInFolder": "Créer « {name} » dans {folder}",
+      "otherFolders": "Autres dossiers"
+    },
+    "form": {
+      "createTitle": "Nouvelle étiquette",
+      "editTitle": "Modifier l’étiquette",
+      "name": "Nom",
+      "namePlaceholder": "p. ex. bug, relecture, idée",
+      "color": "Couleur",
+      "customColor": "Couleur personnalisée",
+      "scope": "Disponible dans",
+      "scopeGlobal": "Toutes les conversations",
+      "scopeFolder": "{folder} uniquement",
+      "create": "Créer",
+      "save": "Enregistrer",
+      "cancel": "Annuler"
+    },
+    "editor": {
+      "empty": "Aucune étiquette ici pour l’instant.",
+      "add": "Nouvelle étiquette",
+      "edit": "Modifier l’étiquette « {name} »",
+      "delete": "Supprimer l’étiquette « {name} »",
+      "dragToReorder": "Faire glisser pour réordonner « {name} »",
+      "deleteTitle": "Supprimer cette étiquette ?",
+      "deleteDescription": "« {name} » sera retirée de toutes les conversations qui la portent. Cette action est irréversible.",
+      "deleteConfirm": "Supprimer",
+      "deleteCancel": "Annuler",
+      "loadFailed": "Impossible de charger les étiquettes"
+    },
+    "manager": {
+      "title": "Gérer les étiquettes",
+      "description": "Marquez les conversations avec des étiquettes de couleur, puis filtrez la barre latérale par étiquette.",
+      "branchTitle": "Étiquette de branche",
+      "branchDescription": "Affiche la branche Git sur laquelle chaque conversation a commencé, sous forme d’étiquette après son titre.",
+      "branchShow": "Afficher",
+      "branchLoadFailed": "Impossible de charger l’étiquette de branche",
+      "globalTitle": "Étiquettes globales",
+      "globalDescription": "Disponibles dans toutes les conversations, mode discussion compris.",
+      "folderTitle": "Étiquettes de dossier",
+      "folderDescription": "Disponibles uniquement dans les conversations du dossier choisi, worktrees compris.",
+      "folderPlaceholder": "Choisir un dossier",
+      "noFolders": "Aucun dossier pour l’instant. Ouvrez-en un dans l’espace de travail pour lui donner ses propres étiquettes."
+    },
+    "filter": {
+      "button": "Filtrer par étiquettes",
+      "searchPlaceholder": "Rechercher des étiquettes…",
+      "match": "Correspondance",
+      "matchAny": "Au moins une",
+      "matchAll": "Toutes",
+      "matchAnyHint": "Conversations portant au moins une des étiquettes choisies",
+      "matchAllHint": "Conversations portant toutes les étiquettes choisies",
+      "modeAll": "Toutes à la fois",
+      "modeAny": "Au moins une",
+      "clear": "Effacer le filtre",
+      "noTags": "Aucune étiquette pour l’instant. Ajoutez-en une depuis le menu d’une conversation.",
+      "noResults": "Aucune étiquette correspondante",
+      "active": "Filtré par étiquettes",
+      "noMatches": "Aucune conversation avec ces étiquettes",
+      "remove": "Retirer « {name} » du filtre"
+    },
+    "toasts": {
+      "assignFailed": "Impossible de mettre à jour les étiquettes de la conversation",
+      "createFailed": "Impossible de créer l’étiquette",
+      "deleteFailed": "Impossible de supprimer l’étiquette",
+      "reorderFailed": "Impossible d’enregistrer l’ordre des étiquettes",
+      "branchTagFailed": "Impossible d’enregistrer l’étiquette de branche"
+    },
+    "errors": {
+      "emptyName": "Saisissez un nom d’étiquette",
+      "duplicateName": "Une étiquette nommée « {name} » existe déjà ici",
+      "invalidColor": "Choisissez une couleur valide",
+      "folderNotTaggable": "Ce dossier ne peut pas avoir ses propres étiquettes",
+      "notApplicable": "Cette étiquette appartient à un autre dossier",
+      "tagNotFound": "Cette étiquette n’existe plus"
     }
   },
   "Pet": {
@@ -5113,6 +5264,8 @@
     }
   },
   "RemoteWorkspace": {
+    "openLocalWorkspace": "Ouvrir l’espace de travail local",
+    "openLocalFailed": "Impossible d’ouvrir l’espace de travail local",
     "openRemoteWorkspace": "Ouvrir l’espace de travail distant",
     "manage": "Gérer l’espace de travail distant",
     "manageTitle": "Connexions à l’espace de travail distant",
@@ -7130,7 +7283,17 @@
       "invalidUrl": "Adresse non valide",
       "profile": "Profil : {name}",
       "profileMenuLabel": "Ouvrir cette page dans un autre profil",
-      "profileDefault": "Par défaut"
+      "profileDefault": "Par défaut",
+      "device": "Appareil : {name}",
+      "deviceMenuLabel": "Afficher comme",
+      "deviceDesktop": "Ordinateur",
+      "deviceTablet": "Tablette",
+      "devicePhone": "Téléphone",
+      "deviceFill": "Tout le volet",
+      "deviceCustom": "Personnalisé",
+      "deviceWidth": "Largeur",
+      "deviceHeight": "Hauteur",
+      "deviceLaidOut": "Volet trop petit : mise en page en {size}"
     },
     "status": {
       "popupDenied": "Fenêtre contextuelle bloquée : {host}",

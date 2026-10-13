@@ -1366,6 +1366,15 @@ export function buildRows(args: {
   /** Collapsed state of each folder group, keyed by group id. Absent key =
    *  expanded (the default), mirroring `folderExpanded`. Optional. */
   groupExpanded?: Record<number, boolean>
+  /**
+   * The buckets were narrowed by a filter (the sidebar's tag filter), so an
+   * empty bucket means "nothing here matches", not "this folder is empty".
+   * Such folders — and worktree sub-groups, and groups left with no matching
+   * member — are dropped instead of drawing a header over an empty hint, and
+   * the Folders section counts only the folders still shown. Optional —
+   * omitted keeps every folder, as before.
+   */
+  hideEmptyFolders?: boolean
 }): SidebarRow[] {
   const {
     pinned,
@@ -1389,8 +1398,17 @@ export function buildRows(args: {
     rootGroupCollapsed = EMPTY_EXPANDED,
     layout,
     groupExpanded = EMPTY_GROUP_EXPANDED,
+    hideEmptyFolders = false,
   } = args
   const rows: SidebarRow[] = []
+
+  // Under `hideEmptyFolders`: does this display bucket hold any row, and does
+  // this folder entry — a container counts its worktrees too — hold any?
+  const bucketHasRows = (folderId: number) =>
+    (byFolder.get(folderId)?.length ?? 0) > 0
+  const entryHasRows = (folderId: number) =>
+    bucketHasRows(folderId) ||
+    (containerChildren.get(folderId) ?? []).some(bucketHasRows)
 
   if (pinned.length > 0) {
     rows.push({
@@ -1453,6 +1471,7 @@ export function buildRows(args: {
   // a group member reuses the SAME depth machinery as a worktree sub-group, so
   // its indent, connector rails and conversation rows all shift together.
   const pushFolderEntry = (folderId: number, baseDepth: number) => {
+    if (hideEmptyFolders && !entryHasRows(folderId)) return
     const worktrees = containerChildren.get(folderId)
     if (!worktrees || worktrees.length === 0) {
       // Plain folder (or, under Show worktrees, a repo with no open worktrees):
@@ -1467,11 +1486,14 @@ export function buildRows(args: {
     rows.push({ kind: "folder", folderId })
     if (!(folderExpanded[folderId] ?? true)) return
     // The repo's OWN sessions move into an indented "root" sub-group, first.
-    rows.push({ kind: "root-group", folderId })
-    if (!rootGroupCollapsed.has(folderId))
-      pushFolderBody(folderId, baseDepth + 1)
+    if (!hideEmptyFolders || bucketHasRows(folderId)) {
+      rows.push({ kind: "root-group", folderId })
+      if (!rootGroupCollapsed.has(folderId))
+        pushFolderBody(folderId, baseDepth + 1)
+    }
     // Then each worktree as its own indented sub-group.
     for (const worktreeId of worktrees) {
+      if (hideEmptyFolders && !bucketHasRows(worktreeId)) continue
       rows.push({ kind: "folder", folderId: worktreeId })
       if (folderExpanded[worktreeId] ?? true) {
         pushFolderBody(worktreeId, baseDepth + 1)
@@ -1493,7 +1515,10 @@ export function buildRows(args: {
       kind: "section",
       section: "folders",
       expanded: foldersExpanded,
-      count: orderedFolderIds.length,
+      // Filtered: the folders still shown, so the badge agrees with the list.
+      count: hideEmptyFolders
+        ? orderedFolderIds.filter(entryHasRows).length
+        : orderedFolderIds.length,
     })
     if (!foldersExpanded) return
     // No layout given (or one with no groups at all) → the historical path,
@@ -1502,16 +1527,16 @@ export function buildRows(args: {
       layout && layout.top.length > 0
         ? layout
         : layoutFromOrderedIds(orderedFolderIds)
-    if (resolved.top.length === 0) {
-      rows.push({ kind: "folders-empty" })
-      return
-    }
+    const rowsBefore = rows.length
     for (const entry of resolved.top) {
       if (entry.kind === "folder") {
         pushFolderEntry(entry.id, 0)
         continue
       }
       const members = resolved.membersByGroup.get(entry.id) ?? []
+      // A group with nothing that matches goes too — but only under a filter:
+      // unfiltered, an empty group is a real state that renders its own hint.
+      if (hideEmptyFolders && !members.some(entryHasRows)) continue
       const expanded = groupExpanded[entry.id] ?? true
       // No member count on the row: the heading's badge shows RUNNING sessions,
       // which the render layer derives from live conversation state rather than
@@ -1526,6 +1551,9 @@ export function buildRows(args: {
       }
       for (const memberId of members) pushFolderEntry(memberId, 1)
     }
+    // Nothing drawn under the header: no folders open at all, or — filtered —
+    // none with a match. The renderer words the hint for each.
+    if (rows.length === rowsBefore) rows.push({ kind: "folders-empty" })
   }
 
   const pushChats = () => {

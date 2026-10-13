@@ -38,6 +38,7 @@ import { CompletedTurnContent } from "./completed-turn-content"
 import { ContextCompactionCard } from "./context-compaction-card"
 import { CollapsibleUserMessage } from "./collapsible-user-message"
 import { CollapsibleSystemMessage } from "./collapsible-system-message"
+import { ContentPartsRenderer } from "./content-parts-renderer"
 import {
   contextCompactionPayload,
   contextCompactionSummary,
@@ -59,6 +60,8 @@ import {
 import { TurnStats } from "./turn-stats"
 import { LiveTurnStats } from "./live-turn-stats"
 import { ModelLabelProvider } from "./model-label-context"
+import { KnownInvocationsProvider } from "./known-invocations-context"
+import { useTranscriptKnownInvocations } from "./use-transcript-known-invocations"
 import { ReplyArtifacts } from "./reply-artifacts"
 import { UserResourceLinks } from "./user-resource-links"
 import { UserImageAttachments } from "./user-image-attachments"
@@ -116,6 +119,7 @@ import {
 import type {
   AgentType,
   AutonomousTurnOrigin,
+  AvailableCommandInfo,
   ConnectionStatus,
   MessageTurn,
   TurnOutcome,
@@ -131,6 +135,7 @@ import type { MessageScrollContextValue } from "@/components/message/message-scr
 import { InitialHistoryScrollController } from "./initial-history-scroll-controller"
 import { extractSessionFilesGrouped } from "@/lib/session-files"
 import { useModelLabels } from "@/hooks/use-model-labels"
+import { useChatAnimationsEnabled } from "@/hooks/use-appearance"
 import { usePageHandoffName } from "@/lib/browser/use-page-handoff-name"
 import { unescapeComposerText } from "@/lib/composer-copy-text"
 import { useStickToBottomContext } from "use-stick-to-bottom"
@@ -142,6 +147,15 @@ interface MessageListViewProps {
   /** This transcript's working directory, including new-chat drafts. */
   imageRoot?: string | null
   agentType: AgentType
+  /**
+   * The slash commands this transcript's agent advertises right now (the same
+   * list behind the composer's `/` menu). A bare `/word` in a sent user message
+   * is shown as a command badge only when it names one of these (or, for Codex,
+   * one of its `$` skills). `null`/`undefined` while the agent has not
+   * advertised; `[]` is an answer (no commands). Required, though it may be
+   * null, so every surface mounting a transcript must decide.
+   */
+  availableCommands?: readonly AvailableCommandInfo[] | null | undefined
   workspaceRootPath?: string | null
   connStatus?: ConnectionStatus | null
   isActive?: boolean
@@ -724,6 +738,16 @@ function isEmptyTurnItem(item: ThreadRenderItem): boolean {
   return true
 }
 
+/** A `system` group that is nothing but a failed turn's line
+ *  (`TurnErrorPart`): the parsers write one per failed round, and so does the
+ *  live stream. */
+export function isTurnErrorGroup(group: ResolvedMessageGroup): boolean {
+  return (
+    group.parts.length > 0 &&
+    group.parts.every((part) => part.type === "turn-error")
+  )
+}
+
 /**
  * When a resolved group's ONLY meaningful content is a single context-compaction
  * tool-call part, return that part's `_meta`, retained summary and call id (so
@@ -1137,6 +1161,10 @@ export function markThreadTail(items: ThreadRenderItem[]): void {
   for (let idx = items.length - 1; idx >= 0; idx--) {
     const item = items[idx]
     if (item.kind === "turn" && isEmptyTurnItem(item)) continue
+    // Nor is a failed round's closing line where a fork lands: a tail fork
+    // keeps everything up to the reply before it — the failure is nothing the
+    // agent carries on from — so that reply is still the thread's tail.
+    if (item.kind === "turn" && isTurnErrorGroup(item.group)) continue
     if (item.kind === "turn") item.isThreadTail = true
     break
   }
@@ -1211,6 +1239,11 @@ const HistoricalMessageGroup = memo(function HistoricalMessageGroup({
   streamingPerfRecorder.countRender(renderKind)
   const t = useTranslations("Folder.chat.messageList")
   if (group.role === "system") {
+    // A failed turn's line is the agent's account of the failure, not a
+    // message the system sent: it closes the round in place, unboxed.
+    if (isTurnErrorGroup(group)) {
+      return <ContentPartsRenderer parts={group.parts} role="system" />
+    }
     return <CollapsibleSystemMessage parts={group.parts} />
   }
 
@@ -1376,20 +1409,24 @@ const AutoScrollOnSend = memo(function AutoScrollOnSend({
   signal: number
 }) {
   const { scrollToBottom } = useStickToBottomContext()
+  const chatAnimations = useChatAnimationsEnabled()
   const lastSignalRef = useRef(signal)
 
   useEffect(() => {
     if (signal === lastSignalRef.current) return
     lastSignalRef.current = signal
 
-    scrollToBottom()
+    const options = chatAnimations
+      ? undefined
+      : { animation: "instant" as const }
+    scrollToBottom(options)
     const rafId = requestAnimationFrame(() => {
-      scrollToBottom()
+      scrollToBottom(options)
     })
     return () => {
       cancelAnimationFrame(rafId)
     }
-  }, [scrollToBottom, signal])
+  }, [scrollToBottom, signal, chatAnimations])
 
   return null
 })
@@ -1720,6 +1757,7 @@ export function MessageListView({
   conversationId,
   imageRoot,
   agentType,
+  availableCommands,
   workspaceRootPath = null,
   connStatus,
   isActive = true,
@@ -1825,6 +1863,17 @@ export function MessageListView({
     (s) =>
       s.allFolders.find((folder) => folder.id === imageFolderId)?.path ?? null
   )
+  const resolvedImageRoot =
+    imageRoot === undefined ? storedImageRoot : imageRoot
+  // What a bare `/word`·`$word` in a user bubble has to be on to render as a
+  // command badge: what the composer's menu offers this agent (or, until its
+  // connection advertises, what it last advertised in this folder).
+  const knownInvocations = useTranscriptKnownInvocations(
+    agentType,
+    availableCommands,
+    resolvedImageRoot
+  )
+  const chatAnimations = useChatAnimationsEnabled()
   const { loadOlderTurns, refetchDetail } = useConversationRuntimeActions()
   // Narrow selectors: the whole session object changes on live tokens, and
   // subscribing to it would re-render the historical thread during streaming.
@@ -2663,7 +2712,7 @@ export function MessageListView({
       <SessionViewerHost>
         <div
           ref={selectionBoxRef}
-          className="relative flex h-full min-h-0 flex-col"
+          className="chat-motion-scope relative flex h-full min-h-0 flex-col"
         >
           {snapshotOmittedToolCalls > 0 ? (
             <p
@@ -2679,7 +2728,7 @@ export function MessageListView({
           <MessageThread
             className="flex-1 min-h-0"
             resize={
-              hasLiveTranscript || initialHistoryScrollActive
+              !chatAnimations || hasLiveTranscript || initialHistoryScrollActive
                 ? "instant"
                 : "smooth"
             }
@@ -2845,10 +2894,12 @@ export function MessageListView({
   )
 
   return (
-    <MarkdownImageProvider
-      rootPath={imageRoot === undefined ? storedImageRoot : imageRoot}
-    >
-      <ModelLabelProvider value={modelLabel}>{thread}</ModelLabelProvider>
+    <MarkdownImageProvider rootPath={resolvedImageRoot}>
+      <ModelLabelProvider value={modelLabel}>
+        <KnownInvocationsProvider value={knownInvocations}>
+          {thread}
+        </KnownInvocationsProvider>
+      </ModelLabelProvider>
     </MarkdownImageProvider>
   )
 }

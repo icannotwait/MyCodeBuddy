@@ -452,6 +452,38 @@ pub fn build_router(
             post(handlers::folders::set_folder_group),
         )
         .route(
+            "/list_conversation_tags",
+            post(handlers::conversation_tags::list_conversation_tags),
+        )
+        .route(
+            "/create_conversation_tag",
+            post(handlers::conversation_tags::create_conversation_tag),
+        )
+        .route(
+            "/update_conversation_tag",
+            post(handlers::conversation_tags::update_conversation_tag),
+        )
+        .route(
+            "/delete_conversation_tag",
+            post(handlers::conversation_tags::delete_conversation_tag),
+        )
+        .route(
+            "/reorder_conversation_tags",
+            post(handlers::conversation_tags::reorder_conversation_tags),
+        )
+        .route(
+            "/update_conversation_tags",
+            post(handlers::conversation_tags::update_conversation_tags),
+        )
+        .route(
+            "/get_conversation_branch_tag",
+            post(handlers::conversation_tags::get_conversation_branch_tag),
+        )
+        .route(
+            "/update_conversation_branch_tag",
+            post(handlers::conversation_tags::update_conversation_branch_tag),
+        )
+        .route(
             "/update_folder_color",
             post(handlers::folders::update_folder_color),
         )
@@ -533,6 +565,10 @@ pub fn build_router(
         .route(
             "/list_directory_entries",
             post(handlers::folders::list_directory_entries),
+        )
+        .route(
+            "/create_directory",
+            post(handlers::folders::create_directory),
         )
         .route(
             "/list_directory_with_files",
@@ -1376,6 +1412,23 @@ pub fn build_router(
         .route(
             "/experts_open_central_dir",
             post(handlers::experts::experts_open_central_dir),
+        )
+        // ─── Generative UI (the ui-render skill) ───
+        .route(
+            "/generative_ui_skill_info",
+            post(handlers::generative_ui::generative_ui_skill_info),
+        )
+        .route(
+            "/generative_ui_list_all_install_statuses",
+            post(handlers::generative_ui::generative_ui_list_all_install_statuses),
+        )
+        .route(
+            "/generative_ui_apply_links",
+            post(handlers::generative_ui::generative_ui_apply_links),
+        )
+        .route(
+            "/generative_ui_read_content",
+            post(handlers::generative_ui::generative_ui_read_content),
         )
         // ─── Science ───
         .route("/science_list", post(handlers::science::science_list))
