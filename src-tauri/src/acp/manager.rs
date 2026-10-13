@@ -23254,7 +23254,14 @@ mod tests {
         let (mgr, join) =
             manager_with_fake_fork("c-fork-tags", pre.id, "session-S2", "session-S1").await;
         let result = mgr
-            .fork_session(&db, "c-fork-tags", None, None, None)
+            .fork_session(
+                &db,
+                fork_test_registry(&db).as_ref(),
+                "c-fork-tags",
+                None,
+                None,
+                None,
+            )
             .await
             .expect("fork_session should succeed");
         let _ = join.await;

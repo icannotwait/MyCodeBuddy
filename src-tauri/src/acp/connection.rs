@@ -45673,6 +45673,7 @@ mod tests {
                     None,
                     &preferred,
                     initial,
+                    &FileSystemRuntime::new(PathBuf::from("/tmp")),
                 )
                 .await;
                 Ok(())
@@ -48440,7 +48441,8 @@ mod tests {
     /// to [`CustomLoop::agent_sends`] go out at once, outside any prompt.
     struct CustomLoop {
         state: Arc<RwLock<SessionState>>,
-        cmd_tx: mpsc::Sender<ConnectionCommand>,
+        cmd_tx: LaneSender<ConnectionCommand>,
+        control_tx: LaneSender<ConnectionControl>,
         events: tokio::sync::broadcast::Receiver<Arc<crate::acp::types::EventEnvelope>>,
         /// Every event the loop emitted so far, in order.
         seen: Vec<AcpEvent>,
@@ -48525,7 +48527,8 @@ mod tests {
                 None,
             )));
             let events = state.read().await.event_stream().subscribe();
-            let (cmd_tx, mut cmd_rx) = mpsc::channel(16);
+            let (cmd_tx, mut cmd_rx, mut cmd_liveness_rx) = connection_channel(16);
+            let (control_tx, mut control_rx, mut control_liveness_rx) = connection_channel(16);
             let loop_state = Arc::clone(&state);
             let client = tokio::spawn(async move {
                 let _ = Client
@@ -48544,6 +48547,10 @@ mod tests {
                         let perms = PendingPermissions::default();
                         let ledger = background_watch::PromptLedger::shared();
                         let stderr_tail = Arc::new(StderrTail::new());
+                        let shell = test_placeholder_terminal_shell();
+                        let route_plan = native_plan(agent_type);
+                        let terminal_prompt_context =
+                            TerminalPromptContext::new(shell.spec.clone());
                         run_conversation_loop(
                             &mut session,
                             "conn-custom",
@@ -48552,10 +48559,22 @@ mod tests {
                             agent_type,
                             &perms,
                             &mut cmd_rx,
-                            Arc::new(TerminalRuntime::with_base_env(BTreeMap::new())),
+                            &mut control_rx,
+                            &mut cmd_liveness_rx,
+                            &mut control_liveness_rx,
+                            Arc::new(TerminalRuntime::new(
+                                BTreeMap::new(),
+                                shell.spec.clone(),
+                                adapter_for(agent_type),
+                            )),
+                            Arc::new(std::sync::Mutex::new(TerminalAssocFallback::new(false))),
+                            Arc::new(FileSystemRuntime::new(PathBuf::from("/tmp"))),
                             "/tmp",
                             false,
+                            &shell.spec,
+                            &route_plan,
                             &ledger,
+                            &terminal_prompt_context,
                             None,
                             &stderr_tail,
                         )
@@ -48568,6 +48587,7 @@ mod tests {
             Self {
                 state,
                 cmd_tx,
+                control_tx,
                 events,
                 seen: Vec::new(),
                 unprompted,
@@ -48593,13 +48613,22 @@ mod tests {
 
         /// The first half of [`Self::run_turn`]: the turn stays open.
         async fn open_turn(&mut self, prompt: &str, last_text: &str) {
-            self.state.write().await.turn_in_flight = true;
+            let turn_generation = {
+                let mut state = self.state.write().await;
+                state.turn_in_flight = true;
+                state.parent_turn_generation += 1;
+                state.active_turn_generation = Some(state.parent_turn_generation);
+                state.parent_turn_generation
+            };
             self.cmd_tx
                 .send(ConnectionCommand::Prompt {
                     blocks: vec![PromptInputBlock::Text {
                         text: prompt.into(),
                     }],
                     user_message: None,
+                    mark_awaiting_reply: false,
+                    bypass_autonomous_hold: false,
+                    turn_generation,
                 })
                 .await
                 .expect("the loop is running");
@@ -48663,7 +48692,7 @@ mod tests {
         }
 
         async fn shutdown(self) {
-            let _ = self.cmd_tx.send(ConnectionCommand::Disconnect).await;
+            let _ = self.control_tx.send(ConnectionControl::Disconnect).await;
             let _ = tokio::time::timeout(std::time::Duration::from_secs(5), self.client).await;
             self.agent.abort();
         }

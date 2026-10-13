@@ -905,6 +905,7 @@ impl TerminalManager {
             title: "Test".to_string(),
             owner_window_label: owner_window_label.to_string(),
             owner_operation_id: owner_operation_id.map(str::to_string),
+            generation: uuid::Uuid::new_v4().to_string(),
             scrollback: Arc::new(Mutex::new(Scrollback::default())),
             temp_files: Vec::new(),
         };
@@ -1216,12 +1217,24 @@ mod tests {
     }
 
     #[cfg(not(target_os = "windows"))]
+    fn posix_sh_spec() -> super::ResolvedShellSpec {
+        super::ResolvedShellSpec {
+            executable: std::path::PathBuf::from("/bin/sh"),
+            dialect: crate::terminal::shell::ShellDialect::Posix,
+            display_name: "sh".into(),
+            source: crate::terminal::shell::ShellSource::System,
+            command_strategy: crate::terminal::shell::ShellCommandStrategy::Posix,
+        }
+    }
+
+    #[cfg(not(target_os = "windows"))]
     fn sleeping_shell(id: &str, command: &str) -> SpawnOptions {
         SpawnOptions {
             terminal_id: id.to_string(),
             working_dir: std::env::temp_dir().to_string_lossy().to_string(),
             owner_window_label: "main".to_string(),
-            shell: Some("/bin/sh".to_string()),
+            owner_operation_id: None,
+            shell: posix_sh_spec(),
             initial_command: Some(command.to_string()),
             extra_env: None,
             temp_files: vec![],
@@ -1446,7 +1459,8 @@ mod tests {
                     terminal_id: "finished-output".to_string(),
                     working_dir: std::env::temp_dir().to_string_lossy().to_string(),
                     owner_window_label: "main".to_string(),
-                    shell: Some("/bin/sh".to_string()),
+                    owner_operation_id: None,
+                    shell: posix_sh_spec(),
                     initial_command: Some("printf 'last-output-marker\\n'; exit 7".to_string()),
                     extra_env: None,
                     temp_files: vec![],
@@ -1489,7 +1503,8 @@ mod tests {
             terminal_id: "reused-id".to_string(),
             working_dir: std::env::temp_dir().to_string_lossy().to_string(),
             owner_window_label: "main".to_string(),
-            shell: Some("/bin/sh".to_string()),
+            owner_operation_id: None,
+            shell: posix_sh_spec(),
             initial_command: Some(command.to_string()),
             extra_env: None,
             temp_files: vec![],
@@ -1557,7 +1572,8 @@ mod tests {
             terminal_id: id.to_string(),
             working_dir: std::env::temp_dir().to_string_lossy().to_string(),
             owner_window_label: "main".to_string(),
-            shell: Some("/bin/sh".to_string()),
+            owner_operation_id: None,
+            shell: posix_sh_spec(),
             initial_command: Some("sleep 30".to_string()),
             extra_env: None,
             temp_files: vec![],
@@ -1606,7 +1622,8 @@ mod tests {
                         terminal_id: id,
                         working_dir: std::env::temp_dir().to_string_lossy().to_string(),
                         owner_window_label: "main".to_string(),
-                        shell: Some("/bin/sh".to_string()),
+                        owner_operation_id: None,
+                        shell: posix_sh_spec(),
                         initial_command: Some(format!(
                             "printf 'started\\n' >> '{}'; sleep 30",
                             output.display()

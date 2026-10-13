@@ -4683,6 +4683,9 @@ mod tests {
             session_id: "ext".into(),
             stop_reason: "end_turn".into(),
             agent_type: "claude_code".into(),
+            mark_awaiting_reply: false,
+            termination_source: None,
+            provider_turn_id: None,
         });
         assert_eq!(s.last_assistant_text.as_deref(), Some("You're welcome."));
     }

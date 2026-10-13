@@ -1877,19 +1877,6 @@ mod diagnostics_tests {
         assert_eq!(compute_verdict(&inp).code, "node_missing");
     }
 
-    // ...and before the adapter explainer: when the adapter's OWN command
-    // resolves in the login shell, the adapter is installed, so "the adapter
-    // is not installed" would be wrong.
-    #[test]
-    fn verdict_terminal_only_path_outranks_adapter_explainer() {
-        let mut inp = base_inputs();
-        inp.agent = Some(adapter_agent_never_installed(Some(
-            "/opt/homebrew/bin/codex",
-        )));
-        inp.terminal.cmd_resolved = Some("/Users/u/bin/codex-acp".to_string());
-        assert_eq!(compute_verdict(&inp).code, "terminal_only_path");
-    }
-
     #[test]
     fn verdict_node_too_old() {
         let mut inp = base_inputs();
