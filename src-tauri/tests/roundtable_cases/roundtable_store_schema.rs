@@ -22,7 +22,7 @@ use codeg_lib::roundtable::{
 };
 use roundtable_protocol::{BindingId, Epoch, ErrorCode, Hash256, IncarnationId, RoomId};
 use sea_orm::{ConnectionTrait, TransactionTrait};
-use sea_orm_migration::{MigrationName, MigratorTrait};
+use sea_orm_migration::MigratorTrait;
 
 use crate::roundtable_support::{
     install_legacy_sessions, legacy_session_visible, open_pool, rt_table_count, scalar_i64,
