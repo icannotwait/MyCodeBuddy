@@ -17097,7 +17097,9 @@ earlier terminal context records.\n\
             .to_string(),
             r#"{"timestamp":"2026-10-10T07:29:29.317Z","ordinal":14,"type":"event_msg","payload":{"type":"task_complete","turn_id":"01a124b7-84d1-7763-bf6d-fef72a40b02c","last_agent_message":null,"error":{"message":"probe: model does not exist","codex_error_info":"other"},"started_at":1791617369,"completed_at":1791617369,"duration_ms":16}}"#.to_string(),
         ]
-        .join("\n");
+        .join("\n")
+            // A rollout record is complete only once newline-terminated.
+            + "\n";
         let detail = parse_rollout("failed-envelope", &content, "fail-2");
         let lines: Vec<&str> = detail
             .turns
