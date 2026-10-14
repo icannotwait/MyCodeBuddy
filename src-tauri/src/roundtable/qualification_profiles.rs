@@ -20,6 +20,9 @@ pub struct AuthFile {
     pub destination: &'static str,
     /// Missing optional files are skipped. A required file that is absent fails.
     pub required: bool,
+    /// Bind read-only. Set where the agent never needs to rewrite the file
+    /// and runs an unsandboxed shell, so the host copy cannot be changed.
+    pub read_only: bool,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -208,15 +211,20 @@ const COMMON_ENV: &[(&str, &str)] = &[
 
 /// codex-acp 2.1.1 starts sessions in mode `agent` ("Auto review"): every
 /// approval goes to Codex's own guardian reviewer, which failed every MCP
-/// call in the sandbox (probe trace 2026-10-10: `Guardian Review` failed,
-/// then `mcp.roundtable.*` failed, no `session/request_permission`). Mode
-/// `read-only` is approval `on-request` with reviewer `user` and a read-only
-/// sandbox, so consent comes to Codeg's permission_reply (roundtable tools
-/// only) like every other adapter.
+/// call in the sandbox (probe trace 2026-10-10). Mode `read-only` then kept
+/// Codex's own Linux sandbox (bubblewrap), which cannot start inside the
+/// member container (`bwrap: capget ... Operation not permitted`), so every
+/// Codex shell read failed and the seat abstained.
+///
+/// Mode `agent-full-access` is approval `never` with sandbox
+/// `dangerFullAccess`: Codex runs its shell directly, and the member
+/// container is the only boundary (read-only workspace mount, read-only
+/// rootfs, no host home, egress only to the bound provider origin). This is
+/// the same boundary every other adapter's shell already runs under.
 const CODEX_ENV: &[(&str, &str)] = &[
     ("HOME", "/rt-home"),
     ("PATH", "/usr/local/bin:/usr/bin:/bin"),
-    ("INITIAL_AGENT_MODE", "read-only"),
+    ("INITIAL_AGENT_MODE", "agent-full-access"),
 ];
 
 pub fn adapter_profiles() -> &'static [AdapterProfile] {
@@ -254,6 +262,7 @@ const PROFILES: &[AdapterProfile] = &[
                 home_relative: ".codex/auth.json",
                 destination: "/rt-home/.codex/auth.json",
                 required: true,
+                read_only: true,
             },
             // Routing only (model_provider + that provider's base_url and
             // wire_api), derived by Codeg from ~/.codex/config.toml; see
@@ -262,6 +271,7 @@ const PROFILES: &[AdapterProfile] = &[
                 home_relative: super::agent_credentials::CODEX_ROUTING_RELATIVE,
                 destination: "/rt-home/.codex/config.toml",
                 required: false,
+                read_only: true,
             },
         ],
         container_env: CODEX_ENV,
@@ -287,6 +297,7 @@ const PROFILES: &[AdapterProfile] = &[
             home_relative: ".grok/auth.json",
             destination: "/rt-home/.grok/auth.json",
             required: true,
+            read_only: false,
         }],
         container_env: COMMON_ENV,
         model_gateway: GROK_GATEWAY,
@@ -309,16 +320,19 @@ const PROFILES: &[AdapterProfile] = &[
                 home_relative: ".cursor/cli-config.json",
                 destination: "/rt-home/.cursor/cli-config.json",
                 required: true,
+                read_only: false,
             },
             AuthFile {
                 home_relative: ".config/cursor/auth.json",
                 destination: "/rt-home/.config/cursor/auth.json",
                 required: false,
+                read_only: false,
             },
             AuthFile {
                 home_relative: ".cursor/auth.json",
                 destination: "/rt-home/.cursor/auth.json",
                 required: false,
+                read_only: false,
             },
         ],
         container_env: &[
@@ -416,22 +430,46 @@ const ANTIGRAVITY_AUTH: &[AuthFile] = &[
         // Host oauth selection (`auth.type`) is what `session/new` reads.
         // A gateway settings file is not written over this mount.
         required: true,
+        read_only: false,
     },
     AuthFile {
         home_relative: ".gemini/antigravity-acp/acp_token.json",
         destination: "/rt-home/.gemini/antigravity-acp/acp_token.json",
         required: true,
+        read_only: false,
     },
     AuthFile {
         home_relative: ".gemini/antigravity-acp/acp_business_token.json",
         destination: "/rt-home/.gemini/antigravity-acp/acp_business_token.json",
         required: false,
+        read_only: false,
     },
 ];
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn codex_runs_unsandboxed_inside_the_container_with_read_only_credentials() {
+        let codex = profile_for_agent("codex").expect("codex profile");
+        // No nested Codex sandbox: bubblewrap cannot start in the member
+        // container, so the container is the boundary.
+        assert!(codex
+            .container_env
+            .contains(&("INITIAL_AGENT_MODE", "agent-full-access")));
+        // With an unsandboxed shell, the host credential and routing files
+        // are bound read-only so the agent cannot rewrite them.
+        assert!(!codex.auth_files.is_empty());
+        assert!(codex.auth_files.iter().all(|file| file.read_only));
+        for other in ["grok", "cursor", "antigravity"] {
+            let profile = profile_for_agent(other).expect("profile");
+            assert!(!profile
+                .container_env
+                .iter()
+                .any(|(key, _)| *key == "INITIAL_AGENT_MODE"));
+        }
+    }
 
     #[test]
     fn antigravity_live_env_is_empty_and_grok_keeps_its_gateway() {

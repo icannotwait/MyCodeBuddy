@@ -1128,6 +1128,15 @@ fn apply_auth_mounts(plan: &mut SandboxPlan, profile: &QualifiedOciProfile) -> R
             fs::create_dir_all(parent)
                 .map_err(|_| rt_error(ErrorCode::StorageUnavailable, "auth_mount"))?;
         }
+        if held.read_only {
+            // Never bind the host file: the CLI (Codex) rewrites its auth and
+            // config files in place, which fails on a read-only bind and would
+            // reach the host through a writable one. Deliver a private copy in
+            // the per-run scratch home instead; it is discarded with the run.
+            copy_credential_into_scratch(&source, &mount_point)
+                .map_err(|_| rt_error(ErrorCode::StorageUnavailable, "auth_mount"))?;
+            continue;
+        }
         if !mount_point.exists() {
             fs::write(&mount_point, b"")
                 .map_err(|_| rt_error(ErrorCode::StorageUnavailable, "auth_mount"))?;
@@ -1135,8 +1144,9 @@ fn apply_auth_mounts(plan: &mut SandboxPlan, profile: &QualifiedOciProfile) -> R
         plan.mounts.push(PlanMount {
             source: source.clone(),
             destination: held.destination.clone(),
-            read_only: false,
+            read_only: held.read_only,
         });
+        let access = if held.read_only { "ro" } else { "rw" };
         plan.oci["mounts"]
             .as_array_mut()
             .ok_or_else(|| rt_error(ErrorCode::InvalidArgument, "oci_mounts"))?
@@ -1144,10 +1154,33 @@ fn apply_auth_mounts(plan: &mut SandboxPlan, profile: &QualifiedOciProfile) -> R
                 "source": source,
                 "destination": held.destination,
                 "type": "bind",
-                "options": ["bind", "rw", "nosuid", "nodev"]
+                "options": ["bind", access, "nosuid", "nodev"]
             }));
     }
     Ok(())
+}
+
+/// Copies a host credential file into the per-run scratch home with owner-only
+/// permissions. The host file is only ever read.
+pub(crate) fn copy_credential_into_scratch(
+    source: &std::path::Path,
+    destination: &std::path::Path,
+) -> std::io::Result<()> {
+    use std::io::Write;
+    let bytes = fs::read(source)?;
+    if fs::symlink_metadata(destination).is_ok() {
+        fs::remove_file(destination)?;
+    }
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(destination)?;
+    file.write_all(&bytes)?;
+    file.sync_all()
 }
 
 fn home_upper_allowed(plan: &SandboxPlan, mount: &PlanMount) -> bool {
@@ -2632,7 +2665,7 @@ fn container_env_allowed(key: &str, value: &str) -> bool {
         "GEMINI_HOME" => value == "/rt-home/.gemini",
         "CURSOR_CONFIG_DIR" => value == "/rt-home/.cursor",
         "XDG_CONFIG_HOME" => value == "/rt-home/.config",
-        "INITIAL_AGENT_MODE" => value == "read-only",
+        "INITIAL_AGENT_MODE" => value == "agent-full-access",
         _ => false,
     }
 }
@@ -2751,15 +2784,15 @@ pub(super) fn verify_profile(plan: &SandboxPlan, profile: &QualifiedOciProfile) 
                     && fs::read(&mount.source).ok().as_deref() == Some(SLIRP_RESOLV_BODY)
             }
             destination if destination.starts_with("/rt-home/") => {
-                !mount.read_only
-                    && profile.host_held_credentials.iter().any(|held| {
-                        held.destination == destination
-                            && held
-                                .source
-                                .canonicalize()
-                                .ok()
-                                .is_some_and(|source| source == mount.source)
-                    })
+                profile.host_held_credentials.iter().any(|held| {
+                    mount.read_only == held.read_only
+                        && held.destination == destination
+                        && held
+                            .source
+                            .canonicalize()
+                            .ok()
+                            .is_some_and(|source| source == mount.source)
+                })
             }
             _ => false,
         };
@@ -5295,6 +5328,7 @@ mod workspace_mount_tests {
             host_held_credentials: vec![AuthMount {
                 source: root.join("home/.grok/auth.json"),
                 destination: "/rt-home/.grok/auth.json".into(),
+                read_only: false,
             }],
             container_env: BTreeMap::new(),
         }
@@ -5373,5 +5407,28 @@ mod workspace_mount_tests {
                 .expect_err(&format!("{} must be refused", project.display()));
             assert_eq!(error.details.reason.as_deref(), Some(reason), "{project:?}");
         }
+    }
+}
+
+#[cfg(all(test, unix))]
+mod credential_copy_tests {
+    use super::copy_credential_into_scratch;
+    use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn read_only_credentials_are_private_scratch_copies_and_host_stays_untouched() {
+        let dir = tempfile::tempdir().unwrap();
+        let host = dir.path().join("host-auth.json");
+        std::fs::write(&host, b"{\"k\":1}").unwrap();
+        let scratch = dir.path().join("rt-home-auth.json");
+        std::fs::write(&scratch, b"").unwrap();
+        copy_credential_into_scratch(&host, &scratch).unwrap();
+        assert_eq!(std::fs::read(&scratch).unwrap(), b"{\"k\":1}");
+        assert_eq!(
+            std::fs::metadata(&scratch).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        std::fs::write(&scratch, b"rewritten by agent").unwrap();
+        assert_eq!(std::fs::read(&host).unwrap(), b"{\"k\":1}");
     }
 }

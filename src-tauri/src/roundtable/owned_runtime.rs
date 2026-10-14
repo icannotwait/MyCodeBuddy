@@ -960,7 +960,7 @@ async fn run_room(
         let fence =
             closing_fence.ok_or_else(|| rt_error(ErrorCode::InvalidState, "empty_phase"))?;
         require_running(&store, &room, boot_epoch, run_epoch).await?;
-        store
+        let closed = store
             .close_phase(CloseInput {
                 room_id: room,
                 phase_id,
@@ -969,6 +969,13 @@ async fn run_room(
                 cancel_unfinished: false,
             })
             .await?;
+        // A failed phase (quorum not met, or a failed synthesis) has no
+        // closing set to publish; close_phase already moved the room to its
+        // terminal or blocked state, so the run ends here.
+        if closed.phase_status == "failed" {
+            super::live_stream::clear_phase(&room.to_string(), &phase_id.to_string());
+            return Ok(());
+        }
         store
             .publish(PublishInput {
                 room_id: room,
@@ -1745,6 +1752,12 @@ async fn prepare_turn(
     })
 }
 
+/// Member attempt budget the workbench sends as `timeouts.attempt_timeout`
+/// (`MEMBER_ATTEMPT_TIMEOUT_MS` in roundtable-workbench.tsx). Qualification
+/// probes use the same per-step deadline so an adapter is not rejected for
+/// latency a real room would accept.
+pub(crate) const MEMBER_ATTEMPT_TIMEOUT_MS: u64 = 225_000;
+
 /// Synthesis has no per-attempt time limit (operator choice): the moderator
 /// runs until it ends its turn, the room's active-time budget runs out, or an
 /// operator stops/pauses the room. Its `deadline` is the room deadline (see
@@ -2165,21 +2178,36 @@ mod prepaid_lease_renewal_tests {
 
 #[cfg(test)]
 mod synthesis_limit_tests {
-    use super::{attempt_deadline, phase_deadline_for};
+    use super::{attempt_deadline, phase_deadline_for, MEMBER_ATTEMPT_TIMEOUT_MS};
     use roundtable_protocol::PhaseKind;
 
     #[test]
     fn synthesis_attempt_runs_to_the_room_deadline() {
         assert_eq!(
-            attempt_deadline(PhaseKind::Synthesis, 1_800_000, 1_000, 225_000),
+            attempt_deadline(
+                PhaseKind::Synthesis,
+                1_800_000,
+                1_000,
+                MEMBER_ATTEMPT_TIMEOUT_MS
+            ),
             1_800_000
         );
         assert_eq!(
-            attempt_deadline(PhaseKind::Proposal, 1_800_000, 1_000, 225_000),
+            attempt_deadline(
+                PhaseKind::Proposal,
+                1_800_000,
+                1_000,
+                MEMBER_ATTEMPT_TIMEOUT_MS
+            ),
             226_000
         );
         assert_eq!(
-            attempt_deadline(PhaseKind::Critique, 100_000, 1_000, 225_000),
+            attempt_deadline(
+                PhaseKind::Critique,
+                100_000,
+                1_000,
+                MEMBER_ATTEMPT_TIMEOUT_MS
+            ),
             100_000
         );
     }

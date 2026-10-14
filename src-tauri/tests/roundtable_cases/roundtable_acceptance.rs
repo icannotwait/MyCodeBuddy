@@ -715,7 +715,8 @@ async fn phase_failed_and_moderator_failure() {
         .await
         .expect("phase failed");
     assert_eq!(failed.phase_status, "failed");
-    assert_eq!(failed.room_status, "running");
+    assert_eq!(failed.room_status, "failed");
+    assert_eq!(failed.blocked_reason.as_deref(), Some("quorum_not_met"));
     assert_eq!(failed.closing_set_ref.as_deref(), Some("phase_failed"));
 
     let paused = ready(
