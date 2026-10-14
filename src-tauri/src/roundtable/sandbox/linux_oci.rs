@@ -1128,6 +1128,15 @@ fn apply_auth_mounts(plan: &mut SandboxPlan, profile: &QualifiedOciProfile) -> R
             fs::create_dir_all(parent)
                 .map_err(|_| rt_error(ErrorCode::StorageUnavailable, "auth_mount"))?;
         }
+        if held.read_only {
+            // Never bind the host file: the CLI (Codex) rewrites its auth and
+            // config files in place, which fails on a read-only bind and would
+            // reach the host through a writable one. Deliver a private copy in
+            // the per-run scratch home instead; it is discarded with the run.
+            copy_credential_into_scratch(&source, &mount_point)
+                .map_err(|_| rt_error(ErrorCode::StorageUnavailable, "auth_mount"))?;
+            continue;
+        }
         if !mount_point.exists() {
             fs::write(&mount_point, b"")
                 .map_err(|_| rt_error(ErrorCode::StorageUnavailable, "auth_mount"))?;
@@ -1149,6 +1158,27 @@ fn apply_auth_mounts(plan: &mut SandboxPlan, profile: &QualifiedOciProfile) -> R
             }));
     }
     Ok(())
+}
+
+/// Copies a host credential file into the per-run scratch home with owner-only
+/// permissions. The host file is only ever read.
+pub(crate) fn copy_credential_into_scratch(
+    source: &std::path::Path,
+    destination: &std::path::Path,
+) -> std::io::Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    let bytes = fs::read(source)?;
+    if fs::symlink_metadata(destination).is_ok() {
+        fs::remove_file(destination)?;
+    }
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(destination)?;
+    file.write_all(&bytes)?;
+    file.sync_all()
 }
 
 fn home_upper_allowed(plan: &SandboxPlan, mount: &PlanMount) -> bool {
@@ -5375,5 +5405,28 @@ mod workspace_mount_tests {
                 .expect_err(&format!("{} must be refused", project.display()));
             assert_eq!(error.details.reason.as_deref(), Some(reason), "{project:?}");
         }
+    }
+}
+
+#[cfg(test)]
+mod credential_copy_tests {
+    use super::copy_credential_into_scratch;
+    use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn read_only_credentials_are_private_scratch_copies_and_host_stays_untouched() {
+        let dir = tempfile::tempdir().unwrap();
+        let host = dir.path().join("host-auth.json");
+        std::fs::write(&host, b"{\"k\":1}").unwrap();
+        let scratch = dir.path().join("rt-home-auth.json");
+        std::fs::write(&scratch, b"").unwrap();
+        copy_credential_into_scratch(&host, &scratch).unwrap();
+        assert_eq!(std::fs::read(&scratch).unwrap(), b"{\"k\":1}");
+        assert_eq!(
+            std::fs::metadata(&scratch).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        std::fs::write(&scratch, b"rewritten by agent").unwrap();
+        assert_eq!(std::fs::read(&host).unwrap(), b"{\"k\":1}");
     }
 }
