@@ -2178,7 +2178,7 @@ mod prepaid_lease_renewal_tests {
 
 #[cfg(test)]
 mod synthesis_limit_tests {
-    use super::{attempt_deadline, phase_deadline_for};
+    use super::{attempt_deadline, phase_deadline_for, MEMBER_ATTEMPT_TIMEOUT_MS};
     use roundtable_protocol::PhaseKind;
 
     #[test]
