@@ -692,6 +692,9 @@ pub enum RuntimeMark {
 pub enum BlockedReason {
     SynthesisFailed,
     RecoveryRequired,
+    /// A member phase closed with fewer accepted turns than its quorum; the
+    /// room ends `failed` instead of publishing an incomplete phase.
+    QuorumNotMet,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

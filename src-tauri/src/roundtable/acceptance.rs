@@ -602,6 +602,16 @@ impl RoundtableStore {
             .await?;
             "synthesis_failed".to_string()
         } else if accepted < phase.quorum {
+            // Too few accepted turns: the room cannot continue, so it ends
+            // `failed` with a stated reason in the same transaction. Nothing
+            // is published for this phase.
+            exec(
+                txn,
+                "UPDATE rt_rooms SET status = 'failed', blocked_reason = 'quorum_not_met'
+                 WHERE room_id = ? AND status = 'running'",
+                vec![text(&room_id)],
+            )
+            .await?;
             exec(
                 txn,
                 "UPDATE rt_phases SET status = 'failed', closing_set_ref = 'phase_failed'

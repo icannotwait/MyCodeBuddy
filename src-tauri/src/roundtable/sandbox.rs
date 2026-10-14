@@ -191,6 +191,10 @@ pub struct QualifiedOciProfile {
 pub struct AuthMount {
     pub source: PathBuf,
     pub destination: String,
+    /// Bind the host file read-only. Omitted when false, so profiles that
+    /// keep a writable credential serialize (and hash) exactly as before.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub read_only: bool,
 }
 
 pub fn qualified_rootfs_digest(rootfs: &Path) -> RtResult<Hash256> {

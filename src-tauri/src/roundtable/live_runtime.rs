@@ -3973,6 +3973,7 @@ mod completion_contract_tests {
         installed.oci.auth_mounts.push(AuthMount {
             source: path,
             destination: "/rt-home/auth.json".into(),
+            read_only: false,
         });
         let mut capture =
             super::super::DiagnosticCapture::new(auth_denylist(&installed, &[]).unwrap());

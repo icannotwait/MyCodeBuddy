@@ -960,7 +960,7 @@ async fn run_room(
         let fence =
             closing_fence.ok_or_else(|| rt_error(ErrorCode::InvalidState, "empty_phase"))?;
         require_running(&store, &room, boot_epoch, run_epoch).await?;
-        store
+        let closed = store
             .close_phase(CloseInput {
                 room_id: room,
                 phase_id,
@@ -969,6 +969,13 @@ async fn run_room(
                 cancel_unfinished: false,
             })
             .await?;
+        // A failed phase (quorum not met, or a failed synthesis) has no
+        // closing set to publish; close_phase already moved the room to its
+        // terminal or blocked state, so the run ends here.
+        if closed.phase_status == "failed" {
+            super::live_stream::clear_phase(&room.to_string(), &phase_id.to_string());
+            return Ok(());
+        }
         store
             .publish(PublishInput {
                 room_id: room,

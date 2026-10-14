@@ -182,6 +182,7 @@ pub async fn measure_host(request: &ProbeRequest) -> ProbeFacts {
         host_held.push(AuthMount {
             source,
             destination: file.destination.to_string(),
+            read_only: file.read_only,
         });
     }
     if let Some(filename) = profile.require_one_filename.filter(|_| !files_replaced) {

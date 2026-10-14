@@ -1135,8 +1135,9 @@ fn apply_auth_mounts(plan: &mut SandboxPlan, profile: &QualifiedOciProfile) -> R
         plan.mounts.push(PlanMount {
             source: source.clone(),
             destination: held.destination.clone(),
-            read_only: false,
+            read_only: held.read_only,
         });
+        let access = if held.read_only { "ro" } else { "rw" };
         plan.oci["mounts"]
             .as_array_mut()
             .ok_or_else(|| rt_error(ErrorCode::InvalidArgument, "oci_mounts"))?
@@ -1144,7 +1145,7 @@ fn apply_auth_mounts(plan: &mut SandboxPlan, profile: &QualifiedOciProfile) -> R
                 "source": source,
                 "destination": held.destination,
                 "type": "bind",
-                "options": ["bind", "rw", "nosuid", "nodev"]
+                "options": ["bind", access, "nosuid", "nodev"]
             }));
     }
     Ok(())
@@ -2632,7 +2633,7 @@ fn container_env_allowed(key: &str, value: &str) -> bool {
         "GEMINI_HOME" => value == "/rt-home/.gemini",
         "CURSOR_CONFIG_DIR" => value == "/rt-home/.cursor",
         "XDG_CONFIG_HOME" => value == "/rt-home/.config",
-        "INITIAL_AGENT_MODE" => value == "read-only",
+        "INITIAL_AGENT_MODE" => value == "agent-full-access",
         _ => false,
     }
 }
@@ -2751,15 +2752,15 @@ pub(super) fn verify_profile(plan: &SandboxPlan, profile: &QualifiedOciProfile) 
                     && fs::read(&mount.source).ok().as_deref() == Some(SLIRP_RESOLV_BODY)
             }
             destination if destination.starts_with("/rt-home/") => {
-                !mount.read_only
-                    && profile.host_held_credentials.iter().any(|held| {
-                        held.destination == destination
-                            && held
-                                .source
-                                .canonicalize()
-                                .ok()
-                                .is_some_and(|source| source == mount.source)
-                    })
+                profile.host_held_credentials.iter().any(|held| {
+                    mount.read_only == held.read_only
+                        && held.destination == destination
+                        && held
+                            .source
+                            .canonicalize()
+                            .ok()
+                            .is_some_and(|source| source == mount.source)
+                })
             }
             _ => false,
         };
@@ -5295,6 +5296,7 @@ mod workspace_mount_tests {
             host_held_credentials: vec![AuthMount {
                 source: root.join("home/.grok/auth.json"),
                 destination: "/rt-home/.grok/auth.json".into(),
+                read_only: false,
             }],
             container_env: BTreeMap::new(),
         }

@@ -74,6 +74,18 @@ impl RoundtableTurnExecutor for ControlledExecutor {
         &self,
         request: RoundtableTurnRequest,
     ) -> RtResult<RoundtableTurnOutcome> {
+        self.execute_with(request, None).await
+    }
+}
+
+impl ControlledExecutor {
+    /// Runs one controlled turn; `forced` replaces the generated result
+    /// (for example an abstention) before it goes through submit_result.
+    async fn execute_with(
+        &self,
+        request: RoundtableTurnRequest,
+        forced: Option<Value>,
+    ) -> RtResult<RoundtableTurnOutcome> {
         self.requests.lock().unwrap().push(request.clone());
         let prompt: Value = serde_json::from_slice(&request.prompt).unwrap();
         self.prompts.lock().unwrap().push(prompt.clone());
@@ -149,6 +161,7 @@ impl RoundtableTurnExecutor for ControlledExecutor {
             }).collect());
             result
         };
+        let result = forced.unwrap_or(result);
         let binding = TokenBinding {
             attempt_id: request.fence.attempt_id,
             room_id: request.room_id,
@@ -2458,10 +2471,16 @@ async fn staged_candidate_then_actual_rpc_failure_never_accepts() {
         conn.execute_unprepared("UPDATE rt_rooms SET status='running'")
             .await
             .unwrap();
-        assert!(runtime
+        // No turn is accepted, so the first phase misses its quorum and the
+        // room ends failed instead of publishing.
+        runtime
             .run_room(store, room, serde_json::from_value(configuration).unwrap())
             .await
-            .is_err());
+            .expect("quorum failure ends the run");
+        assert_eq!(
+            support::scalar_text(&conn, "SELECT blocked_reason FROM rt_rooms").await,
+            "quorum_not_met"
+        );
         assert!(
             support::scalar_i64(&conn, "SELECT COUNT(*) FROM rt_submissions WHERE sealed=1").await
                 > 0
@@ -3041,7 +3060,11 @@ async fn staged_candidate_then_actual_gateway_http_error_cannot_be_accepted() {
                 > 0
         );
         if fail {
-            assert!(result.is_err());
+            result.expect("quorum failure ends the run");
+            assert_eq!(
+                support::scalar_text(&conn, "SELECT status FROM rt_rooms").await,
+                "failed"
+            );
             assert_eq!(
                 support::scalar_i64(&conn, "SELECT COUNT(*) FROM rt_messages").await,
                 0
@@ -3070,4 +3093,129 @@ async fn staged_candidate_then_actual_gateway_http_error_cannot_be_accepted() {
             0
         );
     }
+}
+
+/// Abstains in member phases for one ordinal; every other turn is the
+/// controlled fixture.
+struct AbstainingExecutor {
+    inner: ControlledExecutor,
+    abstain_ordinal: u32,
+}
+#[async_trait]
+impl RoundtableTurnExecutor for AbstainingExecutor {
+    fn request_envelope_bound_bytes(&self, participant: &ParticipantV1) -> RtResult<Option<u64>> {
+        Ok(Some(fixture_request_envelope(participant)))
+    }
+    async fn capability(&self, config: &RoundtableConfigV1) -> RtResult<RuntimeCapability> {
+        self.inner.capability(config).await
+    }
+    fn token_bound(&self) -> &(dyn TokenBound + Send + Sync) {
+        self.inner.token_bound()
+    }
+    async fn execute_turn(
+        &self,
+        request: RoundtableTurnRequest,
+    ) -> RtResult<RoundtableTurnOutcome> {
+        let forced = (request.phase.kind != PhaseKind::Synthesis
+            && request.participant.ordinal == self.abstain_ordinal)
+            .then(|| {
+                json!({"kind":"abstain","summary":"Unable to read the workspace","reason":"The shell could not start, so no file was read.","claims":[],"responses":[],"position_changes":[]})
+            });
+        self.inner.execute_with(request, forced).await
+    }
+    async fn cancel_and_reap(&self, identity: RuntimeIdentity) -> RtResult<CleanupProof> {
+        self.inner.cancel_and_reap(identity).await
+    }
+}
+
+#[tokio::test]
+async fn member_abstention_below_quorum_fails_the_room_without_recovery() {
+    let (dir, conn) = support::open_pool(1).await;
+    migrate_roundtable(&conn).await.unwrap();
+    let store = open_roundtable_store(conn.clone()).await.unwrap();
+    let executor = Arc::new(AbstainingExecutor {
+        inner: ControlledExecutor {
+            root: dir.path().into(),
+            prompts: Mutex::new(Vec::new()),
+            requests: Mutex::new(Vec::new()),
+        },
+        abstain_ordinal: 1,
+    });
+    let runtime = Arc::new(OwnedParticipantRuntime::with_executor(
+        dir.path().into(),
+        Arc::new(ConnectionManager::new()),
+        executor.clone(),
+    ));
+    let service = RoundtableService::open(
+        ServiceConfig {
+            data_dir: dir.path().into(),
+            db_path: dir.path().join("roundtable.db"),
+            db_identity: DbIdentity::new("abstain-below-quorum").unwrap(),
+            discover: None,
+        },
+        store.clone(),
+        runtime.clone(),
+    )
+    .await
+    .unwrap();
+    let actor = ActorContext::from_trusted_entry(
+        "00000000-0000-4000-8000-000000000001".parse().unwrap(),
+        OperatorScope::SingleOperator,
+        ClientIdentity {
+            kind: ClientKind::Web,
+            session_ref: "abstain".into(),
+        },
+    );
+    let mut configuration = config();
+    configuration["budgets"]["room_budget"] = json!("1800000");
+    configuration["budgets"]["phase_budget"] = json!("900000");
+    let created = service
+        .execute_fake_command(
+            &actor,
+            "roundtable_create",
+            json!({"request_id":uuid::Uuid::new_v4().to_string(),"config":configuration}),
+        )
+        .await
+        .unwrap();
+    let room: RoomId = created["room_id"].as_str().unwrap().parse().unwrap();
+    conn.execute_unprepared("UPDATE rt_rooms SET status='running'")
+        .await
+        .unwrap();
+    runtime
+        .run_room(
+            store.clone(),
+            room,
+            serde_json::from_value(configuration).unwrap(),
+        )
+        .await
+        .expect("a failed quorum ends the run cleanly");
+
+    assert_eq!(
+        support::scalar_text(&conn, "SELECT status FROM rt_rooms").await,
+        "failed"
+    );
+    assert_eq!(
+        support::scalar_text(&conn, "SELECT blocked_reason FROM rt_rooms").await,
+        "quorum_not_met"
+    );
+    assert_eq!(
+        support::scalar_text(&conn, "SELECT status FROM rt_phases").await,
+        "failed"
+    );
+    assert_eq!(
+        support::scalar_text(&conn, "SELECT closing_set_ref FROM rt_phases").await,
+        "phase_failed"
+    );
+    // Only the first member phase ran: nothing was published and no
+    // synthesis was attempted.
+    assert!(executor
+        .inner
+        .requests
+        .lock()
+        .unwrap()
+        .iter()
+        .all(|request| request.phase.kind != PhaseKind::Synthesis));
+    let projection = store.projection(&room, None).await.unwrap().body;
+    assert_eq!(projection.status, RoomState::Failed);
+    assert_eq!(projection.blocked_reason, Some(BlockedReason::QuorumNotMet));
 }
