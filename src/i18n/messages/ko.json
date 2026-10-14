@@ -176,6 +176,19 @@
       "sectionDescription": "새 대화 페이지에서 입력창 위에 표시되는 '코드 개발 / 일상 업무' 바로가기 카드입니다.",
       "showQuickActions": "새 대화 페이지에 표시"
     },
+    "chatAnimations": {
+      "sectionTitle": "채팅 애니메이션",
+      "sectionDescription": "대화 영역의 접기/펼치기, 도구 호출, 작업 상태 등의 애니메이션과 부드러운 스크롤을 제어합니다. 끄면 즉시 갱신됩니다. 스피너는 계속 회전합니다.",
+      "enable": "채팅 애니메이션 사용"
+    },
+    "chatWidth": {
+      "sectionTitle": "채팅 너비",
+      "sectionDescription": "대화 영역과 입력창의 최대 너비입니다. 채팅 영역의 좌우 가장자리를 드래그해서 조정할 수도 있습니다.",
+      "label": "콘텐츠 너비",
+      "default": "기본값({width}px)",
+      "hint": "값은 창 확대/축소 100% 기준이며 배율에 따라 함께 조정됩니다. 너무 넓은 값은 창 크기에 맞게 자동으로 제한됩니다.",
+      "reset": "기본값으로 재설정"
+    },
     "workspaceBackground": {
       "sectionTitle": "작업 공간 배경",
       "sectionDescription": "작업 공간 전체 뒤에 이미지를 표시합니다. 사이드바와 패널이 반투명 유리 효과로 바뀌어 이미지가 비쳐 보이며, 마스크가 텍스트 가독성을 유지합니다.",
@@ -2084,7 +2097,8 @@
         "assistant": "어시스턴트",
         "system": "시스템",
         "toolResult": "결과",
-        "toolError": "오류"
+        "toolError": "오류",
+        "turnFailed": "턴 실패"
       },
       "moreActions": "추가 작업",
       "copyText": "텍스트 복사",
@@ -2136,6 +2150,8 @@
     "conversationCard": {
       "untitledConversation": "제목 없는 대화",
       "newConversation": "새 대화",
+      "maximize": "최대화",
+      "restore": "복원",
       "attachToCurrentSession": "세션에 추가",
       "rename": "이름 변경",
       "status": "상태",
@@ -2365,6 +2381,9 @@
       "closeAll": "모두 닫기",
       "hideTerminal": "터미널 숨기기 ({shortcut})",
       "openFolderFirst": "먼저 폴더를 여세요",
+      "processExited": "프로세스가 종료되었습니다",
+      "processExitedWithCode": "프로세스가 종료되었습니다(코드 {code})",
+      "unavailable": "터미널 세션을 사용할 수 없습니다. 세션이 종료되었거나 백엔드가 다시 시작되었을 수 있습니다.",
       "keybar": {
         "label": "터미널 가상 키",
         "show": "가상 키 표시",
@@ -3547,6 +3566,7 @@
         "errorActionCommandCopied": "복사됨",
         "emptyConversation": "이 대화에는 메시지가 없습니다.",
         "systemMessage": "시스템 메시지",
+        "turnFailed": "이번 턴 실패: {message}",
         "copyMessage": "복사",
         "forkFromHere": "여기서 분기",
         "forkBusy": "턴이 실행 중일 때는 분기할 수 없습니다",
@@ -3585,6 +3605,7 @@
         "jumpToPreviousUserMessage": "이전 사용자 메시지로 이동",
         "showMore": "더보기",
         "showLess": "접기",
+        "resizeWidth": "드래그하여 채팅 너비 조정 · 더블 클릭하여 초기화",
         "reasoningEffort": "추론 강도",
         "responseInterrupted": "응답이 중단됨",
         "waitingForSubagents": "하위 작업 대기 중…",
@@ -3753,6 +3774,7 @@
         "nameLabel": "이름:",
         "agentPromptLabel": "프롬프트",
         "agentModelLabel": "모델",
+        "agentEffortLabel": "사고 강도",
         "agentRunning": "실행 중...",
         "agentLiveTranscript": "실시간 활동",
         "agentProgressTools": "도구 호출 {count}회",
@@ -4547,7 +4569,25 @@
     "loading": "로딩 중...",
     "emptyDirectory": "이 디렉토리는 비어 있습니다",
     "errorLoadingDir": "디렉토리 로딩 실패",
-    "permissionDenied": "권한이 없습니다"
+    "permissionDenied": "권한이 없습니다",
+    "newFolder": {
+      "button": "새 폴더",
+      "placeholder": "폴더 이름",
+      "create": "폴더 만들기",
+      "location": "위치: {path}",
+      "errors": {
+        "empty": "폴더 이름을 입력하세요.",
+        "reservedName": "“{name}”은(는) 폴더 이름으로 사용할 수 없습니다.",
+        "separator": "폴더 이름에는 / 또는 \\를 사용할 수 없습니다.",
+        "controlCharacter": "폴더 이름에는 제어 문자나 줄 바꿈을 사용할 수 없습니다.",
+        "reservedCharacter": "폴더 이름에는 {character} 문자를 사용할 수 없습니다.",
+        "invalidParent": "{path}에는 폴더를 만들 수 없습니다.",
+        "parentNotFound": "{path}이(가) 더 이상 존재하지 않습니다.",
+        "alreadyExists": "“{name}”이(가) 이미 있습니다.",
+        "permissionDenied": "여기에 폴더를 만들 권한이 없습니다.",
+        "failed": "폴더를 만들지 못했습니다: {reason}"
+      }
+    }
   },
   "ServerFileBrowser": {
     "title": "서버 파일 선택",
@@ -4941,6 +4981,7 @@
       "experts": "전문가",
       "science": "과학 연구",
       "office": "오피스 도구",
+      "ui": "UI",
       "custom": "사용자 지정"
     },
     "actions": {
@@ -4949,6 +4990,25 @@
     },
     "toasts": {
       "openFolderFailed": "폴더를 열지 못했습니다"
+    }
+  },
+  "GenerativeUiSettings": {
+    "loading": "불러오는 중…",
+    "category": "생성형 UI",
+    "skillName": "UI 렌더링",
+    "skillDescription": "에이전트가 Codeg 채팅에서 상호작용할 수 있는 카드, 표, 차트로 답할 수 있게 합니다.",
+    "usage": "입력창에 /ui-render와 요청을 입력하세요. 예: /ui-render 이번에 변경된 파일을 표로 보여 줘. Codex에서는 $ui-render를 사용합니다. 에이전트에게 카드, 표, 차트로 보여 달라고 직접 요청할 수도 있습니다. 스킬은 활성화한 뒤 새로 시작한 대화에서 사용할 수 있습니다.",
+    "conflict": "중앙 스킬 폴더에 직접 만든 ui-render 스킬이 이미 있습니다. 내장 버전을 사용하려면 사용자 지정 탭에서 이름을 바꾸세요.",
+    "notReadyHint": "직접 만든 ui-render 스킬이 이 이름을 쓰고 있습니다. 사용자 지정 탭에서 이름을 바꾸세요.",
+    "badges": {
+      "nameTaken": "이름 사용 중"
+    },
+    "states": {
+      "not_linked": "활성화되지 않음",
+      "linked_to_codeg": "활성화됨",
+      "linked_elsewhere": "차단됨 — 다른 링크가 존재함",
+      "blocked_by_real_directory": "차단됨 — 사용자 정의 스킬이 이 이름을 점유 중",
+      "broken": "손상된 링크"
     }
   },
   "QuickMessagesSettings": {
@@ -4987,6 +5047,97 @@
       "created": "빠른 메시지가 생성되었습니다",
       "saved": "빠른 메시지가 저장되었습니다",
       "deleted": "빠른 메시지가 삭제되었습니다"
+    }
+  },
+  "ConversationTags": {
+    "tags": "태그",
+    "moreTags": "태그 {count}개 더",
+    "addTags": "태그 추가",
+    "editTags": "태그 편집",
+    "global": "전역",
+    "noTagsYet": "아직 태그가 없습니다",
+    "newTag": "새 태그…",
+    "manageTags": "태그 관리…",
+    "branchChip": "브랜치: {branch}",
+    "picker": {
+      "searchPlaceholder": "태그 검색 또는 만들기…",
+      "noResults": "일치하는 태그가 없습니다",
+      "empty": "아직 태그가 없습니다. 이름을 입력하면 만들 수 있습니다.",
+      "createGlobal": "전역 태그 “{name}” 만들기",
+      "createInFolder": "{folder}에 “{name}” 만들기",
+      "otherFolders": "다른 폴더"
+    },
+    "form": {
+      "createTitle": "새 태그",
+      "editTitle": "태그 편집",
+      "name": "이름",
+      "namePlaceholder": "예: bug, 리뷰 대기, 아이디어",
+      "color": "색상",
+      "customColor": "사용자 지정 색상",
+      "scope": "사용 범위",
+      "scopeGlobal": "모든 대화",
+      "scopeFolder": "{folder}에서만",
+      "create": "만들기",
+      "save": "저장",
+      "cancel": "취소"
+    },
+    "editor": {
+      "empty": "아직 태그가 없습니다.",
+      "add": "새 태그",
+      "edit": "태그 “{name}” 편집",
+      "delete": "태그 “{name}” 삭제",
+      "dragToReorder": "드래그하여 “{name}” 순서 변경",
+      "deleteTitle": "이 태그를 삭제할까요?",
+      "deleteDescription": "“{name}” 태그가 붙은 모든 대화에서 이 태그가 제거됩니다. 되돌릴 수 없습니다.",
+      "deleteConfirm": "삭제",
+      "deleteCancel": "취소",
+      "loadFailed": "태그를 불러오지 못했습니다"
+    },
+    "manager": {
+      "title": "태그 관리",
+      "description": "대화에 색상 태그를 붙이고 사이드바를 태그로 필터링할 수 있습니다.",
+      "branchTitle": "브랜치 태그",
+      "branchDescription": "각 대화를 시작한 Git 브랜치를 제목 뒤에 태그로 표시합니다.",
+      "branchShow": "표시",
+      "branchLoadFailed": "브랜치 태그 설정을 불러오지 못했습니다",
+      "globalTitle": "전역 태그",
+      "globalDescription": "채팅 모드를 포함한 모든 대화에서 사용할 수 있습니다.",
+      "folderTitle": "폴더 태그",
+      "folderDescription": "선택한 폴더의 대화(워크트리 포함)에서만 사용할 수 있습니다.",
+      "folderPlaceholder": "폴더 선택",
+      "noFolders": "아직 폴더가 없습니다. 작업 공간에서 폴더를 열면 전용 태그를 만들 수 있습니다."
+    },
+    "filter": {
+      "button": "태그로 필터링",
+      "searchPlaceholder": "태그 검색…",
+      "match": "조건",
+      "matchAny": "하나라도",
+      "matchAll": "모두",
+      "matchAnyHint": "선택한 태그 중 하나라도 있는 대화",
+      "matchAllHint": "선택한 태그가 모두 있는 대화",
+      "modeAll": "모두 일치",
+      "modeAny": "하나라도 일치",
+      "clear": "필터 지우기",
+      "noTags": "아직 태그가 없습니다. 대화 메뉴에서 추가할 수 있습니다.",
+      "noResults": "일치하는 태그가 없습니다",
+      "active": "태그로 필터링됨",
+      "noMatches": "이 태그가 붙은 대화가 없습니다",
+      "remove": "필터에서 “{name}” 제거"
+    },
+    "toasts": {
+      "assignFailed": "대화의 태그를 업데이트하지 못했습니다",
+      "createFailed": "태그를 만들지 못했습니다",
+      "deleteFailed": "태그를 삭제하지 못했습니다",
+      "reorderFailed": "태그 순서를 저장하지 못했습니다",
+      "branchTagFailed": "브랜치 태그를 저장하지 못했습니다"
+    },
+    "errors": {
+      "emptyName": "태그 이름을 입력하세요",
+      "duplicateName": "이름이 “{name}”인 태그가 이미 있습니다",
+      "invalidColor": "올바른 색상을 선택하세요",
+      "folderNotTaggable": "이 폴더에는 전용 태그를 만들 수 없습니다",
+      "notApplicable": "이 태그는 다른 폴더의 태그입니다",
+      "tagNotFound": "이 태그는 더 이상 존재하지 않습니다"
     }
   },
   "Pet": {
@@ -5113,6 +5264,8 @@
     }
   },
   "RemoteWorkspace": {
+    "openLocalWorkspace": "로컬 워크스페이스 열기",
+    "openLocalFailed": "로컬 워크스페이스를 열지 못했습니다",
     "openRemoteWorkspace": "Open remote workspace",
     "manage": "Manage remote workspace",
     "manageTitle": "Remote Workspace connections",
@@ -7130,7 +7283,17 @@
       "invalidUrl": "올바른 주소가 아닙니다",
       "profile": "프로필: {name}",
       "profileMenuLabel": "이 페이지를 다른 프로필에서 열기",
-      "profileDefault": "기본"
+      "profileDefault": "기본",
+      "device": "기기: {name}",
+      "deviceMenuLabel": "보기 기기",
+      "deviceDesktop": "데스크톱",
+      "deviceTablet": "태블릿",
+      "devicePhone": "휴대폰",
+      "deviceFill": "패널 전체",
+      "deviceCustom": "사용자 지정",
+      "deviceWidth": "너비",
+      "deviceHeight": "높이",
+      "deviceLaidOut": "패널이 너무 작음: {size} 크기로 배치"
     },
     "status": {
       "popupDenied": "팝업 차단됨: {host}",

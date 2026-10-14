@@ -27,7 +27,10 @@ pub(crate) mod confined_file;
 pub mod conversation_experience;
 #[cfg(feature = "tauri-runtime")]
 pub mod conversation_popout;
+pub mod conversation_tags;
 pub mod conversations;
+/// "New folder" in the directory browser (both runtimes).
+pub mod create_directory;
 pub mod custom_agents;
 pub mod custom_skills;
 pub mod deepseek_settings;
@@ -42,6 +45,8 @@ pub mod folder_commands;
 pub mod folder_links;
 pub mod folders;
 pub mod forge;
+/// The `ui-render` skill and the agents it is enabled for (Skill Packs > UI).
+pub mod generative_ui;
 pub mod grok_session_image;
 pub mod history_window;
 pub mod logging;

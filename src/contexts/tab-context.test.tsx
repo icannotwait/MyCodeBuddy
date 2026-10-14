@@ -1956,7 +1956,9 @@ describe("TabProvider sub-session tabs", () => {
       await latestContext?.openTab(1, 99, "codex", true)
     })
     await act(async () => {})
-    expect(getFolderConversationMock).toHaveBeenCalledWith(99)
+    // Only the summary is consumed, so the seed asks for the smallest window
+    // rather than transferring the child's full transcript.
+    expect(getFolderConversationMock).toHaveBeenCalledWith(99, { tailTurns: 1 })
     expect(
       latestContext?.tabs.find((tab) => tab.conversationId === 99)?.title
     ).toBe("Review the auth module")

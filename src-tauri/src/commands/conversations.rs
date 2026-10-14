@@ -2119,7 +2119,7 @@ pub async fn get_folder_conversation_core(
         }
         None => {}
     }
-    summary.message_count = turns.len() as u32;
+    summary.message_count = crate::parsers::message_turn_count(&turns);
     // The transcript is the richer source for the session's model. Codex is
     // the concrete case: an ACP-driven row is created before any
     // `turn_context` names a model, so the DB column can stay NULL forever
@@ -4406,6 +4406,7 @@ mod tests {
             delegation_runtime_stats: None,
             delegation_attention_request: None,
             origin_cwd: None,
+            tag_ids: Vec::new(),
         }
     }
 

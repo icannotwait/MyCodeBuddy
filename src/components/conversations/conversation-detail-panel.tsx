@@ -27,6 +27,7 @@ import { useTaskContext } from "@/contexts/task-context"
 import { cn, copyTextFromMenu } from "@/lib/utils"
 import { DelegationRouteMenu } from "@/components/conversations/delegation-route-menu"
 import { TileScrollContainer } from "@/components/conversations/tile-scroll-container"
+import { stableTabViewOrder } from "@/lib/tab-view-order"
 import { GroupSplitHandle } from "@/components/conversations/group-split-handle"
 import { OverlayHostHiddenProvider } from "@/components/ui/overlay-host-hidden"
 import { TabBar } from "@/components/tabs/tab-bar"
@@ -40,6 +41,7 @@ import { useZoomLevel } from "@/hooks/use-appearance"
 import { getFolderConversation } from "@/lib/api"
 import { isWindowedDetail } from "@/lib/turn-window"
 import { isDesktop } from "@/lib/platform"
+import { ChromeReserve } from "@/components/layout/chrome-reserve"
 import { leftChromeReserve, rightChromeReserve } from "@/lib/window-chrome"
 import {
   getRuntimeSession,
@@ -78,6 +80,7 @@ const ConversationTabView = memo(function ConversationTabView({
   showActiveFlow,
   reloadSignal,
   groupId,
+  isVisible,
 }: {
   tabId: string
   conversationId: number | null
@@ -87,6 +90,17 @@ const ConversationTabView = memo(function ConversationTabView({
   showActiveFlow: boolean
   reloadSignal: number
   groupId: string
+  /** Whether this view is actually on screen: the active tab, or every member
+   *  of a tiled group. A mounted-but-hidden tab keeps its runtime session
+   *  alive, but it must NOT auto-fetch its own detail. Restoring a workspace
+   *  with N open tabs used to issue N concurrent `get_folder_conversation`
+   *  calls — each one a tail window of up to `TAIL_TURNS_DEFAULT` (120) turns,
+   *  so tens of MB across a large tab set — before the user had looked at a
+   *  single one of them. A hidden tab now fetches on the first frame it
+   *  becomes visible, so the workspace opens fetching only the tabs on screen
+   *  (one per split group, or every member of a tiled one) instead of all N.
+   *  Only that first load waits: see the fetch gate in the view. */
+  isVisible: boolean
 }) {
   const ownTab = useTabStore(
     (s) => s.tabs.find((tab) => tab.id === tabId) ?? null
@@ -103,6 +117,7 @@ const ConversationTabView = memo(function ConversationTabView({
       showActiveFlow={showActiveFlow}
       reloadSignal={reloadSignal}
       groupId={groupId}
+      isVisible={isVisible}
     />
   )
 })
@@ -113,26 +128,21 @@ function SplitStripCornerReserve({ side }: { side: "left" | "right" }) {
   const isMobile = useIsMobile()
   const { isOpen: sidebarOpen } = useSidebarContext()
   const { isOpen: auxOpen } = useAuxPanelContext()
-  const { mode } = useWorkspaceView()
+  const { mode, conversationMaximized } = useWorkspaceView()
   const { isMac, isWindows, isLinux } = usePlatform()
   const { zoomLevel } = useZoomLevel()
   if (isMobile) return null
+  const holdsRight = mode === "conversation" || conversationMaximized
+  if (side === "right" && !holdsRight) return null
   const width =
     side === "left"
       ? sidebarOpen
         ? 0
         : leftChromeReserve(isMac && isDesktop(), zoomLevel)
-      : !auxOpen && mode === "conversation"
-        ? rightChromeReserve(isDesktop() && (isWindows || isLinux), zoomLevel)
-        : 0
-  if (width <= 0) return null
-  return (
-    <div
-      data-tauri-drag-region
-      className="h-full shrink-0 ws-strip-line"
-      style={{ width }}
-    />
-  )
+      : auxOpen
+        ? 0
+        : rightChromeReserve(isDesktop() && (isWindows || isLinux), zoomLevel)
+  return <ChromeReserve width={width} />
 }
 
 export function ConversationDetailPanel() {
@@ -489,6 +499,7 @@ export function ConversationDetailPanel() {
         showActiveFlow={(isSplit || canTileGroup) && active}
         reloadSignal={reloadByTabId[tab.id] ?? 0}
         groupId={groupId}
+        isVisible={visible}
       />
     )
     return (
@@ -502,6 +513,7 @@ export function ConversationDetailPanel() {
             tileTabRefs.current.delete(tab.id)
           }
         }}
+        style={canTileGroup ? { order: indexInGroup } : undefined}
         className={cn(
           canTileGroup
             ? cn(
@@ -561,7 +573,7 @@ export function ConversationDetailPanel() {
         {isSplit && (
           <div className="flex h-10 shrink-0 items-stretch bg-muted ws-transparent-bg">
             {touchesLeft && <SplitStripCornerReserve side="left" />}
-            <TabBar groupId={groupId} />
+            <TabBar groupId={groupId} maximizeControl={touchesRight} />
             {touchesRight && <SplitStripCornerReserve side="right" />}
           </div>
         )}
@@ -594,8 +606,12 @@ export function ConversationDetailPanel() {
                 canTileGroup && "flex min-w-full flex-row"
               )}
             >
-              {groupTabs.map((tab, indexInGroup) =>
-                renderTabWrapper(tab, indexInGroup, groupId, canTileGroup)
+              {/* Strip order reaches the screen only through CSS `order`:
+                  a reorder that moved these nodes would reset each moved
+                  transcript's scroll offset and blank it (see
+                  stableTabViewOrder). */}
+              {stableTabViewOrder(groupTabs).map(({ tab, visualIndex }) =>
+                renderTabWrapper(tab, visualIndex, groupId, canTileGroup)
               )}
             </div>
           </TileScrollContainer>

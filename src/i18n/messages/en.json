@@ -176,6 +176,19 @@
       "sectionDescription": "The Code Development / Office Work shortcut cards shown above the composer on the new conversation page.",
       "showQuickActions": "Show on the new conversation page"
     },
+    "chatAnimations": {
+      "sectionTitle": "Chat animations",
+      "sectionDescription": "Entrance, expand/collapse, tool-call and working-status animations in the conversation area, plus smooth scrolling. Turn off for instant, motion-free updates. Spinners keep rotating.",
+      "enable": "Enable chat animations"
+    },
+    "chatWidth": {
+      "sectionTitle": "Chat width",
+      "sectionDescription": "Maximum width of the conversation column and the composer. You can also drag the edges of the chat column to adjust it.",
+      "label": "Content width",
+      "default": "Default ({width}px)",
+      "hint": "Measured at 100% window zoom and scaled with it. Very wide values are limited to fit the window.",
+      "reset": "Reset to default"
+    },
     "workspaceBackground": {
       "sectionTitle": "Workspace background",
       "sectionDescription": "Show a picture behind the whole workspace. Sidebar and panels turn translucent and frosted so the image shows through, and a mask keeps text readable.",
@@ -2084,7 +2097,8 @@
         "assistant": "Assistant",
         "system": "System",
         "toolResult": "Result",
-        "toolError": "Error"
+        "toolError": "Error",
+        "turnFailed": "Turn failed"
       },
       "moreActions": "More actions",
       "copyText": "Copy Text",
@@ -2136,6 +2150,8 @@
     "conversationCard": {
       "untitledConversation": "Untitled conversation",
       "newConversation": "New Conversation",
+      "maximize": "Maximize",
+      "restore": "Restore",
       "attachToCurrentSession": "Add to session",
       "rename": "Rename",
       "status": "Status",
@@ -2365,6 +2381,9 @@
       "closeAll": "Close All",
       "hideTerminal": "Hide Terminal ({shortcut})",
       "openFolderFirst": "Open a folder first",
+      "processExited": "Process exited",
+      "processExitedWithCode": "Process exited (code {code})",
+      "unavailable": "Terminal session unavailable. It may have ended or the backend restarted.",
       "keybar": {
         "label": "Terminal virtual keys",
         "show": "Show virtual keys",
@@ -3547,6 +3566,7 @@
         "errorActionCommandCopied": "Copied",
         "emptyConversation": "No messages in this conversation.",
         "systemMessage": "System message",
+        "turnFailed": "Turn failed: {message}",
         "copyMessage": "Copy",
         "forkFromHere": "Fork from here",
         "forkBusy": "Can't fork while a turn is running",
@@ -3585,6 +3605,7 @@
         "jumpToPreviousUserMessage": "Jump to user message",
         "showMore": "Show more",
         "showLess": "Show less",
+        "resizeWidth": "Drag to resize the chat width · double-click to reset",
         "reasoningEffort": "Reasoning effort",
         "responseInterrupted": "Response interrupted",
         "waitingForSubagents": "Waiting for subagents...",
@@ -3753,6 +3774,7 @@
         "nameLabel": "Name:",
         "agentPromptLabel": "Prompt",
         "agentModelLabel": "Model",
+        "agentEffortLabel": "Effort",
         "agentRunning": "Running...",
         "agentLiveTranscript": "Live activity",
         "agentProgressTools": "{count} tool calls",
@@ -4547,7 +4569,25 @@
     "loading": "Loading...",
     "emptyDirectory": "This directory is empty",
     "errorLoadingDir": "Failed to load directory",
-    "permissionDenied": "Permission denied"
+    "permissionDenied": "Permission denied",
+    "newFolder": {
+      "button": "New folder",
+      "placeholder": "Folder name",
+      "create": "Create folder",
+      "location": "In {path}",
+      "errors": {
+        "empty": "Enter a name for the folder.",
+        "reservedName": "“{name}” can't be used as a folder name.",
+        "separator": "A folder name can't contain / or \\.",
+        "controlCharacter": "A folder name can't contain control characters or line breaks.",
+        "reservedCharacter": "A folder name can't contain {character}.",
+        "invalidParent": "A folder can't be created in {path}.",
+        "parentNotFound": "{path} no longer exists.",
+        "alreadyExists": "“{name}” already exists here.",
+        "permissionDenied": "You don't have permission to create a folder here.",
+        "failed": "Couldn't create the folder: {reason}"
+      }
+    }
   },
   "ServerFileBrowser": {
     "title": "Pick server file",
@@ -4941,6 +4981,7 @@
       "experts": "Experts",
       "science": "Science",
       "office": "Office Tools",
+      "ui": "UI",
       "custom": "Custom"
     },
     "actions": {
@@ -4949,6 +4990,25 @@
     },
     "toasts": {
       "openFolderFailed": "Failed to open folder"
+    }
+  },
+  "GenerativeUiSettings": {
+    "loading": "Loading…",
+    "category": "Generative UI",
+    "skillName": "UI Render",
+    "skillDescription": "Lets the agent answer with interactive cards, tables and charts in Codeg's chat.",
+    "usage": "Type /ui-render followed by your request, for example /ui-render list the changed files as a table. In Codex, use $ui-render. You can also just ask the agent to show something as cards, a table or a chart. An agent gets the skill in conversations started after you enable it.",
+    "conflict": "Your central skills folder already has a skill of your own named ui-render. Rename it on the Custom tab to use the built-in one.",
+    "notReadyHint": "Your own skill named ui-render is in the way. Rename it on the Custom tab.",
+    "badges": {
+      "nameTaken": "Name in use"
+    },
+    "states": {
+      "not_linked": "Not enabled",
+      "linked_to_codeg": "Enabled",
+      "linked_elsewhere": "Blocked — another link exists",
+      "blocked_by_real_directory": "Blocked — a custom skill occupies this name",
+      "broken": "Broken link"
     }
   },
   "QuickMessagesSettings": {
@@ -4987,6 +5047,97 @@
       "created": "Quick message created",
       "saved": "Quick message saved",
       "deleted": "Quick message deleted"
+    }
+  },
+  "ConversationTags": {
+    "tags": "Tags",
+    "moreTags": "{count, plural, one {# more tag} other {# more tags}}",
+    "addTags": "Add tags",
+    "editTags": "Edit tags",
+    "global": "Global",
+    "noTagsYet": "No tags yet",
+    "newTag": "New tag…",
+    "manageTags": "Manage tags…",
+    "branchChip": "Branch: {branch}",
+    "picker": {
+      "searchPlaceholder": "Search or create a tag…",
+      "noResults": "No matching tags",
+      "empty": "No tags yet. Type a name to create one.",
+      "createGlobal": "Create global tag “{name}”",
+      "createInFolder": "Create “{name}” in {folder}",
+      "otherFolders": "Other folders"
+    },
+    "form": {
+      "createTitle": "New tag",
+      "editTitle": "Edit tag",
+      "name": "Name",
+      "namePlaceholder": "e.g. bug, review, idea",
+      "color": "Color",
+      "customColor": "Custom color",
+      "scope": "Available in",
+      "scopeGlobal": "Every conversation",
+      "scopeFolder": "{folder} only",
+      "create": "Create",
+      "save": "Save",
+      "cancel": "Cancel"
+    },
+    "editor": {
+      "empty": "No tags here yet.",
+      "add": "New tag",
+      "edit": "Edit tag “{name}”",
+      "delete": "Delete tag “{name}”",
+      "dragToReorder": "Drag to reorder “{name}”",
+      "deleteTitle": "Delete this tag?",
+      "deleteDescription": "“{name}” will be taken off every conversation that has it. This can't be undone.",
+      "deleteConfirm": "Delete",
+      "deleteCancel": "Cancel",
+      "loadFailed": "Couldn't load tags"
+    },
+    "manager": {
+      "title": "Manage tags",
+      "description": "Label conversations with colored tags, then filter the sidebar by them.",
+      "branchTitle": "Branch tag",
+      "branchDescription": "Show the git branch each conversation started on as a tag after its title.",
+      "branchShow": "Show",
+      "branchLoadFailed": "Couldn't load the branch tag setting",
+      "globalTitle": "Global tags",
+      "globalDescription": "Available on every conversation, chat mode included.",
+      "folderTitle": "Folder tags",
+      "folderDescription": "Available only on the chosen folder's conversations, its worktrees included.",
+      "folderPlaceholder": "Choose a folder",
+      "noFolders": "No folders yet. Open one in the workspace to give it its own tags."
+    },
+    "filter": {
+      "button": "Filter by tags",
+      "searchPlaceholder": "Search tags…",
+      "match": "Match",
+      "matchAny": "Any",
+      "matchAll": "All",
+      "matchAnyHint": "Conversations with at least one of the selected tags",
+      "matchAllHint": "Conversations with every selected tag",
+      "modeAll": "Match all",
+      "modeAny": "Match any",
+      "clear": "Clear filter",
+      "noTags": "No tags yet. Add one from a conversation's menu.",
+      "noResults": "No matching tags",
+      "active": "Filtered by tags",
+      "noMatches": "No conversations with these tags",
+      "remove": "Remove “{name}” from the filter"
+    },
+    "toasts": {
+      "assignFailed": "Couldn't update the conversation's tags",
+      "createFailed": "Couldn't create the tag",
+      "deleteFailed": "Couldn't delete the tag",
+      "reorderFailed": "Couldn't save the tag order",
+      "branchTagFailed": "Couldn't save the branch tag"
+    },
+    "errors": {
+      "emptyName": "Enter a tag name",
+      "duplicateName": "A tag named “{name}” already exists here",
+      "invalidColor": "Pick a valid color",
+      "folderNotTaggable": "This folder can't have its own tags",
+      "notApplicable": "That tag belongs to another folder",
+      "tagNotFound": "That tag no longer exists"
     }
   },
   "Pet": {
@@ -5113,6 +5264,8 @@
     }
   },
   "RemoteWorkspace": {
+    "openLocalWorkspace": "Open local workspace",
+    "openLocalFailed": "Failed to open local workspace",
     "openRemoteWorkspace": "Open remote workspace",
     "manage": "Manage remote workspace",
     "manageTitle": "Remote Workspace connections",
@@ -7130,7 +7283,17 @@
       "invalidUrl": "Not a valid address",
       "profile": "Profile: {name}",
       "profileMenuLabel": "Open this page in another profile",
-      "profileDefault": "Default"
+      "profileDefault": "Default",
+      "device": "Device: {name}",
+      "deviceMenuLabel": "View as",
+      "deviceDesktop": "Desktop",
+      "deviceTablet": "Tablet",
+      "devicePhone": "Phone",
+      "deviceFill": "Full pane",
+      "deviceCustom": "Custom",
+      "deviceWidth": "Width",
+      "deviceHeight": "Height",
+      "deviceLaidOut": "Pane too small: laid out at {size}"
     },
     "status": {
       "popupDenied": "Pop-up blocked: {host}",

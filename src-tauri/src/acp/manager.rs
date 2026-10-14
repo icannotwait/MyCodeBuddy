@@ -6882,6 +6882,16 @@ impl ConnectionManager {
                         origin_cwd: Set(None),
                     };
                     let inserted = sibling.insert(txn).await?;
+                    // The sibling keeps the pre-fork history under the
+                    // original's name, so it keeps the original's tags too —
+                    // without them the user's tagging would appear to have
+                    // fallen off the conversation they forked FROM.
+                    crate::db::service::conversation_tag_service::copy_conversation_tags(
+                        txn,
+                        conversation_id,
+                        inserted.id,
+                    )
+                    .await?;
                     Ok(inserted.id)
                 })
             })
@@ -8008,6 +8018,15 @@ impl ConnectionManager {
     /// what `codeg-mcp` will pass through to `session/set_config_option`
     /// when a delegation actually fires.
     ///
+    /// `preferred_config_values` are applied on the probe session before the
+    /// snapshot is read, exactly as a real launch would apply them: an agent
+    /// that derives one option's choices from another's value (opencode
+    /// re-lists `effort` per selected model) then answers for the user's
+    /// selection instead of its own default. A value the agent rejects is
+    /// logged and skipped — the snapshot still comes back. Each applied
+    /// option itself still reports the agent's own pick as its current value
+    /// (see [`report_agent_chosen_values`]).
+    ///
     /// Returns `Ok(snapshot)` even when the agent advertises no options
     /// (empty `config_options`, `None` modes) — that's a valid outcome the
     /// UI can render as "this agent has nothing to configure."
@@ -8016,6 +8035,7 @@ impl ConnectionManager {
         agent_type: AgentType,
         working_dir: Option<String>,
         launch_inputs: AcpLaunchInputs,
+        preferred_config_values: BTreeMap<String, String>,
     ) -> Result<AgentOptionsSnapshot, AcpError> {
         // Owner window label is informational only (used for
         // disconnect_by_owner_window), but worth being explicit so a probe
@@ -8042,6 +8062,7 @@ impl ConnectionManager {
                 .clone()
         };
         let _probe_guard = per_agent_lock.lock_owned().await;
+        let applied_ids: Vec<String> = preferred_config_values.keys().cloned().collect();
         let conn_id = self
             .spawn_agent(
                 agent_type,
@@ -8051,7 +8072,7 @@ impl ConnectionManager {
                 owner_window,
                 EventEmitter::Noop,
                 None,
-                BTreeMap::new(),
+                preferred_config_values,
                 internal_probe_launch_context(),
                 None,
                 None,
@@ -8079,7 +8100,19 @@ impl ConnectionManager {
         // message over the generic ProbeTimedOut / ConnectionNotFound —
         // an agent that died on Initialize already explained why.
         let snapshot = match raw_snapshot {
-            Ok(s) => Ok(s),
+            Ok(mut s) => {
+                if !applied_ids.is_empty() {
+                    if let Some(state) = state_arc.as_ref() {
+                        let agent_chosen = state.read().await.agent_chosen_config_values.clone();
+                        report_agent_chosen_values(
+                            &mut s.config_options,
+                            &applied_ids,
+                            &agent_chosen,
+                        );
+                    }
+                }
+                Ok(s)
+            }
             Err(wait_err) => {
                 let captured = if let Some(state) = state_arc.as_ref() {
                     state.read().await.last_error.clone()
@@ -12227,6 +12260,42 @@ mod disconnect_origin {
     }
 }
 
+/// Make every option the probe applied a caller's selection to report the value
+/// the agent picked on its own, instead of that selection.
+///
+/// Every consumer of the probe's snapshot reads an option's current value as
+/// what it runs when the caller leaves it unset: the delegation settings panel
+/// names its "Default" choice after it, and the task and automation editors
+/// show and pin it for an option nobody touched. For an applied option that is
+/// the agent's own pick, which the session no longer holds once the selection
+/// is in — reporting the selection would label the user's model as the agent's
+/// default. The options the agent derived from the selection (opencode's
+/// `effort`, re-listed per model) keep the value it answered, because that is
+/// what they run when unset given the selection.
+///
+/// `agent_chosen` is the establishment's own answer
+/// (`SessionState::agent_chosen_config_values`). An applied id the agent never
+/// answered with, or the snapshot does not carry, is left alone.
+fn report_agent_chosen_values(
+    options: &mut [crate::acp::types::SessionConfigOptionInfo],
+    applied_ids: &[String],
+    agent_chosen: &BTreeMap<String, String>,
+) {
+    use crate::acp::types::SessionConfigKindInfo;
+    for option in options
+        .iter_mut()
+        .filter(|option| applied_ids.contains(&option.id))
+    {
+        let Some(chosen) = agent_chosen.get(&option.id) else {
+            continue;
+        };
+        match &mut option.kind {
+            SessionConfigKindInfo::Select(select) => select.current_value = chosen.clone(),
+            SessionConfigKindInfo::Boolean(boolean) => boolean.current_value = chosen == "true",
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -12239,6 +12308,73 @@ mod tests {
     use crate::acp::delegation::spawner::ConnectionSpawner;
     use crate::acp::plan_approval::PlanApprovalDecision;
     use crate::acp::session_attach::SessionAttachMode;
+
+    /// The probe applies the caller's model, so the session it reads holds that
+    /// model; the delegation panel names its "Default" choice after the
+    /// snapshot's current value. Model ids from a live opencode 2.0.24 probe:
+    /// the agent opened on `exo-free` and the caller asked for
+    /// `step-5-preview-free`. The agent's own effort differs from the one it
+    /// answered after the switch, so the test can tell which one survives.
+    #[test]
+    fn the_probe_reports_the_agents_own_pick_for_the_options_it_applied() {
+        use crate::acp::types::{
+            SessionConfigBooleanInfo, SessionConfigKindInfo, SessionConfigOptionInfo,
+            SessionConfigSelectInfo,
+        };
+        let option = |id: &str, kind: SessionConfigKindInfo| SessionConfigOptionInfo {
+            id: id.to_string(),
+            name: id.to_string(),
+            description: None,
+            category: None,
+            kind,
+            recommended_value: None,
+        };
+        let select = |current: &str| {
+            SessionConfigKindInfo::Select(SessionConfigSelectInfo {
+                current_value: current.to_string(),
+                options: Vec::new(),
+                groups: Vec::new(),
+            })
+        };
+        let current = |options: &[SessionConfigOptionInfo], id: &str| {
+            let option = options.iter().find(|o| o.id == id).expect("present");
+            match &option.kind {
+                SessionConfigKindInfo::Select(select) => select.current_value.clone(),
+                SessionConfigKindInfo::Boolean(boolean) => boolean.current_value.to_string(),
+            }
+        };
+        let mut options = vec![
+            option("model", select("opencode/step-5-preview-free")),
+            option("effort", select("default")),
+            option("mode", select("plan")),
+            option(
+                "auto_approve",
+                SessionConfigKindInfo::Boolean(SessionConfigBooleanInfo {
+                    current_value: true,
+                }),
+            ),
+        ];
+        let agent_chosen: BTreeMap<String, String> = [
+            ("model", "opencode/exo-free"),
+            ("effort", "high"),
+            ("mode", "build"),
+            ("auto_approve", "false"),
+        ]
+        .into_iter()
+        .map(|(id, value)| (id.to_string(), value.to_string()))
+        .collect();
+        // `provider` was applied but neither answered nor in the snapshot.
+        let applied = ["model", "auto_approve", "provider"].map(String::from);
+
+        report_agent_chosen_values(&mut options, &applied, &agent_chosen);
+
+        assert_eq!(current(&options, "model"), "opencode/exo-free");
+        assert_eq!(current(&options, "auto_approve"), "false");
+        // Not applied: what the agent answered GIVEN the selection stands — the
+        // default effort of the selected model, and a mode nobody asked for.
+        assert_eq!(current(&options, "effort"), "default");
+        assert_eq!(current(&options, "mode"), "plan");
+    }
 
     /// An agent that has left the connection map but not yet exited can still
     /// be appending to the transcript a restore is about to unlink, so the
@@ -23079,6 +23215,70 @@ mod tests {
                 .is_none(),
             "sibling must not receive a new auto-title job"
         );
+    }
+
+    #[tokio::test]
+    async fn fork_session_sibling_keeps_the_conversations_tags() {
+        use crate::db::service::conversation_tag_service;
+        use crate::db::test_helpers;
+        let db = test_helpers::fresh_in_memory_db().await;
+        let folder_id = test_helpers::seed_folder(&db, "/tmp/fork-tags").await;
+        let pre = conversation_service::create(
+            &db.conn,
+            folder_id,
+            AgentType::ClaudeCode,
+            Some("Tagged".into()),
+            None,
+        )
+        .await
+        .unwrap();
+        conversation_service::bind_external_id(&db.conn, pre.id, "session-S1", &[])
+            .await
+            .unwrap();
+        let global = conversation_tag_service::create_tag(&db.conn, None, "bug", "#d73a4a")
+            .await
+            .unwrap();
+        let owned =
+            conversation_tag_service::create_tag(&db.conn, Some(folder_id), "ui", "#0e8a16")
+                .await
+                .unwrap();
+        conversation_tag_service::update_conversation_tags(
+            &db.conn,
+            pre.id,
+            &[global.id, owned.id],
+            &[],
+        )
+        .await
+        .unwrap();
+
+        let (mgr, join) =
+            manager_with_fake_fork("c-fork-tags", pre.id, "session-S2", "session-S1").await;
+        let result = mgr
+            .fork_session(
+                &db,
+                fork_test_registry(&db).as_ref(),
+                "c-fork-tags",
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect("fork_session should succeed");
+        let _ = join.await;
+
+        let mut expected = vec![global.id, owned.id];
+        expected.sort_unstable();
+        let sibling = conversation_service::get_by_id(&db.conn, result.sibling_conversation_id)
+            .await
+            .unwrap();
+        assert_eq!(
+            sibling.tag_ids, expected,
+            "the pre-fork history keeps its tags"
+        );
+        let current = conversation_service::get_by_id(&db.conn, pre.id)
+            .await
+            .unwrap();
+        assert_eq!(current.tag_ids, expected, "the forked row keeps them too");
     }
 
     #[tokio::test]

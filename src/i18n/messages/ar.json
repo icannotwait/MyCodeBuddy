@@ -176,6 +176,19 @@
       "sectionDescription": "بطاقات الاختصار «تطوير الكود / الأعمال المكتبية» التي تظهر أعلى مربع الإدخال في صفحة المحادثة الجديدة.",
       "showQuickActions": "العرض في صفحة المحادثة الجديدة"
     },
+    "chatAnimations": {
+      "sectionTitle": "حركات المحادثة",
+      "sectionDescription": "حركات الطي/التوسيع واستدعاءات الأدوات وحالة العمل داخل منطقة المحادثة، إضافةً إلى التمرير السلس. عند الإيقاف تتحدّث الواجهة فورًا. تستمر مؤشرات التحميل في الدوران.",
+      "enable": "تفعيل حركات المحادثة"
+    },
+    "chatWidth": {
+      "sectionTitle": "عرض المحادثة",
+      "sectionDescription": "أقصى عرض لعمود المحادثة ومربع الإدخال. يمكنك أيضًا سحب حافتي منطقة المحادثة لضبطه.",
+      "label": "عرض المحتوى",
+      "default": "الافتراضي ({width}px)",
+      "hint": "تُقاس عند تكبير النافذة 100% وتتغيّر معه. تُقيَّد القيم الكبيرة جدًا لتناسب النافذة.",
+      "reset": "إعادة الضبط"
+    },
     "workspaceBackground": {
       "sectionTitle": "خلفية مساحة العمل",
       "sectionDescription": "عرض صورة خلف مساحة العمل بالكامل. يصبح الشريط الجانبي واللوحات شبه شفافة ومصنفرة لتظهر الصورة من خلالها، ويحافظ القناع على وضوح النص.",
@@ -2084,7 +2097,8 @@
         "assistant": "المساعد",
         "system": "النظام",
         "toolResult": "النتيجة",
-        "toolError": "خطأ"
+        "toolError": "خطأ",
+        "turnFailed": "فشلت الجولة"
       },
       "moreActions": "إجراءات إضافية",
       "copyText": "نسخ النص",
@@ -2136,6 +2150,8 @@
     "conversationCard": {
       "untitledConversation": "محادثة بدون عنوان",
       "newConversation": "محادثة جديدة",
+      "maximize": "تكبير",
+      "restore": "استعادة",
       "attachToCurrentSession": "إضافة إلى الجلسة",
       "rename": "إعادة تسمية",
       "status": "الحالة",
@@ -2365,6 +2381,9 @@
       "closeAll": "إغلاق الكل",
       "hideTerminal": "إخفاء الطرفية ({shortcut})",
       "openFolderFirst": "افتح مجلدا أولا",
+      "processExited": "انتهت العملية",
+      "processExitedWithCode": "انتهت العملية (الرمز {code})",
+      "unavailable": "جلسة الطرفية غير متاحة. ربما انتهت أو أُعيد تشغيل الخادم.",
       "keybar": {
         "label": "مفاتيح الطرفية الافتراضية",
         "show": "إظهار المفاتيح الافتراضية",
@@ -3547,6 +3566,7 @@
         "errorActionCommandCopied": "تم النسخ",
         "emptyConversation": "لا توجد رسائل في هذه المحادثة.",
         "systemMessage": "رسالة النظام",
+        "turnFailed": "فشلت هذه الجولة: {message}",
         "copyMessage": "نسخ",
         "forkFromHere": "تفريع من هنا",
         "forkBusy": "لا يمكن التفريع أثناء تنفيذ دور",
@@ -3585,6 +3605,7 @@
         "jumpToPreviousUserMessage": "الانتقال إلى رسالة المستخدم",
         "showMore": "عرض المزيد",
         "showLess": "طي",
+        "resizeWidth": "اسحب لتغيير عرض المحادثة · انقر مرتين للإعادة",
         "reasoningEffort": "جهد الاستدلال",
         "responseInterrupted": "تمت مقاطعة الاستجابة",
         "waitingForSubagents": "بانتظار الوكلاء الفرعيين…",
@@ -3753,6 +3774,7 @@
         "nameLabel": "الاسم:",
         "agentPromptLabel": "المطالبة",
         "agentModelLabel": "النموذج",
+        "agentEffortLabel": "مستوى التفكير",
         "agentRunning": "قيد التشغيل...",
         "agentLiveTranscript": "النشاط المباشر",
         "agentProgressTools": "{count} استدعاءات أدوات",
@@ -4547,7 +4569,25 @@
     "loading": "جاري التحميل...",
     "emptyDirectory": "هذا المجلد فارغ",
     "errorLoadingDir": "فشل في تحميل المجلد",
-    "permissionDenied": "تم رفض الإذن"
+    "permissionDenied": "تم رفض الإذن",
+    "newFolder": {
+      "button": "مجلد جديد",
+      "placeholder": "اسم المجلد",
+      "create": "إنشاء المجلد",
+      "location": "في {path}",
+      "errors": {
+        "empty": "أدخل اسمًا للمجلد.",
+        "reservedName": "لا يمكن استخدام «{name}» اسمًا لمجلد.",
+        "separator": "لا يمكن أن يحتوي اسم المجلد على / أو \\.",
+        "controlCharacter": "لا يمكن أن يحتوي اسم المجلد على أحرف تحكم أو فواصل أسطر.",
+        "reservedCharacter": "لا يمكن أن يحتوي اسم المجلد على {character}.",
+        "invalidParent": "لا يمكن إنشاء مجلد في {path}.",
+        "parentNotFound": "لم يعد {path} موجودًا.",
+        "alreadyExists": "«{name}» موجود هنا بالفعل.",
+        "permissionDenied": "ليس لديك إذن لإنشاء مجلد هنا.",
+        "failed": "تعذّر إنشاء المجلد: {reason}"
+      }
+    }
   },
   "ServerFileBrowser": {
     "title": "اختر ملفًا من الخادم",
@@ -4941,6 +4981,7 @@
       "experts": "الخبراء",
       "science": "البحث العلمي",
       "office": "أدوات المكتب",
+      "ui": "الواجهة",
       "custom": "مخصّصة"
     },
     "actions": {
@@ -4949,6 +4990,25 @@
     },
     "toasts": {
       "openFolderFailed": "فشل فتح المجلد"
+    }
+  },
+  "GenerativeUiSettings": {
+    "loading": "جارٍ التحميل…",
+    "category": "الواجهة التوليدية",
+    "skillName": "عرض الواجهة",
+    "skillDescription": "يتيح للوكيل الرد ببطاقات وجداول ورسوم بيانية تفاعلية في محادثة Codeg.",
+    "usage": "اكتب /ui-render متبوعًا بطلبك، مثل /ui-render اعرض الملفات المعدّلة في جدول. في Codex استخدم $ui-render. ويمكنك أيضًا أن تطلب من الوكيل مباشرةً عرض النتيجة كبطاقات أو جدول أو رسم بياني. تتوفر المهارة في المحادثات التي تبدأ بعد التفعيل.",
+    "conflict": "يحتوي مجلد المهارات المركزي بالفعل على مهارة خاصة بك باسم ui-render. أعد تسميتها من تبويب مخصّصة لاستخدام النسخة المدمجة.",
+    "notReadyHint": "مهارة خاصة بك باسم ui-render تشغل هذا الاسم. أعد تسميتها من تبويب مخصّصة.",
+    "badges": {
+      "nameTaken": "الاسم مستخدم"
+    },
+    "states": {
+      "not_linked": "غير مُفعَّل",
+      "linked_to_codeg": "مُفعَّل",
+      "linked_elsewhere": "محظور — يوجد رابط آخر",
+      "blocked_by_real_directory": "محظور — مهارة مخصصة تشغل هذا الاسم",
+      "broken": "رابط معطوب"
     }
   },
   "QuickMessagesSettings": {
@@ -4987,6 +5047,97 @@
       "created": "تم إنشاء الرسالة السريعة",
       "saved": "تم حفظ الرسالة السريعة",
       "deleted": "تم حذف الرسالة السريعة"
+    }
+  },
+  "ConversationTags": {
+    "tags": "الوسوم",
+    "moreTags": "{count} وسوم أخرى",
+    "addTags": "إضافة وسوم",
+    "editTags": "تعديل الوسوم",
+    "global": "عامة",
+    "noTagsYet": "لا توجد وسوم بعد",
+    "newTag": "وسم جديد…",
+    "manageTags": "إدارة الوسوم…",
+    "branchChip": "الفرع: {branch}",
+    "picker": {
+      "searchPlaceholder": "ابحث عن وسم أو أنشئ وسمًا…",
+      "noResults": "لا توجد وسوم مطابقة",
+      "empty": "لا توجد وسوم بعد. اكتب اسمًا لإنشاء وسم.",
+      "createGlobal": "إنشاء الوسم العام «{name}»",
+      "createInFolder": "إنشاء «{name}» في {folder}",
+      "otherFolders": "مجلدات أخرى"
+    },
+    "form": {
+      "createTitle": "وسم جديد",
+      "editTitle": "تعديل الوسم",
+      "name": "الاسم",
+      "namePlaceholder": "مثلًا: bug، مراجعة، فكرة",
+      "color": "اللون",
+      "customColor": "لون مخصص",
+      "scope": "متاح في",
+      "scopeGlobal": "كل المحادثات",
+      "scopeFolder": "{folder} فقط",
+      "create": "إنشاء",
+      "save": "حفظ",
+      "cancel": "إلغاء"
+    },
+    "editor": {
+      "empty": "لا توجد وسوم هنا بعد.",
+      "add": "وسم جديد",
+      "edit": "تعديل الوسم «{name}»",
+      "delete": "حذف الوسم «{name}»",
+      "dragToReorder": "اسحب لإعادة ترتيب «{name}»",
+      "deleteTitle": "حذف هذا الوسم؟",
+      "deleteDescription": "ستتم إزالة «{name}» من كل المحادثات التي تحمله. لا يمكن التراجع عن ذلك.",
+      "deleteConfirm": "حذف",
+      "deleteCancel": "إلغاء",
+      "loadFailed": "تعذّر تحميل الوسوم"
+    },
+    "manager": {
+      "title": "إدارة الوسوم",
+      "description": "ضع وسومًا ملونة على المحادثات، ثم صفِّ الشريط الجانبي بحسبها.",
+      "branchTitle": "وسم الفرع",
+      "branchDescription": "يعرض فرع Git الذي بدأت عليه كل محادثة كوسم بعد عنوانها.",
+      "branchShow": "إظهار",
+      "branchLoadFailed": "تعذّر تحميل إعداد وسم الفرع",
+      "globalTitle": "الوسوم العامة",
+      "globalDescription": "متاحة في كل المحادثات، بما فيها وضع الدردشة.",
+      "folderTitle": "وسوم المجلد",
+      "folderDescription": "متاحة فقط في محادثات المجلد المختار، بما فيها أشجار العمل التابعة له.",
+      "folderPlaceholder": "اختر مجلدًا",
+      "noFolders": "لا توجد مجلدات بعد. افتح مجلدًا في مساحة العمل لتمنحه وسومه الخاصة."
+    },
+    "filter": {
+      "button": "تصفية حسب الوسوم",
+      "searchPlaceholder": "ابحث في الوسوم…",
+      "match": "المطابقة",
+      "matchAny": "أيٌّ منها",
+      "matchAll": "كلها",
+      "matchAnyHint": "المحادثات التي تحمل وسمًا واحدًا على الأقل من الوسوم المختارة",
+      "matchAllHint": "المحادثات التي تحمل كل الوسوم المختارة",
+      "modeAll": "كلها معًا",
+      "modeAny": "أيٌّ منها",
+      "clear": "مسح التصفية",
+      "noTags": "لا توجد وسوم بعد. أضف وسمًا من قائمة أي محادثة.",
+      "noResults": "لا توجد وسوم مطابقة",
+      "active": "مُصفّى حسب الوسوم",
+      "noMatches": "لا توجد محادثات تحمل هذه الوسوم",
+      "remove": "إزالة «{name}» من التصفية"
+    },
+    "toasts": {
+      "assignFailed": "تعذّر تحديث وسوم المحادثة",
+      "createFailed": "تعذّر إنشاء الوسم",
+      "deleteFailed": "تعذّر حذف الوسم",
+      "reorderFailed": "تعذّر حفظ ترتيب الوسوم",
+      "branchTagFailed": "تعذّر حفظ وسم الفرع"
+    },
+    "errors": {
+      "emptyName": "أدخل اسمًا للوسم",
+      "duplicateName": "يوجد هنا وسم باسم «{name}» بالفعل",
+      "invalidColor": "اختر لونًا صالحًا",
+      "folderNotTaggable": "لا يمكن أن تكون لهذا المجلد وسوم خاصة",
+      "notApplicable": "هذا الوسم يخص مجلدًا آخر",
+      "tagNotFound": "هذا الوسم لم يعد موجودًا"
     }
   },
   "Pet": {
@@ -5113,6 +5264,8 @@
     }
   },
   "RemoteWorkspace": {
+    "openLocalWorkspace": "فتح مساحة العمل المحلية",
+    "openLocalFailed": "تعذر فتح مساحة العمل المحلية",
     "openRemoteWorkspace": "Open remote workspace",
     "manage": "Manage remote workspace",
     "manageTitle": "Remote Workspace connections",
@@ -7130,7 +7283,17 @@
       "invalidUrl": "عنوان غير صالح",
       "profile": "الملف الشخصي: {name}",
       "profileMenuLabel": "فتح هذه الصفحة في ملف شخصي آخر",
-      "profileDefault": "الافتراضي"
+      "profileDefault": "الافتراضي",
+      "device": "الجهاز: {name}",
+      "deviceMenuLabel": "العرض كـ",
+      "deviceDesktop": "سطح المكتب",
+      "deviceTablet": "جهاز لوحي",
+      "devicePhone": "هاتف",
+      "deviceFill": "اللوحة بالكامل",
+      "deviceCustom": "مخصص",
+      "deviceWidth": "العرض",
+      "deviceHeight": "الارتفاع",
+      "deviceLaidOut": "اللوحة صغيرة جدًا: التخطيط بحجم {size}"
     },
     "status": {
       "popupDenied": "تم حظر نافذة منبثقة: {host}",

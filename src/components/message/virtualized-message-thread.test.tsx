@@ -772,19 +772,49 @@ describe("VirtualizedMessageThread focus origin", () => {
     scrollEl.remove()
   })
 
-  it("marks pointer-origin focus and clears it on blur", () => {
-    const { content, viewport, styledViewport } = renderFocusThread()
+  it("marks pointer-origin focus and clears it once focus moves away", () => {
+    vi.useFakeTimers()
+    const other = document.createElement("button")
+    document.body.appendChild(other)
+    try {
+      const { content, viewport, styledViewport } = renderFocusThread()
 
-    dispatchPointerDown(content)
+      dispatchPointerDown(content)
 
-    expect(document.activeElement).toBe(viewport)
-    expect(viewport).toHaveAttribute("data-focus-origin", "pointer")
-    expect(styledViewport.className).toContain(
-      "data-[focus-origin=pointer]:focus-visible:ring-0"
-    )
+      expect(document.activeElement).toBe(viewport)
+      expect(viewport).toHaveAttribute("data-focus-origin", "pointer")
+      expect(styledViewport.className).toContain(
+        "data-[focus-origin=pointer]:focus-visible:ring-0"
+      )
 
-    fireEvent.blur(viewport)
-    expect(viewport).not.toHaveAttribute("data-focus-origin")
+      other.focus()
+      vi.runAllTimers()
+      expect(viewport).not.toHaveAttribute("data-focus-origin")
+    } finally {
+      other.remove()
+      vi.useRealTimers()
+    }
+  })
+
+  it("keeps the pointer marker when only the window loses focus", () => {
+    vi.useFakeTimers()
+    try {
+      const { content, viewport } = renderFocusThread()
+
+      dispatchPointerDown(content)
+
+      // Switching apps blurs the viewport but leaves it the active element;
+      // the browser re-focuses it when the window comes back.
+      fireEvent.blur(viewport)
+      vi.runAllTimers()
+      expect(document.activeElement).toBe(viewport)
+      expect(viewport).toHaveAttribute("data-focus-origin", "pointer")
+
+      fireEvent.focus(window)
+      expect(viewport).toHaveAttribute("data-focus-origin", "pointer")
+    } finally {
+      vi.useRealTimers()
+    }
   })
 
   it("clears the pointer marker on keyboard input so the ring returns", () => {

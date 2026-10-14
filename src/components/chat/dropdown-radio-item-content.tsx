@@ -14,23 +14,37 @@ interface DropdownRadioItemContentProps {
    *  leaf renders arrives the same way, and the callers all hold a translator
    *  already. */
   recommendedLabel?: string | null
+  /** What goes after the label when it names a command that takes an argument
+   *  (`[reconnect]`), shown in the label's line. It gives way first when the
+   *  line is short, so a long hint never squeezes the label away. */
+  hint?: string | null
 }
 
 export function DropdownRadioItemContent({
   label,
   description,
   recommendedLabel,
+  hint,
 }: DropdownRadioItemContentProps) {
   const normalizedDescription = description?.trim()
   const badge = recommendedLabel?.trim()
+  const normalizedHint = hint?.trim()
 
   return (
-    <div className="w-full min-w-0 pr-2" title={label}>
+    <div
+      className="w-full min-w-0 pr-2"
+      title={normalizedHint ? `${label} ${normalizedHint}` : label}
+    >
       {/* break-all: Cursor compound model ids are long single tokens
           (`…[…,effort=high]`); truncate would hide the distinguishing suffix.
           The badge is `shrink-0` so a long name cannot squeeze the chip away. */}
       <div className="flex min-w-0 items-center gap-1.5">
         <p className="min-w-0 break-all whitespace-normal">{label}</p>
+        {normalizedHint ? (
+          <span className="min-w-0 shrink-[3] truncate font-mono text-xs text-muted-foreground">
+            {normalizedHint}
+          </span>
+        ) : null}
         {badge ? (
           <Badge variant="outline" className="px-1 text-3xs font-normal">
             {badge}

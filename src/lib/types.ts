@@ -322,6 +322,14 @@ export type ContentBlock =
     }
   | { type: "thinking"; text: string }
   /**
+   * The turn FAILED, in the agent's own words. Mirror of Rust
+   * `ContentBlock::TurnError`: a parser puts it alone in a `system` turn
+   * closing the round, and the live stream does the same with the failure the
+   * adapter reported (`buildStreamingTurnsFromLiveMessage`). Drawn as one muted
+   * line, never as a reply.
+   */
+  | { type: "turn_error"; message: string }
+  /**
    * Frontend-only, LIVE-stream synthetic block. It is NEVER persisted and
    * NEVER emitted by the Rust JSONL parsers — the persisted plan path is a
    * `TodoWrite` tool_use block. It exists purely so a live plan can survive
@@ -567,6 +575,51 @@ export type FolderGroupChange =
 export const FOLDER_GROUP_CHANGED_EVENT = "folder-group://changed"
 
 /**
+ * A conversation tag: a label (name + one colour) the user can put on
+ * conversations, several per conversation.
+ *
+ * `folder_id` is the tag's scope: `null` for a GLOBAL tag, offered on every
+ * conversation (chat-mode ones included); otherwise the ROOT folder that owns
+ * it, offered only on that folder's conversations and its worktrees'. A
+ * worktree child never owns tags — creating one there lands on its root.
+ *
+ * `color` is always a normalized `#rrggbb`; both theme treatments are derived
+ * from it (see `tagChipStyle`). `sort_order` is the position within the scope.
+ */
+export interface ConversationTagDetail {
+  id: number
+  folder_id: number | null
+  name: string
+  color: string
+  sort_order: number
+}
+
+/**
+ * The branch tag: every conversation's `git_branch` drawn as a chip beside its
+ * tags — whether at all, and in which colour (normalized `#rrggbb`). One
+ * setting for the whole app. Mirrors the Rust `ConversationBranchTag`.
+ */
+export interface ConversationBranchTag {
+  enabled: boolean
+  color: string
+}
+
+/**
+ * Payload for `conversation-tag://changed` — tag DEFINITIONS, plus the branch
+ * tag setting. Which tags a conversation carries rides on
+ * `conversation://changed` instead (the summary's `tag_ids`). `reordered`
+ * carries nothing on purpose: re-read the list. Mirrors the Rust
+ * `ConversationTagChange` (serde `tag = "kind"`).
+ */
+export type ConversationTagChange =
+  | { kind: "upsert"; tag: ConversationTagDetail }
+  | { kind: "deleted"; id: number }
+  | { kind: "reordered" }
+  | { kind: "branch_tag"; setting: ConversationBranchTag }
+
+export const CONVERSATION_TAG_CHANGED_EVENT = "conversation-tag://changed"
+
+/**
  * Result of `createChatConversation`: the new conversation id plus the hidden
  * chat folder backing it, so the caller can drop the folder straight into
  * `allFolders` (resolving cwd / active-folder) without a refetch.
@@ -642,6 +695,14 @@ export interface DbConversationSummary {
   /** Working directory this conversation ran in when it differs from the
    *  current folder path (set after a removed task worktree re-parent). */
   origin_cwd?: string | null
+  /**
+   * Ids of the {@link ConversationTagDetail tags} on this conversation,
+   * ascending. Absent when it has none (the backend omits an empty list). May
+   * name a tag this client has already seen deleted — the tag-deleted broadcast
+   * is not followed by per-conversation upserts — so always resolve ids against
+   * the tag store and skip unknown ones rather than trusting the count.
+   */
+  tag_ids?: number[]
 }
 
 export interface ConversationStatePatch {
@@ -5998,15 +6059,24 @@ export interface TerminalEvent {
    *  snapshot already contains (`seq <= snapshot.seq`). Absent on the exit
    *  event, which carries no output. */
   seq?: number
+  generation?: string
 }
 
-/** Recent output of a live terminal plus the cursor it was read at. `alive`
- *  false means no such terminal is running — the caller should spawn one
- *  rather than attach. */
+/** Recent output of a live or completed terminal.
+ *  When `alive` is false, `exists` distinguishes retained final output
+ *  from a missing session. */
 export interface TerminalSnapshot {
+  /** False after a backend restart or explicit close. Absent on old servers. */
+  exists?: boolean
+  /** Process exit code when a completed PTY reported one. */
+  exit_code?: number | null
+  generation?: string | null
   alive: boolean
   data: string
   seq: number
+  /** The PTY's size, which `data` was laid out for. Absent on old servers. */
+  cols?: number | null
+  rows?: number | null
 }
 
 export interface TokenBreakdown {

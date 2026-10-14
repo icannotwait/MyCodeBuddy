@@ -61,6 +61,8 @@ export interface AppWorkspaceStoreState {
    * group hasn't arrived — would render a half-built sidebar.
    */
   folderGroups: FolderGroupDetail[]
+  /** True only after a successful folder snapshot, so an offline start cannot
+   * mistake an unknown folder list for deleted folders and prune drafts. */
   foldersHydrated: boolean
   foldersLoading: boolean
 
@@ -122,7 +124,7 @@ export interface AppWorkspaceStoreState {
   updateConversationLocal: (
     id: number,
     patch: Partial<
-      Pick<DbConversationSummary, "status" | "title" | "pinned_at">
+      Pick<DbConversationSummary, "status" | "title" | "pinned_at" | "tag_ids">
     >
   ) => void
   /**
@@ -534,6 +536,7 @@ export const useAppWorkspaceStore = create<AppWorkspaceStoreState>()(
           allFolders: allList,
           folderGroups: groupList,
           branches,
+          foldersHydrated: true,
         })
       } catch (err) {
         if (requestId !== latestFolderFetchRequest) return
@@ -541,7 +544,7 @@ export const useAppWorkspaceStore = create<AppWorkspaceStoreState>()(
       } finally {
         // Superseded requests must not clear loading for a newer in-flight fetch.
         if (requestId === latestFolderFetchRequest) {
-          set({ foldersLoading: false, foldersHydrated: true })
+          set({ foldersLoading: false })
         }
       }
     },
@@ -622,8 +625,9 @@ export const useAppWorkspaceStore = create<AppWorkspaceStoreState>()(
       }
       // `stats` (computeStats) depends ONLY on the conversation count and each
       // row's agent_type/message_count. This path replaces a row IN PLACE (count
-      // never changes), and the patch type is restricted to status/title/pinned_at
-      // — none of which is a stat input — so a patch here can never move a stat.
+      // never changes), and the patch type is restricted to status/title/
+      // pinned_at/tag_ids — none of which is a stat input — so a patch here can
+      // never move a stat.
       // Reuse the existing `stats` reference instead of recomputing O(n) and
       // minting a fresh object: otherwise every turn-boundary
       // `conversation_status_changed` tick (one per turn start/stop, per running

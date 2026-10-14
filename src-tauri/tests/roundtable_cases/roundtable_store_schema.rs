@@ -283,7 +283,14 @@ async fn registered_migration_is_idempotent_and_preserves_old_sessions() {
         DurabilityProfile::ProcessCrashRecovery
     );
 
-    Migrator::down(&conn, Some(1))
+    // Roll back the roundtable migration and every migration registered after it.
+    let migrations = Migrator::migrations();
+    let roundtable_index = migrations
+        .iter()
+        .position(|migration| migration.name() == ROUNDTABLE_MIGRATION_NAME)
+        .expect("roundtable migration registered");
+    let steps = (migrations.len() - roundtable_index) as u32;
+    Migrator::down(&conn, Some(steps))
         .await
         .expect("roll back roundtable migration");
     assert_eq!(rt_table_count(&conn).await, 0);

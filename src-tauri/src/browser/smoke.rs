@@ -262,6 +262,7 @@ async fn execute(app: &AppHandle, cmd: &Value) -> Result<Value, String> {
                         .and_then(Value::as_bool)
                         .unwrap_or(false),
                     profile,
+                    zoom: cmd.get("zoom").and_then(Value::as_f64),
                 },
             )
             .map_err(err_string)?;
@@ -348,6 +349,25 @@ async fn execute(app: &AppHandle, cmd: &Value) -> Result<Value, String> {
                 &registry,
                 &str_arg(cmd, "tab_id")?,
                 bounds_arg(cmd)?,
+                cmd.get("zoom").and_then(Value::as_f64),
+            )
+            .map_err(err_string)?;
+            Ok(Value::Null)
+        }
+        "browser_set_window_viewport" => {
+            let viewport = match (
+                cmd.get("width").and_then(Value::as_f64),
+                cmd.get("height").and_then(Value::as_f64),
+            ) {
+                (Some(width), Some(height)) => {
+                    Some(crate::browser::types::ViewportSize { width, height })
+                }
+                _ => None,
+            };
+            browser_commands::set_window_viewport_core(
+                &registry,
+                &str_arg(cmd, "tab_id")?,
+                viewport,
             )
             .map_err(err_string)?;
             Ok(Value::Null)

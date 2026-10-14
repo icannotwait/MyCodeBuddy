@@ -11,6 +11,8 @@ pub use super::chat_channel_message_log::Entity as ChatChannelMessageLog;
 pub use super::chat_channel_sender_context::Entity as ChatChannelSenderContext;
 pub use super::chat_channel_thread_binding::Entity as ChatChannelThreadBinding;
 pub use super::conversation::Entity as Conversation;
+pub use super::conversation_tag::Entity as ConversationTag;
+pub use super::conversation_tag_link::Entity as ConversationTagLink;
 pub use super::custom_agent::Entity as CustomAgent;
 pub use super::delegation_attention_request::Entity as DelegationAttentionRequest;
 pub use super::delegation_completion_tool_intent::Entity as DelegationCompletionToolIntent;

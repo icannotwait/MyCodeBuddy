@@ -24,11 +24,11 @@ pub use canvas::{CanvasBoard, CanvasBoardSummary, CanvasMutation, CanvasNode, Ca
 #[allow(unused_imports)]
 pub use chat_channel::{ChannelStatusInfo, ChatChannelInfo, ChatChannelMessageLogInfo};
 pub use conversation::{
-    AgentConversationCount, AgentStats, ConversationDetail, ConversationStatePatch,
-    ConversationSummary, ConversationTurnsPage, DbConversationDetail, DbConversationSummary,
-    FolderInfo, HistoryWindowInfo, ImportFolderOutcome, ImportResult, ImportSelectedResult,
-    ScanFolder, ScanResult, ScanSession, ScanSessionStatus, SelectedSessionKey, SessionStats,
-    SidebarData,
+    AgentConversationCount, AgentStats, ConversationBranchTag, ConversationDetail,
+    ConversationStatePatch, ConversationSummary, ConversationTagDetail, ConversationTurnsPage,
+    DbConversationDetail, DbConversationSummary, FolderInfo, HistoryWindowInfo,
+    ImportFolderOutcome, ImportResult, ImportSelectedResult, ScanFolder, ScanResult, ScanSession,
+    ScanSessionStatus, SelectedSessionKey, SessionStats, SidebarData,
 };
 pub use delegate_access::{DelegateAccessMode, DelegateAccessReason, DelegateAccessState};
 pub use folder::{

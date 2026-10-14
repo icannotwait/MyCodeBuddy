@@ -139,12 +139,13 @@ pub async fn run_preflight(
 /// diagnostics report, which bounds every command with `DIAG_PROBE_TIMEOUT`.
 ///
 /// The two lookups run concurrently because either can fall through to
-/// `resolve_npx_command`'s `npm prefix -g` probe (only when `which` misses), and
-/// a FAILED prefix resolution is never cached — `cached_npm_global_prefix_with`
-/// short-circuits on `None` before it reaches `OnceCell::set`. On a machine
-/// where that probe stalls, running these in sequence would pay
-/// `NPM_PREFIX_TIMEOUT` twice per adapter agent; overlapping them costs the same
-/// two spawns but bounds the added Settings latency to one timeout.
+/// `resolve_npx_command`'s `npm prefix -g` probe (only when `which` and
+/// `~/.local/bin` both miss), and a FAILED prefix resolution is never cached —
+/// `cached_npm_global_prefix_with` short-circuits on `None` before it reaches
+/// `OnceCell::set`. On a machine where that probe stalls, running these in
+/// sequence would pay `NPM_PREFIX_TIMEOUT` twice per adapter agent; overlapping
+/// them costs the same two spawns but bounds the added Settings latency to one
+/// timeout.
 async fn probe_adapter(meta: &AcpAgentMeta) -> Option<AdapterInfo> {
     let relation = registry::acp_adapter_relation(meta.agent_type)?;
     let adapter_cmd = match &meta.distribution {
@@ -413,7 +414,7 @@ async fn check_npm_environment(node_required: Option<&str>) -> Vec<CheckItem> {
 
 /// Parse a Node.js version string like "v20.19.0" or "20.19.0" into (major, minor, patch).
 /// Handles pre-release suffixes such as "v22.0.0-nightly" by stripping non-numeric tails.
-fn parse_node_version(v: &str) -> Option<(u32, u32, u32)> {
+pub(crate) fn parse_node_version(v: &str) -> Option<(u32, u32, u32)> {
     let v = v.trim().trim_start_matches('v');
     let mut parts = v.splitn(3, '.');
     let major = parts.next()?.parse().ok()?;
@@ -900,7 +901,7 @@ mod adapter_tests {
         );
         assert_eq!(
             info.adapter_package,
-            "@agentclientprotocol/claude-agent-acp@0.85.1"
+            "@agentclientprotocol/claude-agent-acp@0.89.1"
         );
         assert_eq!(info.adapter_cmd, "claude-agent-acp");
         assert!(!info.adapter_installed);
