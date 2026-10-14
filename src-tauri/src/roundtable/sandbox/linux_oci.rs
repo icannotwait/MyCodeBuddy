@@ -1167,16 +1167,18 @@ pub(crate) fn copy_credential_into_scratch(
     destination: &std::path::Path,
 ) -> std::io::Result<()> {
     use std::io::Write;
-    use std::os::unix::fs::OpenOptionsExt;
     let bytes = fs::read(source)?;
     if fs::symlink_metadata(destination).is_ok() {
         fs::remove_file(destination)?;
     }
-    let mut file = fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(destination)?;
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(destination)?;
     file.write_all(&bytes)?;
     file.sync_all()
 }
@@ -5408,7 +5410,7 @@ mod workspace_mount_tests {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod credential_copy_tests {
     use super::copy_credential_into_scratch;
     use std::os::unix::fs::PermissionsExt;
