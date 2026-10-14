@@ -1752,6 +1752,12 @@ async fn prepare_turn(
     })
 }
 
+/// Member attempt budget the workbench sends as `timeouts.attempt_timeout`
+/// (`MEMBER_ATTEMPT_TIMEOUT_MS` in roundtable-workbench.tsx). Qualification
+/// probes use the same per-step deadline so an adapter is not rejected for
+/// latency a real room would accept.
+pub(crate) const MEMBER_ATTEMPT_TIMEOUT_MS: u64 = 225_000;
+
 /// Synthesis has no per-attempt time limit (operator choice): the moderator
 /// runs until it ends its turn, the room's active-time budget runs out, or an
 /// operator stops/pauses the room. Its `deadline` is the room deadline (see
@@ -2178,15 +2184,30 @@ mod synthesis_limit_tests {
     #[test]
     fn synthesis_attempt_runs_to_the_room_deadline() {
         assert_eq!(
-            attempt_deadline(PhaseKind::Synthesis, 1_800_000, 1_000, 225_000),
+            attempt_deadline(
+                PhaseKind::Synthesis,
+                1_800_000,
+                1_000,
+                MEMBER_ATTEMPT_TIMEOUT_MS
+            ),
             1_800_000
         );
         assert_eq!(
-            attempt_deadline(PhaseKind::Proposal, 1_800_000, 1_000, 225_000),
+            attempt_deadline(
+                PhaseKind::Proposal,
+                1_800_000,
+                1_000,
+                MEMBER_ATTEMPT_TIMEOUT_MS
+            ),
             226_000
         );
         assert_eq!(
-            attempt_deadline(PhaseKind::Critique, 100_000, 1_000, 225_000),
+            attempt_deadline(
+                PhaseKind::Critique,
+                100_000,
+                1_000,
+                MEMBER_ATTEMPT_TIMEOUT_MS
+            ),
             100_000
         );
     }

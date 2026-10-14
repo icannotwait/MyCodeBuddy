@@ -457,6 +457,11 @@ pub async fn measure_host(request: &ProbeRequest) -> ProbeFacts {
     facts
 }
 
+/// Per-step ACP deadline for qualification probes: the same budget a room
+/// gives one member attempt, so probes do not fail on latency rooms accept.
+pub(crate) const PROBE_STEP_DEADLINE: Duration =
+    Duration::from_millis(super::owned_runtime::MEMBER_ATTEMPT_TIMEOUT_MS);
+
 fn empty_facts(agent: &str) -> ProbeFacts {
     ProbeFacts {
         agent: agent.to_string(),
@@ -1341,7 +1346,7 @@ async fn rpc(
             params,
             seq: &mut seq,
             assistant: None,
-            deadline: Some(Duration::from_secs(90)),
+            deadline: Some(PROBE_STEP_DEADLINE),
             rejected_permission: &rejected,
             private_log,
             trace,
@@ -2674,5 +2679,17 @@ mod host_auth_mounts {
             fs::read(upper.join(".gemini/antigravity-acp/settings.json")).expect("still empty"),
             b""
         );
+    }
+}
+
+#[cfg(test)]
+mod probe_deadline_tests {
+    #[test]
+    fn probe_step_deadline_matches_the_member_attempt_budget() {
+        assert_eq!(
+            super::PROBE_STEP_DEADLINE.as_millis(),
+            u128::from(super::super::owned_runtime::MEMBER_ATTEMPT_TIMEOUT_MS)
+        );
+        assert_eq!(super::PROBE_STEP_DEADLINE.as_secs(), 225);
     }
 }
