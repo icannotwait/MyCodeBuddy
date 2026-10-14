@@ -1878,11 +1878,20 @@ fn append_host_auth_mounts(
         {
             return Err("auth mount point must stay an empty placeholder".into());
         }
+        // Same access as the live plan: profiles mark files the agent must
+        // not rewrite (Codex runs an unsandboxed shell) as read-only.
+        let read_only = profile.is_some_and(|profile| {
+            profile
+                .auth_files
+                .iter()
+                .any(|file| file.destination == destination.as_str() && file.read_only)
+        });
+        let access = if read_only { "ro" } else { "rw" };
         oci_mounts.push(serde_json::json!({
             "destination": destination,
             "type": "bind",
             "source": source,
-            "options": ["bind", "rw", "nosuid", "nodev"]
+            "options": ["bind", access, "nosuid", "nodev"]
         }));
     }
     Ok(())
