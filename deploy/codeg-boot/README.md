@@ -82,17 +82,31 @@ Roundtable members run in crun containers under
 `codeg-roundtable/launcher` with one narrow `sudo -n tee`. Missing cgroup is a
 no-op; a failed join only warns.
 
+## Immediate 1033 recovery
+
+Outside a wake, a 530 whose body names Cloudflare error **1033** while the
+local UI answers and cloudflared is running restarts cloudflared on the
+**first** failure instead of waiting for `PUBLIC_FAIL_THRESHOLD`. The normal
+cooldown/backoff and daily cap still apply. Set `PUBLIC_1033_IMMEDIATE=0` in
+`local.env` to keep the threshold. Simulated tests:
+`bash deploy/codeg-boot/tests/test-watchdog-wake.sh`.
+
 ## Resume / wake recovery
 
 The box VM is paused when idle. Wall clock keeps running, but uptime and the
 monotonic clock freeze, and on resume cloudflared (http2) still believes its 4
 connections are up while the edge has dropped them (530/1033). The watchdog
-therefore measures each loop **sleep** on the wall clock (loop work is not
-counted, so a slow WebDAV rebuild is never a "wake"):
+therefore watches the wall clock in two places:
 
 - Sleep took more than `WAKE_GAP_THRESHOLD` (default **180 s** for a 60 s
-  sleep): log `resume detected gap=Ns` and probe the public edge on the very
-  next iteration.
+  sleep): log `resume detected gap=Ns (sleep took ...)` and probe the public
+  edge on the very next iteration, before the slow WebDAV/Tailscale steps.
+- The pause can also land mid-iteration (e.g. inside a start script's health
+  wait). At the end of each iteration the time since the previous loop end,
+  minus the sleep, is compared with the same threshold; if exceeded it logs
+  `resume detected ... (loop iteration took ...)`, discards the stale
+  pre-freeze public result and re-probes immediately, before logging status.
+  A genuinely slow step can trip this too; that only costs one extra probe.
 - A failing probe (530 / 1033 / connect failure with local UI ok) is confirmed
   by **one re-probe** after `WAKE_REPROBE_DELAY` (10 s), which also lets a
   self-reconnecting cloudflared recover without a restart. If it still fails,
