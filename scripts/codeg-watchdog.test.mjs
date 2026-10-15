@@ -889,11 +889,17 @@ sleep() {
   )
   assert.equal(result.status, 0, result.stderr)
   assert.equal(result.stderr, "")
-  assert.match(result.log, /resume detected gap=1500s \(loop iteration took 1560s, expected 60s\)/)
+  assert.match(
+    result.log,
+    /resume detected gap=1500s \(loop iteration took 1560s, expected 60s\)/
+  )
   assert.doesNotMatch(result.log, /\(slept/)
   assert.equal(result.starts.match(/1 --force/g)?.length, 1)
   // The status line after the freeze must not carry the pre-freeze public=ok.
-  const status = result.log.trim().split("\n").filter((l) => / 3080=/.test(l))
+  const status = result.log
+    .trim()
+    .split("\n")
+    .filter((l) => / 3080=/.test(l))
   assert.equal(status.length, 2)
   assert.match(status[0], /public=ok/)
   assert.doesNotMatch(status[1], /public=ok/)
