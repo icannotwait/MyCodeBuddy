@@ -86,7 +86,7 @@ sleep() { echo $(($(cat "$T/clock") + ${1%.*} + 3000)) >"$T/clock"; echo zombie 
 watchdog_sleep
 sleep() { echo $(($(cat "$T/clock") + ${1%.*})) >"$T/clock"; }
 watchdog_iteration
-[ "$(grep -c 'resume detected' "$LOG")" = 1 ] && grep -q '(sleep took' "$LOG"; check "sleep freeze detected once" $?
+[ "$(grep -c 'resume detected' "$LOG")" = 1 ] && grep -q '(slept' "$LOG"; check "sleep freeze detected once" $?
 [ "$(restarts)" = 1 ]; check "sleep freeze restarts once" $?
 rm -rf "$T"
 

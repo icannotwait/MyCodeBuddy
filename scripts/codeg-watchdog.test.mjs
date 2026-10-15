@@ -838,3 +838,99 @@ test("watchdog starts ensure-acp in the background so health checks continue", (
   )
   assert.doesNotMatch(source, /"\$BOOT\/ensure-acp-agents\.sh" 9>&- \|\| true/)
 })
+
+test("daemon loop: a freeze mid-iteration is a wake, re-probes and restarts in that iteration", () => {
+  const result = runWatchdog(
+    `
+loop=0
+PUBLIC_1033_IMMEDIATE=0
+port_up() { return 0; }
+http_ok() { return 0; }
+webdav_ok() { return 0; }
+cf_up() { return 0; }
+restart_server() { echo 'unexpected server restart' >&2; exit 90; }
+ps() { printf '123\\n'; }
+# The public edge is healthy until the freeze, then a 1033 zombie.
+curl() {
+  local output= code=200 body=ok
+  if [ -f "$TEST_ROOT/zombie" ]; then code=530 body='error code: 1033'; fi
+  while [ "$#" -gt 0 ]; do
+    if [ "$1" = -o ]; then output=$2; shift; fi
+    shift
+  done
+  [ -z "$output" ] || printf '%s' "$body" >"$output"
+  printf '%s' "$code"
+}
+# The second WebDAV start (inside loop 2, after its public probe) is where
+# the VM freezes for 25 minutes.
+cat >"$BOOT/start-webdav.sh" <<'MOCK'
+#!/bin/bash
+n=$(( $(cat "$TEST_ROOT/webdav-calls" 2>/dev/null || echo 0) + 1 ))
+echo "$n" >"$TEST_ROOT/webdav-calls"
+if [ "$n" = 2 ]; then
+  echo "$(( $(cat "$TEST_ROOT/now") + 1500 ))" >"$TEST_ROOT/now"
+  touch "$TEST_ROOT/zombie"
+fi
+exit 0
+MOCK
+chmod +x "$BOOT/start-webdav.sh"
+TUNNEL_RESTART_GRACE=0
+sleep() {
+  case $1 in
+    60|15)
+      if [ "$loop" -ge 2 ]; then exit 0; fi
+      echo "$(( $(cat "$TEST_ROOT/now") + $1 ))" >"$TEST_ROOT/now"
+      ;;
+  esac
+}
+`,
+    {},
+    true
+  )
+  assert.equal(result.status, 0, result.stderr)
+  assert.equal(result.stderr, "")
+  assert.match(result.log, /resume detected gap=1500s \(loop iteration took 1560s, expected 60s\)/)
+  assert.doesNotMatch(result.log, /\(slept/)
+  assert.equal(result.starts.match(/1 --force/g)?.length, 1)
+  // The status line after the freeze must not carry the pre-freeze public=ok.
+  const status = result.log.trim().split("\n").filter((l) => / 3080=/.test(l))
+  assert.equal(status.length, 2)
+  assert.match(status[0], /public=ok/)
+  assert.doesNotMatch(status[1], /public=ok/)
+})
+
+test("first 530 naming 1033 with local ok and cloudflared up restarts at once", () => {
+  const result = runWatchdog(`
+CURL_CODE=530
+CURL_BODY='error code: 1033'
+check_public_tunnel; printf 'result=%s streak=%s\\n' "$?" "$pub_fail_streak"
+`)
+  assert.equal(result.status, 0, result.stderr)
+  assert.equal(result.stdout, "result=0 streak=1\n")
+  assert.equal(result.starts, "1 --force\n")
+  assert.match(result.log, /on first fail: 1033 zombie/)
+})
+
+test("first-1033 restart respects cooldown, cloudflared state and the opt-out", () => {
+  for (const setup of [
+    'echo "1999999970 180 23148 1 0" >"$TUNNEL_RESTART_STAMP"',
+    "scf=down",
+    "http=bad",
+    "PUBLIC_1033_IMMEDIATE=0",
+  ]) {
+    const result = runWatchdog(`
+${setup}
+CURL_CODE=530
+CURL_BODY='error code: 1033'
+check_public_tunnel || true
+`)
+    assert.equal(result.status, 0, result.stderr)
+    assert.equal(result.starts, "", setup)
+  }
+  const plain = runWatchdog(`
+CURL_CODE=530
+CURL_BODY=unavailable
+check_public_tunnel
+`)
+  assert.equal(plain.starts, "")
+})

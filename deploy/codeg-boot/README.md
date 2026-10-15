@@ -99,7 +99,7 @@ connections are up while the edge has dropped them (530/1033). The watchdog
 therefore watches the wall clock in two places:
 
 - Sleep took more than `WAKE_GAP_THRESHOLD` (default **180 s** for a 60 s
-  sleep): log `resume detected gap=Ns (sleep took ...)` and probe the public
+  sleep): log `resume detected gap=Ns (slept ...)` and probe the public
   edge on the very next iteration, before the slow WebDAV/Tailscale steps.
 - The pause can also land mid-iteration (e.g. inside a start script's health
   wait). At the end of each iteration the time since the previous loop end,

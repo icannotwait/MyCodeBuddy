@@ -431,7 +431,7 @@ check_public_tunnel() {
   # cloudflared is running is the zombie-connector signature: the edge has
   # dropped a live process and it will not re-register by itself. Restart on
   # the first such failure; cooldown/backoff and the daily cap still apply.
-  if [ "$PUBLIC_1033_IMMEDIATE" = 1 ] && [ "$pub_code" = 530 ] && [ "${pub_mention:-}" = 1033 ] &&
+  if [ "${PUBLIC_1033_IMMEDIATE:-1}" = 1 ] && [ "$pub_code" = 530 ] && [ "${pub_mention:-}" = 1033 ] &&
     [ "${http:-}" = ok ] && [ "${scf:-}" = up ] && [ "$pub_fail_streak" -lt "$PUBLIC_FAIL_THRESHOLD" ]; then
     restart_tunnel "public $pub_detail on first fail: 1033 zombie (local http=$http cloudflared=$scf)" || restart_status=$?
     if cf_up; then scf=up; else scf=down; broken=$((broken + 1)); fi
@@ -485,7 +485,9 @@ note_wake() {
   wake_restart_used=0
   wake_watch_until=$((now + WAKE_WATCH_SECS))
   wake_noted_at=$now
-  echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) resume detected gap=$((elapsed - expected))s ($where took ${elapsed}s, expected ${expected}s); probing public edge now" >>"$LOG"
+  local what="$where took"
+  [ "$where" = sleep ] && what=slept
+  echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) resume detected gap=$((elapsed - expected))s ($what ${elapsed}s, expected ${expected}s); probing public edge now" >>"$LOG"
 }
 
 watchdog_sleep() {
