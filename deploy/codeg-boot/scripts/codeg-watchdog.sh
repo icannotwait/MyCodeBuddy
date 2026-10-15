@@ -40,7 +40,8 @@ watchdog_config_uint() {
 watchdog_config_keys() {
   printf '%s\n' CODEG_PUBLIC_URL PUBLIC_FAIL_THRESHOLD TUNNEL_RESTART_COOLDOWN \
     TUNNEL_RESTART_BACKOFF_CAP TUNNEL_RESTART_DAILY_CAP TUNNEL_RESTART_GRACE \
-    WAKE_GAP_THRESHOLD WAKE_REPROBE_DELAY WAKE_WATCH_SECS WAKE_FAST_SLEEP
+    WAKE_GAP_THRESHOLD WAKE_REPROBE_DELAY WAKE_WATCH_SECS WAKE_FAST_SLEEP \
+    PUBLIC_1033_IMMEDIATE
 }
 
 # Machine-local KEY=VALUE file, never tracked in git. CODEG_WATCHDOG_CONFIG
@@ -147,6 +148,7 @@ configure_watchdog() {
   watchdog_config_uint WAKE_REPROBE_DELAY 10 0 120
   watchdog_config_uint WAKE_WATCH_SECS 300 0 3600
   watchdog_config_uint WAKE_FAST_SLEEP 15 5 60
+  watchdog_config_uint PUBLIC_1033_IMMEDIATE 1 0 1
   if [ "$TUNNEL_RESTART_BACKOFF_CAP" -lt "$TUNNEL_RESTART_COOLDOWN" ]; then
     watchdog_warning "backoff cap below cooldown; using $TUNNEL_RESTART_COOLDOWN"
     TUNNEL_RESTART_BACKOFF_CAP=$TUNNEL_RESTART_COOLDOWN
@@ -176,18 +178,6 @@ warn_public_unconfigured() {
   watchdog_warning "CODEG_PUBLIC_URL is not configured (env or $(watchdog_config_path)); public edge probe disabled, a Cloudflare 530/1033 zombie tunnel will NOT be auto-restarted"
 }
 
-mkdir -p "$HB"
-
-# Single-instance via flock
-exec 9>"$LOCK"
-if ! flock -n 9; then
-  exit 0
-fi
-
-configure_watchdog
-echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) watchdog start pid=$$ config=$(watchdog_config_path) public_url=${CODEG_PUBLIC_URL:-unset}" >>"$LOG"
-
-echo $$ > "$PIDFILE"
 loop=0
 pub_fail_streak=0
 
@@ -222,6 +212,7 @@ probe_public() {
   pub_status=unconfigured
   pub_code=000
   pub_detail=
+  pub_mention=
   if [ -z "${CODEG_PUBLIC_URL:-}" ]; then
     warn_public_unconfigured
     return 0
@@ -235,6 +226,7 @@ probe_public() {
     mention=1033
   fi
   rm -f "$body"
+  pub_mention=$mention
 
   # 530 / 1033: classic zombie tunnel (process up, edge broken).
   if [ "$pub_code" = "530" ] || [ -n "$mention" ]; then
@@ -435,7 +427,15 @@ check_public_tunnel() {
   broken=$((broken + 1))
   pub_fail_streak=$((pub_fail_streak + 1))
   echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) public probe FAIL streak=$pub_fail_streak/$PUBLIC_FAIL_THRESHOLD url=$CODEG_PUBLIC_URL $pub_detail cloudflared=$scf http=$http" >>"$LOG"
-  if [ "$pub_fail_streak" -ge "$PUBLIC_FAIL_THRESHOLD" ]; then
+  # A 530 whose body names error 1033 while the local UI answers and
+  # cloudflared is running is the zombie-connector signature: the edge has
+  # dropped a live process and it will not re-register by itself. Restart on
+  # the first such failure; cooldown/backoff and the daily cap still apply.
+  if [ "${PUBLIC_1033_IMMEDIATE:-1}" = 1 ] && [ "$pub_code" = 530 ] && [ "${pub_mention:-}" = 1033 ] &&
+    [ "${http:-}" = ok ] && [ "${scf:-}" = up ] && [ "$pub_fail_streak" -lt "$PUBLIC_FAIL_THRESHOLD" ]; then
+    restart_tunnel "public $pub_detail on first fail: 1033 zombie (local http=$http cloudflared=$scf)" || restart_status=$?
+    if cf_up; then scf=up; else scf=down; broken=$((broken + 1)); fi
+  elif [ "$pub_fail_streak" -ge "$PUBLIC_FAIL_THRESHOLD" ]; then
     restart_tunnel "public $pub_detail after ${pub_fail_streak} consecutive fails (local http=$http)" || restart_status=$?
     # A successful start is not a healthy edge. Preserve the failure streak;
     # subsequent probes observe readiness without triggering another restart.
@@ -471,30 +471,59 @@ check_public_after_wake() {
 }
 
 # The VM is paused when idle and both wall-clock-vs-uptime and monotonic time
-# freeze, so a pause shows up only as a sleep that took far longer on the wall
-# clock than requested. Only the sleep is measured, so slow loop work (e.g. a
-# WebDAV venv rebuild) is never mistaken for a wake.
+# freeze, so a pause shows up only as wall-clock time that passed without the
+# watchdog running. It can land anywhere: in the sleep (caught right after the
+# sleep, so the next iteration probes the edge before any slow step) or in the
+# middle of an iteration, e.g. inside a start script's health wait (caught at
+# the end of the iteration by comparing loop-end timestamps). A genuinely slow
+# step can also trip the loop-end check; that only costs an extra public probe,
+# and a restart still needs a confirmed 530/1033 or connect failure.
 note_wake() {
-  local slept=$1 interval=$2 now
+  local elapsed=$1 expected=$2 where=$3 now
   now=$(date +%s)
   wake_pending=1
   wake_restart_used=0
   wake_watch_until=$((now + WAKE_WATCH_SECS))
-  echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) resume detected gap=$((slept - interval))s (slept ${slept}s, expected ${interval}s); probing public edge now" >>"$LOG"
+  wake_noted_at=$now
+  local what="$where took"
+  [ "$where" = sleep ] && what=slept
+  echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) resume detected gap=$((elapsed - expected))s ($what ${elapsed}s, expected ${expected}s); probing public edge now" >>"$LOG"
 }
 
 watchdog_sleep() {
   local interval=60 before after
   before=$(date +%s)
   if [ "$before" -lt "${wake_watch_until:-0}" ]; then interval=$WAKE_FAST_SLEEP; fi
+  last_sleep_interval=$interval
   sleep "$interval" 9>&-
   after=$(date +%s)
   if [ $((after - before)) -gt "$WAKE_GAP_THRESHOLD" ]; then
-    note_wake "$((after - before))" "$interval"
+    note_wake "$((after - before))" "$interval" sleep
   fi
 }
 
-while true; do
+# End-of-iteration wall-clock check across the whole loop (sleep + work since
+# the previous loop end). Returns 0 when a freeze not already reported by
+# watchdog_sleep happened during this iteration.
+check_loop_gap() {
+  local now elapsed expected
+  now=$(date +%s)
+  if [ -n "${prev_loop_end:-}" ]; then
+    elapsed=$((now - prev_loop_end))
+    expected=${last_sleep_interval:-0}
+    if [ $((elapsed - expected)) -gt "$WAKE_GAP_THRESHOLD" ] &&
+      [ "${wake_noted_at:-0}" -lt "$iter_start" ]; then
+      prev_loop_end=$now
+      note_wake "$elapsed" "$expected" "loop iteration"
+      return 0
+    fi
+  fi
+  prev_loop_end=$now
+  return 1
+}
+
+watchdog_iteration() {
+  iter_start=$(date +%s)
   reload_watchdog_config
   s3080=down
   scf=down
@@ -574,6 +603,13 @@ while true; do
     *) broken=$((broken + 1)) ;;
   esac
 
+  # A freeze mid-iteration makes the public result above a pre-freeze
+  # reading: discard it and probe again now, before logging status.
+  if check_loop_gap; then
+    pub=stale
+    check_public_tunnel
+  fi
+
   ts=$(TZ=Asia/Shanghai date '+%Y-%m-%d %H:%M:%S CST')
   echo "$ts 3080=$s3080 http=$http cloudflared=$scf public=$pub pubcode=${pub_code:-na} webdav=$swebdav tailscale=$stailscale broken=$broken" >>"$LOG"
 
@@ -597,5 +633,30 @@ while true; do
     fi
   fi
 
+}
+
+# Tests source this file with CODEG_WATCHDOG_SOURCE_ONLY=1 to exercise the
+# functions above with stubs and a fake clock.
+if [ "${CODEG_WATCHDOG_SOURCE_ONLY:-}" = 1 ]; then
+  return 0 2>/dev/null || exit 0
+fi
+
+mkdir -p "$HB"
+
+# Single-instance via flock
+exec 9>"$LOCK"
+if ! flock -n 9; then
+  exit 0
+fi
+
+configure_watchdog
+echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) watchdog start pid=$$ config=$(watchdog_config_path) public_url=${CODEG_PUBLIC_URL:-unset}" >>"$LOG"
+
+echo $$ > "$PIDFILE"
+loop=0
+pub_fail_streak=0
+
+while true; do
+  watchdog_iteration
   watchdog_sleep
 done
