@@ -9,3 +9,7 @@
 # and must equal what src/lib/json-render/skill.ts generates, which is LF.
 # Windows checkouts convert text to CRLF by default (core.autocrlf), so pin it.
 src-tauri/genui/** text eol=lf
+
+# Keep vendored Superpowers files byte-identical to upstream. This also
+# keeps extensionless Bash helpers executable under Git Bash on Windows.
+src-tauri/experts/** text eol=lf
