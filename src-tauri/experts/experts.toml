@@ -1,4 +1,7 @@
 # Expert skills metadata. Bundled alongside skills/ and loaded at runtime.
+# Skill source: https://github.com/obra/superpowers (v7.0.1)
+# Upstream commit: 2ce8aa15d05bd57213e6f746f953aafb7ded7a8b
+# Local compatibility addition: skills/writing-skills/package.json (ESM).
 # Category values must match ExpertCategory enum in commands/experts.rs.
 # Icons are lucide-react icon names referenced by the frontend.
 # display_name and description fall back to "en" when a locale is missing.
@@ -86,16 +89,16 @@ pt = "Executar planos"
 ar = "تنفيذ الخطط"
 
 [expert.description]
-en = "Executes a written implementation plan in a separate session with review checkpoints."
-"zh-CN" = "在独立会话中执行既定实现计划，并带有审核检查点。"
-"zh-TW" = "在獨立工作階段中執行既定實作計畫，並帶有審核檢查點。"
-ja = "別セッションで実装計画を実行し、レビューのチェックポイントを設けます。"
-ko = "별도의 세션에서 검토 체크포인트와 함께 구현 계획을 실행합니다."
-es = "Ejecuta un plan de implementación en una sesión separada con puntos de revisión."
-de = "Führt einen geschriebenen Implementierungsplan in einer separaten Sitzung mit Review-Checkpoints aus."
-fr = "Exécute un plan d'implémentation écrit dans une session séparée avec des points de contrôle."
-pt = "Executa um plano de implementação em uma sessão separada com pontos de revisão."
-ar = "ينفذ خطة التنفيذ المكتوبة في جلسة منفصلة مع نقاط مراجعة."
+en = "Executes an implementation plan inline in the current session with verification at each phase."
+"zh-CN" = "在当前会话中直接执行实现计划，并验证每个工作阶段。"
+"zh-TW" = "在目前的工作階段中直接執行實作計畫，並驗證每個工作階段。"
+ja = "現在のセッション内で実装計画を直接実行し、各工程を検証します。"
+ko = "현재 세션에서 구현 계획을 직접 실행하고 각 단계를 검증합니다."
+es = "Ejecuta un plan de implementación en la sesión actual y verifica cada fase."
+de = "Führt einen Implementierungsplan direkt in der aktuellen Sitzung aus und prüft jede Phase."
+fr = "Exécute un plan d'implémentation dans la session actuelle et vérifie chaque étape."
+pt = "Executa um plano de implementação na sessão atual e verifica cada fase."
+ar = "ينفذ خطة التنفيذ مباشرة في الجلسة الحالية مع التحقق من كل مرحلة."
 
 
 [[expert]]
@@ -282,6 +285,37 @@ de = "Untersucht die Ursache in einem vierstufigen Prozess, bevor Fixes vorgesch
 fr = "Enquête sur la cause racine via un processus en quatre phases avant de proposer des correctifs."
 pt = "Investiga a causa raiz com um processo de quatro fases antes de propor correções."
 ar = "يحقق في السبب الجذري عبر عملية من أربع مراحل قبل اقتراح الإصلاحات."
+
+
+[[expert]]
+id = "diagnosing-superpowers"
+category = "debugging"
+icon = "Bug"
+sort_order = 95
+
+[expert.display_name]
+en = "Diagnosing Superpowers"
+"zh-CN" = "诊断 Superpowers 会话"
+"zh-TW" = "診斷 Superpowers 工作階段"
+ja = "Superpowers セッションの診断"
+ko = "Superpowers 세션 진단"
+es = "Diagnóstico de Superpowers"
+de = "Superpowers-Sitzungsdiagnose"
+fr = "Diagnostic des sessions Superpowers"
+pt = "Diagnóstico de sessões Superpowers"
+ar = "تشخيص جلسات Superpowers"
+
+[expert.description]
+en = "Reviews Superpowers session transcripts and reports what went wrong with evidence."
+"zh-CN" = "检查 Superpowers 会话记录，引用证据报告执行中出现的问题。"
+"zh-TW" = "檢查 Superpowers 工作階段記錄，引用證據報告執行中出現的問題。"
+ja = "Superpowers のセッション記録を調べ、問題点を根拠とともに報告します。"
+ko = "Superpowers 세션 기록을 검토하고 발생한 문제를 근거와 함께 보고합니다."
+es = "Revisa los registros de sesiones de Superpowers e informa de los problemas con pruebas."
+de = "Prüft Superpowers-Sitzungsprotokolle und berichtet mit Belegen über aufgetretene Probleme."
+fr = "Examine les transcriptions des sessions Superpowers et signale les problèmes avec des preuves."
+pt = "Examina os registros de sessões Superpowers e relata os problemas com evidências."
+ar = "يراجع سجلات جلسات Superpowers ويبلغ عن المشكلات مع الأدلة."
 
 
 [[expert]]
