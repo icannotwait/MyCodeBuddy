@@ -5507,7 +5507,7 @@ function prepareMappedEnvelope(
         raw_input_is_model_authored: e.raw_input_is_model_authored,
         raw_output: e.raw_output,
         locations: e.locations ?? null,
-        meta: (e.meta as ToolCallMeta) ?? null,
+        meta: stripKimiMcpOAuth((e.meta as ToolCallMeta) ?? null),
         images: e.images ?? null,
         receivedAt: requiredReceivedAt(e),
       })
@@ -5536,7 +5536,7 @@ function prepareMappedEnvelope(
         raw_output: e.raw_output,
         raw_output_append: e.raw_output_append,
         locations: e.locations ?? null,
-        meta: (e.meta as ToolCallMeta) ?? null,
+        meta: stripKimiMcpOAuth((e.meta as ToolCallMeta) ?? null),
         images: e.images ?? null,
         receivedAt: requiredReceivedAt(e),
       })
@@ -5899,6 +5899,7 @@ function prepareMappedEnvelope(
         type: "STATUS_CHANGED",
         contextKey,
         status: "connected",
+        stopReason: e.stop_reason,
       })
       if (snapshot.liveMessage) {
         const blocks = snapshot.liveMessage.content
@@ -7738,6 +7739,15 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
       const keys = reverseMapRef.current.get(connectionId)
       if (keys) keys.add(contextKey)
       else reverseMapRef.current.set(connectionId, new Set([contextKey]))
+      // The desktop ingestor commits to the first key. A row stored under
+      // the backend connection id (a delegation child, or a canonical
+      // viewer) has to stay first, or a later event is judged against
+      // another row's cursor and dropped.
+      if (contextKey !== connectionId) return
+      const current = reverseMapRef.current.get(connectionId)
+      if (!current || current.values().next().value === connectionId) return
+      const rest = [...current].filter((key) => key !== connectionId)
+      reverseMapRef.current.set(connectionId, new Set([connectionId, ...rest]))
     },
     []
   )
@@ -8537,6 +8547,29 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
           publishedConnectionMapsCount += 1
         }
         for (const effect of reducerEffects) effect()
+        for (const connFrame of frame.connections) {
+          const folded = next.get(connFrame.contextKey)?.cancelledTurn
+          if (
+            !folded ||
+            folded === previous.get(connFrame.contextKey)?.cancelledTurn
+          ) {
+            continue
+          }
+          const closesTool = connFrame.rawEvents.some(
+            (event) =>
+              event.type === "tool_call_update" &&
+              toolStatusTerminal(event.status)
+          )
+          if (!closesTool) continue
+          const conn = next.get(connFrame.contextKey)
+          const conversationId = conn?.sessionId
+            ? getConversationIdByExternalIdFromStore(conn.sessionId)
+            : null
+          if (conversationId == null) continue
+          useConversationRuntimeStore
+            .getState()
+            .actions.applyCancelledTurnReports(conversationId, folded)
+        }
         // Event frames are where a live `available_commands` lands: file a
         // newly advertised list under the connection's OWN agent and cwd
         // (see `rememberCommands` in `dispatch` for the non-frame path).
@@ -13636,8 +13669,16 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
           acpGetSessionSnapshot(connectionId),
           backlog.cancelledSnapshot,
         ])
-        if (snapshot && !backlog.cancelled)
-          patch = denormalizeSnapshot(snapshot)
+        // A closed tab or an unmounted provider cancels the wait. Do not
+        // denormalize a snapshot nobody is still watching.
+        if (
+          backlog.cancelled ||
+          observerAliasesRef.current.get(contextKey) !== connectionId
+        ) {
+          backlog.stop()
+          return true
+        }
+        if (snapshot) patch = denormalizeSnapshot(snapshot)
         else connectionGone = true
       } catch (e) {
         console.warn(
@@ -13686,7 +13727,13 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
           leftoverRuntimeIds,
         })
       }
-      bindConnectionRoute(connectionId, contextKey)
+      // Viewer state lives under the backend connection id. The desktop
+      // ingestor commits to the first reverse-map key, so the canonical id
+      // has to be registered before this tab's alias.
+      bindConnectionRoute(connectionId, connectionId)
+      if (contextKey !== connectionId) {
+        bindConnectionRoute(connectionId, contextKey)
+      }
       applyHydrationBacklog(contextKey, connectionId, backlog.echoes)
       flushStreamingQueue(connectionId)
       return true
@@ -14387,6 +14434,10 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
               // the reducer drops a `STREAM_BATCH` for a key with no connection.
               flushStreamingQueue(orphanKey)
               bindConnectionRoute(orphanConn.connectionId, contextKey)
+              // The ingestor commits to the first reverse-map key. Leave the
+              // orphan key in the set and a frame already queued resolves to
+              // a row that this rekey is about to delete.
+              releaseConnectionRoute(orphanConn.connectionId, orphanKey)
               const lastActivity = lastActivityRef.current.get(orphanKey)
               lastActivityRef.current.delete(orphanKey)
               lastActivityRef.current.set(
@@ -14824,6 +14875,10 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
       origin: AcpDisconnectOrigin = "explicit_user"
     ) => {
       pendingConnectRequestsRef.current.delete(contextKey)
+      // A snapshot fetch still in flight must settle the connect() promise
+      // when this surface goes away. Otherwise the caller waits on native
+      // IPC that nobody will watch.
+      cancelHydrationEchoes(contextKey)
       // Cancel in-flight observer discovery delays and handoff re-entry.
       cancelObserverDelay(contextKey)
       clearHandoffWatcher(contextKey)
@@ -14983,6 +15038,7 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
       return tornDown
     },
     [
+      cancelHydrationEchoes,
       clearAliasesPointingTo,
       dispatch,
       releaseObserverAlias,

@@ -23281,7 +23281,7 @@ describe("desktop: hydrating a connection another surface already routes", () =>
   }
 
   function firehose() {
-    return h.subscribe.mock.calls[0]![1] as (envelope: EventEnvelope) => void
+    return emitDesktopEnvelope
   }
 
   function patchAt(eventSeq: number) {
@@ -23467,7 +23467,13 @@ describe("desktop: hydrating a connection another surface already routes", () =>
     ).toBe("req-late")
     expect(h.store!.getConnection(viewerKey)?.lastAppliedSeq).toBe(6)
     await act(async () => childSnapshot())
-    expect(h.store!.getConnection(CONN)).toBeUndefined()
+    // The viewer's canonical row is the backend connection id. Detaching
+    // the child must not turn that viewer back into a delegation child.
+    expect(h.store!.getConnection(CONN)?.isDelegationChild).toBe(false)
+    expect(h.store!.getConnection(CONN)?.isViewer).toBe(true)
+    expect(h.store!.getConnection(CONN)?.pendingPermission?.request_id).toBe(
+      "req-late"
+    )
   })
 
   it.each(["disconnect", "unmount"] as const)(
@@ -23588,8 +23594,10 @@ describe("desktop: hydrating a connection another surface already routes", () =>
     h.denormalizeSnapshot.mockClear()
     await act(async () => rejectSnapshot(new Error("late native reply")))
     expect(h.denormalizeSnapshot).not.toHaveBeenCalled()
-    expect(h.store!.getConnection(CONN)).toBeUndefined()
-    expect(h.store!.getConnection(TAB)).toBeDefined()
+    // The tab's viewer is the canonical row for this connection. A late
+    // rejection must not turn it back into a delegation child.
+    expect(h.store!.getConnection(CONN)?.isDelegationChild).toBe(false)
+    expect(h.store!.getConnection(TAB)?.isViewer).toBe(true)
   })
 
   it("does not convert a cancelled viewer snapshot after the tab closes", async () => {
@@ -23656,15 +23664,19 @@ describe("desktop: hydrating a connection another surface already routes", () =>
   it("keeps for a tab attaching as a viewer what the sub-agent's card got meanwhile", async () => {
     mountDesktop()
     await act(async () => {})
-    // The delegation's child entry already routes the connection…
+    // The delegation's child entry already routes the connection, caught
+    // up through the snapshot cursor so the next live event is contiguous.
     act(() => {
       h.actions!.attachDelegationChild({
         connectionId: CONN,
         parentConnectionId: "parent-conn",
         parentToolUseId: "toolu_delegate",
         agentType: "codex",
+        hydrate: true,
       })
     })
+    await act(async () => {})
+    expect(h.store!.getConnection(CONN)?.lastAppliedSeq).toBe(5)
 
     // …when a tab on the sub-agent's conversation attaches as a viewer, and
     // the permission lands while the tab's snapshot is in flight.

@@ -503,20 +503,17 @@ fn looks_like_path(value: &str) -> bool {
 }
 
 fn is_usable_executable(path: &Path) -> bool {
-    if !path.is_file() {
-        return false;
-    }
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         match path.metadata() {
-            Ok(meta) => meta.permissions().mode() & 0o111 != 0,
+            Ok(meta) => meta.is_file() && meta.permissions().mode() & 0o111 != 0,
             Err(_) => false,
         }
     }
     #[cfg(not(unix))]
     {
-        true
+        path.is_file()
     }
 }
 

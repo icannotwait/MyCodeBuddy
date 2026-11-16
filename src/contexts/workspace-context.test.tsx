@@ -5376,10 +5376,8 @@ describe("resolved image snapshot tabs", () => {
       | null = null
     mockedApi.readFileForEdit
       .mockResolvedValueOnce(snapshotEdit("a.ts", "disk-a", "a-1"))
-      // The first settled activation of an unwatched file performs its own
-      // freshness read. Keep that independent from the save preverification
-      // promise this regression intentionally leaves pending.
-      .mockResolvedValueOnce(snapshotEdit("a.ts", "disk-a", "a-1"))
+      // Opening activation does not re-read a file it just loaded. The
+      // next read is the save preverification, left pending on purpose.
       .mockImplementationOnce(
         () => new Promise((resolve) => (resolvePreverify = resolve))
       )
