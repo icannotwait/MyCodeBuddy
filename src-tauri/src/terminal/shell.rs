@@ -287,6 +287,7 @@ fn classify_system_candidate(executable: PathBuf) -> Result<ResolvedShellSpec, S
 ///
 /// Used by the ACP terminal runtime and kept public so both interactive and
 /// non-interactive paths share one strategy table.
+#[allow(dead_code)]
 pub fn build_command_line(spec: &ResolvedShellSpec, line: &str) -> tokio::process::Command {
     let mut command = crate::process::tokio_command(&spec.executable);
     #[cfg(windows)]

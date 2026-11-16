@@ -416,6 +416,7 @@ impl codeg_lib::acp::work_task_tools::WorkTaskToolAccess for NoTaskTools {
         _parent: &str,
         _verdict: &str,
         _summary: Option<&str>,
+        _thread_replies: &[codeg_lib::acp::delegation::transport::ThreadReply],
     ) -> codeg_lib::acp::work_task_tools::TaskReportAck {
         codeg_lib::acp::work_task_tools::TaskReportAck::rejected("no engine")
     }
@@ -2527,6 +2528,7 @@ const HISTORICAL_WORKFLOW_ROOT_FEATURES: CompanionFeatures = CompanionFeatures {
     workflow_v2: true,
     completion_v2: false,
     tasks: false,
+    result: false,
     automations: false,
     taskboard: false,
     browser: false,
@@ -2546,6 +2548,7 @@ const HISTORICAL_COMPLETION_CHILD_FEATURES: CompanionFeatures = CompanionFeature
     workflow_v2: false,
     completion_v2: true,
     tasks: false,
+    result: false,
     automations: false,
     taskboard: false,
     browser: false,
@@ -2758,6 +2761,7 @@ async fn run_capability_case(case: CapabilityCase) -> CapabilityResult {
                 workflow_v2: true,
                 completion_v2: false,
                 bound_task_id: None,
+                agent_hosts_tools: false,
             },
         )
         .await;
@@ -2773,6 +2777,7 @@ async fn run_capability_case(case: CapabilityCase) -> CapabilityResult {
                 workflow_v2: false,
                 completion_v2: true,
                 bound_task_id: Some(task_id.clone()),
+                agent_hosts_tools: false,
             },
         )
         .await;
@@ -2790,6 +2795,7 @@ async fn run_capability_case(case: CapabilityCase) -> CapabilityResult {
         Arc::new(NoAuthoring),
         Arc::new(codeg_lib::acp::browser_tools::NoBrowserTabs),
         Arc::new(codeg_lib::acp::computer_tools::NoComputerDesktop),
+        Arc::new(codeg_lib::acp::result_tool::NoResultTool),
     );
     let socket_path = workflow_socket_path();
     let listener_task = tokio::spawn(listener.run(socket_path.clone()));
@@ -2807,7 +2813,10 @@ async fn run_capability_case(case: CapabilityCase) -> CapabilityResult {
         role: CompanionRole::DelegationChild,
         can_spawn_child: true,
         connection_incarnation_id: format!("incarnation-{task_id}"),
+        custom_agents: Vec::new(),
         disabled_agents: Vec::new(),
+        assistant_support: Default::default(),
+        result_schema: Default::default(),
     };
     let root_companion = CompanionContext {
         parent_connection_id,
@@ -2817,7 +2826,10 @@ async fn run_capability_case(case: CapabilityCase) -> CapabilityResult {
         role: CompanionRole::Root,
         can_spawn_child: true,
         connection_incarnation_id: format!("root-incarnation-{task_id}"),
+        custom_agents: Vec::new(),
         disabled_agents: Vec::new(),
+        assistant_support: Default::default(),
+        result_schema: Default::default(),
     };
     assert!(companion_tool_names(&child_companion)
         .await
@@ -3655,6 +3667,7 @@ async fn run_final_delivery_fixture(
                 workflow_v2: true,
                 completion_v2: false,
                 bound_task_id: None,
+                agent_hosts_tools: false,
             },
         )
         .await;
@@ -3672,6 +3685,7 @@ async fn run_final_delivery_fixture(
         Arc::new(NoAuthoring),
         Arc::new(codeg_lib::acp::browser_tools::NoBrowserTabs),
         Arc::new(codeg_lib::acp::computer_tools::NoComputerDesktop),
+        Arc::new(codeg_lib::acp::result_tool::NoResultTool),
     );
     let socket_path = workflow_socket_path();
     let listener_task = tokio::spawn(with_historical_workflow_fixture_mutations(
@@ -4712,6 +4726,7 @@ async fn v2_only_aggregate_acceptance() {
         admission_ticket: None,
         recovery_authorization_id: None,
         orchestration_binding: None,
+        assistant: None,
     };
     let dangling_report =
         with_historical_workflow_fixture_mutations(broker.start_delegation(dangling_request)).await;
@@ -4847,6 +4862,7 @@ async fn v2_only_aggregate_acceptance() {
             admission_ticket: None,
             recovery_authorization_id: None,
             orchestration_binding: None,
+            assistant: None,
         })
         .await;
     assert_eq!(

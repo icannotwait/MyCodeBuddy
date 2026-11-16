@@ -58,26 +58,50 @@ use crate::models::agent::AgentType;
 use crate::models::conversation::{ConversationDetail, ConversationSummary, SessionStats};
 use crate::models::message::{ContentBlock, ImageData, MessageTurn, TurnRole, TurnUsage};
 use crate::parsers::{
-    sanitize_user_blocks, user_turn_block, user_turn_block_from_wire, visible_user_chunk,
+    sanitize_user_blocks, user_turn_block, user_turn_block_from_wire, visible_user_chunk, AgentEnv,
     AgentParser, ParseError,
 };
 
 pub struct AcpNativeParser {
     agent_type: AgentType,
     root: PathBuf,
+    trae_sessions: Option<PathBuf>,
 }
 
 impl AcpNativeParser {
     pub fn new(agent_type: AgentType) -> Self {
+        Self::for_env(agent_type, &AgentEnv::inherited())
+    }
+
+    pub fn for_env(agent_type: AgentType, env: &AgentEnv) -> Self {
         Self {
             agent_type,
             root: crate::paths::codeg_acp_transcripts_root(),
+            trae_sessions: crate::acp::trae::uses_trae_rollouts(agent_type)
+                .then(|| crate::acp::trae::resolve_trae_sessions_dir_for_env(env)),
         }
     }
 
     /// Root-injectable constructor for tests.
     pub fn new_in(agent_type: AgentType, root: PathBuf) -> Self {
-        Self { agent_type, root }
+        Self {
+            agent_type,
+            root,
+            trae_sessions: None,
+        }
+    }
+
+    #[cfg(test)]
+    pub fn new_in_with_trae_sessions(
+        agent_type: AgentType,
+        root: PathBuf,
+        trae_sessions: PathBuf,
+    ) -> Self {
+        Self {
+            agent_type,
+            root,
+            trae_sessions: Some(trae_sessions),
+        }
     }
 
     /// Directory name for this agent's transcripts: its ACP registry id.
@@ -125,10 +149,29 @@ impl AgentParser for AcpNativeParser {
                 conversation_id.to_string(),
             ));
         }
-        let turns = project_turns(&transcript.entries);
+        let mut turns = project_turns(&transcript.entries);
+        let native_usage = self.trae_sessions.as_deref().and_then(|sessions| {
+            // Every session of the chain spent tokens under its own id.
+            let mut native_session_ids = vec![conversation_id.to_string()];
+            native_session_ids.extend(acp_transcript::continuation_ancestors_in(
+                &self.root,
+                dir,
+                conversation_id,
+            ));
+            super::trae_usage::enrich_turns(sessions, &native_session_ids, &mut turns)
+        });
         let (used, size) = latest_context_window(&transcript.entries);
-        let session_stats =
-            crate::parsers::merge_context_window_stats(session_stats(&turns), used, size);
+        let stats = session_stats(&turns);
+        let stats = if stats
+            .as_ref()
+            .and_then(|stats| stats.total_usage.as_ref())
+            .is_none()
+        {
+            session_stats_with_native_usage(stats, native_usage)
+        } else {
+            stats
+        };
+        let session_stats = crate::parsers::merge_context_window_stats(stats, used, size);
         Ok(ConversationDetail {
             summary: self.summarize(conversation_id, &transcript),
             turns,
@@ -403,8 +446,9 @@ pub fn is_recorded_update(update: &SessionUpdate) -> bool {
 /// not the per-turn input/output counts `MessageTurn::usage` holds — so it
 /// feeds the session footer's context-window trio, exactly like the built-in
 /// parsers derive it from their own stores, and never a turn's token usage.
-/// (A turn's usage stays `None` for custom agents: ACP has no channel for it,
-/// and inventing one from occupancy deltas would be a guess rendered as fact.)
+/// (A turn's usage comes only from its recorded prompt response or ZCode's
+/// native turn metrics, see `acp::zcode_turn`; otherwise it stays `None`.
+/// Inventing one from occupancy deltas would be a guess rendered as fact.)
 ///
 /// Matched on the raw payload rather than by deserializing: the answer is
 /// almost always in the last few entries, and a string compare per entry costs
@@ -514,10 +558,13 @@ pub fn project_turns(entries: &[TranscriptEntry]) -> Vec<MessageTurn> {
                     // prompt; the part's own span (`flush`) is the honest one.
                     apply_turn_end(p, &entry.p, !steered);
                     p.last_at_ms = entry.t;
-                } else if steered {
-                    // Nothing came after the last steer, so the usage and model
-                    // the turn end reports go on the part before it — never on
-                    // a reply to an earlier prompt.
+                } else {
+                    // Nothing came after the last user message of this turn —
+                    // a steer, or one the agent relayed from another client
+                    // (claude-agent-acp forwards Remote Control messages as
+                    // `user_message_chunk`). The usage and model the turn end
+                    // reports go on the part before it — never on a reply to an
+                    // earlier prompt.
                     if let Some(last) = turns
                         .iter_mut()
                         .skip(prompt_start.unwrap_or(usize::MAX))
@@ -532,6 +579,22 @@ pub fn project_turns(entries: &[TranscriptEntry]) -> Vec<MessageTurn> {
                             last.usage = usage;
                         }
                     }
+                }
+                // A paid attempt can finish without emitting any text or
+                // tools. Keep its reported usage without inventing content,
+                // and never attach an unprompted footer to an earlier turn.
+                if pending.is_none()
+                    && prompt_start.is_some()
+                    && !turns
+                        .iter()
+                        .skip(prompt_start.unwrap_or(usize::MAX))
+                        .any(|turn| matches!(turn.role, TurnRole::Assistant))
+                    && turn_end_model_and_usage(&entry.p).1.is_some()
+                {
+                    let mut turn = PendingTurn::new(turn_start_hint.unwrap_or(entry.t));
+                    apply_turn_end(&mut turn, &entry.p, !steered);
+                    turn.last_at_ms = entry.t;
+                    pending = Some(turn);
                 }
                 flush(&mut pending, &mut turns, &mut seq);
                 prompt_just_recorded = false;
@@ -605,7 +668,7 @@ fn continues_open_user_prose(update: &SessionUpdate) -> bool {
 
 fn flush(pending: &mut Option<PendingTurn>, turns: &mut Vec<MessageTurn>, seq: &mut usize) {
     let Some(p) = pending.take() else { return };
-    if !p.has_content {
+    if !p.has_content && p.usage.is_none() {
         return;
     }
     turns.push(MessageTurn {
@@ -658,20 +721,30 @@ fn turn_end_model_and_usage(payload: &serde_json::Value) -> (Option<String>, Opt
     (model, usage)
 }
 
-/// Read an ACP usage object. Field names follow the `unstable_session_usage`
+/// Read an ACP usage object. Field names follow `unstable_end_turn_token_usage`
 /// shape, with snake_case accepted as well since agents differ.
 fn parse_usage(value: &serde_json::Value) -> Option<TurnUsage> {
-    let get = |camel: &str, snake: &str| -> u64 {
-        value
-            .get(camel)
-            .or_else(|| value.get(snake))
+    let get = |keys: &[&str]| -> u64 {
+        keys.iter()
+            .find_map(|key| value.get(*key))
             .and_then(|v| v.as_u64())
             .unwrap_or(0)
     };
-    let input = get("inputTokens", "input_tokens");
-    let output = get("outputTokens", "output_tokens");
-    let cache_create = get("cacheCreationInputTokens", "cache_creation_input_tokens");
-    let cache_read = get("cacheReadInputTokens", "cache_read_input_tokens");
+    let input = get(&["inputTokens", "input_tokens"]);
+    let output = get(&["outputTokens", "output_tokens"]);
+    // ACP usage is cache-exclusive. Accept its canonical cache names first,
+    // retaining the older spellings for transcripts already on disk. Aliases
+    // name the same bucket; adding them would double-count a cache hit.
+    let cache_create = get(&[
+        "cachedWriteTokens",
+        "cacheCreationInputTokens",
+        "cache_creation_input_tokens",
+    ]);
+    let cache_read = get(&[
+        "cachedReadTokens",
+        "cacheReadInputTokens",
+        "cache_read_input_tokens",
+    ]);
     if input == 0 && output == 0 && cache_create == 0 && cache_read == 0 {
         return None;
     }
@@ -1040,6 +1113,7 @@ fn upsert_tool_call(
                 is_error,
                 agent_stats: None,
                 images,
+                exit_code: None,
             });
         }
     }
@@ -1121,6 +1195,41 @@ fn session_stats(turns: &[MessageTurn]) -> Option<SessionStats> {
     })
 }
 
+/// Preserve native usage from a TRAE turn that produced no renderable
+/// assistant message. Normally `trae_usage::enrich_turns` attaches every
+/// native turn to an ACP turn and the regular aggregation above wins.
+///
+/// Without native usage the stats stand as they are: most ACP agents report
+/// no tokens, and their footer still has the turns' durations to show.
+fn session_stats_with_native_usage(
+    stats: Option<SessionStats>,
+    native_usage: Option<TurnUsage>,
+) -> Option<SessionStats> {
+    let Some(usage) = native_usage else {
+        return stats;
+    };
+    let total_tokens = usage
+        .input_tokens
+        .saturating_add(usage.output_tokens)
+        .saturating_add(usage.cache_creation_input_tokens)
+        .saturating_add(usage.cache_read_input_tokens);
+    match stats {
+        Some(mut stats) => {
+            stats.total_usage = Some(usage);
+            stats.total_tokens = Some(total_tokens);
+            Some(stats)
+        }
+        None => Some(SessionStats {
+            total_usage: Some(usage),
+            total_tokens: Some(total_tokens),
+            total_duration_ms: 0,
+            context_window_used_tokens: None,
+            context_window_max_tokens: None,
+            context_window_usage_percent: None,
+        }),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1153,6 +1262,50 @@ mod tests {
             "sessionUpdate": kind,
             "content": { "type": "text", "text": text }
         })
+    }
+
+    #[test]
+    fn reported_usage_survives_a_turn_without_output_but_not_an_orphan_footer() {
+        let footer = entry(
+            200,
+            EntryKind::TurnEnd,
+            serde_json::json!({
+                "stopReason":"end_turn", "durationMs":100,
+                "usage":{"inputTokens":3,"outputTokens":0,"cachedReadTokens":4,"totalTokens":7}
+            }),
+        );
+        let turns = project_turns(&[prompt(100, "attempt"), footer.clone()]);
+        assert_eq!(turns.len(), 2);
+        assert!(turns[1].blocks.is_empty());
+        assert_eq!(turns[1].usage.as_ref().unwrap().input_tokens, 3);
+        assert_eq!(turns[1].usage.as_ref().unwrap().cache_read_input_tokens, 4);
+        assert_eq!(turns[1].duration_ms, Some(100));
+        assert!(project_turns(&[footer]).is_empty());
+    }
+
+    /// A message typed in another client of the session reaches codeg as a
+    /// `user_message_chunk` while the prompt is still open. It closes the
+    /// reply so far, and when nothing follows it the turn end's usage still
+    /// belongs to that reply.
+    #[test]
+    fn a_relayed_user_message_does_not_drop_the_turn_end_usage() {
+        let turns = project_turns(&[
+            prompt(100, "P"),
+            update(150, text_chunk("agent_message_chunk", "Reply")),
+            update(200, text_chunk("user_message_chunk", "Remote follow-up")),
+            entry(
+                300,
+                EntryKind::TurnEnd,
+                serde_json::json!({
+                    "stopReason": "end_turn", "model": "opus",
+                    "usage": {"inputTokens": 4000, "outputTokens": 10, "totalTokens": 4010}
+                }),
+            ),
+        ]);
+        assert_eq!(roles(&turns), ["User", "Assistant", "User"]);
+        assert_eq!(turns[1].usage.as_ref().map(|u| u.input_tokens), Some(4000));
+        assert_eq!(turns[1].model.as_deref(), Some("opus"));
+        assert_eq!(turns[2].usage, None);
     }
 
     fn attachment_prompt() -> serde_json::Value {
@@ -2146,9 +2299,19 @@ earlier terminal context records.\n\
             steer(2_500, "make it blue"),
             reported_turn_end(3_000, 990),
         ]);
-        assert_eq!(roles(&silent), ["User", "Assistant", "User", "User"]);
+        // The second prompt's reported spend belongs to its own empty result,
+        // never to the reply produced for the first prompt.
+        assert_eq!(
+            roles(&silent),
+            ["User", "Assistant", "User", "User", "Assistant"]
+        );
         assert_eq!(silent[1].usage, None);
         assert_eq!(silent[1].model, None);
+        assert!(silent[4].blocks.is_empty());
+        assert_eq!(
+            silent[4].usage.as_ref().map(|usage| usage.input_tokens),
+            Some(10)
+        );
     }
 
     /// A call the reply started before a steer can report after it: a command
@@ -2344,6 +2507,40 @@ earlier terminal context records.\n\
         assert_eq!(stats.total_duration_ms, 42);
     }
 
+    #[test]
+    fn acp_cache_counters_have_precedence_and_are_not_subtracted_twice() {
+        let usage = parse_usage(&serde_json::json!({
+            "inputTokens":180,"outputTokens":350,"cachedReadTokens":900,"cachedWriteTokens":120,
+            "cacheReadInputTokens":9999,"cacheCreationInputTokens":9999,"thoughtTokens":200
+        }))
+        .unwrap();
+        assert_eq!(usage.input_tokens, 180);
+        assert_eq!(usage.output_tokens, 350);
+        assert_eq!(usage.cache_read_input_tokens, 900);
+        assert_eq!(usage.cache_creation_input_tokens, 120);
+        let cache_only = parse_usage(&serde_json::json!({"cachedReadTokens":42})).unwrap();
+        assert_eq!(cache_only.cache_read_input_tokens, 42);
+        assert_eq!(cache_only.input_tokens, 0);
+        let canonical_zero = parse_usage(
+            &serde_json::json!({"outputTokens":1,"cachedReadTokens":0,"cacheReadInputTokens":9999}),
+        )
+        .unwrap();
+        assert_eq!(canonical_zero.cache_read_input_tokens, 0);
+        for legacy in [
+            serde_json::json!({"cacheReadInputTokens":2,"cacheCreationInputTokens":3}),
+            serde_json::json!({"cache_read_input_tokens":2,"cache_creation_input_tokens":3}),
+        ] {
+            let usage = parse_usage(&legacy).unwrap();
+            assert_eq!(
+                (
+                    usage.cache_read_input_tokens,
+                    usage.cache_creation_input_tokens
+                ),
+                (2, 3)
+            );
+        }
+    }
+
     /// The write-side whitelist and the read-side match arms are two
     /// hand-maintained views of one set. This asserts they agree by RUNNING the
     /// projection over each variant rather than by restating either list, so
@@ -2504,6 +2701,175 @@ earlier terminal context records.\n\
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    #[tokio::test]
+    async fn custom_traecli_history_is_enriched_from_its_native_usage_record() {
+        let transcript_dir = tempfile::tempdir().unwrap();
+        let native_dir = tempfile::tempdir().unwrap();
+        let session_id = "01a13673-cfd5-7c23-bc00-ce5be75fd42b";
+        let agent = AgentType::custom("traecli").unwrap();
+        let agent_dir = crate::acp::registry::registry_id_for(agent);
+
+        let header = TranscriptHeader::new(
+            "custom:traecli",
+            session_id,
+            "/workspace",
+            1_791_914_922_197,
+        );
+        acp_transcript::record_header_in(transcript_dir.path(), agent_dir, &header)
+            .await
+            .unwrap();
+        for (kind, payload) in [
+            (
+                EntryKind::Prompt,
+                serde_json::json!([{"type":"text","text":"hello"}]),
+            ),
+            (
+                EntryKind::Update,
+                serde_json::json!({
+                    "sessionUpdate":"agent_message_chunk",
+                    "content":{"type":"text","text":"done"}
+                }),
+            ),
+            (
+                EntryKind::Update,
+                serde_json::json!({
+                    "sessionUpdate":"usage_update",
+                    "used":20_584,
+                    "size":760_000
+                }),
+            ),
+            (
+                EntryKind::TurnEnd,
+                serde_json::json!({
+                    "stopReason":"end_turn",
+                    "durationMs":3_497,
+                    "model":"gpt-5.6-sol"
+                }),
+            ),
+        ] {
+            acp_transcript::record_entry_in(
+                transcript_dir.path(),
+                agent_dir,
+                session_id,
+                kind,
+                payload,
+            )
+            .await
+            .unwrap();
+        }
+
+        let day = native_dir.path().join("2026/10/14");
+        std::fs::create_dir_all(&day).unwrap();
+        let rollout = day.join(format!("rollout-2026-10-14T02-08-42-{session_id}.jsonl"));
+        std::fs::write(
+            rollout,
+            serde_json::json!({
+                "timestamp":"2026-10-13T18:08:45.732Z",
+                "type":"token_usage_record",
+                "payload":{
+                    "thread_id":session_id,
+                    "session_id":session_id,
+                    "turn_id":"turn-1",
+                    "response_id":"resp-1",
+                    "usage":{
+                        "input_tokens":20_454,
+                        "cache_creation_input_tokens":128,
+                        "cached_input_tokens":19_968,
+                        "output_tokens":130,
+                        "reasoning_output_tokens":24,
+                        "total_tokens":20_584
+                    }
+                }
+            })
+            .to_string()
+                + "\n",
+        )
+        .unwrap();
+
+        let parser = AcpNativeParser::new_in_with_trae_sessions(
+            agent,
+            transcript_dir.path().to_path_buf(),
+            native_dir.path().to_path_buf(),
+        );
+        let detail = parser.get_conversation(session_id).unwrap();
+        let usage = detail.turns[1].usage.as_ref().unwrap();
+        assert_eq!(usage.input_tokens, 358);
+        assert_eq!(usage.cache_creation_input_tokens, 128);
+        assert_eq!(usage.cache_read_input_tokens, 19_968);
+        assert_eq!(usage.output_tokens, 130);
+        let stats = detail.session_stats.unwrap();
+        assert_eq!(stats.total_tokens, Some(20_584));
+        assert_eq!(stats.context_window_used_tokens, Some(20_584));
+        assert_eq!(stats.context_window_max_tokens, Some(760_000));
+    }
+
+    /// A turn end that reports a duration but no tokens — what most ACP agents
+    /// send — keeps its duration in the session footer, whether or not the
+    /// agent has a native store to read usage from.
+    #[tokio::test]
+    async fn a_duration_only_turn_keeps_its_session_stats() {
+        async fn record_duration_only_turn(root: &Path, agent: AgentType, session_id: &str) {
+            let agent_dir = crate::acp::registry::registry_id_for(agent);
+            let header = TranscriptHeader::new(
+                &agent.as_wire(),
+                session_id,
+                "/workspace",
+                1_791_914_922_197,
+            );
+            acp_transcript::record_header_in(root, agent_dir, &header)
+                .await
+                .unwrap();
+            for (kind, payload) in [
+                (
+                    EntryKind::Prompt,
+                    serde_json::json!([{"type":"text","text":"hello"}]),
+                ),
+                (
+                    EntryKind::Update,
+                    serde_json::json!({
+                        "sessionUpdate":"agent_message_chunk",
+                        "content":{"type":"text","text":"done"}
+                    }),
+                ),
+                (
+                    EntryKind::TurnEnd,
+                    serde_json::json!({"stopReason":"end_turn","durationMs":3_000}),
+                ),
+            ] {
+                acp_transcript::record_entry_in(root, agent_dir, session_id, kind, payload)
+                    .await
+                    .unwrap();
+            }
+        }
+
+        let session_id = "01a13673-cfd5-7c23-bc00-ce5be75fd42c";
+        let plain = AgentType::custom("plain-agent").unwrap();
+        let traecli = AgentType::custom("traecli").unwrap();
+        let transcripts = tempfile::tempdir().unwrap();
+        // TRAE's native store, holding no rollout for this session.
+        let native = tempfile::tempdir().unwrap();
+        record_duration_only_turn(transcripts.path(), plain, session_id).await;
+        record_duration_only_turn(transcripts.path(), traecli, session_id).await;
+
+        for parser in [
+            AcpNativeParser::new_in(plain, transcripts.path().to_path_buf()),
+            AcpNativeParser::new_in_with_trae_sessions(
+                traecli,
+                transcripts.path().to_path_buf(),
+                native.path().to_path_buf(),
+            ),
+        ] {
+            let stats = parser
+                .get_conversation(session_id)
+                .unwrap()
+                .session_stats
+                .expect("a duration-only turn still has session stats");
+            assert_eq!(stats.total_duration_ms, 3_000);
+            assert!(stats.total_usage.is_none());
+            assert_eq!(stats.total_tokens, None);
+        }
+    }
+
     #[test]
     fn a_session_opened_but_never_used_is_not_listed() {
         // Opening a conversation writes the ACP header before the user has
@@ -2617,5 +2983,268 @@ earlier terminal context records.\n\
         let old = parser.get_conversation("sess-old").expect("still readable");
         assert_eq!(old.turns.len(), 2);
         let _ = std::fs::remove_dir_all(&root);
+    }
+}
+
+#[cfg(test)]
+mod zcode_history_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn zcode_attachment_bytes_survive_recording_echo_and_cold_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let agent = crate::acp::registry::registry_id_for(AgentType::ZCode);
+        let wire = crate::acp::connection::map_prompt_blocks(vec![
+            PromptInputBlock::Text {
+                text: "Read these attachments".into(),
+            },
+            PromptInputBlock::Image {
+                data: "cGl4ZWxz".into(),
+                mime_type: "image/png".into(),
+                uri: None,
+            },
+            PromptInputBlock::Resource {
+                uri: "clipboard:///report.pdf".into(),
+                mime_type: Some("application/pdf".into()),
+                text: None,
+                blob: Some("JVBERi0xLjQ=".into()),
+            },
+        ]);
+        let payload = serde_json::to_value(&wire).unwrap();
+        assert_eq!(payload[1]["data"], "cGl4ZWxz");
+        assert_eq!(payload[2]["resource"]["blob"], "JVBERi0xLjQ=");
+        acp_transcript::record_header_in(
+            dir.path(),
+            agent,
+            &acp_transcript::TranscriptHeader::new("zcode", "attachments", "/workspace", 1),
+        )
+        .await
+        .unwrap();
+        acp_transcript::record_entry_in(
+            dir.path(),
+            agent,
+            "attachments",
+            EntryKind::Prompt,
+            payload.clone(),
+        )
+        .await
+        .unwrap();
+        for content in payload.as_array().unwrap() {
+            acp_transcript::record_entry_in(
+                dir.path(),
+                agent,
+                "attachments",
+                EntryKind::Update,
+                serde_json::json!({"sessionUpdate":"user_message_chunk", "content":content}),
+            )
+            .await
+            .unwrap();
+        }
+        acp_transcript::record_entry_in(
+            dir.path(), agent, "attachments", EntryKind::Update,
+            serde_json::json!({"sessionUpdate":"agent_message_chunk", "content":{"type":"text","text":"Read both"}}),
+        ).await.unwrap();
+        acp_transcript::record_entry_in(
+            dir.path(),
+            agent,
+            "attachments",
+            EntryKind::TurnEnd,
+            serde_json::json!({"stopReason":"end_turn"}),
+        )
+        .await
+        .unwrap();
+        let parser = AcpNativeParser::new_in(AgentType::ZCode, dir.path().to_path_buf());
+        let cold = parser.get_conversation("attachments").unwrap();
+        assert_eq!(
+            cold.turns.len(),
+            2,
+            "the prompt echo must not duplicate attachments"
+        );
+        assert_eq!(cold.turns[0].blocks.len(), 3);
+        assert!(
+            matches!(&cold.turns[0].blocks[1], ContentBlock::Image { data, mime_type, uri }
+            if data == "cGl4ZWxz" && mime_type == "image/png" && uri.is_none())
+        );
+        assert!(
+            matches!(&cold.turns[0].blocks[2], ContentBlock::Text { text }
+            if text.contains("report.pdf") && !text.contains("JVBERi0xLjQ="))
+        );
+        let stored = acp_transcript::read_transcript_in(dir.path(), agent, "attachments");
+        assert_eq!(
+            stored
+                .entries
+                .iter()
+                .find(|e| e.k == EntryKind::Prompt)
+                .unwrap()
+                .p,
+            payload
+        );
+    }
+
+    #[tokio::test]
+    async fn zcode_history_survives_reopen_and_keeps_tools_usage_and_continuations() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let agent = crate::acp::registry::registry_id_for(AgentType::ZCode);
+        let header = acp_transcript::TranscriptHeader::new("zcode", "old", "/workspace", 1000);
+        acp_transcript::record_header_in(root, agent, &header)
+            .await
+            .unwrap();
+        for (kind, payload) in [
+            (
+                EntryKind::Prompt,
+                serde_json::json!([{"type":"text","text":"Read marker"}]),
+            ),
+            (
+                EntryKind::Update,
+                serde_json::json!({"sessionUpdate":"user_message_chunk","content":{"type":"text","text":"Read marker"}}),
+            ),
+            (
+                EntryKind::Update,
+                serde_json::json!({"sessionUpdate":"agent_thought_chunk","content":{"type":"text","text":"consider"}}),
+            ),
+            (
+                EntryKind::Update,
+                serde_json::json!({"sessionUpdate":"tool_call","toolCallId":"read-1","title":"Read","kind":"read","status":"in_progress","rawInput":{"path":"marker.txt"}}),
+            ),
+            (
+                EntryKind::Update,
+                serde_json::json!({"sessionUpdate":"tool_call_update","toolCallId":"read-1","status":"completed","content":[{"type":"content","content":{"type":"text","text":"MARKER"}}]}),
+            ),
+            (
+                EntryKind::Update,
+                serde_json::json!({"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"MARKER"}}),
+            ),
+            (
+                EntryKind::TurnEnd,
+                serde_json::json!({"stopReason":"end_turn","model":"glm-test","usage":{"inputTokens":10,"outputTokens":5}}),
+            ),
+        ] {
+            acp_transcript::record_entry_in(root, agent, "old", kind, payload)
+                .await
+                .unwrap();
+        }
+        let reopened = AcpNativeParser::new_in(AgentType::ZCode, root.to_path_buf());
+        let before = reopened.get_conversation("old").unwrap();
+        assert_eq!(before.summary.agent_type, AgentType::ZCode);
+        assert_eq!(
+            before.turns.len(),
+            2,
+            "echoed prompts must not duplicate user turns"
+        );
+        let serialized = serde_json::to_string(&before.turns).unwrap();
+        assert!(serialized.contains("consider"));
+        assert!(before.turns[1].blocks.iter().any(|block| matches!(
+            block,
+            ContentBlock::ToolUse { tool_use_id, tool_name, .. }
+                if tool_use_id.as_deref() == Some("read-1") && tool_name == "Read"
+        )));
+        assert!(before.turns[1].blocks.iter().any(|block| matches!(
+            block,
+            ContentBlock::ToolResult { tool_use_id, output_preview, is_error, .. }
+                if tool_use_id.as_deref() == Some("read-1")
+                    && !is_error
+                    && output_preview.as_ref().is_some_and(|output| output.contains("MARKER"))
+        )));
+        assert_eq!(before.turns[1].usage.as_ref().unwrap().input_tokens, 10);
+        let continued = acp_transcript::TranscriptHeader::new("zcode", "new", "/workspace", 2000)
+            .continuing("old");
+        acp_transcript::record_header_in(root, agent, &continued)
+            .await
+            .unwrap();
+        acp_transcript::record_entry_in(
+            root,
+            agent,
+            "new",
+            EntryKind::Prompt,
+            serde_json::json!([{"type":"text","text":"Continue"}]),
+        )
+        .await
+        .unwrap();
+        let parser = AcpNativeParser::new_in(AgentType::ZCode, root.to_path_buf());
+        assert_eq!(parser.get_conversation("new").unwrap().turns.len(), 3);
+        let summaries = parser.list_conversations().unwrap();
+        assert_eq!(summaries.len(), 1, "continuation history should list once");
+        assert_eq!(summaries[0].id, "new");
+    }
+}
+
+#[cfg(test)]
+mod zcode_legacy_history_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn zcode_legacy_histories_and_builtin_history_stay_separate_for_identical_session_ids() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let cases = [
+            (AgentType::custom("zcode").unwrap(), "zcode", "LEGACY_ZCODE"),
+            (
+                AgentType::custom("zcode-acp").unwrap(),
+                "zcode-acp",
+                "LEGACY_ACP",
+            ),
+            (
+                AgentType::ZCode,
+                crate::acp::registry::registry_id_for(AgentType::ZCode),
+                "BUILTIN_ZCODE",
+            ),
+        ];
+        for (agent, dir, marker) in cases {
+            for (sid, previous) in [("previous", None), ("same-id", Some("previous"))] {
+                let mut header = acp_transcript::TranscriptHeader::new(
+                    &agent.as_wire(),
+                    sid,
+                    "/workspace",
+                    1000,
+                );
+                if let Some(previous) = previous {
+                    header = header.continuing(previous);
+                }
+                acp_transcript::record_header_in(root, dir, &header)
+                    .await
+                    .unwrap();
+                acp_transcript::record_entry_in(
+                    root,
+                    dir,
+                    sid,
+                    EntryKind::Prompt,
+                    serde_json::json!([{"type":"text","text":format!("{marker}:{sid}")}]),
+                )
+                .await
+                .unwrap();
+                acp_transcript::record_entry_in(
+                    root,
+                    dir,
+                    sid,
+                    EntryKind::TurnEnd,
+                    serde_json::json!({"stopReason":"end_turn"}),
+                )
+                .await
+                .unwrap();
+            }
+        }
+        for (agent, _, marker) in cases {
+            let parser = AcpNativeParser::new_in(agent, root.to_path_buf());
+            let listed = parser.list_conversations().unwrap();
+            assert_eq!(listed.len(), 1, "only the continuation head is listed");
+            assert_eq!(listed[0].id, "same-id");
+            assert_eq!(listed[0].agent_type, agent);
+            let detail = parser.get_conversation("same-id").unwrap();
+            let turns = serde_json::to_string(&detail.turns).unwrap();
+            assert!(turns.contains(&format!("{marker}:previous")));
+            assert!(turns.contains(&format!("{marker}:same-id")));
+            for (_, _, other) in cases {
+                if other != marker {
+                    assert!(
+                        !turns.contains(other),
+                        "{agent} must not read {other}'s history"
+                    );
+                }
+            }
+            let old = parser.get_conversation("previous").unwrap();
+            assert_eq!(old.summary.agent_type, agent);
+            assert_eq!(old.turns.len(), 1, "old external IDs remain readable");
+        }
     }
 }

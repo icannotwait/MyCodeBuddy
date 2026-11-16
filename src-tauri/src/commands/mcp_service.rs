@@ -481,6 +481,7 @@ mod tests {
     };
     use crate::acp::delegation::listener::TokenEntry;
     use crate::acp::delegation::spawner::{mock::MockSpawner, ConnectionSpawner};
+    use crate::acp::delegation::transport::CompanionRole;
     use crate::acp::delegation::types::DelegationError;
     use crate::acp::feedback::FeedbackConfig;
     use async_trait::async_trait;
@@ -846,14 +847,34 @@ mod tests {
             f.tokens
                 .register(
                     token.into(),
-                    TokenEntry::legacy("conn-a", std::path::PathBuf::from("/tmp")),
+                    TokenEntry {
+                        agent_hosts_tools: false,
+                        parent_connection_id: "conn-a".into(),
+                        working_dir: std::path::PathBuf::from("/tmp"),
+                        bound_task_id: None,
+                        completion_v2: false,
+                        coordination_v1: false,
+                        delegation_continuation_v1: false,
+                        role: CompanionRole::Root,
+                        workflow_v2: false,
+                    },
                 )
                 .await;
         }
         f.tokens
             .register(
                 "t3".into(),
-                TokenEntry::legacy("conn-b", std::path::PathBuf::from("/tmp")),
+                TokenEntry {
+                    agent_hosts_tools: false,
+                    parent_connection_id: "conn-b".into(),
+                    working_dir: std::path::PathBuf::from("/tmp"),
+                    bound_task_id: None,
+                    completion_v2: false,
+                    coordination_v1: false,
+                    delegation_continuation_v1: false,
+                    role: CompanionRole::Root,
+                    workflow_v2: false,
+                },
             )
             .await;
 

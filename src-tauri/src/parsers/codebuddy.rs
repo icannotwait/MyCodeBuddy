@@ -20,13 +20,18 @@ use crate::parsers::{
     infer_context_window_max_tokens, is_safe_subagent_id, latest_turn_total_usage_tokens,
     merge_context_window_stats, relocate_orphaned_tool_results, resolve_patch_line_numbers,
     structurize_read_tool_output, title_from_user_text, truncate_str, visible_title,
-    visible_user_text, AgentParser, ParseError,
+    visible_user_text, AgentEnv, AgentParser, ParseError,
 };
 
 /// Resolve CodeBuddy's config dir, honoring `CODEBUDDY_CONFIG_DIR`, else
 /// `~/.codebuddy` (mirrors `resolve_claude_config_dir`).
 pub(crate) fn resolve_codebuddy_config_dir() -> PathBuf {
-    resolve_codebuddy_config_dir_from(std::env::var_os("CODEBUDDY_CONFIG_DIR"), dirs::home_dir())
+    resolve_codebuddy_config_dir_for_env(&AgentEnv::inherited())
+}
+
+/// The config dir of the CodeBuddy launched with `env`.
+pub(crate) fn resolve_codebuddy_config_dir_for_env(env: &AgentEnv) -> PathBuf {
+    resolve_codebuddy_config_dir_from(env.var_os("CODEBUDDY_CONFIG_DIR"), dirs::home_dir())
 }
 
 fn resolve_codebuddy_config_dir_from(
@@ -53,8 +58,13 @@ pub struct CodeBuddyParser {
 
 impl CodeBuddyParser {
     pub fn new() -> Self {
+        Self::for_env(&AgentEnv::inherited())
+    }
+
+    /// The history of the CodeBuddy launched with `env`.
+    pub fn for_env(env: &AgentEnv) -> Self {
         Self {
-            base_dir: resolve_codebuddy_config_dir().join("projects"),
+            base_dir: resolve_codebuddy_config_dir_for_env(env).join("projects"),
         }
     }
 
@@ -63,6 +73,23 @@ impl CodeBuddyParser {
     #[cfg(any(test, feature = "test-utils"))]
     pub fn with_base_dir(base_dir: PathBuf) -> Self {
         Self { base_dir }
+    }
+
+    /// The images a prompt record carried, read from the blob store beside the
+    /// `projects` dir this parser reads ([`read_prompt_image`]).
+    fn prompt_images(&self, value: &Value) -> Vec<ContentBlock> {
+        let (Some(config_dir), Some(items)) = (
+            self.base_dir.parent(),
+            value.get("content").and_then(Value::as_array),
+        ) else {
+            return Vec::new();
+        };
+        let blobs = config_dir.join("blobs");
+        items
+            .iter()
+            .filter(|item| item.get("type").and_then(Value::as_str) == Some("image_blob_ref"))
+            .filter_map(|item| read_prompt_image(&blobs, item))
+            .collect()
     }
 
     fn parse_summary(&self, path: &Path) -> Option<ConversationSummary> {
@@ -121,8 +148,8 @@ impl CodeBuddyParser {
                             continue;
                         };
                         message_count += 1;
-                        if first_user_text.is_none() {
-                            first_user_text = Some(title_from_user_text(&visible));
+                        if first_user_text.is_none() && !visible.trim().is_empty() {
+                            first_user_text = Some(title_from_user_text(visible.trim()));
                         }
                     }
                     "assistant" => message_count += 1,
@@ -232,19 +259,31 @@ impl CodeBuddyParser {
                             // record entirely — no user turn, no message count,
                             // no fallback title.
                             capture_task_notification(&text, &mut background_notifications);
-                        } else if let Some(visible) = visible_user_text(&text) {
+                        } else {
+                            let text = shown_user_text(text);
                             message_count += 1;
-                            if first_user_text.is_none() {
-                                first_user_text = Some(title_from_user_text(&visible));
+                            if first_user_text.is_none() && !text.trim().is_empty() {
+                                first_user_text = Some(title_from_user_text(text.trim()));
                             }
-                            messages.push(text_message(
-                                format!("cb-user-{idx}"),
-                                MessageRole::User,
-                                visible,
-                                ts,
-                                None,
-                                None,
-                            ));
+                            // The typed text, then the prompt's images: what
+                            // CodeBuddy's own replay shows for the record.
+                            let mut content = Vec::new();
+                            if !text.trim().is_empty() {
+                                content.push(ContentBlock::Text { text });
+                            }
+                            content.extend(self.prompt_images(&value));
+                            if !content.is_empty() {
+                                let mut message = text_message(
+                                    format!("cb-user-{idx}"),
+                                    MessageRole::User,
+                                    String::new(),
+                                    ts,
+                                    None,
+                                    None,
+                                );
+                                message.content = content;
+                                messages.push(message);
+                            }
                         }
                     }
                     "assistant" => {
@@ -342,6 +381,7 @@ impl CodeBuddyParser {
                             is_error: tool_is_error(&value),
                             agent_stats,
                             images: Vec::new(),
+                            exit_code: None,
                         }],
                         timestamp: ts,
                         usage: None,
@@ -549,9 +589,73 @@ impl CodeBuddyTitles {
 /// was nothing to summarize. Showing one of these as the session name is worse
 /// than falling through to the first user message.
 fn is_placeholder_title(text: &str) -> bool {
-    text == "(No content)"
-        || text == "/compact"
-        || (text.starts_with("<image_local_path>") && text.ends_with("</image_local_path>"))
+    text == "(No content)" || text == "/compact" || is_image_local_path_block(text)
+}
+
+/// CodeBuddy's `isImageLocalPathBlock`: the text item its prompt converter adds
+/// after each image a prompt carried, telling the model where it saved the file
+/// (`<image_local_path>…/clipboard-….png</image_local_path>`). The person never
+/// typed it, and CodeBuddy's own replay leaves it out.
+fn is_image_local_path_block(text: &str) -> bool {
+    let text = text.trim();
+    text.starts_with("<image_local_path>") && text.ends_with("</image_local_path>")
+}
+
+/// The extension CodeBuddy's blob store gives a file of `mime` (the image
+/// entries of `PathUtils.MIME_EXT_MAP`); any other type is stored as `.bin`.
+fn blob_extension(mime: &str) -> &'static str {
+    match mime {
+        "image/png" => "png",
+        "image/jpeg" => "jpg",
+        "image/gif" => "gif",
+        "image/webp" => "webp",
+        "image/svg+xml" => "svg",
+        "image/bmp" => "bmp",
+        "image/tiff" => "tiff",
+        _ => "bin",
+    }
+}
+
+/// One `image_blob_ref` item of a prompt, read back from CodeBuddy's blob store
+/// under the checks its own `BlobStore.read` makes: the id is a lowercase
+/// 64-digit hex digest, the file is the one `getBlobPath` names
+/// (`blobs/<first two digits>/<id>.<ext>`), its length matches the recorded
+/// `size` when there is one, and its SHA-256 is the id. The record's
+/// `blob_path` is never read, so a record cannot point the parser at another
+/// file. A blob that is gone or fails a check is left out, as CodeBuddy's
+/// replay leaves it out.
+fn read_prompt_image(blobs: &Path, item: &Value) -> Option<ContentBlock> {
+    use base64::{engine::general_purpose::STANDARD, Engine as _};
+    use sha2::{Digest, Sha256};
+
+    let id = item.get("blob_id")?.as_str()?;
+    if id.len() != 64 || !id.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) {
+        return None;
+    }
+    let mime = item.get("mime")?.as_str()?;
+    if !mime.starts_with("image/") {
+        return None;
+    }
+    let path = blobs
+        .join(&id[..2])
+        .join(format!("{id}.{}", blob_extension(mime)));
+    let bytes = fs::read(path).ok()?;
+    if let Some(size) = item.get("size") {
+        if size.as_u64() != Some(bytes.len() as u64) {
+            return None;
+        }
+    }
+    if format!("{:x}", Sha256::digest(&bytes)) != id {
+        return None;
+    }
+    Some(ContentBlock::Image {
+        data: STANDARD.encode(&bytes),
+        mime_type: mime.to_string(),
+        uri: item
+            .get("original_filename")
+            .and_then(Value::as_str)
+            .map(String::from),
+    })
 }
 
 /// Record types that carry actual conversation content, as opposed to the
@@ -591,17 +695,48 @@ fn call_id(value: &Value) -> Option<String> {
         .map(String::from)
 }
 
+/// What a prompt record shows: the text the person typed.
+///
+/// A prompt command is persisted as the command tags Claude Code introduced
+/// followed by the prompt it expands to: `<command-message>init
+/// </command-message> <command-name>/init</command-name>`, plus ` <command-args>
+/// …</command-args>` when it has arguments, then a line break and the expansion.
+/// CodeBuddy's custom commands, MCP prompts and workflows were already stored
+/// this way in 2.164.0, and since 2.167.0 its built-in ones such as `/init` are
+/// too, where they used to be stored as the bare expansion. CodeBuddy's own
+/// history replay shows the invocation alone, and so does this; the expansion is
+/// written for the model. Only a record that OPENS with the tags is one, so a
+/// prompt that merely mentions them is left as typed.
+fn shown_user_text(text: String) -> String {
+    let head = text.trim_start();
+    let text = if head.starts_with("<command-message>") || head.starts_with("<command-name>") {
+        crate::parsers::claude::slash_command_display(head).unwrap_or(text)
+    } else {
+        text
+    };
+    // Drop Codeg terminal-context and pure delegation-route frames before the
+    // prompt is titled or shown.
+    visible_user_text(&text).unwrap_or_default()
+}
+
 /// Concatenate the `text` of every `content[]` item of the given `item_type`
-/// (`input_text` for user turns, `output_text` for assistant turns).
+/// (`input_text` for user turns, `output_text` for assistant turns), leaving
+/// out the note a prompt carries for each of its images
+/// ([`is_image_local_path_block`]).
 fn collect_text(value: &Value, item_type: &str) -> String {
     let mut out = String::new();
     if let Some(items) = value.get("content").and_then(|c| c.as_array()) {
         for item in items {
-            if item.get("type").and_then(|t| t.as_str()) == Some(item_type) {
-                if let Some(text) = item.get("text").and_then(|t| t.as_str()) {
-                    out.push_str(text);
-                }
+            if item.get("type").and_then(|t| t.as_str()) != Some(item_type) {
+                continue;
             }
+            let Some(text) = item.get("text").and_then(|t| t.as_str()) else {
+                continue;
+            };
+            if item_type == "input_text" && is_image_local_path_block(text) {
+                continue;
+            }
+            out.push_str(text);
         }
     }
     out
@@ -780,6 +915,45 @@ fn deferred_result_envelope(value: &Value) -> Option<String> {
     .ok()
 }
 
+/// `text` without the line-range hint CodeBuddy (2.184.0 on) appends to a Read
+/// result, or `text` itself when it has none.
+///
+/// The hint is one line addressed to the model, after the numbered lines and
+/// the empty `N→` line that ends them:
+/// `\n<system-reminder data-role="tool-hint">Read lines 1-2 of 2.</system-reminder>`
+/// (a partial read gets a `[Truncated: …]` notice naming the next offset, a
+/// read past the end "Read 0 lines from line N"). It reaches codeg live, in a
+/// `session/load` replay and in the transcript's `output.text`, and left in
+/// place it would become the last line of the file card's text. Only a hint
+/// that closes the text, right after a numbered line, is taken off, so any
+/// other result keeps its text as sent; what is left is exactly what 2.183.0
+/// sent for the same read.
+pub(crate) fn strip_read_range_hint(text: &str) -> &str {
+    const OPEN: &str = "\n<system-reminder data-role=\"tool-hint\">";
+    const CLOSE: &str = "</system-reminder>";
+    let Some(body) = text.strip_suffix(CLOSE) else {
+        return text;
+    };
+    let Some(at) = body.rfind(OPEN) else {
+        return text;
+    };
+    let hint = &body[at + OPEN.len()..];
+    if hint.contains('\n') || hint.contains("<system-reminder") {
+        return text;
+    }
+    let kept = &text[..at];
+    let last_line = kept.rsplit('\n').next().unwrap_or(kept);
+    let is_numbered = last_line
+        .trim_start()
+        .split_once('→')
+        .is_some_and(|(num, _)| !num.is_empty() && num.bytes().all(|b| b.is_ascii_digit()));
+    if is_numbered {
+        kept
+    } else {
+        text
+    }
+}
+
 /// `function_call_result.output` is `{type:"text", text}`; fall back to the raw
 /// string or `providerData.toolResult.content`. Deferred MCP tools first surface
 /// their structured `mcpMeta` envelope (see `deferred_result_envelope`).
@@ -790,10 +964,10 @@ fn tool_output_preview(value: &Value) -> Option<String> {
     if let Some(output) = value.get("output") {
         if let Some(text) = output.as_str() {
             if !text.is_empty() {
-                return Some(text.to_string());
+                return Some(strip_read_range_hint(text).to_string());
             }
         } else if let Some(text) = output.get("text").and_then(|t| t.as_str()) {
-            return Some(text.to_string());
+            return Some(strip_read_range_hint(text).to_string());
         }
     }
     let content = value
@@ -855,12 +1029,13 @@ fn tool_is_error(value: &Value) -> bool {
 /// `agentCapabilities.metaPromptSupport`; per the 2.159.0 changelog it reaches
 /// the model but is not shown, broadcast or replayed as a user message):
 /// `markAcpMetaPromptItems` stamps the same flag on its user items. codeg never
-/// sends one, but another client's would land here. Since 2.162.0 it also
-/// covers the task-list reminders CodeBuddy persists for the model: a
-/// `<system-reminder>` text flagged `{isMeta, skipRun, startsNewUserRequest:
-/// false, taskReminderKind: "task" | "todo", taskReminderAnchorId}` that it
-/// leaves out of its own replay (`CODEBUDDY_DISABLE_TASK_REMINDERS=1` turns
-/// them off).
+/// sends one, but another client's would land here. It also covers the
+/// task-list reminders CodeBuddy 2.162.0 through 2.164.0 persisted for the
+/// model: a `<system-reminder>` text flagged `{isMeta, skipRun,
+/// startsNewUserRequest: false, taskReminderKind: "task" | "todo",
+/// taskReminderAnchorId}` that it leaves out of its own replay. 2.167.0 stopped
+/// writing them (and dropped the `CODEBUDDY_DISABLE_TASK_REMINDERS` switch), but
+/// the ones already on disk stay there.
 ///
 /// CodeBuddy's OWN renderer skips exactly these records when it replays a
 /// session (`"message" === type && "user" === role && (isMeta ||
@@ -1123,6 +1298,8 @@ fn agent_stats_from_subagent(
         lines_removed: None,
         other_tool_count: None,
         tool_calls,
+        timeline: Vec::new(),
+        recovered_result: None,
         // CodeBuddy's sub-agent transcript is a file under the parent session,
         // not a session of its own.
         child_session_id: None,
@@ -1426,6 +1603,138 @@ mod tests {
         std::fs::remove_dir_all(&root).ok();
     }
 
+    /// CodeBuddy's TUI starts new sessions in PTC mode since 2.168.2: the
+    /// model's only direct tool is `REPL`, whose JavaScript calls the other
+    /// tools. These records are a real 2.168.2 session (ids and paths
+    /// shortened, `providerData` trimmed) that ran one PTC step, was reopened
+    /// by a host without `mainAgentSupport` (which gets standard mode) and
+    /// continued there. The Read and Bash the code called left no records,
+    /// and `session-meta` still says `ptc` after the standard turn; only each
+    /// record's `providerData.agent` (`ptc`, then `cli`) tells the turns apart.
+    #[test]
+    fn ptc_session_shows_each_repl_step_as_one_tool_card() {
+        let root = std::env::temp_dir().join(format!("codeg-cb-ptc-{}", uuid::Uuid::new_v4()));
+        let sid = "01a1490d-c719-7ac6-9dca-77bf22758389";
+        let code = "const r = await Read({ file_path: \"/Users/demo/app/notes.txt\" });\n\
+                    const b = await Bash({ command: \"echo ptc-ok | tee ptc-marker.txt\", description: \"probe echo\" });\n\
+                    return { read: JSON.stringify(r).slice(0, 300), bash: JSON.stringify(b).slice(0, 300) };";
+        let arguments =
+            serde_json::to_string(&json!({"code": code, "description": "read notes and run echo"}))
+                .expect("serialize arguments");
+        let output = r#"{"result":{"read":"\"TEXTFILE_MARKER line one\\nline two\\n\"","bash":"{\"stdout\":\"ptc-ok\\n\",\"stderr\":\"\",\"exitCode\":0,\"signal\":null}"},"stdout":"","stderr":""}"#;
+        write_session(
+            &root,
+            "Users-demo-app",
+            sid,
+            &[
+                json!({"type":"session-meta","id":"m1","sessionId":sid,"timestamp":1792227002225i64,
+                       "meta":{"codebuddy.ai/mainAgent":"ptc"}}),
+                json!({"id":"u1","timestamp":1792227002501i64,"type":"message","role":"user","sessionId":sid,"cwd":"/Users/demo/app",
+                       "content":[{"type":"input_text","text":"PLEASE_PTC read notes and echo"}],"providerData":{"agent":"ptc"}}),
+                json!({"type":"file-history-snapshot","timestamp":1792227002510i64,"messageId":"u1","snapshot":{},
+                       "isSnapshotUpdate":false,"cwd":"/Users/demo/app"}),
+                json!({"id":"c1","parentId":"u1","timestamp":1792227002817i64,"type":"function_call","sessionId":sid,"cwd":"/Users/demo/app",
+                       "callId":"call_ptc_1","name":"REPL","arguments":arguments,
+                       "providerData":{"agent":"ptc","messageId":"r1","requestModelName":"Auto","argumentsDisplayText":code,
+                         "rawUsage":{"prompt_tokens":1001,"completion_tokens":11,"total_tokens":1012}}}),
+                json!({"id":"c2","parentId":"c1","timestamp":1792227002991i64,"type":"function_call_result","sessionId":sid,"cwd":"/Users/demo/app",
+                       "name":"REPL","callId":"call_ptc_1","status":"completed","output":{"type":"text","text":output},
+                       "providerData":{"agent":"ptc","messageId":"r1","requestModelName":"Auto",
+                         "toolResult":{"title":"read notes and run echo","content":output,
+                           "renderer":{"type":"text","value":"· 1s\n{}"}}}}),
+                json!({"id":"a1","parentId":"c2","timestamp":1792227003016i64,"type":"message","role":"assistant","status":"completed",
+                       "sessionId":sid,"cwd":"/Users/demo/app",
+                       "content":[{"providerData":{"annotations":[]},"type":"output_text","text":"FINAL_ANSWER: done after tool result"}],
+                       "providerData":{"agent":"ptc","messageId":"r2","requestModelName":"Auto",
+                         "rawUsage":{"prompt_tokens":1002,"completion_tokens":12,"total_tokens":1014}}}),
+                json!({"type":"session-meta","id":"m2","sessionId":sid,"timestamp":1792227032000i64,
+                       "meta":{"codebuddy.ai/mainAgent":"ptc","codebuddy.ai/hostKind":"unopted"}}),
+                json!({"type":"session-meta","id":"m3","sessionId":sid,"timestamp":1792227032000i64,
+                       "meta":{"codebuddy.ai/mainAgent":"ptc","codebuddy.ai/hostKind":"unopted"}}),
+                json!({"id":"u2","parentId":"a1","timestamp":1792227036112i64,"type":"message","role":"user","sessionId":sid,"cwd":"/Users/demo/app",
+                       "content":[{"type":"input_text","text":"PLEASE_PTC again"}],"providerData":{"agent":"cli"}}),
+                json!({"id":"a2","parentId":"u2","timestamp":1792227036201i64,"type":"message","role":"assistant","status":"completed",
+                       "sessionId":sid,"cwd":"/Users/demo/app",
+                       "content":[{"type":"output_text","text":"hello from fake model"}],
+                       "providerData":{"agent":"cli","messageId":"r3","requestModelName":"Auto",
+                         "rawUsage":{"prompt_tokens":1002,"completion_tokens":12,"total_tokens":1014,
+                           "prompt_tokens_details":{"cached_tokens":100}}}}),
+                json!({"id":"s1","timestamp":1792227036204i64,"type":"summary","summary":"PLEASE_PTC read notes and echo"}),
+            ],
+        );
+
+        let parser = CodeBuddyParser::with_base_dir(root.clone());
+        let summaries = parser.list_conversations().expect("list");
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(summaries[0].message_count, 4);
+
+        let detail = parser.get_conversation(sid).expect("detail");
+        let blocks = || detail.turns.iter().flat_map(|t| t.blocks.iter());
+
+        let tool_uses: Vec<_> = blocks()
+            .filter_map(|b| match b {
+                ContentBlock::ToolUse {
+                    tool_use_id,
+                    tool_name,
+                    input_preview,
+                    ..
+                } => Some((
+                    tool_use_id.as_deref(),
+                    tool_name.as_str(),
+                    input_preview.as_deref(),
+                )),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(tool_uses.len(), 1, "one card for the step: {tool_uses:?}");
+        let (id, name, input) = tool_uses[0];
+        assert_eq!((id, name), (Some("call_ptc_1"), "REPL"));
+        let input: Value = serde_json::from_str(input.expect("input")).expect("JSON input");
+        assert_eq!(input["code"], code);
+        assert_eq!(input["description"], "read notes and run echo");
+
+        let results: Vec<_> = blocks()
+            .filter_map(|b| match b {
+                ContentBlock::ToolResult {
+                    tool_use_id,
+                    output_preview,
+                    is_error,
+                    ..
+                } => Some((tool_use_id.as_deref(), output_preview.as_deref(), *is_error)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(results, vec![(Some("call_ptc_1"), Some(output), false)]);
+
+        // The prompts and answers of both turns, and nothing from `session-meta`.
+        let texts: Vec<(&str, &str)> = detail
+            .turns
+            .iter()
+            .flat_map(|t| {
+                let role = if matches!(t.role, TurnRole::User) {
+                    "user"
+                } else {
+                    "assistant"
+                };
+                t.blocks.iter().filter_map(move |b| match b {
+                    ContentBlock::Text { text } => Some((role, text.as_str())),
+                    _ => None,
+                })
+            })
+            .collect();
+        assert_eq!(
+            texts,
+            vec![
+                ("user", "PLEASE_PTC read notes and echo"),
+                ("assistant", "FINAL_ANSWER: done after tool result"),
+                ("user", "PLEASE_PTC again"),
+                ("assistant", "hello from fake model"),
+            ]
+        );
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
     /// A Responses-API model's record carries the agents SDK's `response_done`
     /// usage, which is what CodeBuddy stores when the raw stream reports none.
     #[test]
@@ -1531,6 +1840,72 @@ mod tests {
         assert_eq!(user_texts, vec!["fix the bug"]);
 
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    // Since 2.167.0 `/init` is stored the way custom commands already were:
+    // the command tags, then the prompt they expand to. The bubble shows what
+    // was typed, as CodeBuddy's own replay does; a prompt that only mentions the
+    // tags stays as typed.
+    #[test]
+    fn prompt_commands_show_as_typed() {
+        let root = std::env::temp_dir().join(format!("codeg-cb-command-{}", uuid::Uuid::new_v4()));
+        let sid = "sess-command";
+        let user = |id: &str, ts: i64, text: &str| {
+            json!({"id":id,"type":"message","role":"user","timestamp":ts,"cwd":"/Users/demo/app",
+                   "sessionId":sid,"content":[{"type":"input_text","text":text}]})
+        };
+        write_session(
+            &root,
+            "Users-demo-app",
+            sid,
+            &[
+                user(
+                    "u1",
+                    1781821844178,
+                    "<command-message>init</command-message> <command-name>/init</command-name>\n\
+                     Please analyze this codebase and create a CODEBUDDY.md file",
+                ),
+                json!({"id":"a1","type":"message","role":"assistant","timestamp":1781821845000i64,
+                       "cwd":"/Users/demo/app","sessionId":sid,"content":[{"type":"output_text","text":"Created."}]}),
+                user(
+                    "u2",
+                    1781821846000,
+                    "<command-message>review</command-message> <command-name>/review</command-name> \
+                     <command-args>src/main.rs</command-args>\nReview the file for bugs",
+                ),
+                user(
+                    "u3",
+                    1781821847000,
+                    "why does <command-name>/x</command-name> appear here?",
+                ),
+            ],
+        );
+
+        let parser = CodeBuddyParser::with_base_dir(root.clone());
+        let summaries = parser.list_conversations().expect("list");
+        let detail = parser.get_conversation(sid).expect("detail");
+        std::fs::remove_dir_all(&root).ok();
+
+        assert_eq!(summaries[0].title.as_deref(), Some("/init"));
+        assert_eq!(detail.summary.title.as_deref(), Some("/init"));
+        let user_texts: Vec<_> = detail
+            .turns
+            .iter()
+            .filter(|t| matches!(t.role, TurnRole::User))
+            .flat_map(|t| t.blocks.iter())
+            .filter_map(|b| match b {
+                ContentBlock::Text { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            user_texts,
+            vec![
+                "/init",
+                "/review src/main.rs",
+                "why does <command-name>/x</command-name> appear here?",
+            ]
+        );
     }
 
     /// Parse one session through BOTH title paths (list + detail) and assert
@@ -1810,6 +2185,82 @@ mod tests {
         assert!(
             !read_output.contains("1→"),
             "line-number prefixes must be stripped, got: {read_output}"
+        );
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// A 2.184.0 Read result as its transcript stores it: the numbered lines,
+    /// the empty `N→` line and the line-range hint for the model (captured).
+    const READ_2184: &str = "   1→outside one\n   2→outside two\n   3→\n<system-reminder data-role=\"tool-hint\">Read lines 1-2 of 2.</system-reminder>";
+
+    #[test]
+    fn read_range_hint_comes_off_and_leaves_what_2183_sent() {
+        assert_eq!(
+            strip_read_range_hint(READ_2184),
+            "   1→outside one\n   2→outside two\n   3→"
+        );
+        // A partial read's notice and a read past the end (captured).
+        let partial = " 119→big line 119\n 120→\n<system-reminder data-role=\"tool-hint\">[Truncated: PARTIAL view — big.txt: showing lines 100-119 (total unknown). Call Read with offset=120 limit=20 for the next page, or Grep to find a specific section. Do NOT answer from this page alone if the answer may be further in the file.]</system-reminder>";
+        assert_eq!(strip_read_range_hint(partial), " 119→big line 119\n 120→");
+        let past_end = "1000→\n<system-reminder data-role=\"tool-hint\">Read 0 lines from line 1000 (total unknown).</system-reminder>";
+        assert_eq!(strip_read_range_hint(past_end), "1000→");
+    }
+
+    #[test]
+    fn a_tool_hint_after_anything_but_numbered_lines_stays() {
+        // A background task snapshot's hint follows prose, not numbered lines.
+        let snapshot = "Status: running\n<system-reminder data-role=\"tool-hint\">Do NOT poll TaskOutput in a loop.</system-reminder>";
+        assert_eq!(strip_read_range_hint(snapshot), snapshot);
+        // Not at the end, another role, or spanning lines: kept as sent.
+        let not_last = format!("{READ_2184}\nmore");
+        assert_eq!(strip_read_range_hint(&not_last), not_last);
+        let other_role = "   1→a\n   2→\n<system-reminder data-role=\"other\">x</system-reminder>";
+        assert_eq!(strip_read_range_hint(other_role), other_role);
+        let multi_line =
+            "   1→a\n   2→\n<system-reminder data-role=\"tool-hint\">x\ny</system-reminder>";
+        assert_eq!(strip_read_range_hint(multi_line), multi_line);
+        assert_eq!(strip_read_range_hint("   1→a\n   2→b"), "   1→a\n   2→b");
+    }
+
+    #[test]
+    fn read_result_with_a_range_hint_shows_only_the_file_lines() {
+        let root = std::env::temp_dir().join(format!("codeg-cb-readhint-{}", uuid::Uuid::new_v4()));
+        let sid = "sess-readhint";
+        write_session(
+            &root,
+            "Users-demo-app",
+            sid,
+            &[
+                json!({"type":"message","role":"user","timestamp":1781821844000i64,"cwd":"/Users/demo/app","sessionId":sid,
+                       "content":[{"type":"input_text","text":"read it"}]}),
+                json!({"type":"function_call","timestamp":1781821845000i64,"cwd":"/Users/demo/app","sessionId":sid,
+                       "name":"Read","callId":"r1","arguments":"{\"file_path\": \"/x\"}"}),
+                json!({"type":"function_call_result","timestamp":1781821845100i64,"cwd":"/Users/demo/app","sessionId":sid,
+                       "name":"Read","callId":"r1","status":"completed",
+                       "output":{"type":"text","text":READ_2184}}),
+            ],
+        );
+
+        let parser = CodeBuddyParser::with_base_dir(root.clone());
+        let detail = parser.get_conversation(sid).expect("detail");
+        let read_output = detail
+            .turns
+            .iter()
+            .flat_map(|t| &t.blocks)
+            .find_map(|b| match b {
+                ContentBlock::ToolResult {
+                    tool_use_id: Some(id),
+                    output_preview,
+                    ..
+                } if id == "r1" => output_preview.clone(),
+                _ => None,
+            })
+            .expect("read tool result");
+        assert_eq!(
+            Some(read_output),
+            crate::parsers::strip_numbered_lines("   1→outside one\n   2→outside two\n   3→"),
+            "the card gets the same lines as for 2.183.0's result"
         );
 
         std::fs::remove_dir_all(&root).ok();
@@ -2710,5 +3161,172 @@ earlier terminal context records.\n\
             .any(|text| text.contains("partial")));
 
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn for_env_reads_the_config_dir_of_the_launch_env() {
+        let env = AgentEnv::with_overrides(&[("CODEBUDDY_CONFIG_DIR", "/relocated/codebuddy")]);
+        assert_eq!(
+            CodeBuddyParser::for_env(&env).base_dir,
+            PathBuf::from("/relocated/codebuddy").join("projects")
+        );
+    }
+
+    const PROMPT_IMAGE_BYTES: &[u8] = b"\x89PNG\r\n\x1a\nnot-really-pixels";
+
+    /// CodeBuddy names a blob by the SHA-256 of its bytes.
+    fn prompt_image_blob_id() -> String {
+        use sha2::{Digest, Sha256};
+        format!("{:x}", Sha256::digest(PROMPT_IMAGE_BYTES))
+    }
+
+    /// A config dir whose blob store holds the prompt image, laid out the way
+    /// CodeBuddy's `getBlobPath` writes it.
+    fn home_with_prompt_image(tag: &str) -> PathBuf {
+        let home = std::env::temp_dir().join(format!("codeg-cb-{tag}-{}", uuid::Uuid::new_v4()));
+        let id = prompt_image_blob_id();
+        let blob_dir = home.join("blobs").join(&id[..2]);
+        std::fs::create_dir_all(&blob_dir).expect("create blob dir");
+        std::fs::write(blob_dir.join(format!("{id}.png")), PROMPT_IMAGE_BYTES).expect("write blob");
+        home
+    }
+
+    fn prompt_record(sid: &str, timestamp: i64, content: Value) -> Value {
+        json!({"type":"message","role":"user","timestamp":timestamp,"cwd":"/Users/demo/app",
+               "sessionId":sid,"content":content})
+    }
+
+    fn user_blocks(detail: &ConversationDetail) -> Vec<Vec<ContentBlock>> {
+        detail
+            .turns
+            .iter()
+            .filter(|turn| matches!(turn.role, TurnRole::User))
+            .map(|turn| turn.blocks.clone())
+            .collect()
+    }
+
+    // CodeBuddy stores an image a prompt carried as an `image_blob_ref`, then
+    // adds a text item telling the model where it saved the file. Its own
+    // replay shows the typed text and the image and drops that note. Reading
+    // every `input_text` showed the note as part of what the person typed, and
+    // in the title, and never showed the image. The records are a real 2.170.0
+    // prompt with its paths trimmed; `blob_path` points nowhere on purpose,
+    // because the store location is CodeBuddy's, not the record's.
+    #[test]
+    fn a_prompt_image_shows_as_the_image_not_as_its_saved_path() {
+        let home = home_with_prompt_image("image");
+        let sid = "sess-image";
+        let image_ref = json!({"type":"image_blob_ref","blob_id":prompt_image_blob_id(),
+            "mime":"image/png","size":PROMPT_IMAGE_BYTES.len(),
+            "blob_path":"/moved/away/blobs/24/elsewhere.png"});
+        let saved_path = json!({"type":"input_text",
+            "text":"<image_local_path>/tmp/workbuddy-clipboard-images/clipboard-1.png</image_local_path>"});
+        write_session(
+            &home.join("projects"),
+            "Users-demo-app",
+            sid,
+            &[
+                prompt_record(
+                    sid,
+                    1792505064302,
+                    json!([{"type":"input_text","text":"hello image"}, image_ref, saved_path]),
+                ),
+                json!({"type":"message","role":"assistant","timestamp":1792505064496i64,
+                       "cwd":"/Users/demo/app","sessionId":sid,
+                       "content":[{"type":"output_text","text":"hello from fake"}]}),
+                // An image with no typed text keeps its bubble: the image is it.
+                prompt_record(sid, 1792505065000, json!([image_ref, saved_path])),
+            ],
+        );
+        let parser = CodeBuddyParser::with_base_dir(home.join("projects"));
+
+        let summaries = parser.list_conversations().expect("list");
+        assert_eq!(summaries[0].title.as_deref(), Some("hello image"));
+        // Both prompts still count, the image-only one included.
+        assert_eq!(summaries[0].message_count, 3);
+
+        let detail = parser.get_conversation(sid).expect("detail");
+        assert_eq!(detail.summary.title.as_deref(), Some("hello image"));
+        assert_eq!(detail.summary.message_count, 3);
+        let encoded = {
+            use base64::{engine::general_purpose::STANDARD, Engine as _};
+            STANDARD.encode(PROMPT_IMAGE_BYTES)
+        };
+        let users = user_blocks(&detail);
+        assert_eq!(users.len(), 2, "{users:?}");
+        assert!(
+            matches!(
+                users[0].as_slice(),
+                [ContentBlock::Text { text }, ContentBlock::Image { data, mime_type, .. }]
+                    if text == "hello image" && *data == encoded && mime_type == "image/png"
+            ),
+            "{:?}",
+            users[0]
+        );
+        assert!(
+            matches!(
+                users[1].as_slice(),
+                [ContentBlock::Image { data, .. }] if *data == encoded
+            ),
+            "{:?}",
+            users[1]
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    // A blob is read the way CodeBuddy's own store reads it, and only then: a
+    // lowercase 64-digit hex id, the file its `getBlobPath` names, the recorded
+    // size when there is one, and bytes whose SHA-256 is the id. So a record
+    // cannot point the parser at another file, and a blob CodeBuddy would
+    // refuse is not shown. The typed text still is.
+    #[test]
+    fn a_blob_ref_reads_nothing_outside_the_image_store() {
+        let home = home_with_prompt_image("blob-guard");
+        let id = prompt_image_blob_id();
+        std::fs::write(home.join("secret.png"), b"not for the history view").unwrap();
+        // The same bytes stored under a non-image type (which CodeBuddy files
+        // as `.bin`) are still not an image.
+        std::fs::write(
+            home.join("blobs").join(&id[..2]).join(format!("{id}.bin")),
+            PROMPT_IMAGE_BYTES,
+        )
+        .unwrap();
+        // A file at a well-formed id whose bytes are not that id's.
+        let forged = "0".repeat(64);
+        std::fs::create_dir_all(home.join("blobs").join("00")).unwrap();
+        std::fs::write(
+            home.join("blobs").join("00").join(format!("{forged}.png")),
+            PROMPT_IMAGE_BYTES,
+        )
+        .unwrap();
+        let sid = "sess-guard";
+        write_session(
+            &home.join("projects"),
+            "Users-demo-app",
+            sid,
+            &[prompt_record(
+                sid,
+                1792505064302,
+                json!([
+                    {"type":"input_text","text":"look"},
+                    {"type":"image_blob_ref","blob_id":"../../secret","mime":"image/png",
+                     "blob_path":home.join("secret.png")},
+                    {"type":"image_blob_ref","blob_id":id.to_uppercase(),"mime":"image/png"},
+                    {"type":"image_blob_ref","blob_id":id,"mime":"application/octet-stream"},
+                    {"type":"image_blob_ref","blob_id":id,"mime":"image/png","size":1},
+                    {"type":"image_blob_ref","blob_id":forged,"mime":"image/png"},
+                ]),
+            )],
+        );
+        let detail = CodeBuddyParser::with_base_dir(home.join("projects"))
+            .get_conversation(sid)
+            .expect("detail");
+        let users = user_blocks(&detail);
+        assert!(
+            matches!(users.as_slice(), [blocks] if matches!(blocks.as_slice(),
+                [ContentBlock::Text { text }] if text == "look")),
+            "{users:?}"
+        );
+        std::fs::remove_dir_all(&home).ok();
     }
 }

@@ -6,9 +6,11 @@ import type {
   BundledTheme,
   HighlighterGeneric,
   ThemedToken,
+  TokensResult,
 } from "shiki"
 
 import { Button } from "@/components/ui/button"
+import { ScrollArea } from "@/components/ui/scroll-area"
 import {
   Select,
   SelectContent,
@@ -19,6 +21,12 @@ import {
 import { WeightedLruCache } from "@/lib/cache/weighted-lru"
 import { cn, copyTextToClipboard } from "@/lib/utils"
 import { registerBackendScopedStoreReset } from "@/stores/backend-scoped-store-reset"
+import {
+  DEFAULT_CODE_THEMES,
+  getCachedHighlightedCode,
+  rawCodeTokens,
+  subscribeHighlightedCode,
+} from "@/lib/code-highlighter"
 import { CheckIcon, CopyIcon } from "lucide-react"
 import {
   createContext,
@@ -62,7 +70,7 @@ const addKeysToTokens = (lines: ThemedToken[][]): KeyedLine[] =>
   }))
 
 // Token rendering component
-const TokenSpan = ({ token }: { token: ThemedToken }) => (
+export const TokenSpan = ({ token }: { token: ThemedToken }) => (
   <span
     className="dark:!bg-[var(--shiki-dark-bg)] dark:!text-[var(--shiki-dark)]"
     style={
@@ -117,6 +125,12 @@ interface CodeBlockContextType {
 // Context
 const CodeBlockContext = createContext<CodeBlockContextType>({
   code: "",
+})
+
+const normalizeTokens = (result: TokensResult): TokenizedCode => ({
+  tokens: result.tokens,
+  fg: result.fg ?? "inherit",
+  bg: result.bg ?? "transparent",
 })
 
 type HighlighterFactory = (
@@ -501,6 +515,52 @@ export const CodeBlockActions = ({
   </div>
 )
 
+/**
+ * `code` as lines of coloured tokens: plain text at once, then the highlighted
+ * tokens once shiki has them (cached by code and language). For code set
+ * outside a `CodeBlock`, with `TokenSpan` per token.
+ */
+export function useHighlightedTokens(
+  code: string,
+  language: BundledLanguage
+): TokenizedCode {
+  // Memoized raw tokens for immediate display
+  const rawTokens = useMemo(() => normalizeTokens(rawCodeTokens(code)), [code])
+
+  // Synchronous cached-or-raw value, recomputed when code/language changes
+  const syncTokenized = useMemo(() => {
+    const cached = getCachedHighlightedCode({
+      code,
+      language,
+      themes: DEFAULT_CODE_THEMES,
+    })
+    return cached ? normalizeTokens(cached) : rawTokens
+  }, [code, language, rawTokens])
+
+  // Async highlighted result, tagged with its source code/language
+  const [asyncState, setAsyncState] = useState<{
+    code: string
+    language: string
+    tokenized: TokenizedCode
+  } | null>(null)
+
+  useEffect(
+    () =>
+      subscribeHighlightedCode(
+        { code, language, themes: DEFAULT_CODE_THEMES },
+        (result) => {
+          setAsyncState({ code, language, tokenized: normalizeTokens(result) })
+        }
+      ),
+    [code, language]
+  )
+
+  // Use async result only if it matches current code/language
+  return asyncState?.code === code && asyncState?.language === language
+    ? asyncState.tokenized
+    : syncTokenized
+}
+
 export const CodeBlockContent = ({
   code,
   language,
@@ -510,45 +570,18 @@ export const CodeBlockContent = ({
   language: BundledLanguage
   showLineNumbers?: boolean
 }) => {
-  // Memoized raw tokens for immediate display
-  const rawTokens = useMemo(() => createRawTokens(code), [code])
+  const tokenized = useHighlightedTokens(code, language)
 
-  // Synchronous cached-or-raw value, recomputed when code/language changes
-  const syncTokenized = useMemo(
-    () => highlightCode(code, language) ?? rawTokens,
-    [code, language, rawTokens]
-  )
-
-  // Async highlighted result, tagged with its source code/language.
-  // An incrementing request version rejects stale callbacks after props change.
-  const [asyncState, setAsyncState] = useState<{
-    code: string
-    language: string
-    tokenized: TokenizedCode
-  } | null>(null)
-  const requestVersionRef = useRef(0)
-
-  useEffect(() => {
-    const requestVersion = ++requestVersionRef.current
-
-    // Subscribe to async highlighting result
-    highlightCode(code, language, (result) => {
-      if (requestVersion !== requestVersionRef.current) return
-      setAsyncState({ code, language, tokenized: result })
-    })
-  }, [code, language])
-
-  // Use async result only if it matches current code/language (stale
-  // versions never write asyncState, so code/language is sufficient here).
-  const tokenized =
-    asyncState?.code === code && asyncState?.language === language
-      ? asyncState.tokenized
-      : syncTokenized
-
+  // Sideways on the app's overlay scrollbars, like every other scroll area.
   return (
-    <div className="relative overflow-auto">
-      <CodeBlockBody showLineNumbers={showLineNumbers} tokenized={tokenized} />
-    </div>
+    <ScrollArea x="scroll" y="hidden">
+      <div className="relative">
+        <CodeBlockBody
+          showLineNumbers={showLineNumbers}
+          tokenized={tokenized}
+        />
+      </div>
+    </ScrollArea>
   )
 }
 

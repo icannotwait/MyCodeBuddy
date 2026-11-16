@@ -88,9 +88,23 @@ pub struct DbConversationSummary {
         Option<crate::acp::delegation::attention::AttentionRequestSummary>,
     /// Mirror of `conversation.origin_cwd`: the working directory this
     /// conversation actually ran in when it differs from its current folder's
-    /// path (set when a removed task worktree's conversations were re-parented).
+    /// path (set when a removed task worktree's conversations were re-parented,
+    /// or the user moved the conversation to another project).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub origin_cwd: Option<String>,
+    /// Mirror of `conversation.assistant_id`: the assistant a delegation child
+    /// ran as. Absent on every other row.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub assistant_id: Option<i32>,
+    /// That assistant's name when the delegation started, out of the row's
+    /// `assistant_snapshot`. The UI prefers the assistant's current name and
+    /// falls back to this one when the assistant row is unknown to it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub assistant_name: Option<String>,
+    /// Mirror of `conversation.source`: `"cli"` for a conversation a
+    /// `codeg-cli` run started. Absent on every other row.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
     /// Ids of the tags on this conversation, ascending. Not stored on the row —
     /// backfilled from `conversation_tag_link` by one query over the returned
     /// set (`fill_summary_extras`), the same way `child_count` is. Omitted from
@@ -213,10 +227,16 @@ pub struct DbConversationDetail {
     /// Assistant turns in `full[0..turns_offset)`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub assistant_turns_before_offset: Option<usize>,
-    /// User turns in `full[0..turns_offset)`.
+    /// User turns in `full[0..turns_offset)`. The message navigator counts
+    /// and numbers every message of the conversation, including the ones
+    /// above the loaded window; this is what it adds to the window's own.
+    /// Absent from servers that predate it (and from legacy full responses),
+    /// which also tells the client the outline endpoint isn't there.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub user_turns_before_offset: Option<usize>,
-    /// Structural fingerprint of `full[0..turns_offset)`.
+    /// Structural fingerprint of `full[0..turns_offset)` (see
+    /// `commands::turn_window::prefix_fingerprint`), as a fixed-width 16-hex
+    /// string — a u64 JSON number would be rounded past 2^53-1 by JS.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prefix_hash: Option<String>,
     /// Maximum timestamp in the uncovered prefix, absent at offset zero.
@@ -230,7 +250,11 @@ pub struct ConversationTurnsPage {
     pub turns_offset: usize,
     pub turns_total: usize,
     pub assistant_turns_before_offset: usize,
+    /// User turns in `full[0..turns_offset)` — the window's new
+    /// `user_turns_before_offset` after a successful prepend.
     pub user_turns_before_offset: usize,
+    /// Fingerprint of `full[0..turns_offset)` — adopted by the client as its
+    /// new window fingerprint after a successful prepend.
     pub prefix_hash: String,
     pub prefix_hash_before_index: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -241,6 +265,21 @@ pub struct ConversationTurnsPage {
 pub struct ContinuationFailureProjection {
     pub code: ContinuationFailureCode,
     pub finished_at: DateTime<Utc>,
+}
+
+/// The message navigator's view of the history ABOVE the loaded window:
+/// `full[0..min(beforeIndex, total))`, one entry per turn (so `turns[i]` is
+/// global turn `i`), each reduced to what the navigator reads — see
+/// `commands::turn_window::nav_outline_turns` for exactly what survives.
+/// Every turn keeps its id, role and timestamp, so the client can fingerprint
+/// any prefix of it and check it against its window before using it.
+#[derive(Debug, Clone, Serialize)]
+pub struct ConversationOutline {
+    pub turns: Vec<MessageTurn>,
+    pub turns_total: usize,
+    /// Fingerprint of `full[0..turns.len())` — equal to the client's window
+    /// fingerprint when the outline was cut at the window start.
+    pub prefix_hash: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -293,7 +332,9 @@ pub struct ImportResult {
 pub enum ScanSessionStatus {
     /// Not in the DB — importable.
     New,
-    /// At least one live (non-deleted) row exists — already imported.
+    /// At least one live (non-deleted) row exists — already imported. Also a
+    /// Claude Code session whose usage a live conversation of a custom agent
+    /// on the official Claude adapter counts: the import skips it.
     Imported,
     /// Only soft-deleted rows exist. Deletion is a soft delete, so the row (and
     /// its whole history) is still there: the picker offers such a session for

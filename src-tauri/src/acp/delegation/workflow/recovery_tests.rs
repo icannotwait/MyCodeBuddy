@@ -421,6 +421,7 @@ async fn legacy_parent_disconnect_authorize_continue_then_unresumable_replace() 
             parent_conversation_id: parent,
             parent_tool_use_id: "legacy-stale-replacement-tool".into(),
             delegation_call_id: "legacy-stale-replacement".into(),
+            assistant: None,
         }),
     )
     .await
@@ -455,6 +456,7 @@ async fn legacy_parent_disconnect_authorize_continue_then_unresumable_replace() 
             parent_conversation_id: parent,
             parent_tool_use_id: "legacy-replacement-tool".into(),
             delegation_call_id: "legacy-replacement".into(),
+            assistant: None,
         }),
     )
     .await
@@ -935,6 +937,7 @@ async fn seed_legacy_parent_disconnect(
             parent_conversation_id: parent.id,
             parent_tool_use_id: "legacy-source-tool".into(),
             delegation_call_id: source_task_id.clone(),
+            assistant: None,
         }),
     )
     .await

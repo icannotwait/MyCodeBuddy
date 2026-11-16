@@ -8,6 +8,8 @@ import { cloneRepository } from "@/lib/api"
 import { toErrorMessage } from "@/lib/app-error"
 import { openFolderWithDraft } from "@/lib/open-folder-with-draft"
 import { joinFsPath } from "@/lib/path-utils"
+import type { FolderDetail } from "@/lib/types"
+import { useAppWorkspaceStore } from "@/stores/app-workspace-store"
 import { useGitCredential } from "@/contexts/git-credential-context"
 import {
   Dialog,
@@ -24,9 +26,22 @@ import { DirectoryPathInput } from "@/components/shared/directory-path-input"
 interface CloneDialogProps {
   open: boolean
   onOpenChange: (open: boolean) => void
+  /**
+   * Called once the cloned repository has been opened as a workspace folder —
+   * the same hook `WorkspaceFolderDialog` offers, so a caller can act on the
+   * new folder (the sidebar files it into the group the clone started from).
+   * It is the callback of the render the Clone click happened in, so a clone
+   * still finishing after the dialog was reopened elsewhere reports to the
+   * caller that started it.
+   */
+  onFolderOpened?: (folder: FolderDetail) => void
 }
 
-export function CloneDialog({ open, onOpenChange }: CloneDialogProps) {
+export function CloneDialog({
+  open,
+  onOpenChange,
+  onFolderOpened,
+}: CloneDialogProps) {
   const t = useTranslations("Folder.cloneDialog")
   const tToasts = useTranslations("Folder.toasts")
   const { withCredentialRetry } = useGitCredential()
@@ -73,7 +88,8 @@ export function CloneDialog({ open, onOpenChange }: CloneDialogProps) {
         (creds) => cloneRepository(url, fullPath, creds),
         { remoteUrl: url }
       )
-      await openFolderWithDraft(fullPath)
+      const detail = await openFolderWithDraft(fullPath)
+      onFolderOpened?.(detail)
       onOpenChange(false)
       resetForm()
     } catch (err) {

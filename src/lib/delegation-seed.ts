@@ -44,6 +44,8 @@ export function buildDelegationSeedEnvelopes(
       observation: d.observation ?? "active",
       last_agent_activity_at: d.last_agent_activity_at ?? null,
       stalled_since: d.stalled_since ?? null,
+      assistant_id: d.assistant_id ?? null,
+      assistant_name: d.assistant_name ?? null,
     })
   }
   return out

@@ -4593,6 +4593,8 @@ mod tests {
                                 now,
                             ),
                         attention_request: None,
+                        assistant_id: None,
+                        assistant_name: None,
                     })
                     .await;
                 }
@@ -4605,6 +4607,7 @@ mod tests {
                         watermark: 0,
                         detail_refetch: false,
                         transcript_reset: false,
+                        outstanding_tasks: Vec::new(),
                     })
                     .await;
                 }
@@ -4695,6 +4698,8 @@ mod tests {
                             text_preview: None,
                         },
                         card_summary: None,
+                        assistant_id: None,
+                        assistant_name: None,
                     })
                     .await;
                 }
@@ -4707,6 +4712,7 @@ mod tests {
                         watermark: 1,
                         detail_refetch: false,
                         transcript_reset: false,
+                        outstanding_tasks: Vec::new(),
                     })
                     .await;
                 }

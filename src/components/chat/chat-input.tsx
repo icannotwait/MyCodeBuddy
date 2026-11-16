@@ -50,6 +50,8 @@ interface ChatInputProps {
   onConfigOptionChange?: (configId: string, valueId: string) => void
   agentType?: AgentType | null
   availableCommands?: AvailableCommandInfo[] | null
+  /** Pass-through: see `MessageInput.promptSuggestion`. */
+  promptSuggestion?: string | null
   attachmentTabId?: string | null
   /** Pass-through: see `MessageInput`. */
   folderPickerOverride?: ConversationFolderPickerOverride
@@ -132,6 +134,11 @@ interface ChatInputProps {
    * send/enqueue/cancel without relying solely on connection status.
    */
   interactionLocked?: boolean
+  /**
+   * Shared sessions queue follow-ups on the server. The composer still shows
+   * Stop, and Enter calls `onSend` instead of holding the draft.
+   */
+  deliverWhilePrompting?: boolean
 }
 
 export const ChatInput = memo(function ChatInput({
@@ -154,6 +161,7 @@ export const ChatInput = memo(function ChatInput({
   onConfigOptionChange,
   agentType,
   availableCommands,
+  promptSuggestion,
   attachmentTabId,
   folderPickerOverride,
   draftStorageKey,
@@ -192,6 +200,7 @@ export const ChatInput = memo(function ChatInput({
   queuePaused = false,
   onResumeQueue,
   interactionLocked = false,
+  deliverWhilePrompting = false,
 }: ChatInputProps) {
   const t = useTranslations("Folder.chat.chatInput")
   const isConnected = status === "connected"
@@ -296,6 +305,7 @@ export const ChatInput = memo(function ChatInput({
         // does not take the disabled+prompting enqueue bypass. Stop still comes
         // from showCancel (isPrompting || isWaitingForSubagents).
         isPrompting={isPrompting && !isWaitingForSubagents}
+        deliverWhilePrompting={deliverWhilePrompting}
         showCancel={showCancel}
         onCancel={onCancel}
         modes={modes}
@@ -307,6 +317,7 @@ export const ChatInput = memo(function ChatInput({
         onConfigOptionChange={onConfigOptionChange}
         agentType={agentType}
         availableCommands={availableCommands}
+        promptSuggestion={promptSuggestion}
         commandsLoading={commandsLoading}
         attachmentTabId={attachmentTabId}
         folderPickerOverride={folderPickerOverride}

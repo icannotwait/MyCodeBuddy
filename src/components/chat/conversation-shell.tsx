@@ -12,14 +12,14 @@ import type {
   PromptInputBlock,
   QuestionAnswer,
   SessionConfigOptionInfo,
-  AsyncTaskRecord,
   SessionFailureRecord,
   SnapshotTruncation,
   SessionModeInfo,
   AvailableCommandInfo,
+  RemoteControlInfo,
 } from "@/lib/types"
 import { ComposerStatusStrips } from "@/components/chat/composer-status-strips"
-import { AsyncTaskStrip } from "@/components/chat/async-task-strip"
+import { RemoteControlStrip } from "@/components/chat/remote-control-strip"
 import type {
   PendingPermission,
   PendingQuestion,
@@ -40,6 +40,7 @@ import { PermissionDialog } from "@/components/chat/permission-dialog"
 import { QuestionDialog } from "@/components/chat/question-dialog"
 import { AskQuestionCard } from "@/components/chat/ask-question-card"
 import { PlanApprovalCard } from "@/components/chat/plan-approval-card"
+import { MarkdownImageProvider } from "@/components/ai-elements/markdown-local-image"
 
 interface ConversationShellProps {
   status: ConnectionStatus | null
@@ -64,12 +65,12 @@ interface ConversationShellProps {
    *  every surface with a live store — dismissing is client-local, so viewers
    *  get it too. */
   onSessionFailureDismiss?: (ids: string[]) => void
-  /** AIR async tasks for this connection. The strip filters to the live ones
-   *  itself; omit/empty renders nothing. */
-  asyncTasks?: AsyncTaskRecord[]
-  /** Stops one async task. Omitted for read-only surfaces — the stop buttons
-   *  are then hidden, which is right: a viewer has no connection to ask. */
-  onStopAsyncTask?: (taskId: string) => Promise<boolean>
+  /** Claude Code's Remote Control while it is on; its strip shows the
+   *  session's link and QR code. Omit/`null` renders nothing. */
+  remoteControl?: RemoteControlInfo | null
+  /** Turns Remote Control off (sends `/remote-control off`). Omitted for
+   *  surfaces without a connection of their own — the button is then hidden. */
+  onRemoteControlOff?: () => void
   pendingPermission: PendingPermission | null
   pendingQuestion: PendingQuestion | null
   /** Awaiting-answer multiple-choice `ask_user_question`. */
@@ -104,6 +105,9 @@ interface ConversationShellProps {
   onConfigOptionChange?: (configId: string, valueId: string) => void
   agentType?: AgentType | null
   availableCommands?: AvailableCommandInfo[] | null
+  /** The prompt the agent predicts the user will send next; the empty
+   *  composer offers it (see `MessageInput.promptSuggestion`). */
+  promptSuggestion?: string | null
   attachmentTabId?: string | null
   /** Pass-through: see `MessageInput`. */
   folderPickerOverride?: ConversationFolderPickerOverride
@@ -193,6 +197,11 @@ interface ConversationShellProps {
    *  handles' layout maths would be off by the zoom factor, and a card has no
    *  window edge to keep clear. */
   resizableWidth?: boolean
+  /**
+   * Shared sessions have no local queue. Enter while the turn is prompting
+   * still calls `onSend` so the server can queue the follow-up.
+   */
+  deliverWhilePrompting?: boolean
 }
 
 export function ConversationShell({
@@ -205,8 +214,8 @@ export function ConversationShell({
   sessionFailures,
   snapshotTruncation = null,
   onSessionFailureDismiss,
-  asyncTasks,
-  onStopAsyncTask,
+  remoteControl,
+  onRemoteControlOff,
   pendingPermission,
   pendingQuestion,
   pendingAskQuestion,
@@ -230,6 +239,7 @@ export function ConversationShell({
   onConfigOptionChange,
   agentType,
   availableCommands,
+  promptSuggestion,
   attachmentTabId,
   folderPickerOverride,
   draftStorageKey,
@@ -271,6 +281,7 @@ export function ConversationShell({
   injectContent,
   onInjectConsumed,
   resizableWidth = false,
+  deliverWhilePrompting = false,
 }: ConversationShellProps) {
   return (
     // The gutter keeps the chat column (transcript and composer alike) off
@@ -282,13 +293,19 @@ export function ConversationShell({
       {topBanner}
       {routeNotice}
 
-      {/* Above the transcript, not down in the composer dock: this is the state
-          of work running RIGHT NOW, and pinning it here keeps it still while the
-          messages scroll under it — the stop button doesn't move out from under
-          the pointer. The dock below is for things that come and go with the
-          turn or the connection (`ComposerStatusStrips`). */}
-      {asyncTasks && asyncTasks.length > 0 && (
-        <AsyncTaskStrip tasks={asyncTasks} onStop={onStopAsyncTask} />
+      {/* Above the transcript, not down in the composer dock: Remote Control
+          is the session's standing state, and pinning it here keeps it still
+          while the messages scroll under it. The dock below is for things that
+          come and go with the turn or the connection
+          (`ComposerStatusStrips`). Work running past a turn — background
+          tasks, sub-agents, delegations — is the transcript's live activity
+          row's "N running" (`MessageListView`'s `liveRuns`). */}
+      {remoteControl && (
+        <RemoteControlStrip
+          remoteControl={remoteControl}
+          onTurnOff={onRemoteControlOff}
+          canTurnOff={status === "connected"}
+        />
       )}
       {snapshotTruncation ? (
         <SnapshotLimitedNotice truncation={snapshotTruncation} />
@@ -298,11 +315,16 @@ export function ConversationShell({
         {resizableWidth && <ChatWidthHandles />}
       </div>
 
-      <PermissionDialog
-        permission={pendingPermission}
-        onRespond={onRespondPermission}
-        agentType={agentType}
-      />
+      {/* Below the transcript, so outside its image scope: a request or a
+          plan names local images the way a reply does, against the same
+          folder. */}
+      <MarkdownImageProvider rootPath={defaultPath ?? null}>
+        <PermissionDialog
+          permission={pendingPermission}
+          onRespond={onRespondPermission}
+          agentType={agentType}
+        />
+      </MarkdownImageProvider>
 
       <QuestionDialog
         question={pendingQuestion}
@@ -328,11 +350,13 @@ export function ConversationShell({
           <div className="mx-auto w-full chat-content-w px-4">
             {/* key on approval_id so the card always remounts (fresh in-flight /
                 feedback state) if the slot is ever reused for a new approval. */}
-            <PlanApprovalCard
-              key={pendingPlanApproval.approval_id}
-              approval={pendingPlanApproval}
-              onAnswer={onAnswerPlanApproval}
-            />
+            <MarkdownImageProvider rootPath={defaultPath ?? null}>
+              <PlanApprovalCard
+                key={pendingPlanApproval.approval_id}
+                approval={pendingPlanApproval}
+                onAnswer={onAnswerPlanApproval}
+              />
+            </MarkdownImageProvider>
           </div>
         )}
 
@@ -373,6 +397,7 @@ export function ConversationShell({
               onConfigOptionChange={onConfigOptionChange}
               agentType={agentType}
               availableCommands={availableCommands}
+              promptSuggestion={promptSuggestion}
               attachmentTabId={attachmentTabId}
               folderPickerOverride={folderPickerOverride}
               draftStorageKey={draftStorageKey}
@@ -405,6 +430,7 @@ export function ConversationShell({
               onResumeQueue={onResumeQueue}
               injectContent={injectContent}
               onInjectConsumed={onInjectConsumed}
+              deliverWhilePrompting={deliverWhilePrompting}
             />
           </div>
         )}

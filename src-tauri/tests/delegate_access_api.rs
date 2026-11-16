@@ -41,6 +41,7 @@ async fn locked_child_fixture() -> LockedChildFixture {
             parent_conversation_id: parent.id,
             parent_tool_use_id: "tool".into(),
             delegation_call_id: "task".into(),
+            assistant: None,
         }),
     )
     .await
@@ -124,6 +125,7 @@ async fn locked_mutations_return_409_delegate_viewer_only_permission_exempt() {
                 ],
                 is_secret: false,
                 recovery: None,
+                allow_other: true,
             }],
         )
         .await
@@ -263,6 +265,7 @@ async fn answer_question_with_interactive_connection_id_and_locked_owner_returns
                 ],
                 is_secret: false,
                 recovery: None,
+                allow_other: true,
             }],
         )
         .await

@@ -13,6 +13,7 @@ import {
   AgentConfigSection,
   effectiveSelections,
   snapshotLabels,
+  useBooleanOptionLabels,
 } from "@/components/automations/agent-config-section"
 import { useAgentOptions } from "@/components/automations/use-agent-options"
 import { getAgentLabel } from "@/lib/custom-agents"
@@ -51,9 +52,10 @@ interface TaskEditorDialogProps {
   onOpenChange: (open: boolean) => void
   /** Existing task to edit, or null for a blank create. */
   task: WorkTask | null
-  /** Preselected folder for a create (the board's folder filter). */
+  /** Preselected folder for a create (the board's folder filter, the aux
+   *  panel's project, or the project of the conversation a message is in). */
   defaultFolderId: number | null
-  /** Seed text for a create (the "task from message" hand-off). */
+  /** Seed text for a create from a chat message (`TaskFromMessageHost`). */
   prefillText?: string | null
   onSubmit: (draft: WorkTaskDraft) => Promise<void>
 }
@@ -238,6 +240,7 @@ function TaskEditorBody({
     true,
     configValues
   )
+  const booleanLabels = useBooleanOptionLabels()
 
   // An untouched pill is saved as "inherit" only while it shows the agent that
   // inheriting launches. It can show another: the placeholder when nothing is
@@ -297,7 +300,7 @@ function TaskEditorBody({
       config_values,
       label_snapshot: {
         agent_label: getAgentLabel(agentType) ?? agentType,
-        ...snapshotLabels(snapshot, mode_id, config_values),
+        ...snapshotLabels(snapshot, mode_id, config_values, booleanLabels),
       },
       base_branch,
     }
@@ -478,6 +481,7 @@ function TaskEditorBody({
               agentType={agentOptions.snapshotAgentType}
               snapshot={agentOptions.snapshot}
               loading={agentOptions.loading}
+              stale={!agentOptions.current}
               error={agentOptions.error}
               onReload={agentOptions.reload}
               modeId={modeId}

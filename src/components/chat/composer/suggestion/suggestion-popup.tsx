@@ -45,6 +45,7 @@ const TAB_ORDER: readonly ReferenceGroupKind[] = [
 const DEFAULT_TAB_LABELS: Record<ReferenceKind, string> = {
   agent: "Agents",
   delegation_profile: "Agents",
+  assistant: "Assistants",
   file: "Files",
   session: "Sessions",
   commit: "Commits",
@@ -215,6 +216,11 @@ export interface SuggestionPopupProps {
    * `["file"]`.
    */
   allowedKinds?: readonly ReferenceGroupKind[]
+  /**
+   * Display order from Settings → General. Kinds this controller does not
+   * search (assistants, skills) are skipped. Omitted keeps {@link TAB_ORDER}.
+   */
+  tabs?: readonly ReferenceKind[]
 }
 
 /**
@@ -245,14 +251,20 @@ export const SuggestionPopup = forwardRef<
     onActiveOptionChange,
     isEditorComposing,
     allowedKinds,
+    tabs,
   },
   ref
 ) {
   const tabOrder = useMemo<readonly ReferenceGroupKind[]>(() => {
-    if (!allowedKinds) return TAB_ORDER
-    const filtered = TAB_ORDER.filter((kind) => allowedKinds.includes(kind))
-    return filtered.length > 0 ? filtered : TAB_ORDER
-  }, [allowedKinds])
+    const preferred = (tabs ?? TAB_ORDER).filter(
+      (kind): kind is ReferenceGroupKind =>
+        (TAB_ORDER as readonly string[]).includes(kind)
+    )
+    const base = preferred.length > 0 ? preferred : TAB_ORDER
+    if (!allowedKinds) return base
+    const filtered = base.filter((kind) => allowedKinds.includes(kind))
+    return filtered.length > 0 ? filtered : base
+  }, [allowedKinds, tabs])
   const subscribe = useCallback(
     (listener: () => void) => controller.subscribe(listener),
     [controller]

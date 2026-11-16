@@ -2,6 +2,7 @@ import { act, render, screen, waitFor } from "@testing-library/react"
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 import type { ReactNode } from "react"
 
+import type { AcpEventDelivery } from "@/contexts/acp-connections-context"
 import {
   DelegationProvider,
   useDelegation,
@@ -86,7 +87,11 @@ function completedEvent(
 // each test can drive the provider with synthetic acp://event envelopes.
 // `useAcpEvent` runs during render, so the handler is captured synchronously
 // on mount.
-let capturedHandler: ((envelope: EventEnvelope) => void) | null = null
+type CapturedHandler = (
+  envelope: EventEnvelope,
+  delivery?: AcpEventDelivery
+) => void
+let capturedHandler: CapturedHandler | null = null
 
 const mockAttach = vi.fn()
 const mockDetach = vi.fn()
@@ -96,7 +101,7 @@ vi.mock("@/contexts/acp-connections-context", () => ({
     attachDelegationChild: mockAttach,
     detachDelegationChild: mockDetach,
   }),
-  useAcpEvent: (handler: (e: EventEnvelope) => void) => {
+  useAcpEvent: (handler: CapturedHandler) => {
     capturedHandler = handler
   },
 }))
@@ -115,7 +120,9 @@ function BindingProbe({ parentToolUseId }: { parentToolUseId: string }) {
       <div data-testid="agent">{binding.agentType}</div>
       <div data-testid="task-id">{binding.taskId}</div>
       <div data-testid="started-at">{binding.startedAt}</div>
-      <div data-testid="tool-count">{binding.runtimeStats.tool_call_count}</div>
+      <div data-testid="tool-count">
+        {binding.runtimeStats?.tool_call_count ?? "-"}
+      </div>
       <div data-testid="duration-ms">{binding.completedDurationMs ?? "-"}</div>
       <div data-testid="attention">
         {binding.attentionRequest?.request_id ?? "-"}
@@ -125,6 +132,9 @@ function BindingProbe({ parentToolUseId }: { parentToolUseId: string }) {
         {binding.lastAgentActivityAt ?? "-"}
       </div>
       <div data-testid="stalled-since">{binding.stalledSince ?? "-"}</div>
+      <div data-testid="assistant">
+        {binding.assistantId ?? "-"}:{binding.assistantName ?? "-"}
+      </div>
     </div>
   )
 }
@@ -161,7 +171,7 @@ function SubSessionProbe({
   )
 }
 
-/** Same idea for the task-id lookup `ResumedDelegationCard` depends on. */
+/** Same idea for the task-id lookup a resumed delegation row depends on. */
 function TaskIdProbe({ taskId }: { taskId: string }) {
   const { findByTaskId } = useDelegation()
   const binding = findByTaskId(taskId)
@@ -328,6 +338,45 @@ describe("DelegationProvider", () => {
     // must take the agent_type the completion now carries — not a hardcoded
     // default — so the card shows the correct agent icon/label.
     expect(screen.getByTestId("agent")).toHaveTextContent("codex")
+  })
+
+  it("carries the assistant a delegation runs as, from either event", async () => {
+    renderProvider()
+    await awaitHandlerCaptured()
+    dispatch({
+      type: "delegation_started",
+      parent_connection_id: "p1",
+      parent_tool_use_id: "pt-1",
+      child_connection_id: "c1",
+      child_conversation_id: 99,
+      agent_type: "codex",
+      assistant_id: 3,
+      assistant_name: "Reviewer",
+    } as unknown as EventEnvelope)
+    expect(screen.getByTestId("assistant")).toHaveTextContent("3:Reviewer")
+
+    // A completion that arrives without its start still names the assistant.
+    dispatch({
+      type: "delegation_completed",
+      parent_connection_id: "p1",
+      parent_tool_use_id: "pt-2",
+      child_connection_id: "c2",
+      child_conversation_id: 100,
+      agent_type: "codex",
+      assistant_id: 4,
+      assistant_name: "Planner",
+      result: { kind: "ok" },
+    } as unknown as EventEnvelope)
+    // The probe watches pt-1; a plain agent delegation names none.
+    dispatch({
+      type: "delegation_started",
+      parent_connection_id: "p1",
+      parent_tool_use_id: "pt-1",
+      child_connection_id: "c1",
+      child_conversation_id: 99,
+      agent_type: "codex",
+    } as unknown as EventEnvelope)
+    expect(screen.getByTestId("assistant")).toHaveTextContent("-:-")
   })
 
   it("cancels a pending detach when delegation_started replays for the same parent_tool_use_id", async () => {
@@ -593,6 +642,53 @@ describe("DelegationProvider", () => {
     expect(screen.getByTestId("by-task-id-status")).toHaveTextContent("ok")
   })
 
+  it("lists a parent's bindings in start order, finished ones included", async () => {
+    function ParentProbe({ parent }: { parent: string }) {
+      const { bindingsForParent } = useDelegation()
+      return (
+        <div data-testid={`bindings-${parent}`}>
+          {bindingsForParent(parent)
+            .map((b) => `${b.childConnectionId}:${b.status}`)
+            .join(",")}
+        </div>
+      )
+    }
+    render(
+      <DelegationProvider>
+        <ParentProbe parent="p1" />
+        <ParentProbe parent="p2" />
+      </DelegationProvider>
+    )
+    await awaitHandlerCaptured()
+    const started = (parent: string, toolUseId: string, child: string) =>
+      ({
+        type: "delegation_started",
+        parent_connection_id: parent,
+        parent_tool_use_id: toolUseId,
+        child_connection_id: child,
+        child_conversation_id: 1,
+        agent_type: "codex",
+      }) as unknown as EventEnvelope
+    dispatch(started("p1", "pt-a", "c-a"))
+    dispatch(started("p2", "pt-x", "c-x"))
+    dispatch(started("p1", "pt-b", "c-b"))
+    dispatch({
+      type: "delegation_completed",
+      parent_connection_id: "p1",
+      parent_tool_use_id: "pt-a",
+      child_connection_id: "c-a",
+      child_conversation_id: 1,
+      agent_type: "codex",
+      result: { kind: "ok", duration_ms: 1 },
+    } as unknown as EventEnvelope)
+    // Which still RUN is the parent's own `delegatedChildren`; the list only
+    // says who each child is.
+    expect(screen.getByTestId("bindings-p1")).toHaveTextContent(
+      "c-a:ok,c-b:running"
+    )
+    expect(screen.getByTestId("bindings-p2")).toHaveTextContent("c-x:running")
+  })
+
   it("does not match a different task id, or an empty one", async () => {
     render(
       <DelegationProvider>
@@ -613,5 +709,41 @@ describe("DelegationProvider", () => {
     for (const probe of screen.getAllByTestId("by-task-id")) {
       expect(probe).toHaveTextContent("none")
     }
+  })
+
+  // A live `delegation_started` arrives before the child's first event, so its
+  // attach needs no snapshot. A binding re-seeded from the parent's snapshot
+  // names a child that is already mid-turn — maybe parked on a permission it
+  // raised before this client attached, which on the desktop firehose nothing
+  // else would ever deliver (#973) — so that attach hydrates.
+  it("hydrates a child re-seeded from a snapshot, and only that one", async () => {
+    renderProvider()
+    await awaitHandlerCaptured()
+    const started = (parentToolUseId: string, child: string) =>
+      ({
+        type: "delegation_started",
+        parent_connection_id: "p1",
+        parent_tool_use_id: parentToolUseId,
+        child_connection_id: child,
+        child_conversation_id: 99,
+        agent_type: "codex",
+      }) as unknown as EventEnvelope
+
+    dispatch(started("pt-live", "c-live"))
+    act(() => {
+      capturedHandler!(started("pt-seeded", "c-seeded"), {
+        seededFromSnapshot: true,
+      })
+    })
+
+    expect(mockAttach).toHaveBeenCalledTimes(2)
+    expect(mockAttach.mock.calls[0][0]).toMatchObject({
+      connectionId: "c-live",
+      hydrate: false,
+    })
+    expect(mockAttach.mock.calls[1][0]).toMatchObject({
+      connectionId: "c-seeded",
+      hydrate: true,
+    })
   })
 })

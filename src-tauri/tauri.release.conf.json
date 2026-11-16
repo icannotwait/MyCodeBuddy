@@ -2,6 +2,10 @@
   "$schema": "https://schema.tauri.app/config/2",
   "bundle": {
     "createUpdaterArtifacts": true,
-    "externalBin": ["binaries/codeg-mcp", "binaries/codeg-computer-helper"]
+    "externalBin": [
+      "binaries/codeg-mcp",
+      "binaries/codeg-computer-helper",
+      "binaries/codeg-cli"
+    ]
   }
 }

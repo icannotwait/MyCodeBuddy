@@ -1147,6 +1147,7 @@ const SubAgentOverlayRow = memo(function SubAgentOverlayRow({
   const {
     agentType,
     agentDisplayLabel,
+    identity,
     task,
     taskId,
     status,
@@ -1211,8 +1212,14 @@ const SubAgentOverlayRow = memo(function SubAgentOverlayRow({
             )}
           </span>
           <span className="min-w-0 break-words text-xs font-semibold text-foreground">
-            {agentDisplayLabel ??
-              (agentType ? getAgentLabel(agentType) : t("unknownAgent"))}
+            {(() => {
+              const agentName =
+                agentDisplayLabel ??
+                (agentType ? getAgentLabel(agentType) : t("unknownAgent"))
+              return identity.assistantName
+                ? `${identity.assistantName} · ${agentName}`
+                : agentName
+            })()}
           </span>
           {taskId && (
             <span

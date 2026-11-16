@@ -63,18 +63,10 @@ function extractPlanEntriesFromPart(part: AdaptedContentPart): PlanEntryInfo[] {
     return parseTodosFromJson(part.input)
   }
 
-  if (part.type === "tool-group") {
-    // Non-agent tool calls now collapse into tool-group; recurse so
-    // plan-like tools (TodoWrite, plan-update, etc.) are still discovered.
-    // Iterate backwards to match the "latest entry wins" caller semantics.
-    for (let i = part.items.length - 1; i >= 0; i -= 1) {
-      const entries = extractPlanEntriesFromPart(part.items[i])
-      if (entries.length > 0) return entries
-    }
-    return []
-  }
-
   if (part.type === "goal-run") {
+    // Recurse so plan-like tools (TodoWrite, plan-update, etc.) inside a goal
+    // run are still discovered. Iterate backwards to match the "latest entry
+    // wins" caller semantics.
     for (let i = part.items.length - 1; i >= 0; i -= 1) {
       const entries = extractPlanEntriesFromPart(part.items[i])
       if (entries.length > 0) return entries
@@ -89,21 +81,43 @@ function extractPlanEntriesFromPart(part: AdaptedContentPart): PlanEntryInfo[] {
   return []
 }
 
+// The latest plan in one message, or null: a message's adapted object is kept
+// for as long as it reads the same, and the transcript asks of every message
+// above the newest plan on each streaming batch — reading every reasoning block
+// in a long conversation line by line, each time, when it has no plan at all.
+const latestPlanByMessage = new WeakMap<
+  AdaptedMessage,
+  PlanEntryInfo[] | null
+>()
+
+function latestPlanEntriesOf(message: AdaptedMessage): PlanEntryInfo[] | null {
+  let found = latestPlanByMessage.get(message)
+  if (found === undefined) {
+    found = null
+    for (let j = message.content.length - 1; j >= 0; j -= 1) {
+      const entries = extractPlanEntriesFromPart(message.content[j])
+      if (entries.length > 0) {
+        found = entries
+        break
+      }
+    }
+    latestPlanByMessage.set(message, found)
+  }
+  return found
+}
+
 export function extractLatestPlanEntriesFromMessages(
   messages: AdaptedMessage[]
 ): PlanEntryInfo[] {
   let planEntries: PlanEntryInfo[] = []
   let planMessageIndex = -1
 
-  for (let i = messages.length - 1; i >= 0 && planMessageIndex === -1; i -= 1) {
-    const message = messages[i]
-    for (let j = message.content.length - 1; j >= 0; j -= 1) {
-      const entries = extractPlanEntriesFromPart(message.content[j])
-      if (entries.length > 0) {
-        planEntries = entries
-        planMessageIndex = i
-        break
-      }
+  for (let i = messages.length - 1; i >= 0; i -= 1) {
+    const entries = latestPlanEntriesOf(messages[i])
+    if (entries) {
+      planEntries = entries
+      planMessageIndex = i
+      break
     }
   }
 

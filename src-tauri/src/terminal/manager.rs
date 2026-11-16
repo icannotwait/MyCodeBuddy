@@ -228,9 +228,183 @@ fn lock_completed(
 fn lock_terminals(
     terminals: &Mutex<HashMap<String, TerminalInstance>>,
 ) -> std::sync::MutexGuard<'_, HashMap<String, TerminalInstance>> {
-    terminals
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
+    terminals.lock().unwrap_or_else(|p| p.into_inner())
+}
+
+pub(crate) fn resolve_shell() -> String {
+    #[cfg(target_os = "windows")]
+    {
+        if let Ok(shell) = std::env::var("SHELL") {
+            let trimmed = shell.trim();
+            if !trimmed.is_empty() {
+                return trimmed.to_string();
+            }
+        }
+        if let Ok(comspec) = std::env::var("COMSPEC") {
+            let trimmed = comspec.trim();
+            if !trimmed.is_empty() {
+                return trimmed.to_string();
+            }
+        }
+        "cmd.exe".to_string()
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        if let Ok(shell) = std::env::var("SHELL") {
+            let trimmed = shell.trim();
+            if !trimmed.is_empty() {
+                return trimmed.to_string();
+            }
+        }
+        // Try common shells in order of preference
+        for candidate in ["/bin/zsh", "/bin/bash", "/bin/sh"] {
+            if std::path::Path::new(candidate).exists() {
+                return candidate.to_string();
+            }
+        }
+        "/bin/sh".to_string()
+    }
+}
+
+#[cfg(target_os = "windows")]
+#[derive(Debug, Clone, Copy)]
+enum WindowsShellFlavor {
+    Cmd,
+    PowerShell,
+    Posix,
+}
+
+#[cfg(target_os = "windows")]
+fn detect_windows_shell_flavor(shell: &str) -> WindowsShellFlavor {
+    // Shares one classifier with the ACP terminal runtime so the two can't
+    // drift on what `COMSPEC` means — see `terminal::shell_flavor`.
+    match crate::terminal::shell_flavor::classify_shell_family(shell) {
+        ShellFamily::PowerShell => WindowsShellFlavor::PowerShell,
+        ShellFamily::Posix => WindowsShellFlavor::Posix,
+        ShellFamily::Cmd => WindowsShellFlavor::Cmd,
+    }
+}
+
+/// POSIX-side shell flavor. We only inject the `-l -i` login/interactive
+/// flags and the `eval "$CODEG_CMD"` wrapping for shells we know speak that
+/// dialect — passing those to nu / xonsh / elvish / pwsh would cause spawn
+/// failures or weird behavior. Unknown shells get raw spawn (no flags) and,
+/// when an `initial_command` is requested, a plain `-c <command>` (the
+/// closest thing to a universal "run this and exit" convention).
+#[cfg(not(target_os = "windows"))]
+#[derive(Debug, Clone, Copy)]
+#[allow(dead_code)]
+enum PosixShellFlavor {
+    /// bash / zsh / sh / dash / ksh / ash / mksh / busybox / fish — accept
+    /// `-l -i` and the `eval "$VAR"` pattern.
+    BashLike,
+    /// Anything else. Don't assume POSIX flag conventions.
+    Unknown,
+}
+
+#[cfg(not(target_os = "windows"))]
+#[allow(dead_code)]
+fn detect_posix_shell_flavor(shell: &str) -> PosixShellFlavor {
+    let name = crate::terminal::shell_flavor::shell_basename(shell);
+
+    if matches!(
+        name.as_str(),
+        "bash" | "zsh" | "sh" | "dash" | "ksh" | "ash" | "mksh" | "busybox" | "fish"
+    ) {
+        PosixShellFlavor::BashLike
+    } else {
+        PosixShellFlavor::Unknown
+    }
+}
+
+#[allow(dead_code)]
+fn configure_shell_command(cmd: &mut CommandBuilder, shell: &str, initial_command: Option<&str>) {
+    #[cfg(target_os = "windows")]
+    {
+        // Force UTF-8 output for all Windows shell flavors
+        cmd.env("PYTHONUTF8", "1");
+        cmd.env("PYTHONIOENCODING", "utf-8");
+
+        match detect_windows_shell_flavor(shell) {
+            WindowsShellFlavor::Cmd => {
+                if let Some(command) = initial_command {
+                    cmd.env("CODEG_CMD", command);
+                    // Set UTF-8 code page before running the actual command
+                    cmd.args(["/D", "/S", "/C", "chcp 65001 >nul & %CODEG_CMD%"]);
+                } else {
+                    // /K runs the command then stays open for interactive use
+                    cmd.args(["/D", "/S", "/K", "chcp 65001 >nul"]);
+                }
+            }
+            WindowsShellFlavor::PowerShell => {
+                // No `-NoProfile`: the user's `$PROFILE` (fnm, conda, aliases,
+                // PATH) runs, as the `-l -i` below gives POSIX shells their rc
+                // files. PowerShell runs it before `-Command`, so the UTF-8
+                // output (and an interactive tab's title) set there still apply.
+                if let Some(command) = initial_command {
+                    cmd.env("CODEG_CMD", command);
+                    cmd.args([
+                        "-NoLogo",
+                        "-Command",
+                        "[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; $ErrorActionPreference = 'Stop'; Invoke-Expression $env:CODEG_CMD",
+                    ]);
+                } else {
+                    // -NoExit runs the command then stays open for interactive use
+                    cmd.args([
+                        "-NoLogo",
+                        "-NoExit",
+                        "-Command",
+                        "[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; $host.UI.RawUI.WindowTitle = 'codeg'",
+                    ]);
+                }
+            }
+            WindowsShellFlavor::Posix => {
+                cmd.env("TERM", "xterm-256color");
+                cmd.env("COLORTERM", "truecolor");
+                cmd.env("TERM_PROGRAM", "codeg");
+                cmd.env("LANG", "C.UTF-8");
+                if let Some(command) = initial_command {
+                    cmd.env("CODEG_CMD", command);
+                    cmd.args(["-l", "-i", "-c", "eval \"$CODEG_CMD\""]);
+                } else {
+                    cmd.args(["-l", "-i"]);
+                }
+            }
+        }
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        // GUI app environments often miss TERM; force a sane terminal type so
+        // readline/zle can redraw lines correctly (history navigation, etc.).
+        // Locale env (LANG/LC_ALL) is intentionally NOT injected — interactive
+        // PTYs should respect whatever the user's shell rc files set up.
+        cmd.env("TERM", "xterm-256color");
+        cmd.env("COLORTERM", "truecolor");
+        cmd.env("TERM_PROGRAM", "codeg");
+
+        match detect_posix_shell_flavor(shell) {
+            PosixShellFlavor::BashLike => {
+                if let Some(command) = initial_command {
+                    // Indirection via env var avoids quoting/escaping bugs
+                    // for arbitrary commands (and keeps long commands off
+                    // argv for readability in `ps`).
+                    cmd.env("CODEG_CMD", command);
+                    cmd.args(["-l", "-i", "-c", "eval \"$CODEG_CMD\""]);
+                } else {
+                    cmd.args(["-l", "-i"]);
+                }
+            }
+            PosixShellFlavor::Unknown => {
+                // No-flag spawn for nu/xonsh/elvish/pwsh on Linux/etc. Most
+                // modern shells default to interactive when stdin is a TTY,
+                // so we get a usable session without guessing flag syntax.
+                if let Some(command) = initial_command {
+                    cmd.args(["-c", command]);
+                }
+            }
+        }
+    }
 }
 
 /// Options for spawning a new terminal session.
@@ -322,6 +496,27 @@ impl TerminalManager {
                 cmd.env(key, value);
             }
         }
+        // codeg's own codeg-cli first (`cli_run::shim`). Said here because
+        // on Windows portable-pty rebuilds PATH from the registry, dropping
+        // what this process put on its own.
+        if let Some(dir) = crate::cli_run::shim::path_dir() {
+            let current = cmd.get_env("PATH").map(|p| p.to_os_string());
+            let first = current
+                .as_deref()
+                .and_then(|p| std::env::split_paths(p).next());
+            if first.as_deref() != Some(dir) {
+                let sep = if cfg!(windows) { ";" } else { ":" };
+                let mut path = dir.as_os_str().to_os_string();
+                if let Some(current) = current.filter(|p| !p.is_empty()) {
+                    path.push(sep);
+                    path.push(current);
+                }
+                cmd.env("PATH", path);
+            }
+        }
+        // The session's environment, not the one an AppImage's launcher set
+        // up for codeg itself.
+        crate::appimage_env::restore_pty(&mut cmd);
 
         let child = pair
             .slave
@@ -1123,6 +1318,71 @@ mod tests {
         assert!(!snapshot.alive);
         assert!(snapshot.data.is_empty());
         assert_eq!(snapshot.seq, 0);
+    }
+
+    /// The argv a terminal tab launches `shell` with (program first), and the
+    /// `CODEG_CMD` it hands that shell.
+    fn tab_launch(shell: &str, initial_command: Option<&str>) -> (Vec<String>, Option<String>) {
+        let mut cmd = portable_pty::CommandBuilder::new(shell);
+        super::configure_shell_command(&mut cmd, shell, initial_command);
+        let argv = cmd
+            .get_argv()
+            .iter()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        let codeg_cmd = cmd
+            .get_env("CODEG_CMD")
+            .map(|value| value.to_string_lossy().into_owned());
+        (argv, codeg_cmd)
+    }
+
+    /// A PowerShell tab runs the user's `$PROFILE` (fnm's `--use-on-cd`, conda,
+    /// aliases, PATH edits), the way POSIX tabs get their rc files from
+    /// `-l -i`. `-NoLogo`, the UTF-8 output and the tab title stay.
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn powershell_tabs_run_the_users_profile() {
+        for shell in [
+            "pwsh.exe",
+            r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe",
+        ] {
+            let (argv, codeg_cmd) = tab_launch(shell, None);
+            assert_eq!(
+                argv[1..],
+                [
+                    "-NoLogo",
+                    "-NoExit",
+                    "-Command",
+                    "[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; $host.UI.RawUI.WindowTitle = 'codeg'",
+                ]
+            );
+            assert_eq!(codeg_cmd, None);
+
+            let (argv, codeg_cmd) = tab_launch(shell, Some("npm test"));
+            assert_eq!(
+                argv[1..],
+                [
+                    "-NoLogo",
+                    "-Command",
+                    "[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; $ErrorActionPreference = 'Stop'; Invoke-Expression $env:CODEG_CMD",
+                ]
+            );
+            assert_eq!(codeg_cmd.as_deref(), Some("npm test"));
+        }
+    }
+
+    /// On unix pwsh is not one of the shells given `-l -i`: an interactive tab
+    /// launches it bare and a command tab with plain `-c`, and either way it
+    /// runs its profile, as it does by default.
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn powershell_tabs_on_unix_run_the_users_profile() {
+        let shell = "/usr/local/bin/pwsh";
+        assert_eq!(tab_launch(shell, None).0, [shell]);
+        assert_eq!(
+            tab_launch(shell, Some("npm test")).0,
+            [shell, "-c", "npm test"]
+        );
     }
 
     /// A PTY child whose exit the manager never observed. Records whether the

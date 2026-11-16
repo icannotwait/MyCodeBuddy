@@ -248,6 +248,7 @@ function mountPopup(
     tabLabels?: Partial<Record<string, string>>
     onActiveOptionChange?: (optionId: string | null) => void
     allowedKinds?: ReferenceGroupKind[]
+    tabs?: readonly ("file" | "agent" | "session" | "commit" | "assistant")[]
   } = {}
 ) {
   const ref = createRef<SuggestionPopupHandle>()
@@ -270,6 +271,7 @@ function mountPopup(
       tabLabels={overrides.tabLabels}
       onActiveOptionChange={overrides.onActiveOptionChange}
       allowedKinds={overrides.allowedKinds}
+      tabs={overrides.tabs}
     />
   )
   return { ref, onSelect, onClose, controller }
@@ -297,11 +299,13 @@ describe("SuggestionPopup", () => {
     vi.useRealTimers()
   })
 
-  it("renders the active (agent-first) tab's options plus a four-tab strip", async () => {
+  it("renders the active (agent-first) tab's options plus a five-tab strip", async () => {
     mountPopup()
     expect(await screen.findByText("Codex Helper")).toBeInTheDocument()
     expect(screen.getByText("Claude Helper")).toBeInTheDocument()
     expect(screen.queryByText("alpha.md")).toBeNull()
+    // Four controller tabs (agent, file, session, commit). Assistants are a
+    // preference kind the controller does not search yet, so they are not a tab.
     expect(screen.getAllByRole("tab")).toHaveLength(4)
     expect(screen.getByRole("tab", { selected: true })).toHaveAccessibleName(
       /Agents/
@@ -399,6 +403,12 @@ describe("SuggestionPopup", () => {
     act(() => {
       expect(ref.current?.onKeyDown(key("Tab"))).toBe(true)
     })
+    // agent → file. Assistants are a preference kind this controller does
+    // not search, so they are not a tab.
+    expect(screen.getByRole("tab", { selected: true })).toHaveAccessibleName(
+      /Files/
+    )
+    // The file option appears and the agent options are gone.
     expect(await screen.findByText("alpha.md")).toBeInTheDocument()
     expect(screen.queryByText("Codex Helper")).toBeNull()
     expect(screen.getByRole("tab", { selected: true })).toHaveAccessibleName(
@@ -829,5 +839,70 @@ describe("SuggestionPopup", () => {
       vi.advanceTimersByTime(200)
     })
     expect(screen.getByText("Codex Helper")).toBeInTheDocument()
+  })
+})
+
+/**
+ * The tab strip follows the user's `@` panel preference (Settings → General):
+ * which tabs are shown and in what order. The popup takes it as `tabs`; the
+ * composer feeds it from the stored preference.
+ */
+describe("SuggestionPopup with a chosen tab order", () => {
+  const tabNames = () =>
+    screen
+      .getAllByRole("tab")
+      .map((tab) => tab.textContent?.replace(/\d+$/, ""))
+
+  it("shows only the chosen tabs, in the chosen order", async () => {
+    mountPopup({ tabs: ["file", "agent"] })
+    await screen.findByText("alpha.md")
+    expect(tabNames()).toEqual(["Files", "Agents"])
+    // Hidden tabs are gone from the strip, not merely empty.
+    expect(screen.queryByRole("tab", { name: /Sessions/ })).toBeNull()
+    expect(screen.queryByRole("tab", { name: /Commits/ })).toBeNull()
+  })
+
+  it("opens on the first tab with matches, in the chosen order", async () => {
+    // Sessions come first but have nothing for this query, so the panel skips
+    // to the next tab in the user's order that does — Files, not Agents.
+    mountPopup({ tabs: ["session", "file", "agent"] })
+    expect(await screen.findByText("alpha.md")).toBeInTheDocument()
+    expect(screen.getByRole("tab", { selected: true })).toHaveAccessibleName(
+      /Files/
+    )
+  })
+
+  it("moves through the shown tabs only with Tab / Shift+Tab, wrapping", async () => {
+    const { ref } = mountPopup({ tabs: ["file", "agent", "commit"] })
+    await screen.findByText("alpha.md")
+    const selected = () =>
+      screen.getByRole("tab", { selected: true }).textContent ?? ""
+
+    act(() => ref.current?.onKeyDown(key("Tab")))
+    expect(selected()).toMatch(/^Agents/)
+    act(() => ref.current?.onKeyDown(key("Tab")))
+    expect(selected()).toMatch(/^Commits/)
+    // Wraps past the end straight back to the first shown tab — never onto
+    // the hidden Sessions tab.
+    act(() => ref.current?.onKeyDown(key("Tab")))
+    expect(selected()).toMatch(/^Files/)
+    act(() => ref.current?.onKeyDown(key("Tab", true)))
+    expect(selected()).toMatch(/^Commits/)
+  })
+
+  it("asks the controller only through the tabs the popup shows", async () => {
+    // The popup no longer owns the search call. It hides kinds the preference
+    // left out, and the snapshot underneath can still contain them.
+    mountPopup({ tabs: ["file", "agent"] })
+    await screen.findByText("alpha.md")
+    expect(screen.queryByRole("tab", { name: /Sessions/ })).toBeNull()
+    expect(screen.queryByRole("tab", { name: /Commits/ })).toBeNull()
+    expect(tabNames()).toEqual(["Files", "Agents"])
+  })
+
+  it("treats an empty tab list as the built-in one rather than an empty strip", async () => {
+    mountPopup({ tabs: [] })
+    await screen.findByText("Codex Helper")
+    expect(tabNames()).toEqual(["Agents", "Files", "Sessions", "Commits"])
   })
 })

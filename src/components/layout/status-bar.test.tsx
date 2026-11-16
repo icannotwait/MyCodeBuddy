@@ -1,55 +1,63 @@
 import { render, screen } from "@testing-library/react"
-import { describe, expect, it, vi } from "vitest"
-import { StatusBar } from "./status-bar"
+import { beforeEach, describe, expect, it, vi } from "vitest"
 
-const mobileState = vi.hoisted(() => ({ value: false }))
-
-vi.mock("@/hooks/use-mobile", () => ({
-  useIsMobile: () => mobileState.value,
-}))
-vi.mock("./status-bar-stats", () => ({
+const viewport = vi.hoisted(() => ({ mobile: false }))
+vi.mock("@/hooks/use-mobile", () => ({ useIsMobile: () => viewport.mobile }))
+vi.mock("@/components/layout/status-bar-stats", () => ({
   StatusBarStats: () => <span data-testid="status-bar-stats" />,
 }))
-vi.mock("./status-bar-tasks", () => ({
-  StatusBarTasks: () => <span data-testid="status-bar-tasks" />,
+vi.mock("@/components/layout/status-bar-tasks", () => ({
+  StatusBarTasks: () => null,
 }))
-vi.mock("./status-bar-alerts", () => ({
-  StatusBarAlerts: () => <span data-testid="status-bar-alerts" />,
+vi.mock("@/components/layout/status-bar-alerts", () => ({
+  StatusBarAlerts: () => null,
 }))
-vi.mock("./status-bar-update", () => ({
-  StatusBarUpdate: () => <span data-testid="status-bar-update" />,
+vi.mock("@/components/layout/status-bar-mcp", () => ({
+  StatusBarMcp: () => null,
 }))
-vi.mock("./status-bar-mcp", () => ({
-  StatusBarMcp: () => <span data-testid="status-bar-mcp" />,
-}))
-vi.mock("./status-bar-computer", () => ({
+vi.mock("@/components/layout/status-bar-computer", () => ({
   StatusBarComputer: () => <span data-testid="status-bar-computer" />,
 }))
-vi.mock("./command-dropdown", () => ({
-  CommandDropdown: () => <span data-testid="command-dropdown" />,
+vi.mock("@/components/layout/status-bar-update", () => ({
+  StatusBarUpdate: () => null,
 }))
-vi.mock("./quick-actions-dropdown", () => ({
-  QuickActionsDropdown: () => <span data-testid="quick-actions-dropdown" />,
+vi.mock("@/components/layout/command-dropdown", () => ({
+  CommandDropdown: () => null,
 }))
+vi.mock("@/components/layout/quick-actions-dropdown", () => ({
+  QuickActionsDropdown: () => null,
+}))
+vi.mock("@/components/layout/status-bar-web-service", () => ({
+  StatusBarWebService: () => <span data-testid="web-service" />,
+}))
+
+import { StatusBar } from "./status-bar"
+
+beforeEach(() => {
+  viewport.mobile = false
+})
 
 describe("StatusBar", () => {
-  it.each([false, true])(
-    "does not render session model chip on mobile=%s",
-    (mobile) => {
-      mobileState.value = mobile
-      render(<StatusBar />)
-
-      expect(screen.getByTestId("status-bar-stats")).toBeInTheDocument()
-      if (mobile) {
-        expect(
-          screen.queryByTestId("status-bar-computer")
-        ).not.toBeInTheDocument()
-      } else {
-        expect(screen.getByTestId("status-bar-computer")).toBeInTheDocument()
-      }
+  /** "Narrow" is a viewport width, and a desktop window can be shrunk below
+   *  it: the web-service signal must not vanish with it. (The item itself
+   *  renders nothing outside the local desktop.) */
+  it.each([
+    ["wide", false],
+    ["narrow", true],
+  ])("carries the web-service item in the %s layout", (_label, mobile) => {
+    viewport.mobile = mobile
+    render(<StatusBar />)
+    expect(screen.getByTestId("web-service")).toBeInTheDocument()
+    expect(screen.getByTestId("status-bar-stats")).toBeInTheDocument()
+    expect(
+      screen.queryByTestId("status-bar-session-model")
+    ).not.toBeInTheDocument()
+    if (mobile) {
       expect(
-        screen.queryByTestId("status-bar-session-model")
+        screen.queryByTestId("status-bar-computer")
       ).not.toBeInTheDocument()
+    } else {
+      expect(screen.getByTestId("status-bar-computer")).toBeInTheDocument()
     }
-  )
+  })
 })

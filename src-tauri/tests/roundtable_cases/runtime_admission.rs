@@ -386,6 +386,7 @@ async fn generation_is_updated_before_send() {
             mark_awaiting_reply,
             bypass_autonomous_hold,
             turn_generation,
+            internal_suffix: _,
         } => {
             assert!(user_message.is_none());
             assert!(!mark_awaiting_reply);

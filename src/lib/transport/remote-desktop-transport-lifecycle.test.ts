@@ -1,9 +1,17 @@
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
+import {
+  afterEach,
+  beforeEach,
+  describe,
+  expect,
+  it,
+  vi,
+  type Mock,
+} from "vitest"
 import type { EventEnvelope, LiveSessionSnapshot } from "@/lib/types"
 import { RemoteDesktopTransport } from "./remote-desktop-transport"
 import type { RemoteTransportConfig } from "./types"
 
-const { invokeMock, listenMock } = vi.hoisted(() => ({
+const { invokeMock, listenMock, getCurrentWebviewMock } = vi.hoisted(() => ({
   invokeMock:
     vi.fn<
       (command: string, args?: Record<string, unknown>) => Promise<unknown>
@@ -15,13 +23,17 @@ const { invokeMock, listenMock } = vi.hoisted(() => ({
         handler: (event: { payload: unknown }) => void
       ) => Promise<() => void>
     >(),
+  getCurrentWebviewMock: vi.fn(),
 }))
 
 vi.mock("@tauri-apps/api/core", () => ({ invoke: invokeMock }))
 vi.mock("@tauri-apps/api/event", () => ({ listen: listenMock }))
+vi.mock("@tauri-apps/api/webview", () => ({
+  getCurrentWebview: getCurrentWebviewMock,
+}))
 
 let receiveFrame: (event: { payload: unknown }) => void
-let unlisten: ReturnType<typeof vi.fn>
+let unlisten: Mock
 let transports: RemoteDesktopTransport[]
 
 beforeEach(() => {
@@ -30,6 +42,10 @@ beforeEach(() => {
   unlisten = vi.fn()
   transports = []
   invokeMock.mockResolvedValue(undefined)
+  getCurrentWebviewMock.mockReturnValue({
+    label: "main-webview",
+    listen: listenMock,
+  })
   listenMock.mockImplementation(async (_event, handler) => {
     receiveFrame = handler
     return unlisten

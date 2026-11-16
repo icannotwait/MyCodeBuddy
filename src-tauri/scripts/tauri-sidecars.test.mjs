@@ -6,26 +6,34 @@ import { fileURLToPath } from "node:url"
 
 const tauriDir = join(dirname(fileURLToPath(import.meta.url)), "..")
 
-test("default Tauri bundle ships the MCP and computer helper sidecars", () => {
+test("default Tauri bundle ships the MCP, computer helper, and CLI sidecars", () => {
   const config = JSON.parse(
     readFileSync(join(tauriDir, "tauri.conf.json"), "utf8")
   )
 
   assert.deepEqual(
     config.bundle.externalBin,
-    ["binaries/codeg-mcp", "binaries/codeg-computer-helper"],
-    "Ship both opt-in companions; never bundle the server or Codex ACP"
+    [
+      "binaries/codeg-mcp",
+      "binaries/codeg-computer-helper",
+      "binaries/codeg-cli",
+    ],
+    "Ship the opt-in companions; never bundle the server or Codex ACP"
   )
 })
 
-test("release Tauri bundle ships the MCP and computer helper sidecars", () => {
+test("release Tauri bundle ships the MCP, computer helper, and CLI sidecars", () => {
   const config = JSON.parse(
     readFileSync(join(tauriDir, "tauri.release.conf.json"), "utf8")
   )
 
   assert.deepEqual(
     config.bundle.externalBin,
-    ["binaries/codeg-mcp", "binaries/codeg-computer-helper"],
-    "Ship both opt-in companions; never bundle the server or Codex ACP"
+    [
+      "binaries/codeg-mcp",
+      "binaries/codeg-computer-helper",
+      "binaries/codeg-cli",
+    ],
+    "Ship the opt-in companions; never bundle the server or Codex ACP"
   )
 })

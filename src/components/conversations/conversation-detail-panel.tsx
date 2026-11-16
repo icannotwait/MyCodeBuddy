@@ -1,5 +1,9 @@
 "use client"
 
+import {
+  shouldSeedConversation,
+  useFolderTabsStore,
+} from "@/stores/folder-tabs-store"
 import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react"
 import {
   Copy,
@@ -16,12 +20,19 @@ import { useTranslations } from "next-intl"
 import { toast } from "sonner"
 import {
   useAcpActions,
+  useAcpEvent,
   useConnectionStore,
 } from "@/contexts/acp-connections-context"
 import { useActiveFolder } from "@/contexts/active-folder-context"
 import { useAppWorkspaceStore } from "@/stores/app-workspace-store"
+import { FolderTabsEmptyState } from "@/components/conversations/folder-tabs-empty-state"
 import { useTabActions, useTabStore } from "@/contexts/tab-context"
-import { groupOfTab } from "@/stores/tab-store"
+import {
+  groupOfTab,
+  shellGroupOfTab,
+  useVisibleConversationLayout,
+  useVisibleConversationTabs,
+} from "@/stores/tab-store"
 import { computeRects, leafIds } from "@/lib/tab-group-layout"
 import { useTaskContext } from "@/contexts/task-context"
 import { cn, copyTextFromMenu } from "@/lib/utils"
@@ -44,11 +55,17 @@ import { isDesktop } from "@/lib/platform"
 import { ChromeReserve } from "@/components/layout/chrome-reserve"
 import { leftChromeReserve, rightChromeReserve } from "@/lib/window-chrome"
 import {
+  getConversationIdByExternalIdFromStore,
   getRuntimeSession,
+  useConversationRuntimeActions,
   useConversationRuntimeStore,
 } from "@/stores/conversation-runtime-store"
 import type { PointerEvent as ReactPointerEvent } from "react"
-import { type AgentType, type ConversationStatus } from "@/lib/types"
+import {
+  type AgentType,
+  type ConversationStatus,
+  type EventEnvelope,
+} from "@/lib/types"
 import {
   ContextMenu,
   ContextMenuContent,
@@ -148,13 +165,25 @@ function SplitStripCornerReserve({ side }: { side: "left" | "right" }) {
 export function ConversationDetailPanel() {
   const t = useTranslations("Folder.conversation")
   const tDetails = useTranslations("Folder.sessionDetails")
+  const {
+    completeTurn: runtimeCompleteTurn,
+    removeConversation: runtimeRemoveConversation,
+  } = useConversationRuntimeActions()
   const { activeFolder: folder } = useActiveFolder()
   const conversations = useAppWorkspaceStore((s) => s.conversations)
   const allFolders = useAppWorkspaceStore((s) => s.allFolders)
   const tabs = useTabStore((s) => s.tabs)
+  const tabsFollowFolder = useFolderTabsStore((s) => s.enabled)
+  const visibleTabs = useVisibleConversationTabs()
+  const visibleLayout = useVisibleConversationLayout()
+  const visibleTabIds = useMemo(
+    () => new Set(visibleTabs.map((tab) => tab.id)),
+    [visibleTabs]
+  )
   const activeTabId = useTabStore((s) => s.activeTabId)
   const groupLayout = useTabStore((s) => s.groupLayout)
   const groupOf = useTabStore((s) => s.groupOf)
+  const groupViews = useTabStore((s) => s.groupViews)
   const groupSelection = useTabStore((s) => s.groupSelection)
   const tileByGroup = useTabStore((s) => s.tileByGroup)
   const dragOverGroupId = useTabStore((s) => s.tabDrag?.overGroupId ?? null)
@@ -193,6 +222,51 @@ export function ConversationDetailPanel() {
       disconnectIfIdle(replacedTabId).catch(() => {})
     })
   }, [onPreviewTabReplaced, disconnectIfIdle])
+
+  // Background turn_complete handler: for conversations not open in tabs.
+  // Subscribes via the context's primary `acp://event` listener (single
+  // physical Tauri/WebSocket subscription, plus seq dedup). `useAcpEvent`
+  // stabilizes handler identity internally, so the callback can read closure
+  // values directly.
+  useAcpEvent(
+    useCallback(
+      (envelope: EventEnvelope) => {
+        if (envelope.type !== "turn_complete") return
+
+        const runtimeConversationId = getConversationIdByExternalIdFromStore(
+          envelope.session_id
+        )
+        const summary = useAppWorkspaceStore
+          .getState()
+          .conversations.find(
+            (item) => item.external_id === envelope.session_id
+          )
+        const matchedConversationId =
+          runtimeConversationId ?? summary?.id ?? null
+        if (!matchedConversationId) return
+
+        // Match every identifier the panel may carry for the same runtime
+        // session, or this handler races a mounted tab's own completeTurn and
+        // double-promotes the live turn.
+        const dbId2 = summary?.id
+        const isOpenInTabs = tabs.some(
+          (tab) =>
+            tab.conversationId === matchedConversationId ||
+            tab.runtimeConversationId === matchedConversationId ||
+            (dbId2 != null && tab.conversationId === dbId2)
+        )
+        if (isOpenInTabs) return
+
+        runtimeCompleteTurn(matchedConversationId)
+
+        const session = getRuntimeSession(matchedConversationId)
+        if (session?.pendingCleanup) {
+          runtimeRemoveConversation(matchedConversationId)
+        }
+      },
+      [tabs, runtimeCompleteTurn, runtimeRemoveConversation]
+    )
+  )
 
   const hasNoTabs = tabs.length === 0 && !activeTabId
   const activeConversationTab = useMemo(
@@ -417,31 +491,51 @@ export function ConversationDetailPanel() {
   useEffect(() => {
     if (!folder) return
 
-    if (hasNoTabs) {
+    if (
+      shouldSeedConversation(useFolderTabsStore.getState().enabled, hasNoTabs)
+    ) {
       openNewConversationTab(
         folder.id,
         newConversation?.workingDir ?? folder.path
       )
     }
-  }, [folder, hasNoTabs, newConversation?.workingDir, openNewConversationTab])
+  }, [
+    folder,
+    hasNoTabs,
+    newConversation?.workingDir,
+    openNewConversationTab,
+    tabsFollowFolder,
+  ])
 
   const { groups: groupRects, handles: groupHandles } = useMemo(
-    () => computeRects(groupLayout),
-    [groupLayout]
+    () => computeRects(visibleLayout),
+    [visibleLayout]
   )
-  const orderedGroupIds = useMemo(() => leafIds(groupLayout), [groupLayout])
-  const isSplit = orderedGroupIds.length > 1
+  const isSplit = leafIds(visibleLayout).length > 1
+  // Every tab sits in its own view's group shell (`shellGroupOfTab`): the
+  // folder views not on screen keep their shells, hidden, so a folder switch
+  // reparents nothing. Shells come in id order — a fixed order whatever view
+  // is on screen, so a switch never moves one (a moved node resets every
+  // transcript inside it); new shells only ever insert.
   const tabsByGroup = useMemo(() => {
     const byGroup = new Map<string, typeof tabs>()
-    for (const groupId of orderedGroupIds) byGroup.set(groupId, [])
+    for (const groupId of leafIds(groupLayout)) byGroup.set(groupId, [])
+    const state = { rawTabs: tabs, groupOf, groupLayout, groupViews }
     for (const tab of tabs) {
-      const groupId = groupOfTab(groupOf, groupLayout, tab.id)
+      const groupId = visibleTabIds.has(tab.id)
+        ? groupOfTab(groupOf, groupLayout, tab.id)
+        : shellGroupOfTab(state, tab.id)
       const bucket = byGroup.get(groupId)
       if (bucket) bucket.push(tab)
       else byGroup.set(groupId, [tab])
     }
     return byGroup
-  }, [tabs, groupOf, groupLayout, orderedGroupIds])
+  }, [tabs, groupOf, groupLayout, groupViews, visibleTabIds])
+  const orderedGroupIds = useMemo(
+    () => [...tabsByGroup.keys()].sort(),
+    [tabsByGroup]
+  )
+
   const tileTabRefs = useRef<Map<string, HTMLDivElement | null>>(new Map())
   const groupContainerRef = useRef<HTMLDivElement | null>(null)
 
@@ -451,12 +545,14 @@ export function ConversationDetailPanel() {
         .filter(
           (groupId) =>
             tileByGroup[groupId] &&
-            (tabsByGroup.get(groupId)?.length ?? 0) > 1 &&
+            (tabsByGroup.get(groupId) ?? []).filter((tab) =>
+              visibleTabIds.has(tab.id)
+            ).length > 1 &&
             groupSelection[groupId] != null
         )
         .map((groupId) => groupSelection[groupId])
         .join("|"),
-    [orderedGroupIds, tileByGroup, tabsByGroup, groupSelection]
+    [orderedGroupIds, tileByGroup, tabsByGroup, groupSelection, visibleTabIds]
   )
   useEffect(() => {
     if (!tiledSelectionKey) return
@@ -477,17 +573,19 @@ export function ConversationDetailPanel() {
   }, [tabs])
 
   if (hasNoTabs) {
-    return null
+    return tabsFollowFolder ? <FolderTabsEmptyState /> : null
   }
 
   const renderTabWrapper = (
     tab: (typeof tabs)[number],
     indexInGroup: number,
     groupId: string,
-    canTileGroup: boolean
+    canTileG: boolean
   ) => {
-    const active = tab.id === activeTabId
-    const visible = canTileGroup || tab.id === groupSelection[groupId]
+    const inScope = visibleTabIds.has(tab.id)
+    const active = inScope && tab.id === activeTabId
+    // Visible = tiled (all group members shown) or the group's selected tab.
+    const visible = inScope && (canTileG || tab.id === groupSelection[groupId])
     const folderPath = allFolders.find((f) => f.id === tab.folderId)?.path
     const view = (
       <ConversationTabView
@@ -496,7 +594,7 @@ export function ConversationDetailPanel() {
         agentType={tab.agentType}
         workingDir={tab.workingDir ?? folderPath}
         isActive={active}
-        showActiveFlow={(isSplit || canTileGroup) && active}
+        showActiveFlow={(isSplit || canTileG) && active}
         reloadSignal={reloadByTabId[tab.id] ?? 0}
         groupId={groupId}
         isVisible={visible}
@@ -513,16 +611,22 @@ export function ConversationDetailPanel() {
             tileTabRefs.current.delete(tab.id)
           }
         }}
-        style={canTileGroup ? { order: indexInGroup } : undefined}
+        // Tiled, everything below this wrapper is invisible to the row's
+        // scrollbar (a tile clips its content), so TileScrollContainer skips
+        // the layout read its observer would otherwise force per mutation.
+        data-tile-scroll-item=""
+        style={canTileG ? { order: indexInGroup } : undefined}
         className={cn(
-          canTileGroup
-            ? cn(
-                "relative h-full min-w-[24rem] flex-1 overflow-hidden",
-                indexInGroup > 0 && "border-l border-border/50"
-              )
-            : visible
-              ? "h-full"
-              : "conversation-tab-hidden absolute inset-0 invisible pointer-events-none"
+          !inScope
+            ? "conversation-tab-hidden absolute inset-0 invisible pointer-events-none"
+            : canTileG
+              ? cn(
+                  "relative h-full min-w-[24rem] flex-1 overflow-hidden",
+                  indexInGroup > 0 && "border-l border-border/50"
+                )
+              : visible
+                ? "h-full"
+                : "conversation-tab-hidden absolute inset-0 invisible pointer-events-none"
         )}
         onPointerDownCapture={
           visible && !active ? () => switchTab(tab.id) : undefined
@@ -531,10 +635,15 @@ export function ConversationDetailPanel() {
         {/* The visible active cue is now the composer's flowing gradient border
             (see message-input.tsx); keep a non-visual cue for assistive tech in
             tiled mode, where the old top-center icon used to provide it. */}
-        {(isSplit || canTileGroup) && active && (
+        {(isSplit || canTileG) && active && (
           <span className="sr-only">{t("activeConversationIndicator")}</span>
         )}
-        <OverlayHostHiddenProvider hidden={!canTileGroup && !visible}>
+        {/* A backgrounded tab is kept mounted and merely hidden (its session is
+            still live), but a "查看会话" drawer opened from it portals to the
+            body — so without this it went on painting over whichever tab the
+            user switched to. The flag is additive, so a visible tab inside a
+            covered workspace stays hidden. */}
+        <OverlayHostHiddenProvider hidden={!visible}>
           {view}
         </OverlayHostHiddenProvider>
       </div>
@@ -542,20 +651,28 @@ export function ConversationDetailPanel() {
   }
 
   const renderGroupShell = (groupId: string) => {
-    const rect = groupRects.get(groupId)
-    if (!rect) return null
+    const inScope = groupRects.has(groupId)
+    const rect = groupRects.get(groupId) ?? { x: 0, y: 0, w: 100, h: 100 }
     const groupTabs = tabsByGroup.get(groupId) ?? []
-    const canTileGroup = !!tileByGroup[groupId] && groupTabs.length > 1
+    const visibleGroupTabs = groupTabs.filter((tab) =>
+      visibleTabIds.has(tab.id)
+    )
+    const canTileG = !!tileByGroup[groupId] && visibleGroupTabs.length > 1
+    // Only the TOP-edge strips sit under the fixed corner overlays (the split
+    // layout has no title-bar row above them) — the leftmost/rightmost of that
+    // row carry the corner reserves the unsplit strip row normally provides.
     const touchesTop = rect.y <= GROUP_EDGE_EPSILON
     const touchesLeft = touchesTop && rect.x <= GROUP_EDGE_EPSILON
     const touchesRight =
       touchesTop && rect.x + rect.w >= 100 - GROUP_EDGE_EPSILON
-    const selectedTab =
-      groupTabs.find((tab) => tab.id === groupSelection[groupId]) ??
-      groupTabs[0] ??
+    // The group's SELECTED tab drives its header — each split group keeps the
+    // full "tabs + conversation title bar" pairing of the unsplit layout.
+    const selTab =
+      visibleGroupTabs.find((tab) => tab.id === groupSelection[groupId]) ??
+      visibleGroupTabs[0] ??
       null
-    const selectedFolder = selectedTab
-      ? allFolders.find((item) => item.id === selectedTab.folderId)
+    const selTabFolder = selTab
+      ? allFolders.find((item) => item.id === selTab.folderId)
       : undefined
 
     return (
@@ -568,6 +685,8 @@ export function ConversationDetailPanel() {
           top: `${rect.y}%`,
           width: `${rect.w}%`,
           height: `${rect.h}%`,
+          visibility: inScope ? undefined : "hidden",
+          pointerEvents: inScope ? undefined : "none",
         }}
       >
         {isSplit && (
@@ -577,7 +696,7 @@ export function ConversationDetailPanel() {
             {touchesRight && <SplitStripCornerReserve side="right" />}
           </div>
         )}
-        {isSplit && selectedTab && (
+        {isSplit && selTab && (
           <div
             className="shrink-0"
             onPointerDownCapture={() => {
@@ -588,22 +707,22 @@ export function ConversationDetailPanel() {
             }}
           >
             <ConversationDetailHeader
-              tabId={selectedTab.id}
-              conversationId={selectedTab.conversationId}
-              runtimeConversationId={selectedTab.runtimeConversationId ?? null}
-              folderId={selectedTab.folderId}
-              folderPath={selectedFolder?.path}
-              title={selectedTab.title}
-              status={selectedTab.status as ConversationStatus | undefined}
+              tabId={selTab.id}
+              conversationId={selTab.conversationId}
+              runtimeConversationId={selTab.runtimeConversationId ?? null}
+              folderId={selTab.folderId}
+              folderPath={selTabFolder?.path}
+              title={selTab.title}
+              status={selTab.status as ConversationStatus | undefined}
             />
           </div>
         )}
         <div className="relative min-h-0 flex-1 overflow-hidden">
-          <TileScrollContainer canTile={canTileGroup}>
+          <TileScrollContainer canTile={canTileG}>
             <div
               className={cn(
                 "relative h-full",
-                canTileGroup && "flex min-w-full flex-row"
+                canTileG && "flex min-w-full flex-row"
               )}
             >
               {/* Strip order reaches the screen only through CSS `order`:
@@ -611,7 +730,7 @@ export function ConversationDetailPanel() {
                   transcript's scroll offset and blank it (see
                   stableTabViewOrder). */}
               {stableTabViewOrder(groupTabs).map(({ tab, visualIndex }) =>
-                renderTabWrapper(tab, visualIndex, groupId, canTileGroup)
+                renderTabWrapper(tab, visualIndex, groupId, canTileG)
               )}
             </div>
           </TileScrollContainer>
@@ -651,7 +770,11 @@ export function ConversationDetailPanel() {
               onPointerDown={handleContextMenuTriggerPointerDown}
             >
               {orderedGroupIds.map((groupId) => renderGroupShell(groupId))}
+              {/* The handles resize the on-screen view's own layout (a
+                  folder's, while tabs follow the folder), which the visible
+                  one only differs from before the tab set is known. */}
               {isSplit &&
+                visibleLayout === groupLayout &&
                 groupHandles.map((handle) => (
                   <GroupSplitHandle
                     key={`${handle.splitId}:${handle.index}`}
@@ -660,6 +783,13 @@ export function ConversationDetailPanel() {
                     onResize={resizeGroupSplit}
                   />
                 ))}
+              {/* The selected folder has nothing open: every shell above is
+                  hidden, other folders' live tabs included. */}
+              {tabsFollowFolder && visibleTabs.length === 0 && (
+                <div className="absolute inset-0">
+                  <FolderTabsEmptyState />
+                </div>
+              )}
             </div>
           </ContextMenuTrigger>
           <ContextMenuContent>

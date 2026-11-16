@@ -382,6 +382,7 @@ pub(crate) fn is_terminal_declaration_env_key(key: &str) -> bool {
 /// Build terminal base env for ACP `terminal/create`: only git credential
 /// helper keys from the agent runtime, plus OfficeCLI PATH. Never forwards
 /// model/API secrets.
+#[allow(dead_code)]
 pub(crate) fn build_terminal_base_env(
     runtime_env: &BTreeMap<String, String>,
 ) -> BTreeMap<String, String> {

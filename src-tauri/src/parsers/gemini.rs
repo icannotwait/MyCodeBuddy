@@ -9,7 +9,7 @@ use walkdir::WalkDir;
 use crate::models::*;
 use crate::parsers::{
     folder_name_from_path, sanitize_user_blocks, title_from_user_text, truncate_str, visible_title,
-    visible_user_text, AgentParser, ParseError, RecoveryCandidateTracker, RecoveryQuery,
+    visible_user_text, AgentEnv, AgentParser, ParseError, RecoveryCandidateTracker, RecoveryQuery,
 };
 
 #[cfg(any(test, feature = "test-utils"))]
@@ -40,8 +40,14 @@ impl Default for GeminiParser {
 
 impl GeminiParser {
     pub fn new() -> Self {
-        let base_dir = resolve_gemini_base_dir();
-        Self { base_dir }
+        Self::for_env(&AgentEnv::inherited())
+    }
+
+    /// The history of the Gemini CLI launched with `env`.
+    pub fn for_env(env: &AgentEnv) -> Self {
+        Self {
+            base_dir: resolve_gemini_base_dir_for_env(env),
+        }
     }
 
     /// Test-only constructor that lets callers point the parser at a fixture
@@ -761,6 +767,7 @@ impl GeminiParser {
                     is_error,
                     agent_stats: None,
                     images: Vec::new(),
+                    exit_code: None,
                 });
             }
         }
@@ -944,7 +951,13 @@ impl GeminiParser {
 }
 
 pub(crate) fn resolve_gemini_base_dir() -> PathBuf {
-    resolve_gemini_base_dir_from(std::env::var_os("GEMINI_CLI_HOME"), dirs::home_dir())
+    resolve_gemini_base_dir_for_env(&AgentEnv::inherited())
+}
+
+/// The `.gemini` dir of the Gemini CLI launched with `env`: under its
+/// `GEMINI_CLI_HOME`, else under `~`.
+pub(crate) fn resolve_gemini_base_dir_for_env(env: &AgentEnv) -> PathBuf {
+    resolve_gemini_base_dir_from(env.var_os("GEMINI_CLI_HOME"), dirs::home_dir())
 }
 
 fn resolve_gemini_base_dir_from(
@@ -2067,5 +2080,17 @@ earlier terminal context records.\n\
         );
 
         let _ = fs::remove_dir_all(base);
+    }
+
+    /// #948: built with an agent's launch env, the parser reads where THAT
+    /// env puts the agent's files, not where codeg's own environment does.
+    #[test]
+    fn for_env_reads_the_home_of_the_launch_env() {
+        let env =
+            crate::parsers::AgentEnv::with_overrides(&[("GEMINI_CLI_HOME", "/relocated/gemini")]);
+        assert_eq!(
+            GeminiParser::for_env(&env).base_dir,
+            PathBuf::from("/relocated/gemini").join(".gemini")
+        );
     }
 }

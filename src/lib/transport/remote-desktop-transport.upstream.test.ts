@@ -10,6 +10,9 @@ const ipc = vi.hoisted(() => ({
 }))
 vi.mock("@tauri-apps/api/core", () => ({ invoke: ipc.invoke }))
 vi.mock("@tauri-apps/api/event", () => ({ listen: ipc.listen }))
+vi.mock("@tauri-apps/api/webview", () => ({
+  getCurrentWebview: () => ({ listen: ipc.listen }),
+}))
 
 const config: RemoteTransportConfig = {
   id: 7,

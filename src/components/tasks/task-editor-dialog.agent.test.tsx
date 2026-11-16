@@ -68,6 +68,7 @@ vi.mock("@/components/automations/agent-config-section", () => ({
     configValues: Record<string, string>
   ) => ({ mode_id: modeId, config_values: configValues }),
   snapshotLabels: () => ({}),
+  useBooleanOptionLabels: () => ({ on: "On", off: "Off" }),
 }))
 vi.mock("@/components/automations/use-agent-options", () => ({
   useAgentOptions: (
@@ -181,7 +182,6 @@ function agent(
     env: {},
     config_json: null,
     config_file_path: null,
-    opencode_auth_json: null,
     codex_auth_json: null,
     codex_config_toml: null,
     codex_model_catalog: null,

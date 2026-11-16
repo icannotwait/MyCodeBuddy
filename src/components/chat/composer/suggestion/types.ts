@@ -36,6 +36,8 @@ export interface SuggestionGroup {
    * the overflow.
    */
   truncated?: boolean
+  /** This source is still loading; other groups may already be selectable. */
+  loading?: boolean
 }
 
 /**
@@ -60,6 +62,26 @@ export interface MentionUiLabels {
   /** Profile-catalog failure (agent tab). */
   profileError?: string
 }
+
+/**
+ * Resolves the `@` query into grouped suggestions. Async so an implementation
+ * can hit the file tree / conversations / git log / skills APIs. The optional
+ * AbortSignal is aborted when a newer query supersedes this one.
+ *
+ * `kinds` lists the tabs the panel is showing (the user can hide some). A group
+ * outside it is never displayed, so an implementation may skip loading its
+ * source and return it empty; omitted means every kind is wanted.
+ *
+ * `onUpdate` publishes partial snapshots as sources become ready. Groups still
+ * waiting for their source set `loading`; the returned value is the final
+ * snapshot. Consumers that omit the callback can await all groups as before.
+ */
+export type ReferenceSearch = (
+  query: string,
+  signal?: AbortSignal,
+  kinds?: readonly ReferenceKind[],
+  onUpdate?: (groups: SuggestionGroup[]) => void
+) => SuggestionGroup[] | Promise<SuggestionGroup[]>
 
 /** State the suggestion plugin pushes to React while the `@` panel is open. */
 export interface SuggestionState {

@@ -118,6 +118,7 @@ function seed(
     localTurns: [],
     backgroundTurns: [],
     pendingBackgroundSettlements: [],
+    pendingCancelledTurnReports: null,
     optimisticTurns: [],
     liveMessage: o.liveMessage ?? null,
     syncState: "idle" as const,

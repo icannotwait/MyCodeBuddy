@@ -12,4 +12,7 @@ src-tauri/genui/** text eol=lf
 
 # Keep vendored Superpowers files byte-identical to upstream. This also
 # keeps extensionless Bash helpers executable under Git Bash on Windows.
+# Science skills are embedded with `include_dir!` and installed byte for byte;
+# a CRLF checkout would push SKILL.md past the experts compaction limit.
 src-tauri/experts/** text eol=lf
+src-tauri/science/** text eol=lf

@@ -20,6 +20,7 @@ import {
 export interface ReferenceGroupLabels {
   file: string
   agent: string
+  assistant: string
   session: string
   commit: string
   skill: string
@@ -32,6 +33,7 @@ export interface ReferenceGroupLabels {
 export const DEFAULT_GROUP_LABELS: ReferenceGroupLabels = {
   file: "Files",
   agent: "Agents",
+  assistant: "Assistants",
   session: "Sessions",
   commit: "Commits",
   skill: "Skills",

@@ -18,6 +18,7 @@ import {
   AgentConfigSection,
   effectiveSelections,
   snapshotLabels,
+  useBooleanOptionLabels,
 } from "./agent-config-section"
 import { BranchPicker } from "@/components/shared/branch-picker"
 import {
@@ -53,6 +54,10 @@ interface AutomationEditorProps {
   /** When present (the create-from-gallery flow), renders a "← Templates" link
    *  back to the picker. */
   onBackToTemplates?: () => void
+  /** The folder a BLANK create starts in — the one the page's list is narrowed
+   *  to. A template draft and an edit carry their own folder; without either,
+   *  the first folder. */
+  defaultFolderId?: number | null
 }
 
 const CRON_PRESETS = [
@@ -74,6 +79,7 @@ export function AutomationEditor({
   onSubmit,
   onCancel,
   onBackToTemplates,
+  defaultFolderId = null,
 }: AutomationEditorProps) {
   const t = useTranslations("Automations")
   const folders = useAppWorkspaceStore((s) => s.folders)
@@ -90,7 +96,9 @@ export function AutomationEditor({
   // even before the user types — defaultText applies without firing onChange).
   const [prompt, setPrompt] = useState(automation?.config?.display_text ?? "")
   const [folderId, setFolderId] = useState<number | null>(
-    automation?.root_folder_id ?? folders[0]?.id ?? null
+    (automation == null ? defaultFolderId : automation.root_folder_id) ??
+      folders[0]?.id ??
+      null
   )
   const [isolation, setIsolation] = useState<AutomationIsolation>(
     automation?.isolation ?? "worktree_per_run"
@@ -169,6 +177,7 @@ export function AutomationEditor({
     true,
     configValues
   )
+  const booleanLabels = useBooleanOptionLabels()
   const invocations = useComposerInvocations({
     editorRef,
     agentType,
@@ -266,7 +275,7 @@ export function AutomationEditor({
       const label_snapshot = {
         agent_label: getAgentLabel(agentType) ?? agentType,
         ...(folderName ? { folder_label: folderName } : {}),
-        ...snapshotLabels(snapshot, mode_id, config_values),
+        ...snapshotLabels(snapshot, mode_id, config_values, booleanLabels),
       }
 
       // Enqueue-task automations never run in place: canonicalize the
@@ -396,6 +405,7 @@ export function AutomationEditor({
             agentType={agentOptions.snapshotAgentType}
             snapshot={agentOptions.snapshot}
             loading={agentOptions.loading}
+            stale={!agentOptions.current}
             error={agentOptions.error}
             onReload={agentOptions.reload}
             modeId={modeId}

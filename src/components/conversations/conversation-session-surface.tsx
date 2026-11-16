@@ -2859,6 +2859,7 @@ export const ConversationSessionSurface = memo(
         onFocus={handleFocus}
         onSend={handleSend}
         sendClearMode={conn.sharedSession ? "after-admission" : "immediate"}
+        deliverWhilePrompting={conn.sharedSession != null}
         onCancel={handleCancel}
         onRespondPermission={handleRespondPermission}
         onAnswerQuestion={handleAnswerQuestion}
@@ -2986,7 +2987,7 @@ export const ConversationSessionSurface = memo(
                       )
                     }}
                     onOpenAgentsSettings={handleOpenAgentsSettings}
-                    disabled={isConnecting || dbConversationId != null}
+                    disabled={dbConversationId != null}
                   />
                 </div>
                 {composerBlockedMessage ? (
@@ -3073,7 +3074,7 @@ export const ConversationSessionSurface = memo(
                   )
                 }}
                 onOpenAgentsSettings={handleOpenAgentsSettings}
-                disabled={isConnecting || dbConversationId != null}
+                disabled={dbConversationId != null}
               />
               {composerBlockedMessage ? (
                 <div className="mt-2 flex w-full items-center gap-2 rounded-lg border border-destructive/30 bg-destructive/5 px-3 py-2 text-xs text-destructive">

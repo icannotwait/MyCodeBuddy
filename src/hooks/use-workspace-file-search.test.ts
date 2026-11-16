@@ -1,7 +1,7 @@
 import { act, renderHook } from "@testing-library/react"
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 
-import type { WorkspaceFileSearchResult } from "@/lib/api"
+import type { WorkspaceFileEntry } from "@/lib/types"
 import { useWorkspaceFileSearch } from "./use-workspace-file-search"
 
 interface Deferred<T> {
@@ -22,7 +22,6 @@ function deferred<T>(): Deferred<T> {
 
 const mocks = vi.hoisted(() => ({
   searchWorkspaceFiles: vi.fn(),
-  cancelWorkspaceFileSearch: vi.fn(),
   randomUUID: vi.fn(),
   uuidCounter: 0,
 }))
@@ -30,8 +29,6 @@ const mocks = vi.hoisted(() => ({
 vi.mock("@/lib/api", () => ({
   searchWorkspaceFiles: (...args: unknown[]) =>
     mocks.searchWorkspaceFiles(...args),
-  cancelWorkspaceFileSearch: (...args: unknown[]) =>
-    mocks.cancelWorkspaceFileSearch(...args),
 }))
 
 vi.mock("@/lib/utils", async (importOriginal) => ({
@@ -39,19 +36,20 @@ vi.mock("@/lib/utils", async (importOriginal) => ({
   randomUUID: () => mocks.randomUUID(),
 }))
 
-function result(path: string): WorkspaceFileSearchResult {
+function result(path: string): WorkspaceFileEntry[] {
   const name = path.split("/").pop() ?? path
-  return {
-    files: [{ name, path, kind: "file" }],
-    truncated: false,
-  }
+  return [{ name, path, kind: "file" }]
+}
+
+function signalOf(call: unknown[]): AbortSignal {
+  const options = call[2] as { signal: AbortSignal }
+  return options.signal
 }
 
 describe("useWorkspaceFileSearch", () => {
   beforeEach(() => {
     vi.useFakeTimers()
     mocks.searchWorkspaceFiles.mockReset()
-    mocks.cancelWorkspaceFileSearch.mockReset().mockResolvedValue(true)
     mocks.uuidCounter = 0
     mocks.randomUUID.mockReset().mockImplementation(() => {
       mocks.uuidCounter += 1
@@ -116,8 +114,8 @@ describe("useWorkspaceFileSearch", () => {
   })
 
   it("cancels the old request and ignores its late resolution", async () => {
-    const first = deferred<WorkspaceFileSearchResult>()
-    const second = deferred<WorkspaceFileSearchResult>()
+    const first = deferred<WorkspaceFileEntry[]>()
+    const second = deferred<WorkspaceFileEntry[]>()
     mocks.searchWorkspaceFiles
       .mockReturnValueOnce(first.promise)
       .mockReturnValueOnce(second.promise)
@@ -136,21 +134,22 @@ describe("useWorkspaceFileSearch", () => {
     await act(async () => {
       await vi.advanceTimersByTimeAsync(200)
     })
+    const firstSignal = signalOf(mocks.searchWorkspaceFiles.mock.calls[0])
     expect(mocks.searchWorkspaceFiles).toHaveBeenNthCalledWith(
       1,
       "/repo",
       "foo",
-      100,
-      { searchSessionId: "uuid-1", requestId: "uuid-2" }
+      expect.objectContaining({
+        limit: 100,
+        request: { consumerId: "uuid-1", generation: 1 },
+        signal: firstSignal,
+      })
     )
 
     rerender({ query: "bar" })
     expect(hook.current.files).toEqual([])
     expect(hook.current.loading).toBe(true)
-    expect(mocks.cancelWorkspaceFileSearch).toHaveBeenCalledWith({
-      searchSessionId: "uuid-1",
-      requestId: "uuid-2",
-    })
+    expect(firstSignal.aborted).toBe(true)
 
     await act(async () => {
       first.resolve(result("foo.ts"))
@@ -161,12 +160,16 @@ describe("useWorkspaceFileSearch", () => {
     await act(async () => {
       await vi.advanceTimersByTimeAsync(200)
     })
+    const secondSignal = signalOf(mocks.searchWorkspaceFiles.mock.calls[1])
     expect(mocks.searchWorkspaceFiles).toHaveBeenNthCalledWith(
       2,
       "/repo",
       "bar",
-      100,
-      { searchSessionId: "uuid-1", requestId: "uuid-3" }
+      expect.objectContaining({
+        limit: 100,
+        request: { consumerId: "uuid-1", generation: 3 },
+        signal: secondSignal,
+      })
     )
 
     await act(async () => {
@@ -197,8 +200,8 @@ describe("useWorkspaceFileSearch", () => {
   })
 
   it("isolates sessions and cancels each active request on unmount", async () => {
-    const first = deferred<WorkspaceFileSearchResult>()
-    const second = deferred<WorkspaceFileSearchResult>()
+    const first = deferred<WorkspaceFileEntry[]>()
+    const second = deferred<WorkspaceFileEntry[]>()
     mocks.searchWorkspaceFiles
       .mockReturnValueOnce(first.promise)
       .mockReturnValueOnce(second.promise)
@@ -222,23 +225,21 @@ describe("useWorkspaceFileSearch", () => {
     await act(async () => {
       await vi.advanceTimersByTimeAsync(200)
     })
-    expect(mocks.searchWorkspaceFiles.mock.calls[0][3].searchSessionId).toBe(
-      "uuid-1"
-    )
-    expect(mocks.searchWorkspaceFiles.mock.calls[1][3].searchSessionId).toBe(
-      "uuid-3"
-    )
+    const firstCall = mocks.searchWorkspaceFiles.mock.calls[0][2] as {
+      request: { consumerId: string }
+      signal: AbortSignal
+    }
+    const secondCall = mocks.searchWorkspaceFiles.mock.calls[1][2] as {
+      request: { consumerId: string }
+      signal: AbortSignal
+    }
+    expect(firstCall.request.consumerId).toBe("uuid-1")
+    expect(secondCall.request.consumerId).toBe("uuid-2")
 
     a.unmount()
     b.unmount()
-    expect(mocks.cancelWorkspaceFileSearch).toHaveBeenCalledWith({
-      searchSessionId: "uuid-1",
-      requestId: "uuid-2",
-    })
-    expect(mocks.cancelWorkspaceFileSearch).toHaveBeenCalledWith({
-      searchSessionId: "uuid-3",
-      requestId: "uuid-4",
-    })
+    expect(firstCall.signal.aborted).toBe(true)
+    expect(secondCall.signal.aborted).toBe(true)
 
     first.resolve(result("a.ts"))
     second.resolve(result("b.ts"))

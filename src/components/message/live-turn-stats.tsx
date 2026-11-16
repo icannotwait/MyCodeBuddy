@@ -7,6 +7,7 @@ import {
   useRef,
   useState,
   useSyncExternalStore,
+  type ReactNode,
 } from "react"
 import { useLocale, useTranslations } from "next-intl"
 import type {
@@ -49,8 +50,13 @@ export type LiveTurnStatusMode = "auto" | "waiting_for_subagents"
 export const LIVE_TURN_REQUEST_USAGE_VISIBLE = false
 
 interface LiveTurnStatsProps {
-  message: LiveMessage
-  agentType: AgentType
+  /** Running turn. `null` when the turn ended but `trailing` still has a chip. */
+  message: LiveMessage | null
+  /**
+   * Set by the bottom banner. When omitted, the row is figures only (time,
+   * edits, trailing chip) — the transcript already says what the agent is doing.
+   */
+  agentType?: AgentType
   conversationId?: number
   isStreaming?: boolean
   /**
@@ -58,6 +64,8 @@ interface LiveTurnStatsProps {
    * the same elapsed / edit / tool-call layout for the bottom banner.
    */
   statusMode?: LiveTurnStatusMode
+  /** Drawn after the figures — the "N running" chip. */
+  trailing?: ReactNode
 }
 
 interface LineChangeStats {
@@ -67,6 +75,12 @@ interface LineChangeStats {
 
 interface LiveEditStats extends LineChangeStats {
   files: number
+}
+
+const EMPTY_EDIT_STATS: LiveEditStats = {
+  files: 0,
+  additions: 0,
+  deletions: 0,
 }
 
 function formatCompactInt(n: number, formatter: Intl.NumberFormat): string {
@@ -523,11 +537,18 @@ export function LiveTurnStats({
   conversationId,
   isStreaming = true,
   statusMode = "auto",
+  trailing = null,
 }: LiveTurnStatsProps) {
   const locale = useLocale()
   const t = useTranslations("Folder.chat.liveTurnStats")
-  const [elapsed, setElapsed] = useState(() => Date.now() - message.startedAt)
-  const editStats = useMemo(() => extractLiveEditStats(message), [message])
+  const startedAt = message?.startedAt ?? 0
+  const [elapsed, setElapsed] = useState(() =>
+    message ? Date.now() - message.startedAt : 0
+  )
+  const editStats = useMemo(
+    () => (message ? extractLiveEditStats(message) : EMPTY_EDIT_STATS),
+    [message]
+  )
   const showUsage =
     LIVE_TURN_REQUEST_USAGE_VISIBLE && supportsRequestUsageDisplay(agentType)
   const usageSnap = useSyncExternalStore(
@@ -579,15 +600,16 @@ export function LiveTurnStats({
 
   useEffect(() => {
     const timer = setInterval(() => {
-      setElapsed(Date.now() - message.startedAt)
+      setElapsed(Date.now() - startedAt)
     }, 1_000)
     return () => clearInterval(timer)
-  }, [message.startedAt])
+  }, [startedAt])
 
-  const hasThinkingBlock = message.content.some((b) => b.type === "thinking")
+  const hasThinkingBlock =
+    message?.content.some((b) => b.type === "thinking") ?? false
 
   // Only active streams should show thinking/streaming state.
-  const lastBlock = message.content[message.content.length - 1]
+  const lastBlock = message?.content[message.content.length - 1]
   const isThinking =
     statusMode === "auto" &&
     isStreaming &&
@@ -611,108 +633,124 @@ export function LiveTurnStats({
       data-status-mode={statusMode}
     >
       <div className="flex min-h-8 flex-wrap items-center justify-center gap-x-3 gap-y-1 px-4 py-1 text-xs leading-none text-muted-foreground">
-        <AgentIcon
-          agentType={agentType}
-          className="h-3.5 w-3.5 animate-pulse"
-        />
-        <span data-testid="live-turn-stats-status">{statusLabel}</span>
-        <span className="text-border leading-none">|</span>
-        <span className="inline-flex items-center gap-1 leading-none">
-          <Timer className="h-3 w-3 shrink-0" />
-          {elapsedLabel}
-        </span>
-        {editStats.files > 0 && (
+        {agentType ? (
           <>
-            <span className="hidden text-border leading-none @[24rem]/turnstats:inline">
-              |
-            </span>
-            <span className="hidden items-center gap-1 leading-none @[24rem]/turnstats:inline-flex">
-              <FilePenLine className="h-3 w-3 shrink-0" />
-              {editStats.files}F +
-              {formatCompactInt(editStats.additions, compactNumberFormatter)}/-
-              {formatCompactInt(editStats.deletions, compactNumberFormatter)}
-            </span>
+            <AgentIcon
+              agentType={agentType}
+              className="h-3.5 w-3.5 animate-pulse"
+            />
+            <span data-testid="live-turn-stats-status">{statusLabel}</span>
+            <span className="text-border leading-none">|</span>
           </>
-        )}
-        {showUsage && (
-          <TooltipProvider delayDuration={0}>
-            <span
-              className={cn(
-                "hidden text-border leading-none",
-                reserveTps && "@[30rem]/turnstats:inline",
-                reserveTps && !validTps && "invisible"
-              )}
-            >
-              |
+        ) : null}
+        {message ? (
+          <>
+            <span className="inline-flex items-center gap-1 leading-none">
+              <Timer className="h-3 w-3 shrink-0" />
+              {elapsedLabel}
             </span>
-            <span
-              data-testid="output-speed-slot"
-              className={cn(
-                "hidden items-center gap-1 leading-none tabular-nums",
-                reserveTps && "@[30rem]/turnstats:inline-flex",
-                reserveTps && !validTps && "invisible"
-              )}
-              title={validTps ? t("outputSpeedTooltip") : undefined}
-            >
-              {validTps && (
-                <>
-                  <Plane
-                    aria-label={t("outputSpeedAria")}
-                    className="h-3 w-3 shrink-0"
-                  />
-                  <span>{tpsLabel} tok/s</span>
-                  {usageSnap.estimatedSampleCount > 0 && (
-                    <ApproximationMarker
-                      label={t("estimatedAria")}
-                      tooltip={t("estimatedTooltip")}
-                    />
+            {editStats.files > 0 && (
+              <>
+                <span className="hidden text-border leading-none @[24rem]/turnstats:inline">
+                  |
+                </span>
+                <span className="hidden items-center gap-1 leading-none @[24rem]/turnstats:inline-flex">
+                  <FilePenLine className="h-3 w-3 shrink-0" />
+                  {editStats.files}F +
+                  {formatCompactInt(
+                    editStats.additions,
+                    compactNumberFormatter
                   )}
-                </>
-              )}
-            </span>
-            <span
-              className={cn(
-                "hidden text-border leading-none",
-                reserveGeneration && "@[36rem]/turnstats:inline",
-                reserveGeneration && !validGeneration && "invisible"
-              )}
-            >
-              |
-            </span>
-            <span
-              data-testid="generation-share-slot"
-              className={cn(
-                "hidden items-center gap-1 leading-none tabular-nums",
-                reserveGeneration && "@[36rem]/turnstats:inline-flex",
-                reserveGeneration && !validGeneration && "invisible"
-              )}
-              title={
-                validGeneration
-                  ? t("generationShareTooltip", {
-                      generation: generationLabel,
-                      wall: formatElapsedLabel(elapsed, t),
-                      percent: generationShare,
-                    })
-                  : undefined
-              }
-            >
-              {validGeneration && (
-                <>
-                  {generationLabel}
-                  <span className="text-muted-foreground/80">
-                    ({generationShare}%)
-                  </span>
-                  {usageSnap.estimatedSampleCount > 0 && (
-                    <ApproximationMarker
-                      label={t("estimatedAria")}
-                      tooltip={t("estimatedTooltip")}
-                    />
+                  /-
+                  {formatCompactInt(
+                    editStats.deletions,
+                    compactNumberFormatter
                   )}
-                </>
-              )}
-            </span>
-          </TooltipProvider>
-        )}
+                </span>
+              </>
+            )}
+            {showUsage && (
+              <TooltipProvider delayDuration={0}>
+                <span
+                  className={cn(
+                    "hidden text-border leading-none",
+                    reserveTps && "@[30rem]/turnstats:inline",
+                    reserveTps && !validTps && "invisible"
+                  )}
+                >
+                  |
+                </span>
+                <span
+                  data-testid="output-speed-slot"
+                  className={cn(
+                    "hidden items-center gap-1 leading-none tabular-nums",
+                    reserveTps && "@[30rem]/turnstats:inline-flex",
+                    reserveTps && !validTps && "invisible"
+                  )}
+                  title={validTps ? t("outputSpeedTooltip") : undefined}
+                >
+                  {validTps && (
+                    <>
+                      <Plane
+                        aria-label={t("outputSpeedAria")}
+                        className="h-3 w-3 shrink-0"
+                      />
+                      <span>{tpsLabel} tok/s</span>
+                      {usageSnap.estimatedSampleCount > 0 && (
+                        <ApproximationMarker
+                          label={t("estimatedAria")}
+                          tooltip={t("estimatedTooltip")}
+                        />
+                      )}
+                    </>
+                  )}
+                </span>
+                <span
+                  className={cn(
+                    "hidden text-border leading-none",
+                    reserveGeneration && "@[36rem]/turnstats:inline",
+                    reserveGeneration && !validGeneration && "invisible"
+                  )}
+                >
+                  |
+                </span>
+                <span
+                  data-testid="generation-share-slot"
+                  className={cn(
+                    "hidden items-center gap-1 leading-none tabular-nums",
+                    reserveGeneration && "@[36rem]/turnstats:inline-flex",
+                    reserveGeneration && !validGeneration && "invisible"
+                  )}
+                  title={
+                    validGeneration
+                      ? t("generationShareTooltip", {
+                          generation: generationLabel,
+                          wall: formatElapsedLabel(elapsed, t),
+                          percent: generationShare,
+                        })
+                      : undefined
+                  }
+                >
+                  {validGeneration && (
+                    <>
+                      {generationLabel}
+                      <span className="text-muted-foreground/80">
+                        ({generationShare}%)
+                      </span>
+                      {usageSnap.estimatedSampleCount > 0 && (
+                        <ApproximationMarker
+                          label={t("estimatedAria")}
+                          tooltip={t("estimatedTooltip")}
+                        />
+                      )}
+                    </>
+                  )}
+                </span>
+              </TooltipProvider>
+            )}
+          </>
+        ) : null}
+        {trailing}
       </div>
     </div>
   )

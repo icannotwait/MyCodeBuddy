@@ -193,6 +193,22 @@ pub const COMPUTER_TOOLS_SETTINGS_CHANGED_EVENT: &str = "computer-tools-settings
 /// (`{ "automations_enabled": bool, "work_tasks_enabled": bool }`).
 pub const CHAT_AUTHORING_SETTINGS_CHANGED_EVENT: &str = "chat-authoring-settings://changed";
 
+/// Announces that the desktop web service started or stopped, from whichever
+/// surface did it — the Settings window, the status-bar toggle, or auto-start
+/// at launch. Every window (each workspace's status bar, an open Settings
+/// page) follows it by re-reading `get_web_server_status`. Payload is
+/// [`WebServiceStatusChanged`] and deliberately nothing more: like every side
+/// channel it also reaches the web broadcaster, and the status itself carries
+/// the access token.
+pub const WEB_SERVICE_STATUS_CHANGED_EVENT: &str = "web-service://status-changed";
+
+/// Payload for [`WEB_SERVICE_STATUS_CHANGED_EVENT`].
+#[derive(Debug, Clone, Copy, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WebServiceStatusChanged {
+    pub running: bool,
+}
+
 /// Announces a delegation-settings write. Same cross-window rationale as
 /// [`CHAT_AUTHORING_SETTINGS_CHANGED_EVENT`], and load-bearing for the same
 /// reason: the record has two editors — the settings form, which writes all
@@ -338,6 +354,35 @@ pub enum ConversationTagChange {
     BranchTag {
         setting: crate::models::ConversationBranchTag,
     },
+}
+
+/// Global side-channel for assistant definitions. Assistants are edited in the
+/// settings window but drawn in every window and client — the mention panel,
+/// delegation cards, sub-session rows.
+pub const ASSISTANT_CHANGED_EVENT: &str = "assistant://changed";
+
+/// Payload for [`ASSISTANT_CHANGED_EVENT`].
+///
+/// Always WHOLE rows, never a partial update: a client keeps a row only when
+/// it carries a higher `revision` than the copy it holds, and one revision
+/// always names one content. A nudge carrying only the changed fields would
+/// break that — it would advance a stale copy's revision past the broadcast
+/// that carried the content it missed.
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum AssistantChange {
+    /// Insert-or-replace by id: create, edit, enable/disable, and delete (the
+    /// row then carries `deleted_at`).
+    Upsert {
+        assistant: Box<crate::models::AssistantInfo>,
+    },
+    /// The rows whose position changed in a reorder, whole.
+    Reordered {
+        assistants: Vec<crate::models::AssistantInfo>,
+    },
+    /// Rows changed without a per-row broadcast (a config snapshot applied
+    /// here): re-fetch the whole list.
+    Resync,
 }
 
 /// Per-agent progress of the import picker's local-session scan. Emitted by
@@ -582,7 +627,7 @@ pub async fn emit_with_state_built<F>(
 where
     F: FnOnce(&mut SessionState) -> Option<AcpEvent>,
 {
-    let (envelope_arc, completion, stream, evicted) = {
+    let (envelope_arc, completion, stream, evicted, turn_file_jobs) = {
         let mut s = state.write().await;
         let Some(payload) = build(&mut s) else {
             return false;
@@ -614,8 +659,33 @@ where
             payload,
         });
         let evicted = s.push_recent_event(Arc::clone(&public));
-        (public, completion, s.event_stream(), evicted)
+        let turn_file_jobs = std::mem::take(&mut s.turn_file_jobs);
+        (
+            public,
+            completion,
+            s.event_stream(),
+            evicted,
+            turn_file_jobs,
+        )
     };
+
+    // Office auto-preview: confirm the files this turn's tool calls named.
+    // Filesystem work, so off the session lock and off the async workers.
+    if !turn_file_jobs.is_empty() {
+        let emitter = emitter.clone();
+        let run = move || {
+            for job in turn_file_jobs {
+                crate::agent_turn_files::run_job(job, &emitter);
+            }
+        };
+        match tokio::runtime::Handle::try_current() {
+            Ok(runtime) => {
+                runtime.spawn_blocking(run);
+            }
+            // Not reachable from the async callers today; never drop the work.
+            Err(_) => run(),
+        }
+    }
 
     // Per-connection broadcaster — primary delivery path for web/remote-
     // desktop transports (they use Subscribe-with-Snapshot attach for ACP
@@ -996,6 +1066,12 @@ mod tests {
     }
 
     #[test]
+    fn web_service_status_changed_carries_only_the_running_flag() {
+        let wire = serde_json::to_value(WebServiceStatusChanged { running: true }).unwrap();
+        assert_eq!(wire, serde_json::json!({ "running": true }));
+    }
+
+    #[test]
     fn emit_event_broadcasts_tabs_changed_snapshot() {
         // The open-tab set syncs via the same global side-channel as the
         // sidebar: one `emit_event` on `tabs://changed` reaches every client,
@@ -1154,6 +1230,73 @@ mod tests {
         assert_eq!(p["kind"], "layout");
         assert!(p["group"].is_null(), "the layout nudge carries no payload");
         assert!(p["id"].is_null(), "the layout nudge carries no payload");
+    }
+
+    #[test]
+    fn emit_event_broadcasts_assistant_change_wire_shapes() {
+        // The shapes the assistant store switches on: whole rows under
+        // `assistant` / `assistants`, and a bare `resync` nudge.
+        use crate::models::assistant::selection;
+        use crate::models::{AgentType, AssistantAvatar, AssistantInfo, AssistantLabelSnapshot};
+
+        let broadcaster = Arc::new(WebEventBroadcaster::new());
+        let mut rx = broadcaster.subscribe();
+        let emitter = EventEmitter::test_web_only(broadcaster.clone());
+        let now = chrono::Utc::now();
+        let row = AssistantInfo {
+            id: 3,
+            uid: "u-3".to_string(),
+            name: "Reviewer".to_string(),
+            description: String::new(),
+            avatar: AssistantAvatar::Monogram {
+                color: "teal".to_string(),
+            },
+            agent_type: AgentType::Codex,
+            agent_options: selection(None, &[]),
+            label_snapshot: AssistantLabelSnapshot::default(),
+            instructions: String::new(),
+            enabled: true,
+            sort_order: 1,
+            revision: 2,
+            created_at: now,
+            updated_at: now,
+            deleted_at: None,
+        };
+
+        emit_event(
+            &emitter,
+            ASSISTANT_CHANGED_EVENT,
+            AssistantChange::Upsert {
+                assistant: Box::new(row.clone()),
+            },
+        );
+        let evt = rx.try_recv().expect("assistant upsert should broadcast");
+        assert_eq!(evt.channel, ASSISTANT_CHANGED_EVENT);
+        let p = &*evt.payload;
+        assert_eq!(p["kind"], "upsert");
+        assert_eq!(p["assistant"]["id"], 3);
+        assert_eq!(p["assistant"]["revision"], 2);
+        assert!(p["assistant"]
+            .get("deleted_at")
+            .is_some_and(|v| v.is_null()));
+
+        emit_event(
+            &emitter,
+            ASSISTANT_CHANGED_EVENT,
+            AssistantChange::Reordered {
+                assistants: vec![row],
+            },
+        );
+        let evt = rx.try_recv().expect("assistant reorder should broadcast");
+        let p = &*evt.payload;
+        assert_eq!(p["kind"], "reordered");
+        assert_eq!(p["assistants"][0]["name"], "Reviewer");
+
+        emit_event(&emitter, ASSISTANT_CHANGED_EVENT, AssistantChange::Resync);
+        let evt = rx.try_recv().expect("assistant resync should broadcast");
+        let p = &*evt.payload;
+        assert_eq!(p["kind"], "resync");
+        assert!(p["assistant"].is_null(), "the resync nudge carries no rows");
     }
 
     #[test]

@@ -137,7 +137,13 @@ pub fn legacy_companion_context(args: &LegacyParentArgs) -> CompanionContext {
         role: args.role,
         can_spawn_child: args.can_spawn_child,
         connection_incarnation_id: args.connection_incarnation_id.clone(),
+        // `--custom-agents` is accepted and ignored; the fork catalog does not
+        // grow delegate targets from launch argv. Probes match the production
+        // companion: learned from the parent, not a second schema.
+        custom_agents: Vec::new(),
         disabled_agents: split_csv(args.disabled_agents.as_deref()),
+        assistant_support: Default::default(),
+        result_schema: Default::default(),
     }
 }
 

@@ -19,10 +19,11 @@ import {
   Pin,
   PinOff,
   CheckCircle2,
-  FolderX,
   Info,
   ChevronRight,
   AppWindow,
+  SquareTerminal,
+  ListChecks,
 } from "lucide-react"
 import { useTranslations } from "next-intl"
 import { toast } from "sonner"
@@ -81,8 +82,11 @@ import {
   ConversationTagContextSubmenu,
   NewConversationTagDialog,
 } from "./conversation-tag-picker"
+import { MoveToFolderContextSubmenu } from "./move-to-folder-menu"
 import { AgentIcon } from "@/components/agent-icon"
+import { AssistantAvatar } from "@/components/assistants/assistant-avatar"
 import { useBranchChip, useResolvedTags } from "@/hooks/use-conversation-tags"
+import { useAssistant } from "@/stores/assistants-store"
 
 /**
  * Horizontal indent added per delegation-nesting level. Chosen so a child's
@@ -204,6 +208,17 @@ interface SidebarConversationCardProps {
   onStatusChange: (id: number, status: ConversationStatus) => Promise<void>
   onNewConversation?: (folderId: number) => void
   onTogglePin?: (id: number, nextPinned: boolean) => void
+  /** A folder was picked in the "Move to folder" submenu — the caller asks for
+   *  confirmation. Offered on root regular and chat conversations only (a
+   *  sub-session moves with its root). */
+  onMoveToFolder?: (
+    conversation: DbConversationSummary,
+    folderId: number
+  ) => void
+  /** Opens Manage conversations on the folder this row is listed under.
+   *  Offered on root folder conversations only: a chat — and a sub-session,
+   *  which may hang under one — lives in no folder a scope there can name. */
+  onManageConversations?: (conversation: DbConversationSummary) => void
   /** Delegation-tree nesting depth (0 = root). Drives the per-level indent. */
   depth?: number
   /** True when `child_count > 0`: the conversation has delegation children, so
@@ -228,6 +243,8 @@ export const SidebarConversationCard = memo(function SidebarConversationCard({
   onStatusChange,
   onNewConversation,
   onTogglePin,
+  onMoveToFolder,
+  onManageConversations,
   depth = 0,
   hasChildren = false,
   expanded = false,
@@ -503,10 +520,17 @@ export const SidebarConversationCard = memo(function SidebarConversationCard({
                       }}
                       aria-hidden
                     >
-                      <AgentIcon
-                        agentType={conversation.agent_type}
-                        className="h-[0.75rem] w-[0.75rem]"
-                      />
+                      {conversation.assistant_id != null ? (
+                        <SubsessionAssistantAvatar
+                          id={conversation.assistant_id}
+                          name={conversation.assistant_name ?? ""}
+                        />
+                      ) : (
+                        <AgentIcon
+                          agentType={conversation.agent_type}
+                          className="h-[0.75rem] w-[0.75rem]"
+                        />
+                      )}
                       <ConversationStatusDot
                         status={status}
                         size="sm"
@@ -545,24 +569,23 @@ export const SidebarConversationCard = memo(function SidebarConversationCard({
                       size="xs"
                       className="relative -ml-[0.25rem] max-w-[calc(100%-3.875rem)] shrink overflow-hidden"
                     />
-                    {/* Re-parented out of a removed worktree: history loads fine,
-                    but "continue" may need a fresh session (the agent's files
-                    were keyed to the old path). Kept at the far end, with the
-                    row's other status marks. */}
-                    {conversation.origin_cwd ? (
+                    {/* Started by `codeg-cli`: told apart from the window's
+                    own, and found again with the Recent filter. */}
+                    {conversation.source === "cli" ? (
                       <span
                         className="ml-auto inline-flex shrink-0 items-center"
-                        title={tSidebar("worktreeRemovedBadge")}
+                        title={tSidebar("cliBadge")}
                       >
-                        <FolderX
+                        <SquareTerminal
                           className="h-3 w-3 text-muted-foreground/60"
                           aria-hidden
                         />
-                        <span className="sr-only">
-                          {tSidebar("worktreeRemovedBadge")}
-                        </span>
+                        <span className="sr-only">{tSidebar("cliBadge")}</span>
                       </span>
                     ) : null}
+                    {/* No mark for a conversation re-parented out of a removed
+                    worktree (`origin_cwd`): the row stays quiet about it, and
+                    the hover bubble names the original path instead. */}
                   </button>
 
                   {/* Expand/collapse affordance for delegation children. It overlays
@@ -645,10 +668,16 @@ export const SidebarConversationCard = memo(function SidebarConversationCard({
                           className="relative inline-flex shrink-0 items-center justify-center"
                           title={tSidebar("statusRunningBadge")}
                         >
-                          <Loader2
-                            className="h-3.5 w-3.5 animate-spin text-amber-600 dark:text-amber-400"
+                          {/* The turn is on a span, not the icon: an SVG
+                              element's transform animates on the main thread,
+                              laying the page out every frame for as long as
+                              the conversation runs. */}
+                          <span
+                            className="inline-flex animate-spin"
                             aria-hidden
-                          />
+                          >
+                            <Loader2 className="h-3.5 w-3.5 text-amber-600 dark:text-amber-400" />
+                          </span>
                           <span className="sr-only">
                             {tSidebar("statusRunningBadge")}
                           </span>
@@ -839,6 +868,28 @@ export const SidebarConversationCard = memo(function SidebarConversationCard({
                 )}
               </ContextMenuSubContent>
             </ContextMenuSub>
+            {onMoveToFolder &&
+              !isSubsession &&
+              (conversation.kind === "regular" ||
+                conversation.kind === "chat") && (
+                <MoveToFolderContextSubmenu
+                  currentFolderId={conversation.folder_id}
+                  onPick={(folderId) => onMoveToFolder(conversation, folderId)}
+                />
+              )}
+            {onManageConversations &&
+              !isSubsession &&
+              conversation.kind !== "chat" && (
+                <>
+                  <ContextMenuSeparator />
+                  <ContextMenuItem
+                    onSelect={() => onManageConversations(conversation)}
+                  >
+                    <ListChecks className="h-4 w-4" />
+                    {tSidebar("folderHeaderMenu.manageConversations")}
+                  </ContextMenuItem>
+                </>
+              )}
             <ContextMenuSeparator />
             <ContextMenuItem
               variant="destructive"
@@ -949,3 +1000,17 @@ export const SidebarConversationCard = memo(function SidebarConversationCard({
     </>
   )
 })
+
+/** A sub-session run as an assistant shows the assistant's avatar where the
+ *  agent icon goes: its current look from the store, or the generic assistant
+ *  glyph for a row the store does not hold. */
+function SubsessionAssistantAvatar({ id, name }: { id: number; name: string }) {
+  const assistant = useAssistant(id)
+  return (
+    <AssistantAvatar
+      avatar={assistant?.avatar ?? null}
+      name={assistant?.name ?? name}
+      size={14}
+    />
+  )
+}

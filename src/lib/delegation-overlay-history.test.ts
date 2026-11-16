@@ -113,6 +113,8 @@ describe("childConversationToDelegationSource", () => {
       durationMs: null,
       agentType: null,
       errorCode: null,
+      assistantId: null,
+      assistantName: null,
     })
     expect(parseDelegationMeta(source.meta)?.status).toBe("running")
   })
@@ -133,6 +135,8 @@ describe("childConversationToDelegationSource", () => {
       durationMs: null,
       agentType: null,
       errorCode: null,
+      assistantId: null,
+      assistantName: null,
     })
     expect(parseDelegationMeta(source.meta)?.status).toBe("running")
   })

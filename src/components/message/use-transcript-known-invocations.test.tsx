@@ -95,7 +95,8 @@ describe("useTranscriptKnownInvocations", () => {
       useTranscriptKnownInvocations("claude_code", commands, "/ws")
     )
     expect(sorted(result.current)).toEqual(["/init", "/review"])
-    // Every agent but Codex advertises its skills as commands already.
+    // Every agent but Codex, Antigravity and OpenCode advertises its skills as
+    // commands.
     expect(mockUseAgentSkills).toHaveBeenCalledWith(null, "/ws")
   })
 
@@ -107,6 +108,48 @@ describe("useTranscriptKnownInvocations", () => {
     )
     expect(sorted(result.current)).toEqual(["$deploy", "$ship", "/review"])
     expect(mockUseAgentSkills).toHaveBeenCalledWith("codex", "/ws")
+  })
+
+  it("adds Antigravity's on-disk skills under `/`, beside its commands", () => {
+    // Antigravity advertises only its built-ins, never a skill.
+    const skills: AgentSkillItem[] = [
+      { ...CODEX_SKILLS[0], path: "/ws/.agents/skills/ship" },
+    ]
+    mockUseAgentSkills.mockImplementation((agentType) =>
+      agentType === "antigravity" ? skills : NO_SKILLS
+    )
+    const commands = [command("plan"), command("usage")]
+    const { result } = renderHook(() =>
+      useTranscriptKnownInvocations("antigravity", commands, "/ws")
+    )
+    expect(sorted(result.current)).toEqual(["/plan", "/ship", "/usage"])
+    expect(mockUseAgentSkills).toHaveBeenCalledWith("antigravity", "/ws")
+  })
+
+  it("adds OpenCode's on-disk skills under `/`, beside its commands", () => {
+    // OpenCode 2.x advertises only its commands, never a skill (#1089).
+    const skills: AgentSkillItem[] = [
+      {
+        ...CODEX_SKILLS[0],
+        scope: "global",
+        path: "/home/.config/opencode/skills/ship",
+      },
+    ]
+    mockUseAgentSkills.mockImplementation((agentType) =>
+      agentType === "open_code" ? skills : NO_SKILLS
+    )
+    const commands = ["init", "review", "goal", "compact"].map(command)
+    const { result } = renderHook(() =>
+      useTranscriptKnownInvocations("open_code", commands, "/ws")
+    )
+    expect(sorted(result.current)).toEqual([
+      "/compact",
+      "/goal",
+      "/init",
+      "/review",
+      "/ship",
+    ])
+    expect(mockUseAgentSkills).toHaveBeenCalledWith("open_code", "/ws")
   })
 
   it("knows nothing before the agent advertises in a new folder, beyond Codex's disk skills", () => {
@@ -286,9 +329,6 @@ describe("MessageListView", () => {
       const tag = source.slice(start, source.indexOf("/>", start))
       return /\bavailableCommands=\{([^}]*)\}/.exec(tag)?.[1].trim()
     }
-    expect(
-      commandsPassedBy("src/components/canvas/canvas-conversation-surface.tsx")
-    ).toBe("conn.availableCommands")
     // Except with no agent known at all: then nothing it remembered applies,
     // and `[]` is the deliberate answer.
     expect(
@@ -301,6 +341,17 @@ describe("MessageListView", () => {
       "src/components/conversations/conversation-session-surface.tsx"
     expect(commandsPassedBy(sessionSurface)).toBe(
       "connIsForOtherAgent ? null : conn.availableCommands"
+    )
+    // A connection still bound to the agent a draft switched away from has
+    // advertised nothing for the selected one: unknown again, never `[]`.
+    // The canvas surface keeps that expression behind `connectionCommands`.
+    expect(
+      commandsPassedBy("src/components/canvas/canvas-conversation-surface.tsx")
+    ).toBe("connectionCommands")
+    expect(
+      read("src/components/canvas/canvas-conversation-surface.tsx")
+    ).toMatch(
+      /const connectionCommands = connIsForOtherAgent \? null : conn\.availableCommands\n/
     )
   })
 })

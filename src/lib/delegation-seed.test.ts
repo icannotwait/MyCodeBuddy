@@ -36,6 +36,26 @@ describe("buildDelegationSeedEnvelopes", () => {
       agent_type: "codex",
       task_preview: null,
       task_id: "task-1",
+      assistant_id: null,
+      assistant_name: null,
+    })
+  })
+
+  it("re-seeds the assistant a running delegation runs as", () => {
+    const env = buildDelegationSeedEnvelopes(
+      "parent-conn",
+      [
+        dele({
+          parent_tool_use_id: "pt-1",
+          assistant_id: 3,
+          assistant_name: "Reviewer",
+        }),
+      ],
+      1
+    )
+    expect(env[0]).toMatchObject({
+      assistant_id: 3,
+      assistant_name: "Reviewer",
     })
   })
 

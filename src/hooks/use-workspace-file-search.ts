@@ -3,11 +3,8 @@
 import { useEffect, useMemo, useRef, useState } from "react"
 
 import type { FlatFileEntry } from "@/hooks/use-file-tree"
-import {
-  cancelWorkspaceFileSearch,
-  searchWorkspaceFiles,
-  type WorkspaceFileSearchIdentity,
-} from "@/lib/api"
+import { searchWorkspaceFiles } from "@/lib/api"
+import type { WorkspaceFileEntry } from "@/lib/types"
 import { randomUUID } from "@/lib/utils"
 
 export interface UseWorkspaceFileSearchOptions {
@@ -28,20 +25,7 @@ interface SettledResult {
   files: FlatFileEntry[]
 }
 
-interface ActiveRequest {
-  generation: number
-  identity: WorkspaceFileSearchIdentity
-}
-
-function cancelSilently(identity: WorkspaceFileSearchIdentity): void {
-  void cancelWorkspaceFileSearch(identity).catch(() => undefined)
-}
-
-function toFlatFileEntry(hit: {
-  name: string
-  path: string
-  kind: string
-}): FlatFileEntry {
+function toFlatFileEntry(hit: WorkspaceFileEntry): FlatFileEntry {
   const kind: "file" | "dir" = hit.kind === "dir" ? "dir" : "file"
   return {
     name: hit.name,
@@ -66,7 +50,6 @@ export function useWorkspaceFileSearch({
   const [settled, setSettled] = useState<SettledResult | null>(null)
   const sessionIdRef = useRef<string | null>(null)
   const generationRef = useRef(0)
-  const activeRequestRef = useRef<ActiveRequest | null>(null)
 
   useEffect(() => {
     const generation = ++generationRef.current
@@ -74,31 +57,27 @@ export function useWorkspaceFileSearch({
       return
     }
 
+    const abort = new AbortController()
     const timer = window.setTimeout(() => {
-      const searchSessionId =
+      const consumerId =
         sessionIdRef.current ?? (sessionIdRef.current = randomUUID())
-      const identity: WorkspaceFileSearchIdentity = {
-        searchSessionId,
-        requestId: randomUUID(),
-      }
-      activeRequestRef.current = { generation, identity }
-
-      void searchWorkspaceFiles(folderPath, query, limit, identity)
-        .then((searchResult) => {
+      void searchWorkspaceFiles(folderPath, query, {
+        limit,
+        request: { consumerId, generation },
+        signal: abort.signal,
+      })
+        .then((files) => {
           if (generationRef.current !== generation) return
           setSettled({
             tag: requestTag,
-            files: searchResult.files.map(toFlatFileEntry),
+            files: files.map(toFlatFileEntry),
           })
         })
         .catch(() => {
-          if (generationRef.current !== generation) return
-          setSettled({ tag: requestTag, files: [] })
-        })
-        .finally(() => {
-          if (activeRequestRef.current?.generation === generation) {
-            activeRequestRef.current = null
+          if (generationRef.current !== generation || abort.signal.aborted) {
+            return
           }
+          setSettled({ tag: requestTag, files: [] })
         })
     }, debounceMs)
 
@@ -107,11 +86,7 @@ export function useWorkspaceFileSearch({
       if (generationRef.current === generation) {
         generationRef.current += 1
       }
-      const active = activeRequestRef.current
-      if (active?.generation === generation) {
-        activeRequestRef.current = null
-        cancelSilently(active.identity)
-      }
+      abort.abort()
     }
   }, [debounceMs, enabled, folderPath, limit, query, requestTag])
 

@@ -714,6 +714,7 @@ async fn debug_metrics_and_diagnostics_are_authenticated_complete_and_secret_saf
                 options: Vec::new(),
                 is_secret: true,
                 recovery: None,
+                allow_other: true,
             }],
         )
         .await
@@ -2068,6 +2069,7 @@ async fn two_clients_have_one_permission_question_and_plan_responder_winner() {
         ConnectionCommand::RespondPermission {
             request_id,
             option_id,
+            origin: _,
         } => {
             assert_eq!(request_id, "permission-race");
             assert_eq!(option_id, "allow");
@@ -2081,6 +2083,8 @@ async fn two_clients_have_one_permission_question_and_plan_responder_winner() {
                 &first.connection_id,
                 AcpEvent::PermissionResolved {
                     request_id: "permission-race".into(),
+                    option_id: None,
+                    origin: None,
                 },
             )
             .await
@@ -2098,6 +2102,7 @@ async fn two_clients_have_one_permission_question_and_plan_responder_winner() {
                 options: Vec::new(),
                 is_secret: false,
                 recovery: None,
+                allow_other: true,
             }],
         )
         .await

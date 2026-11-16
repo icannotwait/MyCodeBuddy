@@ -207,6 +207,27 @@ pub async fn list_folders(
     Ok(Json(result))
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GetFolderConversationOutlineParams {
+    pub conversation_id: i32,
+    pub before_index: usize,
+}
+
+pub async fn get_folder_conversation_outline(
+    Extension(state): Extension<Arc<AppState>>,
+    Json(params): Json<GetFolderConversationOutlineParams>,
+) -> Result<Json<ConversationOutline>, AppCommandError> {
+    let result = conv_commands::get_folder_conversation_outline_core(
+        &state.db.conn,
+        state.internal_sessions.as_ref(),
+        params.conversation_id,
+        params.before_index,
+    )
+    .await?;
+    Ok(Json(result))
+}
+
 pub async fn get_stats(
     Extension(state): Extension<Arc<AppState>>,
 ) -> Result<Json<AgentStats>, AppCommandError> {
@@ -544,8 +565,31 @@ pub async fn delete_conversation(
         &state.emitter,
         &state.db.conn,
         state.auto_title_coordinator.as_ref(),
+        &state.connection_manager,
         params.conversation_id,
     )
     .await?;
     Ok(Json(()))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MoveConversationsParams {
+    pub conversation_ids: Vec<i32>,
+    pub target_folder_id: i32,
+}
+
+pub async fn move_conversations(
+    Extension(state): Extension<Arc<AppState>>,
+    Json(params): Json<MoveConversationsParams>,
+) -> Result<Json<conv_commands::MoveConversationsResult>, AppCommandError> {
+    let result = conv_commands::move_conversations_core(
+        &state.emitter,
+        &state.db.conn,
+        &state.connection_manager,
+        params.conversation_ids,
+        params.target_folder_id,
+    )
+    .await?;
+    Ok(Json(result))
 }

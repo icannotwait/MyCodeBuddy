@@ -15,7 +15,7 @@ use crate::acp::error::AcpError;
 use crate::acp::internal_bus::AcpEventMetricsSnapshot;
 use crate::acp::latest_release;
 use crate::acp::manager::ConnectionManager;
-use crate::acp::opencode_plugins::{self, PluginCheckSummary};
+use crate::acp::opencode_plugins::{self, PluginList};
 use crate::acp::preflight::{self, PreflightResult};
 use crate::acp::registry;
 use crate::acp::shared_session::{SharedSessionBroker, SharedSessionDiagnostic};
@@ -254,12 +254,17 @@ fn npm_install_attempts(
     Ok((pinned, None))
 }
 
-/// Check whether an NPX agent command is spawnable, by the same lookup as
-/// [`resolve_npx_command`]: PATH, then `~/.local/bin`, then the current npm
-/// global prefix. The fallbacks handle GUI environments that don't inherit the
-/// user's shell PATH.
-pub(crate) async fn is_cmd_available(cmd: &str) -> bool {
-    resolve_npx_command(cmd).await.is_some()
+/// Check whether an NPX agent's command is spawnable, by the same lookup as
+/// [`resolve_npx_command_for`]: PATH, then `~/.local/bin`, then the current npm
+/// global prefix, then the agent vendor's own native install. The fallbacks
+/// handle GUI environments that don't inherit the user's shell PATH.
+///
+/// Qoder on Windows resolves further at launch (see [`crate::acp::qoder`]): a
+/// wrapper whose target the user overrode through Agent Settings env, or one
+/// whose CLI went missing, passes this command-existence gate and reports the
+/// specific problem at connect rather than reading as "not installed" here.
+pub(crate) async fn is_cmd_available(agent_type: AgentType, cmd: &str) -> bool {
+    resolve_npx_command_for(agent_type, cmd).await.is_some()
 }
 
 pub(crate) fn resolve_command_on_path(cmd: &str) -> Option<PathBuf> {
@@ -298,13 +303,32 @@ pub(crate) fn resolve_system_agent_binary_for(agent_type: AgentType, cmd: &str) 
     if let Some(path) = resolve_system_agent_binary(cmd) {
         return Some(path);
     }
+    resolve_system_agent_installer_binary(agent_type, cmd, &home_dir_or_default())
+}
+
+fn resolve_system_agent_installer_binary(
+    agent_type: AgentType,
+    cmd: &str,
+    home: &Path,
+) -> Option<PathBuf> {
     let exe = binary_cache::executable_file_name(cmd);
-    let home = home_dir_or_default();
     registry::binary_system_dirs(agent_type)
         .iter()
         .find_map(|dir| {
             let cand = home.join(dir).join(&exe);
-            cand.is_file().then_some(cand)
+            if cand.is_file() {
+                return Some(cand);
+            }
+            // The official Windows installer ships a cmd shim, not mcode.exe.
+            // PATH/PATHEXT handles it above; GUI launches also need this fallback.
+            #[cfg(windows)]
+            if agent_type == AgentType::MiniMaxCode {
+                let shim = home.join(dir).join("mcode.cmd");
+                if shim.is_file() {
+                    return Some(shim);
+                }
+            }
+            None
         })
 }
 
@@ -443,22 +467,130 @@ async fn prewarm_uvx_agent(
     Ok(())
 }
 
-/// Resolve an npx agent's command the way connect, launch, status and
-/// diagnostics all see it: PATH, then `~/.local/bin` (both via
-/// [`resolve_system_agent_binary`]), then the current npm global prefix.
+/// Resolve a command the way an npx agent's command resolves, short of the
+/// agent-specific last step [`resolve_npx_command_for`] adds: PATH, then
+/// `~/.local/bin` (both via [`resolve_system_agent_binary`]), then the current
+/// npm global prefix.
 ///
 /// Both fallbacks cover an app PATH that lacks the user's shell PATH.
 /// `~/.local/bin` goes first on purpose: when neither copy is on the app's
 /// PATH, a vendor's official installer copy (which targets `~/.local/bin`)
 /// beats an npm copy, as it typically does in a terminal where the installer
 /// put `~/.local/bin` first on PATH. See the Hermes "Launch preference" note
-/// in `acp/registry.rs`. [`NpxCommandResolver::resolve_for_list`] must keep
-/// the same order.
+/// in `acp/registry.rs`. [`NpxCommandResolver::resolve_cmd`] must keep the
+/// same order.
 pub(crate) async fn resolve_npx_command(cmd: &str) -> Option<PathBuf> {
     if let Some(path) = resolve_system_agent_binary(cmd) {
         return Some(path);
     }
     resolve_npx_command_from_current_npm_prefix(cmd).await
+}
+
+/// [`resolve_npx_command`] plus the copy the agent vendor's own native
+/// installer keeps in a directory of its own (see [`npx_native_install`]).
+///
+/// Connect, launch, status, list, diagnostics and version detection all take
+/// an npx agent's command from here, so they agree on whether it is installed.
+/// Ordered last, so anything on PATH, an official-installer copy in
+/// `~/.local/bin` and the npm copy codeg manages all still win.
+pub(crate) async fn resolve_npx_command_for(agent_type: AgentType, cmd: &str) -> Option<PathBuf> {
+    if let Some(path) = resolve_npx_command(cmd).await {
+        return Some(path);
+    }
+    npx_native_install(agent_type, cmd)
+}
+
+/// The native-installer copy of an npx agent's command, for the agents whose
+/// vendor also ships an installer of its own that puts the command where no
+/// other probe looks.
+fn npx_native_install(agent_type: AgentType, cmd: &str) -> Option<PathBuf> {
+    match agent_type {
+        AgentType::Grok => grok_native_install(&home_dir_or_default(), cmd),
+        _ => None,
+    }
+}
+
+/// `grok` as Grok's own installers leave it: `x.ai/cli/install.sh` and
+/// `install.ps1` put it in `~/.grok/bin`, then only add that directory to the
+/// shell rc or the Windows user PATH. An app that was already running, or that
+/// a launcher started with the environment from before the install, never sees
+/// that PATH, and on Windows nothing lands in `~/.local/bin` either, so without
+/// this a working native install reads as not installed.
+///
+/// `@xai-official/grok`'s npm package writes its binary to the same place, and
+/// `npm uninstall -g` leaves that copy behind. An npm-installed Grok resolves
+/// through the npm prefix like every other npx agent, and counting its copy
+/// would keep Grok installed after codeg uninstalls it, so that copy does not
+/// count here. Grok records which installer owns `~/.grok/bin` as
+/// `[cli].installer` in the `config.toml` beside it: `"internal"` from its own
+/// installers, `"npm"` from the npm package's postinstall. Where npm skipped
+/// that postinstall (npm 12 blocks install scripts it was not told to allow,
+/// and `ignore-scripts` skips them), the package's launcher unpacks the binary
+/// on its first run and records nothing; with no record, the copy is told
+/// apart by where its build lives ([`is_grok_npm_copy`]).
+///
+/// Only the default location is probed. A `GROK_BIN_DIR` or `GROK_HOME`
+/// relocation is not followed.
+fn grok_native_install(home: &Path, cmd: &str) -> Option<PathBuf> {
+    let grok_dir = home.join(".grok");
+    let bin_dir = grok_dir.join("bin");
+    let cand = bin_dir.join(binary_cache::executable_file_name(cmd));
+    if !cand.is_file() {
+        return None;
+    }
+    let installer = fs::read_to_string(grok_dir.join("config.toml"))
+        .ok()
+        .and_then(|raw| raw.parse::<toml::Table>().ok())
+        .and_then(|table| {
+            table
+                .get("cli")?
+                .as_table()?
+                .get("installer")?
+                .as_str()
+                .map(str::to_string)
+        });
+    let npm_copy = match installer.as_deref() {
+        Some(installer) => installer == "npm",
+        None => is_grok_npm_copy(&bin_dir, &cand, cmd),
+    };
+    (!npm_copy).then_some(cand)
+}
+
+/// Whether `cand`, `<cmd>` in `bin_dir` (`~/.grok/bin`), is laid out as
+/// `@xai-official/grok`'s npm scripts leave it: they unpack the build beside it
+/// as `<cmd>-<version>` (with `.exe` on Windows) and make `cand` a symlink to
+/// that bare name, or on Windows a copy of that file. Grok's own installers and
+/// its updater keep their builds in `~/.grok/downloads` and link or copy `cand`
+/// from there.
+fn is_grok_npm_copy(bin_dir: &Path, cand: &Path, cmd: &str) -> bool {
+    let prefix = format!("{cmd}-");
+    // As the npm scripts' own cleanup matches their builds: a digit right after
+    // the prefix, which leaves out `grok-pager-<version>`.
+    let is_build = |name: &std::ffi::OsStr| {
+        name.to_str()
+            .and_then(|name| name.strip_prefix(prefix.as_str()))
+            .is_some_and(|version| version.starts_with(|c: char| c.is_ascii_digit()))
+    };
+    if let Ok(target) = fs::read_link(cand) {
+        let mut parts = target.components();
+        return matches!(
+            (parts.next(), parts.next()),
+            (Some(std::path::Component::Normal(name)), None) if is_build(name)
+        );
+    }
+    let Ok(len) = fs::metadata(cand).map(|meta| meta.len()) else {
+        return false;
+    };
+    fs::read_dir(bin_dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .any(|entry| {
+            is_build(&entry.file_name())
+                && entry
+                    .metadata()
+                    .is_ok_and(|meta| meta.is_file() && meta.len() == len)
+        })
 }
 
 #[derive(Default)]
@@ -468,7 +600,18 @@ struct NpxCommandResolver {
 }
 
 impl NpxCommandResolver {
-    async fn resolve_for_list(&mut self, cmd: &str) -> Option<PathBuf> {
+    /// [`resolve_npx_command_for`] for the list path, which asks about every
+    /// npx agent at once: the npm prefix is probed at most once per request,
+    /// and each command is resolved at most once.
+    async fn resolve_for_list(&mut self, agent_type: AgentType, cmd: &str) -> Option<PathBuf> {
+        // Outside the per-command cache, which is keyed by the command alone:
+        // whether a native-installer copy counts depends on the agent asking.
+        self.resolve_cmd(cmd)
+            .await
+            .or_else(|| npx_native_install(agent_type, cmd))
+    }
+
+    async fn resolve_cmd(&mut self, cmd: &str) -> Option<PathBuf> {
         if let Some(cached) = self.per_cmd_cache.get(cmd) {
             return cached.clone();
         }
@@ -584,6 +727,18 @@ fn is_npm_command_candidate(path: &Path) -> bool {
             .unwrap_or(false)
 }
 
+/// The refusal every install / upgrade / uninstall entry point returns for a
+/// [`registry::AgentDistribution::System`] agent. The Settings page never
+/// offers those actions for one (it has no version card to hang them on), so
+/// this is the backstop for a direct API call — and it names where the user
+/// CAN manage the install instead of a bare "unsupported".
+fn system_agent_is_user_managed(name: &str, install_url: &str) -> AcpError {
+    AcpError::protocol(format!(
+        "{name} is installed and updated by its own installer ({install_url}); \
+         codeg launches that install and does not install, upgrade or remove it"
+    ))
+}
+
 /// Verify that the agent SDK / binary is installed and usable.
 ///
 /// This is the pre-spawn guard used by the session-page connect path:
@@ -598,7 +753,7 @@ pub(crate) async fn verify_agent_installed(agent_type: AgentType) -> Result<(), 
     let meta = registry::get_agent_meta(agent_type);
     match meta.distribution {
         registry::AgentDistribution::Npx { cmd, .. } => {
-            if !is_cmd_available(cmd).await {
+            if !is_cmd_available(agent_type, cmd).await {
                 // INVARIANT: the substring "is not installed" is matched
                 // verbatim by the frontend catch block in
                 // `src/contexts/acp-connections-context.tsx` to surface a
@@ -662,6 +817,19 @@ pub(crate) async fn verify_agent_installed(agent_type: AgentType) -> Result<(), 
             // PATH. Kept consistent with the Settings status/list paths via the
             // shared helper, so connect and the UI never disagree on readiness.
             if uvx_agent_launchable(system_cmd) {
+                Ok(())
+            } else {
+                Err(AcpError::SdkNotInstalled(format!(
+                    "{} is not installed. Please install it in Agent Settings.",
+                    meta.name
+                )))
+            }
+        }
+        registry::AgentDistribution::System { cmd, .. } => {
+            // The same resolution `build_agent` launches with; there is no
+            // cache to consult. INVARIANT: see note above — "is not installed"
+            // is a stable substring the frontend matches against.
+            if resolve_system_agent_binary_for(agent_type, cmd).is_some() {
                 Ok(())
             } else {
                 Err(AcpError::SdkNotInstalled(format!(
@@ -735,7 +903,12 @@ async fn detect_local_version(agent_type: AgentType) -> Option<String> {
     let meta = registry::get_agent_meta(agent_type);
     match meta.distribution {
         registry::AgentDistribution::Npx { cmd, package, .. } => {
-            let resolved = resolve_npx_command(cmd).await?;
+            let resolved = resolve_npx_command_for(agent_type, cmd).await?;
+            // A Windows Qoder dispatcher can select a native install even
+            // when a different Qoder version exists in the npm global prefix.
+            if cfg!(windows) && agent_type == AgentType::Qoder {
+                return system_probed_version(agent_type, &resolved, Some(package)).await;
+            }
             // Try `npm list -g <package_name> --json` to get the real installed version.
             let pkg_name = package_name_from_spec(package);
             let mut version = detect_npm_global_version(&pkg_name).await;
@@ -790,6 +963,10 @@ async fn detect_local_version(agent_type: AgentType) -> Option<String> {
             .ok()
             .flatten()
             .map(|_| version.to_string()),
+        registry::AgentDistribution::System { cmd, .. } => {
+            let bin = resolve_system_agent_binary_for(agent_type, cmd)?;
+            system_probed_version(agent_type, &bin, None).await
+        }
     }
 }
 
@@ -887,6 +1064,10 @@ struct AgentDiag {
     /// (NOT `resolve_npx`) is what the verdict uses for non-npx agents, so a
     /// working cached-binary / uvx agent is not misreported as node-missing.
     launchable: Option<String>,
+    /// Windows Qoder only: the program codeg starts behind the launcher
+    /// `launchable` names (see [`crate::acp::qoder`]), or why it could not be
+    /// found. Resolved with the app's env; connect applies the agent's own.
+    direct_launch: Option<Result<String, String>>,
     /// `resolve_npx_command(cmd)` — the resolution the new-session page gates on
     /// (npx agents only; `None` for binary/uvx).
     resolve_npx: Option<String>,
@@ -896,8 +1077,9 @@ struct AgentDiag {
     user_prefix_bin: Option<String>,
     /// Homebrew global bin (`/opt/homebrew/bin/<cmd>` etc.) when it exists (macOS).
     homebrew_bin: Option<String>,
-    /// Version seen by `detect_npm_global_version` (covers BOTH prefixes).
+    /// Version of the selected CLI for Windows Qoder; npm globals otherwise.
     detected_version: Option<String>,
+    direct_version_probe: bool,
     /// `agent_setting.installed_version` recorded in the DB.
     db_version: Option<String>,
 }
@@ -983,7 +1165,7 @@ fn parse_node_major(v: &str) -> Option<u64> {
 /// (`acp::preflight::parse_node_version`), so the two never disagree. They did
 /// when this read majors only: a floor inside a major — codex-acp 2.2's 20.3.0,
 /// which is where `AbortSignal.any` (called on every prompt) first exists,
-/// Kimi's 22.19.0, OpenClaw's 24.16.0 — passed Node 20.2 / 22.18 / 24.15 here
+/// Kimi's 22.19.0 — passed Node 20.2 / 22.18 / 24.15 here
 /// while preflight's `node_version` check failed them. Majors are only the
 /// fallback for a version that does not parse whole.
 fn node_meets_requirement(current: &str, required: &str) -> Option<bool> {
@@ -1099,11 +1281,23 @@ async fn collect_agent_diag(
             diag.distribution = "npx";
             diag.package = Some(package.to_string());
             diag.node_required = node_required.map(str::to_string);
+            diag.direct_version_probe = cfg!(windows) && agent_type == AgentType::Qoder;
 
-            let resolve_npx = resolve_npx_command(cmd)
+            let resolve_npx = resolve_npx_command_for(agent_type, cmd)
                 .await
                 .map(|p| p.to_string_lossy().to_string());
             diag.launchable = resolve_npx.clone();
+            // Qoder on Windows launches the program behind its wrapper (see
+            // `acp::qoder`), so the report adds that program and, for an npm
+            // install, its entry, or why it could not be found, next to the
+            // wrapper the new-session page gates on.
+            if cfg!(windows) && agent_type == AgentType::Qoder {
+                diag.direct_launch = resolve_npx.as_ref().map(|p| {
+                    crate::acp::qoder::resolve_launch(Path::new(p), &BTreeMap::new())
+                        .map(|launch| launch.describe())
+                        .map_err(|error| error.to_string())
+                });
+            }
             diag.resolve_npx = resolve_npx;
 
             diag.system_prefix_bin = npm_prefix_g.and_then(|p| {
@@ -1126,10 +1320,18 @@ async fn collect_agent_diag(
             };
             // `npm list` can hang on a stalled global prefix; bound it (the child
             // is killed on drop via `npm_list_version`'s `kill_on_drop`).
-            diag.detected_version = tokio::time::timeout(
-                DIAG_PROBE_TIMEOUT,
-                detect_npm_global_version(&package_name_from_spec(package)),
-            )
+            diag.detected_version = tokio::time::timeout(DIAG_PROBE_TIMEOUT, async {
+                if diag.direct_version_probe {
+                    match diag.resolve_npx.as_deref() {
+                        Some(path) => {
+                            system_probed_version(agent_type, Path::new(path), Some(package)).await
+                        }
+                        None => None,
+                    }
+                } else {
+                    detect_npm_global_version(&package_name_from_spec(package)).await
+                }
+            })
             .await
             .ok()
             .flatten();
@@ -1184,6 +1386,14 @@ async fn collect_agent_diag(
                     .map(|p| p.to_string_lossy().to_string())
                     .unwrap_or_else(|| format!("{cmd} (system CLI on PATH)"))
             });
+        }
+        registry::AgentDistribution::System { cmd, .. } => {
+            diag.cmd = cmd.to_string();
+            diag.distribution = "system";
+            // Mirrors `verify_agent_installed`: the system resolution is the
+            // whole gate.
+            diag.launchable = resolve_system_agent_binary_for(agent_type, cmd)
+                .map(|p| p.to_string_lossy().to_string());
         }
     }
 
@@ -1402,6 +1612,16 @@ fn compute_verdict(inp: &DiagInputs) -> DiagnosticsVerdict {
         );
     }
 
+    // Windows Qoder: the launcher resolves, but connect starts the CLI behind
+    // it, and that could not be found (the reason is in the agent section).
+    if matches!(agent.direct_launch, Some(Err(_))) {
+        return diag_verdict(
+            DiagLevel::Fail,
+            "installed_but_unresolved",
+            "The agent is recorded as installed, but the app cannot locate its executable.",
+        );
+    }
+
     diag_verdict(
         DiagLevel::Ok,
         "ok",
@@ -1528,6 +1748,7 @@ fn build_report(
         let launch_label = match a.distribution {
             "npx" => format!("{} (resolve_npx_command)", a.cmd),
             "binary" => format!("{} (cached / system binary)", a.cmd),
+            "system" => format!("{} (system CLI: PATH / ~/.local/bin)", a.cmd),
             _ => format!("{} (uvx launchable)", a.cmd),
         };
         let mut checks = vec![diag_check(
@@ -1540,6 +1761,22 @@ fn build_report(
             },
             (a.distribution == "npx").then_some("this is exactly what the new-session page checks"),
         )];
+        if let Some(direct) = &a.direct_launch {
+            checks.push(match direct {
+                Ok(program) => diag_check(
+                    "program behind the launcher",
+                    program,
+                    DiagLevel::Ok,
+                    Some("what connect starts on Windows, instead of the launcher"),
+                ),
+                Err(reason) => diag_check(
+                    "program behind the launcher",
+                    reason,
+                    DiagLevel::Fail,
+                    Some("connect cannot start the CLI behind the launcher"),
+                ),
+            });
+        }
         if let Some(p) = &a.package {
             checks.push(diag_check("package", p, DiagLevel::Info, None));
         }
@@ -1580,10 +1817,18 @@ fn build_report(
                 ));
             }
             checks.push(diag_check(
-                "detect_npm_global_version",
+                if a.direct_version_probe {
+                    "selected CLI --version"
+                } else {
+                    "detect_npm_global_version"
+                },
                 a.detected_version.as_deref().unwrap_or("none"),
                 DiagLevel::Info,
-                Some("covers both prefixes — what the Settings badge uses"),
+                Some(if a.direct_version_probe {
+                    "probes the selected direct launch"
+                } else {
+                    "covers both prefixes — what the Settings badge uses"
+                }),
             ));
         }
         checks.push(diag_check(
@@ -2090,6 +2335,53 @@ fn probe_cache_key(
 static SYSTEM_PROBE_CACHE: std::sync::Mutex<Option<HashMap<ProbeCacheKey, ProbeCacheEntry>>> =
     std::sync::Mutex::new(None);
 
+#[derive(PartialEq, Eq, Hash)]
+struct DirectProbeKey {
+    program: PathBuf,
+    args: Vec<String>,
+}
+
+struct DirectProbeEntry {
+    /// Both the native runtime and its script can change independently.
+    files: Vec<(std::time::SystemTime, u64)>,
+    version: Option<String>,
+}
+
+static DIRECT_PROBE_CACHE: std::sync::Mutex<Option<HashMap<DirectProbeKey, DirectProbeEntry>>> =
+    std::sync::Mutex::new(None);
+
+async fn qoder_probed_version(launch: &crate::acp::qoder::QoderWindowsLaunch) -> Option<String> {
+    let key = DirectProbeKey {
+        program: launch.program.clone(),
+        args: launch.version_probe_args(),
+    };
+    let files = std::iter::once(launch.program.as_path())
+        .chain(launch.prefix_args.iter().map(Path::new))
+        .map(|path| {
+            let metadata = std::fs::metadata(path).ok()?;
+            Some((metadata.modified().ok()?, metadata.len()))
+        })
+        .collect::<Option<Vec<_>>>()?;
+    if let Ok(cache) = DIRECT_PROBE_CACHE.lock() {
+        if let Some(entry) = cache.as_ref().and_then(|map| map.get(&key)) {
+            if entry.files == files {
+                return entry.version.clone();
+            }
+        }
+    }
+    let version = probe_cli_version_token(&launch.program, &key.args).await;
+    if let Ok(mut cache) = DIRECT_PROBE_CACHE.lock() {
+        cache.get_or_insert_with(HashMap::new).insert(
+            key,
+            DirectProbeEntry {
+                files,
+                version: version.clone(),
+            },
+        );
+    }
+    version
+}
+
 /// First version-looking token in probe output: starts with a digit (a leading
 /// `v` is tolerated and stripped), is dotted, and is drawn from the semver /
 /// calendar-version alphabet. Whitespace tokens are additionally split on `/`
@@ -2156,6 +2448,20 @@ pub(crate) async fn system_probed_version(
     let declared_probe = agent_type
         .custom_id()
         .and_then(crate::acp::custom_registry::version_probe_of);
+    // Qoder on Windows runs the program behind its launcher, so the version is
+    // read from that exact program — resolved by the same steps the connect
+    // takes — and from nothing else: probing the wrapper or the global npm
+    // package can report an installation the launch will not start. A
+    // resolution that fails here has no version to report; the connect surfaces
+    // its specific error. The probe sees the process environment, so a
+    // per-agent `QODER_CLI_BIN` override shifts the launch only, and the
+    // recorded version stays the default installation's.
+    if cfg!(windows) && agent_type == AgentType::Qoder {
+        let Ok(launch) = crate::acp::qoder::resolve_launch(resolved_bin, &BTreeMap::new()) else {
+            return None;
+        };
+        return qoder_probed_version(&launch).await;
+    }
     system_probed_version_with(declared_probe, resolved_bin, npm_package).await
 }
 
@@ -2244,16 +2550,84 @@ pub(crate) const NPM_OFFICIAL_REGISTRY: &str = "https://registry.npmjs.org";
 /// it unconditionally guarantees the native binary lands no matter how npm is
 /// configured. Harmless for agents without optional deps.
 const NPM_INCLUDE_OPTIONAL: &str = "--include=optional";
+/// npm ≥7 hides lifecycle-script output by default. hermes-agent's postinstall
+/// runs a multi-minute runtime bootstrap (pinned upstream checkout + isolated
+/// venv sync); without this flag the install log goes silent for the whole
+/// bootstrap, which reads as a hang (codeg imposes no timeout on npm). Grok's
+/// postinstall only unpacks its binary and other agents' packages have no
+/// meaningful install scripts, so for them this adds a few lines at most.
 const NPM_FOREGROUND_SCRIPTS: &str = "--foreground-scripts";
 const NPM_RUN_SCRIPTS_OVERRIDE: &str = "--ignore-scripts=false";
+
+/// The flags that let `package`'s own install scripts run, for the packages
+/// whose install needs those scripts ([`npm_package_requires_scripts`]); none
+/// for any other package.
+///
+/// [`NPM_RUN_SCRIPTS_OVERRIDE`] stopped being enough with npm 12, which runs no
+/// install script it was not told to: npm 12.2.1 skipped hermes-agent's
+/// postinstall under `--ignore-scripts=false` ("install scripts blocked
+/// because they are not covered by allowScripts"). A global install or an
+/// `npx` run has no project `package.json` to hold an `allowScripts` policy,
+/// so npm takes `--allow-scripts=<name>` for those, matched against the
+/// package's resolved registry identity: it covers the package being
+/// installed and none of its dependencies. npm 9.6.7, 10.2.4, 10.8.2 and
+/// 11.17.0 accept the flag without a warning and run the script as before
+/// (11.17.0 and 12.2.2 likewise for a scoped name, `@xai-official/grok`).
+fn npm_run_scripts_args(package: &str) -> Vec<String> {
+    if !npm_package_requires_scripts(package) {
+        return Vec::new();
+    }
+    vec![
+        NPM_RUN_SCRIPTS_OVERRIDE.to_string(),
+        format!("--allow-scripts={}", package_name_from_spec(package)),
+    ]
+}
+
+/// Env var that makes Node's own `fetch` read `HTTP_PROXY`/`HTTPS_PROXY`/
+/// `NO_PROXY` (Node ≥24; earlier runtimes ignore an unknown variable).
+///
+/// Node's `fetch` (undici) is the one hop of an install that ignores the proxy
+/// environment — npm, git and uv all read it. hermes-agent's postinstall
+/// downloads its pinned uv binary with `fetch`, so behind a proxy the whole
+/// bootstrap dies on `Downloading uv ...` with a bare `fetch failed` while
+/// every other step of it would have gone through. Set only when the
+/// environment doesn't already carry the variable, so a user who set it (either
+/// way) still decides.
 const NODE_ENV_PROXY_VAR: &str = "NODE_USE_ENV_PROXY";
 
+/// Whether an npm package's lifecycle scripts are load-bearing for the
+/// install, so codeg's install lets them run ([`npm_run_scripts_args`]):
+///
+/// - hermes-agent ([`npm_package_bootstraps_runtime`]): its postinstall
+///   bootstraps the entire Python runtime the `hermes` bin execs into, so
+///   skipping it yields a broken command.
+/// - `@xai-official/grok`: only its postinstall points `~/.grok/bin/grok` at
+///   the build just installed and records that copy as npm's (see
+///   [`grok_native_install`]). Skipping it leaves the package's launcher to
+///   unpack a build there on its first run and to run whatever
+///   `~/.grok/bin/grok` is from then on, so an upgrade never reaches it (on
+///   npm 12.2.2, an upgrade from 1.0.70 to 1.0.77 still ran 1.0.70), and the
+///   copy `npm uninstall -g` leaves records no installer.
 fn npm_package_requires_scripts(package: &str) -> bool {
+    npm_package_bootstraps_runtime(package)
+        || package_name_from_spec(package) == "@xai-official/grok"
+}
+
+/// Whether an npm package is a bootstrap wrapper: its postinstall downloads
+/// the runtime its bin execs into, so the install can die inside those
+/// downloads ([`annotate_npm_bootstrap_failure`]) or leave a bin with no
+/// runtime behind it. Only the hermes-agent community bridge today.
+fn npm_package_bootstraps_runtime(package: &str) -> bool {
     package_name_from_spec(package) == "hermes-agent"
 }
 
+/// Name the proxy when a bootstrap package's install died inside the wrapper's
+/// own downloads. `NODE_ENV_PROXY_VAR` covers Node ≥24; what remains is a
+/// proxied machine on an older Node, where nothing codeg can pass makes that
+/// `fetch` go through — worth spelling out, because npm reports it as a bare
+/// `fetch failed` that says nothing about a proxy.
 fn annotate_npm_bootstrap_failure(package: &str, error: AcpError) -> AcpError {
-    if !npm_package_requires_scripts(package) {
+    if !npm_package_bootstraps_runtime(package) {
         return error;
     }
     let AcpError::Protocol(message) = &error else {
@@ -2400,7 +2774,7 @@ async fn install_npm_global_package_streaming_inner(
     emitter: &EventEmitter,
 ) -> Result<(), AcpError> {
     let registry_arg = format!("--registry={NPM_OFFICIAL_REGISTRY}");
-    let run_scripts = npm_package_requires_scripts(package);
+    let script_args = npm_run_scripts_args(package);
 
     emit_agent_install_event(
         emitter,
@@ -2415,9 +2789,7 @@ async fn install_npm_global_package_streaming_inner(
         NPM_INCLUDE_OPTIONAL,
         NPM_FOREGROUND_SCRIPTS,
     ];
-    if run_scripts {
-        args.push(NPM_RUN_SCRIPTS_OVERRIDE);
-    }
+    args.extend(script_args.iter().map(String::as_str));
     args.push(&registry_arg);
     args.push(package);
     let (success, stderr) = run_npm_streaming(&args, task_id, emitter).await?;
@@ -2451,9 +2823,7 @@ async fn install_npm_global_package_streaming_inner(
                 NPM_INCLUDE_OPTIONAL,
                 NPM_FOREGROUND_SCRIPTS,
             ];
-            if run_scripts {
-                retry_args.push(NPM_RUN_SCRIPTS_OVERRIDE);
-            }
+            retry_args.extend(script_args.iter().map(String::as_str));
             retry_args.push(&registry_arg);
             retry_args.push(package);
             let (retry_success, retry_stderr) =
@@ -2521,7 +2891,7 @@ async fn install_npm_to_user_prefix_streaming(
     })?;
 
     let prefix_arg = format!("--prefix={}", prefix.display());
-    let run_scripts = npm_package_requires_scripts(package);
+    let script_args = npm_run_scripts_args(package);
 
     emit_agent_install_event(
         emitter,
@@ -2539,9 +2909,7 @@ async fn install_npm_to_user_prefix_streaming(
         NPM_INCLUDE_OPTIONAL,
         NPM_FOREGROUND_SCRIPTS,
     ];
-    if run_scripts {
-        args.push(NPM_RUN_SCRIPTS_OVERRIDE);
-    }
+    args.extend(script_args.iter().map(String::as_str));
     args.push(&prefix_arg);
     args.push(registry_arg);
     args.push(package);
@@ -2564,9 +2932,7 @@ async fn install_npm_to_user_prefix_streaming(
                 NPM_INCLUDE_OPTIONAL,
                 NPM_FOREGROUND_SCRIPTS,
             ];
-            if run_scripts {
-                force_args.push(NPM_RUN_SCRIPTS_OVERRIDE);
-            }
+            force_args.extend(script_args.iter().map(String::as_str));
             force_args.push(&prefix_arg);
             force_args.push(registry_arg);
             force_args.push(package);
@@ -2702,7 +3068,7 @@ fn home_dir_or_default() -> PathBuf {
     dirs::home_dir().unwrap_or_else(|| PathBuf::from("."))
 }
 
-fn codex_home_dir() -> PathBuf {
+pub(crate) fn codex_home_dir() -> PathBuf {
     let configured = std::env::var("CODEX_HOME").ok().and_then(|raw| {
         let trimmed = raw.trim();
         if trimmed.is_empty() {
@@ -2761,47 +3127,44 @@ fn codex_auth_json_path() -> PathBuf {
     codex_home_dir().join("auth.json")
 }
 
-/// OpenCode reads config from `$XDG_CONFIG_HOME/opencode` (falling back to
-/// `~/.config/opencode`) and credentials from `$XDG_DATA_HOME/opencode`
-/// (falling back to `~/.local/share/opencode`) on every platform. codeg must
-/// write where OpenCode reads, so these reuse the same XDG resolution as
-/// `opencode_plugins` (config) and `parsers::opencode` (data) — otherwise a
-/// user with XDG dirs set would get credentials written where OpenCode never
-/// looks, and codeg's own plugin/connect paths would diverge.
-fn opencode_config_dir() -> PathBuf {
-    crate::acp::opencode_plugins::xdg_config_home()
-        .unwrap_or_else(|| home_dir_or_default().join(".config"))
-        .join("opencode")
-}
-
-fn opencode_primary_config_path() -> PathBuf {
-    opencode_config_dir().join("opencode.json")
-}
-
-fn opencode_legacy_config_path() -> PathBuf {
-    opencode_config_dir().join("config.json")
-}
-
+/// OpenCode 2's global config file: the `opencode.jsonc` or `opencode.json`
+/// that wins in its config directory (`OPENCODE_CONFIG_DIR`, else
+/// `$XDG_CONFIG_HOME/opencode`, else `~/.config/opencode`; see
+/// `acp::opencode_config`). 1.x's `config.json` is not read by OpenCode 2, so it
+/// is no fallback.
 fn resolve_opencode_config_path() -> PathBuf {
-    let primary = opencode_primary_config_path();
-    if primary.exists() {
-        return primary;
-    }
-
-    let legacy = opencode_legacy_config_path();
-    if legacy.exists() {
-        return legacy;
-    }
-
-    primary
+    crate::acp::opencode_config::config_file().unwrap_or_else(|| {
+        home_dir_or_default()
+            .join(".config")
+            .join("opencode")
+            .join(crate::acp::opencode_config::CONFIG_FILE_NAMES[0])
+    })
 }
 
-fn opencode_auth_json_path() -> PathBuf {
-    crate::parsers::opencode::resolve_opencode_base_dir().join("auth.json")
+/// OpenCode's config as the user wrote it — comments, trailing commas and
+/// formatting included — so the panel's raw editor round-trips it and its
+/// structured editors change single keys in place. Text that does not parse is
+/// handed over as well: the panel shows it and refuses structured edits, where
+/// an empty config would invite a save that replaces the user's file.
+fn load_opencode_config_text() -> Option<String> {
+    let raw = fs::read_to_string(resolve_opencode_config_path()).ok()?;
+    let raw = raw.strip_prefix('\u{feff}').unwrap_or(&raw);
+    (!raw.trim().is_empty()).then(|| raw.to_string())
 }
 
-fn load_opencode_auth_json_raw() -> Option<String> {
-    fs::read_to_string(opencode_auth_json_path()).ok()
+/// Write the panel's OpenCode config text as is, once it parses as OpenCode
+/// would parse it (JSON with comments and trailing commas, an object at the
+/// root). Written atomically, so OpenCode never reads a half-written file.
+fn persist_opencode_config_text(text: &str) -> Result<(), AcpError> {
+    crate::acp::opencode_config::parse_object(text)
+        .map_err(|e| AcpError::protocol(format!("invalid OpenCode config: {e}")))?;
+    let text = if text.ends_with('\n') {
+        text.to_string()
+    } else {
+        format!("{text}\n")
+    };
+    crate::acp::opencode_config::write_atomic(&resolve_opencode_config_path(), &text)
+        .map_err(|e| AcpError::protocol(format!("write OpenCode config failed: {e}")))
 }
 
 // ---------------------------------------------------------------------------
@@ -2852,13 +3215,7 @@ fn load_opencode_auth_json_raw() -> Option<String> {
 // [`apply_cline_launch_env`].
 
 fn cline_data_dir() -> PathBuf {
-    if let Ok(custom) = std::env::var("CLINE_DIR") {
-        let trimmed = custom.trim();
-        if !trimmed.is_empty() {
-            return PathBuf::from(trimmed);
-        }
-    }
-    home_dir_or_default().join(".cline").join("data")
+    crate::parsers::cline::cline_data_dir()
 }
 
 /// `<data>/settings/providers.json` — the CLI's real credential store, honouring
@@ -3041,7 +3398,31 @@ fn load_cline_provider_settings_at(
             );
         }
     }
+    // The models a session can pick for the provider whose ids are the user's
+    // own: its table in the sibling `models.json`. Shown whichever provider is
+    // selected, so a panel switching to that one edits the table it has.
+    let ids = cline_model_table_ids(
+        &path.with_file_name("models.json"),
+        CLINE_CUSTOM_MODEL_PROVIDER,
+    );
+    if !ids.is_empty() {
+        merged.insert("models".to_string(), serde_json::json!(ids));
+    }
     Some(merged)
+}
+
+/// The ids of `provider`'s table in `models.json`, in the file's order.
+fn cline_model_table_ids(models_path: &Path, provider: &str) -> Vec<String> {
+    read_json_object(models_path)
+        .as_ref()
+        .and_then(|root| {
+            root.get("providers")?
+                .get(provider)?
+                .get("models")?
+                .as_object()
+        })
+        .map(|models| models.keys().cloned().collect())
+        .unwrap_or_default()
 }
 
 /// The Cline panel's view of the agent's credentials, as a unified config JSON
@@ -3171,6 +3552,16 @@ fn persist_cline_local_config(config_patch_json: Option<&str>) -> Result<(), Acp
             .unwrap_or("anthropic"),
     );
 
+    // The panel's whole `models.json` table, when it sends one; without it the
+    // chosen model is added to whatever the table holds.
+    let table = patch.get("models").and_then(|v| v.as_array()).map(|ids| {
+        ids.iter()
+            .filter_map(|id| id.as_str().map(str::trim))
+            .filter(|id| !id.is_empty())
+            .map(str::to_string)
+            .collect::<Vec<_>>()
+    });
+
     persist_cline_provider_settings_at(
         &cline_provider_settings_path(),
         &cline_models_catalog_path(),
@@ -3178,6 +3569,7 @@ fn persist_cline_local_config(config_patch_json: Option<&str>) -> Result<(), Acp
         trim_non_empty(runtime.api_key).as_deref(),
         trim_non_empty(runtime.model).as_deref(),
         trim_non_empty(runtime.api_base_url).as_deref(),
+        table.as_deref(),
     )
 }
 
@@ -3195,6 +3587,7 @@ fn persist_cline_provider_settings_at(
     api_key: Option<&str>,
     model: Option<&str>,
     base_url: Option<&str>,
+    table: Option<&[String]>,
 ) -> Result<(), AcpError> {
     if let Some(base_url) = base_url {
         validate_cline_base_url(base_url)?;
@@ -3285,22 +3678,29 @@ fn persist_cline_provider_settings_at(
     );
 
     write_json_pretty(providers_path, &root, "cline providers.json")?;
-    persist_cline_models_catalog_at(models_path, provider, model, base_url)
+    persist_cline_models_catalog_at(models_path, provider, model, base_url, table)
 }
 
 /// Register the chosen model id in `models.json` so `session/new` can actually
-/// select it.
+/// select it — and, when the panel sends its whole table, exactly the ids in
+/// it (the chosen one always among them).
 ///
 /// Only `openai-compatible` needs this (its model ids are user-authored rather
 /// than catalogued) — for every other provider the model comes from cline's
 /// built-in catalogue and an entry here would be noise. Without it the ACP
 /// session silently starts on the provider's built-in default (`gpt-4o`)
 /// regardless of what `providers.json` names.
+///
+/// Merge-preserving: an entry that stays keeps every field it had, and the
+/// provider entry keeps what codeg does not own — its `protocol`, `client`,
+/// `capabilities`, `modelsSourceUrl`, and the `discoveredModelIds` cline's own
+/// discovery owns (less any id the table no longer holds).
 fn persist_cline_models_catalog_at(
     models_path: &Path,
     provider: &str,
     model: Option<&str>,
     base_url: Option<&str>,
+    table: Option<&[String]>,
 ) -> Result<(), AcpError> {
     if provider != CLINE_CUSTOM_MODEL_PROVIDER {
         return Ok(());
@@ -3327,36 +3727,70 @@ fn persist_cline_models_catalog_at(
         .as_object_mut()
         .ok_or_else(|| AcpError::protocol("cline models.json `providers` must be an object"))?;
 
-    // Keep any extra models the user registered through `cline auth`, but retire
-    // a previously-written entry for the model codeg is replacing.
-    let mut models = providers
+    let mut entry = providers
         .get(provider)
-        .and_then(|entry| entry.get("models"))
         .and_then(|v| v.as_object())
         .cloned()
         .unwrap_or_default();
-    models.insert(
-        model.to_string(),
+    let existing = entry
+        .get("models")
+        .and_then(|v| v.as_object())
+        .cloned()
+        .unwrap_or_default();
+    let new_entry = |id: &str| {
         serde_json::json!({
-            "id": model,
-            "name": model,
+            "id": id,
+            "name": id,
             "contextWindow": CLINE_CUSTOM_MODEL_CONTEXT_WINDOW,
             "maxInputTokens": CLINE_CUSTOM_MODEL_CONTEXT_WINDOW,
             "capabilities": ["streaming", "tools", "images"],
-        }),
-    );
+        })
+    };
+    let models = match table {
+        Some(ids) => {
+            let mut wanted: Vec<&str> = ids.iter().map(String::as_str).collect();
+            if !wanted.contains(&model) {
+                wanted.push(model);
+            }
+            let mut out = serde_json::Map::new();
+            for id in wanted {
+                if !out.contains_key(id) {
+                    let kept = existing.get(id).cloned().unwrap_or_else(|| new_entry(id));
+                    out.insert(id.to_string(), kept);
+                }
+            }
+            out
+        }
+        // Keep any extra models the user registered through `cline auth`.
+        None => {
+            let mut out = existing;
+            if !out.contains_key(model) {
+                out.insert(model.to_string(), new_entry(model));
+            }
+            out
+        }
+    };
 
-    providers.insert(
-        provider.to_string(),
-        serde_json::json!({
-            "provider": {
-                "name": "OpenAI Compatible",
-                "baseUrl": base_url,
-                "defaultModelId": model,
-            },
-            "models": serde_json::Value::Object(models),
-        }),
-    );
+    let mut meta = entry
+        .get("provider")
+        .and_then(|v| v.as_object())
+        .cloned()
+        .unwrap_or_default();
+    if !meta
+        .get("name")
+        .and_then(|v| v.as_str())
+        .is_some_and(|name| !name.trim().is_empty())
+    {
+        meta.insert("name".to_string(), serde_json::json!("OpenAI Compatible"));
+    }
+    meta.insert("baseUrl".to_string(), serde_json::json!(base_url));
+    meta.insert("defaultModelId".to_string(), serde_json::json!(model));
+    entry.insert("provider".to_string(), serde_json::Value::Object(meta));
+    if let Some(serde_json::Value::Array(discovered)) = entry.get_mut("discoveredModelIds") {
+        discovered.retain(|id| id.as_str().is_some_and(|id| models.contains_key(id)));
+    }
+    entry.insert("models".to_string(), serde_json::Value::Object(models));
+    providers.insert(provider.to_string(), serde_json::Value::Object(entry));
 
     write_json_pretty(models_path, &root, "cline models.json")
 }
@@ -3643,200 +4077,10 @@ fn load_codex_local_config_json() -> Option<String> {
     serde_json::to_string_pretty(&serde_json::Value::Object(merged)).ok()
 }
 
-fn persist_codex_local_config(config_patch_json: Option<&str>) -> Result<(), AcpError> {
-    let Some(raw_patch) = config_patch_json else {
-        return Ok(());
-    };
-    let runtime = serde_json::from_str::<AgentRuntimeConfig>(raw_patch)
-        .map_err(|e| AcpError::protocol(format!("invalid config_json: {e}")))?;
-    let AgentRuntimeConfig {
-        api_base_url,
-        api_key,
-        model,
-        env,
-    } = runtime;
-
-    let config_path = codex_config_toml_path();
-    let mut toml_value = if config_path.exists() {
-        match fs::read_to_string(&config_path)
-            .ok()
-            .and_then(|raw| raw.parse::<toml::Value>().ok())
-        {
-            Some(existing) if existing.is_table() => existing,
-            _ => toml::Value::Table(toml::map::Map::new()),
-        }
-    } else {
-        toml::Value::Table(toml::map::Map::new())
-    };
-
-    let table = toml_value
-        .as_table_mut()
-        .ok_or_else(|| AcpError::protocol("codex config root must be a TOML table"))?;
-
-    match trim_non_empty(model) {
-        Some(model) => {
-            table.insert("model".to_string(), toml::Value::String(model));
-        }
-        None => {
-            table.remove("model");
-        }
-    }
-
-    let provider_name = table
-        .get("model_provider")
-        .and_then(|value| value.as_str())
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(str::to_string)
-        .unwrap_or_else(|| "codeg".to_string());
-    table.insert(
-        "model_provider".to_string(),
-        toml::Value::String(provider_name.clone()),
-    );
-
-    let providers_item = table
-        .entry("model_providers".to_string())
-        .or_insert_with(|| toml::Value::Table(toml::map::Map::new()));
-    if !providers_item.is_table() {
-        *providers_item = toml::Value::Table(toml::map::Map::new());
-    }
-    let providers = providers_item
-        .as_table_mut()
-        .ok_or_else(|| AcpError::protocol("invalid model_providers table"))?;
-    let provider_item = providers
-        .entry(provider_name.clone())
-        .or_insert_with(|| toml::Value::Table(toml::map::Map::new()));
-    if !provider_item.is_table() {
-        *provider_item = toml::Value::Table(toml::map::Map::new());
-    }
-    let provider_table = provider_item
-        .as_table_mut()
-        .ok_or_else(|| AcpError::protocol("invalid model provider table"))?;
-    match trim_non_empty(api_base_url) {
-        Some(base_url) => {
-            provider_table.insert("base_url".to_string(), toml::Value::String(base_url));
-        }
-        None => {
-            provider_table.remove("base_url");
-        }
-    }
-    if provider_name == "codeg" {
-        provider_table.insert("name".to_string(), toml::Value::String("codeg".to_string()));
-        provider_table.insert(
-            "wire_api".to_string(),
-            toml::Value::String("responses".to_string()),
-        );
-        provider_table.insert(
-            "requires_openai_auth".to_string(),
-            toml::Value::Boolean(true),
-        );
-    }
-
-    if env.is_empty() {
-        table.remove("env");
-    } else {
-        let mut env_table = toml::map::Map::new();
-        for (key, value) in env {
-            let trimmed = value.trim();
-            if trimmed.is_empty() {
-                continue;
-            }
-            env_table.insert(key, toml::Value::String(trimmed.to_string()));
-        }
-        if env_table.is_empty() {
-            table.remove("env");
-        } else {
-            table.insert("env".to_string(), toml::Value::Table(env_table));
-        }
-    }
-
-    let serialized_toml = toml::to_string_pretty(&toml_value)
-        .map_err(|e| AcpError::protocol(format!("serialize codex toml failed: {e}")))?;
-    if let Some(parent) = config_path.parent() {
-        fs::create_dir_all(parent).map_err(|e| {
-            AcpError::protocol(format!("create codex config directory failed: {e}"))
-        })?;
-    }
-    fs::write(&config_path, format!("{serialized_toml}\n"))
-        .map_err(|e| AcpError::protocol(format!("write codex config failed: {e}")))?;
-
-    let auth_path = codex_auth_json_path();
-    let mut auth_value = if auth_path.exists() {
-        match fs::read_to_string(&auth_path)
-            .ok()
-            .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
-        {
-            Some(existing) if existing.is_object() => existing,
-            _ => serde_json::json!({}),
-        }
-    } else {
-        serde_json::json!({})
-    };
-    let auth_obj = auth_value
-        .as_object_mut()
-        .ok_or_else(|| AcpError::protocol("codex auth root must be object"))?;
-    match trim_non_empty(api_key) {
-        Some(api_key) => {
-            auth_obj.insert(
-                "OPENAI_API_KEY".to_string(),
-                serde_json::Value::String(api_key),
-            );
-        }
-        None => {
-            auth_obj.remove("OPENAI_API_KEY");
-        }
-    }
-    let serialized_auth = serde_json::to_string_pretty(&auth_value)
-        .map_err(|e| AcpError::protocol(format!("serialize codex auth failed: {e}")))?;
-    if let Some(parent) = auth_path.parent() {
-        fs::create_dir_all(parent)
-            .map_err(|e| AcpError::protocol(format!("create codex auth directory failed: {e}")))?;
-    }
-    fs::write(&auth_path, format!("{serialized_auth}\n"))
-        .map_err(|e| AcpError::protocol(format!("write codex auth failed: {e}")))?;
-
-    Ok(())
-}
-
-fn persist_codex_native_config_files(
-    codex_auth_json: Option<&str>,
-    codex_config_toml: Option<&str>,
-) -> Result<(), AcpError> {
-    if let Some(raw_toml) = codex_config_toml {
-        toml::from_str::<toml::Table>(raw_toml)
-            .map_err(|e| AcpError::protocol(format!("invalid codex config.toml: {e}")))?;
-        let path = codex_config_toml_path();
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)
-                .map_err(|e| AcpError::protocol(format!("create codex directory failed: {e}")))?;
-        }
-        fs::write(&path, raw_toml)
-            .map_err(|e| AcpError::protocol(format!("write codex config.toml failed: {e}")))?;
-    }
-
-    if let Some(raw_auth) = codex_auth_json {
-        let parsed = serde_json::from_str::<serde_json::Value>(raw_auth)
-            .map_err(|e| AcpError::protocol(format!("invalid codex auth.json: {e}")))?;
-        if !parsed.is_object() {
-            return Err(AcpError::protocol(
-                "invalid codex auth.json: root must be a JSON object",
-            ));
-        }
-        let path = codex_auth_json_path();
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)
-                .map_err(|e| AcpError::protocol(format!("create codex directory failed: {e}")))?;
-        }
-        fs::write(&path, raw_auth)
-            .map_err(|e| AcpError::protocol(format!("write codex auth.json failed: {e}")))?;
-    }
-
-    Ok(())
-}
-
 /// Read `~/.codex/config.toml` as the base of a structured sandbox merge.
 /// A missing file is an empty base; a real read error fails loudly so a save can
 /// never silently drop the user's existing config.
+#[allow(dead_code)]
 fn read_codex_config_or_empty() -> Result<String, AcpError> {
     let path = codex_config_toml_path();
     match fs::read_to_string(&path) {
@@ -3848,10 +4092,18 @@ fn read_codex_config_or_empty() -> Result<String, AcpError> {
     }
 }
 
-/// The plain-string `approval_policy` values codex 0.145 accepts.
+/// The plain-string `approval_policy` values codex accepts.
 /// `AskForApproval` also has a `Granular(GranularApprovalConfig)` variant, which
 /// is a TOML *table* rather than a string and is handled separately.
-const CODEX_APPROVAL_POLICIES: &[&str] = &["untrusted", "on-request", "never"];
+const CODEX_APPROVAL_POLICIES: &[&str] = &["on-request", "never"];
+
+/// The string `approval_policy` codex retired: from 0.160 at the latest, a
+/// config.toml carrying it makes codex refuse to load the config at all
+/// ("approval_policy = \"untrusted\" is no longer supported; remove this
+/// setting"), so no Codex session starts — in codeg or in the Codex CLI.
+/// Still READ, so the panel can show the value it found and say it has to go;
+/// never written.
+const CODEX_RETIRED_APPROVAL_POLICY: &str = "untrusted";
 
 /// `SandboxMode` — the complete upstream vocabulary.
 const CODEX_SANDBOX_MODES: &[&str] = &["read-only", "workspace-write", "danger-full-access"];
@@ -3878,7 +4130,9 @@ fn parse_codex_sandbox_settings(raw_toml: &str) -> CodexSandboxSettings {
             "on-failure" => "on-request",
             other => other,
         })
-        .filter(|value| CODEX_APPROVAL_POLICIES.contains(value))
+        .filter(|value| {
+            CODEX_APPROVAL_POLICIES.contains(value) || *value == CODEX_RETIRED_APPROVAL_POLICY
+        })
         .map(str::to_string);
     let granular = approval_item
         .and_then(toml::Value::as_table)
@@ -3965,161 +4219,6 @@ fn is_absolute_config_path(value: &str) -> bool {
     }
 }
 
-/// Whether a `model_catalog_json` value points at the file codeg generates.
-/// Anything else is the user's OWN catalog — hand-written, or authored in the
-/// advanced config.toml editor — and codeg must never delete it. Resolved the
-/// way codex resolves the key, so an absolute path to codeg's own file counts
-/// as codeg-owned too. Unresolvable/foreign values answer `false`, which is the
-/// safe direction (leave the key alone).
-fn is_codeg_owned_catalog_ref(value: &str, codex_home: &Path) -> bool {
-    let value = value.trim();
-    if value.is_empty() {
-        return false;
-    }
-    resolve_codex_home_relative(value, codex_home)
-        == codex_home.join(crate::acp::codex_model_catalog::CATALOG_REL)
-}
-
-/// Remove the root `model_catalog_json` key from codex's config.toml, keeping
-/// comments and every other key byte-identical. Returns `None` (no write) when
-/// the key is absent **or** points at a catalog codeg does not own, so this is
-/// safe to call on every save.
-///
-/// Pairs with [`crate::acp::codex_model_catalog::write_catalog_files`] returning
-/// `None`: codeg's generated files and the reference to them must appear and
-/// vanish together — codex refuses to start on a dangling `model_catalog_json`.
-fn remove_codex_catalog_key(
-    base_toml: &str,
-    codex_home: &Path,
-) -> Result<Option<String>, AcpError> {
-    let mut doc = base_toml
-        .parse::<toml_edit::Document>()
-        .map_err(|e| AcpError::protocol(format!("invalid codex config.toml: {e}")))?;
-    let owned = doc
-        .get("model_catalog_json")
-        .and_then(|v| v.as_str())
-        .map(|v| is_codeg_owned_catalog_ref(v, codex_home))
-        .unwrap_or(false);
-    if !owned {
-        return Ok(None);
-    }
-    doc.as_table_mut().remove("model_catalog_json");
-    Ok(Some(doc.to_string()))
-}
-
-/// Drop codeg's own `model_catalog_json` reference from the config.toml on disk,
-/// if it carries one. Reads fresh so it also cleans up a key written by an
-/// earlier codeg version or by another window since the panel opened.
-fn drop_codex_catalog_reference() -> Result<(), AcpError> {
-    let base = read_codex_config_or_empty()?;
-    if let Some(next) = remove_codex_catalog_key(&base, &codex_home_dir())? {
-        persist_codex_native_config_files(None, Some(&next))?;
-    }
-    Ok(())
-}
-
-/// What [`resync_codex_generated_catalog_at`] did.
-#[derive(Debug, PartialEq)]
-enum CodexCatalogResync {
-    /// No catalog codeg can regenerate: config.toml references none, references
-    /// the user's own, or codeg's intent sidecar is missing.
-    NotOwned,
-    /// The generated catalog was re-expanded against the new official list.
-    Rewritten,
-    /// Nothing deviates from codex's own list any more, so the reference and
-    /// the generated files were removed and codex's catalog applies untouched.
-    Released,
-}
-
-/// Re-expand codeg's generated codex catalog (`model_catalog_json`) against
-/// `snapshot`, the official catalog of the codex that is now installed.
-///
-/// The key is a whole-table replace that codeg only rewrites when the model
-/// settings are saved, so a codex upgrade that ships new official models left
-/// every user with custom models or removed officials on the OLD table: codex
-/// 0.159.1 (codex-acp 2.0.1) made GPT-6.1 Sol its default and they would not
-/// see it until they happened to re-save. Expanding the stored intent (the
-/// source sidecar) against the new catalog is exactly what that re-save writes.
-///
-/// Only a catalog codeg owns is touched — config.toml must reference codeg's
-/// own file, and the sidecar must exist. A catalog without a sidecar is NOT
-/// re-imported: read against the new list, every newly shipped official would
-/// look like one the user removed. The root `model` is left alone; the user's
-/// explicit default is part of the sidecar and survives the rewrite as-is.
-fn resync_codex_generated_catalog_at(
-    codex_home: &Path,
-    snapshot: &[serde_json::Value],
-) -> Result<CodexCatalogResync, AcpError> {
-    let config_path = codex_home.join("config.toml");
-    let config_toml = match fs::read_to_string(&config_path) {
-        Ok(text) => text,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(CodexCatalogResync::NotOwned)
-        }
-        Err(e) => {
-            return Err(AcpError::protocol(format!(
-                "read codex config.toml failed: {e}"
-            )))
-        }
-    };
-    let owned = config_toml
-        .parse::<toml::Value>()
-        .ok()
-        .as_ref()
-        .and_then(|doc| doc.get("model_catalog_json"))
-        .and_then(toml::Value::as_str)
-        .is_some_and(|value| is_codeg_owned_catalog_ref(value, codex_home));
-    if !owned {
-        return Ok(CodexCatalogResync::NotOwned);
-    }
-    let raw = match fs::read_to_string(codex_home.join(crate::acp::codex_model_catalog::SOURCE_REL))
-    {
-        Ok(raw) => raw,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(CodexCatalogResync::NotOwned)
-        }
-        Err(e) => {
-            return Err(AcpError::protocol(format!(
-                "read codex catalog source failed: {e}"
-            )))
-        }
-    };
-    let config = crate::acp::codex_model_catalog::parse_model_config(Some(&raw));
-    let released = crate::acp::codex_model_catalog::is_effectively_empty(&config, snapshot);
-    if released {
-        // Reference first, files second: codex refuses to start on a
-        // `model_catalog_json` that points at a missing file, so a failure in
-        // between must leave a stale-but-valid table, never a dangling key.
-        if let Some(next) = remove_codex_catalog_key(&config_toml, codex_home)? {
-            fs::write(&config_path, next)
-                .map_err(|e| AcpError::protocol(format!("write codex config.toml failed: {e}")))?;
-        }
-    }
-    crate::acp::codex_model_catalog::write_catalog_files(&raw, codex_home, snapshot)
-        .map_err(|e| AcpError::protocol(e.to_string()))?;
-    Ok(if released {
-        CodexCatalogResync::Released
-    } else {
-        CodexCatalogResync::Rewritten
-    })
-}
-
-/// After codex-acp is (re)installed: refresh the cached official catalog from
-/// the codex it now drives, then bring codeg's generated catalog in line (see
-/// [`resync_codex_generated_catalog_at`]). Only a LIVE catalog is used — the
-/// stale cache or the compiled-in snapshot would just rewrite the old table.
-/// Best-effort: an install never fails over this.
-async fn resync_codex_generated_catalog() {
-    let Some(snapshot) = crate::acp::codex_catalog_source::refresh_live_catalog().await else {
-        tracing::warn!("[acp] codex installed, but its model catalog could not be read");
-        return;
-    };
-    match resync_codex_generated_catalog_at(&codex_home_dir(), &snapshot) {
-        Ok(outcome) => tracing::info!("[acp] codex model catalog after install: {outcome:?}"),
-        Err(e) => tracing::warn!("[acp] codex model catalog resync failed: {e}"),
-    }
-}
-
 /// Apply the Codex panel's sandbox / approval PATCH to the raw config.toml text,
 /// format-preservingly (comments and unmanaged keys are kept). Values are
 /// validated against the upstream vocabularies first, so a UI bug can never
@@ -4130,7 +4229,7 @@ async fn resync_codex_generated_catalog() {
 /// field the removal rules match codex's own defaults: an unset approval/sandbox
 /// drops its key; a `false` flag or empty `writable_roots` drops that key; and a
 /// `[sandbox_workspace_write]` left with no keys at all drops the section.
-fn apply_codex_sandbox_config(
+pub(crate) fn apply_codex_sandbox_config(
     base_toml: &str,
     settings: &CodexSandboxStructuredConfig,
 ) -> Result<String, AcpError> {
@@ -4158,9 +4257,15 @@ fn apply_codex_sandbox_config(
             (Some(policy), _) => {
                 let policy = policy.trim();
                 if !CODEX_APPROVAL_POLICIES.contains(&policy) {
-                    return Err(AcpError::protocol(format!(
-                        "unsupported codex approval_policy: {policy}"
-                    )));
+                    return Err(AcpError::protocol(
+                        if policy == CODEX_RETIRED_APPROVAL_POLICY {
+                            "codex no longer accepts approval_policy = \"untrusted\": \
+                             it refuses to start with it"
+                                .to_string()
+                        } else {
+                            format!("unsupported codex approval_policy: {policy}")
+                        },
+                    ));
                 }
                 // Assigning a value over an existing `[approval_policy.granular]`
                 // table replaces the whole item, which is what switching away
@@ -4391,6 +4496,29 @@ fn parse_grok_settings(raw_toml: &str) -> GrokSettings {
             ),
             None => (None, None, None, None),
         };
+    let custom_reasoning_efforts = custom_model_id
+        .as_deref()
+        .and_then(|id| {
+            table
+                .as_ref()?
+                .get("model")?
+                .as_table()?
+                .get(id)?
+                .as_table()?
+                .get(GROK_REASONING_EFFORTS_KEY)?
+                .as_array()
+        })
+        .map(|entries| {
+            entries
+                .iter()
+                .filter_map(|entry| match entry {
+                    toml::Value::String(level) => grok_effort_level(level),
+                    toml::Value::Table(t) => grok_effort_level(t.get("value")?.as_str()?),
+                    _ => None,
+                })
+                .collect()
+        })
+        .unwrap_or_default();
 
     let auto_compact_threshold_percent = table
         .as_ref()
@@ -4398,6 +4526,26 @@ fn parse_grok_settings(raw_toml: &str) -> GrokSettings {
         .and_then(|s| s.as_table())
         .and_then(|s| s.get("auto_compact_threshold_percent"))
         .and_then(|v| v.as_integer());
+
+    let custom_extra_models = match custom_model_id.as_deref() {
+        Some(main) => table
+            .as_ref()
+            .and_then(|t| t.get("model"))
+            .and_then(|m| m.as_table())
+            .map(|models| {
+                models
+                    .iter()
+                    .filter(|(key, entry)| {
+                        key.as_str() != main
+                            && entry.get("model_provider").and_then(|v| v.as_str())
+                                == Some(GROK_CODEG_PROVIDER)
+                    })
+                    .map(|(key, _)| key.clone())
+                    .collect()
+            })
+            .unwrap_or_default(),
+        None => Vec::new(),
+    };
 
     GrokSettings {
         default_reasoning_effort: get("models", "default_reasoning_effort"),
@@ -4408,9 +4556,28 @@ fn parse_grok_settings(raw_toml: &str) -> GrokSettings {
         custom_api_key,
         custom_api_backend,
         custom_context_window,
+        custom_reasoning_efforts,
+        custom_extra_models,
         auto_compact_threshold_percent,
         cli_chat_proxy_base_url: get("endpoints", "cli_chat_proxy_base_url"),
     }
+}
+
+/// `[model.<id>].reasoning_efforts` — the per-model reasoning-effort levels
+/// (Grok's config reference: "Allowed reasoning-effort values for this model.
+/// When omitted, the menu comes from the endpoint's `/v1/models` row"). That
+/// endpoint is Grok's model catalog (xAI's, or `[endpoints].models_base_url`),
+/// matched by model id: grok 1.0.62, 1.0.70 and 1.0.77 never fetch the list of
+/// a model's own `base_url`, so a custom model the catalog lacks has levels
+/// only from here.
+const GROK_REASONING_EFFORTS_KEY: &str = "reasoning_efforts";
+
+/// One `reasoning_efforts` level as the panel compares it: trimmed and
+/// lowercased, since Grok parses levels case-insensitively. `None` for an empty
+/// string, which no level can be.
+fn grok_effort_level(raw: &str) -> Option<String> {
+    let level = raw.trim().to_ascii_lowercase();
+    (!level.is_empty()).then_some(level)
 }
 
 /// grok's real `--permission-mode` enum (docs.x.ai / verified against the
@@ -4556,8 +4723,10 @@ pub(crate) fn grok_launch_permission_mode() -> Option<String> {
 /// The loss is inherent to the three presets and is NOT introduced here —
 /// injecting nothing (the previous behavior) yields `agent`, i.e. the same
 /// `on-request` PLUS a widened sandbox. Mapping is therefore strictly better on
-/// the sandbox axis and neutral on the approval axis; the panel discloses the
-/// approval loss to the user rather than pretending it away.
+/// the sandbox axis and neutral on the approval axis. It is also moot on the
+/// codex codeg pins: codex retired `untrusted` and refuses a config carrying it
+/// ([`CODEX_RETIRED_APPROVAL_POLICY`]), so no session starts with it at all,
+/// and the panel says the value has to go rather than describing a fallback.
 ///
 /// **The read-only sandbox, on codex-acp 1.7.0–1.13.x.** No preset carries one
 /// there, and the adapter re-sends the selected preset's `sandboxPolicy` on
@@ -4572,7 +4741,8 @@ fn codex_initial_agent_mode(settings: &CodexSandboxSettings) -> Option<&'static 
         return None;
     }
     // `parse_codex_sandbox_settings` has already folded `on-failure` into
-    // `on-request` and dropped anything outside `CODEX_APPROVAL_POLICIES`.
+    // `on-request` and dropped anything outside `CODEX_APPROVAL_POLICIES` and
+    // the retired `untrusted`.
     let never = settings.approval_policy.as_deref() == Some("never");
     match settings.sandbox_mode.as_deref() {
         // The tightest preset on EVERY adapter generation: a real read-only
@@ -4671,7 +4841,9 @@ fn apply_grok_structured_config(
 ///
 /// Within an active block `model = "<id>"` is always set and each empty sub-field
 /// OMITS its key (empty `base_url` ⇒ Grok's official endpoint). Unmanaged keys the
-/// user hand-added to the block are preserved; a rename starts a fresh block.
+/// user hand-added to the block are preserved; a rename starts a fresh block,
+/// into which a `reasoning_efforts` the panel left alone (`None`) moves along.
+/// How the levels are written otherwise: [`grok_tbl_set_reasoning_efforts`].
 fn apply_grok_custom_model(
     doc: &mut toml_edit::Document,
     settings: &GrokStructuredConfig,
@@ -4695,9 +4867,16 @@ fn apply_grok_custom_model(
 
     match target_id {
         Some(id) => {
-            // A rename removes the stale block before writing the new one.
+            // A rename removes the stale block before writing the new one. Levels
+            // the panel left alone (`None`) move to the new block instead of
+            // going with the old one.
+            let mut carried_efforts = None;
             if let Some(prev) = prev_id.as_deref() {
                 if prev != id {
+                    if settings.custom_reasoning_efforts.is_none() {
+                        carried_efforts =
+                            grok_model_block_value(doc, prev, GROK_REASONING_EFFORTS_KEY);
+                    }
                     remove_grok_model_block(doc, prev);
                 }
             }
@@ -4725,11 +4904,25 @@ fn apply_grok_custom_model(
                     "context_window",
                     settings.custom_context_window.filter(|n| *n > 0),
                 );
+                grok_tbl_set_reasoning_efforts(tbl, settings.custom_reasoning_efforts.as_deref());
+                // A block renamed onto keeps a list of its own.
+                if let Some(levels) = carried_efforts {
+                    if tbl.get(GROK_REASONING_EFFORTS_KEY).is_none() {
+                        tbl.insert(GROK_REASONING_EFFORTS_KEY, levels);
+                    }
+                }
+                // The managed model carries its endpoint itself; one that was
+                // an extra before stops leaning on codeg's provider.
+                if tbl.get("model_provider").and_then(|v| v.as_str()) == Some(GROK_CODEG_PROVIDER) {
+                    tbl.remove("model_provider");
+                }
             }
             // Make the managed model the default for new sessions.
             set_or_remove_grok_key(doc, "models", "default", Some(id))?;
+            apply_grok_extra_models(doc, id, settings)?;
         }
         None => {
+            remove_grok_extra_models(doc);
             if let Some(prev) = prev_id.as_deref() {
                 remove_grok_model_block(doc, prev);
                 // Clear the default only when it still points at the removed block.
@@ -4746,6 +4939,174 @@ fn apply_grok_custom_model(
         }
     }
     Ok(())
+}
+
+/// The provider codeg's extra Grok models point at: `[model_providers.codeg]`,
+/// holding the managed model's endpoint, key and backend. A `[model.<id>]`
+/// naming it is one codeg added, and the only kind codeg removes again.
+const GROK_CODEG_PROVIDER: &str = "codeg";
+
+/// The `[model.<id>]` tables codeg added for the endpoint's other models.
+fn grok_codeg_extra_ids(doc: &toml_edit::Document) -> Vec<String> {
+    doc.get("model")
+        .and_then(|m| m.as_table_like())
+        .map(|models| {
+            models
+                .iter()
+                .filter(|(_, entry)| {
+                    entry
+                        .as_table_like()
+                        .and_then(|t| t.get("model_provider"))
+                        .and_then(|v| v.as_str())
+                        == Some(GROK_CODEG_PROVIDER)
+                })
+                .map(|(key, _)| key.to_string())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Make codeg's extra models those `settings` asks for (beside the managed
+/// model `main_id`), on a `[model_providers.codeg]` that follows the managed
+/// endpoint. A `[model.<id>]` of the user's own is never taken over.
+fn apply_grok_extra_models(
+    doc: &mut toml_edit::Document,
+    main_id: &str,
+    settings: &GrokStructuredConfig,
+) -> Result<(), AcpError> {
+    let owned = grok_codeg_extra_ids(doc);
+    let mut wanted: Vec<String> = Vec::new();
+    let source: Vec<&str> = match settings.custom_extra_models.as_deref() {
+        Some(ids) => ids.iter().map(|id| id.trim()).collect(),
+        None => owned.iter().map(String::as_str).collect(),
+    };
+    for id in source {
+        if !id.is_empty() && id != main_id && !wanted.iter().any(|w| w == id) {
+            wanted.push(id.to_string());
+        }
+    }
+    for id in owned.iter().filter(|id| id.as_str() != main_id) {
+        if !wanted.contains(id) {
+            remove_grok_model_block(doc, id);
+        }
+    }
+    // A name the user's own table already holds stays theirs.
+    wanted.retain(|id| owned.contains(id) || !grok_model_block_exists(doc, id));
+    if wanted.is_empty() {
+        remove_grok_codeg_provider(doc);
+        return Ok(());
+    }
+    {
+        let provider = grok_codeg_provider_table_mut(doc)?;
+        grok_tbl_set_str(
+            provider,
+            "base_url",
+            trimmed_opt(settings.custom_base_url.as_deref()),
+        );
+        grok_tbl_set_str(
+            provider,
+            "api_key",
+            trimmed_opt(settings.custom_api_key.as_deref()),
+        );
+        grok_tbl_set_str(
+            provider,
+            "api_backend",
+            trimmed_opt(settings.custom_api_backend.as_deref()),
+        );
+    }
+    for id in &wanted {
+        let tbl = grok_model_table_mut(doc, id)?;
+        grok_tbl_set_str(tbl, "model", Some(id));
+        grok_tbl_set_str(tbl, "model_provider", Some(GROK_CODEG_PROVIDER));
+    }
+    Ok(())
+}
+
+/// Remove every extra model codeg added, and its provider.
+fn remove_grok_extra_models(doc: &mut toml_edit::Document) {
+    for id in grok_codeg_extra_ids(doc) {
+        remove_grok_model_block(doc, &id);
+    }
+    remove_grok_codeg_provider(doc);
+}
+
+/// Mutable handle to `[model_providers.codeg]`, creating it (under an implicit
+/// `[model_providers]`) as needed.
+fn grok_codeg_provider_table_mut(
+    doc: &mut toml_edit::Document,
+) -> Result<&mut dyn toml_edit::TableLike, AcpError> {
+    let providers = &mut doc["model_providers"];
+    if providers.is_none() {
+        let mut parent = toml_edit::Table::new();
+        parent.set_implicit(true);
+        *providers = toml_edit::Item::Table(parent);
+    }
+    let parent = providers.as_table_like_mut().ok_or_else(|| {
+        AcpError::protocol("cannot write [model_providers.codeg]: [model_providers] is not a table")
+    })?;
+    if parent.get(GROK_CODEG_PROVIDER).is_none() {
+        parent.insert(
+            GROK_CODEG_PROVIDER,
+            toml_edit::Item::Table(toml_edit::Table::new()),
+        );
+    }
+    parent
+        .get_mut(GROK_CODEG_PROVIDER)
+        .and_then(|entry| entry.as_table_like_mut())
+        .ok_or_else(|| {
+            AcpError::protocol("cannot write [model_providers.codeg]: it exists but is not a table")
+        })
+}
+
+/// What codeg writes in `[model_providers.codeg]`, and takes back once no
+/// extra model rides it.
+const GROK_CODEG_PROVIDER_KEYS: [&str; 3] = ["base_url", "api_key", "api_backend"];
+
+/// Take codeg's endpoint and key back out of its provider, and drop the
+/// table once nothing else is in it. A key the user added
+/// (`max_request_bytes`, `extra_headers`, …) stays for the next time codeg's
+/// extras ride the provider: Grok accepts a provider no model names, and none
+/// does once codeg's extras are gone.
+fn remove_grok_codeg_provider(doc: &mut toml_edit::Document) {
+    let Some(parent) = doc
+        .get_mut("model_providers")
+        .and_then(|m| m.as_table_like_mut())
+    else {
+        return;
+    };
+    let Some(table) = parent
+        .get_mut(GROK_CODEG_PROVIDER)
+        .and_then(|entry| entry.as_table_like_mut())
+    else {
+        return;
+    };
+    for key in GROK_CODEG_PROVIDER_KEYS {
+        table.remove(key);
+    }
+    if table.iter().next().is_some() {
+        return;
+    }
+    parent.remove(GROK_CODEG_PROVIDER);
+    if parent.iter().next().is_none() {
+        doc.remove("model_providers");
+    }
+}
+
+/// `[model.<id>].<key>` as a plain value item (an array of tables becomes an
+/// inline array), so it can move into another block whatever its layout.
+fn grok_model_block_value(
+    doc: &toml_edit::Document,
+    id: &str,
+    key: &str,
+) -> Option<toml_edit::Item> {
+    let item = doc
+        .get("model")?
+        .as_table_like()?
+        .get(id)?
+        .as_table_like()?
+        .get(key)?
+        .clone();
+    item.into_value().ok().map(toml_edit::Item::Value)
 }
 
 /// True when `[model.<id>]` exists as a table (standard or inline).
@@ -4821,6 +5182,86 @@ fn grok_tbl_set_int(tbl: &mut dyn toml_edit::TableLike, key: &str, value: Option
             tbl.remove(key);
         }
     }
+}
+
+/// Write the custom model's `reasoning_efforts` from the panel's level list.
+/// Without it a model Grok's catalog doesn't describe advertises no effort
+/// support over ACP, so the composer offers no effort selector for it.
+///
+///  - `None` leaves the key as it is (see `GrokStructuredConfig`; a rename
+///    carries it over in [`apply_grok_custom_model`]);
+///  - an empty list removes it, handing the levels back to Grok's catalog (see
+///    [`GROK_REASONING_EFFORTS_KEY`]);
+///  - a list that already matches the file level for level is left exactly as
+///    written, so a save that never touched the levels cannot reformat a
+///    hand-written `reasoning_efforts`;
+///  - otherwise the key becomes one inline array in which each level still
+///    listed keeps its existing entry verbatim (a table with its own `id` /
+///    `label` / `description` / `default` stays that table), and each new level
+///    is a bare string, which Grok gives its own id and label.
+///
+/// No per-entry `default` is written: `[models].default_reasoning_effort`, which
+/// the panel already sets, outranks it for the default model, and this managed
+/// model always is the default. Left unset, Grok starts on the first level.
+fn grok_tbl_set_reasoning_efforts(tbl: &mut dyn toml_edit::TableLike, levels: Option<&[String]>) {
+    let Some(levels) = levels else {
+        return;
+    };
+    let wanted: Vec<String> = levels
+        .iter()
+        .filter_map(|level| grok_effort_level(level))
+        .collect();
+    if wanted.is_empty() {
+        tbl.remove(GROK_REASONING_EFFORTS_KEY);
+        return;
+    }
+    // The current entries, each paired with the level it declares (`None` when
+    // unreadable — such an entry is never kept by a rewrite).
+    let mut existing: Vec<(Option<String>, Option<toml_edit::Value>)> =
+        match tbl.get(GROK_REASONING_EFFORTS_KEY) {
+            Some(toml_edit::Item::Value(toml_edit::Value::Array(entries))) => entries
+                .iter()
+                .map(|entry| (grok_edit_effort_level(entry), Some(entry.clone())))
+                .collect(),
+            Some(toml_edit::Item::ArrayOfTables(entries)) => entries
+                .iter()
+                .map(|entry| {
+                    let entry = toml_edit::Value::InlineTable(entry.clone().into_inline_table());
+                    (grok_edit_effort_level(&entry), Some(entry))
+                })
+                .collect(),
+            _ => Vec::new(),
+        };
+    if existing
+        .iter()
+        .filter_map(|(level, _)| level.as_deref())
+        .eq(wanted.iter().map(String::as_str))
+    {
+        return;
+    }
+    let mut entries = toml_edit::Array::new();
+    for level in &wanted {
+        let kept = existing
+            .iter_mut()
+            .find(|(existing_level, entry)| {
+                entry.is_some() && existing_level.as_deref() == Some(level.as_str())
+            })
+            .and_then(|(_, entry)| entry.take());
+        match kept {
+            Some(entry) => entries.push(entry),
+            None => entries.push(level.as_str()),
+        }
+    }
+    tbl.insert(GROK_REASONING_EFFORTS_KEY, toml_edit::value(entries));
+}
+
+/// The level one `reasoning_efforts` entry declares, read the way Grok does: a
+/// bare string is its own level, a table declares its `value`.
+fn grok_edit_effort_level(entry: &toml_edit::Value) -> Option<String> {
+    if let Some(level) = entry.as_str() {
+        return grok_effort_level(level);
+    }
+    grok_effort_level(entry.as_inline_table()?.get("value")?.as_str()?)
 }
 
 /// `Some(trimmed)` only when non-empty after trimming, else `None` (so an empty
@@ -4904,24 +5345,6 @@ fn set_or_remove_grok_number(
     Ok(())
 }
 
-fn persist_opencode_auth_json(raw_auth: &str) -> Result<(), AcpError> {
-    let parsed = serde_json::from_str::<serde_json::Value>(raw_auth)
-        .map_err(|e| AcpError::protocol(format!("invalid opencode auth.json: {e}")))?;
-    if !parsed.is_object() {
-        return Err(AcpError::protocol(
-            "invalid opencode auth.json: root must be a JSON object",
-        ));
-    }
-    let path = opencode_auth_json_path();
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)
-            .map_err(|e| AcpError::protocol(format!("create opencode directory failed: {e}")))?;
-    }
-    fs::write(&path, format!("{raw_auth}\n"))
-        .map_err(|e| AcpError::protocol(format!("write opencode auth.json failed: {e}")))?;
-    Ok(())
-}
-
 // ---------------------------------------------------------------------------
 // Kimi Code config helpers
 //
@@ -4976,10 +5399,14 @@ const KIMI_SYNTHETIC_TOKEN_ACCESS: &str = "codeg-local-gate";
 /// past session's model id to draw a gauge, while this one is the budget codeg DECLARES
 /// for a bring-your-own provider whose model is unknown — the managed block routes to
 /// any of the six interface types, so the model behind it may be GPT or Claude, not a
-/// Kimi model at all. Kimi spends the declared number rather than checking it (a live
-/// run with this default emits `llm.request.maxTokens = 262144` and
-/// `usage_update {size: 262144}`), so it is the compaction budget, not a fact about the
-/// model. Users on a bigger window raise it in the config panel.
+/// Kimi model at all. Kimi spends the declared number rather than checking it: a live
+/// run with this default reports `usage_update {size: 262144}`, so it is the
+/// compaction budget, not a fact about the model. Up to 2.1.1 Kimi also turned it
+/// into the request's output cap (`llm.request.maxTokens = 262144`), which an
+/// OpenAI-compatible server rejects when it is above the model's own output limit.
+/// From 2.2.0 it no longer sets the cap: an `openai` / `openai_responses` block
+/// sends none, and a `kimi` block caps output at this window minus the context in
+/// use. Users on a bigger window raise it in the config panel.
 const KIMI_DEFAULT_MAX_CONTEXT_SIZE: i64 = 262_144;
 /// The six native provider `type` values Kimi accepts in `[providers.<name>]`.
 const KIMI_INTERFACE_TYPES: &[&str] = &[
@@ -5832,61 +6259,44 @@ pub(crate) async fn acp_update_kimi_code_config_and_refresh(
     .await)
 }
 
-/// Validate an API key + endpoint by listing the account's models. GETs
-/// `<base_url>/models` with the key as a Bearer token and returns the model ids
-/// (OpenAI-compatible `{ "data": [{ "id": ... }] }`). Surfaces the provider's
-/// own error message on failure. Lets the settings panel populate a model picker
-/// and doubles as a one-click connection test — directly preventing the
-/// "Not found the model ..." trap of typing a model the account can't access.
-pub(crate) async fn acp_fetch_kimi_models_core(
-    base_url: &str,
-    api_key: &str,
-) -> Result<Vec<String>, AcpError> {
-    let base = base_url.trim().trim_end_matches('/');
-    if base.is_empty() {
-        return Err(AcpError::protocol("base URL is required to list models"));
+/// Keep the `/model` picker ids of a Claude agent with no model provider
+/// bound ([`crate::acp::claude_model_picker`]); none clears them.
+async fn store_claude_model_picker(
+    models: &[String],
+    conn: &sea_orm::DatabaseConnection,
+) -> Result<(), AcpError> {
+    use crate::acp::claude_model_picker as picker;
+    use crate::db::service::app_metadata_service;
+    let ids = picker::normalize(models.iter().map(String::as_str));
+    if let Some(why) = picker::invalid(&ids) {
+        return Err(AcpError::protocol(why));
     }
-    let key = api_key.trim();
-    if key.is_empty() {
-        return Err(AcpError::protocol("API key is required to list models"));
+    match picker::encode(&ids) {
+        Some(stored) => {
+            app_metadata_service::upsert_value(conn, picker::METADATA_KEY, &stored).await
+        }
+        None => app_metadata_service::delete_value(conn, picker::METADATA_KEY).await,
     }
-    let url = format!("{base}/models");
-    let resp = reqwest::Client::new()
-        .get(&url)
-        .bearer_auth(key)
-        .timeout(std::time::Duration::from_secs(20))
-        .send()
-        .await
-        .map_err(|e| AcpError::protocol(format!("list models request failed: {e}")))?;
-    let status = resp.status();
-    let body: serde_json::Value = resp
-        .json()
-        .await
-        .map_err(|e| AcpError::protocol(format!("list models returned invalid JSON: {e}")))?;
-    if !status.is_success() {
-        let msg = body
-            .get("error")
-            .and_then(|e| e.get("message"))
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or("request rejected");
-        return Err(AcpError::protocol(format!("{status}: {msg}")));
-    }
-    let mut ids: Vec<String> = body
-        .get("data")
-        .and_then(serde_json::Value::as_array)
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|m| {
-                    m.get("id")
-                        .and_then(serde_json::Value::as_str)
-                        .map(str::to_string)
-                })
-                .collect()
-        })
-        .unwrap_or_default();
-    ids.sort();
-    ids.dedup();
-    Ok(ids)
+    .map_err(|e| AcpError::protocol(e.to_string()))
+}
+
+/// [`store_claude_model_picker`], then flag the running sessions the ids now
+/// differ from. A bound provider keeps its own ids, in its model JSON.
+pub(crate) async fn acp_update_claude_model_picker_core(
+    models: Vec<String>,
+    db: &AppDatabase,
+    manager: &ConnectionManager,
+    data_dir: &Path,
+) -> Result<usize, AcpError> {
+    store_claude_model_picker(&models, &db.conn).await?;
+    Ok(refresh_config_staleness(
+        manager,
+        db,
+        data_dir,
+        &[AgentType::ClaudeCode],
+        ConfigStaleKind::AgentConfig,
+    )
+    .await)
 }
 
 // ---------------------------------------------------------------------------
@@ -5998,6 +6408,65 @@ fn account_home_dir() -> Option<PathBuf> {
     dirs::home_dir()
 }
 
+/// What `os.homedir()` answers in a Node child that inherits codeg's own
+/// environment: `HOME` (`USERPROFILE` on Windows) when it is set, otherwise the
+/// account's home. `dirs::home_dir()` gives the same answer on unix, but on
+/// Windows it asks the OS for the profile folder and never reads `USERPROFILE`,
+/// so a codeg started with `USERPROFILE` pointing elsewhere would name another
+/// home than its Node children use.
+fn inherited_node_home_dir() -> PathBuf {
+    node_home_from(std::env::var_os(CHILD_HOME_KEY))
+}
+
+/// [`inherited_node_home_dir`] with codeg's home variable handed in. An empty
+/// value counts as unset: it names no folder codeg could manage.
+fn node_home_from(variable: Option<std::ffi::OsString>) -> PathBuf {
+    variable
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .or_else(account_home_dir)
+        .unwrap_or_else(home_dir_or_default)
+}
+
+/// Read the launch's agent-directory `enabledModels` preference. Missing,
+/// malformed or empty settings leave the model selector unrestricted.
+///
+/// So does a workspace that sets its own: a trusted project's
+/// `.pi/settings.json` replaces the agent dir's list outright, and whether pi
+/// trusts the project is settled inside pi at startup (`trust.json`, an
+/// extension, `defaultProjectTrust` or a prompt). codeg cannot tell which list
+/// that pi runs with, and the wrong one would hide models it offers. A project
+/// file pi loads nothing from — unreadable, or JSON other than an object —
+/// leaves the agent dir's list in force, as in pi; one codeg cannot parse
+/// counts as setting its own, since pi's parser may still read it.
+pub(crate) fn pi_enabled_model_patterns_for_env(
+    runtime_env: &BTreeMap<String, String>,
+    workspace: &Path,
+) -> Option<Vec<String>> {
+    if let Ok(raw) = fs::read_to_string(workspace.join(".pi").join("settings.json")) {
+        match serde_json::from_str::<serde_json::Value>(without_bom(&raw)) {
+            Ok(serde_json::Value::Object(project)) if project.contains_key("enabledModels") => {
+                return None
+            }
+            Ok(_) => {}
+            Err(_) => return None,
+        }
+    }
+    let settings = read_json_object_or_empty(
+        &pi_agent_dir_in_workspace(runtime_env, workspace).join("settings.json"),
+    );
+    let patterns = settings
+        .get("enabledModels")
+        .and_then(serde_json::Value::as_array)?
+        .iter()
+        .filter_map(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|pattern| !pattern.is_empty())
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    (!patterns.is_empty()).then_some(patterns)
+}
+
 /// Pi's agent dir as the pi CHILD of a launch with `runtime_env` resolves it —
 /// before a relative value is anchored (see [`pi_agent_dir_in_workspace`]).
 ///
@@ -6042,8 +6511,19 @@ fn pi_agent_dir_in_workspace(runtime_env: &BTreeMap<String, String>, workspace: 
 // `PI_ACP_TRUST_WORKSPACE` remains reserved in the frontend for migration, but
 // no backend launch path reads it. Project trust is an explicit user decision.
 
-const PI_TRUST_REQUIRING_CONFIG_RESOURCES: [&str; 7] = [
+/// The `<cwd>/.pi/` entries whose mere presence makes a project "trust-requiring"
+/// for pi. Mirrors pi's own `TRUST_REQUIRING_PROJECT_CONFIG_RESOURCES`
+/// (`core/trust-manager.js`, verified against pi 1.3.0, whose native MCP added
+/// `mcp.json`).
+///
+/// This list is a mirror of another project's constant, so it can drift if pi
+/// adds a resource kind, and the drift is not harmless. Over-detecting only
+/// costs one extra prompt, but a kind missing here lets a repository that ships
+/// only that kind past the launch gate under a grant nobody confirmed — and pi
+/// loads it, since the grant is in force.
+const PI_TRUST_REQUIRING_CONFIG_RESOURCES: [&str; 8] = [
     "settings.json",
+    "mcp.json",
     "extensions",
     "skills",
     "prompts",
@@ -6057,6 +6537,12 @@ const PI_TRUST_REQUIRING_CONFIG_RESOURCES: [&str; 7] = [
 pub struct PiProjectResource {
     pub path: String,
     pub kind: String,
+    /// Whether loading this resource means executing repo-controlled code at pi
+    /// startup, as opposed to feeding it repo-controlled text. `.pi/extensions`
+    /// are JS/TS modules whose top level runs immediately, `.pi/settings.json`
+    /// can make pi install project packages, and `.pi/mcp.json` names commands
+    /// pi starts as MCP servers — the approval UI must say so plainly rather
+    /// than describing all of these as "config".
     pub executes_code: bool,
 }
 
@@ -6079,7 +6565,10 @@ fn pi_project_trust_resources_with_home(cwd: &Path, home: &Path) -> Vec<PiProjec
             found.push(PiProjectResource {
                 path: path.to_string_lossy().to_string(),
                 kind: format!(".pi/{entry}"),
-                executes_code: matches!(entry, "extensions" | "settings.json"),
+                // Extensions are modules pi imports (top-level code runs); project
+                // settings can pull in and install project packages; a project
+                // MCP server is a command pi starts.
+                executes_code: matches!(entry, "extensions" | "settings.json" | "mcp.json"),
             });
         }
     }
@@ -6217,6 +6706,32 @@ async fn pi_settings_dir_from_db(db: &AppDatabase) -> Result<PathBuf, AcpError> 
     pi_settings_dir_checked(pi_agent_dir_for_env(&pi_runtime_env_from_db(db).await?))
 }
 
+/// The API key pi keeps for `provider` in its `auth.json`
+/// (`{"<provider>": {"type": "api_key", "key": …}}`), if it keeps one.
+pub(crate) async fn pi_stored_api_key(
+    db: &AppDatabase,
+    provider: &str,
+) -> Result<Option<String>, AcpError> {
+    let dir = pi_settings_dir_from_db(db).await?;
+    Ok(pi_stored_api_key_at(&dir, provider))
+}
+
+fn pi_stored_api_key_at(pi_dir: &Path, provider: &str) -> Option<String> {
+    let auth = read_json_object_or_empty(&pi_dir.join("auth.json"));
+    let entry = auth.get(provider)?;
+    if entry.get("type").and_then(serde_json::Value::as_str) != Some("api_key") {
+        return None;
+    }
+    entry
+        .get("key")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|key| !key.is_empty())
+        .map(str::to_string)
+}
+
+/// Project-trust state for `cwd` against explicit files. Split from the DB-backed
+/// command so it is directly unit-testable against a tempdir.
 fn pi_project_trust_state_at(
     trust_file: &Path,
     ack_file: &Path,
@@ -6568,7 +7083,7 @@ fn pi_write_trust_decision_at(
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     let _lock = acquire_pi_trust_lock(path)?;
     let mut obj = match fs::read_to_string(path) {
-        Ok(text) => match serde_json::from_str::<serde_json::Value>(&text) {
+        Ok(text) => match serde_json::from_str::<serde_json::Value>(without_bom(&text)) {
             Ok(serde_json::Value::Object(map)) => map,
             _ => {
                 return Err(AcpError::protocol(format!(
@@ -6639,6 +7154,11 @@ pub(crate) struct PiConfigUpdate {
     /// or a client that predates the control). Ignored when `custom_base_url` is
     /// `None` — a built-in model carries pi's own, more accurate declaration.
     pub model_reasoning: Option<PiModelReasoningSpec>,
+    /// The custom provider's whole model list, when the panel sends one: its
+    /// `models` become exactly these ids, `model` always among them. `None`
+    /// adds `model` to whatever the list holds. Ignored without
+    /// `custom_base_url`.
+    pub custom_models: Option<Vec<String>>,
 }
 
 /// A model's reasoning capability as pi records it in `models.json`.
@@ -6665,14 +7185,21 @@ pub struct PiModelReasoningSpec {
 /// no picker will ever offer.
 const PI_THINKING_LEVELS: [&str; 7] = ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
 
+/// `raw` past a leading UTF-8 byte-order mark, which pi strips from its files
+/// before parsing them and serde_json rejects.
+fn without_bom(raw: &str) -> &str {
+    raw.strip_prefix('\u{feff}').unwrap_or(raw)
+}
+
 /// Read a JSON file into an owned object map, returning an empty map when the
 /// file is absent, unreadable, or does not parse to a JSON object. Pi's native
 /// files are small and codeg-owned; corruption shouldn't abort a save (we
-/// re-author the managed keys and preserve whatever else parses).
+/// re-author the managed keys and preserve whatever else parses). A leading
+/// byte-order mark is not corruption: pi reads past it, and so does this.
 fn read_json_object_or_empty(path: &Path) -> serde_json::Map<String, serde_json::Value> {
     fs::read_to_string(path)
         .ok()
-        .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
+        .and_then(|raw| serde_json::from_str::<serde_json::Value>(without_bom(&raw)).ok())
         .and_then(|value| match value {
             serde_json::Value::Object(map) => Some(map),
             _ => None,
@@ -6696,6 +7223,41 @@ fn write_json_object_pretty(
     fs::write(path, text)
         .map_err(|e| AcpError::protocol(format!("write pi config failed: {e}")))?;
     Ok(())
+}
+
+/// Make a custom provider's `models` exactly `ids`, `model_id` always among
+/// them: an entry that stays keeps every field it had, a new one is
+/// `{id, name: id}`. Every entry written is one pi's schema accepts — pi drops
+/// the whole of `models.json`, every custom provider with it, over a single
+/// invalid entry — so one without an `id` (already invalid) goes.
+fn set_pi_custom_models(
+    entry: &mut serde_json::Map<String, serde_json::Value>,
+    ids: &[String],
+    model_id: &str,
+) {
+    let mut existing: HashMap<String, serde_json::Value> = HashMap::new();
+    if let Some(serde_json::Value::Array(items)) = entry.remove("models") {
+        for item in items {
+            if let Some(id) = item.get("id").and_then(serde_json::Value::as_str) {
+                existing.entry(id.to_string()).or_insert(item);
+            }
+        }
+    }
+    let mut wanted: Vec<String> = Vec::new();
+    for id in ids.iter().map(|id| id.trim()).chain([model_id]) {
+        if !id.is_empty() && !wanted.iter().any(|w| w == id) {
+            wanted.push(id.to_string());
+        }
+    }
+    let models = wanted
+        .into_iter()
+        .map(|id| {
+            existing
+                .remove(&id)
+                .unwrap_or_else(|| serde_json::json!({ "id": id, "name": id }))
+        })
+        .collect();
+    entry.insert("models".to_string(), serde_json::Value::Array(models));
 }
 
 /// Upsert `model_id` into a custom provider's `models` array, applying `reasoning`
@@ -7159,6 +7721,9 @@ pub(crate) async fn acp_update_pi_config_core(
             "api".to_string(),
             serde_json::Value::String(custom_api.to_string()),
         );
+        if let Some(ids) = update.custom_models.as_deref() {
+            set_pi_custom_models(&mut entry, ids, model);
+        }
         apply_pi_custom_model(&mut entry, model, update.model_reasoning.as_ref());
         providers.insert(provider.to_string(), serde_json::Value::Object(entry));
         models_doc.insert(
@@ -7398,10 +7963,10 @@ pub(crate) fn acp_validate_pi_command_core(command: String) -> PiCommandValidati
 /// and never blocks indefinitely (`Command::output` waits for the short-lived
 /// `--version` child to exit on its own).
 fn probe_pi_version(resolved: &Path) -> Option<String> {
-    let output = std::process::Command::new(resolved)
-        .arg("--version")
-        .output()
-        .ok()?;
+    let mut probe = std::process::Command::new(resolved);
+    probe.arg("--version");
+    crate::appimage_env::restore(&mut probe);
+    let output = probe.output().ok()?;
     if !output.status.success() {
         return None;
     }
@@ -7822,7 +8387,28 @@ fn yaml_str(value: &serde_yaml::Value, key: &str) -> Option<String> {
 fn existing_hermes_model_provider(existing: Option<&str>) -> Option<String> {
     let raw = existing?;
     let value: serde_yaml::Value = serde_yaml::from_str(raw).ok()?;
-    value.get("model").and_then(|m| yaml_str(m, "provider"))
+    value
+        .get("model")
+        .and_then(|m| yaml_str(m, "provider"))
+        .map(|provider| hermes_panel_provider(&provider).to_string())
+}
+
+/// The named provider codeg writes the panel's `custom` endpoint as
+/// (`providers.codeg`, picked with `model.provider: custom:codeg`). Hermes asks
+/// a named provider's `/models` with that provider's key and lists every model
+/// it serves, where `model.provider: custom` is probed with no key at all and
+/// offers only the configured model.
+const HERMES_CODEG_PROVIDER: &str = "codeg";
+const HERMES_CODEG_PROVIDER_REF: &str = "custom:codeg";
+
+/// The panel's provider id for a `model.provider` value: codeg's named
+/// provider is the panel's `custom`; anything else is itself.
+fn hermes_panel_provider(provider: &str) -> &str {
+    if provider == HERMES_CODEG_PROVIDER_REF {
+        "custom"
+    } else {
+        provider
+    }
 }
 
 /// How `merge_hermes_model_config` should treat the `model.base_url` field.
@@ -7888,6 +8474,28 @@ fn merge_hermes_model_config(
         .and_then(Value::as_mapping_mut)
         .expect("model is a mapping");
 
+    if hermes_inlines_api_key(provider) {
+        model_map.insert(
+            Value::String("provider".to_string()),
+            Value::String(HERMES_CODEG_PROVIDER_REF.to_string()),
+        );
+        if !model.is_empty() {
+            model_map.insert(
+                Value::String("default".to_string()),
+                Value::String(model.to_string()),
+            );
+        }
+        write_hermes_codeg_provider(root_map, base_url, inline_api_key);
+        return serde_yaml::to_string(&root)
+            .map_err(|e| AcpError::protocol(format!("serialize hermes config.yaml failed: {e}")));
+    }
+    // Any other provider: codeg's named provider is no longer what the panel
+    // configures, and Hermes would go on listing its models.
+    remove_hermes_codeg_provider(root_map);
+    let model_map = root_map
+        .get_mut(&model_key)
+        .and_then(Value::as_mapping_mut)
+        .expect("model is a mapping");
     model_map.insert(
         Value::String("provider".to_string()),
         Value::String(provider.to_string()),
@@ -7937,6 +8545,132 @@ fn merge_hermes_model_config(
 
     serde_yaml::to_string(&root)
         .map_err(|e| AcpError::protocol(format!("serialize hermes config.yaml failed: {e}")))
+}
+
+/// Write the panel's `custom` endpoint into codeg's named provider
+/// (`providers.codeg`): `base_url`, the key (or none, for a keyless local
+/// server), and the `api_mode` a raw-editor user gave it — scrubbed when the
+/// panel switched to custom from another provider. A config from before the
+/// named provider moves its inline `model.base_url` / `api_key` / `api_mode`
+/// there, and an entry switched off is switched back on. Every other key of
+/// the provider entry, and every other provider, stays as it was.
+fn write_hermes_codeg_provider(
+    root_map: &mut serde_yaml::Mapping,
+    base_url: BaseUrlWrite<'_>,
+    inline_api_key: InlineApiKeyWrite<'_>,
+) {
+    use serde_yaml::{Mapping, Value};
+    let key = |k: &str| Value::String(k.to_string());
+    // What an inline (pre-named-provider) custom config carried.
+    let mut legacy = Mapping::new();
+    if let Some(model_map) = root_map
+        .get_mut(key("model"))
+        .and_then(Value::as_mapping_mut)
+    {
+        for field in ["base_url", "api_key", "api_mode"] {
+            if let Some(value) = model_map.remove(key(field)) {
+                legacy.insert(key(field), value);
+            }
+        }
+    }
+    if !root_map
+        .get(key("providers"))
+        .map(Value::is_mapping)
+        .unwrap_or(false)
+    {
+        root_map.insert(key("providers"), Value::Mapping(Mapping::new()));
+    }
+    let providers = root_map
+        .get_mut(key("providers"))
+        .and_then(Value::as_mapping_mut)
+        .expect("providers is a mapping");
+    if !providers
+        .get(key(HERMES_CODEG_PROVIDER))
+        .map(Value::is_mapping)
+        .unwrap_or(false)
+    {
+        providers.insert(key(HERMES_CODEG_PROVIDER), Value::Mapping(Mapping::new()));
+    }
+    let entry = providers
+        .get_mut(key(HERMES_CODEG_PROVIDER))
+        .and_then(Value::as_mapping_mut)
+        .expect("providers.codeg is a mapping");
+    // Switched off while the panel configured another provider.
+    if entry.get(key("enabled")) != Some(&Value::Bool(true)) {
+        entry.shift_remove(key("enabled"));
+    }
+    for (field, value) in legacy {
+        if entry.get(&field).is_none() {
+            entry.insert(field, value);
+        }
+    }
+    match base_url {
+        BaseUrlWrite::Set(url) if !url.trim().is_empty() => {
+            entry.insert(key("base_url"), Value::String(url.trim().to_string()));
+        }
+        BaseUrlWrite::Set(_) => {
+            entry.remove(key("base_url"));
+        }
+        BaseUrlWrite::Preserve => {}
+    }
+    match inline_api_key {
+        InlineApiKeyWrite::Set {
+            key: api_key,
+            scrub_mode,
+        } => {
+            if api_key.trim().is_empty() {
+                entry.remove(key("api_key"));
+            } else {
+                entry.insert(key("api_key"), Value::String(api_key.trim().to_string()));
+            }
+            if scrub_mode {
+                entry.remove(key("api_mode"));
+            }
+        }
+        InlineApiKeyWrite::Clear => {
+            entry.remove(key("api_key"));
+            entry.remove(key("api_mode"));
+        }
+    }
+}
+
+/// What codeg writes in `providers.codeg`, and takes back once the panel
+/// configures another provider.
+const HERMES_CODEG_PROVIDER_KEYS: [&str; 4] = ["base_url", "api_key", "api_mode", "enabled"];
+
+/// Take codeg's endpoint and key back out of its named provider, and drop
+/// the entry — and the `providers` map once it is empty — when nothing else
+/// is in it. A key the user added (`models`, `extra_headers`, …) stays for
+/// the next time the panel configures `custom`, the entry switched off
+/// (`enabled: false`) meanwhile: Hermes lists a URL-less entry's `models`.
+fn remove_hermes_codeg_provider(root_map: &mut serde_yaml::Mapping) {
+    use serde_yaml::Value;
+    let providers_key = Value::String("providers".to_string());
+    let Some(providers) = root_map
+        .get_mut(&providers_key)
+        .and_then(Value::as_mapping_mut)
+    else {
+        return;
+    };
+    let codeg_key = Value::String(HERMES_CODEG_PROVIDER.to_string());
+    let Some(entry) = providers
+        .get_mut(&codeg_key)
+        .and_then(Value::as_mapping_mut)
+    else {
+        return;
+    };
+    // Shifting, not swapping, keeps the user's keys in the order they wrote.
+    for field in HERMES_CODEG_PROVIDER_KEYS {
+        entry.shift_remove(Value::String(field.to_string()));
+    }
+    if !entry.is_empty() {
+        entry.insert(Value::String("enabled".to_string()), Value::Bool(false));
+        return;
+    }
+    providers.shift_remove(&codeg_key);
+    if providers.is_empty() {
+        root_map.shift_remove(&providers_key);
+    }
 }
 
 /// Quote a single argv token for the current platform's shell, only when it
@@ -8020,21 +8754,30 @@ async fn hermes_setup_argvs() -> (Vec<String>, Vec<String>) {
         // Unreachable: Hermes is always an Npx distribution. Fall through to
         // the npx guidance with the same pinned spec so a future match-arm
         // change can't resurrect a stale recipe.
-        _ => "hermes-agent@0.21.6",
+        _ => "hermes-agent@0.23.1",
     };
-    let build = |tail: &[&str]| {
-        let mut command = vec![
-            "npx".to_string(),
-            "-y".to_string(),
-            NPM_RUN_SCRIPTS_OVERRIDE.to_string(),
-            "--package".to_string(),
-            package.to_string(),
-            "hermes".to_string(),
-        ];
-        command.extend(tail.iter().map(|arg| (*arg).to_string()));
-        command
-    };
-    (build(&["acp", "--setup"]), build(&["model"]))
+    (
+        hermes_npx_argv(package, &["acp", "--setup"]),
+        hermes_npx_argv(package, &["model"]),
+    )
+}
+
+/// `npx -y <script flags> --package <spec> hermes <tail…>`: a Hermes command
+/// for a machine where no `hermes` resolves. The wrapper's postinstall
+/// bootstrap IS the install, so the npx run gets the same script flags as an
+/// install ([`npm_run_scripts_args`]); without them a user-level
+/// `ignore-scripts=true`, or npm 12's default block on install scripts, skips
+/// the bootstrap (npx accepts npm config flags).
+fn hermes_npx_argv(package: &str, tail: &[&str]) -> Vec<String> {
+    let mut argv = vec!["npx".to_string(), "-y".to_string()];
+    argv.extend(npm_run_scripts_args(package));
+    argv.extend([
+        "--package".to_string(),
+        package.to_string(),
+        "hermes".to_string(),
+    ]);
+    argv.extend(tail.iter().map(|s| s.to_string()));
+    argv
 }
 
 /// Build the displayed/runnable `(setup, model)` shell commands for the Hermes
@@ -8084,26 +8827,55 @@ fn project_hermes_key_and_base(
     (api_key, base_url)
 }
 
+/// What config.yaml says the panel's provider, model, endpoint and inline key
+/// are.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct HermesModelProjection {
+    provider: Option<String>,
+    model: Option<String>,
+    base_url: Option<String>,
+    api_key: Option<String>,
+}
+
+fn hermes_model_projection(raw_yaml: &str) -> HermesModelProjection {
+    let Ok(value) = serde_yaml::from_str::<serde_yaml::Value>(raw_yaml) else {
+        return HermesModelProjection::default();
+    };
+    let Some(model_section) = value.get("model") else {
+        return HermesModelProjection::default();
+    };
+    let provider = yaml_str(model_section, "provider");
+    // codeg's named provider is the panel's `custom`, its endpoint and key in
+    // `providers.codeg`; a config from before keeps them inline.
+    let endpoint = if provider.as_deref() == Some(HERMES_CODEG_PROVIDER_REF) {
+        value
+            .get("providers")
+            .and_then(|p| p.get(HERMES_CODEG_PROVIDER))
+    } else {
+        Some(model_section)
+    };
+    HermesModelProjection {
+        model: yaml_str(model_section, "default"),
+        base_url: endpoint.and_then(|e| yaml_str(e, "base_url")),
+        api_key: endpoint.and_then(|e| yaml_str(e, "api_key")),
+        provider: provider.map(|p| hermes_panel_provider(&p).to_string()),
+    }
+}
+
 async fn load_hermes_local_config_json() -> Option<String> {
     let env_map = fs::read_to_string(hermes_env_path())
         .ok()
         .map(|raw| parse_env_file(&raw))
         .unwrap_or_default();
 
-    let mut provider: Option<String> = None;
-    let mut model: Option<String> = None;
-    let mut yaml_base_url: Option<String> = None;
-    let mut yaml_api_key: Option<String> = None;
-    if let Ok(raw_yaml) = fs::read_to_string(hermes_config_yaml_path()) {
-        if let Ok(value) = serde_yaml::from_str::<serde_yaml::Value>(&raw_yaml) {
-            if let Some(model_section) = value.get("model") {
-                provider = yaml_str(model_section, "provider");
-                model = yaml_str(model_section, "default");
-                yaml_base_url = yaml_str(model_section, "base_url");
-                yaml_api_key = yaml_str(model_section, "api_key");
-            }
-        }
-    }
+    let HermesModelProjection {
+        provider,
+        model,
+        base_url: yaml_base_url,
+        api_key: yaml_api_key,
+    } = fs::read_to_string(hermes_config_yaml_path())
+        .map(|raw| hermes_model_projection(&raw))
+        .unwrap_or_default();
 
     let (api_key, base_url) = match provider.as_deref() {
         Some(p) => project_hermes_key_and_base(
@@ -8662,6 +9434,219 @@ fn qoder_settings_json_path() -> PathBuf {
     crate::parsers::qoder::resolve_qoder_config_dir().join("settings.json")
 }
 
+/// The user-global instructions file the agent itself loads at session start,
+/// or `None` when it has no such file codeg can edit safely.
+///
+/// Each entry is the file the agent's shipped code reads (checked against the
+/// pinned releases), resolved with the same environment overrides as the rest
+/// of this panel. `None` on purpose:
+/// - Hermes: its only global file is `SOUL.md`, which REPLACES the persona;
+/// - Cursor: user rules are `.mdc` files with front matter, or server-side;
+/// - MiniMax Code: the data dir moves with profiles and a legacy migration;
+/// - custom agents: codeg does not know their file layout.
+pub(crate) fn agent_system_instructions_path(agent_type: AgentType) -> Option<PathBuf> {
+    match agent_type {
+        AgentType::ClaudeCode => {
+            Some(crate::parsers::claude::resolve_claude_config_dir().join("CLAUDE.md"))
+        }
+        // `AGENTS.override.md` wins while it is non-blank.
+        AgentType::Codex => Some(codex_style_instructions_file(
+            &crate::parsers::codex::resolve_codex_home_dir(),
+        )),
+        AgentType::Gemini => {
+            Some(crate::parsers::gemini::resolve_gemini_base_dir().join("GEMINI.md"))
+        }
+        // Antigravity reads every one of `~/.gemini/{AGENTS,GEMINI}.md` from a
+        // hardcoded `~/.gemini` (it ignores `GEMINI_HOME`); `AGENTS.md` keeps
+        // it apart from Gemini CLI's `GEMINI.md`.
+        AgentType::Antigravity => Some(home_dir_or_default().join(".gemini").join("AGENTS.md")),
+        AgentType::OpenCode => Some(
+            crate::acp::opencode_config::config_dir()
+                .unwrap_or_else(|| home_dir_or_default().join(".config").join("opencode"))
+                .join("AGENTS.md"),
+        ),
+        // Cline's "Global AGENTS.md" is the cross-agent `~/.agents` one.
+        AgentType::Cline => Some(home_dir_or_default().join(".agents").join("AGENTS.md")),
+        // User memory is `<config dir>/CODEBUDDY.md` (or `.mdc`, first found);
+        // an `AGENTS.md` there is only read when the workspace IS the home.
+        AgentType::CodeBuddy => Some(first_existing_file(
+            &crate::parsers::codebuddy::resolve_codebuddy_config_dir(),
+            CODEBUDDY_INSTRUCTIONS_FILES,
+        )),
+        AgentType::KimiCode => {
+            Some(crate::parsers::kimi_code::resolve_kimi_code_home_dir().join("AGENTS.md"))
+        }
+        // Pi loads the first of these that exists.
+        AgentType::Pi => Some(first_existing_file(
+            &crate::parsers::pi::resolve_pi_agent_dir(),
+            PI_INSTRUCTIONS_FILES,
+        )),
+        AgentType::Grok => Some(crate::parsers::grok::resolve_grok_home_dir().join("AGENTS.md")),
+        AgentType::DeepSeek => {
+            Some(crate::parsers::deepseek::resolve_dsh_home_dir().join("AGENTS.md"))
+        }
+        AgentType::Qoder => {
+            Some(crate::parsers::qoder::resolve_qoder_config_dir().join("AGENTS.md"))
+        }
+        // Kiro's global instructions are steering files.
+        AgentType::Kiro => Some(
+            crate::parsers::kiro::resolve_kiro_home_dir()
+                .join("steering")
+                .join("AGENTS.md"),
+        ),
+        // A Codex fork: same override precedence.
+        AgentType::Trae => Some(codex_style_instructions_file(
+            &crate::acp::trae::resolve_trae_home_dir(),
+        )),
+        AgentType::CommandCode => {
+            Some(crate::acp::command_code::command_code_home_dir().join("AGENTS.md"))
+        }
+        // ZCode follows HOME / USERPROFILE only.
+        AgentType::ZCode => Some(inherited_node_home_dir().join(".zcode").join("AGENTS.md")),
+        AgentType::Hermes | AgentType::Cursor | AgentType::MiniMaxCode | AgentType::Custom(_) => {
+            None
+        }
+    }
+}
+
+const CODEX_INSTRUCTIONS_FILES: &[&str] = &["AGENTS.override.md", "AGENTS.md"];
+const PI_INSTRUCTIONS_FILES: &[&str] = &[
+    "AGENTS.override.md",
+    "AGENTS.md",
+    "AGENTS.MD",
+    "CLAUDE.md",
+    "CLAUDE.MD",
+];
+const CODEBUDDY_INSTRUCTIONS_FILES: &[&str] = &["CODEBUDDY.md", "CODEBUDDY.mdc"];
+
+/// Every file [`agent_system_instructions_path`] may resolve to for the agent,
+/// whichever is in effect right now. A save goes to the file the panel showed
+/// (when it is one of these), not to a fresh resolution: blanking Codex's
+/// override, say, flips the resolution to `AGENTS.md`, whose content the
+/// editor never displayed.
+fn agent_system_instructions_candidates(agent_type: AgentType) -> Vec<PathBuf> {
+    let Some(resolved) = agent_system_instructions_path(agent_type) else {
+        return Vec::new();
+    };
+    let siblings: &[&str] = match agent_type {
+        AgentType::Codex | AgentType::Trae => CODEX_INSTRUCTIONS_FILES,
+        AgentType::Pi => PI_INSTRUCTIONS_FILES,
+        AgentType::CodeBuddy => CODEBUDDY_INSTRUCTIONS_FILES,
+        _ => &[],
+    };
+    let mut candidates = vec![resolved.clone()];
+    if let Some(dir) = resolved.parent() {
+        candidates.extend(siblings.iter().map(|name| dir.join(name)));
+    }
+    candidates
+}
+
+/// `<dir>/AGENTS.override.md` while it holds anything but whitespace, else
+/// `<dir>/AGENTS.md` — the file Codex (and its forks) actually loads.
+fn codex_style_instructions_file(dir: &Path) -> PathBuf {
+    let override_file = dir.join(CODEX_INSTRUCTIONS_FILES[0]);
+    match fs::read_to_string(&override_file) {
+        Ok(text) if !text.trim().is_empty() => override_file,
+        _ => dir.join(CODEX_INSTRUCTIONS_FILES[1]),
+    }
+}
+
+/// The first of `names` in `dir` that is a file, else the first name.
+fn first_existing_file(dir: &Path, names: &[&str]) -> PathBuf {
+    names
+        .iter()
+        .map(|name| dir.join(name))
+        .find(|path| path.is_file())
+        .unwrap_or_else(|| dir.join(names[0]))
+}
+
+/// The agent's global instructions file as `(path, content)` for the settings
+/// panel; the content is `None` when the file does not exist or cannot be read
+/// as UTF-8 text.
+pub(crate) fn load_agent_system_instructions(
+    agent_type: AgentType,
+) -> (Option<String>, Option<String>) {
+    let path = agent_system_instructions_path(agent_type);
+    let path_str = path.as_ref().map(|p| p.display().to_string());
+    let content = path.and_then(|p| fs::read_to_string(p).ok());
+    (path_str, content)
+}
+
+/// Write `content` as the agent's global instructions file.
+///
+/// The file belongs to the agent (and to the user, who may edit it by hand or
+/// keep it in a dotfiles checkout), so the write is careful with it:
+/// - content equal to what is on disk is not written at all, and empty content
+///   for a missing file does not create it (nor its directory);
+/// - a file that exists but cannot be read as text is refused rather than
+///   replaced, since the panel showed it empty;
+/// - the write is atomic and goes through a symlink, keeping the link and the
+///   file's permissions.
+///
+/// `shown_path` is the file the panel displayed (the `system_instructions_file_path`
+/// it was given); the write goes there, and only when it is one of the
+/// agent's own instruction files. Without it the file is resolved afresh.
+fn persist_agent_system_instructions(
+    agent_type: AgentType,
+    content: &str,
+    shown_path: Option<&str>,
+) -> Result<(), AcpError> {
+    let Some(resolved) = agent_system_instructions_path(agent_type) else {
+        return Err(AcpError::protocol(
+            "this agent has no global instructions file",
+        ));
+    };
+    let path = instructions_write_target(
+        resolved,
+        agent_system_instructions_candidates(agent_type),
+        shown_path,
+    )?;
+    write_instructions_file(&path, content)
+}
+
+/// The file a save writes: the one the panel showed when it is among the
+/// agent's `candidates`, else (nothing shown) the `resolved` one.
+fn instructions_write_target(
+    resolved: PathBuf,
+    candidates: Vec<PathBuf>,
+    shown_path: Option<&str>,
+) -> Result<PathBuf, AcpError> {
+    let Some(shown) = shown_path else {
+        return Ok(resolved);
+    };
+    candidates
+        .into_iter()
+        .find(|candidate| candidate.display().to_string() == shown)
+        .ok_or_else(|| {
+            AcpError::protocol(format!(
+                "{shown} is not this agent's instructions file (it is now {}); reopen the settings to edit it",
+                resolved.display()
+            ))
+        })
+}
+
+fn write_instructions_file(path: &Path, content: &str) -> Result<(), AcpError> {
+    let current = match fs::read_to_string(path) {
+        Ok(text) => Some(text),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => {
+            return Err(AcpError::protocol(format!(
+                "failed to read instructions file {}: {e}",
+                path.display()
+            )))
+        }
+    };
+    if current.as_deref().unwrap_or_default() == content {
+        return Ok(());
+    }
+    crate::acp::opencode_config::write_atomic(path, content).map_err(|e| {
+        AcpError::protocol(format!(
+            "failed to write instructions file {}: {e}",
+            path.display()
+        ))
+    })
+}
+
 pub(crate) fn load_agent_local_config_json(agent_type: AgentType) -> Option<String> {
     if agent_type == AgentType::Codex {
         return load_codex_local_config_json();
@@ -8671,6 +9656,9 @@ pub(crate) fn load_agent_local_config_json(agent_type: AgentType) -> Option<Stri
     }
     if agent_type == AgentType::KimiCode {
         return load_kimi_code_config_json();
+    }
+    if agent_type == AgentType::OpenCode {
+        return load_opencode_config_text();
     }
 
     let path = agent_local_config_path(agent_type)?;
@@ -8756,7 +9744,13 @@ fn persist_agent_local_config_json(
     config_patch_json: Option<&str>,
 ) -> Result<(), AcpError> {
     if agent_type == AgentType::Codex {
-        return persist_codex_local_config(config_patch_json);
+        // codex's files are written by the commit coordinator alone
+        // (`codex_catalog::commit_user_change`), which owns the keys codeg
+        // manages and writes config.toml and auth.json as one change; every
+        // Codex save returns before reaching here.
+        return Err(AcpError::protocol(
+            "codex's config is written by the commit coordinator, not merged here",
+        ));
     }
     if agent_type == AgentType::Cline {
         return persist_cline_local_config(config_patch_json);
@@ -8776,24 +9770,18 @@ fn persist_agent_local_config_json(
         return Ok(());
     };
 
+    // The panel sends OpenCode's whole file, possibly with comments: it is
+    // validated as OpenCode parses it and written as sent, never re-serialized.
+    if agent_type == AgentType::OpenCode {
+        return persist_opencode_config_text(raw_patch);
+    }
+
     let patch = serde_json::from_str::<serde_json::Value>(raw_patch)
         .map_err(|e| AcpError::protocol(format!("invalid config_json: {e}")))?;
     if !patch.is_object() {
         return Err(AcpError::protocol(
             "invalid config_json: root must be a JSON object",
         ));
-    }
-
-    if agent_type == AgentType::OpenCode {
-        let serialized = serde_json::to_string_pretty(&patch)
-            .map_err(|e| AcpError::protocol(format!("serialize config_json failed: {e}")))?;
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)
-                .map_err(|e| AcpError::protocol(format!("create config directory failed: {e}")))?;
-        }
-        fs::write(&path, format!("{serialized}\n"))
-            .map_err(|e| AcpError::protocol(format!("write local config failed: {e}")))?;
-        return Ok(());
     }
 
     let mut base = if path.exists() {
@@ -8844,23 +9832,36 @@ pub(crate) fn skill_storage_spec(agent_type: AgentType) -> Option<SkillStorageSp
             ],
             project_rel_dirs: vec![".codex/skills", ".agents/skills"],
         }),
-        AgentType::OpenCode => Some(SkillStorageSpec {
-            kind: SkillStorageKind::SkillDirectoryOnly,
-            // OpenCode is a "universal" agent for the `skills` CLI (its
-            // skillsDir is `.agents/skills`): a global `skills add` writes the
-            // real skill into the shared `~/.agents/skills` store and does NOT
-            // create a `~/.config/opencode/skills` symlink. OpenCode reads both
-            // locations, so probe both — otherwise CLI-installed skills are
-            // invisible here and in Settings → Skills.
-            global_dirs: vec![
-                home_dir_or_default()
-                    .join(".config")
-                    .join("opencode")
-                    .join("skills"),
-                home_dir_or_default().join(".agents").join("skills"),
-            ],
-            project_rel_dirs: vec![".agents/skills", ".opencode/skills"],
-        }),
+        // OpenCode 2 reads skills from `skills/` and `skill/` under its config
+        // directory — `$OPENCODE_CONFIG_DIR`, else `$XDG_CONFIG_HOME/opencode`,
+        // else `~/.config/opencode` (`acp::opencode_config`) — from the shared
+        // `~/.agents/skills`, and in a project from `.opencode/skills`,
+        // `.opencode/skill` and `.agents/skills` (`core/src/config/plugin/
+        // skill.ts`, `compatibility.ts`). A skill is an `<id>/SKILL.md` bundle
+        // or, at the top of one of those directories, a flat `<id>.md`
+        // (`skill-scan.ts`, `skill-file.ts`). New skills go to the first of
+        // each list, the layout OpenCode documents. It also reads
+        // `.claude/skills`, which codeg lists under Claude Code, and the same
+        // folders in every directory above the project; the composer's `/`
+        // menu reads all of them (`acp::opencode_skills`).
+        //
+        // `~/.agents/skills` matters beyond OpenCode: OpenCode is a
+        // "universal" agent for the `skills` CLI, whose global `skills add`
+        // writes the real skill there and links nothing into OpenCode's own
+        // directory, so without it CLI-installed skills would be invisible.
+        AgentType::OpenCode => {
+            let config_dir = crate::acp::opencode_config::config_dir()
+                .unwrap_or_else(|| home_dir_or_default().join(".config").join("opencode"));
+            Some(SkillStorageSpec {
+                kind: SkillStorageKind::SkillDirectoryOrMarkdownFile,
+                global_dirs: vec![
+                    config_dir.join("skills"),
+                    config_dir.join("skill"),
+                    home_dir_or_default().join(".agents").join("skills"),
+                ],
+                project_rel_dirs: vec![".opencode/skills", ".opencode/skill", ".agents/skills"],
+            })
+        }
         AgentType::Gemini => Some(SkillStorageSpec {
             kind: SkillStorageKind::SkillDirectoryOnly,
             global_dirs: vec![
@@ -9039,6 +10040,98 @@ pub(crate) fn skill_storage_spec(agent_type: AgentType) -> Option<SkillStorageSp
             ],
             project_rel_dirs: vec![".gemini/skills", ".agents/skills"],
         }),
+        // Kiro's default agent resources are
+        // `skill://.kiro/skills/*/SKILL.md` (workspace) and
+        // `skill://<KIRO_HOME>/skills/*/SKILL.md` (global, `~/.kiro` by
+        // default) — bundles only, and no shared `.agents/skills` store.
+        AgentType::Kiro => Some(SkillStorageSpec {
+            kind: SkillStorageKind::SkillDirectoryOnly,
+            global_dirs: vec![crate::parsers::kiro::resolve_kiro_home_dir().join("skills")],
+            project_rel_dirs: vec![".kiro/skills"],
+        }),
+        // TRAE CLI loads `<id>/SKILL.md` bundles — never a flat `<id>.md` —
+        // from `<TRAE_HOME>/skills` and the shared `~/.agents/skills` store,
+        // plus `.trae/skills` and `.agents/skills` in a trusted workspace.
+        // Verified against 0.209.1 by planting one skill in each candidate
+        // directory: exactly those four appeared in the catalog it sends the
+        // model, while `.codex/skills`, `.claude/skills` and the flat file
+        // were ignored. The TRAE-native directory leads so linking targets it
+        // without touching the shared store (the pi / Cursor ordering). Note
+        // that `~/.trae/skills` is also where the TRAE IDE keeps its skills,
+        // so the CLI — and this list — sees those too. Its bundled skills in
+        // `<TRAE_HOME>/skills/.system` are left out: the CLI owns them.
+        AgentType::Trae => Some(SkillStorageSpec {
+            kind: SkillStorageKind::SkillDirectoryOnly,
+            global_dirs: vec![
+                crate::acp::trae::resolve_trae_home_dir().join("skills"),
+                home_dir_or_default().join(".agents").join("skills"),
+            ],
+            project_rel_dirs: vec![".trae/skills", ".agents/skills"],
+        }),
+        // Command Code loads `<id>/SKILL.md` bundles — found recursively, never
+        // a flat `<id>.md` — from `~/.commandcode/skills` and the shared
+        // `~/.agents/skills` store, plus `.commandcode/skills` and
+        // `.agents/skills` in the project. Verified against 1.84.0, 1.86.3,
+        // 1.88.0, 1.88.1, 1.88.2 and 1.88.4 by planting one skill in each candidate
+        // directory: exactly those four reached the session's commands, while
+        // `.claude/skills` (project and user) and the flat file were ignored.
+        // The Command Code directory leads so linking targets it without
+        // touching the shared store (the TRAE CLI ordering); on a name clash
+        // Command Code prefers it too.
+        AgentType::CommandCode => Some(SkillStorageSpec {
+            kind: SkillStorageKind::SkillDirectoryOnly,
+            global_dirs: vec![
+                crate::acp::command_code::command_code_home_dir().join("skills"),
+                home_dir_or_default().join(".agents").join("skills"),
+            ],
+            project_rel_dirs: vec![".commandcode/skills", ".agents/skills"],
+        }),
+        // The skills a ZCode session can use are the ones the official ZCode
+        // runtime (`zcode app-server`, which the bridge spawns) loads — not the
+        // bridge's own `$name` command list. The runtime's roots are
+        // `resolveDefaultSkillRoots` in apps/zcode-cli/packages/adapters/src/
+        // skills/roots.ts (read at the 0.16.9 and 0.17.0 sources): user
+        // `<os home>/.zcode/skills` then `<os home>/.agents/skills`, and for
+        // every directory from the cwd up to the Git worktree root,
+        // `<dir>/.zcode/skills` then `<dir>/.agents/skills`, plus enabled
+        // plugin caches, which stay ZCode's. Bundles only (`<id>/SKILL.md`).
+        // [`project_skill_bases`] walks the same project folders.
+        //
+        // The OS home is what Node's `os.homedir()` answers, which on Windows
+        // is `USERPROFILE`, not the profile folder `dirs::home_dir()` asks the
+        // OS for ([`inherited_node_home_dir`]). It is never `ZCODE_HOME`: no
+        // runtime caller passes a home directory to that function, and the
+        // bridge hands `ZCODE_HOME` to the runtime only as its data root
+        // (`ZCODE_DATA_BASE_DIR`, and only when the path ends in `.zcode`),
+        // which the skill roots do not use. The bridge's command list reads
+        // `$ZCODE_HOME/skills` instead, so with `ZCODE_HOME` pointing anywhere
+        // but `~/.zcode`, a skill installed there would be offered as a
+        // command that none of the runtime's default roots contains.
+        //
+        // `.zcode/skills` leads both pairs. It is where ZCode's own settings
+        // create skills, global and project alike; the runtime prefers it over
+        // `.agents/skills` in the same folder, so with a copy in each, the one
+        // listed and edited here is the one ZCode uses; and installing there
+        // leaves the shared store, which other agents read, alone. Of the
+        // project folders, the bridge's command list reads only the cwd's
+        // `.agents/skills`, so project skills created here are not offered as
+        // commands, though the runtime loads them. Codeg runs the agent in the
+        // session cwd, which is what both the bridge and the runtime scan from.
+        AgentType::ZCode => {
+            let home = inherited_node_home_dir();
+            Some(SkillStorageSpec {
+                kind: SkillStorageKind::SkillDirectoryOnly,
+                global_dirs: vec![
+                    home.join(".zcode").join("skills"),
+                    home.join(".agents").join("skills"),
+                ],
+                project_rel_dirs: vec![".zcode/skills", ".agents/skills"],
+            })
+        }
+        // MiniMax Code's native profile roots and external skill discovery are
+        // CLI-owned; do not install into a different profile than the launch
+        // env selects.
+        AgentType::MiniMaxCode => None,
         // codeg cannot detect where an arbitrary ACP agent loads skills from,
         // so custom agents are gated on the user's own declaration: that the
         // agent reads the shared `.agents/skills` store (the cross-agent
@@ -9135,49 +10228,81 @@ pub(crate) fn scoped_skill_dirs(
                 .ok_or_else(|| {
                     AcpError::protocol("workspace_path is required for project scoped skills")
                 })?;
-            let base = project_skill_base(agent_type, workspace);
-            Ok(spec
-                .project_rel_dirs
-                .iter()
-                .map(|relative| base.join(relative))
-                .collect())
+            Ok(project_skill_dirs(agent_type, &spec, workspace))
         }
     }
 }
 
-/// The directory an agent's PROJECT-relative skill dirs hang off.
+/// Every directory an agent's PROJECT-scoped skills are read from, in the
+/// order it reads them: its `project_rel_dirs`, in their declared order, under
+/// each base [`project_skill_bases`] names, nearest base first. The first one
+/// is where a new project skill goes.
+fn project_skill_dirs(
+    agent_type: AgentType,
+    spec: &SkillStorageSpec,
+    workspace: &str,
+) -> Vec<PathBuf> {
+    project_skill_bases(agent_type, workspace)
+        .iter()
+        .flat_map(|base| {
+            spec.project_rel_dirs
+                .iter()
+                .map(move |relative| base.join(relative))
+        })
+        .collect()
+}
+
+/// The directories an agent's PROJECT-relative skill dirs hang off, nearest
+/// first.
 ///
-/// Normally the workspace itself. DeepSeek and Kimi Code are the exceptions:
-/// both walk up from the session cwd to the nearest ancestor containing `.git`
-/// before joining their project-relative skill dirs, falling back to the cwd
-/// when they reach the filesystem root — DeepSeek in `dsh-skill-filesystem`'s
-/// `findProjectRoot`, Kimi in `features/skill/catalog/skillRoots.ts`'s
-/// `projectRoots` → `findUpwardRoot(workDir, ".git", exists)`. Opening a
-/// subdirectory of a repo as the workspace would otherwise make codeg create
-/// and list `<subdir>/.dsh/skills` / `<subdir>/.kimi-code/skills` — a directory
-/// the agent never scans, so the skill would simply never load, with nothing on
-/// screen saying so.
+/// Normally just the workspace itself. DeepSeek and Kimi Code use one other
+/// directory instead: both walk up from the session cwd to the nearest ancestor
+/// containing `.git` before joining their project-relative skill dirs, falling
+/// back to the cwd when they reach the filesystem root — DeepSeek in
+/// `dsh-skill-filesystem`'s `findProjectRoot`, Kimi in
+/// `features/skill/catalog/skillRoots.ts`'s `projectRoots` →
+/// `findUpwardRoot(workDir, ".git", exists)`. Opening a subdirectory of a repo
+/// as the workspace would otherwise make codeg create and list
+/// `<subdir>/.dsh/skills` / `<subdir>/.kimi-code/skills` — a directory the agent
+/// never scans, so the skill would simply never load, with nothing on screen
+/// saying so.
 ///
 /// Kimi's half was confirmed live: `kimi acp` launched with `cwd` at
 /// `<repo>/sub` advertised the skills under `<repo>/.kimi-code/skills` and
 /// `<repo>/.agents/skills` and ignored the ones under `<repo>/sub/...`.
 ///
+/// ZCode scans every directory on that walk: `resolveProjectSkillDirectories`
+/// in its runtime's `skills/roots.ts` returns each one from the cwd up to the
+/// nearest ancestor containing `.git`, the cwd first, and the cwd alone when no
+/// ancestor has one. A skill it loads from a parent folder is then listed and
+/// edited where it is, and the copy listed for an id is the one the runtime
+/// ranks first among its project folders. It loads a skill by its declared
+/// `name`, though, and ranks user skills above project ones.
+///
 /// `.git` is matched as a plain path, file or directory: in a linked worktree
-/// (which codeg creates routinely) it is a FILE, and both upstreams' existence
-/// probes (`pathExists` / `stat`) accept that too.
-fn project_skill_base(agent_type: AgentType, workspace: &str) -> PathBuf {
+/// (which codeg creates routinely) it is a FILE, and all three upstreams'
+/// existence probes (`pathExists` / `stat`) accept that too.
+fn project_skill_bases(agent_type: AgentType, workspace: &str) -> Vec<PathBuf> {
     let workspace = PathBuf::from(workspace);
-    if !matches!(agent_type, AgentType::DeepSeek | AgentType::KimiCode) {
-        return workspace;
-    }
+    let every_level = match agent_type {
+        AgentType::DeepSeek | AgentType::KimiCode => false,
+        AgentType::ZCode => true,
+        _ => return vec![workspace],
+    };
+    let mut walked = Vec::new();
     let mut current = workspace.as_path();
     loop {
+        walked.push(current.to_path_buf());
         if current.join(".git").exists() {
-            return current.to_path_buf();
+            return if every_level {
+                walked
+            } else {
+                vec![current.to_path_buf()]
+            };
         }
         match current.parent() {
             Some(parent) if parent != current => current = parent,
-            _ => return workspace.clone(),
+            _ => return vec![workspace.clone()],
         }
     }
 }
@@ -9273,7 +10398,7 @@ fn parse_frontmatter_scalar(rest: &str) -> Option<String> {
     }
 }
 
-fn build_skill_item(
+pub(crate) fn build_skill_item(
     id: String,
     scope: AgentSkillScope,
     layout: AgentSkillLayout,
@@ -10195,8 +11320,12 @@ fn agent_env_keys(agent_type: AgentType) -> (&'static str, &'static str, &'stati
         // `llm-deepseek` adapter through the launch-environment snapshot —
         // which, when the host installs none (deepseek-acp does not), falls
         // back to `process.env`, so codeg's launch env reaches it. It resolves
-        // per request (`config.baseURL ?? env ?? https://api.deepseek.com`),
-        // NOT at load. `DEEPSEEK_ACP_PROVIDER` is a different thing entirely —
+        // per request (`config.baseURL ?? env ?? <default>`), NOT at load. The
+        // default and the protocol moved in deepseek-acp 0.10.0: through 0.9.0
+        // OpenAI Chat Completions at `https://api.deepseek.com`, since then
+        // DeepSeek's Anthropic-compatible Messages API (`<base>/v1/messages`)
+        // at `https://api.deepseek.com/anthropic`, so a bound endpoint must
+        // serve the latter. `DEEPSEEK_ACP_PROVIDER` is a different thing entirely —
         // the provider ROUTE id (`deepseek-official`), a registry key rather
         // than a URL — so it must not ride the base-url slot, or binding a
         // model provider would write an endpoint into the route selector and
@@ -10228,7 +11357,9 @@ fn agent_env_keys(agent_type: AgentType) -> (&'static str, &'static str, &'stati
         // `auth.type = "gemini-api-key"` reads (the server says so in its own
         // `auth_required` message). `AGY_ACP_DEFAULT_MODEL` is real — it is
         // the env the server's `get_default_model_id` consults before falling
-        // back to `gemini-3.7-flash-high`. There is NO endpoint override, so
+        // back to `gemini-3.8-flash-high` (for an Agent Platform session
+        // `gemini-4-argon-high` from 1.4.1, `gemini-4-carbon-medium` from
+        // 1.5.0). There is NO endpoint override, so
         // the base-url slot stays an inert `AGY_BASE_URL` placeholder for the
         // same reason `CURSOR_MODEL`/`QODER_BASE_URL` above are: it keeps the
         // generic cascade off the `OPENAI_*` keys.
@@ -10245,6 +11376,37 @@ fn agent_env_keys(agent_type: AgentType) -> (&'static str, &'static str, &'stati
         // keeps the generic cascade off the `OPENAI_*` keys. The LLM endpoint
         // travels in `providers.json` instead (`persist_cline_local_config`).
         AgentType::Cline => ("CLINE_BASE_URL", "CLINE_API_KEY", "CLINE_MODEL"),
+        // Kiro's non-interactive credential is `KIRO_API_KEY` — the one the
+        // CLI's headless mode documents, and the only sign-in a server/Docker
+        // install without a browser can use. There is no endpoint or model
+        // env: the model is chosen per session over ACP (`session/new`
+        // answers with `models`). The two placeholders keep the generic
+        // cascade off the OPENAI_* keys, like `QODER_BASE_URL` above.
+        AgentType::Kiro => ("KIRO_BASE_URL", "KIRO_API_KEY", "KIRO_MODEL"),
+        // TRAE CLI's non-interactive sign-in is its personal access token,
+        // which the handshake exchanges through the `trae-tob-pat` auth method
+        // (see `acp::trae`), and `TRAECLI_HOST` is the API base URL of an
+        // enterprise's own deployment — both straight from TRAE's docs. The
+        // model is chosen per session over ACP, so the model slot is an inert
+        // `TRAE_MODEL` placeholder that keeps the generic cascade off the
+        // OPENAI_* keys, like `KIRO_MODEL` above.
+        AgentType::Trae => (
+            crate::acp::trae::TRAE_HOST_ENV,
+            crate::acp::trae::TRAE_PAT_ENV,
+            "TRAE_MODEL",
+        ),
+        // Command Code's non-interactive sign-in is the API key it reads from
+        // `COMMAND_CODE_API_KEY` ahead of its stored login (see
+        // `acp::command_code`). It talks only to its own service — models from
+        // other providers are declared in its `providers.json`, not in env —
+        // and the model is chosen per session over ACP, so the endpoint and
+        // model slots are inert placeholders that keep the generic cascade off
+        // the OPENAI_* keys, like `KIRO_BASE_URL` / `KIRO_MODEL` above.
+        AgentType::CommandCode => (
+            "COMMAND_CODE_BASE_URL",
+            crate::acp::command_code::COMMAND_CODE_API_KEY_ENV,
+            "COMMAND_CODE_MODEL",
+        ),
         _ => ("OPENAI_BASE_URL", "OPENAI_API_KEY", "OPENAI_MODEL"),
     }
 }
@@ -10359,6 +11521,13 @@ pub(crate) fn build_runtime_env_from_setting(
     let Some(raw_config_json) = local_config_json else {
         return merged;
     };
+    // OpenCode's local config is its own `opencode.json(c)`, not codeg's
+    // runtime config: its top-level `model` is OpenCode's default model, which
+    // the generic projection below would export as `OPENAI_MODEL` into every
+    // command the agent runs.
+    if agent_type == AgentType::OpenCode {
+        return merged;
+    }
     let Ok(config) = serde_json::from_str::<AgentRuntimeConfig>(raw_config_json) else {
         return merged;
     };
@@ -10369,6 +11538,13 @@ pub(crate) fn build_runtime_env_from_setting(
             continue;
         }
         merged.insert(key, trimmed.to_string());
+    }
+
+    // MiniMax Code uses its existing native login/provider configuration.
+    // Explicit env overrides remain available, but generic provider fields
+    // must not synthesize OPENAI_* or invented MiniMax variables.
+    if agent_type == AgentType::MiniMaxCode {
+        return merged;
     }
 
     let (api_base_url_key, api_key_key, model_key) = agent_env_keys(agent_type);
@@ -10393,6 +11569,16 @@ pub(crate) fn build_runtime_env_from_setting(
     merged
 }
 
+/// Agents that keep their own provider configuration and take no codeg model
+/// provider: MiniMax Code (its own login and providers), and OpenCode, whose
+/// providers live in its config and credential store and whose `openai`
+/// integration would otherwise pick up the bound provider's key from the
+/// `OPENAI_*` env the generic binding writes. Binding one is refused, and a
+/// binding stored earlier is ignored at launch.
+fn keeps_own_providers(agent_type: AgentType) -> bool {
+    matches!(agent_type, AgentType::MiniMaxCode | AgentType::OpenCode)
+}
+
 /// Resolve model provider credentials into runtime env vars if `model_provider_id` is set.
 pub(crate) async fn apply_model_provider_env(
     agent_type: AgentType,
@@ -10400,6 +11586,9 @@ pub(crate) async fn apply_model_provider_env(
     runtime_env: &mut BTreeMap<String, String>,
     conn: &sea_orm::DatabaseConnection,
 ) {
+    if keeps_own_providers(agent_type) {
+        return;
+    }
     let provider_id = match setting.and_then(|s| s.model_provider_id) {
         Some(id) => id,
         None => return,
@@ -10414,6 +11603,42 @@ pub(crate) async fn apply_model_provider_env(
     }
     if !provider.api_key.trim().is_empty() {
         runtime_env.insert(key_key.to_string(), provider.api_key.clone());
+    }
+}
+
+/// The `/model` picker ids codeg adds to a Claude launch
+/// ([`crate::acp::claude_model_picker`]): the bound provider's, else the ones
+/// kept for the unbound panel — and only for a launch against a gateway
+/// (`ANTHROPIC_BASE_URL`), where Anthropic's own API would refuse them.
+/// Whatever the per-agent env put under the launch key is dropped first, so
+/// the stored ids are the only source.
+async fn apply_claude_model_picker_env(
+    setting: Option<&crate::db::entities::agent_setting::Model>,
+    runtime_env: &mut BTreeMap<String, String>,
+    conn: &sea_orm::DatabaseConnection,
+) {
+    use crate::acp::claude_model_picker as picker;
+    runtime_env.remove(picker::LAUNCH_KEY);
+    if runtime_env
+        .get("ANTHROPIC_BASE_URL")
+        .is_none_or(|url| url.trim().is_empty())
+    {
+        return;
+    }
+    let ids = match setting.and_then(|s| s.model_provider_id) {
+        Some(id) => match model_provider_service::get_by_id(conn, id).await {
+            Ok(Some(provider)) => picker::provider_ids(provider.model.as_deref()),
+            _ => Vec::new(),
+        },
+        None => crate::db::service::app_metadata_service::get_value(conn, picker::METADATA_KEY)
+            .await
+            .ok()
+            .flatten()
+            .map(|raw| picker::decode(&raw))
+            .unwrap_or_default(),
+    };
+    if let Some(encoded) = picker::encode(&ids) {
+        runtime_env.insert(picker::LAUNCH_KEY.to_string(), encoded);
     }
 }
 
@@ -10551,9 +11776,10 @@ fn cascade_update_agent_config(
     api_url: &str,
     api_key: &str,
     model_env: &BTreeMap<String, Option<String>>,
-    codex_model: &CodexModelAction,
-    codex_model_raw: Option<&str>,
 ) -> Result<(), AcpError> {
+    if keeps_own_providers(agent_type) {
+        return Ok(());
+    }
     let (url_key, key_key, _) = agent_env_keys(agent_type);
     match agent_type {
         AgentType::ClaudeCode | AgentType::Gemini => {
@@ -10591,144 +11817,12 @@ fn cascade_update_agent_config(
             // model-provider endpoint to cascade into.
         }
         AgentType::Codex => {
-            let auth_path = codex_auth_json_path();
-            let mut auth_obj = if auth_path.exists() {
-                fs::read_to_string(&auth_path)
-                    .ok()
-                    .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
-                    .filter(|v| v.is_object())
-                    .unwrap_or_else(|| serde_json::json!({}))
-            } else {
-                serde_json::json!({})
-            };
-            if !api_key.trim().is_empty() {
-                auth_obj[key_key] = serde_json::Value::String(api_key.to_string());
-            }
-            let auth_str = serde_json::to_string_pretty(&auth_obj)
-                .map_err(|e| AcpError::protocol(e.to_string()))?;
-
-            let config_path = codex_config_toml_path();
-            let mut toml_value = if config_path.exists() {
-                fs::read_to_string(&config_path)
-                    .ok()
-                    .and_then(|raw| raw.parse::<toml::Value>().ok())
-                    .filter(|v| v.is_table())
-                    .unwrap_or_else(|| toml::Value::Table(toml::map::Map::new()))
-            } else {
-                toml::Value::Table(toml::map::Map::new())
-            };
-            let table = toml_value
-                .as_table_mut()
-                .ok_or_else(|| AcpError::protocol("codex config root must be a TOML table"))?;
-            table.remove("api_base_url");
-
-            let provider_name = table
-                .get("model_provider")
-                .and_then(|value| value.as_str())
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .map(str::to_string)
-                .unwrap_or_else(|| "codeg".to_string());
-            table.insert(
-                "model_provider".to_string(),
-                toml::Value::String(provider_name.clone()),
-            );
-
-            let providers_item = table
-                .entry("model_providers".to_string())
-                .or_insert_with(|| toml::Value::Table(toml::map::Map::new()));
-            if !providers_item.is_table() {
-                *providers_item = toml::Value::Table(toml::map::Map::new());
-            }
-            let providers = providers_item
-                .as_table_mut()
-                .ok_or_else(|| AcpError::protocol("invalid model_providers table"))?;
-            let provider_item = providers
-                .entry(provider_name.clone())
-                .or_insert_with(|| toml::Value::Table(toml::map::Map::new()));
-            if !provider_item.is_table() {
-                *provider_item = toml::Value::Table(toml::map::Map::new());
-            }
-            let provider_table = provider_item
-                .as_table_mut()
-                .ok_or_else(|| AcpError::protocol("invalid model provider table"))?;
-            if api_url.trim().is_empty() {
-                provider_table.remove("base_url");
-            } else {
-                provider_table.insert(
-                    "base_url".to_string(),
-                    toml::Value::String(api_url.to_string()),
-                );
-            }
-            if provider_name == "codeg" {
-                provider_table.insert("name".to_string(), toml::Value::String("codeg".to_string()));
-                provider_table.insert(
-                    "wire_api".to_string(),
-                    toml::Value::String("responses".to_string()),
-                );
-                provider_table.insert(
-                    "requires_openai_auth".to_string(),
-                    toml::Value::Boolean(true),
-                );
-            }
-            match codex_model {
-                CodexModelAction::Set(model) => {
-                    table.insert("model".to_string(), toml::Value::String(model.to_string()));
-                }
-                CodexModelAction::Clear => {
-                    table.remove("model");
-                }
-                CodexModelAction::NoOp => {}
-            }
-            // Regenerate the model_catalog_json file from the provider's full
-            // structured model config and reference it (relative to CODEX_HOME).
-            // REPLACE semantics require rewriting the whole catalog every time.
-            let snapshot = crate::acp::codex_catalog_source::cached_or_bundled_snapshot();
-            match crate::acp::codex_model_catalog::write_catalog_files(
-                codex_model_raw.unwrap_or_default(),
-                &codex_home_dir(),
-                &snapshot,
-            ) {
-                Ok(Some(inj)) => {
-                    table.insert(
-                        "model_catalog_json".to_string(),
-                        toml::Value::String(inj.catalog_rel.to_string()),
-                    );
-                }
-                Ok(None) => {
-                    table.remove("model_catalog_json");
-                }
-                Err(e) => {
-                    tracing::warn!("[ModelProvider] write codex catalog failed: {e}");
-                }
-            }
-            let toml_str = toml::to_string_pretty(&toml_value)
-                .map_err(|e| AcpError::protocol(e.to_string()))?;
-
-            persist_codex_native_config_files(Some(&auth_str), Some(&toml_str))?;
+            // codex's files belong to the commit coordinator, which the
+            // caller runs with the provider's new row
+            // (`codex_catalog::commit_user_change`).
         }
         AgentType::OpenCode => {
-            let auth_path = opencode_auth_json_path();
-            let mut auth_obj = if auth_path.exists() {
-                fs::read_to_string(&auth_path)
-                    .ok()
-                    .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
-                    .filter(|v| v.is_object())
-                    .unwrap_or_else(|| serde_json::json!({}))
-            } else {
-                serde_json::json!({})
-            };
-            if !api_key.trim().is_empty() {
-                auth_obj["api_key"] = serde_json::Value::String(api_key.to_string());
-            }
-            let auth_str = serde_json::to_string_pretty(&auth_obj)
-                .map_err(|e| AcpError::protocol(e.to_string()))?;
-            persist_opencode_auth_json(&auth_str)?;
-
-            let patch = serde_json::json!({ "apiBaseUrl": api_url });
-            let patch_str =
-                serde_json::to_string(&patch).map_err(|e| AcpError::protocol(e.to_string()))?;
-            persist_agent_local_config_json(agent_type, Some(&patch_str))?;
+            // Unreachable: OpenCode keeps its own providers (`keeps_own_providers`).
         }
         AgentType::Cline => {}
         AgentType::CodeBuddy => {
@@ -10784,6 +11878,29 @@ fn cascade_update_agent_config(
             // METHOD, never a credential, so there is nothing here to
             // reconcile either.
         }
+        AgentType::Kiro => {
+            // Kiro signs in to its own service (`kiro-cli login`, or
+            // `KIRO_API_KEY` in the agent's env) and accepts no custom base
+            // URL, so it stays off the model-provider credential cascade.
+        }
+        AgentType::ZCode | AgentType::MiniMaxCode => {
+            // Authentication and providers belong to the official agent runtime.
+        }
+        AgentType::Trae => {
+            // TRAE CLI signs in to TRAE's own service (`traecli login`, or a
+            // PAT in the agent's env, which the handshake exchanges) and its
+            // models come from that account, so it stays off the
+            // model-provider credential cascade. `TRAECLI_HOST` points at an
+            // enterprise deployment of the same service, not at a model
+            // provider.
+        }
+        AgentType::CommandCode => {
+            // Command Code signs in to its own service (`command-code login`,
+            // or `COMMAND_CODE_API_KEY` in the agent's env) and its models come
+            // from that account; other providers are declared in its own
+            // `~/.commandcode/providers.json`. Nothing here maps onto a model
+            // provider's URL and key, so it stays off the cascade.
+        }
         AgentType::Custom(_) => {
             // Custom agents are deliberately configuration-free: codeg writes
             // no config file for them and they are excluded from the
@@ -10808,11 +11925,16 @@ pub(crate) async fn cascade_update_model_provider(
         .await
         .map_err(|e| AcpError::protocol(e.to_string()))?;
 
+    let mut codex_error = None;
     for setting in &dependents {
         let agent_type: AgentType = match serde_json::from_str(&setting.agent_type) {
             Ok(at) => at,
             Err(_) => continue,
         };
+
+        if keeps_own_providers(agent_type) {
+            continue;
+        }
 
         // 1. Update env_json in database (uses agent_env_keys for consistent key names)
         let (url_key, key_key, _) = agent_env_keys(agent_type);
@@ -10850,16 +11972,20 @@ pub(crate) async fn cascade_update_model_provider(
             .await
             .map_err(|e| AcpError::protocol(e.to_string()))?;
 
-        // 2. Update on-disk config files
-        let codex_action = provider_codex_model_action(agent_type, new_model);
-        if let Err(e) = cascade_update_agent_config(
-            agent_type,
-            new_api_url,
-            new_api_key,
-            &model_env,
-            &codex_action,
-            new_model,
-        ) {
+        // 2. Update on-disk config files. Codex's go through the commit
+        // coordinator, which reads the provider's new row (and fetches its
+        // list when that is the source); its failure is reported, after the
+        // other agents are done.
+        if agent_type == AgentType::Codex {
+            let change = crate::commands::codex_catalog::CodexUserChange::reapply(
+                crate::acp::codex_catalog_commit::FetchPolicy::IfNeeded,
+            );
+            if let Err(e) = crate::commands::codex_catalog::commit_user_change(db, &change).await {
+                codex_error = Some(e);
+            }
+        } else if let Err(e) =
+            cascade_update_agent_config(agent_type, new_api_url, new_api_key, &model_env)
+        {
             tracing::warn!(
                 "[ModelProvider] cascade_update_agent_config({agent_type}) failed: {e}, skipping config update"
             );
@@ -10867,33 +11993,32 @@ pub(crate) async fn cascade_update_model_provider(
 
         emit_acp_agents_updated(emitter, "env_updated", Some(agent_type));
     }
-    Ok(())
+    match codex_error {
+        Some(e) => Err(crate::commands::codex_catalog::to_acp_error(e)),
+        None => Ok(()),
+    }
 }
 
 pub async fn acp_preflight_core(
+    db: &AppDatabase,
     agent_type: AgentType,
     force_refresh: Option<bool>,
-    db: &AppDatabase,
 ) -> Result<PreflightResult, AcpError> {
     if force_refresh.unwrap_or(false) {
         preflight::clear_npm_env_cache();
     }
-
-    let setting = agent_setting_service::get_by_agent_type(&db.conn, agent_type)
-        .await
-        .map_err(|e| AcpError::protocol(e.to_string()))?;
-    let runtime_env = build_runtime_env_from_setting(agent_type, setting.as_ref(), None);
+    let runtime_env = build_agent_effective_config_env(&db.conn, agent_type).await?;
     Ok(preflight::run_preflight(agent_type, &runtime_env).await)
 }
 
 #[cfg(feature = "tauri-runtime")]
 #[cfg_attr(feature = "tauri-runtime", tauri::command)]
 pub async fn acp_preflight(
+    db: State<'_, AppDatabase>,
     agent_type: AgentType,
     force_refresh: Option<bool>,
-    db: State<'_, AppDatabase>,
 ) -> Result<PreflightResult, AcpError> {
-    acp_preflight_core(agent_type, force_refresh, &db).await
+    acp_preflight_core(&db, agent_type, force_refresh).await
 }
 
 /// Resolve the full runtime env every ACP spawn should receive — settings
@@ -10964,7 +12089,7 @@ pub(crate) async fn build_session_runtime_env(
 /// Settings may inspect Pi's local model catalog while the agent is disabled.
 /// Reuse the exact launch environment, bypassing only the connection permission
 /// gate; this path starts no ACP session and sends no prompt.
-async fn build_runtime_env_for_agent(
+pub(crate) async fn build_runtime_env_for_agent(
     db: &AppDatabase,
     agent_type: AgentType,
     _session_id: Option<&str>,
@@ -10986,6 +12111,9 @@ async fn build_runtime_env_for_agent(
 
     let mut runtime_env =
         build_agent_effective_config_env_from_setting(&db.conn, agent_type, setting.as_ref()).await;
+    if agent_type == AgentType::ClaudeCode {
+        apply_claude_model_picker_env(setting.as_ref(), &mut runtime_env, &db.conn).await;
+    }
 
     // codex resume no longer needs a `MODEL_PROVIDER` pin: codex-acp 1.0.1
     // (#224) resolves the resumed provider from `~/.codex/config.toml` via
@@ -11032,6 +12160,15 @@ pub(crate) fn fingerprint_config(
     hasher.update(b"\x01native\x01");
     if let Some(native) = load_agent_local_config_json(agent_type) {
         hasher.update(native.as_bytes());
+    }
+    // OpenCode 2 reads provider credentials from its database when a process
+    // starts, and a running `opencode acp` never sees one changed after that.
+    // codeg changes them only through its settings (see
+    // `commands::opencode_credentials`), which bumps this counter, so a
+    // session started before a change reads as restart-required.
+    if agent_type == AgentType::OpenCode {
+        hasher.update(b"\x01opencode_credentials\x01");
+        hasher.update(crate::commands::opencode_credentials::credential_epoch().to_le_bytes());
     }
     // Grok's native config (~/.grok/config.toml) is not exposed via
     // `agent_local_config_path` — it's edited through the Grok settings panel
@@ -11137,7 +12274,6 @@ pub(crate) async fn acp_update_agent_preferences_and_refresh(
     enabled: bool,
     env: BTreeMap<String, String>,
     config_json: Option<String>,
-    opencode_auth_json: Option<String>,
     codex_auth_json: Option<String>,
     codex_config_toml: Option<String>,
     db: &AppDatabase,
@@ -11150,7 +12286,6 @@ pub(crate) async fn acp_update_agent_preferences_and_refresh(
         enabled,
         env,
         config_json,
-        opencode_auth_json,
         codex_auth_json,
         codex_config_toml,
         db,
@@ -11736,14 +12871,22 @@ pub async fn acp_get_session_snapshot_by_conversation(
 /// connection by `external_id` and the frontend would mis-tag it as a locally
 /// owned connection, tearing it down (killing the real owner's agent) on tab
 /// close. Discovering it here lets the second client attach as a viewer.
+///
+/// A conversation the user moved to another folder only discovers connections
+/// launched in the folder it is in NOW: one still running in the folder it left
+/// (a client that missed the move, or a turn that was in flight) is not
+/// something to attach to — the next prompt there is refused anyway.
 pub(crate) async fn acp_find_connection_for_conversation_core(
     manager: &ConnectionManager,
+    db: &sea_orm::DatabaseConnection,
     conversation_id: i32,
     session_id: Option<&str>,
     agent_type: AgentType,
 ) -> Result<Option<crate::acp::ConversationConnectionInfo>, AcpError> {
+    let fence = manager.relocation_fence(db, conversation_id).await;
+    let dir = fence.as_ref().map(|(_, path)| path.as_str());
     let connection_id = match manager
-        .find_connection_by_conversation_id(conversation_id)
+        .find_connection_by_conversation_id_in(conversation_id, dir)
         .await
     {
         Some(id) => id,
@@ -11753,7 +12896,7 @@ pub(crate) async fn acp_find_connection_for_conversation_core(
         None => match session_id {
             Some(sid) if !sid.is_empty() => {
                 match manager
-                    .find_connection_by_external_id(sid, agent_type)
+                    .find_connection_by_external_id_in(sid, agent_type, dir)
                     .await
                 {
                     Some(id) => id,
@@ -11796,9 +12939,11 @@ pub async fn acp_find_connection_for_conversation(
     session_id: Option<String>,
     agent_type: AgentType,
     manager: State<'_, ConnectionManager>,
+    db: State<'_, AppDatabase>,
 ) -> Result<Option<crate::acp::ConversationConnectionInfo>, AcpError> {
     acp_find_connection_for_conversation_core(
         &manager,
+        &db.conn,
         conversation_id,
         session_id.as_deref(),
         agent_type,
@@ -11818,7 +12963,7 @@ pub(crate) async fn acp_get_agent_status_core(
 
     let (available, installed_version) = match &meta.distribution {
         registry::AgentDistribution::Npx { cmd, package, .. } => {
-            let resolved = resolve_npx_command(cmd).await;
+            let resolved = resolve_npx_command_for(agent_type, cmd).await;
             let mut version = resolved
                 .as_ref()
                 .and_then(|_| setting.as_ref().and_then(|m| m.installed_version.clone()));
@@ -11889,6 +13034,16 @@ pub(crate) async fn acp_get_agent_status_core(
             }
             (uvx_agent_launchable(*system_cmd), version)
         }
+        // A system agent runs on every platform its vendor ships for; whether
+        // THIS machine has it is `installed_version`, probed from the one
+        // install there can be.
+        registry::AgentDistribution::System { cmd, .. } => {
+            let version = match resolve_system_agent_binary_for(agent_type, cmd) {
+                Some(bin) => system_probed_version(agent_type, &bin, None).await,
+                None => None,
+            };
+            (true, version)
+        }
     };
 
     Ok(crate::acp::types::AcpAgentStatus {
@@ -11942,7 +13097,7 @@ pub(crate) async fn acp_list_agents_core(db: &AppDatabase) -> Result<Vec<AcpAgen
                 // Keep the list path bounded: each list request probes npm
                 // global prefix at most once, then reuses the result across
                 // all NPX agents in the loop.
-                let resolved = npx_resolver.resolve_for_list(cmd).await;
+                let resolved = npx_resolver.resolve_for_list(agent_type, cmd).await;
                 let mut version = resolved
                     .as_ref()
                     .and_then(|_| setting.and_then(|m| m.installed_version.clone()));
@@ -12008,6 +13163,14 @@ pub(crate) async fn acp_list_agents_core(db: &AppDatabase) -> Result<Vec<AcpAgen
                 }
                 (uvx_agent_launchable(*system_cmd), "uvx", version)
             }
+            // Mirror the status path.
+            registry::AgentDistribution::System { cmd, .. } => {
+                let version = match resolve_system_agent_binary_for(agent_type, cmd) {
+                    Some(bin) => system_probed_version(agent_type, &bin, None).await,
+                    None => None,
+                };
+                (true, "system", version)
+            }
         };
 
         let mut env = setting
@@ -12015,7 +13178,12 @@ pub(crate) async fn acp_list_agents_core(db: &AppDatabase) -> Result<Vec<AcpAgen
             .and_then(|s| serde_json::from_str::<BTreeMap<String, String>>(s).ok())
             .unwrap_or_default();
         let local_config_json = load_agent_local_config_json(agent_type);
-        if let Some(raw_local_config) = local_config_json.as_deref() {
+        // Not for OpenCode, whose local config is its own file (see
+        // `build_runtime_env_from_setting`).
+        if let Some(raw_local_config) = local_config_json
+            .as_deref()
+            .filter(|_| agent_type != AgentType::OpenCode)
+        {
             if let Ok(local_cfg) = serde_json::from_str::<AgentRuntimeConfig>(raw_local_config) {
                 for (key, value) in local_cfg.env {
                     let trimmed = value.trim();
@@ -12024,23 +13192,27 @@ pub(crate) async fn acp_list_agents_core(db: &AppDatabase) -> Result<Vec<AcpAgen
                     }
                     env.insert(key, trimmed.to_string());
                 }
-                let (api_base_url_key, api_key_key, model_key) = agent_env_keys(agent_type);
-                if let Some(value) = trim_non_empty(local_cfg.api_base_url) {
-                    env.insert(api_base_url_key.to_string(), value);
-                }
-                if let Some(value) = trim_non_empty(local_cfg.api_key) {
-                    env.insert(api_key_key.to_string(), value);
-                }
-                if agent_type != AgentType::ClaudeCode {
-                    if let Some(value) = trim_non_empty(local_cfg.model) {
-                        env.insert(model_key.to_string(), value);
+                if agent_type != AgentType::MiniMaxCode {
+                    let (api_base_url_key, api_key_key, model_key) = agent_env_keys(agent_type);
+                    if let Some(value) = trim_non_empty(local_cfg.api_base_url) {
+                        env.insert(api_base_url_key.to_string(), value);
+                    }
+                    if let Some(value) = trim_non_empty(local_cfg.api_key) {
+                        env.insert(api_key_key.to_string(), value);
+                    }
+                    if agent_type != AgentType::ClaudeCode {
+                        if let Some(value) = trim_non_empty(local_cfg.model) {
+                            env.insert(model_key.to_string(), value);
+                        }
                     }
                 }
             }
         }
         let sort_order = setting.map(|m| m.sort_order).unwrap_or(idx as i32);
-        // Persist detected version to DB for binary agents (npx written during install/upgrade)
-        if dist_type == "binary" {
+        // Persist detected version to DB for binary and system agents (npx
+        // written during install/upgrade). Both are probed on every list, so
+        // the probe is the authority and the row only mirrors it.
+        if dist_type == "binary" || dist_type == "system" {
             let _ = agent_setting_service::set_installed_version(
                 &db.conn,
                 agent_type,
@@ -12050,11 +13222,6 @@ pub(crate) async fn acp_list_agents_core(db: &AppDatabase) -> Result<Vec<AcpAgen
         }
         let codex_auth_json = if agent_type == AgentType::Codex {
             load_codex_auth_json_raw()
-        } else {
-            None
-        };
-        let opencode_auth_json = if agent_type == AgentType::OpenCode {
-            load_opencode_auth_json_raw()
         } else {
             None
         };
@@ -12097,6 +13264,8 @@ pub(crate) async fn acp_list_agents_core(db: &AppDatabase) -> Result<Vec<AcpAgen
         } else {
             (local_config_json, None)
         };
+        let (system_instructions_file_path, system_instructions_content) =
+            load_agent_system_instructions(agent_type);
         let grok_config_toml = if agent_type == AgentType::Grok {
             load_grok_config_toml_raw()
         } else {
@@ -12114,6 +13283,20 @@ pub(crate) async fn acp_list_agents_core(db: &AppDatabase) -> Result<Vec<AcpAgen
         // Parsed scalar settings backing the Cursor panel's structured controls
         // (approval mode / sandbox / permission rules); an absent config file
         // still yields defaults so the panel renders its editors.
+        // The `/model` picker ids kept for an unbound Claude panel; a bound
+        // provider's own are in its model JSON, which the page already has.
+        let claude_model_picker = if agent_type == AgentType::ClaudeCode {
+            crate::db::service::app_metadata_service::get_value(
+                &db.conn,
+                crate::acp::claude_model_picker::METADATA_KEY,
+            )
+            .await
+            .ok()
+            .flatten()
+            .map(|raw| crate::acp::claude_model_picker::decode(&raw))
+        } else {
+            None
+        };
         let cursor_settings = if agent_type == AgentType::Cursor {
             Some(parse_cursor_settings(
                 cursor_cli_config_json.as_deref().unwrap_or(""),
@@ -12131,6 +13314,19 @@ pub(crate) async fn acp_list_agents_core(db: &AppDatabase) -> Result<Vec<AcpAgen
             available,
             distribution_type: dist_type.to_string(),
             is_acp_adapter: registry::acp_adapter_relation(agent_type).is_some(),
+            install_url: match &meta.distribution {
+                registry::AgentDistribution::System { install_url, .. } => {
+                    Some((*install_url).to_string())
+                }
+                _ => None,
+            },
+            supports_self_update: matches!(
+                meta.distribution,
+                registry::AgentDistribution::System {
+                    update_args: Some(_),
+                    ..
+                }
+            ),
             custom_source: agent_type
                 .custom_id()
                 .and_then(crate::acp::custom_registry::source_of)
@@ -12145,7 +13341,8 @@ pub(crate) async fn acp_list_agents_core(db: &AppDatabase) -> Result<Vec<AcpAgen
             config_json,
             config_file_path: agent_local_config_path(agent_type)
                 .map(|path| path.display().to_string()),
-            opencode_auth_json,
+            system_instructions_file_path,
+            system_instructions_content,
             codex_auth_json,
             codex_config_toml,
             codex_sandbox_settings,
@@ -12156,6 +13353,7 @@ pub(crate) async fn acp_list_agents_core(db: &AppDatabase) -> Result<Vec<AcpAgen
             grok_settings,
             cursor_cli_config_json,
             cursor_settings,
+            claude_model_picker,
             model_provider_id: setting.and_then(|m| m.model_provider_id),
             icon_url: agent_type
                 .custom_id()
@@ -12224,7 +13422,6 @@ pub(crate) async fn acp_update_agent_preferences_core(
     enabled: bool,
     env: BTreeMap<String, String>,
     config_json: Option<String>,
-    opencode_auth_json: Option<String>,
     codex_auth_json: Option<String>,
     codex_config_toml: Option<String>,
     db: &AppDatabase,
@@ -12249,7 +13446,12 @@ pub(crate) async fn acp_update_agent_preferences_core(
             Some(trimmed.to_string())
         }
     });
-    if let Some(raw) = config_json.as_deref() {
+    // OpenCode's file may carry comments and trailing commas; its own branch
+    // below validates it the way OpenCode parses it.
+    if let Some(raw) = config_json
+        .as_deref()
+        .filter(|_| agent_type != AgentType::OpenCode)
+    {
         let parsed = serde_json::from_str::<serde_json::Value>(raw)
             .map_err(|e| AcpError::protocol(format!("invalid config_json: {e}")))?;
         if !parsed.is_object() {
@@ -12259,28 +13461,36 @@ pub(crate) async fn acp_update_agent_preferences_core(
         }
     }
 
-    let patch = agent_setting_service::AgentSettingsUpdate {
-        enabled,
-        env_json,
-        model_provider_id: None,
-    };
-    agent_setting_service::update(&db.conn, agent_type, patch)
+    // Preferences are not a binding: the model provider column is left alone
+    // (binding and unbinding go through `acp_update_agent_env_core`).
+    agent_setting_service::update_preferences(&db.conn, agent_type, enabled, env_json)
         .await
         .map_err(|e| AcpError::protocol(e.to_string()))?;
 
     if agent_type == AgentType::Codex {
+        // Through the coordinator like every codex write, so the keys codeg
+        // manages are recomputed rather than taken from the submitted text.
         if codex_auth_json.is_some() || codex_config_toml.is_some() {
-            persist_codex_native_config_files(
-                codex_auth_json.as_deref(),
-                codex_config_toml.as_deref(),
-            )?;
+            let change = crate::commands::codex_catalog::CodexUserChange {
+                panel_intent: None,
+                toml_base: codex_config_toml,
+                toml_baseline: None,
+                sandbox: None,
+                auth_text: codex_auth_json,
+                fetch: crate::acp::codex_catalog_commit::FetchPolicy::IfNeeded,
+            };
+            crate::commands::codex_catalog::commit_user_change(db, &change)
+                .await
+                .map_err(crate::commands::codex_catalog::to_acp_error)?;
         }
         emit_acp_agents_updated(emitter, "preferences_updated", Some(agent_type));
         return Ok(());
     }
 
     if agent_type == AgentType::OpenCode {
-        persist_opencode_native_config(opencode_auth_json.as_deref(), config_json.as_deref())?;
+        if let Some(raw) = config_json.as_deref() {
+            persist_opencode_config_text(raw)?;
+        }
         emit_acp_agents_updated(emitter, "preferences_updated", Some(agent_type));
         return Ok(());
     }
@@ -12353,7 +13563,6 @@ pub async fn acp_update_agent_preferences(
     enabled: bool,
     env: BTreeMap<String, String>,
     config_json: Option<String>,
-    opencode_auth_json: Option<String>,
     codex_auth_json: Option<String>,
     codex_config_toml: Option<String>,
     manager: State<'_, ConnectionManager>,
@@ -12371,7 +13580,6 @@ pub async fn acp_update_agent_preferences(
         enabled,
         env,
         config_json,
-        opencode_auth_json,
         codex_auth_json,
         codex_config_toml,
         &db,
@@ -12402,15 +13610,8 @@ pub(crate) async fn acp_update_agent_env_core(
 
     // If a provider is selected, the provider's model field is authoritative:
     // each relevant env key is set when the provider has a value and cleared
-    // (removed) when empty. Codex's root `model` in config.toml is handled the
-    // same way.
+    // (removed) when empty. Codex's own files follow the binding below.
     let mut merged_env = env;
-    let mut codex_action = CodexModelAction::NoOp;
-    // When a Codex provider is bound, capture its structured model list so we can
-    // regenerate the `model_catalog_json` catalog + root `model` after the DB
-    // write. `Some(_)` means "codex provider bound"; the inner option is the
-    // provider's stored model value.
-    let mut codex_bound_model: Option<Option<String>> = None;
     // When a Claude provider is bound, capture the inputs to also rewrite the
     // on-disk config.env below. Claude's model fields live in config.env, which
     // the runtime overlays OVER db env_json (see `build_runtime_env_from_setting`),
@@ -12420,6 +13621,16 @@ pub(crate) async fn acp_update_agent_env_core(
     // provider-edit cascade.
     let mut claude_local_cascade: Option<(String, String, BTreeMap<String, Option<String>>)> = None;
     if let Some(pid) = model_provider_id {
+        // MiniMax Code keeps its own login and providers, and launches with
+        // nothing but its explicit env (see `build_runtime_env_from_setting`).
+        // A bound provider's model would reach it anyway, as the OPENAI_MODEL
+        // that `parse_provider_model` falls back to. OpenCode keeps its
+        // providers in its own config and credential store.
+        if keeps_own_providers(agent_type) {
+            return Err(AcpError::protocol(format!(
+                "{agent_type} uses its own provider configuration; model provider {pid} cannot be bound to it"
+            )));
+        }
         let provider = crate::db::service::model_provider_service::get_by_id(&db.conn, pid)
             .await
             .map_err(|e| AcpError::protocol(e.to_string()))?
@@ -12454,14 +13665,9 @@ pub(crate) async fn acp_update_agent_env_core(
                 }
             }
         }
-        codex_action = provider_codex_model_action(agent_type, provider.model.as_deref());
-        // Codex's on-disk config (catalog + root model) is regenerated from the
-        // provider's structured model list by `apply_codex_catalog_and_model`
+        // Codex's files follow the binding through the commit coordinator
         // below; Gemini's analogous config.env gap is pre-existing and out of
         // scope here. Only Claude needs the local-config cascade on bind.
-        if agent_type == AgentType::Codex {
-            codex_bound_model = Some(provider.model.clone());
-        }
         if agent_type == AgentType::ClaudeCode {
             claude_local_cascade = Some((
                 provider.api_url.clone(),
@@ -12484,124 +13690,26 @@ pub(crate) async fn acp_update_agent_env_core(
     // custom model option) cannot survive a bind/rebind via any save path. `None`
     // entries become JSON-null and are removed by `merge_json_values`.
     if let Some((api_url, api_key, model_env)) = claude_local_cascade {
-        if let Err(e) = cascade_update_agent_config(
-            agent_type,
-            &api_url,
-            &api_key,
-            &model_env,
-            &CodexModelAction::NoOp,
-            None,
-        ) {
+        if let Err(e) = cascade_update_agent_config(agent_type, &api_url, &api_key, &model_env) {
             eprintln!(
                 "[acp_update_agent_env] cascade_update_agent_config({agent_type}) failed: {e}"
             );
         }
     }
 
-    if let Some(model_raw) = codex_bound_model {
-        // Codex provider bound: regenerate the catalog + config.toml keys from
-        // the provider's full model list (REPLACE semantics require the whole
-        // list every time).
-        if let Err(e) = apply_codex_catalog_and_model(model_raw.as_deref()) {
-            tracing::error!("[acp_update_agent_env] apply_codex_catalog_and_model failed: {e}");
-        }
-    } else if let Err(e) = apply_codex_root_model_action(&codex_action) {
-        tracing::error!("[acp_update_agent_env] apply_codex_root_model_action failed: {e}");
+    // Codex bound to a provider: its endpoint, key and model list reach
+    // codex's files, the list fetched from the provider when it is the
+    // source. Unbinding leaves them to the panel save that follows.
+    if agent_type == AgentType::Codex && model_provider_id.is_some() {
+        let change = crate::commands::codex_catalog::CodexUserChange::reapply(
+            crate::acp::codex_catalog_commit::FetchPolicy::IfNeeded,
+        );
+        crate::commands::codex_catalog::commit_user_change(db, &change)
+            .await
+            .map_err(crate::commands::codex_catalog::to_acp_error)?;
     }
 
     emit_acp_agents_updated(emitter, "env_updated", Some(agent_type));
-    Ok(())
-}
-
-/// Apply a `CodexModelAction` to the `model` field at the root of
-/// `~/.codex/config.toml`, preserving everything else.
-fn apply_codex_root_model_action(action: &CodexModelAction) -> Result<(), AcpError> {
-    if matches!(action, CodexModelAction::NoOp) {
-        return Ok(());
-    }
-    let config_path = codex_config_toml_path();
-    let mut toml_value = if config_path.exists() {
-        fs::read_to_string(&config_path)
-            .ok()
-            .and_then(|raw| raw.parse::<toml::Value>().ok())
-            .filter(|v| v.is_table())
-            .unwrap_or_else(|| toml::Value::Table(toml::map::Map::new()))
-    } else {
-        toml::Value::Table(toml::map::Map::new())
-    };
-    let table = toml_value
-        .as_table_mut()
-        .ok_or_else(|| AcpError::protocol("codex config root must be a TOML table"))?;
-    match action {
-        CodexModelAction::Set(model) => {
-            table.insert("model".to_string(), toml::Value::String(model.clone()));
-        }
-        CodexModelAction::Clear => {
-            table.remove("model");
-        }
-        CodexModelAction::NoOp => unreachable!(),
-    }
-    let toml_str =
-        toml::to_string_pretty(&toml_value).map_err(|e| AcpError::protocol(e.to_string()))?;
-    persist_codex_native_config_files(None, Some(&toml_str))?;
-    Ok(())
-}
-
-/// Codex: generate the `model_catalog_json` catalog file from a structured
-/// model list and point `~/.codex/config.toml` at it (relative to `CODEX_HOME`),
-/// plus set the root `model` to the default slug. An empty/blank list removes
-/// both keys and the generated files (codex falls back to its default catalog).
-///
-/// This reflows config.toml through the `toml` crate — the same behavior the
-/// provider bind / cascade paths already have. The comment-preserving agent
-/// panel path instead patches the config.toml text on the frontend and only
-/// asks the backend to (re)write the catalog *files* (see
-/// `acp_update_agent_config_core`).
-fn apply_codex_catalog_and_model(raw: Option<&str>) -> Result<(), AcpError> {
-    let snapshot = crate::acp::codex_catalog_source::cached_or_bundled_snapshot();
-    let injection = crate::acp::codex_model_catalog::write_catalog_files(
-        raw.unwrap_or_default(),
-        &codex_home_dir(),
-        &snapshot,
-    )
-    .map_err(|e| AcpError::protocol(e.to_string()))?;
-
-    let config_path = codex_config_toml_path();
-    let mut toml_value = if config_path.exists() {
-        fs::read_to_string(&config_path)
-            .ok()
-            .and_then(|raw| raw.parse::<toml::Value>().ok())
-            .filter(|v| v.is_table())
-            .unwrap_or_else(|| toml::Value::Table(toml::map::Map::new()))
-    } else {
-        toml::Value::Table(toml::map::Map::new())
-    };
-    let table = toml_value
-        .as_table_mut()
-        .ok_or_else(|| AcpError::protocol("codex config root must be a TOML table"))?;
-    match &injection {
-        Some(inj) => {
-            table.insert(
-                "model_catalog_json".to_string(),
-                toml::Value::String(inj.catalog_rel.to_string()),
-            );
-            match &inj.default_model {
-                Some(model) => {
-                    table.insert("model".to_string(), toml::Value::String(model.clone()));
-                }
-                None => {
-                    table.remove("model");
-                }
-            }
-        }
-        None => {
-            table.remove("model_catalog_json");
-            table.remove("model");
-        }
-    }
-    let toml_str =
-        toml::to_string_pretty(&toml_value).map_err(|e| AcpError::protocol(e.to_string()))?;
-    persist_codex_native_config_files(None, Some(&toml_str))?;
     Ok(())
 }
 
@@ -12635,51 +13743,22 @@ pub async fn acp_update_agent_env(
     .await
 }
 
-/// Decide what to write to OpenCode's `auth.json`. `None` (caller passed no
-/// auth payload) leaves the file untouched. An explicitly empty payload becomes
-/// `{}` so clearing the last credential truncates the file instead of being
-/// skipped — otherwise a stale key would survive on disk and the disconnected
-/// provider would reappear after reload.
-fn opencode_auth_payload_to_write(raw: Option<&str>) -> Option<String> {
-    let trimmed = raw?.trim();
-    Some(if trimmed.is_empty() {
-        "{}".to_string()
-    } else {
-        trimmed.to_string()
-    })
-}
-
-/// Persist OpenCode's native files (`auth.json` + `opencode.json`) for a
-/// config/preferences save. Shared by both the config and preferences commands
-/// so the empty-auth handling can't drift between the two exposed paths. An
-/// explicitly empty auth payload truncates `auth.json` to `{}`; `None` leaves
-/// each file untouched.
-fn persist_opencode_native_config(
-    opencode_auth_json: Option<&str>,
-    config_json: Option<&str>,
-) -> Result<(), AcpError> {
-    if let Some(auth) = opencode_auth_payload_to_write(opencode_auth_json) {
-        persist_opencode_auth_json(&auth)?;
-    }
-    if let Some(raw) = config_json {
-        persist_agent_local_config_json(AgentType::OpenCode, Some(raw))?;
-    }
-    Ok(())
-}
-
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn acp_update_agent_config_core(
     agent_type: AgentType,
     config_json: Option<String>,
-    opencode_auth_json: Option<String>,
+    system_instructions_content: Option<String>,
+    system_instructions_file_path: Option<String>,
     codex_auth_json: Option<String>,
     codex_config_toml: Option<String>,
+    codex_config_toml_baseline: Option<String>,
     codex_model_catalog: Option<String>,
     codex_sandbox: Option<CodexSandboxStructuredConfig>,
     grok_config_toml: Option<String>,
     grok_structured: Option<GrokStructuredConfig>,
     cursor_cli_config_json: Option<String>,
     cursor_structured: Option<crate::acp::types::CursorStructuredConfig>,
+    db: &AppDatabase,
     emitter: &EventEmitter,
 ) -> Result<(), AcpError> {
     let config_json = config_json.and_then(|raw| {
@@ -12690,7 +13769,12 @@ pub(crate) async fn acp_update_agent_config_core(
             Some(trimmed.to_string())
         }
     });
-    if let Some(raw) = config_json.as_deref() {
+    // OpenCode's file may carry comments and trailing commas; its own branch
+    // below validates it the way OpenCode parses it.
+    if let Some(raw) = config_json
+        .as_deref()
+        .filter(|_| agent_type != AgentType::OpenCode)
+    {
         let parsed = serde_json::from_str::<serde_json::Value>(raw)
             .map_err(|e| AcpError::protocol(format!("invalid config_json: {e}")))?;
         if !parsed.is_object() {
@@ -12700,48 +13784,55 @@ pub(crate) async fn acp_update_agent_config_core(
         }
     }
 
-    if agent_type == AgentType::Codex {
-        // Mirrors the Grok/Cursor flow. The advanced raw editor sends the whole
-        // file (`codex_config_toml = Some(text)`), so that text is the verbatim
-        // base; the sandbox/approval controls send only a patch, merged onto the
-        // CURRENT on-disk config (read fresh, failing loudly on a real read
-        // error) so a stale in-memory snapshot can't drop keys written by codex
-        // itself or another window since the panel opened.
-        if codex_auth_json.is_some() || codex_config_toml.is_some() || codex_sandbox.is_some() {
-            let merged_toml = match &codex_sandbox {
-                Some(sandbox) => {
-                    let base = match codex_config_toml {
-                        Some(text) => text,
-                        None => read_codex_config_or_empty()?,
-                    };
-                    Some(apply_codex_sandbox_config(&base, sandbox)?)
-                }
-                None => codex_config_toml,
-            };
-            persist_codex_native_config_files(codex_auth_json.as_deref(), merged_toml.as_deref())?;
+    if let Some(instructions) = system_instructions_content.as_deref() {
+        persist_agent_system_instructions(
+            agent_type,
+            instructions,
+            system_instructions_file_path.as_deref(),
+        )?;
+        // The instructions panel saves on its own: nothing else was sent, so
+        // no native config file may be touched — the generic tail below would
+        // re-serialize the agent's settings file (and reset it to `{}` when it
+        // does not parse).
+        if config_json.is_none()
+            && codex_auth_json.is_none()
+            && codex_config_toml.is_none()
+            && codex_model_catalog.is_none()
+            && codex_sandbox.is_none()
+            && grok_config_toml.is_none()
+            && grok_structured.is_none()
+            && cursor_cli_config_json.is_none()
+            && cursor_structured.is_none()
+        {
+            emit_acp_agents_updated(emitter, "config_updated", Some(agent_type));
+            return Ok(());
         }
-        // The frontend has already patched config.toml's `model_catalog_json` +
-        // root `model` into `codex_config_toml` (comment-preserving text patch);
-        // the backend only (re)writes the generated catalog *files* here.
-        if let Some(raw) = codex_model_catalog.as_deref() {
-            let snapshot = crate::acp::codex_catalog_source::cached_or_bundled_snapshot();
-            match crate::acp::codex_model_catalog::write_catalog_files(
-                raw,
-                &codex_home_dir(),
-                &snapshot,
-            ) {
-                // Catalog files gone (nothing deviates from codex's own list any
-                // more) — the reference must go with them, or codex fails to
-                // start on a `model_catalog_json` pointing at a missing file.
-                // The frontend only patches that key when the user *edits* the
-                // model editor, so a save that merely lets a stale removal
-                // dissolve would otherwise leave the two out of sync.
-                Ok(None) => drop_codex_catalog_reference()?,
-                Ok(Some(_)) => {}
-                Err(e) => {
-                    tracing::error!("[acp_update_agent_config] write codex catalog failed: {e}")
-                }
-            }
+    }
+
+    if agent_type == AgentType::Codex {
+        // Every write to codex's files goes through the commit coordinator,
+        // which owns the keys codeg manages (`model_catalog_json`, and root
+        // `model` while it publishes a catalog) and, with a provider bound,
+        // the endpoint and key. The advanced raw editor sends the whole file,
+        // checked against the text it was loaded from (`…_baseline`) so a
+        // hand edit of a managed key is refused rather than lost; the sandbox
+        // / approval controls send only a patch, applied to the file on disk.
+        if codex_auth_json.is_some()
+            || codex_config_toml.is_some()
+            || codex_sandbox.is_some()
+            || codex_model_catalog.is_some()
+        {
+            let change = crate::commands::codex_catalog::CodexUserChange {
+                panel_intent: codex_model_catalog,
+                toml_base: codex_config_toml,
+                toml_baseline: codex_config_toml_baseline,
+                sandbox: codex_sandbox,
+                auth_text: codex_auth_json,
+                fetch: crate::acp::codex_catalog_commit::FetchPolicy::IfNeeded,
+            };
+            crate::commands::codex_catalog::commit_user_change(db, &change)
+                .await
+                .map_err(crate::commands::codex_catalog::to_acp_error)?;
         }
         emit_acp_agents_updated(emitter, "config_updated", Some(agent_type));
         return Ok(());
@@ -12809,7 +13900,9 @@ pub(crate) async fn acp_update_agent_config_core(
     }
 
     if agent_type == AgentType::OpenCode {
-        persist_opencode_native_config(opencode_auth_json.as_deref(), config_json.as_deref())?;
+        if let Some(raw) = config_json.as_deref() {
+            persist_opencode_config_text(raw)?;
+        }
         emit_acp_agents_updated(emitter, "config_updated", Some(agent_type));
         return Ok(());
     }
@@ -12842,9 +13935,11 @@ pub(crate) async fn acp_update_agent_config_core(
 pub(crate) async fn acp_update_agent_config_and_refresh(
     agent_type: AgentType,
     config_json: Option<String>,
-    opencode_auth_json: Option<String>,
+    system_instructions_content: Option<String>,
+    system_instructions_file_path: Option<String>,
     codex_auth_json: Option<String>,
     codex_config_toml: Option<String>,
+    codex_config_toml_baseline: Option<String>,
     codex_model_catalog: Option<String>,
     codex_sandbox: Option<CodexSandboxStructuredConfig>,
     grok_config_toml: Option<String>,
@@ -12859,15 +13954,18 @@ pub(crate) async fn acp_update_agent_config_and_refresh(
     acp_update_agent_config_core(
         agent_type,
         config_json,
-        opencode_auth_json,
+        system_instructions_content,
+        system_instructions_file_path,
         codex_auth_json,
         codex_config_toml,
+        codex_config_toml_baseline,
         codex_model_catalog,
         codex_sandbox,
         grok_config_toml,
         grok_structured,
         cursor_cli_config_json,
         cursor_structured,
+        db,
         emitter,
     )
     .await?;
@@ -12887,9 +13985,11 @@ pub(crate) async fn acp_update_agent_config_and_refresh(
 pub async fn acp_update_agent_config(
     agent_type: AgentType,
     config_json: Option<String>,
-    opencode_auth_json: Option<String>,
+    system_instructions_content: Option<String>,
+    system_instructions_file_path: Option<String>,
     codex_auth_json: Option<String>,
     codex_config_toml: Option<String>,
+    codex_config_toml_baseline: Option<String>,
     codex_model_catalog: Option<String>,
     codex_sandbox: Option<CodexSandboxStructuredConfig>,
     grok_config_toml: Option<String>,
@@ -12909,9 +14009,11 @@ pub async fn acp_update_agent_config(
     acp_update_agent_config_and_refresh(
         agent_type,
         config_json,
-        opencode_auth_json,
+        system_instructions_content,
+        system_instructions_file_path,
         codex_auth_json,
         codex_config_toml,
+        codex_config_toml_baseline,
         codex_model_catalog,
         codex_sandbox,
         grok_config_toml,
@@ -12947,6 +14049,24 @@ pub async fn acp_update_hermes_config(
         },
         &emitter,
     )
+}
+
+/// Keep the `/model` picker ids of an unbound Claude agent. Desktop command;
+/// the web handler calls `acp_update_claude_model_picker_core` directly.
+#[cfg(feature = "tauri-runtime")]
+#[cfg_attr(feature = "tauri-runtime", tauri::command)]
+pub async fn acp_update_claude_model_picker(
+    models: Vec<String>,
+    manager: State<'_, ConnectionManager>,
+    db: State<'_, AppDatabase>,
+    app: tauri::AppHandle,
+) -> Result<usize, AcpError> {
+    let app_data_dir = app
+        .path()
+        .app_data_dir()
+        .map(|p| crate::paths::resolve_effective_data_dir(&p))
+        .unwrap_or_else(|_| std::path::PathBuf::from("."));
+    acp_update_claude_model_picker_core(models, &db, &manager, &app_data_dir).await
 }
 
 #[cfg(feature = "tauri-runtime")]
@@ -13002,18 +14122,6 @@ pub async fn acp_update_kimi_code_config(
     .await
 }
 
-/// List the models an API key + endpoint can access (validates the key and
-/// populates the Kimi settings model picker). Desktop command; the web handler
-/// calls `acp_fetch_kimi_models_core` directly.
-#[cfg(feature = "tauri-runtime")]
-#[cfg_attr(feature = "tauri-runtime", tauri::command)]
-pub async fn acp_fetch_kimi_models(
-    base_url: String,
-    api_key: String,
-) -> Result<Vec<String>, AcpError> {
-    acp_fetch_kimi_models_core(&base_url, &api_key).await
-}
-
 /// Apply a structured Pi config update, writing pi's native `settings.json`
 /// (provider/model/thinking level) and `auth.json` (when an API key is given).
 /// Desktop command; the web handler calls `acp_update_pi_config_core` directly.
@@ -13028,6 +14136,7 @@ pub async fn acp_update_pi_config(
     custom_base_url: Option<String>,
     custom_api: Option<String>,
     model_reasoning: Option<PiModelReasoningSpec>,
+    custom_models: Option<Vec<String>>,
     db: State<'_, AppDatabase>,
     app: tauri::AppHandle,
 ) -> Result<(), AcpError> {
@@ -13041,6 +14150,7 @@ pub async fn acp_update_pi_config(
             custom_base_url,
             custom_api,
             model_reasoning,
+            custom_models,
         },
         &db,
         &emitter,
@@ -13250,10 +14360,10 @@ fn open_external_terminal_impl(command: &str, cwd: Option<&str>) -> Result<(), A
         ];
         for (term, args) in candidates {
             if resolve_command_on_path(term).is_some() {
-                return Command::new(term)
-                    .args(args)
-                    .arg(&keep_open)
-                    .current_dir(&dir)
+                let mut terminal = Command::new(term);
+                terminal.args(args).arg(&keep_open).current_dir(&dir);
+                crate::appimage_env::restore(&mut terminal);
+                return terminal
                     .spawn()
                     .map(|_| ())
                     .map_err(|e| AcpError::protocol(format!("open {term} failed: {e}")));
@@ -13401,6 +14511,9 @@ pub(crate) async fn acp_download_agent_binary_core(
         registry::AgentDistribution::Uvx { .. } => Err(AcpError::protocol(
             "download is only supported for binary agents",
         )),
+        registry::AgentDistribution::System { install_url, .. } => {
+            Err(system_agent_is_user_managed(meta.name, install_url))
+        }
     };
 
     match &result {
@@ -13434,6 +14547,178 @@ pub async fn acp_download_agent_binary(
 ) -> Result<(), AcpError> {
     let emitter = EventEmitter::Tauri(app);
     acp_download_agent_binary_core(agent_type, version, task_id, &emitter).await
+}
+
+/// Upper bound on a vendor updater run. Generous — it downloads a full build
+/// (Kiro's are 150–360 MB) — but bounded, so a wedged updater cannot hold the
+/// Settings page's package lock forever.
+const SYSTEM_UPDATE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15 * 60);
+
+/// Run `program args…`, streaming every stdout/stderr line as an install-log
+/// event. Returns whether it exited successfully, plus its stderr for the error
+/// message. Killed (and reported as a failure) past `timeout`.
+async fn run_streaming_command(
+    program: &std::path::Path,
+    args: &[&str],
+    task_id: &str,
+    emitter: &EventEmitter,
+    timeout: std::time::Duration,
+) -> Result<(bool, String), AcpError> {
+    use tokio::io::BufReader;
+
+    let mut cmd = crate::process::tokio_command(program);
+    cmd.args(args)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true);
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| AcpError::protocol(format!("failed to spawn {}: {e}", program.display())))?;
+
+    let pump = |reader: Option<Box<dyn tokio::io::AsyncRead + Unpin + Send>>| {
+        let emitter = emitter.clone();
+        let task_id = task_id.to_string();
+        tokio::spawn(async move {
+            match reader {
+                Some(reader) => {
+                    crate::process::collect_lines_lossy(BufReader::new(reader), |line| {
+                        emit_agent_install_event(
+                            &emitter,
+                            &task_id,
+                            AgentInstallEventKind::Log,
+                            line,
+                        );
+                    })
+                    .await
+                }
+                None => String::new(),
+            }
+        })
+    };
+    let stdout = pump(child.stdout.take().map(|s| Box::new(s) as _));
+    let stderr = pump(child.stderr.take().map(|s| Box::new(s) as _));
+
+    let run = async {
+        let (_, stderr) = tokio::join!(stdout, stderr);
+        let status = child.wait().await;
+        (status, stderr.unwrap_or_default())
+    };
+    match tokio::time::timeout(timeout, run).await {
+        Ok((Ok(status), stderr)) => Ok((status.success(), stderr)),
+        Ok((Err(e), _)) => Err(AcpError::protocol(format!(
+            "failed to wait for {}: {e}",
+            program.display()
+        ))),
+        Err(_) => Err(AcpError::protocol(format!(
+            "{} did not finish within {} minutes",
+            program.display(),
+            timeout.as_secs() / 60
+        ))),
+    }
+}
+
+/// Upgrade a [`registry::AgentDistribution::System`] agent in place through
+/// the vendor's own updater (`update_args` — `kiro-cli update
+/// --non-interactive` for Kiro), streaming its output on the shared
+/// agent-install topic like every other install action. The install stays the
+/// user's own: the same copy their terminal runs is the one updated, and codeg
+/// still launches whatever `<cmd>` resolves to afterwards.
+///
+/// An updater that finds nothing newer also succeeds; the re-probed version is
+/// what tells the caller whether anything changed. Sessions already running
+/// keep the build they started with until they reconnect.
+pub(crate) async fn acp_update_system_agent_core(
+    agent_type: AgentType,
+    task_id: String,
+    db: &AppDatabase,
+    emitter: &EventEmitter,
+) -> Result<Option<String>, AcpError> {
+    emit_agent_install_event(emitter, &task_id, AgentInstallEventKind::Started, "");
+    let meta = registry::get_agent_meta(agent_type);
+
+    let result: Result<Option<String>, AcpError> = async {
+        let registry::AgentDistribution::System {
+            cmd,
+            update_args,
+            install_url,
+            ..
+        } = meta.distribution
+        else {
+            return Err(AcpError::protocol(format!(
+                "{} is not updated through its own CLI",
+                meta.name
+            )));
+        };
+        let Some(update_args) = update_args else {
+            return Err(system_agent_is_user_managed(meta.name, install_url));
+        };
+        // INVARIANT: "is not installed" is the stable substring the frontend
+        // matches to surface its install prompt (see `verify_agent_installed`).
+        let bin = resolve_system_agent_binary_for(agent_type, cmd).ok_or_else(|| {
+            AcpError::SdkNotInstalled(format!(
+                "{} is not installed. Please install it in Agent Settings.",
+                meta.name
+            ))
+        })?;
+        emit_agent_install_event(
+            emitter,
+            &task_id,
+            AgentInstallEventKind::Log,
+            format!("$ {} {}", bin.display(), update_args.join(" ")),
+        );
+        let (success, stderr) =
+            run_streaming_command(&bin, update_args, &task_id, emitter, SYSTEM_UPDATE_TIMEOUT)
+                .await?;
+        if !success {
+            let detail = stderr.trim();
+            return Err(AcpError::protocol(if detail.is_empty() {
+                format!("{} update failed", meta.name)
+            } else {
+                format!("{} update failed: {detail}", meta.name)
+            }));
+        }
+        // The probe cache is keyed by the binary's mtime, so an update that
+        // replaced it is re-probed rather than served the old answer.
+        let version = system_probed_version(agent_type, &bin, None).await;
+        agent_setting_service::set_installed_version(&db.conn, agent_type, version.clone())
+            .await
+            .map_err(|e| AcpError::protocol(e.to_string()))?;
+        emit_acp_agents_updated(emitter, "system_agent_updated", Some(agent_type));
+        Ok(version)
+    }
+    .await;
+
+    match &result {
+        Ok(version) => emit_agent_install_event(
+            emitter,
+            &task_id,
+            AgentInstallEventKind::Completed,
+            match version {
+                Some(v) => format!("{} {v}", meta.name),
+                None => meta.name.to_string(),
+            },
+        ),
+        Err(e) => emit_agent_install_event(
+            emitter,
+            &task_id,
+            AgentInstallEventKind::Failed,
+            e.to_string(),
+        ),
+    }
+    result
+}
+
+#[cfg(feature = "tauri-runtime")]
+#[cfg_attr(feature = "tauri-runtime", tauri::command)]
+pub async fn acp_update_system_agent(
+    agent_type: AgentType,
+    task_id: String,
+    db: State<'_, AppDatabase>,
+    app: tauri::AppHandle,
+) -> Result<Option<String>, AcpError> {
+    let emitter = EventEmitter::Tauri(app);
+    acp_update_system_agent_core(agent_type, task_id, &db, &emitter).await
 }
 
 /// Provision ONLY the uv toolchain (uvx) into codeg's cache — independent of
@@ -13520,25 +14805,49 @@ pub(crate) async fn acp_detect_agent_local_version_core(
         // wake `useAcpAgents()` so the composer stops claiming it's missing.
         if previous.as_deref() != Some(version.as_str()) {
             emit_acp_agents_updated(emitter, "local_version_detected", Some(agent_type));
+            // codex-acp changed outside codeg: the codex it drives may have
+            // too, and the provider may answer that version with another list.
+            if agent_type == AgentType::Codex && previous.is_some() {
+                crate::acp::codex_runtime::invalidate();
+                crate::acp::codex_catalog_refresh::kick(
+                    crate::acp::codex_catalog_refresh::Kick::AdapterChanged,
+                );
+            }
         }
         return Ok(Some(version));
     }
 
-    // Binary agents detect their version purely from the on-disk cache, so a
-    // `None` here means the binary is genuinely absent (cleared cache, or a
-    // failed custom/upgrade install). Return `None` authoritatively rather than
-    // falling back to the DB, which would resurrect a removed version as a
-    // phantom that can no longer be launched. The returned value does NOT depend
-    // on the mirror write below, so a swallowed write cannot reintroduce the
-    // phantom. (NPX detection runs `npm list`, which can fail transiently, so
-    // for npx we keep the DB value as a best-effort fallback.)
-    if matches!(
-        registry::get_agent_meta(agent_type).distribution,
-        registry::AgentDistribution::Binary { .. } | registry::AgentDistribution::Bundled { .. }
-    ) {
+    // Nothing detected. When that means the agent is not installed, return
+    // `None` authoritatively rather than falling back to the DB, which would
+    // resurrect a removed version as a phantom that can no longer be launched.
+    // The returned value does NOT depend on the mirror write below, so a
+    // swallowed write cannot reintroduce the phantom.
+    let not_installed = match registry::get_agent_meta(agent_type).distribution {
+        // Binary agents detect their version purely from the on-disk cache, so
+        // a `None` means the binary is genuinely absent (cleared cache, or a
+        // failed custom/upgrade install). A system agent is the same case: its
+        // one install either resolves or does not exist.
+        registry::AgentDistribution::Binary { .. }
+        | registry::AgentDistribution::System { .. }
+        | registry::AgentDistribution::Bundled { .. } => true,
+        // An npx agent whose command does not resolve cannot be launched: it is
+        // the very check `verify_agent_installed` refuses a connect on. The
+        // package was removed outside codeg, or the npm global prefix moved (a
+        // switch to another Node version, an npm `prefix` change) and left the
+        // install behind. Only a command that still resolves keeps the stored
+        // version as a best-effort fallback, since then it is `npm list` and
+        // `--version` that failed to read the version, which can be transient.
+        // `detect_local_version` already resolved the command once; with no
+        // stored version there is nothing to clear, so skip resolving again.
+        registry::AgentDistribution::Npx { cmd, .. } => {
+            previous.is_some() && !is_cmd_available(agent_type, cmd).await
+        }
+        registry::AgentDistribution::Uvx { .. } => false,
+    };
+    if not_installed {
         let _ = agent_setting_service::set_installed_version(conn, agent_type, None).await;
-        // Mirror the heal in the clearing direction: a binary that vanished from
-        // disk must flip the composer back to "not installed".
+        // Mirror the heal in the clearing direction: an agent that can no
+        // longer be launched must flip the composer back to "not installed".
         if previous.is_some() {
             emit_acp_agents_updated(emitter, "local_version_cleared", Some(agent_type));
         }
@@ -13576,6 +14885,36 @@ pub async fn acp_fetch_agent_latest_release(
     agent_type: AgentType,
 ) -> Result<Option<latest_release::AgentLatestRelease>, AcpError> {
     acp_fetch_agent_latest_release_core(agent_type).await
+}
+
+/// After codeg installed or upgraded codex-acp: a new codex-acp can drive a
+/// codex with another official model list, and a provider may answer its
+/// version with another list, so what codeg published must follow. Never
+/// fails the install: a refresh that fails is logged, and the scheduler
+/// tries again.
+async fn refresh_codex_catalog_after_install(
+    emitter: &EventEmitter,
+    task_id: &str,
+    refresh: impl std::future::Future<
+        Output = Result<
+            crate::acp::codex_catalog_refresh::RefreshReport,
+            crate::acp::codex_catalog_commit::CatalogError,
+        >,
+    >,
+) {
+    emit_agent_install_event(
+        emitter,
+        task_id,
+        AgentInstallEventKind::Log,
+        "Refreshing the Codex model catalog...",
+    );
+    match refresh.await {
+        Ok(report) => tracing::info!(
+            "[acp] codex model catalog after install: {:?}",
+            report.outcome
+        ),
+        Err(e) => tracing::warn!("[acp] codex model catalog refresh failed: {e}"),
+    }
 }
 
 pub(crate) async fn acp_prepare_npx_agent_core(
@@ -13697,15 +15036,24 @@ pub(crate) async fn acp_prepare_npx_agent_core(
                     }
                 };
 
-            if npm_package_requires_scripts(&install_spec) {
+            // For a bootstrap-wrapper package (hermes-agent), npm metadata
+            // existing does NOT mean the agent can run: a skipped or broken
+            // postinstall leaves a shim that exits "runtime is not ready".
+            // Verify the binary a launch would resolve actually answers
+            // `--version` BEFORE recording success — the same resolution
+            // order connect uses, so an official-installer CLI (on PATH or in
+            // `~/.local/bin`) legitimately satisfies the check. Without this,
+            // a broken install is recorded as installed and only fails at
+            // connect time with an opaque error.
+            if npm_package_bootstraps_runtime(&install_spec) {
                 emit_agent_install_event(
                     emitter,
                     &task_id,
                     AgentInstallEventKind::Log,
                     format!("Verifying the {} runtime...", meta.name),
                 );
-                let runtime_ok = match resolve_npx_command(cmd).await {
-                    Some(binary) => system_probed_version(agent_type, &binary, None)
+                let runtime_ok = match resolve_npx_command_for(agent_type, cmd).await {
+                    Some(bin) => system_probed_version(agent_type, &bin, None)
                         .await
                         .is_some(),
                     None => false,
@@ -13747,16 +15095,13 @@ pub(crate) async fn acp_prepare_npx_agent_core(
             .await
             .map_err(|e| AcpError::protocol(e.to_string()))?;
 
-            // A new codex-acp can drive a codex with a different official
-            // model list; codeg's generated catalog must follow it.
             if agent_type == AgentType::Codex {
-                emit_agent_install_event(
+                refresh_codex_catalog_after_install(
                     emitter,
                     &task_id,
-                    AgentInstallEventKind::Log,
-                    "Refreshing the Codex model catalog...",
-                );
-                resync_codex_generated_catalog().await;
+                    crate::acp::codex_catalog_refresh::after_install(),
+                )
+                .await;
             }
             emit_acp_agents_updated(emitter, "npx_prepared", Some(agent_type));
             Ok(resolved)
@@ -13767,6 +15112,9 @@ pub(crate) async fn acp_prepare_npx_agent_core(
         registry::AgentDistribution::Bundled { .. } => Err(AcpError::protocol(
             "bundled agents are updated with DrawCode",
         )),
+        registry::AgentDistribution::System { install_url, .. } => {
+            Err(system_agent_is_user_managed(meta.name, install_url))
+        }
         registry::AgentDistribution::Uvx {
             package,
             cmd,
@@ -13895,6 +15243,13 @@ pub(crate) async fn acp_uninstall_agent_core(
             }
             registry::AgentDistribution::Uvx { .. } => {
                 binary_cache::clear_uvx_agent_prepared(agent_type)?;
+            }
+            // Removing the user's own install is their installer's job; codeg
+            // owns nothing on disk for this agent. Refusing (rather than
+            // "succeeding" at nothing) also keeps the DB version below intact,
+            // so the agent does not flip to "not installed" while it still is.
+            registry::AgentDistribution::System { install_url, .. } => {
+                return Err(system_agent_is_user_managed(meta.name, install_url));
             }
         }
 
@@ -14093,14 +15448,13 @@ pub async fn acp_list_agent_skills(
 
     if let Some(workspace) = workspace_path.as_deref().map(str::trim) {
         if !workspace.is_empty() {
-            // Same base the WRITE path resolves through `scoped_skill_dirs` —
-            // for DeepSeek and Kimi Code that is the repo root, not the
-            // workspace. Joining onto the workspace here instead would make a
-            // skill saved from a nested workspace vanish from the list that is
-            // meant to show it.
-            let base = project_skill_base(agent_type, workspace);
-            for relative in &spec.project_rel_dirs {
-                let project_dir = base.join(relative);
+            // The same directories, in the same order, that the WRITE path
+            // resolves through `scoped_skill_dirs` — for DeepSeek and Kimi Code
+            // under the repo root, not the workspace, and for ZCode under every
+            // folder up to it. Listing the workspace's own dirs instead would
+            // make a skill saved from a nested workspace vanish from the list
+            // that is meant to show it.
+            for project_dir in project_skill_dirs(agent_type, &spec, workspace) {
                 locations.push(AgentSkillLocation {
                     scope: AgentSkillScope::Project,
                     path: project_dir.to_string_lossy().to_string(),
@@ -14134,6 +15488,38 @@ pub async fn acp_list_agent_skills(
         locations,
         skills,
     })
+}
+
+/// The skills an agent's sessions can load, for the composer menus. OpenCode
+/// loads skills from more folders than the Skills settings page manages for it
+/// (`acp::opencode_skills`), so its menu reads them all, with the environment
+/// OpenCode is launched with; every other agent's menu lists what
+/// [`acp_list_agent_skills`] does.
+pub(crate) async fn acp_list_agent_runtime_skills_core(
+    agent_type: AgentType,
+    workspace_path: Option<String>,
+    db: &AppDatabase,
+) -> Result<AgentSkillsListResult, AcpError> {
+    if agent_type != AgentType::OpenCode {
+        return acp_list_agent_skills(agent_type, workspace_path).await;
+    }
+    let env = agent_setting_service::load_agent_env(&db.conn, agent_type).await;
+    let workspace = workspace_path
+        .as_deref()
+        .map(str::trim)
+        .filter(|path| !path.is_empty())
+        .map(Path::new);
+    Ok(crate::acp::opencode_skills::SkillSources::for_env(&env).listing(workspace))
+}
+
+#[cfg(feature = "tauri-runtime")]
+#[cfg_attr(feature = "tauri-runtime", tauri::command)]
+pub async fn acp_list_agent_runtime_skills(
+    agent_type: AgentType,
+    workspace_path: Option<String>,
+    db: State<'_, AppDatabase>,
+) -> Result<AgentSkillsListResult, AcpError> {
+    acp_list_agent_runtime_skills_core(agent_type, workspace_path, &db).await
 }
 
 #[cfg_attr(feature = "tauri-runtime", tauri::command)]
@@ -14259,12 +15645,15 @@ pub async fn acp_delete_agent_skill(
     Ok(())
 }
 
-pub(crate) async fn opencode_list_plugins_core() -> Result<PluginCheckSummary, AcpError> {
-    opencode_plugins::check_opencode_plugins(None).map_err(AcpError::Protocol)
+/// The plugins OpenCode's global config declares (`plugins`, plus 1.x
+/// `plugin` entries). OpenCode 2 installs package plugins itself when a
+/// session starts, so this lists declarations; it checks no cache.
+pub(crate) async fn opencode_list_plugins_core() -> Result<PluginList, AcpError> {
+    opencode_plugins::list_plugins().map_err(AcpError::Protocol)
 }
 
 #[cfg_attr(feature = "tauri-runtime", tauri::command)]
-pub async fn opencode_list_plugins() -> Result<PluginCheckSummary, AcpError> {
+pub async fn opencode_list_plugins() -> Result<PluginList, AcpError> {
     opencode_list_plugins_core().await
 }
 
@@ -14305,38 +15694,25 @@ pub async fn codex_bundled_catalog(
     Ok(codex_bundled_catalog_core(force_refresh.unwrap_or(false)).await)
 }
 
-pub(crate) async fn opencode_install_plugins_core(
-    names: Option<Vec<String>>,
-    task_id: String,
-    emitter: &EventEmitter,
-) -> Result<(), AcpError> {
-    opencode_plugins::install_missing_plugins(names, task_id, emitter)
-        .await
-        .map_err(AcpError::Protocol)
-}
-
-#[cfg(feature = "tauri-runtime")]
-#[cfg_attr(feature = "tauri-runtime", tauri::command)]
-pub async fn opencode_install_plugins(
-    names: Option<Vec<String>>,
-    task_id: String,
-    app: tauri::AppHandle,
-) -> Result<(), AcpError> {
-    let emitter = EventEmitter::Tauri(app);
-    opencode_install_plugins_core(names, task_id, &emitter).await
-}
-
-pub(crate) async fn opencode_uninstall_plugin_core(
-    name: String,
-) -> Result<PluginCheckSummary, AcpError> {
-    opencode_plugins::uninstall_plugin(name)
-        .await
-        .map_err(AcpError::Protocol)
+/// Declare `spec` in OpenCode's `plugins`; OpenCode installs a package plugin
+/// the next time a session starts.
+pub(crate) async fn opencode_add_plugin_core(spec: String) -> Result<PluginList, AcpError> {
+    opencode_plugins::add_plugin(&spec).map_err(AcpError::Protocol)
 }
 
 #[cfg_attr(feature = "tauri-runtime", tauri::command)]
-pub async fn opencode_uninstall_plugin(name: String) -> Result<PluginCheckSummary, AcpError> {
-    opencode_uninstall_plugin_core(name).await
+pub async fn opencode_add_plugin(spec: String) -> Result<PluginList, AcpError> {
+    opencode_add_plugin_core(spec).await
+}
+
+/// Remove every declaration of `spec` from OpenCode's plugin lists.
+pub(crate) async fn opencode_remove_plugin_core(spec: String) -> Result<PluginList, AcpError> {
+    opencode_plugins::remove_plugin(&spec).map_err(AcpError::Protocol)
+}
+
+#[cfg_attr(feature = "tauri-runtime", tauri::command)]
+pub async fn opencode_remove_plugin(spec: String) -> Result<PluginList, AcpError> {
+    opencode_remove_plugin_core(spec).await
 }
 
 // ─── Codex Device Code OAuth ───
@@ -14557,6 +15933,602 @@ pub(crate) async fn codex_poll_device_code_core(
 }
 
 #[cfg(test)]
+mod opencode_skills_tests {
+    use super::*;
+
+    fn write_skill(root: &Path, id: &str, body: &str) {
+        fs::create_dir_all(root.join(id)).unwrap();
+        fs::write(root.join(id).join("SKILL.md"), body).unwrap();
+    }
+
+    /// OpenCode 2 reads skills under its own config directory — which follows
+    /// `OPENCODE_CONFIG_DIR`, then `XDG_CONFIG_HOME` — from both `skills/` and
+    /// `skill/`, besides the shared `~/.agents/skills`; in a project from
+    /// `.opencode/skills`, `.opencode/skill` and `.agents/skills`.
+    #[test]
+    fn opencode_skill_roots_follow_its_config_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (xdg, own) = (tmp.path().join("xdg"), tmp.path().join("own"));
+        let shared = home_dir_or_default().join(".agents").join("skills");
+        temp_env::with_vars(
+            [
+                ("OPENCODE_CONFIG_DIR", None::<&Path>),
+                ("XDG_CONFIG_HOME", Some(xdg.as_path())),
+            ],
+            || {
+                let spec = skill_storage_spec(AgentType::OpenCode).expect("OpenCode has a store");
+                assert_eq!(spec.kind, SkillStorageKind::SkillDirectoryOrMarkdownFile);
+                assert_eq!(
+                    spec.global_dirs,
+                    vec![
+                        xdg.join("opencode").join("skills"),
+                        xdg.join("opencode").join("skill"),
+                        shared.clone(),
+                    ]
+                );
+                assert_eq!(
+                    spec.project_rel_dirs,
+                    vec![".opencode/skills", ".opencode/skill", ".agents/skills"]
+                );
+            },
+        );
+        temp_env::with_vars(
+            [
+                ("OPENCODE_CONFIG_DIR", Some(own.as_path())),
+                ("XDG_CONFIG_HOME", Some(xdg.as_path())),
+            ],
+            || {
+                let spec = skill_storage_spec(AgentType::OpenCode).expect("OpenCode has a store");
+                assert_eq!(
+                    spec.global_dirs,
+                    vec![own.join("skills"), own.join("skill"), shared.clone()]
+                );
+            },
+        );
+    }
+
+    /// Project skills: bundles and flat `<id>.md` files from every directory
+    /// OpenCode reads, and new skills as bundles in `.opencode/skills`.
+    #[tokio::test]
+    async fn opencode_project_skills_take_bundles_and_flat_files_from_each_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let workspace = tmp.path().join("repo");
+        let config = tmp.path().join("config");
+        temp_env::async_with_vars([("OPENCODE_CONFIG_DIR", Some(config.as_path()))], async {
+            write_skill(&workspace.join(".opencode/skills"), "bundle", "a bundle");
+            fs::create_dir_all(workspace.join(".opencode/skill")).unwrap();
+            fs::write(workspace.join(".opencode/skill/flat.md"), "a flat file").unwrap();
+            write_skill(&workspace.join(".agents/skills"), "shared", "shared");
+            let ws = workspace.to_string_lossy().into_owned();
+
+            let dirs = scoped_skill_dirs(AgentType::OpenCode, AgentSkillScope::Project, Some(&ws))
+                .unwrap();
+            assert_eq!(
+                dirs,
+                vec![
+                    workspace.join(".opencode/skills"),
+                    workspace.join(".opencode/skill"),
+                    workspace.join(".agents/skills"),
+                ]
+            );
+            let kind = SkillStorageKind::SkillDirectoryOrMarkdownFile;
+            let mut found: Vec<(String, AgentSkillLayout)> = dirs
+                .iter()
+                .flat_map(|dir| list_skills_from_dir(AgentSkillScope::Project, dir, kind).unwrap())
+                .map(|skill| (skill.id, skill.layout))
+                .collect();
+            found.sort_by(|a, b| a.0.cmp(&b.0));
+            assert_eq!(
+                found,
+                vec![
+                    ("bundle".to_string(), AgentSkillLayout::SkillDirectory),
+                    ("flat".to_string(), AgentSkillLayout::MarkdownFile),
+                    ("shared".to_string(), AgentSkillLayout::SkillDirectory),
+                ]
+            );
+
+            let saved = acp_save_agent_skill(
+                AgentType::OpenCode,
+                AgentSkillScope::Project,
+                "new-skill".into(),
+                "---\nname: new-skill\ndescription: Test\n---\nbody".into(),
+                Some(ws.clone()),
+                Some(AgentSkillLayout::SkillDirectory),
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                Path::new(&saved.path),
+                workspace.join(".opencode/skills/new-skill")
+            );
+            assert!(workspace
+                .join(".opencode/skills/new-skill/SKILL.md")
+                .is_file());
+
+            // A flat skill is found where it lives and edited in place.
+            let edited = acp_save_agent_skill(
+                AgentType::OpenCode,
+                AgentSkillScope::Project,
+                "flat".into(),
+                "edited".into(),
+                Some(ws),
+                None,
+            )
+            .await
+            .unwrap();
+            assert_eq!(edited.layout, AgentSkillLayout::MarkdownFile);
+            assert_eq!(
+                fs::read_to_string(workspace.join(".opencode/skill/flat.md")).unwrap(),
+                "edited"
+            );
+            assert!(
+                !config.exists(),
+                "project skills never touch the config dir"
+            );
+        })
+        .await;
+    }
+}
+
+#[cfg(test)]
+mod zcode_skills_tests {
+    use super::*;
+
+    fn write_skill(root: &Path, id: &str, body: &str) {
+        fs::create_dir_all(root.join(id)).unwrap();
+        fs::write(root.join(id).join("SKILL.md"), body).unwrap();
+    }
+
+    /// The ZCode runtime reads user skills from the home Node's `os.homedir()`
+    /// names, `HOME` or on Windows `USERPROFILE`, and ignores `ZCODE_HOME`, so
+    /// the managed stores follow that variable and not `ZCODE_HOME`. On
+    /// Windows this also proves `USERPROFILE` wins over the profile folder
+    /// `dirs::home_dir()` would have named.
+    #[test]
+    fn zcode_skill_roots_hang_off_the_os_home_not_zcode_home() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (home, relocated) = (tmp.path().join("home"), tmp.path().join("relocated"));
+        temp_env::with_vars(
+            [
+                (CHILD_HOME_KEY, Some(&home)),
+                ("ZCODE_HOME", Some(&relocated)),
+            ],
+            || {
+                let spec = skill_storage_spec(AgentType::ZCode).expect("ZCode declares a store");
+                assert_eq!(spec.kind, SkillStorageKind::SkillDirectoryOnly);
+                assert_eq!(
+                    spec.global_dirs,
+                    vec![
+                        home.join(".zcode").join("skills"),
+                        home.join(".agents").join("skills"),
+                    ]
+                );
+                assert_eq!(
+                    spec.project_rel_dirs,
+                    vec![".zcode/skills", ".agents/skills"]
+                );
+            },
+        );
+    }
+
+    /// Node falls back to the account's home only when the variable is unset;
+    /// an empty one is treated the same, since it names no folder to manage.
+    #[test]
+    fn zcode_home_is_the_home_variable_or_the_account_home() {
+        let account = account_home_dir().unwrap_or_else(home_dir_or_default);
+        assert_eq!(node_home_from(None), account);
+        assert_eq!(node_home_from(Some("".into())), account);
+        let pinned = std::env::temp_dir().join("codeg-zcode-home");
+        assert_eq!(node_home_from(Some(pinned.clone().into())), pinned);
+    }
+
+    #[tokio::test]
+    async fn zcode_skills_manage_directory_bundles_in_native_then_shared_order() {
+        let tmp = tempfile::tempdir().unwrap();
+        let native = tmp.path().join(".zcode");
+        let relocated = tmp.path().join("relocated");
+        temp_env::async_with_vars(
+            [
+                (CHILD_HOME_KEY, Some(tmp.path())),
+                ("ZCODE_HOME", Some(relocated.as_path())),
+            ],
+            async {
+                let shared = tmp.path().join(".agents/skills");
+                let native_skills = native.join("skills");
+                write_skill(&native_skills, "duplicate", "native");
+                write_skill(&shared, "duplicate", "shared");
+                write_skill(&shared, "shared-only", "shared only");
+                write_skill(&relocated.join("skills"), "relocated-only", "menu only");
+                fs::write(native_skills.join("flat.md"), "not a directory bundle").unwrap();
+                fs::create_dir_all(native.join("cli")).unwrap();
+                let config = r#"{"skills":{"disabled":{"enable":false}},"other":"preserve"}"#;
+                fs::write(native.join("cli/config.json"), config).unwrap();
+                let plugin = native.join("cli/plugins/cache/market/plugin/1.0.0/skills");
+                write_skill(&plugin, "plugin-owned", "plugin bytes");
+
+                let listed = acp_list_agent_skills(AgentType::ZCode, None).await.unwrap();
+                assert!(listed.supported);
+                assert_eq!(listed.locations[0].path, native_skills.to_string_lossy());
+                let mut ids: Vec<_> = listed.skills.iter().map(|s| s.id.as_str()).collect();
+                ids.sort_unstable();
+                assert_eq!(
+                    ids,
+                    vec!["duplicate", "shared-only"],
+                    "flat files, plugin caches and $ZCODE_HOME/skills stay out"
+                );
+                let duplicate = listed.skills.iter().find(|s| s.id == "duplicate").unwrap();
+                assert_eq!(Path::new(&duplicate.path), native_skills.join("duplicate"));
+
+                let saved = acp_save_agent_skill(
+                    AgentType::ZCode,
+                    AgentSkillScope::Global,
+                    "new-skill".into(),
+                    "---\nname: new-skill\ndescription: Test\n---\nbody".into(),
+                    None,
+                    Some(AgentSkillLayout::MarkdownFile),
+                )
+                .await
+                .unwrap();
+                assert_eq!(saved.layout, AgentSkillLayout::SkillDirectory);
+                assert_eq!(Path::new(&saved.path), native_skills.join("new-skill"));
+                assert!(native_skills.join("new-skill/SKILL.md").is_file());
+                assert!(
+                    !shared.join("new-skill").exists(),
+                    "installs use the native store"
+                );
+                assert!(
+                    !relocated.join("skills/new-skill").exists(),
+                    "installs never follow ZCODE_HOME"
+                );
+                let read = acp_read_agent_skill(
+                    AgentType::ZCode,
+                    AgentSkillScope::Global,
+                    "new-skill".into(),
+                    None,
+                )
+                .await
+                .unwrap();
+                assert!(read.content.ends_with("body"));
+                acp_save_agent_skill(
+                    AgentType::ZCode,
+                    AgentSkillScope::Global,
+                    "new-skill".into(),
+                    "edited".into(),
+                    None,
+                    None,
+                )
+                .await
+                .unwrap();
+                assert_eq!(
+                    fs::read_to_string(native_skills.join("new-skill/SKILL.md")).unwrap(),
+                    "edited"
+                );
+                acp_delete_agent_skill(
+                    AgentType::ZCode,
+                    AgentSkillScope::Global,
+                    "new-skill".into(),
+                    None,
+                )
+                .await
+                .unwrap();
+                assert!(!native_skills.join("new-skill").exists());
+                assert_eq!(
+                    fs::read_to_string(shared.join("duplicate/SKILL.md")).unwrap(),
+                    "shared"
+                );
+                assert_eq!(
+                    fs::read_to_string(native.join("cli/config.json")).unwrap(),
+                    config
+                );
+                assert_eq!(
+                    fs::read_to_string(plugin.join("plugin-owned/SKILL.md")).unwrap(),
+                    "plugin bytes"
+                );
+            },
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn zcode_native_skill_crud_does_not_rewrite_cli_policy() {
+        let tmp = tempfile::tempdir().unwrap();
+        let native = tmp.path().join(".zcode");
+        fs::create_dir_all(native.join("cli")).unwrap();
+        let config = r#"{"skills":{"keep-disabled":{"enable":false}}}"#;
+        fs::write(native.join("cli/config.json"), config).unwrap();
+        temp_env::async_with_vars([(CHILD_HOME_KEY, Some(tmp.path()))], async {
+            let id = "codeg-zcode-crud-fixture";
+            // An existing bundle is saved in place, whatever layout is asked for.
+            write_skill(&native.join("skills"), id, "before");
+            let skill = acp_save_agent_skill(
+                AgentType::ZCode,
+                AgentSkillScope::Global,
+                id.into(),
+                "body".into(),
+                None,
+                Some(AgentSkillLayout::MarkdownFile),
+            )
+            .await
+            .unwrap();
+            assert_eq!(skill.layout, AgentSkillLayout::SkillDirectory);
+            assert_eq!(Path::new(&skill.path), native.join("skills").join(id));
+            let listed = acp_list_agent_skills(AgentType::ZCode, None).await.unwrap();
+            assert!(listed.skills.iter().any(|s| s.id == id));
+            let content =
+                acp_read_agent_skill(AgentType::ZCode, AgentSkillScope::Global, id.into(), None)
+                    .await
+                    .unwrap();
+            assert_eq!(content.content, "body");
+            acp_save_agent_skill(
+                AgentType::ZCode,
+                AgentSkillScope::Global,
+                id.into(),
+                "edited".into(),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                fs::read_to_string(native.join("skills").join(id).join("SKILL.md")).unwrap(),
+                "edited"
+            );
+            acp_delete_agent_skill(AgentType::ZCode, AgentSkillScope::Global, id.into(), None)
+                .await
+                .unwrap();
+            assert!(!native.join("skills").join(id).exists());
+            assert_eq!(
+                fs::read_to_string(native.join("cli/config.json")).unwrap(),
+                config
+            );
+        })
+        .await;
+    }
+
+    /// Project skills are created in the session cwd's `.zcode/skills`, never
+    /// at the Git root. A skill only in `.agents/skills` is edited where it is,
+    /// and with a copy in each folder the `.zcode` one, which the runtime
+    /// loads, is the one listed and edited.
+    #[tokio::test]
+    async fn zcode_project_skills_live_in_the_session_cwd_with_the_runtimes_precedence() {
+        let tmp = tempfile::tempdir().unwrap();
+        let workspace = tmp.path().join("repo/nested");
+        let native = workspace.join(".zcode/skills");
+        let shared = workspace.join(".agents/skills");
+        fs::create_dir_all(&workspace).unwrap();
+        fs::create_dir_all(tmp.path().join("repo/.git")).unwrap();
+        write_skill(&shared, "shared-only", "shared");
+        write_skill(&native, "both", "native copy");
+        write_skill(&shared, "both", "shared copy");
+        temp_env::async_with_vars([(CHILD_HOME_KEY, Some(tmp.path().join("home")))], async {
+            let workspace_arg = Some(workspace.to_string_lossy().into_owned());
+            let save = |id: &'static str, body: &'static str| {
+                acp_save_agent_skill(
+                    AgentType::ZCode,
+                    AgentSkillScope::Project,
+                    id.into(),
+                    body.into(),
+                    workspace_arg.clone(),
+                    None,
+                )
+            };
+            let saved = save("project-test", "project").await.unwrap();
+            assert_eq!(Path::new(&saved.path), native.join("project-test"));
+            assert!(!tmp.path().join("repo/.zcode/skills/project-test").exists());
+            assert!(!shared.join("project-test").exists());
+
+            let listed = acp_list_agent_skills(AgentType::ZCode, workspace_arg.clone())
+                .await
+                .unwrap();
+            let project_path = |id: &str| {
+                listed
+                    .skills
+                    .iter()
+                    .find(|s| s.scope == AgentSkillScope::Project && s.id == id)
+                    .map(|s| PathBuf::from(&s.path))
+            };
+            assert_eq!(
+                project_path("project-test"),
+                Some(native.join("project-test"))
+            );
+            assert_eq!(
+                project_path("shared-only"),
+                Some(shared.join("shared-only"))
+            );
+            assert_eq!(project_path("both"), Some(native.join("both")));
+
+            save("shared-only", "edited shared").await.unwrap();
+            assert_eq!(
+                fs::read_to_string(shared.join("shared-only/SKILL.md")).unwrap(),
+                "edited shared"
+            );
+            assert!(!native.join("shared-only").exists());
+            save("both", "edited native").await.unwrap();
+            assert_eq!(
+                fs::read_to_string(native.join("both/SKILL.md")).unwrap(),
+                "edited native"
+            );
+            assert_eq!(
+                fs::read_to_string(shared.join("both/SKILL.md")).unwrap(),
+                "shared copy"
+            );
+
+            assert!(acp_save_agent_skill(
+                AgentType::ZCode,
+                AgentSkillScope::Project,
+                "bad".into(),
+                "body".into(),
+                None,
+                None,
+            )
+            .await
+            .is_err());
+            assert!(acp_save_agent_skill(
+                AgentType::ZCode,
+                AgentSkillScope::Global,
+                "../escape".into(),
+                "body".into(),
+                None,
+                None,
+            )
+            .await
+            .is_err());
+            acp_delete_agent_skill(
+                AgentType::ZCode,
+                AgentSkillScope::Project,
+                "project-test".into(),
+                workspace_arg,
+            )
+            .await
+            .unwrap();
+            assert!(!native.join("project-test").exists());
+        })
+        .await;
+    }
+
+    /// The runtime scans `.zcode/skills` then `.agents/skills` in every folder
+    /// from the cwd up to the nearest `.git`, nearest first, and in the cwd
+    /// alone without one. A parent folder's skill is listed and edited where
+    /// it is, an id lists its nearest copy, and new skills still go to the cwd.
+    #[tokio::test]
+    async fn zcode_project_skills_reach_every_folder_up_to_the_git_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        let pkg = repo.join("pkg");
+        let workspace = pkg.join("app");
+        fs::create_dir_all(&workspace).unwrap();
+        // A linked worktree's `.git` is a file, which the runtime's `stat`
+        // accepts too.
+        fs::write(repo.join(".git"), "gitdir: /elsewhere\n").unwrap();
+        write_skill(&tmp.path().join(".zcode/skills"), "above-root", "outside");
+        write_skill(&repo.join(".agents/skills"), "root-shared", "root");
+        write_skill(&repo.join(".zcode/skills"), "near", "root copy");
+        write_skill(&pkg.join(".zcode/skills"), "level", "pkg native");
+        write_skill(&pkg.join(".agents/skills"), "level", "pkg shared");
+        write_skill(&pkg.join(".agents/skills"), "near", "pkg copy");
+        write_skill(&workspace.join(".agents/skills"), "near", "cwd copy");
+        temp_env::async_with_vars([(CHILD_HOME_KEY, Some(tmp.path().join("home")))], async {
+            let workspace_arg = Some(workspace.to_string_lossy().into_owned());
+            let expected: Vec<PathBuf> = [&workspace, &pkg, &repo]
+                .iter()
+                .flat_map(|base| [base.join(".zcode/skills"), base.join(".agents/skills")])
+                .collect();
+            let dirs = scoped_skill_dirs(
+                AgentType::ZCode,
+                AgentSkillScope::Project,
+                workspace_arg.as_deref(),
+            )
+            .unwrap();
+            assert_eq!(dirs, expected);
+
+            let listed = acp_list_agent_skills(AgentType::ZCode, workspace_arg.clone())
+                .await
+                .unwrap();
+            let locations: Vec<PathBuf> = listed
+                .locations
+                .iter()
+                .filter(|l| l.scope == AgentSkillScope::Project)
+                .map(|l| PathBuf::from(&l.path))
+                .collect();
+            assert_eq!(locations, expected);
+            let project: BTreeMap<&str, PathBuf> = listed
+                .skills
+                .iter()
+                .filter(|s| s.scope == AgentSkillScope::Project)
+                .map(|s| (s.id.as_str(), PathBuf::from(&s.path)))
+                .collect();
+            assert_eq!(
+                project,
+                BTreeMap::from([
+                    ("level", pkg.join(".zcode/skills/level")),
+                    ("near", workspace.join(".agents/skills/near")),
+                    ("root-shared", repo.join(".agents/skills/root-shared")),
+                ]),
+                "nearest folder first, `.zcode` before `.agents`, nothing above the repo"
+            );
+
+            let save = |id: &'static str, body: &'static str| {
+                acp_save_agent_skill(
+                    AgentType::ZCode,
+                    AgentSkillScope::Project,
+                    id.into(),
+                    body.into(),
+                    workspace_arg.clone(),
+                    None,
+                )
+            };
+            save("root-shared", "edited").await.unwrap();
+            assert_eq!(
+                fs::read_to_string(repo.join(".agents/skills/root-shared/SKILL.md")).unwrap(),
+                "edited"
+            );
+            assert!(!workspace.join(".zcode/skills/root-shared").exists());
+            let created = save("fresh", "new").await.unwrap();
+            assert_eq!(
+                Path::new(&created.path),
+                workspace.join(".zcode/skills/fresh")
+            );
+
+            // Deleting the copy in use uncovers the next one, as in the runtime.
+            acp_delete_agent_skill(
+                AgentType::ZCode,
+                AgentSkillScope::Project,
+                "level".into(),
+                workspace_arg.clone(),
+            )
+            .await
+            .unwrap();
+            assert!(!pkg.join(".zcode/skills/level").exists());
+            let read = acp_read_agent_skill(
+                AgentType::ZCode,
+                AgentSkillScope::Project,
+                "level".into(),
+                workspace_arg.clone(),
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                Path::new(&read.skill.path),
+                pkg.join(".agents/skills/level")
+            );
+            assert_eq!(read.content, "pkg shared");
+
+            let bare = tmp.path().join("bare/ws");
+            fs::create_dir_all(&bare).unwrap();
+            write_skill(&tmp.path().join("bare/.zcode/skills"), "parent", "no repo");
+            let dirs = scoped_skill_dirs(AgentType::ZCode, AgentSkillScope::Project, bare.to_str())
+                .unwrap();
+            assert_eq!(
+                dirs,
+                vec![bare.join(".zcode/skills"), bare.join(".agents/skills")],
+                "without a `.git` above, only the cwd counts"
+            );
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn zcode_has_authoritative_rows_in_every_bundled_skill_matrix() {
+        let tmp = tempfile::tempdir().unwrap();
+        temp_env::async_with_vars([(CHILD_HOME_KEY, Some(tmp.path()))], async {
+            let rows = crate::commands::experts::experts_list_all_install_statuses()
+                .await
+                .unwrap();
+            assert!(rows.iter().any(|r| r.agent_type == AgentType::ZCode));
+            let rows = crate::commands::science::science_list_all_install_statuses()
+                .await
+                .unwrap();
+            assert!(rows.iter().any(|r| r.agent_type == AgentType::ZCode));
+            let rows = crate::commands::office_tools::officecli_skill_list_all_install_statuses()
+                .await
+                .unwrap();
+            assert!(rows.iter().any(|r| r.agent_type == AgentType::ZCode));
+        })
+        .await;
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -14586,6 +16558,20 @@ mod tests {
         assert_eq!(event.channel, ACP_AGENTS_UPDATED_EVENT);
         assert_eq!(event.payload["reason"], "display_preferences_updated");
         assert_eq!(event.payload["agent_type"], "codex");
+    }
+
+    /// A Codex model catalog refresh that fails after an install is logged
+    /// and leaves the install as it went: the install path awaits nothing it
+    /// could fail with.
+    #[tokio::test]
+    async fn a_failed_catalog_refresh_does_not_fail_a_codex_install() {
+        let failing = async {
+            Err(crate::acp::provider_models::EndpointError::new(
+                "repair_needed",
+                "the Codex configuration needs repair",
+            ))
+        };
+        let () = refresh_codex_catalog_after_install(&EventEmitter::Noop, "t1", failing).await;
     }
 
     #[test]
@@ -14661,17 +16647,72 @@ mod tests {
 
     #[cfg(unix)]
     fn fake_version_script(dir: &std::path::Path, name: &str, banner: &str) -> PathBuf {
-        use std::io::Write;
-        use std::os::unix::fs::PermissionsExt;
-
         let bin = dir.join(name);
-        {
-            let mut f = std::fs::File::create(&bin).expect("create script");
-            f.write_all(format!("#!/bin/sh\necho \"{banner}\"\n").as_bytes())
-                .expect("write script");
-        }
-        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        crate::process::write_test_script(&bin, &format!("#!/bin/sh\necho \"{banner}\"\n"));
         bin
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn streaming_command_reports_exit_status_and_stderr() {
+        let sh = std::path::Path::new("/bin/sh");
+        let (ok, stderr) = run_streaming_command(
+            sh,
+            &["-c", "echo out; echo boom 1>&2; exit 3"],
+            "t",
+            &EventEmitter::Noop,
+            std::time::Duration::from_secs(10),
+        )
+        .await
+        .expect("spawned");
+        assert!(!ok);
+        assert!(stderr.contains("boom"), "{stderr:?}");
+
+        let (ok, _) = run_streaming_command(
+            sh,
+            &["-c", "true"],
+            "t",
+            &EventEmitter::Noop,
+            std::time::Duration::from_secs(10),
+        )
+        .await
+        .expect("spawned");
+        assert!(ok);
+    }
+
+    // A wedged updater must not hold the Settings page's package lock forever.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn streaming_command_gives_up_past_its_timeout() {
+        let err = run_streaming_command(
+            std::path::Path::new("/bin/sh"),
+            &["-c", "sleep 5"],
+            "t",
+            &EventEmitter::Noop,
+            std::time::Duration::from_millis(200),
+        )
+        .await
+        .expect_err("timed out");
+        assert!(err.to_string().contains("did not finish"), "{err}");
+    }
+
+    // Only a system agent with a self-updater can be upgraded this way; every
+    // agent codeg installs itself upgrades through its own actions instead.
+    #[tokio::test]
+    async fn only_self_updating_system_agents_take_the_system_update() {
+        let db = crate::db::test_helpers::fresh_in_memory_db().await;
+        let err = acp_update_system_agent_core(
+            AgentType::Codex,
+            "t".to_string(),
+            &db,
+            &EventEmitter::Noop,
+        )
+        .await
+        .expect_err("codex is not a system agent");
+        assert!(
+            err.to_string().contains("not updated through its own CLI"),
+            "{err}"
+        );
     }
 
     #[cfg(unix)]
@@ -14689,6 +16730,123 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
+    async fn qoder_version_cache_distinguishes_entries_and_refreshes_after_a_change() {
+        use crate::acp::qoder::{QoderInstallKind, QoderWindowsLaunch};
+        let dir = tempfile::tempdir().unwrap();
+        let entry = dir.path().join("version.sh");
+        std::fs::write(
+            &entry,
+            "printf x >> \"${0%/*}/probes\"\nprintf '1.2.3\\n'\n",
+        )
+        .unwrap();
+        let mut launch = QoderWindowsLaunch {
+            program: PathBuf::from("/bin/sh"),
+            prefix_args: vec![entry.clone().into_os_string()],
+            kind: QoderInstallKind::NpmPackage,
+        };
+        for _ in 0..2 {
+            assert_eq!(
+                qoder_probed_version(&launch).await.as_deref(),
+                Some("1.2.3")
+            );
+        }
+        assert_eq!(std::fs::read(dir.path().join("probes")).unwrap(), b"x");
+        // A different file length makes invalidation deterministic even on a
+        // filesystem with coarse timestamps.
+        std::fs::write(
+            &entry,
+            "printf x >> \"${0%/*}/probes\"\nprintf '10.20.30\\n'\n",
+        )
+        .unwrap();
+        assert_eq!(
+            qoder_probed_version(&launch).await.as_deref(),
+            Some("10.20.30")
+        );
+        assert_eq!(std::fs::read(dir.path().join("probes")).unwrap(), b"xx");
+        let other = dir.path().join("other.sh");
+        std::fs::write(&other, "printf '4.5.6\\n'\n").unwrap();
+        launch.prefix_args = vec![other.into_os_string()];
+        assert_eq!(
+            qoder_probed_version(&launch).await.as_deref(),
+            Some("4.5.6")
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn qoder_version_cache_also_caches_failed_probes() {
+        use crate::acp::qoder::{QoderInstallKind, QoderWindowsLaunch};
+        let dir = tempfile::tempdir().unwrap();
+        let entry = dir.path().join("failing.sh");
+        std::fs::write(&entry, "printf x >> \"${0%/*}/probes\"\nexit 1\n").unwrap();
+        let launch = QoderWindowsLaunch {
+            program: PathBuf::from("/bin/sh"),
+            prefix_args: vec![entry.into_os_string()],
+            kind: QoderInstallKind::NpmPackage,
+        };
+        for _ in 0..2 {
+            assert_eq!(qoder_probed_version(&launch).await, None);
+        }
+        assert_eq!(std::fs::read(dir.path().join("probes")).unwrap(), b"x");
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn qoder_detection_and_diagnostics_probe_the_selected_cli_before_npm() {
+        let node = resolve_command_on_path("node").expect("the fixture needs a real node");
+        let output = crate::process::tokio_command(&node)
+            .arg("--version")
+            .output()
+            .await
+            .unwrap();
+        let expected = extract_version_token(&String::from_utf8_lossy(&output.stdout)).unwrap();
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(
+            root.path().join("qoder.cmd"),
+            "@echo off\r\nset \"DISPATCHER=%~dp0qoder-dispatcher.ps1\"\r\npowershell.exe -File \"%DISPATCHER%\" -- %*\r\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.path().join("npm.cmd"),
+            "@echo off\r\necho {\"dependencies\":{\"@qoder-ai/qodercli\":{\"version\":\"0.0.1\"}}}\r\n",
+        )
+        .unwrap();
+        let inherited_path = std::env::var_os("PATH").unwrap_or_default();
+        let test_path = std::env::join_paths(
+            std::iter::once(root.path().to_path_buf())
+                .chain(std::env::split_paths(&inherited_path)),
+        )
+        .unwrap();
+        let db = crate::db::test_helpers::fresh_in_memory_db().await;
+        // A real native executable answers --version, while the competing npm
+        // metadata deliberately describes a different version. The dispatcher
+        // selects the executable through its supported override.
+        temp_env::async_with_vars(
+            [
+                ("PATH", Some(test_path.as_os_str())),
+                ("QODER_CLI_BIN", Some(node.as_os_str())),
+            ],
+            async {
+                assert_eq!(
+                    detect_npm_global_version("@qoder-ai/qodercli")
+                        .await
+                        .as_deref(),
+                    Some("0.0.1")
+                );
+                assert_eq!(
+                    detect_local_version(AgentType::Qoder).await.as_deref(),
+                    Some(expected.as_str())
+                );
+                let diag = collect_agent_diag(&db, AgentType::Qoder, None).await;
+                assert_eq!(diag.detected_version.as_deref(), Some(expected.as_str()));
+                assert!(diag.direct_version_probe);
+            },
+        )
+        .await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     async fn a_failing_declared_probe_falls_back_to_the_version_convention() {
         let dir = tempfile::tempdir().expect("tempdir");
         // `name/version` banner — the shape that motivated the token split.
@@ -14700,6 +16858,141 @@ mod tests {
             system_probed_version_with(Some("codeg-missing-probe-cmd-e2e --version"), &bin, None)
                 .await;
         assert_eq!(version.as_deref(), Some("3.2.1"));
+    }
+
+    /// Register an npx agent for the detection tests below. The caller holds
+    /// the registry lock. Its command and package are unique to the test, so
+    /// whether the command resolves is up to the test's own HOME
+    /// (`~/.local/bin`), never to what this machine has installed.
+    fn register_npx_detection_agent(id: &str) -> AgentType {
+        use crate::acp::custom_registry::{
+            CustomAgentDef, CustomAgentSpec, CustomDistributionKind, NpxSpec,
+        };
+        let def = CustomAgentDef {
+            registry_id: id.to_string(),
+            name: id.to_string(),
+            description: String::new(),
+            version: "0.0.34".into(),
+            distribution_kind: CustomDistributionKind::Npx,
+            spec: CustomAgentSpec {
+                npx: Some(NpxSpec {
+                    package: format!("{id}@0.0.34"),
+                    args: Vec::new(),
+                    env: BTreeMap::new(),
+                    cmd: Some(id.to_string()),
+                    node_required: None,
+                }),
+                ..Default::default()
+            },
+            icon_url: None,
+            skills_shared_store: false,
+            skills_dir: None,
+            source: Default::default(),
+            version_probe: None,
+            supports_mcp: true,
+        };
+        assert!(
+            custom_registry::hydrate(&[def]).is_empty(),
+            "the definition registers"
+        );
+        AgentType::custom(id).expect("a valid custom id")
+    }
+
+    /// A settings row for `agent` that records `version` as installed.
+    async fn db_recording_installed_version(agent: AgentType, version: &str) -> AppDatabase {
+        let db = crate::db::test_helpers::fresh_in_memory_db().await;
+        agent_setting_service::ensure_defaults(
+            &db.conn,
+            &[agent_setting_service::AgentDefaultInput {
+                agent_type: agent,
+                registry_id: registry::registry_id_for(agent).to_string(),
+                default_sort_order: 0,
+            }],
+        )
+        .await
+        .expect("settings row");
+        agent_setting_service::set_installed_version(&db.conn, agent, Some(version.to_string()))
+            .await
+            .expect("installed version");
+        db
+    }
+
+    async fn stored_installed_version(db: &AppDatabase, agent: AgentType) -> Option<String> {
+        agent_setting_service::get_by_agent_type(&db.conn, agent)
+            .await
+            .expect("settings row")
+            .and_then(|m| m.installed_version)
+    }
+
+    // An npx agent recorded as installed whose command no longer resolves (the
+    // package was removed outside codeg, or the npm global prefix moved on a
+    // Node version switch) cannot be launched, so detection must say so. It
+    // used to hand the stored version back, and Settings showed the agent as
+    // installed and up to date while every connect refused it as not installed.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn detection_clears_a_stored_npx_version_whose_command_no_longer_resolves() {
+        let _registry = custom_registry::hydrate_test_guard();
+        let agent = register_npx_detection_agent("detect-gone-npx-agent");
+        let db = db_recording_installed_version(agent, "0.0.34").await;
+        let broadcaster = std::sync::Arc::new(crate::web::event_bridge::WebEventBroadcaster::new());
+        let mut events = broadcaster.subscribe();
+        let emitter = EventEmitter::test_web_only(broadcaster.clone());
+        let home = tempfile::tempdir().expect("tempdir");
+
+        let (gate, detected) = temp_env::async_with_vars([("HOME", Some(home.path()))], async {
+            let gate = verify_agent_installed(agent).await;
+            let detected = acp_detect_agent_local_version_core(agent, &db.conn, &emitter)
+                .await
+                .expect("detection runs");
+            (gate, detected)
+        })
+        .await;
+        custom_registry::hydrate(&[]);
+
+        assert!(gate.is_err(), "the connect gate refuses the agent");
+        assert_eq!(detected, None, "detection agrees with the connect gate");
+        assert_eq!(stored_installed_version(&db, agent).await, None);
+        let event = events.try_recv().expect("the composer is told to reload");
+        assert_eq!(event.channel, ACP_AGENTS_UPDATED_EVENT);
+        assert_eq!(event.payload["reason"], "local_version_cleared");
+    }
+
+    // The stored version still stands in when the command resolves and only
+    // its version could not be read this time (`npm list` failing, a
+    // `--version` that prints nothing): the agent is launchable.
+    #[cfg(unix)]
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn detection_keeps_a_stored_npx_version_whose_command_resolves_without_a_version() {
+        let _registry = custom_registry::hydrate_test_guard();
+        let agent = register_npx_detection_agent("detect-quiet-npx-agent");
+        let db = db_recording_installed_version(agent, "0.0.34").await;
+        let home = tempfile::tempdir().expect("tempdir");
+        let bin_dir = home.path().join(".local").join("bin");
+        std::fs::create_dir_all(&bin_dir).expect("bin dir");
+        crate::process::write_test_script(&bin_dir.join("detect-quiet-npx-agent"), "#!/bin/sh\n");
+
+        let (gate, detected) = temp_env::async_with_vars([("HOME", Some(home.path()))], async {
+            let gate = verify_agent_installed(agent).await;
+            let detected =
+                acp_detect_agent_local_version_core(agent, &db.conn, &EventEmitter::Noop)
+                    .await
+                    .expect("detection runs");
+            (gate, detected)
+        })
+        .await;
+        custom_registry::hydrate(&[]);
+
+        assert!(
+            gate.is_ok(),
+            "the command resolves in ~/.local/bin: {gate:?}"
+        );
+        assert_eq!(detected.as_deref(), Some("0.0.34"));
+        assert_eq!(
+            stored_installed_version(&db, agent).await.as_deref(),
+            Some("0.0.34")
+        );
     }
 
     #[test]
@@ -15093,6 +17386,57 @@ mod tests {
         Some(Some(value))
     }
 
+    /// codex refuses to load a config.toml holding `approval_policy =
+    /// "untrusted"` (0.160.1 and 0.164.0, measured: "is no longer supported;
+    /// remove this setting"), so no Codex session starts with it. The panel
+    /// still reads it, to show what is there and that it has to go, but codeg
+    /// never writes it; replacing or clearing it works as for any value.
+    #[test]
+    fn the_retired_untrusted_policy_is_read_but_never_written() {
+        let base = "approval_policy = \"untrusted\"\nmodel = \"gpt-5\"\n";
+        assert_eq!(
+            parse_codex_sandbox_settings(base)
+                .approval_policy
+                .as_deref(),
+            Some("untrusted")
+        );
+
+        let refused = apply_codex_sandbox_config(
+            "model = \"gpt-5\"\n",
+            &CodexSandboxStructuredConfig {
+                approval_policy: set("untrusted".into()),
+                ..Default::default()
+            },
+        )
+        .expect_err("codeg must not write a policy codex refuses");
+        assert!(
+            refused.to_string().contains("no longer accepts"),
+            "{refused}"
+        );
+
+        for (patch, want) in [
+            (set("on-request".to_string()), Some("on-request")),
+            (Some(None), None),
+        ] {
+            let merged = apply_codex_sandbox_config(
+                base,
+                &CodexSandboxStructuredConfig {
+                    approval_policy: patch,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            assert!(!merged.contains("untrusted"), "{merged}");
+            assert_eq!(
+                parse_codex_sandbox_settings(&merged)
+                    .approval_policy
+                    .as_deref(),
+                want
+            );
+            assert!(merged.contains("model = \"gpt-5\""));
+        }
+    }
+
     #[test]
     fn apply_codex_sandbox_config_writes_and_preserves_unmanaged_keys() {
         let base = "# keep me\nmodel = \"gpt-5\"\n\n[features]\nskills = true\n";
@@ -15214,256 +17558,6 @@ mod tests {
         assert!(back.granular.is_some());
         assert_eq!(back.sandbox_mode.as_deref(), Some("workspace-write"));
         assert!(back.workspace_write.network_access);
-    }
-
-    fn config_with_catalog_ref(value: &str) -> String {
-        format!(
-            "\
-# my codex config
-model = \"gw/x\"           # the model
-model_catalog_json = \"{value}\"
-model_provider = \"codeg\"
-
-[model_providers.codeg]
-base_url = \"https://example.test/v1\"
-"
-        )
-    }
-
-    #[test]
-    fn remove_codex_catalog_key_is_format_preserving_and_no_op_when_absent() {
-        let home = Path::new("/tmp/codeg-test-codex-home");
-        let base = config_with_catalog_ref("codeg-model-catalog.json");
-        let next = remove_codex_catalog_key(&base, home)
-            .unwrap()
-            .expect("codeg-owned key was present");
-        assert!(!next.contains("model_catalog_json"));
-        // Comments and every unmanaged key survive verbatim.
-        assert!(next.contains("# my codex config"));
-        assert!(next.contains("model = \"gw/x\"           # the model"));
-        assert!(next.contains("[model_providers.codeg]"));
-        assert!(next.contains("base_url = \"https://example.test/v1\""));
-        // No key → no rewrite at all (callers skip the disk write).
-        assert!(remove_codex_catalog_key(&next, home).unwrap().is_none());
-        assert!(remove_codex_catalog_key("", home).unwrap().is_none());
-    }
-
-    /// The cleanup must only ever reclaim codeg's OWN generated file. A catalog
-    /// the user wrote by hand (or typed into the advanced config.toml editor)
-    /// reaches this path on every panel save — deleting its reference would
-    /// silently orphan the user's models.
-    #[test]
-    fn remove_codex_catalog_key_preserves_user_owned_references() {
-        let home = Path::new("/tmp/codeg-test-codex-home");
-        for foreign in [
-            "manual.json",
-            "/abs/path/to/manual.json",
-            "~/my-catalog.json",
-            "nested/codeg-model-catalog.json",
-            "  ",
-        ] {
-            let base = config_with_catalog_ref(foreign);
-            assert!(
-                remove_codex_catalog_key(&base, home).unwrap().is_none(),
-                "must not touch a user-owned reference: {foreign}"
-            );
-        }
-        // An absolute path naming codeg's own file IS codeg-owned.
-        let abs = home
-            .join(crate::acp::codex_model_catalog::CATALOG_REL)
-            .to_string_lossy()
-            .into_owned();
-        assert!(is_codeg_owned_catalog_ref(&abs, home));
-        assert!(is_codeg_owned_catalog_ref(
-            crate::acp::codex_model_catalog::CATALOG_REL,
-            home
-        ));
-        assert!(!is_codeg_owned_catalog_ref("manual.json", home));
-    }
-
-    fn catalog_slugs(home: &Path) -> Vec<String> {
-        let text = fs::read_to_string(home.join(crate::acp::codex_model_catalog::CATALOG_REL))
-            .expect("generated catalog");
-        serde_json::from_str::<serde_json::Value>(&text).expect("catalog json")["models"]
-            .as_array()
-            .expect("models")
-            .iter()
-            .filter_map(|m| m["slug"].as_str().map(str::to_owned))
-            .collect()
-    }
-
-    /// The official list before codex 0.159.1: today's minus GPT-6.1 Sol.
-    fn catalog_without_gpt_6_1_sol() -> Vec<serde_json::Value> {
-        crate::acp::codex_model_catalog::bundled_snapshot_models()
-            .into_iter()
-            .filter(|m| m["slug"] != "gpt-6.1-sol")
-            .collect()
-    }
-
-    /// A catalog codeg generated before an upgrade is re-expanded from its
-    /// stored intent, so the new official model shows up — in codex's own
-    /// rank, behind the custom — without the user re-saving anything.
-    #[test]
-    fn resync_rewrites_codegs_catalog_against_the_new_official_list() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let home = dir.path();
-        let config = config_with_catalog_ref(crate::acp::codex_model_catalog::CATALOG_REL);
-        fs::write(home.join("config.toml"), &config).unwrap();
-        let intent = r#"{"customs":[{"slug":"gw/x","base":"gpt-5.6-sol"}],"default":"gw/x"}"#;
-        crate::acp::codex_model_catalog::write_catalog_files(
-            intent,
-            home,
-            &catalog_without_gpt_6_1_sol(),
-        )
-        .unwrap()
-        .expect("customs → generated catalog");
-        assert!(!catalog_slugs(home).iter().any(|s| s == "gpt-6.1-sol"));
-
-        // Today's list plus one model no compiled-in snapshot has, so only
-        // the list passed in can put it in the table.
-        let mut new = crate::acp::codex_model_catalog::bundled_snapshot_models();
-        let mut unshipped = new
-            .iter()
-            .find(|m| m["slug"] == "gpt-5.5")
-            .cloned()
-            .expect("gpt-5.5 in snapshot");
-        unshipped["slug"] = serde_json::Value::String("gpt-test-unshipped".into());
-        new.push(unshipped);
-        assert_eq!(
-            resync_codex_generated_catalog_at(home, &new).unwrap(),
-            CodexCatalogResync::Rewritten
-        );
-        let slugs = catalog_slugs(home);
-        assert_eq!(slugs[..3], ["gw/x", "gpt-6.1-sol", "gpt-6-astra"]);
-        assert!(slugs.iter().any(|s| s == "gpt-test-unshipped"));
-        assert_eq!(slugs.len(), new.len() + 1);
-        // The intent and config.toml are untouched: same bytes as before.
-        assert_eq!(
-            fs::read_to_string(home.join(crate::acp::codex_model_catalog::SOURCE_REL)).unwrap(),
-            intent
-        );
-        assert_eq!(
-            fs::read_to_string(home.join("config.toml")).unwrap(),
-            config
-        );
-    }
-
-    /// Nothing that codeg cannot regenerate is touched: the user's own catalog,
-    /// a config with no catalog at all, and a codeg catalog whose intent sidecar
-    /// is gone (re-importing it against the NEW list would read every newly
-    /// shipped official as one the user removed).
-    #[test]
-    fn resync_leaves_catalogs_codeg_cannot_regenerate_alone() {
-        let new = crate::acp::codex_model_catalog::bundled_snapshot_models();
-        let intent = r#"{"customs":[{"slug":"gw/x","base":"gpt-5.6-sol"}]}"#;
-        let catalog_path = |home: &Path| home.join(crate::acp::codex_model_catalog::CATALOG_REL);
-
-        // No config.toml at all.
-        let dir = tempfile::tempdir().expect("tempdir");
-        assert_eq!(
-            resync_codex_generated_catalog_at(dir.path(), &new).unwrap(),
-            CodexCatalogResync::NotOwned
-        );
-
-        // The user's own catalog, even with a codeg sidecar lying around.
-        let dir = tempfile::tempdir().expect("tempdir");
-        let home = dir.path();
-        fs::write(
-            home.join("config.toml"),
-            config_with_catalog_ref("manual.json"),
-        )
-        .unwrap();
-        fs::write(
-            home.join(crate::acp::codex_model_catalog::SOURCE_REL),
-            intent,
-        )
-        .unwrap();
-        assert_eq!(
-            resync_codex_generated_catalog_at(home, &new).unwrap(),
-            CodexCatalogResync::NotOwned
-        );
-        assert!(!catalog_path(home).exists(), "no catalog was generated");
-        assert_eq!(
-            fs::read_to_string(home.join("config.toml")).unwrap(),
-            config_with_catalog_ref("manual.json"),
-            "the user's reference is left byte-identical"
-        );
-
-        // No `model_catalog_json` key.
-        fs::write(home.join("config.toml"), "model = \"gpt-5.5\"\n").unwrap();
-        assert_eq!(
-            resync_codex_generated_catalog_at(home, &new).unwrap(),
-            CodexCatalogResync::NotOwned
-        );
-        assert!(!catalog_path(home).exists(), "no catalog was generated");
-
-        // codeg's reference, but no sidecar: the old table stays as it is.
-        let dir = tempfile::tempdir().expect("tempdir");
-        let home = dir.path();
-        fs::write(
-            home.join("config.toml"),
-            config_with_catalog_ref(crate::acp::codex_model_catalog::CATALOG_REL),
-        )
-        .unwrap();
-        crate::acp::codex_model_catalog::write_catalog_files(
-            intent,
-            home,
-            &catalog_without_gpt_6_1_sol(),
-        )
-        .unwrap()
-        .expect("seeded");
-        fs::remove_file(home.join(crate::acp::codex_model_catalog::SOURCE_REL)).unwrap();
-        let before = fs::read_to_string(catalog_path(home)).unwrap();
-        assert_eq!(
-            resync_codex_generated_catalog_at(home, &new).unwrap(),
-            CodexCatalogResync::NotOwned
-        );
-        assert_eq!(fs::read_to_string(catalog_path(home)).unwrap(), before);
-    }
-
-    /// When the new list makes the takeover moot (the only removal names a model
-    /// codex has since retired), control goes back to codex: the reference is
-    /// dropped — format-preservingly — and the generated files with it, so
-    /// config.toml never points at a file that is gone.
-    #[test]
-    fn resync_releases_a_takeover_the_new_list_makes_moot() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let home = dir.path();
-        fs::write(
-            home.join("config.toml"),
-            config_with_catalog_ref(crate::acp::codex_model_catalog::CATALOG_REL),
-        )
-        .unwrap();
-        // The old list still LISTED a model the user removed; the new one no
-        // longer ships it at all.
-        let mut old = crate::acp::codex_model_catalog::bundled_snapshot_models();
-        let mut retired = old
-            .iter()
-            .find(|m| m["slug"] == "gpt-5.5")
-            .cloned()
-            .expect("gpt-5.5 in snapshot");
-        retired["slug"] = serde_json::Value::String("gpt-5.4-retired".into());
-        old.push(retired);
-        let intent = r#"{"customs":[],"excludedOfficials":["gpt-5.4-retired"]}"#;
-        crate::acp::codex_model_catalog::write_catalog_files(intent, home, &old)
-            .unwrap()
-            .expect("a live removal → generated catalog");
-
-        let new = crate::acp::codex_model_catalog::bundled_snapshot_models();
-        assert_eq!(
-            resync_codex_generated_catalog_at(home, &new).unwrap(),
-            CodexCatalogResync::Released
-        );
-        let config = fs::read_to_string(home.join("config.toml")).unwrap();
-        assert!(!config.contains("model_catalog_json"), "{config}");
-        assert!(config.contains("# my codex config"));
-        assert!(config.contains("model = \"gw/x\"           # the model"));
-        assert!(!home
-            .join(crate::acp::codex_model_catalog::CATALOG_REL)
-            .exists());
-        assert!(!home
-            .join(crate::acp::codex_model_catalog::SOURCE_REL)
-            .exists());
     }
 
     #[test]
@@ -15699,6 +17793,169 @@ base_url = \"https://example.test/v1\"
         assert_eq!(s.auto_compact_threshold_percent, Some(90));
     }
 
+    /// The endpoint's other models ride codeg's own provider, which follows
+    /// the managed endpoint; codeg removes only tables naming that provider.
+    #[test]
+    fn grok_extra_models_ride_codegs_provider_and_only_codegs_go() {
+        let custom = |extras: Option<Vec<&str>>, base: &str| GrokStructuredConfig {
+            custom_model_id: Some("main".into()),
+            custom_base_url: Some(base.into()),
+            custom_api_key: Some("sk-gw".into()),
+            custom_api_backend: Some("chat_completions".into()),
+            custom_extra_models: extras.map(|ids| ids.into_iter().map(String::from).collect()),
+            ..Default::default()
+        };
+        let user_own = "[model.mine]\nmodel = \"mine\"\nbase_url = \"https://own/v1\"\n";
+        let merged = apply_grok_structured_config(
+            user_own,
+            &custom(
+                Some(vec!["glm-5.2", "main", "mine", "kimi-k3"]),
+                "https://gw/v1",
+            ),
+        )
+        .unwrap();
+        let back = parse_grok_settings(&merged);
+        assert_eq!(back.custom_model_id.as_deref(), Some("main"));
+        // Not the managed model, and not a table of the user's own.
+        assert_eq!(back.custom_extra_models, ["glm-5.2", "kimi-k3"]);
+        let doc: toml::Table = toml::from_str(&merged).unwrap();
+        assert_eq!(doc["model"]["glm-5.2"]["model"].as_str(), Some("glm-5.2"));
+        assert_eq!(
+            doc["model"]["mine"]["base_url"].as_str(),
+            Some("https://own/v1")
+        );
+        assert!(doc["model"]["mine"].get("model_provider").is_none());
+        let provider = &doc["model_providers"]["codeg"];
+        assert_eq!(provider["base_url"].as_str(), Some("https://gw/v1"));
+        assert_eq!(provider["api_key"].as_str(), Some("sk-gw"));
+        assert_eq!(provider["api_backend"].as_str(), Some("chat_completions"));
+
+        // An untouched list keeps the extras and follows the endpoint.
+        let moved = apply_grok_structured_config(&merged, &custom(None, "https://gw2/v1")).unwrap();
+        let back = parse_grok_settings(&moved);
+        assert_eq!(back.custom_extra_models, ["glm-5.2", "kimi-k3"]);
+        let doc: toml::Table = toml::from_str(&moved).unwrap();
+        assert_eq!(
+            doc["model_providers"]["codeg"]["base_url"].as_str(),
+            Some("https://gw2/v1")
+        );
+
+        // Unpicked ones go; an emptied list takes the provider with it.
+        let fewer =
+            apply_grok_structured_config(&moved, &custom(Some(vec!["kimi-k3"]), "https://gw2/v1"))
+                .unwrap();
+        assert_eq!(parse_grok_settings(&fewer).custom_extra_models, ["kimi-k3"]);
+        let none =
+            apply_grok_structured_config(&fewer, &custom(Some(vec![]), "https://gw2/v1")).unwrap();
+        let doc: toml::Table = toml::from_str(&none).unwrap();
+        assert!(doc.get("model_providers").is_none(), "{none}");
+        assert!(doc["model"].get("kimi-k3").is_none());
+        assert_eq!(
+            doc["model"]["mine"]["base_url"].as_str(),
+            Some("https://own/v1")
+        );
+
+        // Clearing the managed model clears codeg's extras too.
+        let cleared =
+            apply_grok_structured_config(&fewer, &GrokStructuredConfig::default()).unwrap();
+        let doc: toml::Table = toml::from_str(&cleared).unwrap();
+        assert!(doc.get("model_providers").is_none(), "{cleared}");
+        assert!(doc["model"].get("kimi-k3").is_none());
+        assert!(doc["model"].get("mine").is_some());
+    }
+
+    /// A key the user added to `[model_providers.codeg]` is theirs to keep:
+    /// emptying the extras or clearing the model takes back only codeg's
+    /// endpoint and key, and the next extras ride the user's key again.
+    #[test]
+    fn a_grok_codeg_provider_with_a_key_of_the_users_own_stays() {
+        let own =
+            "[model_providers.codeg]\nbase_url = \"https://gw/v1\"\nmax_request_bytes = 25000000\n";
+        let settings = |extras: Vec<&str>| GrokStructuredConfig {
+            custom_model_id: Some("main".into()),
+            custom_base_url: Some("https://gw2/v1".into()),
+            custom_api_key: Some("sk-gw".into()),
+            custom_extra_models: Some(extras.into_iter().map(String::from).collect()),
+            ..Default::default()
+        };
+        let with = apply_grok_structured_config(own, &settings(vec!["x"])).unwrap();
+        let doc: toml::Table = toml::from_str(&with).unwrap();
+        // The endpoint codeg's extras ride follows the panel; the user's key stays.
+        assert_eq!(
+            doc["model_providers"]["codeg"]["base_url"].as_str(),
+            Some("https://gw2/v1")
+        );
+        assert_eq!(
+            doc["model_providers"]["codeg"]["max_request_bytes"].as_integer(),
+            Some(25000000)
+        );
+        for after in [
+            apply_grok_structured_config(&with, &settings(vec![])).unwrap(),
+            apply_grok_structured_config(&with, &GrokStructuredConfig::default()).unwrap(),
+        ] {
+            let doc: toml::Table = toml::from_str(&after).unwrap();
+            let provider = doc["model_providers"]["codeg"].as_table().unwrap();
+            assert_eq!(
+                provider.keys().collect::<Vec<_>>(),
+                ["max_request_bytes"],
+                "{after}"
+            );
+            assert!(
+                doc.get("model").and_then(|m| m.get("x")).is_none(),
+                "{after}"
+            );
+
+            let again = apply_grok_structured_config(&after, &settings(vec!["y"])).unwrap();
+            let doc: toml::Table = toml::from_str(&again).unwrap();
+            let provider = &doc["model_providers"]["codeg"];
+            assert_eq!(
+                provider["base_url"].as_str(),
+                Some("https://gw2/v1"),
+                "{again}"
+            );
+            assert_eq!(provider["api_key"].as_str(), Some("sk-gw"), "{again}");
+            assert_eq!(
+                provider["max_request_bytes"].as_integer(),
+                Some(25000000),
+                "{again}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_grok_extra_made_the_managed_model_carries_its_own_endpoint() {
+        let first = apply_grok_structured_config(
+            "",
+            &GrokStructuredConfig {
+                custom_model_id: Some("main".into()),
+                custom_base_url: Some("https://gw/v1".into()),
+                custom_extra_models: Some(vec!["next".into()]),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let renamed = apply_grok_structured_config(
+            &first,
+            &GrokStructuredConfig {
+                custom_model_id: Some("next".into()),
+                custom_base_url: Some("https://gw/v1".into()),
+                custom_extra_models: Some(vec![]),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let doc: toml::Table = toml::from_str(&renamed).unwrap();
+        assert!(
+            doc["model"]["next"].get("model_provider").is_none(),
+            "{renamed}"
+        );
+        assert_eq!(
+            doc["model"]["next"]["base_url"].as_str(),
+            Some("https://gw/v1")
+        );
+        assert!(parse_grok_settings(&renamed).custom_extra_models.is_empty());
+    }
+
     #[test]
     fn parse_grok_settings_untracks_default_without_model_block() {
         // `[models].default` naming a stock model (no `[model.*]` block) is not a
@@ -15822,6 +18079,258 @@ base_url = \"https://example.test/v1\"
         assert!(!merged.contains("[model."), "managed block removed");
         let back = parse_grok_settings(&merged);
         assert!(back.custom_model_id.is_none());
+    }
+
+    /// The `reasoning_efforts` value of `[model.<id>]` in `merged`, as TOML text.
+    fn grok_efforts_text(merged: &str, id: &str) -> Option<String> {
+        let doc = merged.parse::<toml_edit::Document>().unwrap();
+        doc.get("model")?
+            .as_table_like()?
+            .get(id)?
+            .as_table_like()?
+            .get("reasoning_efforts")
+            .map(|item| item.to_string().trim().to_string())
+    }
+
+    #[test]
+    fn parse_grok_settings_reads_reasoning_efforts_in_every_form() {
+        // Bare strings, inline tables (their `value`, not their `id`) and mixed
+        // case all read as the lowercased level Grok sends; an entry with no
+        // readable level is skipped.
+        let inline = "[models]\ndefault = \"foo\"\n\n[model.foo]\nmodel = \"foo\"\n\
+                      reasoning_efforts = [\"Low\", { id = \"deep\", value = \"high\", label = \"Deep\" }, \
+                      { id = \"broken\" }, 7]\n";
+        assert_eq!(
+            parse_grok_settings(inline).custom_reasoning_efforts,
+            vec!["low", "high"]
+        );
+        // An array of tables reads the same.
+        let aot = "[models]\ndefault = \"foo\"\n\n[model.foo]\nmodel = \"foo\"\n\n\
+                   [[model.foo.reasoning_efforts]]\nvalue = \"medium\"\n\n\
+                   [[model.foo.reasoning_efforts]]\nvalue = \"xhigh\"\ndefault = true\n";
+        assert_eq!(
+            parse_grok_settings(aot).custom_reasoning_efforts,
+            vec!["medium", "xhigh"]
+        );
+        // Absent key, or a block that is not the managed model ⇒ nothing declared.
+        for body in [
+            "[models]\ndefault = \"foo\"\n\n[model.foo]\nmodel = \"foo\"\n",
+            "[models]\ndefault = \"grok-4.5\"\n\n[model.foo]\nreasoning_efforts = [\"low\"]\n",
+        ] {
+            let levels = parse_grok_settings(body).custom_reasoning_efforts;
+            assert!(levels.is_empty(), "{body}");
+        }
+    }
+
+    #[test]
+    fn apply_grok_reasoning_efforts_writes_bare_levels_and_round_trips() {
+        let merged = apply_grok_structured_config(
+            "",
+            &GrokStructuredConfig {
+                custom_model_id: Some("grok-4.7".into()),
+                custom_reasoning_efforts: Some(vec![
+                    "low".into(),
+                    "medium".into(),
+                    " High ".into(),
+                    "xhigh".into(),
+                    "".into(),
+                ]),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        // The shape verified against grok 1.0.62, 1.0.70 and 1.0.77: bare levels
+        // make it advertise `supportsReasoningEffort` with exactly these
+        // `reasoningEfforts`.
+        assert_eq!(
+            grok_efforts_text(&merged, "grok-4.7").as_deref(),
+            Some("[\"low\", \"medium\", \"high\", \"xhigh\"]")
+        );
+        assert_eq!(
+            parse_grok_settings(&merged).custom_reasoning_efforts,
+            vec!["low", "medium", "high", "xhigh"]
+        );
+    }
+
+    #[test]
+    fn apply_grok_reasoning_efforts_none_leaves_a_hand_written_list() {
+        // No levels sent — the panel's chips were untouched, or the client
+        // predates the field: the hand-written list must survive, even though
+        // every other field is managed.
+        let base = "[models]\ndefault = \"foo\"\n\n[model.foo]\nmodel = \"foo\"\n\
+                    reasoning_efforts = [{ id = \"deep\", value = \"high\", label = \"Deep\" }]\n";
+        let merged = apply_grok_structured_config(
+            base,
+            &GrokStructuredConfig {
+                custom_model_id: Some("foo".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(merged.contains(
+            "reasoning_efforts = [{ id = \"deep\", value = \"high\", label = \"Deep\" }]"
+        ));
+    }
+
+    #[test]
+    fn apply_grok_reasoning_efforts_unchanged_list_is_left_as_written() {
+        // Saving other fields sends the levels the panel read back. Matching the
+        // file (case-insensitively, skipping unreadable entries) leaves the
+        // user's layout, comments and extra fields alone — in both TOML forms.
+        let inline = "[models]\ndefault = \"foo\"\n\n[model.foo]\nmodel = \"foo\"\n\
+                      reasoning_efforts = [\n  \"Low\", # cheap\n  { value = \"high\", default = true },\n  { id = \"broken\" },\n]\n";
+        let aot = "[models]\ndefault = \"foo\"\n\n[model.foo]\nmodel = \"foo\"\n\n\
+                   [[model.foo.reasoning_efforts]]\nvalue = \"low\" # cheap\n\n\
+                   [[model.foo.reasoning_efforts]]\nvalue = \"high\"\ndefault = true\n";
+        for base in [inline, aot] {
+            let merged = apply_grok_structured_config(
+                base,
+                &GrokStructuredConfig {
+                    custom_model_id: Some("foo".into()),
+                    custom_base_url: Some("https://gw/v1".into()),
+                    custom_reasoning_efforts: Some(vec!["low".into(), "high".into()]),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            // Untouched: the comment and the per-entry default are still there.
+            assert!(merged.contains("# cheap"), "{merged}");
+            assert!(merged.contains("default = true"), "{merged}");
+            assert_eq!(
+                parse_grok_settings(&merged).custom_base_url.as_deref(),
+                Some("https://gw/v1")
+            );
+        }
+    }
+
+    #[test]
+    fn apply_grok_reasoning_efforts_change_keeps_the_entries_still_listed() {
+        // A changed list keeps each surviving level's own entry (its id, label
+        // and default stay), adds new levels as bare strings, drops the removed
+        // ones — including an AoT, which becomes one inline array.
+        let inline = "[models]\ndefault = \"foo\"\n\n[model.foo]\nmodel = \"foo\"\n\
+                      reasoning_efforts = [\"low\", { id = \"deep\", value = \"high\", label = \"Deep\" }, \"xhigh\"]\n";
+        let aot = "[models]\ndefault = \"foo\"\n\n[model.foo]\nmodel = \"foo\"\n\n\
+                   [[model.foo.reasoning_efforts]]\nvalue = \"low\"\n\n\
+                   [[model.foo.reasoning_efforts]]\nid = \"deep\"\nvalue = \"high\"\nlabel = \"Deep\"\n\n\
+                   [[model.foo.reasoning_efforts]]\nvalue = \"xhigh\"\n";
+        for (base, kept_low) in [(inline, "\"low\""), (aot, "{ value = \"low\" }")] {
+            let merged = apply_grok_structured_config(
+                base,
+                &GrokStructuredConfig {
+                    custom_model_id: Some("foo".into()),
+                    custom_reasoning_efforts: Some(vec![
+                        "low".into(),
+                        "medium".into(),
+                        "high".into(),
+                    ]),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            assert_eq!(
+                grok_efforts_text(&merged, "foo"),
+                Some(format!(
+                    "[{kept_low}, \"medium\", {{ id = \"deep\", value = \"high\", label = \"Deep\" }}]"
+                )),
+                "{merged}"
+            );
+            assert!(!merged.contains("[[model.foo.reasoning_efforts]]"));
+            assert_eq!(
+                parse_grok_settings(&merged).custom_reasoning_efforts,
+                vec!["low", "medium", "high"]
+            );
+        }
+    }
+
+    #[test]
+    fn apply_grok_reasoning_efforts_empty_hands_levels_back_to_the_endpoint() {
+        let base = "[models]\ndefault = \"foo\"\n\n[model.foo]\nmodel = \"foo\"\n\
+                    reasoning_efforts = [\"low\", \"high\"]\n";
+        let merged = apply_grok_structured_config(
+            base,
+            &GrokStructuredConfig {
+                custom_model_id: Some("foo".into()),
+                custom_reasoning_efforts: Some(vec!["  ".into()]),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(!merged.contains("reasoning_efforts"), "{merged}");
+        assert_eq!(
+            parse_grok_settings(&merged).custom_model_id.as_deref(),
+            Some("foo")
+        );
+    }
+
+    #[test]
+    fn apply_grok_reasoning_efforts_follow_a_rename() {
+        // A rename starts a fresh block; the levels the panel holds land in it.
+        let base = "[models]\ndefault = \"old\"\n\n[model.old]\nmodel = \"old\"\n\
+                    reasoning_efforts = [\"low\", \"high\"]\n";
+        let merged = apply_grok_structured_config(
+            base,
+            &GrokStructuredConfig {
+                custom_model_id: Some("new".into()),
+                custom_reasoning_efforts: Some(vec!["low".into(), "high".into()]),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(!merged.contains("old"), "{merged}");
+        let back = parse_grok_settings(&merged);
+        assert_eq!(back.custom_model_id.as_deref(), Some("new"));
+        assert_eq!(back.custom_reasoning_efforts, vec!["low", "high"]);
+    }
+
+    #[test]
+    fn apply_grok_reasoning_efforts_left_alone_move_with_a_rename() {
+        // The panel sends no levels while its chips are untouched; a rename must
+        // not drop the list with the old block. An array of tables arrives as
+        // one inline array, and a block renamed onto keeps a list of its own.
+        let rename = |base: &str| {
+            apply_grok_structured_config(
+                base,
+                &GrokStructuredConfig {
+                    custom_model_id: Some("new".into()),
+                    ..Default::default()
+                },
+            )
+            .unwrap()
+        };
+        let inline = rename(
+            "[models]\ndefault = \"old\"\n\n[model.old]\nmodel = \"old\"\n\
+             reasoning_efforts = [\"low\", { id = \"deep\", value = \"high\" }]\n",
+        );
+        assert!(!inline.contains("old"), "{inline}");
+        assert_eq!(
+            grok_efforts_text(&inline, "new").as_deref(),
+            Some("[\"low\", { id = \"deep\", value = \"high\" }]")
+        );
+
+        let aot = rename(
+            "[models]\ndefault = \"old\"\n\n[model.old]\nmodel = \"old\"\n\n\
+             [[model.old.reasoning_efforts]]\nvalue = \"low\"\n\n\
+             [[model.old.reasoning_efforts]]\nvalue = \"xhigh\"\ndefault = true\n",
+        );
+        assert!(!aot.contains("[[model."), "{aot}");
+        assert_eq!(
+            grok_efforts_text(&aot, "new").as_deref(),
+            Some("[{ value = \"low\" }, { value = \"xhigh\", default = true }]")
+        );
+        assert_eq!(
+            parse_grok_settings(&aot).custom_reasoning_efforts,
+            vec!["low", "xhigh"]
+        );
+
+        let onto = rename(
+            "[models]\ndefault = \"old\"\n\n[model.old]\nreasoning_efforts = [\"low\"]\n\n\
+             [model.new]\nreasoning_efforts = [\"max\"]\n",
+        );
+        assert_eq!(
+            parse_grok_settings(&onto).custom_reasoning_efforts,
+            vec!["max"]
+        );
     }
 
     #[test]
@@ -15980,6 +18489,38 @@ base_url = \"https://example.test/v1\"
         pi_canonical_path(dir).to_string_lossy().to_string()
     }
 
+    fn resource_kinds(cwd: &Path) -> Vec<String> {
+        pi_project_trust_resources(cwd)
+            .into_iter()
+            .map(|resource| resource.kind)
+            .collect()
+    }
+
+    /// Drive the launch gate with an isolated pi agent dir and an isolated
+    /// codeg home (the acknowledgement store lives there, via `CODEG_HOME`).
+    fn launch_block_for(agent_dir: &Path, codeg_home: &Path, cwd: &Path) -> Option<String> {
+        temp_env::with_var(
+            "CODEG_HOME",
+            Some(codeg_home.to_string_lossy().to_string()),
+            || pi_project_trust_launch_block(cwd, &pi_env_for(agent_dir)),
+        )
+    }
+
+    /// Build a workspace shipping `.pi/extensions`, with `trust.json` saying
+    /// what `decision` says about the exact folder.
+    fn gated_workspace(tmp: &Path, decision: Option<bool>) -> (PathBuf, PathBuf, PathBuf) {
+        let ws = tmp.join("ws");
+        fs::create_dir_all(ws.join(".pi").join("extensions")).unwrap();
+        let agent_dir = tmp.join("agent");
+        fs::create_dir_all(&agent_dir).unwrap();
+        if let Some(verdict) = decision {
+            let mut map = serde_json::Map::new();
+            map.insert(canonical_key(&ws), serde_json::Value::Bool(verdict));
+            write_json_object_pretty(&agent_dir.join("trust.json"), &map).unwrap();
+        }
+        (ws, agent_dir, tmp.join("codeg-home"))
+    }
+
     #[test]
     fn pi_project_trust_resources_detect_executable_project_entries() {
         let tmp = tempfile::tempdir().expect("tempdir");
@@ -15988,17 +18529,107 @@ base_url = \"https://example.test/v1\"
         touch(&workspace.join(".pi/settings.json"));
         fs::create_dir_all(workspace.join(".pi/prompts")).unwrap();
 
-        let resources = pi_project_trust_resources(&workspace)
+        let by_kind = pi_project_trust_resources(&workspace)
             .into_iter()
             .map(|resource| (resource.kind, resource.executes_code))
             .collect::<BTreeMap<_, _>>();
-        assert_eq!(
-            resources.get(".pi/extensions"),
-            Some(&true),
-            "extensions execute during Pi startup",
+
+        assert_eq!(by_kind.get(".pi/extensions"), Some(&true));
+        assert_eq!(by_kind.get(".pi/settings.json"), Some(&true));
+        assert_eq!(by_kind.get(".pi/prompts"), Some(&false));
+    }
+
+    /// pi 1.x starts a trusted project's `.pi/mcp.json` servers, and a stdio
+    /// server is a command it runs: a repo shipping only that file is gated.
+    #[test]
+    fn pi_trust_gates_a_project_mcp_config_that_runs_commands() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let ws = tmp.path().join("ws");
+        touch(&ws.join(".pi").join("mcp.json"));
+
+        let resources = pi_project_trust_resources(&ws);
+        assert_eq!(resources.len(), 1);
+        assert_eq!(resources[0].kind, ".pi/mcp.json");
+        assert!(resources[0].executes_code);
+
+        let agent_dir = tmp.path().join("agent");
+        let mut map = serde_json::Map::new();
+        map.insert(canonical_key(&ws), serde_json::Value::Bool(true));
+        write_json_object_pretty(&agent_dir.join("trust.json"), &map).unwrap();
+        assert!(launch_block_for(&agent_dir, &tmp.path().join("codeg-home"), &ws).is_some());
+    }
+
+    /// A bare `.pi/` directory is not a project resource for pi, so codeg must not
+    /// prompt about it (`hasTrustRequiringProjectResources` ignores it too).
+    #[test]
+    fn pi_trust_resources_ignores_a_bare_pi_dir() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let ws = tmp.path().join("ws");
+        fs::create_dir_all(ws.join(".pi")).unwrap();
+
+        assert!(pi_project_trust_resources(&ws).is_empty());
+    }
+
+    /// pi walks ancestors for `.agents/skills`, so a parent directory's store is
+    /// gated for this workspace too.
+    #[test]
+    fn pi_trust_resources_walks_ancestors_for_agents_skills() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let parent = tmp.path().join("parent");
+        let ws = parent.join("repo");
+        fs::create_dir_all(&ws).unwrap();
+        fs::create_dir_all(parent.join(".agents").join("skills")).unwrap();
+
+        assert_eq!(resource_kinds(&ws), vec![".agents/skills".to_string()]);
+    }
+
+    /// `~/.agents/skills` is the USER's own store, not a repo's — pi excludes it
+    /// from the trust decision and so must codeg, or every workspace under $HOME
+    /// would raise a bogus prompt.
+    #[test]
+    fn pi_trust_resources_excludes_the_user_agents_skills_store() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let home = tmp.path().join("home");
+        let ws = home.join("repo");
+        fs::create_dir_all(&ws).unwrap();
+        fs::create_dir_all(home.join(".agents").join("skills")).unwrap();
+
+        // The home is injected rather than pinned through the env: on Windows
+        // `dirs::home_dir()` resolves the `FOLDERID_Profile` known folder and
+        // ignores `HOME`/`USERPROFILE`, so an env-pinned home would leave the real
+        // profile as the exclusion and report the fixture's store.
+        //
+        // Scope the assertion to the fixture as well — the ancestor walk climbs out
+        // of the tempdir into the machine's own directories, and on Windows the
+        // tempdir sits under that very profile dir.
+        let root = pi_canonical_path(tmp.path());
+        let from_fixture = pi_project_trust_resources_with_home(&ws, &home)
+            .into_iter()
+            .map(|resource| resource.path)
+            .filter(|path| Path::new(path).starts_with(&root))
+            .collect::<Vec<_>>();
+
+        assert!(
+            from_fixture.is_empty(),
+            "the user's own ~/.agents/skills must not count as a repo resource, got {from_fixture:?}",
         );
-        assert_eq!(resources.get(".pi/settings.json"), Some(&true));
-        assert_eq!(resources.get(".pi/prompts"), Some(&false));
+    }
+
+    /// The decision for the exact folder wins.
+    #[test]
+    fn pi_nearest_trust_decision_reads_the_exact_folder() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let ws = tmp.path().join("ws");
+        fs::create_dir_all(&ws).unwrap();
+        let trust = tmp.path().join("trust.json");
+        let mut map = serde_json::Map::new();
+        map.insert(canonical_key(&ws), serde_json::Value::Bool(false));
+        write_json_object_pretty(&trust, &map).unwrap();
+
+        assert_eq!(
+            pi_nearest_trust_decision(&trust, &ws),
+            Some((canonical_key(&ws), false)),
+        );
     }
 
     #[test]
@@ -16144,6 +18775,36 @@ base_url = \"https://example.test/v1\"
                 );
             }
         }
+    }
+
+    /// `trust.json` holds decisions the user made inside pi. If codeg can't parse
+    /// it, it must refuse loudly rather than rewrite the file from scratch.
+    /// pi reads `trust.json` past a byte-order mark, so a grant behind one is in
+    /// force for pi and must stop the launch here too.
+    #[test]
+    fn pi_launch_is_blocked_by_a_grant_behind_a_byte_order_mark() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let (ws, agent_dir, home) = gated_workspace(tmp.path(), Some(true));
+        let trust = agent_dir.join("trust.json");
+        let text = fs::read_to_string(&trust).unwrap();
+        fs::write(&trust, format!("\u{feff}{text}")).unwrap();
+
+        assert!(launch_block_for(&agent_dir, &home, &ws).is_some());
+    }
+
+    #[test]
+    fn pi_set_project_trust_reads_past_a_byte_order_mark() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let ws = tmp.path().join("ws");
+        fs::create_dir_all(&ws).unwrap();
+        let trust = tmp.path().join("trust.json");
+        fs::write(&trust, "\u{feff}{\"/elsewhere\":false}").unwrap();
+
+        pi_write_trust_decision_at(&trust, &ws, Some(true)).unwrap();
+
+        let map = read_json_object_or_empty(&trust);
+        assert_eq!(map.get("/elsewhere"), Some(&serde_json::json!(false)));
+        assert_eq!(map.get(&canonical_key(&ws)), Some(&serde_json::json!(true)));
     }
 
     #[test]
@@ -16335,6 +18996,7 @@ base_url = \"https://example.test/v1\"
             custom_base_url: None,
             custom_api: None,
             model_reasoning: None,
+            custom_models: None,
         };
         lookup_failed(
             acp_update_pi_config_core(update, &db, &EventEmitter::Noop)
@@ -16557,10 +19219,8 @@ base_url = \"https://example.test/v1\"
 
     #[cfg(unix)]
     fn fake_pi(dir: &Path, name: &str, body: &str) -> PathBuf {
-        use std::os::unix::fs::PermissionsExt;
         let script = dir.join(name);
-        fs::write(&script, format!("#!/bin/sh\n{body}")).unwrap();
-        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+        crate::process::write_test_script(&script, &format!("#!/bin/sh\n{body}"));
         script
     }
 
@@ -16749,6 +19409,59 @@ echo {"id":"codeg-models","type":"response","command":"get_available_models","su
         assert_eq!(models[0]["id"], "other", "untouched sibling stays put");
     }
 
+    /// The panel's list is the provider's list: a kept model stays as the user
+    /// tuned it, a new one gets exactly what pi's schema asks for, a dropped
+    /// one goes, and the chosen model is always there.
+    #[test]
+    fn pi_custom_models_take_the_panels_whole_list() {
+        let mut entry = serde_json::Map::new();
+        entry.insert(
+            "models".to_string(),
+            serde_json::json!([
+                { "id": "kept", "name": "Kept", "contextWindow": 400000 },
+                { "id": "dropped", "name": "Dropped" },
+                { "name": "no id: pi would reject the whole file" },
+            ]),
+        );
+        set_pi_custom_models(
+            &mut entry,
+            &[
+                " kept ".to_string(),
+                "fresh".to_string(),
+                "kept".to_string(),
+            ],
+            "chosen",
+        );
+        assert_eq!(
+            pi_models_of(&entry),
+            vec![
+                serde_json::json!({ "id": "kept", "name": "Kept", "contextWindow": 400000 }),
+                serde_json::json!({ "id": "fresh", "name": "fresh" }),
+                serde_json::json!({ "id": "chosen", "name": "chosen" }),
+            ]
+        );
+    }
+
+    #[test]
+    fn pi_stored_api_key_reads_only_an_api_key_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("auth.json"),
+            serde_json::json!({
+                "relay": { "type": "api_key", "key": " sk-relay " },
+                "oauthed": { "type": "oauth", "access": "token" },
+            })
+            .to_string(),
+        )
+        .unwrap();
+        assert_eq!(
+            pi_stored_api_key_at(dir.path(), "relay").as_deref(),
+            Some("sk-relay")
+        );
+        assert_eq!(pi_stored_api_key_at(dir.path(), "oauthed"), None);
+        assert_eq!(pi_stored_api_key_at(dir.path(), "missing"), None);
+    }
+
     /// Turning the switch off only flips the flag: the level selection stays on
     /// disk so re-enabling restores it instead of making the user re-pick.
     #[test]
@@ -16922,115 +19635,236 @@ echo {"id":"codeg-models","type":"response","command":"get_available_models","su
     }
 
     #[test]
-    fn opencode_auth_empty_payload_truncates_to_empty_object() {
-        // Clearing the last credential sends "" — it must persist `{}` (clearing
-        // the file), not be skipped (which would strand a stale key on disk).
-        assert_eq!(
-            opencode_auth_payload_to_write(Some("")),
-            Some("{}".to_string())
-        );
-        assert_eq!(
-            opencode_auth_payload_to_write(Some("   \n")),
-            Some("{}".to_string())
-        );
-    }
-
-    #[test]
-    fn opencode_auth_payload_preserves_non_empty_and_skips_none() {
-        let json = r#"{"openai":{"type":"api","key":"k"}}"#;
-        assert_eq!(
-            opencode_auth_payload_to_write(Some(json)),
-            Some(json.to_string())
-        );
-        // No payload supplied → leave auth.json untouched.
-        assert_eq!(opencode_auth_payload_to_write(None), None);
-    }
-
-    // Call-site guard: both acp_update_agent_config_core and
-    // acp_update_agent_preferences_core route OpenCode persistence through
-    // persist_opencode_native_config, so testing it covers both exposed paths.
-    #[test]
-    fn persist_opencode_native_config_empty_auth_clears_file() {
+    fn pi_enabled_model_patterns_read_from_the_launch_agent_dir() {
         let tmp = tempfile::tempdir().expect("tempdir");
-        // Pin HOME and clear XDG_DATA_HOME so the auth path resolves under the
-        // temp dir regardless of the developer's environment.
-        temp_env::with_vars(
-            [
-                ("HOME", Some(tmp.path())),
-                ("XDG_DATA_HOME", None::<&std::path::Path>),
-            ],
-            || {
-                let auth_path = opencode_auth_json_path();
-                fs::create_dir_all(auth_path.parent().unwrap()).expect("mkdir");
-                fs::write(&auth_path, r#"{"openai":{"type":"api","key":"k"}}"#).expect("seed");
+        fs::write(
+            tmp.path().join("settings.json"),
+            r#"{"enabledModels":["openai/*"," anthropic/claude-opus:high ",42,"  "]}"#,
+        )
+        .unwrap();
+        let env = BTreeMap::from([(
+            String::from("PI_CODING_AGENT_DIR"),
+            tmp.path().to_string_lossy().into_owned(),
+        )]);
 
-                // Disconnecting the last provider sends an empty auth payload: it
-                // must truncate auth.json to {}, not strand the stale credential.
-                persist_opencode_native_config(Some(""), None).expect("persist");
-
-                assert_eq!(fs::read_to_string(&auth_path).unwrap().trim(), "{}");
-            },
+        assert_eq!(
+            pi_enabled_model_patterns_for_env(&env, tmp.path()),
+            Some(vec![
+                "openai/*".to_string(),
+                "anthropic/claude-opus:high".to_string(),
+            ])
         );
     }
 
     #[test]
-    fn persist_opencode_native_config_none_auth_leaves_file() {
+    fn pi_enabled_model_patterns_treat_missing_or_empty_as_unscoped() {
         let tmp = tempfile::tempdir().expect("tempdir");
-        temp_env::with_vars(
-            [
-                ("HOME", Some(tmp.path())),
-                ("XDG_DATA_HOME", None::<&std::path::Path>),
-            ],
-            || {
-                let auth_path = opencode_auth_json_path();
-                fs::create_dir_all(auth_path.parent().unwrap()).expect("mkdir");
-                let original = "{\"openai\":{\"type\":\"api\",\"key\":\"k\"}}\n";
-                fs::write(&auth_path, original).expect("seed");
+        let env = BTreeMap::from([(
+            String::from("PI_CODING_AGENT_DIR"),
+            tmp.path().to_string_lossy().into_owned(),
+        )]);
 
-                // No auth payload supplied → file untouched.
-                persist_opencode_native_config(None, None).expect("persist");
+        assert_eq!(pi_enabled_model_patterns_for_env(&env, tmp.path()), None);
 
-                assert_eq!(fs::read_to_string(&auth_path).unwrap(), original);
-            },
+        fs::write(tmp.path().join("settings.json"), r#"{"enabledModels":[]}"#).unwrap();
+        assert_eq!(pi_enabled_model_patterns_for_env(&env, tmp.path()), None);
+        fs::write(tmp.path().join("settings.json"), "invalid json").unwrap();
+        assert_eq!(pi_enabled_model_patterns_for_env(&env, tmp.path()), None);
+    }
+
+    #[test]
+    fn pi_enabled_model_patterns_resolve_relative_agent_dir_in_workspace() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let agent_dir = tmp.path().join("agent");
+        fs::create_dir(&agent_dir).unwrap();
+        fs::write(
+            agent_dir.join("settings.json"),
+            r#"{"enabledModels":["openai/*"]}"#,
+        )
+        .unwrap();
+        let env = BTreeMap::from([("PI_CODING_AGENT_DIR".into(), "agent".into())]);
+
+        assert_eq!(
+            pi_enabled_model_patterns_for_env(&env, tmp.path()),
+            Some(vec!["openai/*".into()])
         );
     }
 
     #[test]
-    fn opencode_config_path_falls_back_when_xdg_config_home_empty() {
-        // An empty XDG_CONFIG_HOME must fall back to <home>/.config, not resolve
-        // to a relative "opencode/opencode.json". `dirs::home_dir()` ignores the
-        // HOME env var on Windows, so derive the expected base from the same
-        // resolution production uses instead of pinning HOME.
-        temp_env::with_var("XDG_CONFIG_HOME", Some(""), || {
+    fn pi_files_are_read_past_a_byte_order_mark() {
+        // pi strips a UTF-8 byte-order mark before parsing its files. Read as
+        // corrupt instead, the settings merge-write would replace every key
+        // the user had with codeg's three.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let settings = tmp.path().join("settings.json");
+        fs::write(
+            &settings,
+            "\u{feff}{\"enabledModels\":[\"openai/*\"],\"sessionDir\":\"/s\"}",
+        )
+        .unwrap();
+
+        let map = read_json_object_or_empty(&settings);
+        assert_eq!(map.get("sessionDir"), Some(&serde_json::json!("/s")));
+        let env = BTreeMap::from([(
+            String::from("PI_CODING_AGENT_DIR"),
+            tmp.path().to_string_lossy().into_owned(),
+        )]);
+        assert_eq!(
+            pi_enabled_model_patterns_for_env(&env, tmp.path()),
+            Some(vec!["openai/*".to_string()])
+        );
+    }
+
+    #[test]
+    fn pi_enabled_model_patterns_yield_to_a_project_that_sets_its_own() {
+        let agent_dir = tempfile::tempdir().expect("agent dir");
+        fs::write(
+            agent_dir.path().join("settings.json"),
+            r#"{"enabledModels":["openai/*"]}"#,
+        )
+        .unwrap();
+        let env = BTreeMap::from([(
+            String::from("PI_CODING_AGENT_DIR"),
+            agent_dir.path().to_string_lossy().into_owned(),
+        )]);
+        let workspace = tempfile::tempdir().expect("workspace");
+        let project = workspace.path().join(".pi");
+        fs::create_dir(&project).unwrap();
+        let global = Some(vec!["openai/*".to_string()]);
+
+        // A trusted project's list replaces the agent dir's — and an empty one
+        // unscopes pi — so whether pi trusts the project decides; codeg can't.
+        // A file codeg cannot parse might be one of those for pi's parser.
+        for own in [
+            r#"{"enabledModels":["anthropic/*"]}"#,
+            r#"{"enabledModels":[]}"#,
+            "\u{feff}{\"enabledModels\":[\"anthropic/*\"]}",
+            "not json",
+        ] {
+            fs::write(project.join("settings.json"), own).unwrap();
             assert_eq!(
-                opencode_primary_config_path(),
-                home_dir_or_default()
-                    .join(".config")
-                    .join("opencode")
-                    .join("opencode.json")
+                pi_enabled_model_patterns_for_env(&env, workspace.path()),
+                None,
+                "{own}"
             );
-        });
+        }
+        // A project file without the key, or JSON pi loads nothing from,
+        // leaves the agent dir's list in force.
+        for other in [r#"{"theme":"dark"}"#, "[]", "null"] {
+            fs::write(project.join("settings.json"), other).unwrap();
+            assert_eq!(
+                pi_enabled_model_patterns_for_env(&env, workspace.path()),
+                global,
+                "{other}"
+            );
+        }
     }
 
     #[test]
-    fn opencode_paths_follow_xdg_when_set() {
+    fn opencode_config_dir_falls_back_when_xdg_config_home_empty() {
+        // An empty XDG_CONFIG_HOME must fall back to <home>/.config, not resolve
+        // to a relative "opencode/…" path. `dirs::home_dir()` ignores the HOME
+        // env var on Windows, so derive the expected base from the same
+        // resolution production uses instead of pinning HOME.
+        temp_env::with_vars(
+            [
+                ("XDG_CONFIG_HOME", Some("")),
+                ("OPENCODE_CONFIG_DIR", None::<&str>),
+            ],
+            || {
+                assert_eq!(
+                    crate::acp::opencode_config::config_dir(),
+                    Some(home_dir_or_default().join(".config").join("opencode"))
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn opencode_paths_follow_xdg_and_opencode_config_dir() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let cfg = tmp.path().join("xdg-config");
-        let data = tmp.path().join("xdg-data");
+        let own = tmp.path().join("own-config");
         temp_env::with_vars(
             [
                 ("HOME", Some(tmp.path())),
                 ("XDG_CONFIG_HOME", Some(cfg.as_path())),
-                ("XDG_DATA_HOME", Some(data.as_path())),
+                ("OPENCODE_CONFIG_DIR", None::<&std::path::Path>),
             ],
             || {
                 assert_eq!(
-                    opencode_primary_config_path(),
+                    resolve_opencode_config_path(),
                     cfg.join("opencode").join("opencode.json")
                 );
+                // OpenCode 2 loads opencode.jsonc after opencode.json, so the
+                // .jsonc file is the one whose keys take effect.
+                fs::create_dir_all(cfg.join("opencode")).expect("mkdir");
+                fs::write(cfg.join("opencode").join("opencode.json"), "{}").expect("json");
+                fs::write(cfg.join("opencode").join("opencode.jsonc"), "{}").expect("jsonc");
                 assert_eq!(
-                    opencode_auth_json_path(),
-                    data.join("opencode").join("auth.json")
+                    resolve_opencode_config_path(),
+                    cfg.join("opencode").join("opencode.jsonc")
+                );
+            },
+        );
+        // OPENCODE_CONFIG_DIR replaces the XDG directory in OpenCode 2.
+        temp_env::with_vars(
+            [
+                ("XDG_CONFIG_HOME", Some(cfg.as_path())),
+                ("OPENCODE_CONFIG_DIR", Some(own.as_path())),
+            ],
+            || {
+                assert_eq!(resolve_opencode_config_path(), own.join("opencode.json"));
+            },
+        );
+    }
+
+    #[test]
+    fn opencode_config_text_round_trips_with_comments() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let cfg = tmp.path().join("xdg-config");
+        temp_env::with_vars(
+            [
+                ("XDG_CONFIG_HOME", Some(cfg.as_path())),
+                ("OPENCODE_CONFIG_DIR", None::<&std::path::Path>),
+            ],
+            || {
+                let dir = cfg.join("opencode");
+                fs::create_dir_all(&dir).expect("mkdir");
+                let text = "{\n  // my model\n  \"model\": \"a/b\",\n}\n";
+                fs::write(dir.join("opencode.jsonc"), format!("\u{feff}{text}")).expect("seed");
+                // Loaded as written (BOM aside): comments and trailing commas
+                // reach the panel instead of a re-serialized copy.
+                assert_eq!(
+                    load_agent_local_config_json(AgentType::OpenCode).as_deref(),
+                    Some(text)
+                );
+
+                let edited = "{\n  // my model\n  \"model\": \"c/d\",\n}";
+                persist_agent_local_config_json(AgentType::OpenCode, Some(edited))
+                    .expect("persist");
+                assert_eq!(
+                    fs::read_to_string(dir.join("opencode.jsonc")).expect("read"),
+                    format!("{edited}\n")
+                );
+                // No stray opencode.json next to it.
+                assert!(!dir.join("opencode.json").exists());
+
+                // Text OpenCode could not load is refused, and the file kept.
+                let err = persist_agent_local_config_json(AgentType::OpenCode, Some("{'a': 1}"))
+                    .expect_err("single quotes are not JSONC");
+                assert!(err.to_string().contains("invalid OpenCode config"), "{err}");
+                assert_eq!(
+                    fs::read_to_string(dir.join("opencode.jsonc")).expect("read"),
+                    format!("{edited}\n")
+                );
+
+                // Invalid text on disk still reaches the panel, so a save
+                // cannot silently replace it with an empty config.
+                fs::write(dir.join("opencode.jsonc"), "{ \"model\": ").expect("broken");
+                assert_eq!(
+                    load_agent_local_config_json(AgentType::OpenCode).as_deref(),
+                    Some("{ \"model\": ")
                 );
             },
         );
@@ -17874,6 +20708,104 @@ wire_api = "chat"
         assert_eq!(models[1].label, "");
     }
 
+    /// A Claude launch carries the `/model` picker ids of whoever owns the
+    /// model list: the bound provider, else the unbound panel; never an id the
+    /// per-agent env slipped under the launch key.
+    #[tokio::test]
+    async fn a_claude_launch_carries_the_picker_of_whoever_owns_the_models() {
+        use crate::acp::claude_model_picker::{decode, LAUNCH_KEY};
+        use crate::db::entities::agent_setting;
+        let db = crate::db::test_helpers::fresh_in_memory_db().await;
+        let setting = |provider: Option<i32>| agent_setting::Model {
+            id: 1,
+            agent_type: "claude_code".to_string(),
+            registry_id: "claude-code".to_string(),
+            enabled: true,
+            show_thinking: true,
+            sort_order: 0,
+            installed_version: None,
+            env_json: None,
+            model_provider_id: provider,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        };
+        let picked = |env: &BTreeMap<String, String>| env.get(LAUNCH_KEY).map(|raw| decode(raw));
+        let gateway = || {
+            BTreeMap::from([(
+                "ANTHROPIC_BASE_URL".to_string(),
+                "https://relay.example".to_string(),
+            )])
+        };
+
+        store_claude_model_picker(
+            &[
+                " glm-5.2 ".to_string(),
+                "kimi-k3".to_string(),
+                "glm-5.2".to_string(),
+            ],
+            &db.conn,
+        )
+        .await
+        .unwrap();
+        let mut env = gateway();
+        env.insert(LAUNCH_KEY.to_string(), "[\"slipped\"]".to_string());
+        apply_claude_model_picker_env(Some(&setting(None)), &mut env, &db.conn).await;
+        assert_eq!(
+            picked(&env),
+            Some(vec!["glm-5.2".to_string(), "kimi-k3".to_string()])
+        );
+
+        let provider = model_provider_service::create(
+            &db.conn,
+            "Relay".to_string(),
+            "https://relay.example".to_string(),
+            "sk".to_string(),
+            "claude_code".to_string(),
+            Some(r#"{"main":"qwen-4","pickerModels":["qwen-4"]}"#.to_string()),
+        )
+        .await
+        .unwrap();
+        let mut env = gateway();
+        apply_claude_model_picker_env(Some(&setting(Some(provider.id))), &mut env, &db.conn).await;
+        assert_eq!(picked(&env), Some(vec!["qwen-4".to_string()]));
+
+        // A bound provider without picker ids adds none, the panel's included.
+        let bare = model_provider_service::create(
+            &db.conn,
+            "Bare".to_string(),
+            "https://relay.example".to_string(),
+            "sk".to_string(),
+            "claude_code".to_string(),
+            Some(r#"{"main":"qwen-4"}"#.to_string()),
+        )
+        .await
+        .unwrap();
+        let mut env = gateway();
+        env.insert(LAUNCH_KEY.to_string(), "[\"slipped\"]".to_string());
+        apply_claude_model_picker_env(Some(&setting(Some(bare.id))), &mut env, &db.conn).await;
+        assert_eq!(picked(&env), None);
+
+        // Against Anthropic's own API (no gateway), none are added.
+        store_claude_model_picker(&["glm-5.2".to_string()], &db.conn)
+            .await
+            .unwrap();
+        let mut env = BTreeMap::new();
+        apply_claude_model_picker_env(Some(&setting(None)), &mut env, &db.conn).await;
+        assert_eq!(picked(&env), None);
+
+        // Storing none clears the panel's.
+        store_claude_model_picker(&[], &db.conn).await.unwrap();
+        let mut env = gateway();
+        apply_claude_model_picker_env(Some(&setting(None)), &mut env, &db.conn).await;
+        assert_eq!(picked(&env), None);
+        let too_many: Vec<String> = (0..=crate::acp::claude_model_picker::MAX_MODELS)
+            .map(|i| format!("m{i}"))
+            .collect();
+        assert!(store_claude_model_picker(&too_many, &db.conn)
+            .await
+            .is_err());
+    }
+
     #[tokio::test]
     async fn find_connection_for_conversation_core_returns_info_when_bound() {
         // A live connection bound to the conversation → discovery returns its
@@ -17884,6 +20816,7 @@ wire_api = "chat"
         use crate::web::event_bridge::EventEmitter;
 
         let mgr = ConnectionManager::new();
+        let db = crate::db::test_helpers::fresh_in_memory_db().await;
         mgr.insert_test_connection("c1", AgentType::ClaudeCode, None, EventEmitter::Noop)
             .await;
         {
@@ -17893,10 +20826,16 @@ wire_api = "chat"
             s.event_seq = 7;
         }
 
-        let info = acp_find_connection_for_conversation_core(&mgr, 42, None, AgentType::ClaudeCode)
-            .await
-            .expect("ok")
-            .expect("a live connection is bound to conversation 42");
+        let info = acp_find_connection_for_conversation_core(
+            &mgr,
+            &db.conn,
+            42,
+            None,
+            AgentType::ClaudeCode,
+        )
+        .await
+        .expect("ok")
+        .expect("a live connection is bound to conversation 42");
         assert_eq!(info.connection_id, "c1");
         assert_eq!(info.event_seq, 7);
     }
@@ -17910,14 +20849,19 @@ wire_api = "chat"
         use crate::web::event_bridge::EventEmitter;
 
         let mgr = ConnectionManager::new();
+        let db = crate::db::test_helpers::fresh_in_memory_db().await;
         mgr.insert_test_connection("c1", AgentType::ClaudeCode, None, EventEmitter::Noop)
             .await;
-        assert!(
-            acp_find_connection_for_conversation_core(&mgr, 999, None, AgentType::ClaudeCode)
-                .await
-                .expect("ok")
-                .is_none()
-        );
+        assert!(acp_find_connection_for_conversation_core(
+            &mgr,
+            &db.conn,
+            999,
+            None,
+            AgentType::ClaudeCode
+        )
+        .await
+        .expect("ok")
+        .is_none());
     }
 
     #[tokio::test]
@@ -17932,6 +20876,7 @@ wire_api = "chat"
         use crate::web::event_bridge::EventEmitter;
 
         let mgr = ConnectionManager::new();
+        let db = crate::db::test_helpers::fresh_in_memory_db().await;
         mgr.insert_test_connection("c1", AgentType::ClaudeCode, None, EventEmitter::Noop)
             .await;
         {
@@ -17944,16 +20889,23 @@ wire_api = "chat"
 
         // by-conversation misses, no session fallback → None.
         assert!(
-            acp_find_connection_for_conversation_core(&mgr, 42, None, AgentType::ClaudeCode)
-                .await
-                .expect("ok")
-                .is_none(),
+            acp_find_connection_for_conversation_core(
+                &mgr,
+                &db.conn,
+                42,
+                None,
+                AgentType::ClaudeCode
+            )
+            .await
+            .expect("ok")
+            .is_none(),
             "without a session_id fallback an unbound connection is undiscoverable"
         );
 
         // session fallback finds the live owner (matching agent_type).
         let info = acp_find_connection_for_conversation_core(
             &mgr,
+            &db.conn,
             42,
             Some("sess-abc"),
             AgentType::ClaudeCode,
@@ -17967,6 +20919,7 @@ wire_api = "chat"
         // a non-matching session id still misses.
         assert!(acp_find_connection_for_conversation_core(
             &mgr,
+            &db.conn,
             42,
             Some("other"),
             AgentType::ClaudeCode
@@ -17979,10 +20932,16 @@ wire_api = "chat"
         // (external_id is unique only per agent) — otherwise a viewer could
         // attach to the wrong agent's connection.
         assert!(
-            acp_find_connection_for_conversation_core(&mgr, 42, Some("sess-abc"), AgentType::Codex)
-                .await
-                .expect("ok")
-                .is_none(),
+            acp_find_connection_for_conversation_core(
+                &mgr,
+                &db.conn,
+                42,
+                Some("sess-abc"),
+                AgentType::Codex
+            )
+            .await
+            .expect("ok")
+            .is_none(),
             "external_id fallback must be scoped by agent_type"
         );
     }
@@ -17997,6 +20956,7 @@ wire_api = "chat"
         use crate::models::AgentType;
         use crate::web::event_bridge::EventEmitter;
 
+        let db = crate::db::test_helpers::fresh_in_memory_db().await;
         for terminal in [ConnectionStatus::Disconnected, ConnectionStatus::Error] {
             let mgr = ConnectionManager::new();
             mgr.insert_test_connection("c1", AgentType::ClaudeCode, None, EventEmitter::Noop)
@@ -18008,10 +20968,16 @@ wire_api = "chat"
                 s.status = terminal.clone();
             }
             assert!(
-                acp_find_connection_for_conversation_core(&mgr, 42, None, AgentType::ClaudeCode)
-                    .await
-                    .expect("ok")
-                    .is_none(),
+                acp_find_connection_for_conversation_core(
+                    &mgr,
+                    &db.conn,
+                    42,
+                    None,
+                    AgentType::ClaudeCode
+                )
+                .await
+                .expect("ok")
+                .is_none(),
                 "terminal status {terminal:?} must not be returned as a live connection"
             );
         }
@@ -18183,10 +21149,11 @@ wire_api = "chat"
     // own version is also the recorded fallback when detection comes up empty.
     #[test]
     fn hermes_custom_version_spec_keeps_lifecycle_scripts_and_records_its_version() {
-        let spec = build_npm_install_spec("hermes-agent@0.21.6", Some("0.22.0")).unwrap();
-        assert_eq!(spec, "hermes-agent@0.22.0");
+        let spec = build_npm_install_spec("hermes-agent@0.23.1", Some("0.24.0")).unwrap();
+        assert_eq!(spec, "hermes-agent@0.24.0");
         assert!(npm_package_requires_scripts(&spec));
-        assert_eq!(version_from_package_spec(&spec).as_deref(), Some("0.22.0"));
+        assert!(npm_package_bootstraps_runtime(&spec));
+        assert_eq!(version_from_package_spec(&spec).as_deref(), Some("0.24.0"));
     }
 
     #[test]
@@ -18305,8 +21272,10 @@ wire_api = "chat"
                     request_npm_prefix: Some(Some(prefix.clone())),
                     ..Default::default()
                 };
-                let listed = resolver.resolve_for_list(cmd).await;
-                let listed_prefix_only = resolver.resolve_for_list(prefix_only_cmd).await;
+                let listed = resolver.resolve_for_list(AgentType::Hermes, cmd).await;
+                let listed_prefix_only = resolver
+                    .resolve_for_list(AgentType::Hermes, prefix_only_cmd)
+                    .await;
                 (direct, listed, listed_prefix_only)
             })
             .await;
@@ -18316,6 +21285,207 @@ wire_api = "chat"
         assert_eq!(
             listed_prefix_only.as_deref(),
             Some(prefix_only_path.as_path())
+        );
+    }
+
+    /// A `grok` in `~/.grok/bin` (`grok.exe` on Windows) counts as Grok's
+    /// native install unless it is the npm package's copy, the one `npm
+    /// uninstall -g` leaves behind: recorded as npm's, or, with no record,
+    /// laid out as the npm package lays it out (see the layout tests below).
+    #[test]
+    fn grok_native_install_counts_any_copy_but_the_npm_packages() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let grok_dir = home.path().join(".grok");
+        let bin = grok_dir
+            .join("bin")
+            .join(binary_cache::executable_file_name("grok"));
+        let config = grok_dir.join("config.toml");
+        let found = || grok_native_install(home.path(), "grok");
+
+        std::fs::create_dir_all(&grok_dir).expect("create grok dir");
+        std::fs::write(&config, "[cli]\r\ninstaller = \"internal\"\r\n").expect("write config");
+        assert_eq!(found(), None, "an installer record alone is not an install");
+
+        std::fs::create_dir_all(bin.parent().expect("bin dir")).expect("create bin dir");
+        std::fs::write(&bin, "").expect("write grok");
+        // The record as `install.ps1` writes it, with CRLF line endings.
+        assert_eq!(found().as_deref(), Some(bin.as_path()));
+
+        // Without an npm record, a copy with no build of the npm package's
+        // beside it still counts.
+        for other in ["", "[cli]\nauto_update = false\n", "not = [toml"] {
+            std::fs::write(&config, other).expect("write config");
+            assert_eq!(found().as_deref(), Some(bin.as_path()), "config: {other:?}");
+        }
+        std::fs::remove_file(&config).expect("remove config");
+        assert_eq!(found().as_deref(), Some(bin.as_path()), "no config");
+
+        // What `@xai-official/grok`'s postinstall writes; its copy outlives
+        // `npm uninstall -g`.
+        std::fs::write(&config, "[cli]\ninstaller = \"npm\"\nauto_update = true\n")
+            .expect("write config");
+        assert_eq!(found(), None);
+    }
+
+    /// Where npm skipped the postinstall, the package's launcher unpacks the
+    /// build on its first run and records no installer, and the copy is told
+    /// apart by its layout. This is the Windows one, which the test can build
+    /// on any host: `grok.exe` copied from the `grok-<version>.exe` beside it.
+    #[test]
+    fn grok_native_install_skips_an_unrecorded_copy_of_an_npm_build() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let grok_dir = home.path().join(".grok");
+        let bin_dir = grok_dir.join("bin");
+        let bin = bin_dir.join(binary_cache::executable_file_name("grok"));
+        let build_name = |stem: &str| format!("{stem}{}", std::env::consts::EXE_SUFFIX);
+        let build = bin_dir.join(build_name("grok-1.0.70"));
+        let config = grok_dir.join("config.toml");
+        let found = || grok_native_install(home.path(), "grok");
+
+        std::fs::create_dir_all(&bin_dir).expect("create bin dir");
+        std::fs::write(&build, "build 1.0.70").expect("write build");
+        std::fs::write(&bin, "build 1.0.70").expect("write copy");
+        // The launcher's first run leaves no config; a turn then writes one
+        // with a `[cli]` table and still no installer.
+        assert_eq!(found(), None, "no config");
+        std::fs::write(&config, "[cli]\nauto_update = true\n").expect("write config");
+        assert_eq!(found(), None, "no installer");
+
+        // A record decides over the layout.
+        std::fs::write(&config, "[cli]\ninstaller = \"internal\"\n").expect("write config");
+        assert_eq!(found().as_deref(), Some(bin.as_path()));
+        std::fs::remove_file(&config).expect("remove config");
+
+        // A `grok` that is no copy of that build counts, and so does one beside
+        // files that only look like builds (the pager's, another `grok-…`).
+        std::fs::write(&bin, "another build").expect("write other");
+        assert_eq!(found().as_deref(), Some(bin.as_path()));
+        std::fs::remove_file(&build).expect("remove build");
+        for name in ["grok-pager-1.0.70", "grok-latest"] {
+            let lookalike = bin_dir.join(build_name(name));
+            std::fs::write(&lookalike, "another build").expect("write lookalike");
+            assert_eq!(found().as_deref(), Some(bin.as_path()), "{name}");
+            std::fs::remove_file(&lookalike).expect("remove lookalike");
+        }
+    }
+
+    /// The Unix layout: npm links `grok` to the bare name of the build beside
+    /// it, where Grok's own installers link it into `~/.grok/downloads`.
+    #[cfg(unix)]
+    #[test]
+    fn grok_native_install_skips_an_unrecorded_link_to_an_npm_build() {
+        use std::os::unix::fs::symlink;
+
+        let home = tempfile::tempdir().expect("tempdir");
+        let grok_dir = home.path().join(".grok");
+        let bin_dir = grok_dir.join("bin");
+        let downloads = grok_dir.join("downloads");
+        let bin = bin_dir.join("grok");
+        let found = || grok_native_install(home.path(), "grok");
+        std::fs::create_dir_all(&bin_dir).expect("create bin dir");
+        std::fs::create_dir_all(&downloads).expect("create downloads");
+        std::fs::write(bin_dir.join("grok-1.0.70"), "build 1.0.70").expect("write build");
+        std::fs::write(downloads.join("grok-macos-aarch64"), "build").expect("write download");
+        let relink = |target: &Path| {
+            let _ = std::fs::remove_file(&bin);
+            symlink(target, &bin).expect("link grok");
+        };
+
+        // What the npm launcher and postinstall leave, with no record.
+        relink(Path::new("grok-1.0.70"));
+        assert_eq!(found(), None);
+        std::fs::write(grok_dir.join("config.toml"), "[cli]\nauto_update = true\n")
+            .expect("write config");
+        assert_eq!(found(), None, "a config without an installer");
+
+        // install.sh's relative link, and the absolute one it makes when the
+        // bin and download directories have different parents.
+        let absolute = downloads.join("grok-macos-aarch64");
+        for target in [
+            Path::new("../downloads/grok-macos-aarch64"),
+            absolute.as_path(),
+        ] {
+            relink(target);
+            assert_eq!(found().as_deref(), Some(bin.as_path()), "{target:?}");
+        }
+    }
+
+    #[cfg(not(windows))]
+    #[tokio::test]
+    async fn grok_native_install_is_the_last_npx_fallback() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let home = tempfile::tempdir().expect("tempdir");
+        let grok_dir = home.path().join(".grok");
+        let native_bin = grok_dir.join("bin");
+        let local_bin = home.path().join(".local").join("bin");
+        let prefix = home.path().join("npm-prefix");
+        let prefix_bin = npm_prefix_bin_dir(&prefix);
+        // Names nothing on the real PATH or npm prefix can answer.
+        let native_only = "codeg-test-grok-native-only";
+        let with_local_bin = "codeg-test-grok-native-and-local-bin";
+        let with_npm = "codeg-test-grok-native-and-npm-prefix";
+        for path in [
+            native_bin.join(native_only),
+            native_bin.join(with_local_bin),
+            local_bin.join(with_local_bin),
+            native_bin.join(with_npm),
+            prefix_bin.join(with_npm),
+        ] {
+            std::fs::create_dir_all(path.parent().expect("bin directory"))
+                .expect("create bin directory");
+            std::fs::write(&path, "").expect("write command");
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+                .expect("mark command executable");
+        }
+        std::fs::write(
+            grok_dir.join("config.toml"),
+            "[cli]\ninstaller = \"internal\"\n",
+        )
+        .expect("write config");
+
+        let got = temp_env::async_with_vars([("HOME", Some(home.path()))], async {
+            let mut resolver = NpxCommandResolver {
+                request_npm_prefix: Some(Some(prefix.clone())),
+                ..Default::default()
+            };
+            (
+                resolve_npx_command(native_only).await,
+                resolve_npx_command_for(AgentType::Grok, native_only).await,
+                resolve_npx_command_for(AgentType::Hermes, native_only).await,
+                is_cmd_available(AgentType::Grok, native_only).await,
+                resolver
+                    .resolve_for_list(AgentType::Grok, native_only)
+                    .await,
+                // Asked after Grok's lookup cached the command.
+                resolver
+                    .resolve_for_list(AgentType::Hermes, native_only)
+                    .await,
+                resolve_npx_command_for(AgentType::Grok, with_local_bin).await,
+                resolver.resolve_for_list(AgentType::Grok, with_npm).await,
+            )
+        })
+        .await;
+
+        let native = native_bin.join(native_only);
+        assert_eq!(got.0, None);
+        assert_eq!(got.1.as_deref(), Some(native.as_path()));
+        assert_eq!(got.2, None, "only Grok looks in ~/.grok/bin");
+        assert!(got.3, "the connect guard agrees");
+        assert_eq!(got.4.as_deref(), Some(native.as_path()), "the list agrees");
+        assert_eq!(
+            got.5, None,
+            "the list cache does not leak it to another agent"
+        );
+        assert_eq!(
+            got.6.as_deref(),
+            Some(local_bin.join(with_local_bin).as_path()),
+            "~/.local/bin still wins"
+        );
+        assert_eq!(
+            got.7.as_deref(),
+            Some(prefix_bin.join(with_npm).as_path()),
+            "the npm copy still wins"
         );
     }
 
@@ -18610,9 +21780,118 @@ wire_api = "chat"
         );
     }
 
+    /// A key the user added to `providers.codeg` is theirs to keep when the
+    /// panel moves to another provider, which takes back only codeg's
+    /// endpoint and key and switches the entry off; moving back to custom
+    /// writes them in beside it and switches it on again.
     #[test]
-    fn merge_hermes_model_config_custom_writes_and_clears_inline_key() {
-        // custom writes the key inline in `model.api_key` (+ keeps base_url).
+    fn a_hermes_codeg_provider_with_a_key_of_the_users_own_stays() {
+        let own = "model:\n  provider: custom:codeg\n  default: m\nproviders:\n  codeg:\n    base_url: https://gw/v1\n    api_key: sk\n    api_mode: chat_completions\n    extra_headers:\n      X-Team: a\n    models:\n      kimi-k3: {}\n";
+        let switched = merge_hermes_model_config(
+            Some(own),
+            "anthropic",
+            "claude",
+            BaseUrlWrite::Set(""),
+            InlineApiKeyWrite::Clear,
+        )
+        .unwrap();
+        let entry = hermes_codeg_entry(&switched);
+        let keys: Vec<_> = entry
+            .as_mapping()
+            .unwrap()
+            .keys()
+            .filter_map(|k| k.as_str())
+            .collect();
+        assert_eq!(keys, ["extra_headers", "models", "enabled"], "{switched}");
+        assert_eq!(entry.get("enabled"), Some(&serde_yaml::Value::Bool(false)));
+        // Saving another provider again leaves it as it is.
+        let again = merge_hermes_model_config(
+            Some(&switched),
+            "openrouter",
+            "m",
+            BaseUrlWrite::Preserve,
+            InlineApiKeyWrite::Clear,
+        )
+        .unwrap();
+        assert_eq!(hermes_codeg_entry(&again), entry);
+
+        let back = merge_hermes_model_config(
+            Some(&switched),
+            "custom",
+            "m",
+            BaseUrlWrite::Set("https://gw/v1"),
+            InlineApiKeyWrite::Set {
+                key: "sk",
+                scrub_mode: true,
+            },
+        )
+        .unwrap();
+        let entry = hermes_codeg_entry(&back);
+        assert_eq!(
+            entry.get("base_url").and_then(|v| v.as_str()),
+            Some("https://gw/v1")
+        );
+        assert_eq!(entry.get("api_key").and_then(|v| v.as_str()), Some("sk"));
+        assert!(entry.get("enabled").is_none(), "{back}");
+        assert_eq!(
+            entry
+                .get("extra_headers")
+                .and_then(|h| h.get("X-Team"))
+                .and_then(|v| v.as_str()),
+            Some("a"),
+            "{back}"
+        );
+    }
+
+    #[test]
+    fn the_panel_reads_codegs_named_provider_back_as_custom() {
+        let written = merge_hermes_model_config(
+            None,
+            "custom",
+            "glm-5.2",
+            BaseUrlWrite::Set("https://gw/v1"),
+            InlineApiKeyWrite::Set {
+                key: "sk-gw",
+                scrub_mode: true,
+            },
+        )
+        .unwrap();
+        let expected = HermesModelProjection {
+            provider: Some("custom".into()),
+            model: Some("glm-5.2".into()),
+            base_url: Some("https://gw/v1".into()),
+            api_key: Some("sk-gw".into()),
+        };
+        assert_eq!(hermes_model_projection(&written), expected);
+        // An inline custom config from before reads the same.
+        let inline = "model:\n  provider: custom\n  default: glm-5.2\n  base_url: https://gw/v1\n  api_key: sk-gw\n";
+        assert_eq!(hermes_model_projection(inline), expected);
+        // Another provider's endpoint is its own model section's.
+        let other = hermes_model_projection(
+            "model:\n  provider: openrouter\n  default: m\nproviders:\n  codeg:\n    base_url: https://stale/v1\n",
+        );
+        assert_eq!(other.provider.as_deref(), Some("openrouter"));
+        assert_eq!(other.base_url, None);
+        assert_eq!(
+            hermes_model_projection("not: [valid"),
+            HermesModelProjection::default()
+        );
+    }
+
+    /// `providers.codeg` of a written config.
+    fn hermes_codeg_entry(yaml: &str) -> serde_yaml::Value {
+        let value: serde_yaml::Value = serde_yaml::from_str(yaml).expect("parse");
+        value
+            .get("providers")
+            .and_then(|p| p.get(HERMES_CODEG_PROVIDER))
+            .cloned()
+            .unwrap_or(serde_yaml::Value::Null)
+    }
+
+    #[test]
+    fn merge_hermes_model_config_custom_writes_codegs_named_provider() {
+        // custom is codeg's named provider: endpoint + key in providers.codeg,
+        // picked with `custom:codeg`, none of them inline any more.
         let with_key = merge_hermes_model_config(
             None,
             "custom",
@@ -18635,11 +21914,30 @@ wire_api = "chat"
             Some("sk-abc")
         );
         assert_eq!(
-            model.get("base_url").and_then(|v| v.as_str()),
+            model.get("provider").and_then(|v| v.as_str()),
+            Some("custom:codeg")
+        );
+        assert_eq!(
+            model.get("default").and_then(|v| v.as_str()),
+            Some("gpt-5.5")
+        );
+        assert!(model.get("api_key").is_none() && model.get("base_url").is_none());
+        let entry = hermes_codeg_entry(&with_key);
+        assert_eq!(
+            entry.get("api_key").and_then(|v| v.as_str()),
+            Some("sk-abc")
+        );
+        assert_eq!(
+            entry.get("base_url").and_then(|v| v.as_str()),
             Some("https://endpoint.test/v1")
         );
+        // The panel still reads it as `custom`.
+        assert_eq!(
+            existing_hermes_model_provider(Some(&with_key)).as_deref(),
+            Some("custom")
+        );
 
-        // A blank inline key drops the field (keyless local server).
+        // A blank key drops it (keyless local server).
         let keyless = merge_hermes_model_config(
             Some(&with_key),
             "custom",
@@ -18651,15 +21949,13 @@ wire_api = "chat"
             },
         )
         .expect("merge keyless");
-        let value: serde_yaml::Value = serde_yaml::from_str(&keyless).expect("parse");
-        assert!(value.get("model").and_then(|m| m.get("api_key")).is_none());
+        assert!(hermes_codeg_entry(&keyless).get("api_key").is_none());
 
-        // custom→custom re-save with scrub_mode=false preserves a raw-editor
-        // `api_mode`; switching in with scrub_mode=true drops it.
-        let with_mode =
-            "model:\n  provider: custom\n  default: m\n  api_mode: anthropic_messages\n";
+        // An inline config from before moves over, keeping a raw-editor
+        // `api_mode` on a custom→custom re-save; switching in scrubs it.
+        let inline = "model:\n  provider: custom\n  default: m\n  base_url: https://old/v1\n  api_key: sk-old\n  api_mode: anthropic_messages\nproviders:\n  mine:\n    base_url: https://mine/v1\n";
         let resaved = merge_hermes_model_config(
-            Some(with_mode),
+            Some(inline),
             "custom",
             "m",
             BaseUrlWrite::Set("https://e/v1"),
@@ -18669,17 +21965,36 @@ wire_api = "chat"
             },
         )
         .expect("merge resave");
-        let value: serde_yaml::Value = serde_yaml::from_str(&resaved).expect("parse");
+        let entry = hermes_codeg_entry(&resaved);
         assert_eq!(
-            value
-                .get("model")
-                .and_then(|m| m.get("api_mode"))
-                .and_then(|v| v.as_str()),
+            entry.get("api_mode").and_then(|v| v.as_str()),
             Some("anthropic_messages"),
             "custom→custom re-save preserves api_mode"
         );
+        assert_eq!(
+            entry.get("base_url").and_then(|v| v.as_str()),
+            Some("https://e/v1")
+        );
+        assert_eq!(entry.get("api_key").and_then(|v| v.as_str()), Some("sk-1"));
+        let value: serde_yaml::Value = serde_yaml::from_str(&resaved).expect("parse");
+        let model = value.get("model").expect("model section");
+        for field in ["base_url", "api_key", "api_mode"] {
+            assert!(
+                model.get(field).is_none(),
+                "{field} moved to providers.codeg"
+            );
+        }
+        assert_eq!(
+            value
+                .get("providers")
+                .and_then(|p| p.get("mine"))
+                .and_then(|m| m.get("base_url"))
+                .and_then(|v| v.as_str()),
+            Some("https://mine/v1"),
+            "the user's own providers stay"
+        );
         let switched_in = merge_hermes_model_config(
-            Some(with_mode),
+            Some(inline),
             "custom",
             "m",
             BaseUrlWrite::Set("https://e/v1"),
@@ -18689,32 +22004,35 @@ wire_api = "chat"
             },
         )
         .expect("merge switch-in");
-        let value: serde_yaml::Value = serde_yaml::from_str(&switched_in).expect("parse");
         assert!(
-            value.get("model").and_then(|m| m.get("api_mode")).is_none(),
+            hermes_codeg_entry(&switched_in).get("api_mode").is_none(),
             "switching TO custom scrubs a stale api_mode"
         );
 
-        // Switching to a keyed provider scrubs the stale inline key + api_mode.
+        // Switching to a keyed provider drops codeg's provider, and any stale
+        // inline key + mode.
         let stale = "model:\n  provider: custom\n  default: gpt-5.5\n  api_key: sk-old\n  api_mode: chat_completions\n";
-        let switched = merge_hermes_model_config(
-            Some(stale),
-            "anthropic",
-            "claude",
-            BaseUrlWrite::Set(""),
-            InlineApiKeyWrite::Clear,
-        )
-        .expect("merge switch");
-        let value: serde_yaml::Value = serde_yaml::from_str(&switched).expect("parse");
-        let model = value.get("model").expect("model section");
-        assert!(
-            model.get("api_key").is_none(),
-            "stale inline key must be scrubbed"
-        );
-        assert!(
-            model.get("api_mode").is_none(),
-            "stale api_mode must be scrubbed"
-        );
+        for before in [stale, resaved.as_str()] {
+            let switched = merge_hermes_model_config(
+                Some(before),
+                "anthropic",
+                "claude",
+                BaseUrlWrite::Set(""),
+                InlineApiKeyWrite::Clear,
+            )
+            .expect("merge switch");
+            let value: serde_yaml::Value = serde_yaml::from_str(&switched).expect("parse");
+            let model = value.get("model").expect("model section");
+            assert!(
+                model.get("api_key").is_none(),
+                "stale inline key must be scrubbed"
+            );
+            assert!(
+                model.get("api_mode").is_none(),
+                "stale api_mode must be scrubbed"
+            );
+            assert!(hermes_codeg_entry(&switched).is_null(), "{switched}");
+        }
     }
 
     #[test]
@@ -19554,7 +22872,8 @@ wire_api = "chat"
             None,
         )
         .expect("plan custom");
-        // custom NEVER writes `.env` — key + endpoint live inline in config.yaml.
+        // custom NEVER writes `.env` — key + endpoint live in config.yaml, on
+        // codeg's named provider.
         assert!(env.is_empty(), "custom must not write any .env var");
         let value: serde_yaml::Value = serde_yaml::from_str(&yaml).expect("yaml");
         let model = value.get("model").expect("model section");
@@ -19571,7 +22890,20 @@ wire_api = "chat"
             Some("sk-custom-1")
         );
         assert_eq!(
-            model.get("base_url").and_then(|v| v.as_str()),
+            model.get("provider").and_then(|v| v.as_str()),
+            Some("custom:codeg")
+        );
+        assert_eq!(
+            model.get("default").and_then(|v| v.as_str()),
+            Some("gpt-5.5")
+        );
+        let entry = hermes_codeg_entry(&yaml);
+        assert_eq!(
+            entry.get("api_key").and_then(|v| v.as_str()),
+            Some("sk-custom-1")
+        );
+        assert_eq!(
+            entry.get("base_url").and_then(|v| v.as_str()),
             Some("https://endpoint.test/v1")
         );
         // A newline in the inline key is rejected (same guard as the `.env` path).
@@ -19603,6 +22935,7 @@ wire_api = "chat"
             value.get("model").and_then(|m| m.get("api_mode")).is_none(),
             "stale api_mode must be scrubbed when switching to custom"
         );
+        assert!(hermes_codeg_entry(&yaml).get("api_mode").is_none());
     }
 
     #[test]
@@ -19795,8 +23128,67 @@ wire_api = "chat"
         }
     }
 
+    /// The script flags reach exactly the packages whose install needs their
+    /// scripts, and name the package, which npm 12 needs before it runs a
+    /// script of a global install or an `npx` run.
+    #[test]
+    fn installs_name_the_packages_whose_scripts_npm_must_run() {
+        for (specs, name) in [
+            (
+                &["hermes-agent@0.23.1", "hermes-agent@0.24.0", "hermes-agent"][..],
+                "hermes-agent",
+            ),
+            (
+                &["@xai-official/grok@1.0.77", "@xai-official/grok"][..],
+                "@xai-official/grok",
+            ),
+        ] {
+            for spec in specs {
+                assert_eq!(
+                    npm_run_scripts_args(spec),
+                    [
+                        "--ignore-scripts=false".to_string(),
+                        format!("--allow-scripts={name}"),
+                    ],
+                    "{spec}"
+                );
+            }
+        }
+        // Every other agent keeps the user's own script policy, and so does a
+        // package whose name only starts like one of those.
+        for spec in [
+            "cline@3.0.74",
+            "@xai-official/grok-darwin-arm64@1.0.77",
+            "hermes-agent-npm@1.0.0",
+        ] {
+            assert!(npm_run_scripts_args(spec).is_empty(), "{spec}");
+        }
+        // Grok's postinstall downloads nothing and leaves no runtime to check.
+        assert!(!npm_package_bootstraps_runtime("@xai-official/grok@1.0.77"));
+        assert_eq!(
+            hermes_npx_argv("hermes-agent@0.23.1", &["acp", "--setup"]),
+            [
+                "npx",
+                "-y",
+                "--ignore-scripts=false",
+                "--allow-scripts=hermes-agent",
+                "--package",
+                "hermes-agent@0.23.1",
+                "hermes",
+                "acp",
+                "--setup",
+            ]
+        );
+    }
+
     #[tokio::test]
-    async fn hermes_npx_setup_argvs_address_the_hermes_bin() {
+    async fn hermes_setup_argvs_address_the_hermes_bin() {
+        // Every recipe form must drive the wrapper's `hermes` bin (the ACP
+        // CLI): `<hermes> acp --setup` / `<hermes> model` when a binary
+        // resolves, else `npx -y --package <pin> hermes …`. The `--package`
+        // flag is load-bearing in the npx form — the package's DEFAULT bin is
+        // `hermes-agent` (`agent.legacy_cli:main`), not the `hermes` CLI — and the
+        // pinned spec keeps the on-demand bootstrap on the audited version.
         let (setup, model) = hermes_setup_argvs().await;
         assert_eq!(setup.last().map(String::as_str), Some("--setup"));
         assert_eq!(model.last().map(String::as_str), Some("model"));
@@ -19808,7 +23200,7 @@ wire_api = "chat"
                     .expect("npx recipe must select the hermes package");
                 assert_eq!(
                     argv.get(package_index + 1).map(String::as_str),
-                    Some("hermes-agent@0.21.6")
+                    Some("hermes-agent@0.23.1")
                 );
                 assert_eq!(
                     argv.get(package_index + 2).map(String::as_str),
@@ -20449,19 +23841,25 @@ model = "gpt"
             )
         };
 
-        let annotated = annotate_npm_bootstrap_failure("hermes-agent@0.21.6", download());
+        let annotated = annotate_npm_bootstrap_failure("hermes-agent@0.23.1", download());
         let text = annotated.to_string();
         assert!(text.contains("fetch failed"), "keeps the original error");
         assert!(text.contains("HTTP(S)_PROXY"), "adds the proxy hint");
 
         // A package whose install runs no bootstrap can't fail this way, so the
-        // hint would be noise even on a matching message.
-        let other = annotate_npm_bootstrap_failure("@zed-industries/claude-code-acp", download());
-        assert!(!other.to_string().contains("HTTP(S)_PROXY"));
+        // hint would be noise even on a matching message. That includes Grok,
+        // whose postinstall codeg also runs but which downloads nothing.
+        for other in [
+            "@zed-industries/claude-code-acp",
+            "@xai-official/grok@1.0.77",
+        ] {
+            let other = annotate_npm_bootstrap_failure(other, download());
+            assert!(!other.to_string().contains("HTTP(S)_PROXY"));
+        }
 
         // A hermes failure that isn't a download stays untouched.
         let permissions = annotate_npm_bootstrap_failure(
-            "hermes-agent@0.21.6",
+            "hermes-agent@0.23.1",
             AcpError::Protocol("failed to install npm package globally: EACCES".to_string()),
         );
         assert!(!permissions.to_string().contains("HTTP(S)_PROXY"));
@@ -20558,6 +23956,21 @@ model = "gpt"
                 api_key,
                 model,
                 base_url,
+                None,
+            )
+        }
+
+        /// A save from the panel, which sends its whole `models.json` table.
+        fn save_table(&self, model: &str, table: &[&str]) -> Result<(), AcpError> {
+            let table: Vec<String> = table.iter().map(|id| id.to_string()).collect();
+            persist_cline_provider_settings_at(
+                &self.providers,
+                &self.models,
+                "openai-compatible",
+                Some("sk"),
+                Some(model),
+                Some("https://relay.example/v1"),
+                Some(&table),
             )
         }
     }
@@ -20791,6 +24204,63 @@ model = "gpt"
             "earlier model stays selectable"
         );
         assert!(entry["models"]["second"].is_object());
+    }
+
+    /// The panel's table is the table: picked ids stay with what they had,
+    /// new ones are registered, unpicked ones go — the chosen model always
+    /// stays selectable.
+    #[test]
+    fn cline_models_catalog_takes_the_panels_whole_table() {
+        let store = ClineStore::new();
+        std::fs::create_dir_all(store.models.parent().unwrap()).expect("settings dir");
+        std::fs::write(
+            &store.models,
+            serde_json::json!({
+                "version": 1,
+                "providers": {"openai-compatible": {
+                    "provider": {"name": "My relay", "baseUrl": "https://old/v1",
+                                 "protocol": "openai-chat", "modelsSourceUrl": "https://old/v1/models"},
+                    "models": {
+                        "glm-5.2": {"id": "glm-5.2", "name": "GLM", "contextWindow": 200000},
+                        "stale": {"id": "stale"}
+                    },
+                    "discoveredModelIds": ["stale", "glm-5.2"],
+                    "extra": true
+                }}
+            })
+            .to_string(),
+        )
+        .expect("seed");
+
+        store
+            .save_table("kimi-k3", &["glm-5.2", "qwen-4"])
+            .expect("save");
+        let entry = read_cline_json(&store.models)["providers"]["openai-compatible"].clone();
+        let ids: Vec<&String> = entry["models"].as_object().unwrap().keys().collect();
+        assert_eq!(ids, ["glm-5.2", "qwen-4", "kimi-k3"]);
+        assert_eq!(
+            entry["models"]["glm-5.2"]["contextWindow"], 200000,
+            "kept as it was"
+        );
+        assert_eq!(entry["models"]["qwen-4"]["name"], "qwen-4");
+        // What cline itself owns stays; discovery keeps only the ids still there.
+        assert_eq!(entry["provider"]["name"], "My relay");
+        assert_eq!(entry["provider"]["protocol"], "openai-chat");
+        assert_eq!(
+            entry["provider"]["modelsSourceUrl"],
+            "https://old/v1/models"
+        );
+        assert_eq!(entry["provider"]["baseUrl"], "https://relay.example/v1");
+        assert_eq!(entry["provider"]["defaultModelId"], "kimi-k3");
+        assert_eq!(entry["discoveredModelIds"], serde_json::json!(["glm-5.2"]));
+        assert_eq!(entry["extra"], true);
+
+        // The projection hands the table back to the panel.
+        let projected = load_cline_provider_settings_at(&store.providers).expect("projection");
+        assert_eq!(
+            projected["models"],
+            serde_json::json!(["glm-5.2", "qwen-4", "kimi-k3"])
+        );
     }
 
     #[test]
@@ -21088,6 +24558,7 @@ model = "gpt"
             None,
             Some("claude-sonnet-5"),
             None,
+            None,
         )
         .expect("save");
 
@@ -21121,6 +24592,99 @@ model = "gpt"
     }
 
     #[test]
+    fn minimax_code_installer_discovery_finds_only_an_existing_launcher() {
+        let home = tempfile::tempdir().unwrap();
+        assert!(resolve_system_agent_installer_binary(
+            AgentType::MiniMaxCode,
+            "mcode",
+            home.path()
+        )
+        .is_none());
+        #[cfg(not(windows))]
+        let relative = ".minimax-code/bin/mcode";
+        #[cfg(windows)]
+        let relative = ".minimax-code/mcode.cmd";
+        let launcher = home.path().join(relative);
+        std::fs::create_dir_all(launcher.parent().unwrap()).unwrap();
+        std::fs::write(&launcher, "not executed").unwrap();
+        assert_eq!(
+            resolve_system_agent_installer_binary(AgentType::MiniMaxCode, "mcode", home.path()),
+            Some(launcher)
+        );
+    }
+
+    #[test]
+    fn minimax_code_keeps_explicit_env_without_inventing_provider_overrides() {
+        let config = serde_json::json!({
+            "apiBaseUrl": "https://example.test", "apiKey": "not-used",
+            "model": "not-used",
+            "env": {"MINIMAX_DATA_DIR": "/profiles/selected", "EXPLICIT": "value"}
+        });
+        let env =
+            build_runtime_env_from_setting(AgentType::MiniMaxCode, None, Some(&config.to_string()));
+        assert_eq!(env.len(), 2);
+        assert_eq!(
+            env.get("MINIMAX_DATA_DIR").map(String::as_str),
+            Some("/profiles/selected")
+        );
+        assert_eq!(env.get("EXPLICIT").map(String::as_str), Some("value"));
+        assert!(skill_storage_spec(AgentType::MiniMaxCode).is_none());
+    }
+
+    // OpenCode's local config is its own opencode.json: its `model` is
+    // OpenCode's default model and must not turn into `OPENAI_MODEL` (nor
+    // anything else) in the launch env.
+    #[test]
+    fn opencode_config_never_reaches_the_launch_env() {
+        let config =
+            "{\n  // comment\n  \"model\": \"anthropic/claude-x\",\n  \"env\": {\"X\": \"y\"},\n}";
+        let env = build_runtime_env_from_setting(AgentType::OpenCode, None, Some(config));
+        assert!(env.is_empty(), "{env:?}");
+    }
+
+    // Model providers are not offered for MiniMax Code, but the API accepts one
+    // for any agent type; binding it would persist OPENAI_MODEL.
+    #[tokio::test]
+    async fn minimax_code_refuses_a_model_provider_binding() {
+        let db = crate::db::test_helpers::fresh_in_memory_db().await;
+        let provider = crate::db::service::model_provider_service::create(
+            &db.conn,
+            "p".to_string(),
+            "https://example.test/v1".to_string(),
+            "k".to_string(),
+            "minimax_code".to_string(),
+            Some("unexpected-model".to_string()),
+        )
+        .await
+        .unwrap();
+        let err = acp_update_agent_env_core(
+            AgentType::MiniMaxCode,
+            true,
+            BTreeMap::new(),
+            Some(provider.id),
+            &db,
+            &EventEmitter::Noop,
+        )
+        .await
+        .expect_err("the bind is refused");
+        assert!(err.to_string().contains("cannot be bound"), "{err}");
+        let setting = agent_setting_service::get_by_agent_type(&db.conn, AgentType::MiniMaxCode)
+            .await
+            .unwrap()
+            .expect("the defaults row exists");
+        assert_eq!(setting.model_provider_id, None);
+        assert!(
+            !setting
+                .env_json
+                .as_deref()
+                .unwrap_or_default()
+                .contains("OPENAI_MODEL"),
+            "{:?}",
+            setting.env_json
+        );
+    }
+
+    #[test]
     fn an_explicit_cline_provider_env_row_still_wins() {
         let now = chrono::Utc::now();
         let setting = crate::db::entities::agent_setting::Model {
@@ -21144,6 +24708,174 @@ model = "gpt"
         assert_eq!(
             env.get("CLINE_PROVIDER").map(String::as_str),
             Some("cline-pass")
+        );
+    }
+
+    #[test]
+    fn instructions_write_creates_the_file_and_its_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("agent").join("AGENTS.md");
+        write_instructions_file(&path, "# Rules\n").unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), "# Rules\n");
+        write_instructions_file(&path, "").unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), "");
+    }
+
+    #[test]
+    fn instructions_write_of_empty_text_never_creates_a_missing_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let agent_dir = dir.path().join("agent");
+        write_instructions_file(&agent_dir.join("AGENTS.md"), "").unwrap();
+        assert!(!agent_dir.exists());
+    }
+
+    #[test]
+    fn instructions_write_refuses_a_file_it_cannot_read_as_text() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("AGENTS.md");
+        fs::write(&path, [0xff, 0xfe, 0x00]).unwrap();
+        assert!(write_instructions_file(&path, "# Rules").is_err());
+        assert_eq!(fs::read(&path).unwrap(), vec![0xff, 0xfe, 0x00]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn instructions_write_goes_through_a_symlink() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("dotfiles-CLAUDE.md");
+        fs::write(&target, "old").unwrap();
+        let link = dir.path().join("CLAUDE.md");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        write_instructions_file(&link, "new").unwrap();
+        assert!(fs::symlink_metadata(&link)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(fs::read_to_string(&target).unwrap(), "new");
+    }
+
+    #[test]
+    fn test_agent_system_instructions_paths() {
+        let file_name = |agent: AgentType| {
+            agent_system_instructions_path(agent)
+                .and_then(|path| path.file_name().map(|n| n.to_string_lossy().into_owned()))
+        };
+        assert_eq!(
+            file_name(AgentType::ClaudeCode).as_deref(),
+            Some("CLAUDE.md")
+        );
+        assert_eq!(file_name(AgentType::Gemini).as_deref(), Some("GEMINI.md"));
+        for agent in [
+            AgentType::Antigravity,
+            AgentType::OpenCode,
+            AgentType::Cline,
+            AgentType::KimiCode,
+            AgentType::Grok,
+            AgentType::DeepSeek,
+            AgentType::Qoder,
+            AgentType::Kiro,
+            AgentType::CommandCode,
+            AgentType::ZCode,
+        ] {
+            assert_eq!(file_name(agent).as_deref(), Some("AGENTS.md"), "{agent:?}");
+        }
+        let antigravity = agent_system_instructions_path(AgentType::Antigravity).unwrap();
+        assert!(antigravity.ends_with(".gemini/AGENTS.md"));
+        let kiro = agent_system_instructions_path(AgentType::Kiro).unwrap();
+        assert!(kiro.ends_with("steering/AGENTS.md"));
+        let cline = agent_system_instructions_path(AgentType::Cline).unwrap();
+        assert!(cline.ends_with(".agents/AGENTS.md"));
+        // Codex, Trae, Pi and CodeBuddy pick among candidates that exist on
+        // this machine; their rules are covered by the helpers' tests.
+        for agent in [
+            AgentType::Codex,
+            AgentType::Trae,
+            AgentType::Pi,
+            AgentType::CodeBuddy,
+        ] {
+            assert!(agent_system_instructions_path(agent).is_some(), "{agent:?}");
+        }
+        for agent in [
+            AgentType::Hermes,
+            AgentType::Cursor,
+            AgentType::MiniMaxCode,
+            AgentType::Custom("my-bot"),
+        ] {
+            assert_eq!(agent_system_instructions_path(agent), None, "{agent:?}");
+        }
+    }
+
+    #[test]
+    fn codex_style_instructions_use_a_non_blank_override() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(
+            codex_style_instructions_file(dir.path()),
+            dir.path().join("AGENTS.md")
+        );
+        fs::write(dir.path().join("AGENTS.override.md"), " \n").unwrap();
+        assert_eq!(
+            codex_style_instructions_file(dir.path()),
+            dir.path().join("AGENTS.md")
+        );
+        fs::write(dir.path().join("AGENTS.override.md"), "# Override").unwrap();
+        assert_eq!(
+            codex_style_instructions_file(dir.path()),
+            dir.path().join("AGENTS.override.md")
+        );
+    }
+
+    #[test]
+    fn instructions_save_stays_on_the_shown_file_when_the_resolution_flips() {
+        let dir = tempfile::tempdir().unwrap();
+        let override_file = dir.path().join("AGENTS.override.md");
+        let agents_file = dir.path().join("AGENTS.md");
+        fs::write(&override_file, "# Override").unwrap();
+        fs::write(&agents_file, "# Fallback").unwrap();
+        let candidates = || vec![override_file.clone(), agents_file.clone()];
+        let shown = override_file.display().to_string();
+
+        // Blanking the shown override flips Codex's resolution to AGENTS.md…
+        write_instructions_file(&override_file, "").unwrap();
+        let resolved = codex_style_instructions_file(dir.path());
+        assert_eq!(resolved, agents_file);
+        // …but the next save still lands on the file the editor showed.
+        let target = instructions_write_target(resolved, candidates(), Some(&shown)).unwrap();
+        assert_eq!(target, override_file);
+        write_instructions_file(&target, "# New").unwrap();
+        assert_eq!(fs::read_to_string(&agents_file).unwrap(), "# Fallback");
+        assert_eq!(fs::read_to_string(&override_file).unwrap(), "# New");
+    }
+
+    #[test]
+    fn instructions_save_refuses_a_path_that_is_not_the_agents_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let agents_file = dir.path().join("AGENTS.md");
+        let elsewhere = dir.path().join("elsewhere.md").display().to_string();
+        assert!(instructions_write_target(
+            agents_file.clone(),
+            vec![agents_file.clone()],
+            Some(&elsewhere)
+        )
+        .is_err());
+        assert_eq!(
+            instructions_write_target(agents_file.clone(), vec![agents_file.clone()], None)
+                .unwrap(),
+            agents_file
+        );
+    }
+
+    #[test]
+    fn first_existing_instructions_file_falls_back_to_the_first_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let names = ["AGENTS.override.md", "AGENTS.md", "CLAUDE.md"];
+        assert_eq!(
+            first_existing_file(dir.path(), &names),
+            dir.path().join("AGENTS.override.md")
+        );
+        fs::write(dir.path().join("CLAUDE.md"), "x").unwrap();
+        assert_eq!(
+            first_existing_file(dir.path(), &names),
+            dir.path().join("CLAUDE.md")
         );
     }
 }

@@ -248,6 +248,7 @@ pub fn try_enqueue(prepared: PreparedPrompt) -> Result<TurnGeneration, QueueReje
         mark_awaiting_reply: false,
         bypass_autonomous_hold: false,
         turn_generation,
+        internal_suffix: Vec::new(),
     });
     Ok(TurnGeneration(turn_generation))
 }

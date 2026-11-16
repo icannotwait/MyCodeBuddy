@@ -94,8 +94,8 @@ export function SearchCommandDialog({
     new Set(conversations.map((c) => c.agent_type))
   ).sort(compareAgentType)
 
-  // Rank files by relevance (name/path tiers + fuzzy subsequence), scanning the
-  // full list so a deeply nested match isn't crowded out by shallower ones.
+  // The backend ranks the whole workspace before capping the response, so a
+  // deeply nested match remains reachable without retaining the full index.
   const filteredFiles = useMemo(
     () => rankFileMatches(query, files, 100),
     [files, query]

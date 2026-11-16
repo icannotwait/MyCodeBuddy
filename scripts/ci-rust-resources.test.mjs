@@ -18,7 +18,7 @@ test("Rust CI serializes desktop and small macOS builds without dropping targets
     "macos-latest",
     "windows-latest",
   ])
-  assert.deepEqual(matrix.mode, ["desktop", "server"])
+  assert.deepEqual(matrix.mode, ["desktop", "server", "cli"])
 
   for (const os of matrix.os) {
     for (const mode of matrix.mode) {

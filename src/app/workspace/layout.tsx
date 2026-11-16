@@ -1,5 +1,11 @@
 "use client"
 
+import {
+  useVisibleConversationLayout,
+  useVisibleConversationTabs,
+} from "@/stores/tab-store"
+import { leafIds } from "@/lib/tab-group-layout"
+import { useFolderTabsStore } from "@/stores/folder-tabs-store"
 import { BrowserEvalConfirm } from "@/components/browser/browser-eval-confirm"
 import { BrowserEventsBridge } from "@/components/browser/browser-events-bridge"
 import { BrowserScreenshotMarkupHost } from "@/components/browser/browser-screenshot-markup"
@@ -20,6 +26,8 @@ import { FolderTitleBar } from "@/components/layout/folder-title-bar"
 import { Sidebar } from "@/components/layout/sidebar"
 import { StatusBar } from "@/components/layout/status-bar"
 import { AppWorkspaceProvider } from "@/contexts/app-workspace-context"
+import { useAppWorkspaceStore } from "@/stores/app-workspace-store"
+import { AssistantsSync } from "@/stores/assistants-store"
 import { ConversationTagsSync } from "@/stores/conversation-tags-store"
 import { ConversationTagsManagerHost } from "@/components/conversations/conversation-tags-manager"
 import { useActiveFolder } from "@/contexts/active-folder-context"
@@ -28,6 +36,7 @@ import { AlertProvider } from "@/contexts/alert-context"
 import {
   AcpConnectionsProvider,
   useAcpActions,
+  useAcpEvent,
 } from "@/contexts/acp-connections-context"
 import { DelegationProvider } from "@/contexts/delegation-context"
 import { ConversationRuntimeProvider } from "@/contexts/conversation-runtime-context"
@@ -38,6 +47,7 @@ import { SidebarProvider, useSidebarContext } from "@/contexts/sidebar-context"
 import { SearchDialogProvider } from "@/contexts/search-dialog-context"
 import { AutomationsViewProvider } from "@/contexts/automations-view-context"
 import { TasksViewProvider } from "@/contexts/tasks-view-context"
+import { TaskFromMessageHost } from "@/components/tasks/task-from-message-host"
 import {
   WorkbenchRouteProvider,
   useWorkbenchRoute,
@@ -64,6 +74,7 @@ import {
 import { RemoteConnectionGate } from "@/contexts/remote-connection-context"
 import { UpdateProvider } from "@/components/providers/update-provider"
 import { useWorkspaceBackground, useZoomLevel } from "@/hooks/use-appearance"
+import { useHistoryBackDismiss } from "@/hooks/use-history-back-dismiss"
 import { FILL_MODE_STYLE } from "@/lib/workspace-background"
 import { TabBar } from "@/components/tabs/tab-bar"
 import { TerminalPanel } from "@/components/terminal/terminal-panel"
@@ -72,6 +83,7 @@ import { ChromeReserve } from "@/components/layout/chrome-reserve"
 import { LeftEdgeChrome } from "@/components/layout/left-edge-chrome"
 import { RightEdgeChrome } from "@/components/layout/right-edge-chrome"
 import { WorkspaceChromeController } from "@/components/layout/workspace-chrome-controller"
+import { MobileWorkspacePanes } from "@/components/layout/mobile-workspace-panes"
 import { WindowControls } from "@/components/layout/window-controls"
 import { FileWorkspaceTabBar } from "@/components/files/file-workspace-tab-bar"
 import { FileWorkspaceHeader } from "@/components/files/file-workspace-header"
@@ -102,6 +114,25 @@ import { useIsMobile } from "@/hooks/use-mobile"
 import { usePlatform } from "@/hooks/use-platform"
 import { Drawer, DrawerContent, DrawerTitle } from "@/components/ui/drawer"
 import { OverlayHostHiddenProvider } from "@/components/ui/overlay-host-hidden"
+
+/**
+ * Patches the in-memory conversation list when the backend emits
+ * `conversation_status_changed`. Upstream exports this from
+ * `app-workspace-context`; that module is outside this merge slice and does
+ * not currently export it, so the same bridge lives next to its mount.
+ * Must render inside `AcpConnectionsProvider`.
+ */
+function ConversationStatusEventBridge() {
+  useAcpEvent((envelope) => {
+    if (envelope.type !== "conversation_status_changed") return
+    useAppWorkspaceStore
+      .getState()
+      .updateConversationLocal(envelope.conversation_id, {
+        status: envelope.status,
+      })
+  })
+  return null
+}
 
 function WorkspaceDocumentTitle() {
   const { activeFolder } = useActiveFolder()
@@ -343,8 +374,11 @@ function WorkspaceContent({ children }: { children: React.ReactNode }) {
   const { isOpen: auxOpen } = useAuxPanelContext()
   const { isMac, isWindows, isLinux } = usePlatform()
   const { zoomLevel } = useZoomLevel()
-  const hasConvTabs = useTabStore((s) => s.tabs.length > 0)
-  const isConvSplit = useTabStore(selectIsSplit)
+  const hasConvTabs = useVisibleConversationTabs().length > 0
+  // Tabs following the folder keep the strip (and its "+") for an empty one.
+  const tabsFollowFolder = useFolderTabsStore((s) => s.enabled)
+  const showConvStrip = hasConvTabs || tabsFollowFolder
+  const isConvSplit = leafIds(useVisibleConversationLayout()).length > 1
   const winLinuxControls = isDesktop() && (isWindows || isLinux)
   // The window chrome (toggle/search left, terminal/aux/settings right) now
   // lives in fixed corner overlays (see FolderLayoutShell) that never move on
@@ -441,7 +475,7 @@ function WorkspaceContent({ children }: { children: React.ReactNode }) {
                   <div className="flex h-10 shrink-0 items-stretch bg-muted ws-transparent-bg">
                     <ChromeReserve width={leftCornerWidth} />
                     <div className="flex min-w-0 flex-1 items-stretch">
-                      {hasConvTabs ? (
+                      {showConvStrip ? (
                         // The unsplit strip IS the column's top-right strip,
                         // so it carries the maximize/restore button.
                         <TabBar maximizeControl />
@@ -617,40 +651,38 @@ function WorkspaceContent({ children }: { children: React.ReactNode }) {
 
 function MobileWorkspaceContent({ children }: { children: React.ReactNode }) {
   const { mode, activePane } = useWorkspaceView()
+  const { activateConversationPane } = useWorkspaceActions()
   const { isConversations } = useWorkbenchRoute()
   const hasRouteStrip = useHasWorkbenchRouteStrip()
 
   const showConversation =
     mode === "conversation" || activePane === "conversation"
 
+  // The mobile file view is a pane swap, not a route: without a history entry
+  // behind it, a back gesture falls straight through the /workspace navigation
+  // and unloads the whole page (or exits the PWA). One pushed entry lets back
+  // close the file view instead.
+  useHistoryBackDismiss(
+    isConversations && !showConversation,
+    activateConversationPane
+  )
+
   return (
     <div className="relative h-full min-h-0 overflow-hidden">
       <KeptMountedSurface hidden={!isConversations}>
-        {showConversation ? (
-          // Mobile mirrors the desktop chrome: no tab strip — the conversation
-          // detail header (folder › title) renders inside {children}, and tabs
-          // are navigated from the sidebar (single active conversation at a time).
-          <section
-            className="flex h-full min-h-0 flex-col overflow-hidden"
-            data-workspace-pane="conversation"
-          >
-            <div className="relative flex-1 min-h-0 overflow-hidden">
-              {children}
-            </div>
-          </section>
-        ) : (
-          // File view: the shared FileWorkspaceHeader (folder › file breadcrumb)
-          // replaces the file tab strip, matching the desktop file column.
-          <section
-            className="flex h-full min-h-0 flex-col overflow-hidden"
-            data-workspace-pane="files"
-          >
-            <FileWorkspaceHeader />
-            <div className="flex-1 min-h-0 overflow-hidden">
-              <FileWorkspacePanel />
-            </div>
-          </section>
-        )}
+        <MobileWorkspacePanes
+          showConversation={showConversation}
+          files={
+            <>
+              <FileWorkspaceHeader />
+              <div className="flex-1 min-h-0 overflow-hidden">
+                <FileWorkspacePanel />
+              </div>
+            </>
+          }
+        >
+          {children}
+        </MobileWorkspacePanes>
       </KeptMountedSurface>
       {!isConversations ? (
         // Same canvas as the desktop overlay: conversation-identical background
@@ -685,8 +717,28 @@ function MobileFolderWorkspaceShell({
     isOpen: auxOpen,
     restored: auxRestored,
     toggle: toggleAux,
+    setOpen: setAuxOpen,
   } = useAuxPanelContext()
   const { isOpen: terminalOpen, toggle: toggleTerminal } = useTerminalContext()
+
+  // A full-page route opened from inside the aux drawer — a work tab's "open
+  // full page", a repository row's task chip — would otherwise land UNDER the
+  // drawer, which on a phone covers nearly the whole screen. The desktop panel
+  // collapses for a route by itself (see FolderWorkspaceShell); here the drawer
+  // closes, and its toggle stays hidden until the conversations come back.
+  const { isConversations } = useWorkbenchRoute()
+  useEffect(() => {
+    if (!isConversations) setAuxOpen(false)
+  }, [isConversations, setAuxOpen])
+
+  // Each of these drawers is a state toggle, not a route: without a history
+  // entry behind them the back gesture falls through and unloads the whole
+  // page. One pushed entry per open drawer lets back close the topmost one
+  // (the entries stack in open order, so drawers open on top of each other
+  // unwind top-down).
+  useHistoryBackDismiss(sidebarRestored && sidebarOpen, toggleSidebar)
+  useHistoryBackDismiss(auxRestored && auxOpen, toggleAux)
+  useHistoryBackDismiss(terminalOpen, toggleTerminal)
 
   return (
     <div className="flex flex-1 min-h-0 overflow-hidden">
@@ -1486,6 +1538,8 @@ function WorkspaceLayoutInner({ children }: { children: React.ReactNode }) {
                     window; which tags a conversation carries rides on its
                     summary instead. */}
                 <ConversationTagsSync />
+                <ConversationStatusEventBridge />
+                <AssistantsSync />
                 {/* The tag manager, opened from tag pickers, folder menus and
                     the sidebar's tag filter — all popovers or menus that
                     unmount as they close, so none can host it. */}
@@ -1528,6 +1582,12 @@ function WorkspaceLayoutInner({ children }: { children: React.ReactNode }) {
                                   <WorkbenchRouteProvider>
                                     <WorkbenchRouteConversationSync />
                                     <ConversationAwaitingReplyClearer />
+                                    {/* The task editor a message's "create
+                                          task" opens over the page it is on:
+                                          a transcript shows in a tab, a canvas
+                                          card or a drawer on any route, and
+                                          none of them keeps one of its own. */}
+                                    <TaskFromMessageHost />
                                     {/* Inside WorkbenchRouteProvider: the
                                           listener calls openConversations() to
                                           surface a launcher-opened folder. */}
