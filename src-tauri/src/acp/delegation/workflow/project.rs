@@ -2614,7 +2614,7 @@ fn progress_and_durable_identity_mismatch(
     let Some(durable) = durable else {
         return false;
     };
-    if durable.work_unit_key.as_deref() != Some(expected_key)
+    durable.work_unit_key.as_deref() != Some(expected_key)
         || simple_task_index_from_key(durable.work_unit_key.as_deref())
             .is_some_and(|index| index != task_index)
         || expected_agent
@@ -2623,10 +2623,6 @@ fn progress_and_durable_identity_mismatch(
         || durable.profile_id != expected_profile
         || (!progress.agent_type.is_empty() && progress.agent_type != durable.agent_type)
         || (progress.profile_id.is_some() && progress.profile_id != durable.profile_id)
-    {
-        return true;
-    }
-    false
 }
 
 fn reconcile_simple_orchestration_binding(

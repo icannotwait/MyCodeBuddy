@@ -29,6 +29,7 @@ vi.mock("@/contexts/workspace-context", () => ({
     openFilePreview: vi.fn(),
     openSessionFileDiff: vi.fn(),
   }),
+  useOptionalWorkspaceActions: () => null,
 }))
 vi.mock("@/contexts/active-folder-context", () => ({
   useActiveFolder: () => ({ activeFolder: { path: "/repo" } }),

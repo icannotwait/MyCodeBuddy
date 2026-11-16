@@ -152,9 +152,7 @@ export function applyDelegationEnvelope(
       // empty table. Reading `runtime_stats.started_at` threw when the field
       // was absent.
       const stats =
-        envelope.runtime_stats ??
-        existing?.runtimeStats ??
-        emptyRuntimeStats()
+        envelope.runtime_stats ?? existing?.runtimeStats ?? emptyRuntimeStats()
       // Synthesize only when no binding exists (mid-flight mount / reconnect).
       const base: DelegationBinding = existing ?? {
         parentConnectionId: envelope.parent_connection_id,

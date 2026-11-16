@@ -224,17 +224,52 @@ export const MentionSuggestion = Extension.create<MentionSuggestionOptions>({
       // Let Tiptap track the trigger throughout mobile IME composition; the
       // companion plugin below still forces one clean rematch on compositionend.
       allow: ({ state }) => !state.selection.$from.parent.type.spec.code,
-      render: () => ({
-        onStart: (props) => controller.onStart(toRenderState(props)),
-        onUpdate: (props) => controller.onUpdate(toRenderState(props)),
-        onExit: () => controller.onExit(),
-        onKeyDown: ({ event }) => {
-          if (isImeCompositionKey(event) || editor.view.composing) {
-            return false
+      render: () => {
+        // Tiptap's suggestion view calls onStart and then onUpdate twice for
+        // one activation (before and after the empty items fetch). The
+        // controller searches on both, so a composition rematch must forward
+        // only the first notice for a given query and range.
+        let notified: {
+          query: string | null
+          from: number
+          to: number
+        } | null = null
+        const remember = (state: MentionRenderState) => {
+          notified = {
+            query: state.query,
+            from: state.range.from,
+            to: state.range.to,
           }
-          return controller.onKeyDown(event)
-        },
-      }),
+        }
+        const sameNotice = (state: MentionRenderState) =>
+          notified != null &&
+          notified.query === state.query &&
+          notified.from === state.range.from &&
+          notified.to === state.range.to
+        return {
+          onStart: (props) => {
+            const state = toRenderState(props)
+            remember(state)
+            controller.onStart(state)
+          },
+          onUpdate: (props) => {
+            const state = toRenderState(props)
+            if (sameNotice(state)) return
+            remember(state)
+            controller.onUpdate(state)
+          },
+          onExit: () => {
+            notified = null
+            controller.onExit()
+          },
+          onKeyDown: ({ event }) => {
+            if (isImeCompositionKey(event) || editor.view.composing) {
+              return false
+            }
+            return controller.onKeyDown(event)
+          },
+        }
+      },
     })
     return [mentionSuggestion, compositionRematch]
   },

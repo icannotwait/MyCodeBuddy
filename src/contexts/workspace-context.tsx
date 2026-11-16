@@ -2954,6 +2954,36 @@ export function WorkspaceProvider({ children }: WorkspaceProviderProps) {
               prev && prev.path === absPath ? null : prev
             )
           }
+          // A PDF or image that fails to read has to stay on the tab. Removing
+          // it (the text-file first-open failure) would look like the open
+          // never happened, and the next attempt could fall through to a text
+          // read of the same bytes.
+          if (binary) {
+            const existing = fileTabsRef.current.find((tab) => tab.id === tabId)
+            if (existing?.hasLoadedSuccessfully) {
+              failOpenTab(tabId, displayName, error)
+              settle({ ok: false, reason: "load" })
+              return
+            }
+            const message = toErrorMessage(error)
+            const errorPatch = {
+              language: seed.language,
+              content: t("unableLoadContent", { message }),
+              savedContent: "",
+              readonly: true as const,
+              loading: false,
+              saveState: "error" as const,
+              saveError: message,
+              hasLoadedSuccessfully: false as const,
+            }
+            if (!commitPathReadyTab(tabId, errorPatch)) {
+              settle({ ok: false, reason: "stale" })
+              return
+            }
+            toast.error(t("unableOpenFile", { name: displayName }))
+            settle({ ok: false, reason: "load" })
+            return
+          }
           failOpenTab(tabId, displayName, error)
           settle({ ok: false, reason: "load" })
         }
@@ -4175,31 +4205,31 @@ export function WorkspaceProvider({ children }: WorkspaceProviderProps) {
   // folder still references only leaves this scope (nothing is lost, so it
   // asks nothing); the rest close behind a single confirmation when any of
   // them has unsaved edits — cancelling closes nothing, as in normal mode.
-  const closeScopeFileTabs = useCallback((
-    keepId: string | null,
-    alreadyConfirmed = false
-  ) => {
-    const folderTabs = useFolderTabsStore.getState()
-    const scope = folderTabs.scope
-    const ids = (folderTabs.fileRefs[scope] ?? []).filter((id) => id !== keepId)
-    if (ids.length === 0) return
-    const elsewhere = (id: string) =>
-      Object.entries(folderTabs.fileRefs).some(
-        ([other, refs]) => other !== String(scope) && refs.includes(id)
+  const closeScopeFileTabs = useCallback(
+    (keepId: string | null, alreadyConfirmed = false) => {
+      const folderTabs = useFolderTabsStore.getState()
+      const scope = folderTabs.scope
+      const ids = (folderTabs.fileRefs[scope] ?? []).filter(
+        (id) => id !== keepId
       )
-    const closing = new Set(ids.filter((id) => !elsewhere(id)))
-    if (
-      !alreadyConfirmed &&
-      fileTabsRef.current.some(
-        (tab) => closing.has(tab.id) && isDirtyFileTab(tab)
-      )
-    ) {
-      // Same AlertDialog as the other dirty closes. A blocking confirm
-      // inside this callback re-entered under StrictMode and froze the
-      // webview; the dialog confirms once, then replays the close.
-      setPendingDirtyClose({ kind: "scope", keepId })
-      return
-    }
+      if (ids.length === 0) return
+      const elsewhere = (id: string) =>
+        Object.entries(folderTabs.fileRefs).some(
+          ([other, refs]) => other !== String(scope) && refs.includes(id)
+        )
+      const closing = new Set(ids.filter((id) => !elsewhere(id)))
+      if (
+        !alreadyConfirmed &&
+        fileTabsRef.current.some(
+          (tab) => closing.has(tab.id) && isDirtyFileTab(tab)
+        )
+      ) {
+        // Same AlertDialog as the other dirty closes. A blocking confirm
+        // inside this callback re-entered under StrictMode and froze the
+        // webview; the dialog confirms once, then replays the close.
+        setPendingDirtyClose({ kind: "scope", keepId })
+        return
+      }
       for (const id of ids) {
         if (!closing.has(id)) folderTabs.removeFile(id, scope)
       }

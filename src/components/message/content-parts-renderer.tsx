@@ -1,4 +1,5 @@
 import { useCallback, useEffect, type RefObject } from "react"
+import { buildActivity } from "@/lib/activity/build-activity"
 import type { ActivityModel } from "@/lib/activity/types"
 import { useChatMotion } from "@/hooks/use-chat-motion"
 import { ActivityTimeline } from "./activity/activity-timeline"
@@ -3598,7 +3599,13 @@ export const ContentPartsRenderer = memo(function ContentPartsRenderer(
         <GoalRunPart
           key={`goal-${keyId}`}
           part={part}
-          renderPart={(child, childKey) => renderPart(child, childKey, false)}
+          renderBody={() => (
+            <>
+              {part.items.map((item, idx) =>
+                renderPart(item, `${keyId}:${idx}`, false)
+              )}
+            </>
+          )}
         />
       )
     }
@@ -3659,12 +3666,37 @@ export const ContentPartsRenderer = memo(function ContentPartsRenderer(
     return null
   }
 
+  // Upstream draws an agent's tool activity as timeline rows. Prose that
+  // sits between those parts is a note on the same timeline. A turn that is
+  // only prose stays on the card renderer so autolink and Grok image scope
+  // keep their props. Tool groups, work units, and goal runs stay there too.
+  const hasProcessPart = parts.some((part) =>
+    TIMELINE_PART_TYPES.has(part.type)
+  )
+  if (
+    role !== "user" &&
+    role !== "system" &&
+    hasProcessPart &&
+    parts.every(
+      (part) => TIMELINE_PART_TYPES.has(part.type) || part.type === "text"
+    )
+  ) {
+    return <AssistantActivity parts={parts} isStreaming={isStreaming} />
+  }
+
   return (
     <div className="space-y-4">
       {parts.map((part, i) => renderPart(part, `${i}`, true))}
     </div>
   )
 })
+
+const TIMELINE_PART_TYPES = new Set<AdaptedContentPart["type"]>([
+  "tool-call",
+  "tool-result",
+  "delegation-status-group",
+  "background-task-group",
+])
 
 const ActivityTextPart = memo(function TextPart({
   text,
@@ -3937,6 +3969,37 @@ function useAssistantRenderPart(isStreaming: boolean) {
     [isStreaming]
   )
 }
+
+/** An agent's tool activity as its timeline, then any trailing answer. */
+const AssistantActivity = memo(function AssistantActivity({
+  parts,
+  isStreaming,
+}: {
+  parts: AdaptedContentPart[]
+  isStreaming: boolean
+}) {
+  const render = useAssistantRenderPart(isStreaming)
+  const model = useMemo(
+    () => buildActivity(parts, { isStreaming }),
+    [parts, isStreaming]
+  )
+  return (
+    <div className="space-y-4">
+      <ActivityTimeline
+        model={model}
+        isStreaming={isStreaming}
+        renderPart={render}
+      />
+      {model.answer.map((part, i) =>
+        render(
+          part,
+          `answer-${i}`,
+          isStreaming && i === model.answer.length - 1
+        )
+      )}
+    </div>
+  )
+})
 
 /**
  * The activity timeline for an already-built model. `CompletedTurnContent`

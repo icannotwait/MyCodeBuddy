@@ -10,6 +10,7 @@ import {
   useAcpActions,
   useConnectionStore,
 } from "@/contexts/acp-connections-context"
+import { AlertProvider } from "@/contexts/alert-context"
 import {
   ConversationRuntimeProvider,
   resetConversationRuntimeStore,
@@ -83,6 +84,7 @@ const toastMock = vi.hoisted(() => ({
 vi.mock("sonner", () => ({
   toast: {
     error: toastMock.error,
+    dismiss: vi.fn(),
   },
 }))
 
@@ -173,7 +175,10 @@ vi.mock("@/lib/api", () => ({
   acpGetAgentStatus: vi.fn(),
   acpFindConnectionForConversation: vi.fn(),
   acpConnect: vi.fn(),
+  acpConnectOrAttach: vi.fn(),
   acpDisconnect: vi.fn(),
+  acpReleaseLease: vi.fn(),
+  acpTerminateSharedSession: vi.fn(),
   acpGetSessionSnapshot: vi.fn(),
   acpTouchConnection: vi.fn(),
   getHomeDirectory: vi.fn(),
@@ -7577,9 +7582,18 @@ it("retains mobile conversation identity, connection and runtime through A(files
     is_acp_adapter: true,
   } as never)
   vi.mocked(api.acpFindConnectionForConversation).mockResolvedValue(null)
-  vi.mocked(api.acpConnect).mockResolvedValue("mobile-connection")
+  vi.mocked(api.acpConnectOrAttach).mockResolvedValue({
+    connectionId: "mobile-connection",
+    generation: 1,
+    leaseId: "lease-1",
+    leaseExpiresAt: "2099-01-01T00:00:00Z",
+    disposition: "created",
+    phase: "ready",
+    eventSeq: 0,
+  })
   vi.mocked(api.acpGetSessionSnapshot).mockResolvedValue(null)
   vi.mocked(api.acpDisconnect).mockReset().mockResolvedValue(undefined)
+  vi.mocked(api.acpReleaseLease).mockReset().mockResolvedValue(undefined)
   const mounted = vi.fn()
   const unmounted = vi.fn()
   const filesUnmounted = vi.fn()
@@ -7637,14 +7651,16 @@ it("retains mobile conversation identity, connection and runtime through A(files
   useFolderTabsStore.getState().setEnabled(true)
   useFolderTabsStore.getState().activateScope(1)
   const view = render(
-    <AcpConnectionsProvider>
-      <ConversationRuntimeProvider>
-        <WorkspaceProvider>
-          <FolderTabsProbe />
-          <Mobile />
-        </WorkspaceProvider>
-      </ConversationRuntimeProvider>
-    </AcpConnectionsProvider>
+    <AlertProvider>
+      <AcpConnectionsProvider>
+        <ConversationRuntimeProvider>
+          <WorkspaceProvider>
+            <FolderTabsProbe />
+            <Mobile />
+          </WorkspaceProvider>
+        </ConversationRuntimeProvider>
+      </AcpConnectionsProvider>
+    </AlertProvider>
   )
   await act(async () => {
     await connecting
@@ -7686,15 +7702,20 @@ it("retains mobile conversation identity, connection and runtime through A(files
   }
   expect(mounted).toHaveBeenCalledOnce()
   expect(unmounted).not.toHaveBeenCalled()
-  expect(api.acpConnect).toHaveBeenCalledOnce()
+  expect(api.acpConnectOrAttach).toHaveBeenCalledOnce()
   expect(api.acpDisconnect).not.toHaveBeenCalled()
+  expect(api.acpReleaseLease).not.toHaveBeenCalled()
   expect(filesUnmounted).toHaveBeenCalledTimes(2)
   // A real teardown still releases both resources after the retained view closes.
   await act(async () => {
     view.unmount()
   })
   expect(unmounted).toHaveBeenCalledOnce()
-  expect(api.acpDisconnect).toHaveBeenCalledWith("mobile-connection")
+  expect(api.acpReleaseLease).toHaveBeenCalledWith(
+    "mobile-connection",
+    1,
+    "lease-1"
+  )
   expect(useConversationRuntimeStore.getState().byConversationId.has(42)).toBe(
     false
   )
@@ -8056,20 +8077,22 @@ describe("Folder-tabs file closes, restores and selection", () => {
     const a = await openDirty("/repo/a.ts")
     const b = await openDirty("/repo/b.ts")
     const c = await openDirty("/repo/c.ts", false)
-    const confirm = vi.spyOn(window, "confirm").mockReturnValue(false)
     act(() => scopedWorkspace.closeAllFileTabs())
-    expect(confirm).toHaveBeenCalledTimes(1)
+    expect(screen.getByText("dirtyCloseConfirm")).toBeInTheDocument()
+    act(() => {
+      screen.getByText("dirtyCloseCancel").click()
+    })
     expect(scopedWorkspace.fileTabs.map((tab) => tab.id)).toEqual([a, b, c])
     expect(useFolderTabsStore.getState().fileRefs[1]).toEqual([a, b, c])
 
-    confirm.mockReturnValue(true)
     act(() => scopedWorkspace.closeAllFileTabs())
-    expect(confirm).toHaveBeenCalledTimes(2)
+    act(() => {
+      screen.getByText("dirtyCloseConfirm").click()
+    })
     expect(scopedWorkspace.allFileTabs).toEqual([])
     expect(useFolderTabsStore.getState().fileRefs[1]).toEqual([])
     expect(scopedWorkspace.activePane).toBe("conversation")
     expect(renderPhaseWrites()).toBe(0)
-    confirm.mockRestore()
   })
 
   it("close others only releases this worktree's hold on a shared buffer, without asking for it", async () => {
@@ -8078,11 +8101,12 @@ describe("Folder-tabs file closes, restores and selection", () => {
     act(() => scopedWorkspace.switchFileTab(shared))
     const b = await openDirty("/repo2/b.ts")
     const c = await openDirty("/repo2/c.ts", false)
-    const confirm = vi.spyOn(window, "confirm").mockReturnValue(true)
     act(() => scopedWorkspace.closeOtherFileTabs(c))
     // b is dirty and closes for good: one question. The shared buffer stays
     // open in the other worktree, so losing it here costs nothing.
-    expect(confirm).toHaveBeenCalledTimes(1)
+    act(() => {
+      screen.getByText("dirtyCloseConfirm").click()
+    })
     expect(scopedWorkspace.fileTabs.map((tab) => tab.id)).toEqual([c])
     expect(scopedWorkspace.activeFileTabId).toBe(c)
     expect(scopedWorkspace.allFileTabs?.map((tab) => tab.id)).toEqual([
@@ -8097,7 +8121,6 @@ describe("Folder-tabs file closes, restores and selection", () => {
       isDirty: true,
     })
     expect(renderPhaseWrites()).toBe(0)
-    confirm.mockRestore()
   })
 
   it("closing the selected buffer moves straight to its neighbour in the scope's order", async () => {

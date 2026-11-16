@@ -25,6 +25,7 @@ import {
   DEFAULT_CODE_THEMES,
   getCachedHighlightedCode,
   rawCodeTokens,
+  setHighlighterFactoryOverride,
   subscribeHighlightedCode,
 } from "@/lib/code-highlighter"
 import { CheckIcon, CopyIcon } from "lucide-react"
@@ -340,6 +341,9 @@ export function __setHighlighterFactoryForTest(
 ): void {
   highlighterFactoryOverride = factory
   highlighterCache.clear()
+  setHighlighterFactoryOverride(
+    factory ? (language) => factory(language as BundledLanguage) : null
+  )
 }
 
 /** Test-only: insert a completed token entry under an arbitrary key. */
@@ -372,6 +376,7 @@ export function __getHighlightCacheStatsForTest(): {
 /** Test-only: reset overrides, caches, and in-flight state. */
 export function __resetHighlightCachesForTest(): void {
   highlighterFactoryOverride = null
+  setHighlighterFactoryOverride(null)
   clearHighlightCaches()
 }
 

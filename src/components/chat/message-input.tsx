@@ -2535,6 +2535,7 @@ export function MessageInput({
                       <SessionSettingsPicker
                         agentType={agentType ?? null}
                         settings={sessionSettings}
+                        locked={mutationLocked}
                         loadingLabel={
                           showSelectorsLoading
                             ? showConfigLoading

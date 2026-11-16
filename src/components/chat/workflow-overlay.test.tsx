@@ -1,4 +1,5 @@
 import {
+  cleanup,
   fireEvent,
   render,
   screen,
@@ -720,6 +721,21 @@ function simpleTaskOverviewGraph(): WorkflowGraphSnapshot {
 
 beforeEach(() => {
   __resetWorkflowGraphStoreForTests()
+  // `set()` copies action functions onto the next state object, so a spy from
+  // the previous test can outlive `restoreAllMocks` and keep its call history.
+  const state = useWorkflowGraphStore.getState() as unknown as Record<
+    string,
+    { mockClear?: () => void }
+  >
+  for (const key of [
+    "activateOverlayInterest",
+    "activateConversation",
+    "activateSimpleFileInterest",
+    "refresh",
+    "applyFromDetail",
+  ]) {
+    state[key]?.mockClear?.()
+  }
   vi.mocked(useSyncExternalStore).mockClear()
   vi.mocked(openDelegatedChildSession).mockClear()
   openWorkflowFile.mockClear()
@@ -740,6 +756,7 @@ beforeEach(() => {
 })
 
 afterEach(() => {
+  cleanup()
   vi.unstubAllGlobals()
   vi.restoreAllMocks()
 })

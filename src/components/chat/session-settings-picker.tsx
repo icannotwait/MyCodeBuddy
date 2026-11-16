@@ -43,6 +43,8 @@ interface SessionSettingsPickerProps {
    *  the placeholder held in their place. `null` when nothing is loading. */
   loadingLabel: string | null
   onChange: OnChange
+  /** A locked composer cannot change settings. An open popover closes. */
+  locked?: boolean
 }
 
 /**
@@ -66,6 +68,7 @@ export function SessionSettingsPicker({
   settings,
   loadingLabel,
   onChange,
+  locked = false,
 }: SessionSettingsPickerProps) {
   const t = useTranslations("Folder.chat.messageInput")
   const [open, setOpen] = useState(false)
@@ -75,8 +78,10 @@ export function SessionSettingsPicker({
     useScrollbarSafeDismiss()
 
   // A popover left open over a session that lost its settings would reopen
-  // the moment they come back.
-  if (open && settings.length === 0) setOpen(false)
+  // the moment they come back. A lock (a viewer-only turn, an in-flight
+  // admission) closes it the same way: the trigger is disabled, and a
+  // disabled trigger does not dismiss the layer that is already open.
+  if (open && (settings.length === 0 || locked)) setOpen(false)
 
   if (settings.length === 0) {
     return loadingLabel ? (
@@ -111,6 +116,7 @@ export function SessionSettingsPicker({
             variant="ghost"
             size="xs"
             aria-label={label}
+            disabled={locked}
             // A pill tinted with the theme color chosen in Appearance
             // settings (`--primary`), translucent so it also sits over a
             // workspace background image. Hover and the open popover deepen

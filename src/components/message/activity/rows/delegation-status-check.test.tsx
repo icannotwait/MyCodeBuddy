@@ -452,9 +452,7 @@ describe("delegation status call", () => {
     )
     expect(screen.getByText(label)).toBeInTheDocument()
     if (observation === "stalled") {
-      expect(screen.getByTestId("delegation-status-card")).not.toHaveClass(
-        "bg-destructive/5"
-      )
+      expect(document.querySelector("li")).not.toHaveClass("bg-destructive/5")
     }
   })
 

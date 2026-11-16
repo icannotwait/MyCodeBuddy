@@ -49,6 +49,27 @@ let cacheBytes = 0
 let shikiPromise: Promise<typeof import("shiki")> | undefined
 let highlighterPromise: Promise<Highlighter> | undefined
 
+/** Test seam: CodeBlockContent shares this engine, so a factory set from the
+ * code-block tests must replace the real Shiki import. */
+type HighlighterFactoryOverride = (language: string) => Promise<{
+  codeToTokens: (
+    code: string,
+    options: {
+      lang: string
+      themes: { light: unknown; dark: unknown }
+    }
+  ) => TokensResult
+}>
+
+let highlighterFactoryOverride: HighlighterFactoryOverride | null = null
+
+export function setHighlighterFactoryOverride(
+  factory: HighlighterFactoryOverride | null
+): void {
+  highlighterFactoryOverride = factory
+  highlighterPromise = undefined
+}
+
 function loadShiki() {
   shikiPromise ??= import("shiki").catch((error) => {
     shikiPromise = undefined
@@ -179,52 +200,62 @@ function requestHighlight(
   void (async () => {
     let result: TokensResult
     try {
-      const [shiki, highlighter] = await Promise.all([
-        loadShiki(),
-        getHighlighter(),
-      ])
-      const name = options.language.trim().toLowerCase()
-      const info = shiki.bundledLanguagesInfo.find(
-        (entry) => entry.id === name || entry.aliases?.includes(name)
-      )
-      const language = info ? (info.id as BundledLanguage) : "text"
-      // Streamdown deliberately declares permissive structural theme types;
-      // its custom-theme objects are passed through to Shiki at this boundary.
-      const themes = options.themes as [
-        BundledTheme | ThemeRegistrationAny,
-        BundledTheme | ThemeRegistrationAny,
-      ]
-      await Promise.all([
-        ...(language !== "text" &&
-        !highlighter.getLoadedLanguages().includes(language)
-          ? [
-              once(`language:${language}`, () =>
-                highlighter.loadLanguage(language)
-              ),
-            ]
-          : []),
-        ...themes.map((theme) => {
-          if (
-            typeof theme === "string" &&
-            highlighter.getLoadedThemes().includes(theme)
-          ) {
-            return undefined
-          }
-          return once(`theme:${JSON.stringify(theme)}`, () =>
-            highlighter.loadTheme(theme)
-          )
-        }),
-      ])
-      // A streaming update or unmount can dispose the last subscriber while
-      // the engine/grammar is loading. Do not tokenize that obsolete prefix.
-      if (!request.prefetch && request.callbacks.size === 0) return
-      result = highlighter.codeToTokens(options.code, {
-        lang: language,
-        themes: { light: themes[0], dark: themes[1] },
-      })
-      // Incomplete blocks are superseded on the next streaming batch. Keeping
-      // every prefix turns one growing block into quadratic retained tokens.
-      if (request.cacheResult) remember(key, result)
+      if (highlighterFactoryOverride) {
+        const highlighter = await highlighterFactoryOverride(options.language)
+        if (!request.prefetch && request.callbacks.size === 0) return
+        result = highlighter.codeToTokens(options.code, {
+          lang: options.language,
+          themes: { light: options.themes[0], dark: options.themes[1] },
+        })
+        if (request.cacheResult) remember(key, result)
+      } else {
+        const [shiki, highlighter] = await Promise.all([
+          loadShiki(),
+          getHighlighter(),
+        ])
+        const name = options.language.trim().toLowerCase()
+        const info = shiki.bundledLanguagesInfo.find(
+          (entry) => entry.id === name || entry.aliases?.includes(name)
+        )
+        const language = info ? (info.id as BundledLanguage) : "text"
+        // Streamdown deliberately declares permissive structural theme types;
+        // its custom-theme objects are passed through to Shiki at this boundary.
+        const themes = options.themes as [
+          BundledTheme | ThemeRegistrationAny,
+          BundledTheme | ThemeRegistrationAny,
+        ]
+        await Promise.all([
+          ...(language !== "text" &&
+          !highlighter.getLoadedLanguages().includes(language)
+            ? [
+                once(`language:${language}`, () =>
+                  highlighter.loadLanguage(language)
+                ),
+              ]
+            : []),
+          ...themes.map((theme) => {
+            if (
+              typeof theme === "string" &&
+              highlighter.getLoadedThemes().includes(theme)
+            ) {
+              return undefined
+            }
+            return once(`theme:${JSON.stringify(theme)}`, () =>
+              highlighter.loadTheme(theme)
+            )
+          }),
+        ])
+        // A streaming update or unmount can dispose the last subscriber while
+        // the engine/grammar is loading. Do not tokenize that obsolete prefix.
+        if (!request.prefetch && request.callbacks.size === 0) return
+        result = highlighter.codeToTokens(options.code, {
+          lang: language,
+          themes: { light: themes[0], dark: themes[1] },
+        })
+        // Incomplete blocks are superseded on the next streaming batch. Keeping
+        // every prefix turns one growing block into quadratic retained tokens.
+        if (request.cacheResult) remember(key, result)
+      }
     } catch (error) {
       console.error("Failed to highlight code:", error)
       result = rawCodeTokens(options.code)

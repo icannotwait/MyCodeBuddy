@@ -47,10 +47,6 @@ use super::registry::{BrowserRegistry, BrowserTab};
 use super::shim::linux_child as shim;
 #[cfg(target_os = "macos")]
 use super::shim::macos as shim;
-#[cfg(target_os = "macos")]
-use super::shim::macos as shim;
-#[cfg(target_os = "windows")]
-use super::shim::windows as shim;
 #[cfg(target_os = "windows")]
 use super::shim::windows as shim;
 use super::surface::{page_zoom_to_apply, BrowserSurface};

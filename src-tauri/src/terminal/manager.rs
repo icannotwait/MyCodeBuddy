@@ -9,6 +9,8 @@ use portable_pty::{native_pty_system, CommandBuilder, MasterPty, PtySize};
 
 use super::error::TerminalError;
 use super::shell::{configure_interactive_command, ResolvedShellSpec};
+#[cfg(target_os = "windows")]
+use super::shell_flavor::ShellFamily;
 use super::types::{TerminalEvent, TerminalInfo, TerminalSnapshot};
 use crate::browser::service_url::ServiceScanner;
 use crate::browser::services::ServiceWatch;
@@ -231,6 +233,7 @@ fn lock_terminals(
     terminals.lock().unwrap_or_else(|p| p.into_inner())
 }
 
+#[cfg(feature = "tauri-runtime")]
 pub(crate) fn resolve_shell() -> String {
     #[cfg(target_os = "windows")]
     {

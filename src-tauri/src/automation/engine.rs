@@ -1170,7 +1170,7 @@ impl AutomationEngine {
         self.index.lock().await.remove(conn_id);
         let _ = self
             .manager
-            .disconnect_with_origin(&conn_id, AcpDisconnectOrigin::InternalJobComplete)
+            .disconnect_with_origin(conn_id, AcpDisconnectOrigin::InternalJobComplete)
             .await;
 
         if let Ok(true) = settled {

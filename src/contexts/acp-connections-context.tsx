@@ -2432,10 +2432,11 @@ const EMPTY_BACKGROUND_TASKS: readonly BackgroundOutstandingTask[] = []
 
 /** Whether two outstanding-task sets list the same tasks, the same way. */
 function sameBackgroundTasks(
-  a: readonly BackgroundOutstandingTask[],
-  b: readonly BackgroundOutstandingTask[]
+  a: readonly BackgroundOutstandingTask[] | null | undefined,
+  b: readonly BackgroundOutstandingTask[] | null | undefined
 ): boolean {
   if (a === b) return true
+  if (a == null || b == null) return false
   if (a.length !== b.length) return false
   return a.every((task, i) => {
     const other = b[i]
@@ -4273,7 +4274,7 @@ function reduceSingleAction(
       const conn = state.get(action.contextKey)
       if (!conn?.pendingPermission) return state
       if (conn.pendingPermission.queued === action.depth) return state
-      const next = new Map(state)
+      const next = writableConnections(state, mutateUnpublished)
       next.set(action.contextKey, {
         ...conn,
         pendingPermission: {
@@ -4306,7 +4307,7 @@ function reduceSingleAction(
       if (!conn) return state
       const merged = mergeToolApprovals(conn.toolApprovals, [action.approval])
       if (merged === conn.toolApprovals) return state
-      const next = new Map(state)
+      const next = writableConnections(state, mutateUnpublished)
       next.set(action.contextKey, { ...conn, toolApprovals: merged })
       return next
     }
@@ -4712,7 +4713,7 @@ function reduceSingleAction(
           return state
         }
       }
-      const next = new Map(state)
+      const next = writableConnections(state, mutateUnpublished)
       next.set(action.contextKey, {
         ...conn,
         liveMessage: {
@@ -4965,7 +4966,7 @@ function reduceSingleAction(
     case "PROMPT_SUGGESTION": {
       const conn = state.get(action.contextKey)
       if (!conn || conn.promptSuggestion === action.text) return state
-      const next = new Map(state)
+      const next = writableConnections(state, mutateUnpublished)
       next.set(action.contextKey, { ...conn, promptSuggestion: action.text })
       return next
     }
@@ -4983,7 +4984,7 @@ function reduceSingleAction(
       ) {
         return state
       }
-      const next = new Map(state)
+      const next = writableConnections(state, mutateUnpublished)
       next.set(action.contextKey, { ...conn, remoteControl: after })
       return next
     }
@@ -5004,8 +5005,13 @@ function connectionsReducer(
     for (const frame of action.frames) {
       const beforeConn = next.get(frame.contextKey)
       if (!beforeConn) continue
+      let reducedMap = next
       for (const item of frame.actions) {
-        reduceSingleAction(next, item, true, effects)
+        reducedMap = reduceSingleAction(reducedMap, item, true, effects)
+      }
+      if (reducedMap !== next) {
+        next.clear()
+        for (const [key, value] of reducedMap) next.set(key, value)
       }
       const reduced = next.get(frame.contextKey)
       if (reduced && frame.highestSeq > reduced.lastAppliedSeq) {
@@ -5595,6 +5601,10 @@ function prepareMappedEnvelope(
           e.settled?.filter((settlement) => !settlement.wire_visible).length ??
           0,
         turnsCount: e.turns?.length ?? 0,
+        tasks:
+          e.outstanding_tasks && e.outstanding_tasks.length > 0
+            ? e.outstanding_tasks
+            : EMPTY_BACKGROUND_TASKS,
       })
       const sessionId = e.session_id
       const turns = e.turns
@@ -5650,6 +5660,7 @@ function prepareMappedEnvelope(
               status: item.status,
               summary: item.summary ?? null,
               result: item.result ?? null,
+              interim: item.interim === true,
             })
           }
         }
@@ -6071,6 +6082,54 @@ function prepareMappedEnvelope(
       })
       break
     }
+    case "delegation_child_running":
+      actions.push({
+        type: "DELEGATION_RUNNING",
+        contextKey,
+        childConnectionId: e.child_connection_id,
+        running: e.running,
+      })
+      break
+    case "tool_approval":
+      actions.push({
+        type: "TOOL_APPROVAL",
+        contextKey,
+        approval: e.approval,
+      })
+      break
+    case "background_task_progress": {
+      const sessionId = e.session_id
+      const toolUseId = e.tool_use_id
+      const meta = e.meta
+      afterCommit.push(() => {
+        const conversationId = getConversationIdByExternalIdFromStore(sessionId)
+        if (conversationId == null) return
+        useConversationRuntimeStore
+          .getState()
+          .actions.applyBackgroundTaskProgress(conversationId, toolUseId, meta)
+      })
+      break
+    }
+    case "prompt_suggestion":
+      actions.push({
+        type: "PROMPT_SUGGESTION",
+        contextKey,
+        text: e.text?.trim() || null,
+      })
+      break
+    case "remote_control":
+      actions.push({
+        type: "REMOTE_CONTROL",
+        contextKey,
+        remoteControl: e.remote_control
+          ? { session_url: e.remote_control.session_url ?? null }
+          : null,
+      })
+      break
+    case "transcript_rolled_over":
+      // The backend re-points the conversation after Claude `/clear`.
+      // The sidebar converges from `conversation://changed`.
+      break
     default: {
       const unknown = envelope as EventEnvelope & { type: string }
       console.warn("[acp-context] unknown ACP event type", {
@@ -6165,7 +6224,12 @@ function onlyCursorChanged(
     before.conversationId === after.conversationId &&
     before.delegationRouteOverride === after.delegationRouteOverride &&
     before.waitingForSubagents === after.waitingForSubagents &&
-    before.toolWatchdogProjections === after.toolWatchdogProjections
+    before.toolWatchdogProjections === after.toolWatchdogProjections &&
+    before.delegatedChildren === after.delegatedChildren &&
+    before.remoteControl === after.remoteControl &&
+    before.toolApprovals === after.toolApprovals &&
+    before.promptSuggestion === after.promptSuggestion &&
+    before.backgroundTasks === after.backgroundTasks
   )
 }
 
@@ -6647,10 +6711,26 @@ function prepareEventFrame(
           hasAuthoritativeTerminalDelivery(connFrame, event.seq),
           completedRuntimeSessions
         )
-        if (!admission.accepted) continue
-        stepCompletionRuntimeConversationIds = admission.runtimeConversationIds
-        for (const runtimeId of admission.runtimeConversationIds) {
-          completedRuntimeSessions.set(runtimeId, event.session_id)
+        if (admission.accepted) {
+          stepCompletionRuntimeConversationIds =
+            admission.runtimeConversationIds
+          for (const runtimeId of admission.runtimeConversationIds) {
+            completedRuntimeSessions.set(runtimeId, event.session_id)
+          }
+        } else {
+          // Nothing to promote into the transcript. The status transition
+          // still has to land: a completion that arrives before `prompting`
+          // (or with an empty live message) is the agent going idle, and
+          // the sweep ignores `connecting` forever if this event is dropped.
+          // A completion for a different session must not end the live turn.
+          const sessionOk =
+            snapshot.sessionId == null ||
+            event.session_id == null ||
+            snapshot.sessionId === event.session_id
+          const endsIdleTurn =
+            sessionOk &&
+            (snapshot.status !== "prompting" || snapshot.liveMessage == null)
+          if (!endsIdleTurn) continue
         }
       }
       stepEvents.push(event)
@@ -8424,6 +8504,17 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
 
   const commitEventFrame = useCallback(
     (frame: AcceptedEventFrame): void => {
+      // A surface still fetching its snapshot is not routed yet. Events the
+      // firehose already handed to another surface of this connection have to
+      // be replayed onto it, or a permission raised in that window never
+      // arrives. Record them before the reducer applies the frame.
+      for (const connFrame of frame.connections) {
+        const hydrating = hydrationEchoesRef.current.get(connFrame.connectionId)
+        if (!hydrating || hydrating.size === 0) continue
+        for (const event of connFrame.rawEvents) {
+          for (const echoes of hydrating) echoes.push(event)
+        }
+      }
       const prepared = prepareEventFrame(
         frame,
         storeRef.current.connections,
@@ -10168,6 +10259,22 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
     [clearAliasesPointingTo, dispatch, settleListenerWaiters, t]
   )
 
+  // Mid-turn progress clears a recovered AIR retry incident. The prepare
+  // path does the same inline; this callback is the live event-handler path
+  // (`content_delta`, `thinking`, `tool_call`).
+  const settleRetryIncidentsOnProgress = useCallback(
+    (contextKey: string) => {
+      const conn = storeRef.current.connections.get(contextKey)
+      if (!conn || !hasSettleableRetryIncident(conn.sessionFailures)) return
+      dispatch({
+        type: "SETTLE_SESSION_FAILURES",
+        contextKey,
+        scope: "retry_incidents",
+      })
+    },
+    [dispatch]
+  )
+
   // Push envelopes into the frame ingestor. Optional flush for connect-time
   // buffered drains that must apply before the next tick.
   //
@@ -11629,7 +11736,12 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
       const notifySession = (
         kind: Parameters<typeof notifyDesktop>[0],
         content: { body: string; redactedBody?: string }
-      ) => notifyDesktop(kind, sessionNotification(shadowKey, content))
+      ) => {
+        void notifyDesktop(kind, sessionNotification(shadowKey, content))
+        // Taskbar / Dock attention rides along with every desktop alert.
+        // Replay sources never reach here (`mayNotify` is live or desktop).
+        void requestWindowAttention(kind)
+      }
 
       // One owner: live streaming deltas that bypass the ingestor play in
       // `pushMappedEvents`. Everything accepted into this frame plays here.
@@ -11699,6 +11811,15 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
             })
           }
           break
+        case "plan_approval_request":
+          if (mayNotify && conn) {
+            void notifySession("permission_request", {
+              body: translate("notificationPlanApproval", {
+                agent: getAgentLabel(conn.agentType),
+              }),
+            })
+          }
+          break
         case "permission_request":
           if (mayNotify && conn) {
             const agentLabel = getAgentLabel(conn.agentType)
@@ -11709,13 +11830,15 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
           break
         case "background_activity":
           if (mayNotify && conn && event.settled && event.settled.length > 0) {
+            const finished = event.settled.filter((item) => !item.interim)
+            if (finished.length === 0) break
             const agentLabel = getAgentLabel(conn.agentType)
-            const count = event.settled.length
+            const count = finished.length
             const many = tChat("backgroundTasks.notifySettledMany", {
               agent: agentLabel,
               count,
             })
-            const single = event.settled[0]!
+            const single = finished[0]!
             void notifySession("background_task", {
               body:
                 count === 1
@@ -12502,12 +12625,6 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
           new Error("Desktop ACP delivery previously failed; restart the app")
         )
         return
-      }
-      // Routed elsewhere while a surface of this connection is still
-      // hydrating: keep it for that one too (`hydrationEchoesRef`).
-      const hydrating = hydrationEchoesRef.current.get(envelope.connection_id)
-      if (hydrating) {
-        for (const echoes of hydrating) echoes.push(envelope)
       }
 
       const hasAttachStream = getEventStream() !== null
@@ -13331,7 +13448,12 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
           owned = true
           if (conn && isConnectionBusy(conn)) busy = true
         }
-        if (owned && !busy) acpDisconnect(connectionId).catch(() => {})
+        if (owned && !busy) {
+          acpDisconnect(
+            connectionId,
+            disconnectLeaseWithOrigin(null, "provider_unmount")
+          ).catch(() => {})
+        }
       }
       for (const [, sub] of attachSubs) {
         try {
@@ -13890,6 +14012,7 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
             sameGeneration ? "resume" : "cold",
             { generation: response.generation, leaseId: response.leaseId }
           )
+          bindConnectionRoute(response.connectionId, contextKey)
           if (
             activeRequest.retryFailedGeneration != null ||
             activeRequest.sharedReconnect != null
@@ -14508,8 +14631,9 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
           undefined
         )
         if (attachSub) {
-          // Done — the EventStream handles snapshot, replay, live events,
-          // and reconnect entirely in-band over the same WS.
+          // The attach stream delivers events, but provider teardown walks
+          // the route table to release a shared lease or disconnect an owner.
+          bindConnectionRoute(connectionId, contextKey)
         } else {
           // Legacy path (Tauri desktop, RemoteDesktop): same flow as
           // before Phase 3. Awaits snapshot HTTP first, then registers

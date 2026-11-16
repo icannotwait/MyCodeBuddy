@@ -100,27 +100,48 @@ vi.mock("@/lib/platform", async (importOriginal) => {
 // virtua / stick-to-bottom / heavy markdown — keep list tests focused.
 vi.mock("virtua", () => ({
   Virtualizer: forwardRef(function VirtualizerMock(
-    props: { children?: ReactNode },
-    ref: Ref<{ scrollToIndex: (i: number) => void }>
+    props: {
+      children?: ReactNode | ((item: unknown, index: number) => ReactNode)
+      data?: readonly unknown[]
+    },
+    ref: Ref<{
+      scrollToIndex: (i: number) => void
+      scrollOffset: number
+      scrollSize: number
+      viewportSize: number
+      findItemIndex: (offset: number) => number
+      getItemOffset: (index: number) => number
+    }>
   ) {
-    const children = Array.isArray(props.children) ? props.children : []
+    const rendered = Array.isArray(props.data)
+      ? props.data.map((item, index) =>
+          typeof props.children === "function"
+            ? props.children(item, index)
+            : null
+        )
+      : Array.isArray(props.children)
+        ? props.children
+        : []
     virtualizerKeysSpy(
-      children.map(
+      rendered.map(
         (child) => (child as { key?: string | null } | null)?.key ?? null
       )
     )
     useImperativeHandle(ref, () => ({
       scrollToIndex: virtualizerScrollToIndex,
+      scrollOffset: 0,
+      scrollSize: 0,
+      viewportSize: 800,
+      findItemIndex: () => 0,
+      getItemOffset: () => 0,
     }))
     return (
       <div data-testid="virtua-root">
-        {Array.isArray(props.children)
-          ? props.children.map((child, index) => (
-              <div key={index} data-virtua-item>
-                {child}
-              </div>
-            ))
-          : props.children}
+        {rendered.map((child, index) => (
+          <div key={index} data-virtua-item>
+            {child}
+          </div>
+        ))}
       </div>
     )
   }),
@@ -325,6 +346,46 @@ vi.mock("./content-parts-renderer", async () => {
               />
             )
           )}
+        </div>
+      )
+    },
+    ActivityParts: ({
+      model,
+    }: {
+      model?: {
+        steps?: Array<{ type: string; part?: MockPart }>
+      }
+    }) => {
+      const inherited = useContext(OptionsContext)
+      const steps = model?.steps ?? []
+      const notes = steps.filter(
+        (step) => step.type === "note" && step.part?.type === "text"
+      )
+      const polls = steps.filter((step) => step.type === "delegation-polls")
+      if (notes.length === 0 && polls.length === 0) return null
+      return (
+        <div data-grok-phase={inherited?.grokSessionImagePhase ?? undefined}>
+          {notes.map((step, index) => (
+            <span
+              key={`note-${index}`}
+              data-testid="assistant-text"
+              data-autolink-local-paths={String(
+                inherited?.autolinkLocalPathParts?.has(step.part!) ?? false
+              )}
+              data-grok-session-image-eligible={String(
+                inherited?.grokSessionImageTextParts?.has(step.part!) ?? false
+              )}
+            >
+              {step.part?.text}
+            </span>
+          ))}
+          {polls.map((step, index) => (
+            <span
+              key={`poll-${index}`}
+              data-testid="delegation-status-residual"
+              data-visible-task-ids="all"
+            />
+          ))}
         </div>
       )
     },

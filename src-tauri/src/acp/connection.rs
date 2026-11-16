@@ -9035,6 +9035,7 @@ fn build_client_capabilities(
     client_capabilities
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_new_session_request(
     agent_type: AgentType,
     cwd: &Path,
@@ -9116,6 +9117,7 @@ pub(crate) fn resume_session_request_for(
     req
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_load_session_request(
     agent_type: AgentType,
     session_id: SessionId,
@@ -25933,7 +25935,7 @@ async fn gemini_mode_update_chunk(
         .as_ref()?
         .available_modes
         .iter()
-        .any(|mode| mode.id.to_string() == mode_id)
+        .any(|mode| mode.id == mode_id)
         .then(|| mode_id.to_string())
 }
 

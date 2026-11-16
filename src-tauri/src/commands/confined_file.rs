@@ -107,14 +107,18 @@ fn invalid_alias() -> AppCommandError {
 
 fn is_definitive_alias_resolution_failure(error: &std::io::Error) -> bool {
     #[cfg(unix)]
-    if error.raw_os_error() == Some(libc::ELOOP) {
-        return true;
+    {
+        error.raw_os_error() == Some(libc::ELOOP)
     }
     #[cfg(windows)]
-    if error.raw_os_error() == Some(1921) {
-        return true;
+    {
+        error.raw_os_error() == Some(1921)
     }
-    false
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = error;
+        false
+    }
 }
 
 fn is_alias_resolution_failure(error: &std::io::Error) -> bool {

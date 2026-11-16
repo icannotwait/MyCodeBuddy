@@ -16,7 +16,10 @@ import {
   MessageResponse,
   type MessageResponseProps,
 } from "@/components/ai-elements/message"
-import { MarkdownImageSpan } from "@/components/ai-elements/markdown-local-image"
+import {
+  MarkdownImageSpan,
+  setForgeImageSpanRenderer,
+} from "@/components/ai-elements/markdown-local-image"
 import { forgeReadImage } from "@/lib/api"
 import type { ForgeImage, ForgeRemote } from "@/lib/types"
 import { remarkGitlabImages } from "./remark-gitlab-images"
@@ -171,6 +174,8 @@ function ForgeImageSpan(
     />
   )
 }
+
+setForgeImageSpanRenderer(ForgeImageSpan)
 
 const forgeImageComponents: Components = {
   span: ForgeImageSpan as Components["span"],

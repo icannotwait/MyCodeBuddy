@@ -1963,8 +1963,7 @@ export const useTabStore = create<TabStoreState>()((set, get) => ({
       localDesktop = false
     }
     const needsPopoutFence =
-      conversationId > 0 &&
-      (localDesktop || webPopoutMayOwn(conversationId))
+      conversationId > 0 && (localDesktop || webPopoutMayOwn(conversationId))
 
     if (needsPopoutFence) {
       try {

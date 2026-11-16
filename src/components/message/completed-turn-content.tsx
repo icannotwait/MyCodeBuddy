@@ -221,6 +221,13 @@ export const CompletedTurnContent = memo(function CompletedTurnContent({
     () => buildActivity(parts, { isStreaming, keepAnswer: proseOnRail }),
     [parts, isStreaming, proseOnRail]
   )
+  // The timeline has no lane for a delegation work unit. Those cards are the
+  // fork's record of a run (and the status polls folded into it), so they stay
+  // on the part renderer instead of disappearing into an empty step list.
+  const workUnits = useMemo(
+    () => parts.filter((part) => part.type === "delegation-work-unit"),
+    [parts]
+  )
   // The header's red "N failed": open the turn at the first failure nothing
   // redid — the row, and the group it is folded into.
   const failureKey = activity.summary.firstUnrecoveredKey
@@ -402,6 +409,13 @@ export const CompletedTurnContent = memo(function CompletedTurnContent({
             </div>
           </CollapsibleContent>
         </Collapsible>
+        {workUnits.length > 0 ? (
+          <ContentPartsRenderer
+            parts={workUnits}
+            role="assistant"
+            isStreaming={isStreaming}
+          />
+        ) : null}
         {answerShown ? (
           // Keyed as the prose it was on the rail (`prose:<its index in the
           // reply>`), so the closing words glide off the rail into place when

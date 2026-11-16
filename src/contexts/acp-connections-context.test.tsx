@@ -4594,7 +4594,9 @@ describe("AcpConnectionsProvider preview-tab release (disconnectIfIdle)", () => 
     await act(async () => {
       await h.actions!.disconnectIfIdle(TAB)
     })
-    expect(h.acpDisconnect).toHaveBeenCalledWith("spawned-conn")
+    expect(h.acpDisconnect).toHaveBeenCalledWith("spawned-conn", {
+      origin: "explicit_user",
+    })
   })
 
   it("keeps an owner alive while Remote Control is on", async () => {
@@ -4646,7 +4648,9 @@ describe("AcpConnectionsProvider preview-tab release (disconnectIfIdle)", () => 
     await act(async () => {
       await h.actions!.disconnectIfIdle(TAB)
     })
-    expect(h.acpDisconnect).toHaveBeenCalledWith("spawned-conn")
+    expect(h.acpDisconnect).toHaveBeenCalledWith("spawned-conn", {
+      origin: "explicit_user",
+    })
   })
 
   // A client that attaches mid-delegation (a reload, a second window) never
@@ -4728,7 +4732,7 @@ describe("AcpConnectionsProvider preview-tab release (disconnectIfIdle)", () => 
 describe("AcpConnectionsProvider unmount teardown (desktop)", () => {
   beforeEach(() => {
     h.eventStreamValue = null
-    vi.mocked(subscribe).mockClear()
+    h.subscribe.mockClear()
   })
 
   async function connectOwner() {
@@ -4742,13 +4746,9 @@ describe("AcpConnectionsProvider unmount teardown (desktop)", () => {
     await act(async () => {
       await h.actions!.connect(TAB, "claude_code", "/tmp/x", "sess-1", 42)
     })
-    const onEvent = vi.mocked(subscribe).mock.calls[0]![1] as (
-      envelope: EventEnvelope
-    ) => void
-    const emit = (envelope: EventEnvelope) =>
-      act(() => {
-        onEvent(envelope)
-      })
+    const emit = (envelope: EventEnvelope) => {
+      emitDesktopEnvelope(envelope)
+    }
     emit({
       seq: 1,
       connection_id: "spawned-conn",
@@ -4798,7 +4798,9 @@ describe("AcpConnectionsProvider unmount teardown (desktop)", () => {
 
     unmount()
 
-    expect(h.acpDisconnect).toHaveBeenCalledWith("spawned-conn")
+    expect(h.acpDisconnect).toHaveBeenCalledWith("spawned-conn", {
+      origin: "provider_unmount",
+    })
   })
 })
 
@@ -4885,7 +4887,9 @@ describe("AcpConnectionsProvider active key across a view's lifetime", () => {
           CONNECTION_IDLE_TIMEOUT_MS + IDLE_SWEEP_INTERVAL_MS + 1000
         )
       })
-      expect(h.acpDisconnect).toHaveBeenCalledWith("spawned-conn")
+      expect(h.acpDisconnect).toHaveBeenCalledWith("spawned-conn", {
+        origin: "idle_timeout",
+      })
     } finally {
       vi.useRealTimers()
     }
@@ -4934,7 +4938,9 @@ describe("AcpConnectionsProvider active key across a view's lifetime", () => {
           CONNECTION_IDLE_TIMEOUT_MS + IDLE_SWEEP_INTERVAL_MS + 1000
         )
       })
-      expect(h.acpDisconnect).toHaveBeenCalledWith("spawned-conn")
+      expect(h.acpDisconnect).toHaveBeenCalledWith("spawned-conn", {
+        origin: "idle_timeout",
+      })
     } finally {
       vi.useRealTimers()
     }
@@ -22504,7 +22510,7 @@ describe("tool approvals", () => {
     const handlers = await connectOwner()
     const live = approval("tc-1", "reject_once", "2026-10-22T09:05:00Z")
     emitAcpEvent(handlers, {
-      seq: 3,
+      seq: 1,
       connection_id: "spawned-conn",
       type: "tool_approval",
       approval: live,
@@ -22814,7 +22820,9 @@ describe("Claude Code's Remote Control (claude-agent-acp 0.93.0)", () => {
           CONNECTION_IDLE_TIMEOUT_MS + IDLE_SWEEP_INTERVAL_MS + 1000
         )
       })
-      expect(h.acpDisconnect).toHaveBeenCalledWith("spawned-conn")
+      expect(h.acpDisconnect).toHaveBeenCalledWith("spawned-conn", {
+        origin: "idle_timeout",
+      })
     } finally {
       vi.useRealTimers()
     }
@@ -23182,7 +23190,7 @@ describe("desktop: a sub-agent already parked when this window attaches", () => 
 
   beforeEach(async () => {
     h.eventStreamValue = null
-    vi.mocked(subscribe).mockClear()
+    h.subscribe.mockClear()
     h.acpFindConnectionForConversation.mockResolvedValue({
       connection_id: PARENT,
       event_seq: 5,
@@ -23273,9 +23281,7 @@ describe("desktop: hydrating a connection another surface already routes", () =>
   }
 
   function firehose() {
-    return vi.mocked(subscribe).mock.calls[0]![1] as (
-      envelope: EventEnvelope
-    ) => void
+    return h.subscribe.mock.calls[0]![1] as (envelope: EventEnvelope) => void
   }
 
   function patchAt(eventSeq: number) {
@@ -23318,7 +23324,7 @@ describe("desktop: hydrating a connection another surface already routes", () =>
   beforeEach(() => {
     h.eventStreamValue = null
     seen.length = 0
-    vi.mocked(subscribe).mockClear()
+    h.subscribe.mockClear()
     h.notifyDesktop.mockClear()
     h.acpFindConnectionForConversation.mockResolvedValue({
       connection_id: CONN,
@@ -25140,7 +25146,9 @@ describe("a switch that lands while another agent is still connecting", () => {
     await act(async () => {})
 
     // The abandoned attempt is torn down and never registered...
-    expect(h.acpDisconnect).toHaveBeenCalledWith("claude_code-conn")
+    expect(h.acpDisconnect).toHaveBeenCalledWith("claude_code-conn", {
+      origin: "abandoned_connect",
+    })
     expect(h.store!.getConnection(TAB)).toBeUndefined()
     // ...and the newest request is the one actually connecting now.
     expect(h.acpConnect).toHaveBeenCalledTimes(2)
@@ -25168,7 +25176,9 @@ describe("a switch that lands while another agent is still connecting", () => {
     await act(async () => {
       await h.actions!.connect(TAB, "codex", "/tmp/x")
     })
-    expect(h.acpDisconnect).toHaveBeenCalledWith("starting-claude")
+    expect(h.acpDisconnect).toHaveBeenCalledWith("starting-claude", {
+      origin: "connection_superseded",
+    })
     expect(h.acpConnect).toHaveBeenCalledTimes(2)
     expect(h.store!.getConnection(TAB)?.agentType).toBe("codex")
     expect(h.store!.getConnection(TAB)?.status).toBe("connecting")
@@ -26362,12 +26372,14 @@ describe("hasPrompted: whether a turn has run on the connection", () => {
 
   it("adopts a turn even from a snapshot older than the events applied", async () => {
     const handlers = await connectDraft()
-    emitAcpEvent(handlers, {
-      seq: 4,
-      connection_id: "spawned-conn",
-      type: "status_changed",
-      status: "connected",
-    })
+    for (const seq of [1, 2, 3, 4]) {
+      emitAcpEvent(handlers, {
+        seq,
+        connection_id: "spawned-conn",
+        type: "status_changed",
+        status: "connected",
+      })
+    }
     expect(hasPrompted()).toBe(false)
 
     // Stale by event_seq, so its current-state fields are ignored — but a turn

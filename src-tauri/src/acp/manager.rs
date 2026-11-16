@@ -3809,7 +3809,6 @@ impl ConnectionManager {
     }
 
     #[allow(clippy::too_many_arguments)]
-    #[allow(clippy::too_many_arguments)]
     pub async fn spawn_agent(
         &self,
         agent_type: AgentType,
@@ -3983,8 +3982,10 @@ impl ConnectionManager {
             route_preference: Some(DelegationRoutePolicy::Codeg),
             route_capability: capability,
         };
-        let mut launch_context = ConnectionLaunchContext::default();
-        launch_context.delegation_can_spawn_child = true;
+        let launch_context = ConnectionLaunchContext {
+            delegation_can_spawn_child: true,
+            ..ConnectionLaunchContext::default()
+        };
         self.spawn_agent_with_attach_mode_and_workflow_binding(
             agent_type,
             working_dir,

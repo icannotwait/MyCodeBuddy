@@ -218,7 +218,9 @@ export const ReasoningContent = memo(function ReasoningContent({
   const { isStreaming } = useContext(ReasoningContext)
   return (
     <CollapsibleContent>
-      <ReasoningMarkdown isStreaming={isStreaming}>{children}</ReasoningMarkdown>
+      <ReasoningMarkdown isStreaming={isStreaming}>
+        {children}
+      </ReasoningMarkdown>
     </CollapsibleContent>
   )
 })

@@ -42,6 +42,7 @@ import {
 import { createLiveTranscriptFrameSink } from "@/stores/live-transcript-store"
 import {
   extractPermissionToolCallId,
+  useAcpActions,
   useConnectionStore,
   type ConnectionState,
 } from "@/contexts/acp-connections-context"

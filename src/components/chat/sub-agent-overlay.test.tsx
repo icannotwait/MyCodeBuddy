@@ -684,6 +684,7 @@ describe("SubAgentOverlay", () => {
       <SubAgentOverlay
         delegations={[source("pt-1", { assistant_id: 3, task: "Review" })]}
         overlayKey="k-assistant"
+        defaultExpanded={false}
       />
     )
     fireEvent.click(screen.getByText("Sub-agents 1").closest("button")!)

@@ -2248,6 +2248,12 @@ export function MessageListView({
       [conversationId]
     )
   )
+  const detail = useConversationRuntimeStore(
+    useCallback(
+      (s) => s.byConversationId.get(conversationId)?.detail ?? null,
+      [conversationId]
+    )
+  )
   const detailHistoryLoadingOlder = useConversationRuntimeStore(
     useCallback(
       (s) =>
@@ -2977,7 +2983,7 @@ export function MessageListView({
     : 0
   const userMessageCount = earlierUserCount + loadedUserMessages.count
   const earlierOutline = useConversationOutline({
-    fetchId: session?.dbConversationId ?? conversationId,
+    fetchId: durableConversationId,
     offset: windowedDetail?.turns_offset ?? 0,
     prefixHash: windowedDetail?.prefix_hash ?? null,
     enabled: navDemanded && earlierUserCount > 0,

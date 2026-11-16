@@ -271,6 +271,7 @@ function resolveLifecycleStatus(input: {
   toolOutput: ParsedToolOutput | null
   state?: ToolCallState
   errorText?: string | null
+  ended?: { status: "ok" | "err" } | null
 }): DelegationLifecycleStatus {
   const {
     binding,
@@ -280,6 +281,7 @@ function resolveLifecycleStatus(input: {
     toolOutput,
     state,
     errorText,
+    ended = null,
   } = input
 
   if (binding) return binding.status
@@ -302,6 +304,10 @@ function resolveLifecycleStatus(input: {
   if (toolOutput?.kind === "outcome") {
     return toolOutput.isError ? "err" : "ok"
   }
+  // A later status check is newer than the running ack when nothing live
+  // or stored says otherwise. Leaving the lifecycle on `running` makes the
+  // sticky work-unit projection paint a failed task as still running.
+  if (ended) return ended.status
   if (toolOutput?.kind === "ack") return "running"
   if (state === "output-available") return "ok"
   if (fromProj === "running") return "running"
@@ -638,6 +644,7 @@ export function buildDelegationCardModel(input: {
     toolOutput,
     state,
     errorText,
+    ended,
   })
 
   const status =

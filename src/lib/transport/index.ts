@@ -1,5 +1,6 @@
 import { detectEnvironment } from "./detect"
 import type { RemoteTransportConfig, Transport } from "./types"
+import { WebTransport } from "./web-transport"
 
 export type { RemoteTransportConfig, Transport, UnsubscribeFn } from "./types"
 
@@ -17,10 +18,6 @@ function createTauriTransport(): Transport {
 }
 
 function createWebTransport(baseUrl: string): Transport {
-  // eslint-disable-next-line @typescript-eslint/no-require-imports
-  const { WebTransport } = require("./web-transport") as {
-    WebTransport: new (baseUrl: string) => Transport
-  }
   return new WebTransport(baseUrl)
 }
 

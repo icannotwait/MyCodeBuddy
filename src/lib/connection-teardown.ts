@@ -64,9 +64,9 @@ export function isConnectionBusy(conn: ConnectionWork): boolean {
   return (
     conn.status === "prompting" ||
     conn.backgroundOutstanding > 0 ||
-    conn.asyncTasks.some((task) => !isAsyncTaskTerminal(task)) ||
+    (conn.asyncTasks ?? []).some((task) => !isAsyncTaskTerminal(task)) ||
     conn.remoteControl != null ||
-    conn.delegatedChildren.length > 0
+    (conn.delegatedChildren?.length ?? 0) > 0
   )
 }
 

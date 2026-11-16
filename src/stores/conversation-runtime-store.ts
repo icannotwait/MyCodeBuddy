@@ -2270,7 +2270,7 @@ const kimiTodosByInfo = new WeakMap<ToolCallInfo, PlanEntryInfo[] | null>()
 function kimiTodosOf(info: ToolCallInfo): PlanEntryInfo[] | null {
   let entries = kimiTodosByInfo.get(info)
   if (entries === undefined) {
-    entries = kimiTodoWriteEntries(info.raw_input)
+    entries = kimiTodoWriteEntries(info.raw_input, info)
     kimiTodosByInfo.set(info, entries)
   }
   return entries
@@ -3788,16 +3788,17 @@ function reducer(
             current.syncState === "awaiting_persist" && !keepAllLiveBuffers
             ? []
             : retireCoveredLocalTurns(
-              current.localTurns,
-              detail,
-              action.localAlignmentBoundaryIndex ?? current.batchBoundaryIndex,
-              action.localAlignmentBoundaryIndex !== undefined
-                ? undefined
-                : current.batchBoundaryPrefixHash,
-              {
-                allowRicherCover: true,
-              }
-            )
+                current.localTurns,
+                detail,
+                action.localAlignmentBoundaryIndex ??
+                  current.batchBoundaryIndex,
+                action.localAlignmentBoundaryIndex !== undefined
+                  ? undefined
+                  : current.batchBoundaryPrefixHash,
+                {
+                  allowRicherCover: true,
+                }
+              )
       const retiredLocalPrefix =
         nextLocalTurns.length < current.localTurns.length
 
@@ -3888,7 +3889,13 @@ function reducer(
       // next reply some other round's stats, so the batch is re-anchored on
       // the transcript just loaded (`recaptureBatchStart`). A batch left with
       // nothing at all is captured afresh by its next send anyway.
-      if (nextSession.localTurns.length < current.localTurns.length) {
+      // Authoritative Manual Reload already cleared the batch anchor. Recapture
+      // is for a settled refetch that folded finished rounds into detail while
+      // a prompt is still in flight — not for a reload that dropped ownership.
+      if (
+        !authoritative &&
+        nextSession.localTurns.length < current.localTurns.length
+      ) {
         const capture = recaptureBatchStart(nextSession)
         nextSession.historyAssistantBaseline = capture.baseline
         nextSession.batchBoundaryIndex = capture.boundaryIndex
@@ -5382,10 +5389,15 @@ const fetchGeneration = new Map<number, number>()
 const historyPageGeneration = new Map<number, number>()
 const authoritativeFetchGeneration = new Map<number, number>()
 
+// Monotonic across resets. Clearing the map must not let a fetch that started
+// before the reset reuse the next test's (or the next session's) generation 1
+// and commit a stale detail over it.
+let fetchGenerationEpoch = 0
+
 function bumpFetchGeneration(conversationId: number): number {
-  const next = (fetchGeneration.get(conversationId) ?? 0) + 1
-  fetchGeneration.set(conversationId, next)
-  return next
+  fetchGenerationEpoch += 1
+  fetchGeneration.set(conversationId, fetchGenerationEpoch)
+  return fetchGenerationEpoch
 }
 
 function isLatestGeneration(
@@ -5395,10 +5407,12 @@ function isLatestGeneration(
   return fetchGeneration.get(conversationId) === generation
 }
 
+let historyPageGenerationEpoch = 0
+
 function bumpHistoryPageGeneration(conversationId: number): number {
-  const next = (historyPageGeneration.get(conversationId) ?? 0) + 1
-  historyPageGeneration.set(conversationId, next)
-  return next
+  historyPageGenerationEpoch += 1
+  historyPageGeneration.set(conversationId, historyPageGenerationEpoch)
+  return historyPageGenerationEpoch
 }
 
 function isLatestHistoryPageGeneration(
@@ -8945,37 +8959,37 @@ export const useConversationRuntimeStore = create<ConversationRuntimeStore>()((
             // An unverified window must not pin tool meta either: the same
             // mis-alignment the scalar patches refuse applies to tool rows.
             if (!(responseWindowed && !windowVerified)) {
-            const parsedAssistantTurns = parsedTurns.filter(
-              (turn) => turn.role === "assistant"
-            )
-            const historyBoundary = Math.min(
-              Math.max(persistedAssistantCount, 0),
-              parsedAssistantTurns.length
-            )
-            const sessionParsedTurns =
-              parsedAssistantTurns.slice(historyBoundary)
-            const offset =
-              sessionParsedTurns.length - localAssistantIndices.length
-            for (let i = 0; i < localAssistantIndices.length; i++) {
-              const parsedIdx = Math.max(offset, 0) + i
-              const matchedTurns =
-                parsedIdx >= 0 && parsedIdx < sessionParsedTurns.length
-                  ? [sessionParsedTurns[parsedIdx]]
-                  : []
-              const toolMetaTurns =
-                i === 0 && offset > 0
-                  ? [...sessionParsedTurns.slice(0, offset), ...matchedTurns]
-                  : matchedTurns
-              const index = localAssistantIndices[i]
-              const toolMeta = collectToolMetaPatches(
-                cur.localTurns[index],
-                toolMetaTurns
+              const parsedAssistantTurns = parsedTurns.filter(
+                (turn) => turn.role === "assistant"
               )
-              if (toolMeta.length === 0) continue
-              const existing = patches.find((patch) => patch.index === index)
-              if (existing) existing.tool_meta = toolMeta
-              else patches.push({ index, tool_meta: toolMeta })
-            }
+              const historyBoundary = Math.min(
+                Math.max(persistedAssistantCount, 0),
+                parsedAssistantTurns.length
+              )
+              const sessionParsedTurns =
+                parsedAssistantTurns.slice(historyBoundary)
+              const offset =
+                sessionParsedTurns.length - localAssistantIndices.length
+              for (let i = 0; i < localAssistantIndices.length; i++) {
+                const parsedIdx = Math.max(offset, 0) + i
+                const matchedTurns =
+                  parsedIdx >= 0 && parsedIdx < sessionParsedTurns.length
+                    ? [sessionParsedTurns[parsedIdx]]
+                    : []
+                const toolMetaTurns =
+                  i === 0 && offset > 0
+                    ? [...sessionParsedTurns.slice(0, offset), ...matchedTurns]
+                    : matchedTurns
+                const index = localAssistantIndices[i]
+                const toolMeta = collectToolMetaPatches(
+                  cur.localTurns[index],
+                  toolMetaTurns
+                )
+                if (toolMeta.length === 0) continue
+                const existing = patches.find((patch) => patch.index === index)
+                if (existing) existing.tool_meta = toolMeta
+                else patches.push({ index, tool_meta: toolMeta })
+              }
             }
 
             if (patches.length > 0 || parsed.session_stats) {

@@ -317,10 +317,7 @@ fn is_absolute_path(path: &str) -> bool {
         return true;
     }
     let bytes = path.as_bytes();
-    if bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' {
-        return true;
-    }
-    false
+    bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':'
 }
 
 /// Validate `agent_type` as a Codeg [`AgentType`] wire string (snake_case).

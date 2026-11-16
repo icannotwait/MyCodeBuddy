@@ -191,6 +191,21 @@ function LocalMarkdownImage({
   )
 }
 
+type ForgeSpanRenderer = (
+  props: ComponentProps<"span"> & { node?: unknown }
+) => ReactNode
+
+// Forge upload images ride the same `span` node. The app span stays
+// authoritative (callers must not replace it); Forge registers its renderer
+// here so a `data-codeg-forge-image` span still becomes an upload image.
+let forgeImageSpan: ForgeSpanRenderer | null = null
+
+export function setForgeImageSpanRenderer(
+  render: ForgeSpanRenderer | null
+): void {
+  forgeImageSpan = render
+}
+
 export function MarkdownImageSpan({
   // The parser node is not a DOM attribute.
   // eslint-disable-next-line @typescript-eslint/no-unused-vars
@@ -207,6 +222,12 @@ export function MarkdownImageSpan({
   // author-written raw HTML — leave that span as the plain text it is instead
   // of decorating it with a broken-image icon.
   const source = props["data-codeg-local-image"]
+  const forgeSource = (props as { "data-codeg-forge-image"?: string })[
+    "data-codeg-forge-image"
+  ]
+  if (forgeSource && forgeImageSpan) {
+    return forgeImageSpan({ node: _node, children, ...props })
+  }
   if (source) {
     return (
       <LocalMarkdownImage
