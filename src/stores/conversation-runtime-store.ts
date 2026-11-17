@@ -2730,9 +2730,10 @@ export function buildStreamingTurnsFromLiveMessage(
         // card keeps the interleaved order it showed live; once history
         // reloads from disk the parsed `agent_stats.timeline` takes over as
         // the card's timeline source.
-        const transcript = isAgent
-          ? agentTranscripts.get(block.info.tool_call_id)
-          : undefined
+        const transcript =
+          isAgent && attachAgentTranscripts
+            ? agentTranscripts.get(block.info.tool_call_id)
+            : undefined
 
         const agentStats: AgentExecutionStats | undefined =
           isAgent && children.length > 0
@@ -8119,7 +8120,7 @@ export const useConversationRuntimeStore = create<ConversationRuntimeStore>()((
         // because a legacy detail never reports turns_offset > 0). Clear the
         // flag; the top sentinel retriggers on the next scroll.
         if (!isLatestHistoryPageGeneration(conversationId, pageGeneration)) {
-          return
+          return false
         }
         dispatch({ type: "LOAD_OLDER_TURNS_DONE", conversationId })
         return false

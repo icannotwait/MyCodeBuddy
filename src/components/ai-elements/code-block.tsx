@@ -184,9 +184,8 @@ function getTokensCacheKey(code: string, language: BundledLanguage): string {
 const defaultHighlighterFactory: HighlighterFactory = (language) =>
   // Load Shiki's engine lazily: a static `import` would pull it (and its
   // textmate machinery) into the first-paint bundle for every message list,
-  // even a text-only conversation. Highlighting is already async with an
-  // immediate raw-token fallback (see `createRawTokens`), so deferring the
-  // engine import only extends that existing pre-highlight window slightly.
+  // even a text-only conversation. Highlighting is already async, so
+  // deferring the engine import only extends that pre-highlight window slightly.
   import("shiki").then(({ createHighlighter }) =>
     createHighlighter({
       langs: [language],
@@ -208,22 +207,6 @@ const getHighlighter = (
   highlighterCache.set(language, highlighterPromise)
   return highlighterPromise
 }
-
-// Create raw tokens for immediate display while highlighting loads
-const createRawTokens = (code: string): TokenizedCode => ({
-  bg: "transparent",
-  fg: "inherit",
-  tokens: code.split("\n").map((line) =>
-    line === ""
-      ? []
-      : [
-          {
-            color: "inherit",
-            content: line,
-          } as ThemedToken,
-        ]
-  ),
-})
 
 function startHighlight(
   code: string,
@@ -341,8 +324,12 @@ export function __setHighlighterFactoryForTest(
 ): void {
   highlighterFactoryOverride = factory
   highlighterCache.clear()
+  // Shiki's `codeToTokens` overloads are not the structural factory the shared
+  // highlighter accepts. The test doubles and the real engine both expose it.
   setHighlighterFactoryOverride(
-    factory ? (language) => factory(language as BundledLanguage) : null
+    (factory
+      ? (language: string) => factory(language as BundledLanguage)
+      : null) as Parameters<typeof setHighlighterFactoryOverride>[0]
   )
 }
 

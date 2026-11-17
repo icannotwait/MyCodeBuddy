@@ -1794,7 +1794,6 @@ function presentBackendError(
     evidence: details?.trim() || undefined,
   }
 }
-const MAX_LIVE_TOOL_RAW_OUTPUT_CHARS = 200_000
 const MAX_BUFFERED_UNMAPPED_EVENTS_PER_CONNECTION = 64
 const MAX_BUFFERED_UNMAPPED_CONNECTIONS = 128
 /**
@@ -2902,7 +2901,6 @@ function reduceSingleAction(
         outOfTurnToolCalls: null,
         hasPrompted: false,
         cancelledTurn: null,
-        outOfTurnToolCalls: null,
         delegationRoute: null,
         conversationId: action.conversationId ?? null,
         delegationRouteOverride: action.delegationRouteOverride ?? null,
@@ -6618,7 +6616,7 @@ function hasAuthoritativeTerminalDelivery(
 function prepareEventFrame(
   frame: AcceptedEventFrame,
   connections: ConnectionsMap,
-  reverseMap: Map<string, string>,
+  reverseMap: Map<string, ReadonlySet<string>>,
   env: PrepareEnv
 ): PreparedEventFrame {
   // Progressive draft so later envelopes in the same frame see prior effects.
@@ -9967,6 +9965,7 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
       locations: unknown
       meta: ToolCallMeta
       images: ToolCallImage[] | null
+      receivedAt: number
     }>
   >([])
   const toolCallUpdateRafId = useRef<number | null>(null)
@@ -10364,6 +10363,7 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
             // Wire `null` normalizes to `undefined` so the reducer's strict
             // attribution equality works on one representation.
             parentToolUseId: e.parent_tool_use_id ?? undefined,
+            receivedAt: e.received_at ?? Date.now(),
           })
           break
         case "thinking":
@@ -10373,6 +10373,7 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
             contextKey,
             text: e.text,
             parentToolUseId: e.parent_tool_use_id ?? undefined,
+            receivedAt: e.received_at ?? Date.now(),
           })
           break
         case "claude_sdk_message":
@@ -10399,6 +10400,7 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
             locations: e.locations ?? null,
             meta: stripKimiMcpOAuth((e.meta as ToolCallMeta) ?? null),
             images: e.images ?? null,
+            receivedAt: e.received_at ?? Date.now(),
           })
           break
         case "tool_call_update":
@@ -10417,6 +10419,7 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
             locations: e.locations ?? null,
             meta: stripKimiMcpOAuth((e.meta as ToolCallMeta) ?? null),
             images: e.images ?? null,
+            receivedAt: e.received_at ?? Date.now(),
           })
           scheduleToolCallUpdateFlush()
           break
@@ -10581,6 +10584,10 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
             type: "SET_BACKGROUND_OUTSTANDING",
             contextKey,
             outstanding: e.outstanding,
+            outOfTurnSettleCount:
+              e.settled?.filter((settlement) => !settlement.wire_visible)
+                .length ?? 0,
+            turnsCount: e.turns?.length ?? 0,
             tasks:
               e.outstanding_tasks && e.outstanding_tasks.length > 0
                 ? e.outstanding_tasks
@@ -10926,6 +10933,7 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
             type: "PLAN_UPDATE",
             contextKey,
             entries: e.entries,
+            receivedAt: e.received_at ?? Date.now(),
           })
           break
         case "session_failure": {
@@ -11230,7 +11238,7 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
             ? getAgentLabel(nc.agentType)
             : (e.agent_type as string)
           const { route, text, reason, evidence } = presentBackendError(
-            t,
+            t as unknown as AcpTranslate,
             e.code,
             e.message,
             e.details,
@@ -11451,6 +11459,7 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
             type: "ACP_LOAD_ERROR",
             contextKey,
             message: localizedMessage,
+            code: e.code,
             command: recoveryCommand,
           })
           break
@@ -11472,6 +11481,7 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
               used: e.used,
               size: e.size,
             },
+            boundaryAt: e.received_at ?? Date.now(),
           })
           break
         case "prompt_suggestion":

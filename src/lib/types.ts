@@ -1245,8 +1245,6 @@ export interface DbConversationDetail {
   turns_total?: number | null
   /** Assistant turns in `full[0..turns_offset)` (baseline globalization). */
   assistant_turns_before_offset?: number | null
-  /** User turns in `full[0..turns_offset)`. */
-  user_turns_before_offset?: number | null
   /**
    * User turns in `full[0..turns_offset)`: the messages above the loaded
    * window, which the message navigator counts without loading them. Absent
@@ -5462,6 +5460,8 @@ export interface AcpAgentInfo {
   system_instructions_file_path?: string | null
   system_instructions_content?: string | null
   codex_auth_json: string | null
+  /** OpenCode `auth.json` when a server still returns it. Current servers omit it. */
+  opencode_auth_json?: string | null
   codex_config_toml: string | null
   /** Compact structured codex model-catalog source (the custom-model list),
    *  round-tripped into the settings editor. Codex + api-key mode only. */

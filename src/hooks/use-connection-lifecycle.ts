@@ -772,7 +772,7 @@ export function useConnectionLifecycle({
           })
           void useAppWorkspaceStore.getState().refreshConversations()
           onSendFailed?.(e)
-          return
+          return null
         }
         console.error("[ConnLifecycle] sendPrompt:", e)
         const appError = extractAppCommandError(e)

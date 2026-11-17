@@ -154,6 +154,10 @@ jobs:
             # `--all-targets`. test-utils is already on, so tests compile.
             clippy_args: "--all-targets --features test-utils"
           - mode: server
+            # The server lib test links a large debug binary. Four parallel
+            # rustc jobs on the 7 GiB Ubuntu runner drop the hosted runner
+            # ("lost communication") the way overlapping rustc jobs do locally.
+            build_jobs: 1
             # Server binary is opt-in (`--features server`) and Tauri-free
             # (`--no-default-features`). No webkit/appindicator system libs.
             # `--lib` skips integration tests for `cargo test`, so

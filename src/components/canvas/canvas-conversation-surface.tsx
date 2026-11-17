@@ -881,12 +881,6 @@ export function CanvasConversationSurface({
           sessionFailures={conn.sessionFailures}
           snapshotTruncation={conn.snapshotTruncation}
           onSessionFailureDismiss={handleSessionFailureDismiss}
-          asyncTasks={conn.asyncTasks}
-          onStopAsyncTask={
-            conn.connectionId !== null && !conn.isViewer
-              ? handleStopAsyncTask
-              : undefined
-          }
           remoteControl={connIsForOtherAgent ? null : conn.remoteControl}
           onRemoteControlOff={
             conn.connectionId !== null && !conn.isViewer

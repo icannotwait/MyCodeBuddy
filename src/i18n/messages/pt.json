@@ -1230,7 +1230,12 @@
       "approvalPolicyUntrustedRetired": "O codex não aceita mais untrusted: com esse valor no config.toml, o codex se recusa a iniciar, no codeg e nas sessões da CLI e do IDE do codex. Escolha outra política de aprovação e salve.",
       "apiUrlLabel": "URL da API",
       "apiKeyLabel": "Chave da API",
-      "managedKeysHint": "Enquanto o codeg publica a lista de modelos, ele gerencia aqui model_catalog_json e o “model” da raiz: altere-os na lista de modelos acima."
+      "managedKeysHint": "Enquanto o codeg publica a lista de modelos, ele gerencia aqui model_catalog_json e o “model” da raiz: altere-os na lista de modelos acima.",
+      "enableSkills": "Habilitar Skills",
+      "enableSkillsAria": "Habilitar Skills para Codex",
+      "enableFast": "Habilitar Fast",
+      "enableFastAria": "Habilitar nível de serviço Fast para Codex",
+      "approvalPolicyUntrustedAcpWarning": "Untrusted não tem equivalente entre os três presets de aprovação do adaptador ACP, então as sessões do codeg voltam para \"quando solicitado\": o modelo passa a decidir quando perguntar, e comandos que o sandbox já permite deixam de pedir confirmação. Restrinja o modo de sandbox abaixo em vez disso."
     },
     "gemini": {
       "authConfig": "Configuração de autenticação do Gemini",
@@ -1306,7 +1311,9 @@
         "connectedBadge": "conectado",
         "noKeyMethod": "O OpenCode não conecta este provedor com chave de API. Entre pelo terminal com: opencode auth login",
         "apiKeyEditHint": "Deixe vazio para manter a chave salva; uma nova chave a substitui.",
-        "package": "Pacote (npm)"
+        "package": "Pacote (npm)",
+        "catalogLabel": "Catálogo do models.dev",
+        "oauthApiKeyNote": "Este provedor também oferece login pelo navegador via opencode auth login. O login pelo navegador chegará em breve — por enquanto, cole uma chave de API."
       },
       "customProvider": {
         "title": "Adicionar um provedor personalizado",
@@ -1361,11 +1368,17 @@
           "question": "Fazer uma pergunta a você",
           "shell": "Executar comandos de shell, comparados pelo comando analisado",
           "subagent": "Iniciar subagentes, comparados pelo id do agente",
-          "execute": "Executar scripts do Code Mode que chamam ferramentas MCP; se negado, o modelo usa essas ferramentas diretamente"
+          "execute": "Executar scripts do Code Mode que chamam ferramentas MCP; se negado, o modelo usa essas ferramentas diretamente",
+          "bash": "Executar comandos de shell, pelo comando analisado",
+          "task": "Iniciar subagentes, pelo tipo de subagente",
+          "list": "Listar o conteúdo de um diretório",
+          "lsp": "Executar consultas LSP",
+          "doom_loop": "Dispara quando a mesma chamada se repete três vezes com a mesma entrada"
         },
         "orderingLocked": "A edição abaixo fica pausada até a ordem ser corrigida, para que nenhuma alteração aqui reordene essas regras sem aviso.",
         "legacyRules": "Estas regras vêm das chaves permission e tools do OpenCode 1, que o OpenCode 2 ainda lê. Sua próxima alteração aqui as reescreve como regras permissions do OpenCode 2.",
-        "allToolsResourcesHint": "Regras para todas as ferramentas em alvos específicos"
+        "allToolsResourcesHint": "Regras para todas as ferramentas em alvos específicos",
+        "legacyTools": "O mapa tools legado de nível superior nega uma ferramenta. O OpenCode o funde com as permissões, então ele se aplica acima de tudo o que aparece aqui. Edite-o no JSON nativo abaixo ou ative o aceite automático para apagá-lo."
       },
       "behavior": {
         "title": "Comportamento e compactação",
@@ -1388,28 +1401,38 @@
           "preserveRecentTokens": "Tokens mantidos na íntegra",
           "reserved": "Tokens reservados",
           "maxLines": "Limite de linhas da saída",
-          "maxBytes": "Limite de bytes da saída"
+          "maxBytes": "Limite de bytes da saída",
+          "tailTurns": "Turnos mantidos na íntegra"
         },
         "hints": {
           "subagentDepth": "Quantos níveis os subagentes podem aninhar (experimental.subagent_depth). 1 impede um subagente de iniciar outro.",
           "preserveRecentTokens": "Orçamento de tokens dos turnos recentes mantidos literalmente após uma compactação (compaction.keep.tokens). Padrão 15000.",
           "reserved": "Espaço deixado livre na janela de contexto antes da compactação automática (compaction.buffer): um número de tokens como <code>20000</code> ou uma parte da janela de <code>1%</code> a <code>99%</code>, como <code>20%</code>. Sem valor, <code>15%</code> da janela ficam livres, no mínimo <code>16000</code> tokens.",
           "maxLines": "Saída maior que isso vai para o disco e é substituída por uma prévia. Padrão 2000.",
-          "maxBytes": "Saída maior que isso vai para o disco e é substituída por uma prévia. Padrão 51200."
+          "maxBytes": "Saída maior que isso vai para o disco e é substituída por uma prévia. Padrão 51200.",
+          "tailTurns": "Quantos turnos recentes do usuário ficam fora da compactação. Sem valor, apenas o orçamento de tokens abaixo os limita."
         },
         "ignoredLegacyKeys": "O OpenCode 2 ignora estas configurações do OpenCode 1 no arquivo: {keys}.",
         "removeIgnoredLegacyKeys": "Remover",
         "backgroundCompaction": "Compactação em segundo plano",
         "backgroundCompactionHint": "Experimental: resume em segundo plano quando o contexto se aproxima do limite, para que a compactação automática não espere. Resumos não usados também consomem tokens.",
         "todo": "Ferramenta de lista de tarefas",
-        "todoHint": "Experimental: dá ao agente a ferramenta todowrite, para que o Codeg mostre o plano dele como lista de tarefas."
+        "todoHint": "Experimental: dá ao agente a ferramenta todowrite, para que o Codeg mostre o plano dele como lista de tarefas.",
+        "share": "Compartilhamento",
+        "shareHint": "Se uma sessão pode ser publicada como link compartilhado.",
+        "shareManual": "Manual (somente quando pedido)",
+        "shareAuto": "Automático (toda sessão nova)",
+        "shareDisabled": "Desativado",
+        "compactionPrune": "Podar saída antiga de ferramentas",
+        "compactionPruneHint": "Descarta a saída de chamadas antigas durante a compactação em vez de resumi-la."
       },
       "authKindEnv": "Variável de ambiente {name}",
       "envConnectionHint": "Conectado pela variável de ambiente {name}. Para desconectar, remova-a onde ela está definida.",
       "keyStored": "Chave salva no OpenCode",
       "keyMissing": "Nenhuma chave salva",
       "setApiKey": "Definir chave de API",
-      "credentialsNeedInstall": "O OpenCode guarda as chaves dos provedores no próprio armazenamento de credenciais, então conectar um provedor exige o OpenCode instalado. Instale-o acima primeiro."
+      "credentialsNeedInstall": "O OpenCode guarda as chaves dos provedores no próprio armazenamento de credenciais, então conectar um provedor exige o OpenCode instalado. Instale-o acima primeiro.",
+      "addProvider": "Adicionar provedor"
     },
     "openClaw": {
       "gatewayConfig": "Configuração de Gateway",
@@ -1531,7 +1554,9 @@
       "rawEditorPlaceholder": "[providers.codeg]\ntype = \"kimi\"\nbase_url = \"https://api.moonshot.cn/v1\"\napi_key = \"sk-...\"",
       "gateNotReady": "Not authenticated yet — save an API key below (or sign in) to open Kimi sessions.",
       "authModeHint": "“API key” writes a codeg-managed config.toml provider and seeds a gate token. “Login” clears that and uses a real `kimi login` session (requires a Kimi subscription).",
-      "rawEditorHint": "Written verbatim (comments preserved) and validated as TOML. codeg also seeds the gate token so the session opens."
+      "rawEditorHint": "Written verbatim (comments preserved) and validated as TOML. codeg also seeds the gate token so the session opens.",
+      "fetchModels": "Testar e listar modelos",
+      "fetchModelsNeedsKey": "Informe primeiro uma chave de API e um endpoint"
     },
     "authModeOfficialSubscription": "Assinatura oficial",
     "authModeCustomEndpoint": "Endpoint personalizado",
@@ -1592,11 +1617,15 @@
       "providerExists": "O provedor {providerId} já existe",
       "modelIdPattern": "O ID do modelo só aceita letras, números, sublinhado, ponto, dois-pontos e hífen",
       "modelExists": "O modelo {modelId} já existe",
-      "openCodeConfigUnreadable": "O arquivo de configuração do OpenCode tem um erro de sintaxe. Corrija-o primeiro no editor de JSON nativo."
+      "openCodeConfigUnreadable": "O arquivo de configuração do OpenCode tem um erro de sintaxe. Corrija-o primeiro no editor de JSON nativo.",
+      "openCodeAuthMustBeObject": "OpenCode auth.json deve ser um objeto JSON",
+      "openCodeAuthInvalid": "Erro de formato no OpenCode auth.json: {message}"
     },
     "warnings": {
       "nativeJsonRecoveredStructured": "A configuração JSON nativa é inválida; redefinida para configuração estruturada",
-      "authRecoveredStructured": "auth.json é inválido; redefinido para configuração estruturada"
+      "authRecoveredStructured": "auth.json é inválido; redefinido para configuração estruturada",
+      "nativeJsonRecoveredOpenCode": "A configuração JSON nativa é inválida; redefinida para configuração estruturada do OpenCode",
+      "openCodeAuthRecovered": "OpenCode auth.json é inválido; redefinido para configuração padrão"
     },
     "toasts": {
       "agentActionCompleted": "{name} {action} concluído",
@@ -1738,7 +1767,20 @@
       "add": "Adicionar",
       "remove": "Remover",
       "loadFailed": "Não foi possível ler a configuração do OpenCode: {message}",
-      "updateFailed": "Não foi possível atualizar a configuração do OpenCode: {message}"
+      "updateFailed": "Não foi possível atualizar a configuração do OpenCode: {message}",
+      "status": {
+        "installed": "Instalado",
+        "missing": "Não instalado",
+        "needs_migration": "Requer migração",
+        "path": "Plugin por caminho",
+        "path_missing": "Caminho não encontrado"
+      },
+      "installAll": "Instalar todos os ausentes",
+      "pinVersions": "Fixar versões @latest",
+      "install": "Instalar",
+      "uninstall": "Desinstalar",
+      "success": "Todos os plugins foram instalados com sucesso",
+      "failed": "Operação do plugin falhou"
     },
     "pi": {
       "configManagement": "Configuração do Pi",
@@ -2273,7 +2315,8 @@
       "originalWorkingDir": "Diretório de trabalho original",
       "cliBadge": "Iniciada pela linha de comando",
       "recentFilterCli": "Linha de comando",
-      "noRecentCli": "Nenhuma conversa recente da linha de comando"
+      "noRecentCli": "Nenhuma conversa recente da linha de comando",
+      "worktreeRemovedBadge": "Worktree de origem removida"
     },
     "conversation": {
       "reloadFailed": "Falha ao recarregar conversa: {message}",
@@ -3875,7 +3918,13 @@
         "backgroundContinuation": "Continuação em segundo plano",
         "loadOlderHistory": "Carregar mensagens anteriores",
         "loadBackgroundActivity": "Carregar atividade em segundo plano",
-        "snapshotOmittedToolCalls": "Esta vista ao vivo omitiu {count} chamadas de ferramenta. As mensagens salvas preenchem essas lacunas."
+        "snapshotOmittedToolCalls": "Esta vista ao vivo omitiu {count} chamadas de ferramenta. As mensagens salvas preenchem essas lacunas.",
+        "attachedResources": "Recursos anexados",
+        "error": "Erro: {message}",
+        "duration": "Duração",
+        "worked": "Trabalho concluído",
+        "workedFor": "Trabalhou por {duration}",
+        "working": "Trabalhando..."
       },
       "liveTurnStats": {
         "thinking": "Pensando...",
@@ -3902,8 +3951,14 @@
           "inputAvailable": "Em execução",
           "inputStreaming": "Pendente",
           "outputAvailable": "Concluído",
-          "outputError": "Erro"
-        }
+          "outputError": "Erro",
+          "approvalRequested": "Aguardando aprovação",
+          "approvalResponded": "Respondido",
+          "outputDenied": "Negado"
+        },
+        "parameters": "Parâmetros",
+        "error": "Erro",
+        "result": "Resultado"
       },
       "delegation": {
         "unknownAgent": "Subagente",
@@ -3998,7 +4053,9 @@
           }
         },
         "unknownAssistant": "Assistente #{id}",
-        "deletedAssistant": "(excluído)"
+        "deletedAssistant": "(excluído)",
+        "subAgentRunning": "Subagente em execução…",
+        "noDetail": "No detail available yet."
       },
       "contentParts": {
         "offset": "Deslocamento: {offset}",
@@ -4033,7 +4090,8 @@
             "budgetLimited": "orçamento limitado",
             "complete": "concluído",
             "limited": "limite atingido"
-          }
+          },
+          "titleWithStatus": "Objetivo {status}"
         },
         "title": {
           "edit": "Editar",
@@ -4082,7 +4140,15 @@
         "backgroundTask": {
           "polledTimes": "Consultada {count} vezes",
           "launchNote": "Em execução em segundo plano · {id}",
-          "monitorNote": "Monitorando em segundo plano · {id}"
+          "monitorNote": "Monitorando em segundo plano · {id}",
+          "title": "Tarefa em segundo plano",
+          "titleWithId": "Tarefa em segundo plano · {id}",
+          "running": "Em execução",
+          "completed": "Concluída",
+          "failed": "Falhou",
+          "stopped": "Interrompida",
+          "exitCode": "saída {code}",
+          "runningInBackground": "Segundo plano"
         },
         "codexScript": {
           "outputMissing": "O codex truncou a saída do script e removeu o separador deste comando, então nenhuma saída pôde ser atribuída a ele.",
@@ -4126,6 +4192,72 @@
           "other": "{count, plural, one {Usou # ferramenta} other {Usou # ferramentas}}",
           "errorSuffix": "{count, plural, one {# falhou} other {# falharam}}",
           "joiner": " · "
+        },
+        "unknown": "desconhecido",
+        "inputTruncated": "A entrada foi truncada — o diff pode estar incompleto.",
+        "replaceAll": "SUBSTITUIR TUDO",
+        "filesCount": "Arquivos: {count}",
+        "update": "atualizar",
+        "moreFiles": "+{count} arquivos a mais",
+        "timeoutMs": "Tempo limite: {timeout}ms",
+        "backgroundTrue": "Segundo plano: true",
+        "scriptToolCalls": "{count, plural, one {# chamada de ferramenta} other {# chamadas de ferramenta}}",
+        "limit": "Limite: {limit}",
+        "mode": "Modo: {mode}",
+        "cell": "Célula: {cell}",
+        "pathLabel": "Caminho:",
+        "globLabel": "Padrão glob:",
+        "typeLabel": "Tipo:",
+        "outputLabel": "Saída:",
+        "caseInsensitive": "Sem diferenciar maiúsculas/minúsculas",
+        "multiline": "Multilinha",
+        "promptLabel": "Instrução",
+        "subjectLabel": "Assunto",
+        "taskLabel": "Tarefa",
+        "nameLabel": "Nome:",
+        "agentPromptLabel": "Instrução",
+        "agentRunning": "Em execução...",
+        "agentLiveTranscript": "Atividade ao vivo",
+        "agentSessionAction": "Ver a sessão do subagente",
+        "agentSubagentDone": "Concluído",
+        "agentSubagentInterrupted": "Interrompido",
+        "agentSubagentUnknown": "Desfecho desconhecido",
+        "agentStatsBash": "Comandos",
+        "agentStatsRead": "Arquivos lidos",
+        "agentStatsSearch": "Pesquisas",
+        "agentStatsEdit": "Edições",
+        "agentStatsOther": "Outros",
+        "field": {
+          "file": "Arquivo",
+          "notebook": "Caderno",
+          "command": "Comando",
+          "old": "Antigo",
+          "new": "Novo",
+          "pattern": "Padrão",
+          "path": "Caminho",
+          "query": "Consulta",
+          "url": "URL:",
+          "description": "Descrição",
+          "content": "Conteúdo",
+          "source": "Fonte",
+          "prompt": "Instrução",
+          "subject": "Assunto",
+          "taskId": "ID da tarefa",
+          "status": "Situação",
+          "skill": "Skill",
+          "args": "Argumentos",
+          "offset": "Deslocamento",
+          "limit": "Limite",
+          "glob": "Padrão glob",
+          "type": "Tipo",
+          "output": "Saída",
+          "replaceAll": "Substituir tudo",
+          "language": "Idioma",
+          "timeout": "Tempo limite",
+          "background": "Segundo plano",
+          "agentType": "Tipo de agente",
+          "library": "Biblioteca",
+          "libraryId": "ID da biblioteca"
         }
       },
       "messageNav": {
@@ -4141,7 +4273,10 @@
         "currentMessage": "Mensagem atual",
         "scrollToCurrent": "Rolar até a mensagem atual (#{ordinal})",
         "running": "Em andamento",
-        "total": "{count, plural, one {# mensagem} other {# mensagens}}"
+        "total": "{count, plural, one {# mensagem} other {# mensagens}}",
+        "collapsedSummary": "Mensagens {count}",
+        "remove": "Remover",
+        "noDiffDataAvailable": "Nenhum dado de diff disponível para {filePath}"
       },
       "replyArtifacts": {
         "title": "Arquivos alterados",
@@ -4264,7 +4399,9 @@
       },
       "feedbackCheckResult": {
         "count": "{count, plural, =1 {1 comentário} other {# comentários}}",
-        "errorTitle": "Falha ao verificar comentários"
+        "errorTitle": "Falha ao verificar comentários",
+        "expand": "Mostrar todos os comentários",
+        "collapse": "Recolher"
       },
       "codegMcpTool": {
         "getSessionInfo": "Lendo a sessão {session}",
@@ -4346,7 +4483,16 @@
         "opWait": "Obtendo resultado do subagente",
         "opClose": "Encerrando subagente",
         "opResume": "Retomando subagente",
-        "opList": "Listando subagentes"
+        "opList": "Listando subagentes",
+        "errorTitle": "Falha na tarefa do subagente",
+        "statesLabel": "Subagentes",
+        "statusRunning": "Em execução",
+        "statusCompleted": "Concluído",
+        "statusFailed": "Falhou",
+        "statusPending": "Iniciando",
+        "statusInterrupted": "Interrompido",
+        "statusClosed": "Encerrado",
+        "statusNotFound": "Não encontrado"
       },
       "contextCompaction": {
         "compacting": "Compactando o contexto…",
@@ -4767,6 +4913,11 @@
       "terminal": {
         "title": "Console",
         "running": "Em execução"
+      },
+      "toolCallBlock": {
+        "tool": "Ferramenta",
+        "error": "Erro",
+        "result": "Resultado"
       }
     },
     "diffPreview": {
@@ -7048,7 +7199,8 @@
         "config_changed": "A configuração do Codex mudou durante o salvamento; tente de novo.",
         "database": "Não foi possível ler as configurações: {message}"
       }
-    }
+    },
+    "officialsTitle": "Modelos oficiais"
   },
   "DeepSeekModelEditor": {
     "title": "Lista de modelos",

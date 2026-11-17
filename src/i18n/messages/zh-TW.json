@@ -1230,7 +1230,12 @@
       "approvalPolicyUntrustedRetired": "codex 已不再接受 untrusted：config.toml 中有這個值時，codex 會拒絕啟動，codeg 裡和 codex CLI、IDE 工作階段裡都一樣。請改選其他審批策略並儲存。",
       "apiUrlLabel": "API 位址",
       "apiKeyLabel": "API 金鑰",
-      "managedKeysHint": "codeg 發布模型清單期間，這裡的 model_catalog_json 與根鍵 model 由 codeg 管理，請在上方的模型清單中修改。"
+      "managedKeysHint": "codeg 發布模型清單期間，這裡的 model_catalog_json 與根鍵 model 由 codeg 管理，請在上方的模型清單中修改。",
+      "enableSkills": "啟用 Skills",
+      "enableSkillsAria": "Codex 啟用 Skills",
+      "enableFast": "啟用 Fast",
+      "enableFastAria": "Codex 啟用 Fast 服務等級",
+      "approvalPolicyUntrustedAcpWarning": "ACP 轉接器只有三種審批預設，untrusted 無對應項，codeg 工作階段會退回「按需詢問」——此時由模型自行決定何時詢問，沙箱本就允許的命令不再詢問。請改用下方的沙箱模式收緊。"
     },
     "gemini": {
       "authConfig": "Gemini 認證配置",
@@ -1306,7 +1311,9 @@
         "connectedBadge": "已連接",
         "noKeyMethod": "OpenCode 不透過 API 金鑰連接此供應商。請在終端機中執行 opencode auth login 登入。",
         "apiKeyEditHint": "留空則保留已存的金鑰；填入新金鑰會取代它。",
-        "package": "套件（npm）"
+        "package": "套件（npm）",
+        "catalogLabel": "models.dev 目錄",
+        "oauthApiKeyNote": "此 Provider 也支援透過 opencode auth login 瀏覽器登入。瀏覽器登入即將推出——目前請貼上 API Key。"
       },
       "customProvider": {
         "title": "新增自訂 Provider",
@@ -1361,11 +1368,17 @@
           "question": "向你提問",
           "shell": "執行 shell 命令，按解析後的命令比對",
           "subagent": "啟動子智慧體，按智慧體 ID 比對",
-          "execute": "執行呼叫 MCP 工具的 Code Mode 腳本；拒絕後模型改為直接使用這些工具"
+          "execute": "執行呼叫 MCP 工具的 Code Mode 腳本；拒絕後模型改為直接使用這些工具",
+          "bash": "執行 shell 指令，依解析後的指令比對",
+          "task": "啟動子代理，依子代理類型比對",
+          "list": "列出目錄內容",
+          "lsp": "執行 LSP 查詢",
+          "doom_loop": "同一呼叫以相同輸入重複 3 次時觸發"
         },
         "orderingLocked": "在順序修正之前，下方編輯暫停，以免這裡的任何修改悄悄改變這些規則的順序。",
         "legacyRules": "這些規則來自 OpenCode 1 的 permission 與 tools 設定，OpenCode 2 仍會讀取。你在這裡的下一次修改會把它們改寫為 OpenCode 2 的 permissions 規則。",
-        "allToolsResourcesHint": "作用於所有工具之特定對象的規則"
+        "allToolsResourcesHint": "作用於所有工具之特定對象的規則",
+        "legacyTools": "頂層的舊版 tools 設定停用了某個工具。OpenCode 會把它併入權限，因此會疊加在此處顯示的所有設定之上。請在下方原生 JSON 中修改，或開啟「自動接受所有權限」將其清除。"
       },
       "behavior": {
         "title": "行為與壓縮",
@@ -1388,28 +1401,38 @@
           "preserveRecentTokens": "保留原文的 token 數",
           "reserved": "預留 token",
           "maxLines": "工具輸出行數上限",
-          "maxBytes": "工具輸出位元組上限"
+          "maxBytes": "工具輸出位元組上限",
+          "tailTurns": "保留原文的輪數"
         },
         "hints": {
           "subagentDepth": "子智慧體最多可以巢狀幾層（experimental.subagent_depth）。填 1 表示子智慧體不能再啟動子智慧體。",
           "preserveRecentTokens": "壓縮後仍按原文保留的最近對話 token 預算（compaction.keep.tokens）。預設 15000。",
           "reserved": "自動壓縮前在上下文視窗裡預留的空間（compaction.buffer）：填 token 數，如 <code>20000</code>；或填視窗占比，<code>1%</code> 到 <code>99%</code>，如 <code>20%</code>。不填則預留視窗的 <code>15%</code>，至少 <code>16000</code> 個 token。",
           "maxLines": "超過該行數的輸出會落檔，只在對話裡留一段預覽。預設 2000。",
-          "maxBytes": "超過該位元組數的輸出會落檔，只在對話裡留一段預覽。預設 51200。"
+          "maxBytes": "超過該位元組數的輸出會落檔，只在對話裡留一段預覽。預設 51200。",
+          "tailTurns": "最近多少輪使用者對話不參與壓縮。留空表示只受下方的 token 預算約束。"
         },
         "ignoredLegacyKeys": "檔案中的這些 OpenCode 1 設定已被 OpenCode 2 忽略：{keys}。",
         "removeIgnoredLegacyKeys": "移除",
         "backgroundCompaction": "背景壓縮",
         "backgroundCompactionHint": "實驗性：上下文接近上限時在背景預先產生摘要，自動壓縮無需等待。未用上的摘要同樣消耗 token。",
         "todo": "待辦清單工具",
-        "todoHint": "實驗性：為智慧體提供 todowrite 工具，Codeg 即可把它的計畫顯示為待辦清單。"
+        "todoHint": "實驗性：為智慧體提供 todowrite 工具，Codeg 即可把它的計畫顯示為待辦清單。",
+        "share": "工作階段分享",
+        "shareHint": "工作階段是否可以發佈成分享連結。",
+        "shareManual": "手動（需要時才分享）",
+        "shareAuto": "自動（每個新工作階段都分享）",
+        "shareDisabled": "停用",
+        "compactionPrune": "裁剪舊工具輸出",
+        "compactionPruneHint": "壓縮時直接丟棄較早工具呼叫的輸出，而不是總結進去。"
       },
       "authKindEnv": "環境變數 {name}",
       "envConnectionHint": "透過環境變數 {name} 連接。要中斷連線，請在設定它的地方取消該變數。",
       "keyStored": "金鑰已存入 OpenCode",
       "keyMissing": "未儲存金鑰",
       "setApiKey": "設定 API 金鑰",
-      "credentialsNeedInstall": "OpenCode 把供應商金鑰存在自己的憑證庫中，連接供應商需要先安裝 OpenCode。請先在上方安裝。"
+      "credentialsNeedInstall": "OpenCode 把供應商金鑰存在自己的憑證庫中，連接供應商需要先安裝 OpenCode。請先在上方安裝。",
+      "addProvider": "新增 Provider"
     },
     "openClaw": {
       "gatewayConfig": "Gateway 配置",
@@ -1531,7 +1554,9 @@
       "rawEditorPlaceholder": "[providers.codeg]\ntype = \"kimi\"\nbase_url = \"https://api.moonshot.cn/v1\"\napi_key = \"sk-...\"",
       "gateNotReady": "尚未鑒權——請在下方儲存 API Key（或登入）以開啟 Kimi 工作階段。",
       "authModeHint": "「API Key」寫入受管 config.toml 供應商並播種閘道權杖；「登入」會清除它並改用真實的 `kimi login` 工作階段（需要 Kimi 訂閱）。",
-      "rawEditorHint": "逐字寫入（保留註解）並依 TOML 驗證。codeg 同時會播種閘道權杖以開啟工作階段。"
+      "rawEditorHint": "逐字寫入（保留註解）並依 TOML 驗證。codeg 同時會播種閘道權杖以開啟工作階段。",
+      "fetchModels": "測試並取得模型",
+      "fetchModelsNeedsKey": "請先填寫 API Key 和接入點"
     },
     "authModeOfficialSubscription": "官網訂閱",
     "authModeCustomEndpoint": "自定義介面",
@@ -1592,11 +1617,15 @@
       "providerExists": "Provider {providerId} 已存在",
       "modelIdPattern": "模型 ID 僅支援字母、數字、底線、點、冒號與中劃線",
       "modelExists": "Model {modelId} 已存在",
-      "openCodeConfigUnreadable": "OpenCode 設定檔有語法錯誤，請先在原生 JSON 編輯器中修正。"
+      "openCodeConfigUnreadable": "OpenCode 設定檔有語法錯誤，請先在原生 JSON 編輯器中修正。",
+      "openCodeAuthMustBeObject": "OpenCode auth.json 必須是 JSON 物件",
+      "openCodeAuthInvalid": "OpenCode auth.json 格式錯誤：{message}"
     },
     "warnings": {
       "nativeJsonRecoveredStructured": "原生 JSON 配置格式無效，已重置為結構化配置",
-      "authRecoveredStructured": "auth.json 格式無效，已重置為結構化配置"
+      "authRecoveredStructured": "auth.json 格式無效，已重置為結構化配置",
+      "nativeJsonRecoveredOpenCode": "原生 JSON 配置格式無效，已重置為 OpenCode 結構化配置",
+      "openCodeAuthRecovered": "OpenCode auth.json 格式無效，已重置為預設配置"
     },
     "toasts": {
       "agentActionCompleted": "{name}{action}完成",
@@ -1738,7 +1767,20 @@
       "add": "新增",
       "remove": "移除",
       "loadFailed": "無法讀取 OpenCode 設定：{message}",
-      "updateFailed": "無法更新 OpenCode 設定：{message}"
+      "updateFailed": "無法更新 OpenCode 設定：{message}",
+      "status": {
+        "installed": "已安裝",
+        "missing": "未安裝",
+        "needs_migration": "需要遷移",
+        "path": "路徑外掛",
+        "path_missing": "路徑不存在"
+      },
+      "installAll": "安裝全部缺失外掛",
+      "pinVersions": "固定 @latest 版本",
+      "install": "安裝",
+      "uninstall": "解除安裝",
+      "success": "所有外掛安裝成功",
+      "failed": "外掛操作失敗"
     },
     "pi": {
       "configManagement": "Pi 設定",
@@ -2273,7 +2315,8 @@
       "originalWorkingDir": "最初執行目錄",
       "cliBadge": "從命令列啟動",
       "recentFilterCli": "命令列",
-      "noRecentCli": "沒有最近從命令列啟動的對話"
+      "noRecentCli": "沒有最近從命令列啟動的對話",
+      "worktreeRemovedBadge": "來源 worktree 已刪除"
     },
     "conversation": {
       "reloadFailed": "會話重新載入失敗：{message}",
@@ -3875,7 +3918,13 @@
         "backgroundContinuation": "後台續寫",
         "loadOlderHistory": "載入更早的訊息",
         "loadBackgroundActivity": "載入背景活動",
-        "snapshotOmittedToolCalls": "目前的即時檢視省略了 {count} 個工具呼叫。已載入已儲存的訊息來補上缺口。"
+        "snapshotOmittedToolCalls": "目前的即時檢視省略了 {count} 個工具呼叫。已載入已儲存的訊息來補上缺口。",
+        "attachedResources": "附加資源",
+        "error": "錯誤：{message}",
+        "duration": "耗時",
+        "worked": "工作已結束",
+        "workedFor": "工作了 {duration}",
+        "working": "正在工作中..."
       },
       "liveTurnStats": {
         "thinking": "思考中...",
@@ -3902,8 +3951,14 @@
           "inputAvailable": "執行中",
           "inputStreaming": "等待中",
           "outputAvailable": "已完成",
-          "outputError": "錯誤"
-        }
+          "outputError": "錯誤",
+          "approvalRequested": "等待授權",
+          "approvalResponded": "已回應",
+          "outputDenied": "已拒絕"
+        },
+        "parameters": "參數",
+        "error": "錯誤",
+        "result": "結果"
       },
       "delegation": {
         "unknownAgent": "子智慧體",
@@ -3998,7 +4053,9 @@
           }
         },
         "unknownAssistant": "助手 #{id}",
-        "deletedAssistant": "（已刪除）"
+        "deletedAssistant": "（已刪除）",
+        "subAgentRunning": "子代理執行中…",
+        "noDetail": "暫無詳情。"
       },
       "contentParts": {
         "offset": "位移：{offset}",
@@ -4033,7 +4090,8 @@
             "budgetLimited": "預算受限",
             "complete": "已完成",
             "limited": "已達上限"
-          }
+          },
+          "titleWithStatus": "目標{status}"
         },
         "title": {
           "edit": "編輯",
@@ -4082,7 +4140,15 @@
         "backgroundTask": {
           "polledTimes": "輪詢 {count} 次",
           "launchNote": "已在背景執行 · {id}",
-          "monitorNote": "已在背景監看 · {id}"
+          "monitorNote": "已在背景監看 · {id}",
+          "title": "背景任務",
+          "titleWithId": "背景任務 · {id}",
+          "running": "執行中",
+          "completed": "已完成",
+          "failed": "失敗",
+          "stopped": "已停止",
+          "exitCode": "退出碼 {code}",
+          "runningInBackground": "背景執行"
         },
         "codexScript": {
           "outputMissing": "codex 截斷指令碼輸出時捨棄了這個命令的分隔行，因此沒有輸出可歸屬給它。",
@@ -4126,6 +4192,72 @@
           "other": "呼叫 {count} 個工具",
           "errorSuffix": "{count} 個失敗",
           "joiner": " · "
+        },
+        "unknown": "未知",
+        "inputTruncated": "輸入已截斷，diff 可能不完整。",
+        "replaceAll": "全部替換",
+        "filesCount": "檔案：{count}",
+        "update": "更新",
+        "moreFiles": "+{count} 個更多檔案",
+        "timeoutMs": "逾時：{timeout}ms",
+        "backgroundTrue": "背景：true",
+        "scriptToolCalls": "呼叫 {count} 個工具",
+        "limit": "限制：{limit}",
+        "mode": "模式：{mode}",
+        "cell": "儲存格：{cell}",
+        "pathLabel": "路徑：",
+        "globLabel": "Glob：",
+        "typeLabel": "類型：",
+        "outputLabel": "輸出：",
+        "caseInsensitive": "不區分大小寫",
+        "multiline": "多行",
+        "promptLabel": "提示詞",
+        "subjectLabel": "主題",
+        "taskLabel": "任務",
+        "nameLabel": "名稱：",
+        "agentPromptLabel": "提示詞",
+        "agentRunning": "執行中...",
+        "agentLiveTranscript": "即時活動",
+        "agentSessionAction": "檢視子智慧體工作階段",
+        "agentSubagentDone": "已完成",
+        "agentSubagentInterrupted": "已中斷",
+        "agentSubagentUnknown": "結果未知",
+        "agentStatsBash": "命令",
+        "agentStatsRead": "讀取檔案",
+        "agentStatsSearch": "搜尋",
+        "agentStatsEdit": "編輯",
+        "agentStatsOther": "其他",
+        "field": {
+          "file": "檔案",
+          "notebook": "筆記本",
+          "command": "命令",
+          "old": "舊內容",
+          "new": "新內容",
+          "pattern": "模式",
+          "path": "路徑",
+          "query": "查詢",
+          "url": "URL 位址",
+          "description": "描述",
+          "content": "內容",
+          "source": "來源內容",
+          "prompt": "提示詞",
+          "subject": "主題",
+          "taskId": "任務 ID",
+          "status": "狀態",
+          "skill": "Skill",
+          "args": "參數",
+          "offset": "位移",
+          "limit": "限制",
+          "glob": "Glob",
+          "type": "類型",
+          "output": "輸出",
+          "replaceAll": "全部替換",
+          "language": "語言",
+          "timeout": "逾時",
+          "background": "背景",
+          "agentType": "Agent 類型",
+          "library": "函式庫",
+          "libraryId": "函式庫 ID"
         }
       },
       "messageNav": {
@@ -4141,7 +4273,10 @@
         "currentMessage": "目前訊息",
         "scrollToCurrent": "捲動到目前訊息（#{ordinal}）",
         "running": "進行中",
-        "total": "共 {count} 則"
+        "total": "共 {count} 則",
+        "collapsedSummary": "訊息 {count}",
+        "remove": "移除",
+        "noDiffDataAvailable": "找不到 {filePath} 的差異資料"
       },
       "replyArtifacts": {
         "title": "變更檔案",
@@ -4264,7 +4399,9 @@
       },
       "feedbackCheckResult": {
         "count": "{count} 則回饋",
-        "errorTitle": "回饋檢查失敗"
+        "errorTitle": "回饋檢查失敗",
+        "expand": "展開全部回饋",
+        "collapse": "收合"
       },
       "codegMcpTool": {
         "getSessionInfo": "讀取會話 {session}",
@@ -4346,7 +4483,16 @@
         "opWait": "取得子智能體結果",
         "opClose": "結束子智能體",
         "opResume": "恢復子智能體",
-        "opList": "檢視子智能體"
+        "opList": "檢視子智能體",
+        "errorTitle": "子智能體任務失敗",
+        "statesLabel": "子智能體",
+        "statusRunning": "執行中",
+        "statusCompleted": "已完成",
+        "statusFailed": "失敗",
+        "statusPending": "初始化中",
+        "statusInterrupted": "已中斷",
+        "statusClosed": "已關閉",
+        "statusNotFound": "未找到"
       },
       "contextCompaction": {
         "compacting": "正在壓縮上下文…",
@@ -4767,6 +4913,11 @@
       "terminal": {
         "title": "終端",
         "running": "執行中"
+      },
+      "toolCallBlock": {
+        "tool": "工具",
+        "error": "錯誤",
+        "result": "結果"
       }
     },
     "diffPreview": {
@@ -7048,7 +7199,8 @@
         "config_changed": "儲存期間 Codex 設定被其他地方修改了，請重試。",
         "database": "讀取設定失敗：{message}"
       }
-    }
+    },
+    "officialsTitle": "官方模型"
   },
   "DeepSeekModelEditor": {
     "title": "模型清單",

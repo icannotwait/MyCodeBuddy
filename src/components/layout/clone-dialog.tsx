@@ -9,7 +9,6 @@ import { toErrorMessage } from "@/lib/app-error"
 import { openFolderWithDraft } from "@/lib/open-folder-with-draft"
 import { joinFsPath } from "@/lib/path-utils"
 import type { FolderDetail } from "@/lib/types"
-import { useAppWorkspaceStore } from "@/stores/app-workspace-store"
 import { useGitCredential } from "@/contexts/git-credential-context"
 import {
   Dialog,

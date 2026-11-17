@@ -1230,7 +1230,12 @@
       "approvalPolicyUntrustedRetired": "لم يعد codex يقبل untrusted: عند وجود هذه القيمة في config.toml يرفض codex البدء، في codeg وفي جلسات codex CLI وIDE على حد سواء. اختر سياسة موافقة أخرى ثم احفظ.",
       "apiUrlLabel": "عنوان API",
       "apiKeyLabel": "مفتاح API",
-      "managedKeysHint": "ما دام codeg ينشر قائمة النماذج فهو يدير هنا model_catalog_json و«model» في الجذر — غيّرهما من قائمة النماذج أعلاه."
+      "managedKeysHint": "ما دام codeg ينشر قائمة النماذج فهو يدير هنا model_catalog_json و«model» في الجذر — غيّرهما من قائمة النماذج أعلاه.",
+      "enableSkills": "تفعيل Skills",
+      "enableSkillsAria": "تفعيل Skills لـ Codex",
+      "enableFast": "تفعيل Fast",
+      "enableFastAria": "تفعيل مستوى خدمة Fast لـ Codex",
+      "approvalPolicyUntrustedAcpWarning": "لا يوجد مكافئ لـ untrusted بين إعدادات الموافقة الثلاثة في محوّل ACP، لذا تعود جلسات codeg إلى «عند الطلب»: يقرّر النموذج حينها متى يسأل، وتتوقف الأوامر التي تسمح بها البيئة المعزولة أصلاً عن طلب التأكيد. قيّد وضع العزل أدناه بدلاً من ذلك."
     },
     "gemini": {
       "authConfig": "إعداد مصادقة Gemini",
@@ -1306,7 +1311,9 @@
         "connectedBadge": "متصل",
         "noKeyMethod": "لا يربط OpenCode هذا المزوّد بمفتاح API. سجّل الدخول من الطرفية بالأمر: opencode auth login",
         "apiKeyEditHint": "اتركه فارغًا للاحتفاظ بالمفتاح المحفوظ؛ والمفتاح الجديد يحل محله.",
-        "package": "الحزمة (npm)"
+        "package": "الحزمة (npm)",
+        "catalogLabel": "كتالوج models.dev",
+        "oauthApiKeyNote": "يدعم هذا المزود أيضًا تسجيل الدخول عبر المتصفح باستخدام opencode auth login. سيتوفر تسجيل الدخول عبر المتصفح قريبًا — في الوقت الحالي، الصق مفتاح API."
       },
       "customProvider": {
         "title": "إضافة مزود مخصص",
@@ -1361,11 +1368,17 @@
           "question": "طرح سؤال عليك",
           "shell": "تشغيل أوامر shell، تُطابق حسب الأمر بعد تحليله",
           "subagent": "تشغيل وكلاء فرعيين، تُطابق حسب معرّف الوكيل",
-          "execute": "تشغيل نصوص Code Mode التي تستدعي أدوات MCP؛ عند رفضه يستخدم النموذج تلك الأدوات مباشرة"
+          "execute": "تشغيل نصوص Code Mode التي تستدعي أدوات MCP؛ عند رفضه يستخدم النموذج تلك الأدوات مباشرة",
+          "bash": "تشغيل أوامر الصدفة، بمطابقة الأمر بعد تحليله",
+          "task": "تشغيل الوكلاء الفرعيين، بمطابقة نوع الوكيل الفرعي",
+          "list": "سرد محتويات المجلد",
+          "lsp": "تشغيل استعلامات LSP",
+          "doom_loop": "يُفعَّل عند تكرار الاستدعاء نفسه ثلاث مرات بالمدخلات نفسها"
         },
         "orderingLocked": "يتوقف التحرير أدناه مؤقتًا حتى يُصحَّح الترتيب، كي لا يعيد أي تغيير هنا ترتيب هذه القواعد دون أن تلاحظ.",
         "legacyRules": "تأتي هذه القواعد من مفتاحي permission وtools في OpenCode 1، اللذين لا يزال OpenCode 2 يقرؤهما. سيعيد تعديلك التالي هنا كتابتها كقواعد permissions الخاصة بـ OpenCode 2.",
-        "allToolsResourcesHint": "قواعد لكل الأدوات على أهداف محددة"
+        "allToolsResourcesHint": "قواعد لكل الأدوات على أهداف محددة",
+        "legacyTools": "خريطة tools القديمة في المستوى الأعلى ترفض إحدى الأدوات. يدمجها OpenCode ضمن الأذونات، لذا تُطبَّق فوق كل ما يظهر هنا. عدّلها في JSON الأصلي أدناه، أو فعّل القبول التلقائي لمسحها."
       },
       "behavior": {
         "title": "السلوك والضغط",
@@ -1388,28 +1401,38 @@
           "preserveRecentTokens": "الرموز المحفوظة حرفيًا",
           "reserved": "رموز محجوزة",
           "maxLines": "حد أسطر مخرجات الأدوات",
-          "maxBytes": "حد بايتات مخرجات الأدوات"
+          "maxBytes": "حد بايتات مخرجات الأدوات",
+          "tailTurns": "الأدوار المحفوظة حرفيًا"
         },
         "hints": {
           "subagentDepth": "عدد مستويات تداخل الوكلاء الفرعيين (experimental.subagent_depth). القيمة 1 تمنع الوكيل الفرعي من تشغيل وكيل آخر.",
           "preserveRecentTokens": "ميزانية الرموز للأدوار الأخيرة التي تُحفظ حرفيًا بعد الضغط (compaction.keep.tokens). الافتراضي 15000.",
           "reserved": "المساحة التي تُترك فارغة في نافذة السياق قبل الضغط التلقائي (compaction.buffer): عدد رموز مثل <code>20000</code>، أو نسبة من النافذة من <code>1%</code> إلى <code>99%</code> مثل <code>20%</code>. عند عدم التعيين تبقى <code>15%</code> من النافذة فارغة، بحد أدنى <code>16000</code> رمز.",
           "maxLines": "المخرجات الأطول من ذلك تُكتب إلى القرص ويُستبدل بها معاينة. الافتراضي 2000.",
-          "maxBytes": "المخرجات الأكبر من ذلك تُكتب إلى القرص ويُستبدل بها معاينة. الافتراضي 51200."
+          "maxBytes": "المخرجات الأكبر من ذلك تُكتب إلى القرص ويُستبدل بها معاينة. الافتراضي 51200.",
+          "tailTurns": "عدد أدوار المستخدم الأخيرة التي تبقى بلا ضغط. عند تركه فارغًا تحدّها ميزانية الرموز أدناه فقط."
         },
         "ignoredLegacyKeys": "يتجاهل OpenCode 2 إعدادات OpenCode 1 هذه في الملف: {keys}.",
         "removeIgnoredLegacyKeys": "إزالة",
         "backgroundCompaction": "الضغط في الخلفية",
         "backgroundCompactionHint": "تجريبي: يلخّص في الخلفية عندما يقترب السياق من حده، كي لا ينتظر الضغط التلقائي. الملخصات غير المستخدمة تستهلك الرموز أيضًا.",
         "todo": "أداة قائمة المهام",
-        "todoHint": "تجريبي: يمنح الوكيل أداة todowrite، ليعرض Codeg خطته كقائمة مهام."
+        "todoHint": "تجريبي: يمنح الوكيل أداة todowrite، ليعرض Codeg خطته كقائمة مهام.",
+        "share": "المشاركة",
+        "shareHint": "هل يمكن نشر الجلسة كرابط مشاركة.",
+        "shareManual": "يدوي (عند الطلب فقط)",
+        "shareAuto": "تلقائي (كل جلسة جديدة)",
+        "shareDisabled": "معطَّل",
+        "compactionPrune": "تقليم مخرجات الأدوات القديمة",
+        "compactionPruneHint": "يتخلص من مخرجات استدعاءات الأدوات القديمة أثناء الضغط بدل تلخيصها."
       },
       "authKindEnv": "متغير البيئة {name}",
       "envConnectionHint": "متصل عبر متغير البيئة {name}. لقطع الاتصال، احذفه من حيث تم تعيينه.",
       "keyStored": "المفتاح محفوظ في OpenCode",
       "keyMissing": "لا يوجد مفتاح محفوظ",
       "setApiKey": "تعيين مفتاح API",
-      "credentialsNeedInstall": "يحفظ OpenCode مفاتيح المزوّدين في مخزن بيانات الاعتماد الخاص به، لذا يتطلب ربط مزوّد تثبيت OpenCode. ثبّته أولًا من الأعلى."
+      "credentialsNeedInstall": "يحفظ OpenCode مفاتيح المزوّدين في مخزن بيانات الاعتماد الخاص به، لذا يتطلب ربط مزوّد تثبيت OpenCode. ثبّته أولًا من الأعلى.",
+      "addProvider": "إضافة مزود"
     },
     "openClaw": {
       "gatewayConfig": "إعداد Gateway",
@@ -1531,7 +1554,9 @@
       "rawEditorPlaceholder": "[providers.codeg]\ntype = \"kimi\"\nbase_url = \"https://api.moonshot.cn/v1\"\napi_key = \"sk-...\"",
       "gateNotReady": "Not authenticated yet — save an API key below (or sign in) to open Kimi sessions.",
       "authModeHint": "“API key” writes a codeg-managed config.toml provider and seeds a gate token. “Login” clears that and uses a real `kimi login` session (requires a Kimi subscription).",
-      "rawEditorHint": "Written verbatim (comments preserved) and validated as TOML. codeg also seeds the gate token so the session opens."
+      "rawEditorHint": "Written verbatim (comments preserved) and validated as TOML. codeg also seeds the gate token so the session opens.",
+      "fetchModels": "اختبار وجلب النماذج",
+      "fetchModelsNeedsKey": "أدخل أولًا مفتاح API ونقطة النهاية"
     },
     "authModeOfficialSubscription": "الاشتراك الرسمي",
     "authModeCustomEndpoint": "نقطة نهاية مخصصة",
@@ -1592,11 +1617,15 @@
       "providerExists": "المزوّد {providerId} موجود بالفعل",
       "modelIdPattern": "يدعم معرّف النموذج الأحرف والأرقام والشرطة السفلية والنقطة والنقطتين والشرطة فقط",
       "modelExists": "النموذج {modelId} موجود بالفعل",
-      "openCodeConfigUnreadable": "يحتوي ملف إعدادات OpenCode على خطأ في الصياغة. أصلحه أولًا في محرر JSON الأصلي."
+      "openCodeConfigUnreadable": "يحتوي ملف إعدادات OpenCode على خطأ في الصياغة. أصلحه أولًا في محرر JSON الأصلي.",
+      "openCodeAuthMustBeObject": "يجب أن يكون OpenCode auth.json كائن JSON",
+      "openCodeAuthInvalid": "خطأ في تنسيق OpenCode auth.json: {message}"
     },
     "warnings": {
       "nativeJsonRecoveredStructured": "إعداد JSON الأصلي غير صالح؛ تمت إعادة التعيين إلى إعداد مُهيكل",
-      "authRecoveredStructured": "ملف auth.json غير صالح؛ تمت إعادة التعيين إلى إعداد مُهيكل"
+      "authRecoveredStructured": "ملف auth.json غير صالح؛ تمت إعادة التعيين إلى إعداد مُهيكل",
+      "nativeJsonRecoveredOpenCode": "إعداد JSON الأصلي غير صالح؛ تمت إعادة التعيين إلى إعداد OpenCode المُهيكل",
+      "openCodeAuthRecovered": "ملف OpenCode auth.json غير صالح؛ تمت إعادة التعيين إلى الإعداد الافتراضي"
     },
     "toasts": {
       "agentActionCompleted": "اكتمل {action} لـ {name}",
@@ -1738,7 +1767,20 @@
       "add": "إضافة",
       "remove": "إزالة",
       "loadFailed": "تعذّرت قراءة إعدادات OpenCode: {message}",
-      "updateFailed": "تعذّر تحديث إعدادات OpenCode: {message}"
+      "updateFailed": "تعذّر تحديث إعدادات OpenCode: {message}",
+      "status": {
+        "installed": "مثبّت",
+        "missing": "غير مثبّت",
+        "needs_migration": "يتطلب الترحيل",
+        "path": "إضافة من مسار",
+        "path_missing": "المسار غير موجود"
+      },
+      "installAll": "تثبيت جميع الإضافات المفقودة",
+      "pinVersions": "تثبيت إصدارات @latest",
+      "install": "تثبيت",
+      "uninstall": "إزالة",
+      "success": "تم تثبيت جميع الإضافات بنجاح",
+      "failed": "فشلت عملية الإضافة"
     },
     "pi": {
       "configManagement": "إعدادات Pi",
@@ -2273,7 +2315,8 @@
       "originalWorkingDir": "دليل العمل الأصلي",
       "cliBadge": "بدأت من سطر الأوامر",
       "recentFilterCli": "سطر الأوامر",
-      "noRecentCli": "لا توجد محادثات حديثة من سطر الأوامر"
+      "noRecentCli": "لا توجد محادثات حديثة من سطر الأوامر",
+      "worktreeRemovedBadge": "تمت إزالة شجرة العمل الأصلية"
     },
     "conversation": {
       "reloadFailed": "فشل إعادة تحميل المحادثة: {message}",
@@ -3875,7 +3918,13 @@
         "backgroundContinuation": "متابعة في الخلفية",
         "loadOlderHistory": "تحميل الرسائل الأقدم",
         "loadBackgroundActivity": "تحميل نشاط الخلفية",
-        "snapshotOmittedToolCalls": "أسقط هذا العرض المباشر {count} من استدعاءات الأدوات. الرسائل المحفوظة تسد هذه الفجوات."
+        "snapshotOmittedToolCalls": "أسقط هذا العرض المباشر {count} من استدعاءات الأدوات. الرسائل المحفوظة تسد هذه الفجوات.",
+        "attachedResources": "الموارد المرفقة",
+        "error": "خطأ: {message}",
+        "duration": "المدة",
+        "worked": "انتهى العمل",
+        "workedFor": "عمل لمدة {duration}",
+        "working": "جارٍ العمل..."
       },
       "liveTurnStats": {
         "thinking": "جارٍ التفكير...",
@@ -3902,8 +3951,14 @@
           "inputAvailable": "قيد التشغيل",
           "inputStreaming": "قيد الانتظار",
           "outputAvailable": "مكتمل",
-          "outputError": "خطأ"
-        }
+          "outputError": "خطأ",
+          "approvalRequested": "بانتظار الموافقة",
+          "approvalResponded": "تم الرد",
+          "outputDenied": "مرفوض"
+        },
+        "parameters": "المعلمات",
+        "error": "خطأ",
+        "result": "النتيجة"
       },
       "delegation": {
         "unknownAgent": "وكيل فرعي",
@@ -3998,7 +4053,9 @@
           }
         },
         "unknownAssistant": "المساعد #{id}",
-        "deletedAssistant": "(محذوف)"
+        "deletedAssistant": "(محذوف)",
+        "subAgentRunning": "العميل الفرعي قيد التشغيل…",
+        "noDetail": "No detail available yet."
       },
       "contentParts": {
         "offset": "الإزاحة: {offset}",
@@ -4033,7 +4090,8 @@
             "budgetLimited": "الميزانية محدودة",
             "complete": "مكتمل",
             "limited": "تم بلوغ الحد"
-          }
+          },
+          "titleWithStatus": "الهدف {status}"
         },
         "title": {
           "edit": "تحرير",
@@ -4082,7 +4140,15 @@
         "backgroundTask": {
           "polledTimes": "تم الاستعلام {count} مرة",
           "launchNote": "قيد التشغيل في الخلفية · {id}",
-          "monitorNote": "قيد المراقبة في الخلفية · {id}"
+          "monitorNote": "قيد المراقبة في الخلفية · {id}",
+          "title": "مهمة في الخلفية",
+          "titleWithId": "مهمة في الخلفية · {id}",
+          "running": "قيد التشغيل",
+          "completed": "اكتملت",
+          "failed": "فشلت",
+          "stopped": "متوقفة",
+          "exitCode": "رمز الخروج {code}",
+          "runningInBackground": "في الخلفية"
         },
         "codexScript": {
           "outputMissing": "اقتطع codex مُخرَج النص البرمجي وأزال الفاصل الخاص بهذا الأمر، لذا تعذّر نسب أي مُخرَج إليه.",
@@ -4126,6 +4192,72 @@
           "other": "{count, plural, zero {استخدام صفر أداة} one {استخدام أداة واحدة} two {استخدام أداتين} few {استخدام # أدوات} many {استخدام # أداة} other {استخدام # أداة}}",
           "errorSuffix": "{count, plural, zero {صفر فشل} one {فشل واحد} two {فشلان} few {# فشلوا} many {# فشلاً} other {# فشل}}",
           "joiner": " · "
+        },
+        "unknown": "غير معروف",
+        "inputTruncated": "تم اقتطاع الإدخال — قد يكون الفرق غير مكتمل.",
+        "replaceAll": "استبدال الكل",
+        "filesCount": "الملفات: {count}",
+        "update": "تحديث",
+        "moreFiles": "+{count} ملف إضافي",
+        "timeoutMs": "المهلة: {timeout}ms",
+        "backgroundTrue": "الخلفية: true",
+        "scriptToolCalls": "{count, plural, zero {صفر استدعاء أداة} one {استدعاء أداة واحد} two {استدعاءا أداة} few {# استدعاءات أداة} many {# استدعاء أداة} other {# استدعاء أداة}}",
+        "limit": "الحد: {limit}",
+        "mode": "الوضع: {mode}",
+        "cell": "الخلية: {cell}",
+        "pathLabel": "المسار:",
+        "globLabel": "نمط glob:",
+        "typeLabel": "النوع:",
+        "outputLabel": "المخرجات:",
+        "caseInsensitive": "غير حساس لحالة الأحرف",
+        "multiline": "متعدد الأسطر",
+        "promptLabel": "المطالبة",
+        "subjectLabel": "الموضوع",
+        "taskLabel": "المهمة",
+        "nameLabel": "الاسم:",
+        "agentPromptLabel": "المطالبة",
+        "agentRunning": "قيد التشغيل...",
+        "agentLiveTranscript": "النشاط المباشر",
+        "agentSessionAction": "عرض جلسة الوكيل الفرعي",
+        "agentSubagentDone": "انتهى",
+        "agentSubagentInterrupted": "تمت مقاطعته",
+        "agentSubagentUnknown": "النتيجة غير معروفة",
+        "agentStatsBash": "الأوامر",
+        "agentStatsRead": "الملفات المقروءة",
+        "agentStatsSearch": "عمليات البحث",
+        "agentStatsEdit": "التعديلات",
+        "agentStatsOther": "أخرى",
+        "field": {
+          "file": "ملف",
+          "notebook": "دفتر",
+          "command": "أمر",
+          "old": "قديم",
+          "new": "جديد",
+          "pattern": "النمط",
+          "path": "المسار",
+          "query": "الاستعلام",
+          "url": "URL:",
+          "description": "الوصف",
+          "content": "المحتوى",
+          "source": "المصدر",
+          "prompt": "المطالبة",
+          "subject": "الموضوع",
+          "taskId": "معرف المهمة",
+          "status": "الحالة",
+          "skill": "Skill",
+          "args": "الوسائط",
+          "offset": "الإزاحة",
+          "limit": "الحد",
+          "glob": "نمط glob",
+          "type": "النوع",
+          "output": "المخرجات",
+          "replaceAll": "استبدال الكل",
+          "language": "اللغة",
+          "timeout": "المهلة",
+          "background": "الخلفية",
+          "agentType": "نوع الوكيل",
+          "library": "المكتبة",
+          "libraryId": "معرف المكتبة"
         }
       },
       "messageNav": {
@@ -4141,7 +4273,10 @@
         "currentMessage": "الرسالة الحالية",
         "scrollToCurrent": "التمرير إلى الرسالة الحالية (#{ordinal})",
         "running": "قيد التشغيل",
-        "total": "{count, plural, zero {لا رسائل} one {رسالة واحدة} two {رسالتان} few {# رسائل} many {# رسالة} other {# رسالة}}"
+        "total": "{count, plural, zero {لا رسائل} one {رسالة واحدة} two {رسالتان} few {# رسائل} many {# رسالة} other {# رسالة}}",
+        "collapsedSummary": "الرسائل {count}",
+        "remove": "إزالة",
+        "noDiffDataAvailable": "لا توجد بيانات diff متاحة لـ {filePath}"
       },
       "replyArtifacts": {
         "title": "الملفات المتغيرة",
@@ -4264,7 +4399,9 @@
       },
       "feedbackCheckResult": {
         "count": "{count} ملاحظة",
-        "errorTitle": "فشل التحقق من الملاحظات"
+        "errorTitle": "فشل التحقق من الملاحظات",
+        "expand": "عرض كل الملاحظات",
+        "collapse": "طي"
       },
       "codegMcpTool": {
         "getSessionInfo": "قراءة المحادثة {session}",
@@ -4346,7 +4483,16 @@
         "opWait": "جلب نتيجة الوكيل الفرعي",
         "opClose": "إغلاق الوكيل الفرعي",
         "opResume": "استئناف الوكيل الفرعي",
-        "opList": "سرد الوكلاء الفرعيين"
+        "opList": "سرد الوكلاء الفرعيين",
+        "errorTitle": "فشلت مهمة الوكيل الفرعي",
+        "statesLabel": "الوكلاء الفرعيون",
+        "statusRunning": "قيد التشغيل",
+        "statusCompleted": "مكتمل",
+        "statusFailed": "فشل",
+        "statusPending": "قيد البدء",
+        "statusInterrupted": "متوقف",
+        "statusClosed": "مغلق",
+        "statusNotFound": "غير موجود"
       },
       "contextCompaction": {
         "compacting": "جارٍ ضغط السياق…",
@@ -4767,6 +4913,11 @@
       "terminal": {
         "title": "الطرفية",
         "running": "قيد التشغيل"
+      },
+      "toolCallBlock": {
+        "tool": "أداة",
+        "error": "خطأ",
+        "result": "النتيجة"
       }
     },
     "diffPreview": {
@@ -7048,7 +7199,8 @@
         "config_changed": "تغيّرت إعدادات Codex أثناء الحفظ؛ حاول مرة أخرى.",
         "database": "تعذّرت قراءة الإعدادات: {message}"
       }
-    }
+    },
+    "officialsTitle": "النماذج الرسمية"
   },
   "DeepSeekModelEditor": {
     "title": "قائمة النماذج",

@@ -36,7 +36,10 @@ import {
 } from "@/lib/ask-selection-handoff"
 import { useConnectionLifecycle } from "@/hooks/use-connection-lifecycle"
 import { useMessageQueue, type QueuedMessage } from "@/hooks/use-message-queue"
-import { MessageListView } from "@/components/message/message-list-view"
+import {
+  MessageListView,
+  type LiveRunsSource,
+} from "@/components/message/message-list-view"
 import {
   GoalControlProvider,
   type GoalControlValue,
@@ -907,7 +910,6 @@ export const ConversationSessionSurface = memo(
     useEffect(() => {
       isViewerRef.current = conn.isViewer
     }, [conn.isViewer])
-    const isConnecting = connStatus === "connecting"
     // The tab's connection is keyed by a stable tabId, but agent switching is
     // async — and for a not-installed target, connect()'s preflight throws BEFORE
     // it tears down the old connection. So `conn` can still describe the PREVIOUS
@@ -2698,6 +2700,26 @@ export const ConversationSessionSurface = memo(
       [openTab, refreshConversations]
     )
 
+    const runsAgentName = getAgentLabel(selectedAgent)
+    const liveRuns = useMemo<LiveRunsSource>(
+      () => ({
+        connectionId: conn.connectionId,
+        asyncTasks: conn.asyncTasks,
+        backgroundTasks: conn.backgroundTasks,
+        delegatedChildren: conn.delegatedChildren,
+        onStopAsyncTask: handleStopAsyncTask,
+        agentName: runsAgentName,
+      }),
+      [
+        conn.connectionId,
+        conn.asyncTasks,
+        conn.backgroundTasks,
+        conn.delegatedChildren,
+        handleStopAsyncTask,
+        runsAgentName,
+      ]
+    )
+
     const messageListNode = (
       <GoalControlProvider value={goalControlValue}>
         <MessageListView
@@ -2737,6 +2759,7 @@ export const ConversationSessionSurface = memo(
               : undefined
           }
           imageRoot={workingDirForConnection ?? null}
+          liveRuns={liveRuns}
         />
       </GoalControlProvider>
     )
@@ -2846,12 +2869,6 @@ export const ConversationSessionSurface = memo(
         sessionFailures={conn.sessionFailures}
         snapshotTruncation={conn.snapshotTruncation}
         onSessionFailureDismiss={handleSessionFailureDismiss}
-        asyncTasks={conn.asyncTasks}
-        onStopAsyncTask={
-          conn.connectionId !== null && !conn.isViewer && !interactionLocked
-            ? handleStopAsyncTask
-            : undefined
-        }
         pendingPermission={conn.pendingPermission}
         pendingQuestion={conn.pendingQuestion}
         pendingAskQuestion={conn.pendingAskQuestion}

@@ -190,6 +190,11 @@ export type AdaptedContentPart =
       state: "output-available" | "output-error"
     }
   | { type: "reasoning"; content: string; isStreaming: boolean }
+  | {
+      type: "tool-group"
+      items: AdaptedToolCallPart[]
+      isStreaming: boolean
+    }
   /**
    * A run of consecutive `get_delegation_status` poll cards, merged into one
    * card. When a delegated task runs longer than the 60s status-wait cap, the
@@ -2147,6 +2152,7 @@ export function isTurnAnswerPart(part: AdaptedContentPart): boolean {
     case "reasoning":
     case "tool-call":
     case "tool-result":
+    case "tool-group":
     case "delegation-status-group":
     case "background-task-group":
     case "goal-run":

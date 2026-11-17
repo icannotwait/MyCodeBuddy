@@ -550,7 +550,9 @@ export function LiveTurnStats({
     [message]
   )
   const showUsage =
-    LIVE_TURN_REQUEST_USAGE_VISIBLE && supportsRequestUsageDisplay(agentType)
+    LIVE_TURN_REQUEST_USAGE_VISIBLE &&
+    agentType != null &&
+    supportsRequestUsageDisplay(agentType)
   const usageSnap = useSyncExternalStore(
     subscribeRequestUsage,
     () =>
@@ -614,6 +616,7 @@ export function LiveTurnStats({
     statusMode === "auto" &&
     isStreaming &&
     hasThinkingBlock &&
+    message != null &&
     message.content.length <= 1 &&
     lastBlock?.type === "thinking"
 

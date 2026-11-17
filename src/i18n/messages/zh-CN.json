@@ -1230,7 +1230,12 @@
       "approvalPolicyUntrustedRetired": "codex 已不再接受 untrusted：config.toml 里有这个值时，codex 会拒绝启动，codeg 里和 codex CLI、IDE 会话里都一样。请改选其他审批策略并保存。",
       "apiUrlLabel": "API 地址",
       "apiKeyLabel": "API Key",
-      "managedKeysHint": "codeg 发布模型列表期间，这里的 model_catalog_json 和根键 model 由 codeg 管理，请在上面的模型列表里修改。"
+      "managedKeysHint": "codeg 发布模型列表期间，这里的 model_catalog_json 和根键 model 由 codeg 管理，请在上面的模型列表里修改。",
+      "enableSkills": "启用 Skills",
+      "enableSkillsAria": "Codex 启用 Skills",
+      "enableFast": "启用 Fast",
+      "enableFastAria": "Codex 启用 Fast 服务等级",
+      "approvalPolicyUntrustedAcpWarning": "ACP 适配器只有三种审批预设，untrusted 无对应项，codeg 会话会退回「按需询问」——此时由模型自行决定何时询问，沙箱本就允许的命令不再询问。请改用下方的沙箱模式收紧。"
     },
     "gemini": {
       "authConfig": "Gemini 认证配置",
@@ -1306,7 +1311,9 @@
         "connectedBadge": "已连接",
         "noKeyMethod": "OpenCode 不通过 API 密钥连接此供应商。请在终端中运行 opencode auth login 登录。",
         "apiKeyEditHint": "留空则保留已存的密钥；填入新密钥会替换它。",
-        "package": "包（npm）"
+        "package": "包（npm）",
+        "catalogLabel": "models.dev 目录",
+        "oauthApiKeyNote": "该 Provider 也支持通过 opencode auth login 浏览器登录。浏览器登录即将推出——目前请粘贴 API Key。"
       },
       "customProvider": {
         "title": "添加自定义 Provider",
@@ -1361,11 +1368,17 @@
           "question": "向你提问",
           "shell": "运行 shell 命令，按解析后的命令匹配",
           "subagent": "启动子智能体，按智能体 ID 匹配",
-          "execute": "运行调用 MCP 工具的 Code Mode 脚本；拒绝后模型改为直接使用这些工具"
+          "execute": "运行调用 MCP 工具的 Code Mode 脚本；拒绝后模型改为直接使用这些工具",
+          "bash": "运行 shell 命令，按解析后的命令匹配",
+          "task": "启动子代理，按子代理类型匹配",
+          "list": "列出目录内容",
+          "lsp": "运行 LSP 查询",
+          "doom_loop": "同一调用以相同输入重复 3 次时触发"
         },
         "orderingLocked": "在顺序修正之前，下方编辑暂停，以免这里的任何修改悄悄改变这些规则的顺序。",
         "legacyRules": "这些规则来自 OpenCode 1 的 permission 与 tools 配置，OpenCode 2 仍会读取。你在这里的下一次修改会把它们改写为 OpenCode 2 的 permissions 规则。",
-        "allToolsResourcesHint": "作用于所有工具的特定对象的规则"
+        "allToolsResourcesHint": "作用于所有工具的特定对象的规则",
+        "legacyTools": "顶层的旧版 tools 配置禁用了某个工具。OpenCode 会把它并入权限，因此它会叠加在此处显示的全部设置之上。请在下方原生 JSON 中修改，或开启「自动接受所有权限」将其清除。"
       },
       "behavior": {
         "title": "行为与压缩",
@@ -1388,28 +1401,38 @@
           "preserveRecentTokens": "保留原文的 token 数",
           "reserved": "预留 token",
           "maxLines": "工具输出行数上限",
-          "maxBytes": "工具输出字节上限"
+          "maxBytes": "工具输出字节上限",
+          "tailTurns": "保留原文的轮数"
         },
         "hints": {
           "subagentDepth": "子智能体最多可以嵌套几层（experimental.subagent_depth）。填 1 表示子智能体不能再启动子智能体。",
           "preserveRecentTokens": "压缩后仍按原文保留的最近对话 token 预算（compaction.keep.tokens）。默认 15000。",
           "reserved": "自动压缩前在上下文窗口里预留的空间（compaction.buffer）：填 token 数，如 <code>20000</code>；或填窗口占比，<code>1%</code> 到 <code>99%</code>，如 <code>20%</code>。不填则预留窗口的 <code>15%</code>，至少 <code>16000</code> 个 token。",
           "maxLines": "超过该行数的输出会落盘，只在会话里留一段预览。默认 2000。",
-          "maxBytes": "超过该字节数的输出会落盘，只在会话里留一段预览。默认 51200。"
+          "maxBytes": "超过该字节数的输出会落盘，只在会话里留一段预览。默认 51200。",
+          "tailTurns": "最近多少轮用户对话不参与压缩。留空表示只受下面的 token 预算约束。"
         },
         "ignoredLegacyKeys": "文件中的这些 OpenCode 1 设置已被 OpenCode 2 忽略：{keys}。",
         "removeIgnoredLegacyKeys": "移除",
         "backgroundCompaction": "后台压缩",
         "backgroundCompactionHint": "实验性：上下文接近上限时在后台预先生成摘要，自动压缩无需等待。未用上的摘要同样消耗 token。",
         "todo": "待办列表工具",
-        "todoHint": "实验性：为智能体提供 todowrite 工具，Codeg 即可把它的计划显示为待办列表。"
+        "todoHint": "实验性：为智能体提供 todowrite 工具，Codeg 即可把它的计划显示为待办列表。",
+        "share": "会话分享",
+        "shareHint": "会话是否可以发布成分享链接。",
+        "shareManual": "手动（需要时才分享）",
+        "shareAuto": "自动（每个新会话都分享）",
+        "shareDisabled": "禁用",
+        "compactionPrune": "裁剪旧工具输出",
+        "compactionPruneHint": "压缩时直接丢弃较早工具调用的输出，而不是把它们总结进去。"
       },
       "authKindEnv": "环境变量 {name}",
       "envConnectionHint": "通过环境变量 {name} 连接。要断开，请在设置它的地方取消该变量。",
       "keyStored": "密钥已存入 OpenCode",
       "keyMissing": "未存储密钥",
       "setApiKey": "设置 API 密钥",
-      "credentialsNeedInstall": "OpenCode 把供应商密钥存在自己的凭证库中，连接供应商需要先安装 OpenCode。请先在上方安装。"
+      "credentialsNeedInstall": "OpenCode 把供应商密钥存在自己的凭证库中，连接供应商需要先安装 OpenCode。请先在上方安装。",
+      "addProvider": "新增 Provider"
     },
     "openClaw": {
       "gatewayConfig": "Gateway 配置",
@@ -1531,7 +1554,9 @@
       "rawEditorPlaceholder": "[providers.codeg]\ntype = \"kimi\"\nbase_url = \"https://api.moonshot.cn/v1\"\napi_key = \"sk-...\"",
       "gateNotReady": "尚未鉴权——请在下方保存 API Key（或登录）以打开 Kimi 会话。",
       "authModeHint": "「API Key」写入受管 config.toml 供应商并播种门控令牌；「登录」会清除它并改用真实的 `kimi login` 会话（需要 Kimi 订阅）。",
-      "rawEditorHint": "逐字写入（保留注释）并按 TOML 校验。codeg 同时会播种门控令牌以打开会话。"
+      "rawEditorHint": "逐字写入（保留注释）并按 TOML 校验。codeg 同时会播种门控令牌以打开会话。",
+      "fetchModels": "测试并获取模型",
+      "fetchModelsNeedsKey": "请先填写 API Key 和接入点"
     },
     "authModeOfficialSubscription": "官网订阅",
     "authModeCustomEndpoint": "自定义接口",
@@ -1592,11 +1617,15 @@
       "providerExists": "Provider {providerId} 已存在",
       "modelIdPattern": "模型 ID 仅支持字母、数字、下划线、点、冒号与中划线",
       "modelExists": "Model {modelId} 已存在",
-      "openCodeConfigUnreadable": "OpenCode 配置文件有语法错误，请先在原生 JSON 编辑器中修复。"
+      "openCodeConfigUnreadable": "OpenCode 配置文件有语法错误，请先在原生 JSON 编辑器中修复。",
+      "openCodeAuthMustBeObject": "OpenCode auth.json 必须是 JSON 对象",
+      "openCodeAuthInvalid": "OpenCode auth.json 格式错误：{message}"
     },
     "warnings": {
       "nativeJsonRecoveredStructured": "原生 JSON 配置格式无效，已重置为结构化配置",
-      "authRecoveredStructured": "auth.json 格式无效，已重置为结构化配置"
+      "authRecoveredStructured": "auth.json 格式无效，已重置为结构化配置",
+      "nativeJsonRecoveredOpenCode": "原生 JSON 配置格式无效，已重置为 OpenCode 结构化配置",
+      "openCodeAuthRecovered": "OpenCode auth.json 格式无效，已重置为默认配置"
     },
     "toasts": {
       "agentActionCompleted": "{name}{action}完成",
@@ -1738,7 +1767,20 @@
       "add": "添加",
       "remove": "移除",
       "loadFailed": "无法读取 OpenCode 配置：{message}",
-      "updateFailed": "无法更新 OpenCode 配置：{message}"
+      "updateFailed": "无法更新 OpenCode 配置：{message}",
+      "status": {
+        "installed": "已安装",
+        "missing": "未安装",
+        "needs_migration": "需要迁移",
+        "path": "路径插件",
+        "path_missing": "路径不存在"
+      },
+      "installAll": "安装全部缺失插件",
+      "pinVersions": "固定 @latest 版本",
+      "install": "安装",
+      "uninstall": "卸载",
+      "success": "所有插件安装成功",
+      "failed": "插件操作失败"
     },
     "pi": {
       "configManagement": "Pi 配置",
@@ -2273,7 +2315,8 @@
       "originalWorkingDir": "最初运行目录",
       "cliBadge": "从命令行启动",
       "recentFilterCli": "命令行",
-      "noRecentCli": "没有最近从命令行启动的会话"
+      "noRecentCli": "没有最近从命令行启动的会话",
+      "worktreeRemovedBadge": "源 worktree 已删除"
     },
     "conversation": {
       "reloadFailed": "会话重新加载失败：{message}",
@@ -3875,7 +3918,13 @@
         "backgroundContinuation": "后台续写",
         "loadOlderHistory": "加载更早的消息",
         "loadBackgroundActivity": "加载后台活动",
-        "snapshotOmittedToolCalls": "当前实时视图省略了 {count} 个工具调用。已加载已保存的消息来补齐缺口。"
+        "snapshotOmittedToolCalls": "当前实时视图省略了 {count} 个工具调用。已加载已保存的消息来补齐缺口。",
+        "attachedResources": "附加资源",
+        "error": "错误：{message}",
+        "duration": "耗时",
+        "worked": "工作已结束",
+        "workedFor": "工作了 {duration}",
+        "working": "正在工作中..."
       },
       "liveTurnStats": {
         "thinking": "思考中...",
@@ -3902,8 +3951,14 @@
           "inputAvailable": "运行中",
           "inputStreaming": "等待中",
           "outputAvailable": "已完成",
-          "outputError": "错误"
-        }
+          "outputError": "错误",
+          "approvalRequested": "等待授权",
+          "approvalResponded": "已响应",
+          "outputDenied": "已拒绝"
+        },
+        "parameters": "参数",
+        "error": "错误",
+        "result": "结果"
       },
       "delegation": {
         "unknownAgent": "子智能体",
@@ -3998,7 +4053,9 @@
           }
         },
         "unknownAssistant": "助手 #{id}",
-        "deletedAssistant": "（已删除）"
+        "deletedAssistant": "（已删除）",
+        "subAgentRunning": "子智能体运行中…",
+        "noDetail": "暂无详情。"
       },
       "contentParts": {
         "offset": "偏移：{offset}",
@@ -4033,7 +4090,8 @@
             "budgetLimited": "预算受限",
             "complete": "已完成",
             "limited": "已达上限"
-          }
+          },
+          "titleWithStatus": "目标{status}"
         },
         "title": {
           "edit": "编辑",
@@ -4082,7 +4140,15 @@
         "backgroundTask": {
           "polledTimes": "轮询 {count} 次",
           "launchNote": "已在后台运行 · {id}",
-          "monitorNote": "已在后台监视 · {id}"
+          "monitorNote": "已在后台监视 · {id}",
+          "title": "后台任务",
+          "titleWithId": "后台任务 · {id}",
+          "running": "运行中",
+          "completed": "已完成",
+          "failed": "失败",
+          "stopped": "已停止",
+          "exitCode": "退出码 {code}",
+          "runningInBackground": "后台运行"
         },
         "codexScript": {
           "outputMissing": "codex 截断脚本输出时丢掉了这条命令的分隔行，因此没有输出可以归属给它。",
@@ -4126,6 +4192,72 @@
           "other": "调用 {count} 个工具",
           "errorSuffix": "{count} 个失败",
           "joiner": " · "
+        },
+        "unknown": "未知",
+        "inputTruncated": "输入已截断，diff 可能不完整。",
+        "replaceAll": "全部替换",
+        "filesCount": "文件：{count}",
+        "update": "更新",
+        "moreFiles": "+{count} 个更多文件",
+        "timeoutMs": "超时：{timeout}ms",
+        "backgroundTrue": "后台：true",
+        "scriptToolCalls": "调用 {count} 个工具",
+        "limit": "限制：{limit}",
+        "mode": "模式：{mode}",
+        "cell": "单元：{cell}",
+        "pathLabel": "路径：",
+        "globLabel": "Glob：",
+        "typeLabel": "类型：",
+        "outputLabel": "输出：",
+        "caseInsensitive": "忽略大小写",
+        "multiline": "多行",
+        "promptLabel": "提示词",
+        "subjectLabel": "主题",
+        "taskLabel": "任务",
+        "nameLabel": "名称：",
+        "agentPromptLabel": "提示词",
+        "agentRunning": "运行中...",
+        "agentLiveTranscript": "实时活动",
+        "agentSessionAction": "查看子智能体会话",
+        "agentSubagentDone": "已完成",
+        "agentSubagentInterrupted": "已中断",
+        "agentSubagentUnknown": "结果未知",
+        "agentStatsBash": "命令",
+        "agentStatsRead": "读取文件",
+        "agentStatsSearch": "搜索",
+        "agentStatsEdit": "编辑",
+        "agentStatsOther": "其他",
+        "field": {
+          "file": "文件",
+          "notebook": "笔记本",
+          "command": "命令",
+          "old": "旧内容",
+          "new": "新内容",
+          "pattern": "模式",
+          "path": "路径",
+          "query": "查询",
+          "url": "URL地址",
+          "description": "描述",
+          "content": "内容",
+          "source": "源内容",
+          "prompt": "提示词",
+          "subject": "主题",
+          "taskId": "任务 ID",
+          "status": "状态",
+          "skill": "Skill",
+          "args": "参数",
+          "offset": "偏移",
+          "limit": "限制",
+          "glob": "Glob",
+          "type": "类型",
+          "output": "输出",
+          "replaceAll": "全部替换",
+          "language": "语言",
+          "timeout": "超时",
+          "background": "后台",
+          "agentType": "Agent 类型",
+          "library": "库",
+          "libraryId": "库 ID"
         }
       },
       "messageNav": {
@@ -4141,7 +4273,10 @@
         "currentMessage": "当前消息",
         "scrollToCurrent": "滚动到当前消息（#{ordinal}）",
         "running": "进行中",
-        "total": "共 {count} 条"
+        "total": "共 {count} 条",
+        "collapsedSummary": "消息 {count}",
+        "remove": "移除",
+        "noDiffDataAvailable": "未找到 {filePath} 的差异数据"
       },
       "replyArtifacts": {
         "title": "改动文件",
@@ -4264,7 +4399,9 @@
       },
       "feedbackCheckResult": {
         "count": "{count} 条反馈",
-        "errorTitle": "反馈检查失败"
+        "errorTitle": "反馈检查失败",
+        "expand": "展开全部反馈",
+        "collapse": "收起"
       },
       "codegMcpTool": {
         "getSessionInfo": "读取会话 {session}",
@@ -4346,7 +4483,16 @@
         "opWait": "获取子智能体结果",
         "opClose": "结束子智能体",
         "opResume": "恢复子智能体",
-        "opList": "查看子智能体"
+        "opList": "查看子智能体",
+        "errorTitle": "子智能体任务失败",
+        "statesLabel": "子智能体",
+        "statusRunning": "运行中",
+        "statusCompleted": "已完成",
+        "statusFailed": "失败",
+        "statusPending": "初始化中",
+        "statusInterrupted": "已中断",
+        "statusClosed": "已关闭",
+        "statusNotFound": "未找到"
       },
       "contextCompaction": {
         "compacting": "正在压缩上下文…",
@@ -4767,6 +4913,11 @@
       "terminal": {
         "title": "终端",
         "running": "运行中"
+      },
+      "toolCallBlock": {
+        "tool": "工具",
+        "error": "错误",
+        "result": "结果"
       }
     },
     "diffPreview": {
@@ -7048,7 +7199,8 @@
         "config_changed": "保存期间 Codex 配置被别处修改了，请重试。",
         "database": "读取设置失败：{message}"
       }
-    }
+    },
+    "officialsTitle": "官方模型"
   },
   "DeepSeekModelEditor": {
     "title": "模型列表",

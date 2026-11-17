@@ -24,7 +24,7 @@ import {
 import {
   type DelegationBinding,
   type DelegationStatus,
-} from "@/contexts/delegation-context"
+} from "@/lib/delegation-binding-reduce"
 import type { ToolCallState } from "@/lib/adapters/ai-elements-adapter"
 
 /**
@@ -1195,6 +1195,10 @@ function parseCodeModeInput(parsed: unknown): ParsedInput | null {
         : null,
     task: taskAt !== null ? objectTaskValue(code, taskAt) : null,
     workingDir: workingAt !== null ? objectStringValue(code, workingAt) : null,
+    profileLabel: null,
+    workUnitKey: null,
+    targetTaskId: null,
+    replacesTaskId: null,
   }
 }
 

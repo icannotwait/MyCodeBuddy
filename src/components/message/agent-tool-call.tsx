@@ -602,14 +602,14 @@ export const AgentToolCallPart = memo(function AgentToolCallPart({
                     {entry.text}
                   </div>
                 ) : null
-              ) : (
+              ) : entry.type === "text" ? (
                 <div
                   key={i}
                   className="text-sm prose prose-sm dark:prose-invert max-w-none [&_ul]:list-inside [&_ol]:list-inside"
                 >
                   <MessageResponse>{entry.text}</MessageResponse>
                 </div>
-              )
+              ) : null
             )}
           </div>
         )}

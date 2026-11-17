@@ -1230,7 +1230,12 @@
       "approvalPolicyUntrustedRetired": "codex は untrusted を受け付けなくなりました。config.toml にこの値があると、codex は起動を拒否します（codeg でも codex CLI や IDE のセッションでも同じです）。別の承認ポリシーを選んで保存してください。",
       "apiUrlLabel": "API URL",
       "apiKeyLabel": "API キー",
-      "managedKeysHint": "codeg がモデル一覧を公開している間は、ここの model_catalog_json とルートの model を codeg が管理します。上のモデル一覧で変更してください。"
+      "managedKeysHint": "codeg がモデル一覧を公開している間は、ここの model_catalog_json とルートの model を codeg が管理します。上のモデル一覧で変更してください。",
+      "enableSkills": "Skills を有効化",
+      "enableSkillsAria": "Codex の Skills を有効化",
+      "enableFast": "Fast を有効化",
+      "enableFastAria": "Codex の Fast サービスティアを有効化",
+      "approvalPolicyUntrustedAcpWarning": "ACP アダプターの 3 つの承認プリセットに untrusted に相当するものはないため、codeg のセッションは「要求時」にフォールバックします。その場合はモデルが尋ねるタイミングを決め、サンドボックスが既に許可しているコマンドは確認されなくなります。代わりに下のサンドボックスモードで制限してください。"
     },
     "gemini": {
       "authConfig": "Gemini 認証設定",
@@ -1306,7 +1311,9 @@
         "connectedBadge": "接続済み",
         "noKeyMethod": "OpenCode はこのプロバイダーを API キーで接続しません。ターミナルで opencode auth login を実行してサインインしてください。",
         "apiKeyEditHint": "空欄なら保存済みのキーを維持します。新しいキーを入力すると置き換えます。",
-        "package": "パッケージ（npm）"
+        "package": "パッケージ（npm）",
+        "catalogLabel": "models.dev カタログ",
+        "oauthApiKeyNote": "このプロバイダーは opencode auth login によるブラウザサインインにも対応しています。ブラウザサインインは近日対応予定です。今は API キーを貼り付けてください。"
       },
       "customProvider": {
         "title": "カスタムプロバイダーを追加",
@@ -1361,11 +1368,17 @@
           "question": "あなたへの質問",
           "shell": "シェルコマンドの実行。解析後のコマンドで照合",
           "subagent": "サブエージェントの起動。エージェント ID で照合",
-          "execute": "MCP ツールを呼ぶ Code Mode スクリプトの実行。拒否するとモデルはそれらのツールを直接使います"
+          "execute": "MCP ツールを呼ぶ Code Mode スクリプトの実行。拒否するとモデルはそれらのツールを直接使います",
+          "bash": "シェルコマンドの実行。解析後のコマンドで照合",
+          "task": "サブエージェントの起動。サブエージェントの種類で照合",
+          "list": "ディレクトリ内容の一覧表示",
+          "lsp": "LSP クエリの実行",
+          "doom_loop": "同じ入力で同じ呼び出しが 3 回繰り返されたときに作動"
         },
         "orderingLocked": "順序が修正されるまで下の編集は一時停止します。ここでの変更がこれらのルールの順序を知らないうちに変えないようにするためです。",
         "legacyRules": "これらのルールは OpenCode 1 の permission と tools の設定に由来し、OpenCode 2 も引き続き読み込みます。ここで次に変更すると、OpenCode 2 の permissions ルールとして書き直されます。",
-        "allToolsResourcesHint": "すべてのツールに対する特定の対象のルール"
+        "allToolsResourcesHint": "すべてのツールに対する特定の対象のルール",
+        "legacyTools": "トップレベルの旧 tools 設定がツールを拒否しています。OpenCode はこれを権限に統合するため、ここに表示されている設定すべての上に適用されます。下のネイティブ JSON で編集するか、自動承認をオンにして削除してください。"
       },
       "behavior": {
         "title": "動作とコンパクション",
@@ -1388,28 +1401,38 @@
           "preserveRecentTokens": "原文のまま残すトークン数",
           "reserved": "予約トークン",
           "maxLines": "ツール出力の行数上限",
-          "maxBytes": "ツール出力のバイト数上限"
+          "maxBytes": "ツール出力のバイト数上限",
+          "tailTurns": "原文のまま残すターン数"
         },
         "hints": {
           "subagentDepth": "サブエージェントを何段までネストできるか（experimental.subagent_depth）。1 ならサブエージェントはさらに別のサブエージェントを起動できません。",
           "preserveRecentTokens": "コンパクション後も原文のまま残す直近ターンのトークン予算（compaction.keep.tokens）。既定値 15000。",
           "reserved": "自動コンパクションの前にコンテキストウィンドウで空けておく領域（compaction.buffer）。トークン数（例: <code>20000</code>）か、ウィンドウに対する割合（<code>1%</code>〜<code>99%</code>、例: <code>20%</code>）で指定します。未設定ならウィンドウの <code>15%</code>（最低 <code>16000</code> トークン）を空けます。",
           "maxLines": "これを超える出力はディスクに書き出され、プレビューだけが残ります。既定 2000。",
-          "maxBytes": "これを超える出力はディスクに書き出され、プレビューだけが残ります。既定 51200。"
+          "maxBytes": "これを超える出力はディスクに書き出され、プレビューだけが残ります。既定 51200。",
+          "tailTurns": "直近いくつのユーザーターンをコンパクションから除外するか。未設定なら下のトークン予算だけが上限になります。"
         },
         "ignoredLegacyKeys": "ファイル内の次の OpenCode 1 の設定は OpenCode 2 では無視されます：{keys}。",
         "removeIgnoredLegacyKeys": "削除",
         "backgroundCompaction": "バックグラウンドコンパクション",
         "backgroundCompactionHint": "実験的機能：コンテキストが上限に近づくとバックグラウンドで要約を作成し、自動コンパクションの待ち時間をなくします。使われなかった要約もトークンを消費します。",
         "todo": "ToDo リストツール",
-        "todoHint": "実験的機能：エージェントに todowrite ツールを与え、Codeg がその計画を ToDo リストとして表示できるようにします。"
+        "todoHint": "実験的機能：エージェントに todowrite ツールを与え、Codeg がその計画を ToDo リストとして表示できるようにします。",
+        "share": "共有",
+        "shareHint": "セッションを共有リンクとして公開できるかどうか。",
+        "shareManual": "手動（必要なときだけ）",
+        "shareAuto": "自動（新しいセッションを常に共有）",
+        "shareDisabled": "無効",
+        "compactionPrune": "古いツール出力を削る",
+        "compactionPruneHint": "コンパクション時に古いツール呼び出しの出力を要約せずに破棄します。"
       },
       "authKindEnv": "環境変数 {name}",
       "envConnectionHint": "環境変数 {name} で接続されています。切断するには、設定している場所でこの変数を削除してください。",
       "keyStored": "キーは OpenCode に保存済み",
       "keyMissing": "キー未保存",
       "setApiKey": "API キーを設定",
-      "credentialsNeedInstall": "OpenCode はプロバイダーのキーを独自の認証情報ストアに保存するため、プロバイダーの接続には OpenCode のインストールが必要です。先に上でインストールしてください。"
+      "credentialsNeedInstall": "OpenCode はプロバイダーのキーを独自の認証情報ストアに保存するため、プロバイダーの接続には OpenCode のインストールが必要です。先に上でインストールしてください。",
+      "addProvider": "プロバイダーを追加"
     },
     "openClaw": {
       "gatewayConfig": "Gateway 設定",
@@ -1531,7 +1554,9 @@
       "rawEditorPlaceholder": "[providers.codeg]\ntype = \"kimi\"\nbase_url = \"https://api.moonshot.cn/v1\"\napi_key = \"sk-...\"",
       "gateNotReady": "Not authenticated yet — save an API key below (or sign in) to open Kimi sessions.",
       "authModeHint": "“API key” writes a codeg-managed config.toml provider and seeds a gate token. “Login” clears that and uses a real `kimi login` session (requires a Kimi subscription).",
-      "rawEditorHint": "Written verbatim (comments preserved) and validated as TOML. codeg also seeds the gate token so the session opens."
+      "rawEditorHint": "Written verbatim (comments preserved) and validated as TOML. codeg also seeds the gate token so the session opens.",
+      "fetchModels": "テストしてモデルを取得",
+      "fetchModelsNeedsKey": "先に API キーとエンドポイントを入力してください"
     },
     "authModeOfficialSubscription": "公式サブスクリプション",
     "authModeCustomEndpoint": "カスタムエンドポイント",
@@ -1592,11 +1617,15 @@
       "providerExists": "Provider {providerId} はすでに存在します",
       "modelIdPattern": "Model ID は英字・数字・アンダースコア・ドット・コロン・ハイフンのみ使用できます",
       "modelExists": "Model {modelId} はすでに存在します",
-      "openCodeConfigUnreadable": "OpenCode の設定ファイルに構文エラーがあります。先にネイティブ JSON エディターで修正してください。"
+      "openCodeConfigUnreadable": "OpenCode の設定ファイルに構文エラーがあります。先にネイティブ JSON エディターで修正してください。",
+      "openCodeAuthMustBeObject": "OpenCode の auth.json はJSONオブジェクトである必要があります",
+      "openCodeAuthInvalid": "OpenCode の auth.json 形式エラー: {message}"
     },
     "warnings": {
       "nativeJsonRecoveredStructured": "ネイティブJSON設定が不正のため、構造化設定にリセットしました",
-      "authRecoveredStructured": "auth.json が不正のため、構造化設定にリセットしました"
+      "authRecoveredStructured": "auth.json が不正のため、構造化設定にリセットしました",
+      "nativeJsonRecoveredOpenCode": "ネイティブJSON設定が不正のため、OpenCode構造化設定にリセットしました",
+      "openCodeAuthRecovered": "OpenCode の auth.json が不正のため、デフォルト設定にリセットしました"
     },
     "toasts": {
       "agentActionCompleted": "{name} の {action} が完了しました",
@@ -1738,7 +1767,20 @@
       "add": "追加",
       "remove": "削除",
       "loadFailed": "OpenCode の設定を読み込めませんでした：{message}",
-      "updateFailed": "OpenCode の設定を更新できませんでした：{message}"
+      "updateFailed": "OpenCode の設定を更新できませんでした：{message}",
+      "status": {
+        "installed": "インストール済み",
+        "missing": "未インストール",
+        "needs_migration": "移行が必要",
+        "path": "パスプラグイン",
+        "path_missing": "パスが見つかりません"
+      },
+      "installAll": "不足プラグインをすべてインストール",
+      "pinVersions": "@latest バージョンを固定",
+      "install": "インストール",
+      "uninstall": "アンインストール",
+      "success": "すべてのプラグインが正常にインストールされました",
+      "failed": "プラグイン操作に失敗しました"
     },
     "pi": {
       "configManagement": "Pi 設定",
@@ -2273,7 +2315,8 @@
       "originalWorkingDir": "元の作業ディレクトリ",
       "cliBadge": "コマンドラインから開始",
       "recentFilterCli": "コマンドライン",
-      "noRecentCli": "コマンドラインからの最近の会話はありません"
+      "noRecentCli": "コマンドラインからの最近の会話はありません",
+      "worktreeRemovedBadge": "元の worktree は削除済み"
     },
     "conversation": {
       "reloadFailed": "会話の再読み込みに失敗しました: {message}",
@@ -3875,7 +3918,13 @@
         "backgroundContinuation": "バックグラウンド継続",
         "loadOlderHistory": "以前のメッセージを読み込む",
         "loadBackgroundActivity": "バックグラウンドの動作を読み込む",
-        "snapshotOmittedToolCalls": "このライブ表示ではツール呼び出しが {count} 件省略されています。保存済みのメッセージで不足分を補います。"
+        "snapshotOmittedToolCalls": "このライブ表示ではツール呼び出しが {count} 件省略されています。保存済みのメッセージで不足分を補います。",
+        "attachedResources": "添付リソース",
+        "error": "エラー: {message}",
+        "duration": "所要時間",
+        "worked": "作業完了",
+        "workedFor": "{duration} 作業しました",
+        "working": "作業中..."
       },
       "liveTurnStats": {
         "thinking": "考え中...",
@@ -3902,8 +3951,14 @@
           "inputAvailable": "実行中",
           "inputStreaming": "保留中",
           "outputAvailable": "完了",
-          "outputError": "エラー"
-        }
+          "outputError": "エラー",
+          "approvalRequested": "承認待ち",
+          "approvalResponded": "応答済み",
+          "outputDenied": "拒否"
+        },
+        "parameters": "パラメーター",
+        "error": "エラー",
+        "result": "結果"
       },
       "delegation": {
         "unknownAgent": "サブエージェント",
@@ -3998,7 +4053,9 @@
           }
         },
         "unknownAssistant": "アシスタント #{id}",
-        "deletedAssistant": "（削除済み）"
+        "deletedAssistant": "（削除済み）",
+        "subAgentRunning": "サブエージェント実行中…",
+        "noDetail": "No detail available yet."
       },
       "contentParts": {
         "offset": "オフセット: {offset}",
@@ -4033,7 +4090,8 @@
             "budgetLimited": "予算制限",
             "complete": "完了",
             "limited": "上限到達"
-          }
+          },
+          "titleWithStatus": "目標 {status}"
         },
         "title": {
           "edit": "編集",
@@ -4082,7 +4140,15 @@
         "backgroundTask": {
           "polledTimes": "{count} 回ポーリング",
           "launchNote": "バックグラウンドで実行中 · {id}",
-          "monitorNote": "バックグラウンドで監視中 · {id}"
+          "monitorNote": "バックグラウンドで監視中 · {id}",
+          "title": "バックグラウンドタスク",
+          "titleWithId": "バックグラウンドタスク · {id}",
+          "running": "実行中",
+          "completed": "完了",
+          "failed": "失敗",
+          "stopped": "停止しました",
+          "exitCode": "終了コード {code}",
+          "runningInBackground": "バックグラウンド"
         },
         "codexScript": {
           "outputMissing": "codex がスクリプト出力を切り詰めた際にこのコマンドの区切り行が失われたため、出力を割り当てられませんでした。",
@@ -4126,6 +4192,72 @@
           "other": "{count} 件のツールを使用",
           "errorSuffix": "{count} 件失敗",
           "joiner": " · "
+        },
+        "unknown": "不明",
+        "inputTruncated": "入力が切り詰められました — diff が不完全な可能性があります。",
+        "replaceAll": "すべて置換",
+        "filesCount": "ファイル: {count}",
+        "update": "更新",
+        "moreFiles": "+{count} 件の追加ファイル",
+        "timeoutMs": "タイムアウト: {timeout}ms",
+        "backgroundTrue": "バックグラウンド: true",
+        "scriptToolCalls": "{count} 個のツールを呼び出し",
+        "limit": "上限: {limit}",
+        "mode": "モード: {mode}",
+        "cell": "セル: {cell}",
+        "pathLabel": "パス:",
+        "globLabel": "Glob パターン:",
+        "typeLabel": "タイプ:",
+        "outputLabel": "出力:",
+        "caseInsensitive": "大文字小文字を区別しない",
+        "multiline": "複数行",
+        "promptLabel": "プロンプト",
+        "subjectLabel": "件名",
+        "taskLabel": "タスク",
+        "nameLabel": "名前:",
+        "agentPromptLabel": "プロンプト",
+        "agentRunning": "実行中...",
+        "agentLiveTranscript": "ライブアクティビティ",
+        "agentSessionAction": "サブエージェントのセッションを表示",
+        "agentSubagentDone": "完了",
+        "agentSubagentInterrupted": "中断",
+        "agentSubagentUnknown": "結果不明",
+        "agentStatsBash": "コマンド",
+        "agentStatsRead": "ファイル読取",
+        "agentStatsSearch": "検索",
+        "agentStatsEdit": "編集",
+        "agentStatsOther": "その他",
+        "field": {
+          "file": "ファイル",
+          "notebook": "ノートブック",
+          "command": "コマンド",
+          "old": "旧",
+          "new": "新",
+          "pattern": "パターン",
+          "path": "パス",
+          "query": "クエリ",
+          "url": "URL:",
+          "description": "説明",
+          "content": "内容",
+          "source": "ソース",
+          "prompt": "プロンプト",
+          "subject": "件名",
+          "taskId": "タスク ID",
+          "status": "状態",
+          "skill": "Skill",
+          "args": "引数",
+          "offset": "オフセット",
+          "limit": "上限",
+          "glob": "Glob パターン",
+          "type": "タイプ",
+          "output": "出力",
+          "replaceAll": "すべて置換",
+          "language": "言語",
+          "timeout": "タイムアウト",
+          "background": "バックグラウンド",
+          "agentType": "エージェント種別",
+          "library": "ライブラリ",
+          "libraryId": "ライブラリ ID"
         }
       },
       "messageNav": {
@@ -4141,7 +4273,10 @@
         "currentMessage": "現在のメッセージ",
         "scrollToCurrent": "現在のメッセージ（#{ordinal}）へスクロール",
         "running": "実行中",
-        "total": "全 {count} 件"
+        "total": "全 {count} 件",
+        "collapsedSummary": "メッセージ {count}",
+        "remove": "削除",
+        "noDiffDataAvailable": "{filePath} の差分データがありません"
       },
       "replyArtifacts": {
         "title": "変更されたファイル",
@@ -4264,7 +4399,9 @@
       },
       "feedbackCheckResult": {
         "count": "フィードバック {count} 件",
-        "errorTitle": "フィードバックの確認に失敗しました"
+        "errorTitle": "フィードバックの確認に失敗しました",
+        "expand": "すべてのフィードバックを表示",
+        "collapse": "折りたたむ"
       },
       "codegMcpTool": {
         "getSessionInfo": "セッション {session} を読み取り中",
@@ -4346,7 +4483,16 @@
         "opWait": "サブエージェントの結果を取得中",
         "opClose": "サブエージェントを終了中",
         "opResume": "サブエージェントを再開中",
-        "opList": "サブエージェント一覧"
+        "opList": "サブエージェント一覧",
+        "errorTitle": "サブエージェントのタスクが失敗しました",
+        "statesLabel": "サブエージェント",
+        "statusRunning": "実行中",
+        "statusCompleted": "完了",
+        "statusFailed": "失敗",
+        "statusPending": "起動中",
+        "statusInterrupted": "中断",
+        "statusClosed": "終了",
+        "statusNotFound": "見つかりません"
       },
       "contextCompaction": {
         "compacting": "コンテキストを圧縮しています…",
@@ -4767,6 +4913,11 @@
       "terminal": {
         "title": "ターミナル",
         "running": "実行中"
+      },
+      "toolCallBlock": {
+        "tool": "ツール",
+        "error": "エラー",
+        "result": "結果"
       }
     },
     "diffPreview": {
@@ -7048,7 +7199,8 @@
         "config_changed": "保存中に Codex の設定が別の場所で変更されました。もう一度お試しください。",
         "database": "設定を読み込めませんでした：{message}"
       }
-    }
+    },
+    "officialsTitle": "公式モデル"
   },
   "DeepSeekModelEditor": {
     "title": "モデル一覧",

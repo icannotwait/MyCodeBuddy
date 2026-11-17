@@ -2487,14 +2487,6 @@ function extractCodexTomlImportantValues(
       if (assignment.key === "model_reasoning_effort") {
         continue
       }
-      if (
-        !currentProviderSection &&
-        !inFeaturesSection &&
-        assignment.key === "service_tier"
-      ) {
-        serviceTierFast = assignment.value.toLowerCase() === "fast"
-        continue
-      }
     }
 
     const boolAssignment = parseTomlBooleanAssignment(rawLine)
@@ -8505,7 +8497,6 @@ export function AcpAgentSettings() {
         codexProviderOptions: synced.providerOptions,
         codexSupportsWebsockets: synced.supportsWebsockets,
         codexDefaultModeRequestUserInput: synced.defaultModeRequestUserInput,
-        codexServiceTierFast: synced.serviceTierFast,
         codexConfigTomlText: nextToml,
       }))
     },
@@ -8523,39 +8514,6 @@ export function AcpAgentSettings() {
       updateSelectedDraft((current) => ({
         ...current,
         envText: patchCodexCliRuntimeEnv(current.envText, enabled),
-      }))
-    },
-    [selectedAgent, selectedDraft, updateSelectedDraft]
-  )
-
-  const handleCodexServiceTierFastChange = useCallback(
-    (enabled: boolean) => {
-      if (
-        !selectedAgent ||
-        !selectedDraft ||
-        selectedAgent.agent_type !== "codex"
-      )
-        return
-      const nextToml = patchCodexConfigTomlText(
-        selectedDraft.codexConfigTomlText,
-        { serviceTierFast: enabled }
-      )
-      const synced = extractCodexImportantValues(
-        selectedDraft.codexAuthJsonText,
-        nextToml
-      )
-      updateSelectedDraft((current) => ({
-        ...current,
-        apiBaseUrl: synced.apiBaseUrl,
-        apiKey: synced.apiKey ?? current.apiKey,
-        model: synced.model,
-        codexModelProvider: synced.modelProvider,
-        codexProviderOptions: synced.providerOptions,
-        codexSupportsWebsockets: synced.supportsWebsockets,
-        codexSkills: synced.skills,
-        codexDefaultModeRequestUserInput: synced.defaultModeRequestUserInput,
-        codexServiceTierFast: synced.serviceTierFast,
-        codexConfigTomlText: nextToml,
       }))
     },
     [selectedAgent, selectedDraft, updateSelectedDraft]
