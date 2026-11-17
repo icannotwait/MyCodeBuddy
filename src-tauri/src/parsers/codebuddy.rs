@@ -143,13 +143,24 @@ impl CodeBuddyParser {
                     // the two paths MUST agree or the auto-title backfill would
                     // oscillate between them.
                     "user" if !is_injected_user_record(&value) => {
-                        let text = collect_text(&value, "input_text");
-                        let Some(visible) = visible_user_text(&text) else {
+                        let shown = shown_user_text(collect_text(&value, "input_text"));
+                        let has_image = value
+                            .get("content")
+                            .and_then(|content| content.as_array())
+                            .is_some_and(|items| {
+                                items.iter().any(|item| {
+                                    item.get("type").and_then(Value::as_str)
+                                        == Some("image_blob_ref")
+                                })
+                            });
+                        // An image-only prompt has no visible text and still
+                        // counts, matching `parse_detail`.
+                        if shown.trim().is_empty() && !has_image {
                             continue;
-                        };
+                        }
                         message_count += 1;
-                        if first_user_text.is_none() && !visible.trim().is_empty() {
-                            first_user_text = Some(title_from_user_text(visible.trim()));
+                        if first_user_text.is_none() && !shown.trim().is_empty() {
+                            first_user_text = Some(title_from_user_text(shown.trim()));
                         }
                     }
                     "assistant" => message_count += 1,

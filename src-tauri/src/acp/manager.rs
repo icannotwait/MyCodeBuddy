@@ -1242,6 +1242,12 @@ pub struct ConnectionManager {
     admission_insert_hold: Arc<std::sync::Mutex<Option<AdmissionInsertHold>>>,
     #[cfg(test)]
     stub_direct_spawn: Arc<std::sync::atomic::AtomicBool>,
+    /// Test-only: `spawn_agent` returns once the process is registered, while
+    /// initialize is still in flight. Production waits for the bootstrap
+    /// outcome so route fallback and option probes still see a finished
+    /// handshake.
+    #[cfg(test)]
+    return_before_bootstrap: Arc<std::sync::atomic::AtomicBool>,
     /// Conversations a user moved to another folder during this process's
     /// life (root and the delegation children that moved with it).
     ///
@@ -1526,6 +1532,8 @@ impl ConnectionManager {
             admission_insert_hold: Arc::new(std::sync::Mutex::new(None)),
             #[cfg(test)]
             stub_direct_spawn: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            #[cfg(test)]
+            return_before_bootstrap: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             relocated: Arc::new(std::sync::Mutex::new(Default::default())),
         }
     }
@@ -1586,6 +1594,8 @@ impl ConnectionManager {
             admission_insert_hold: self.admission_insert_hold.clone(),
             #[cfg(test)]
             stub_direct_spawn: self.stub_direct_spawn.clone(),
+            #[cfg(test)]
+            return_before_bootstrap: self.return_before_bootstrap.clone(),
             relocated: self.relocated.clone(),
         }
     }
@@ -4204,6 +4214,21 @@ impl ConnectionManager {
                     RouteReuseDecision::Conflict {
                         existing_connection_id,
                     } => {
+                        // A resume onto a connection someone is already driving
+                        // keeps that live process. The launch snapshot stays
+                        // the one it started with; a freshly loaded child plan
+                        // must not turn the reuse into a route conflict.
+                        if parent_connection_id.is_some() {
+                            tracing::info!(
+                                "[ACP] reusing live connection id={} for parent resume \
+                                 despite route fingerprint drift",
+                                existing_connection_id
+                            );
+                            return Ok(SpawnOutcome {
+                                connection_id: existing_connection_id,
+                                reused: true,
+                            });
+                        }
                         tracing::info!(
                             "[ACP] session route conflict existing={} requested_fp={}",
                             existing_connection_id,
@@ -4396,6 +4421,14 @@ impl ConnectionManager {
                     }
                 }
             } else {
+                #[cfg(test)]
+                if self
+                    .return_before_bootstrap
+                    .load(std::sync::atomic::Ordering::SeqCst)
+                {
+                    drop(route_bootstrap_rx);
+                    break connection_id;
+                }
                 route_bootstrap_rx.await
             };
 
@@ -9776,6 +9809,12 @@ impl ConnectionManager {
     }
 
     #[cfg(test)]
+    pub fn return_before_bootstrap_for_test(&self) {
+        self.return_before_bootstrap
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    #[cfg(test)]
     async fn hold_after_admission_for_test(&self) {
         let hook = self
             .admission_insert_hold
@@ -15005,6 +15044,42 @@ mod tests {
 
     #[tokio::test]
     async fn shared_replacement_map_and_state_incarnations_match_on_first_exposure() {
+        use crate::acp::custom_registry::{
+            hydrate, hydrate_test_guard, BinaryPlatformSpec, CustomAgentDef, CustomAgentSpec,
+            CustomDistributionKind,
+        };
+
+        // The replacement is a real custom binary. An unregistered id fails
+        // in `build_agent` before the attempt is inserted in the map.
+        let _registry = hydrate_test_guard();
+        let def = CustomAgentDef {
+            registry_id: "missing-replacement-fence".into(),
+            name: "Missing replacement fence".into(),
+            description: String::new(),
+            version: "1.0.0".into(),
+            distribution_kind: CustomDistributionKind::Binary,
+            spec: CustomAgentSpec {
+                binary: BTreeMap::from([(
+                    crate::acp::registry::current_platform().to_string(),
+                    BinaryPlatformSpec {
+                        archive: "https://example.invalid/missing-replacement-fence.tar.gz".into(),
+                        cmd: "true".into(),
+                        args: Vec::new(),
+                        env: BTreeMap::new(),
+                        sha256: None,
+                    },
+                )]),
+                ..Default::default()
+            },
+            icon_url: None,
+            skills_shared_store: false,
+            skills_dir: None,
+            source: Default::default(),
+            version_probe: None,
+            supports_mcp: true,
+        };
+        assert!(hydrate(std::slice::from_ref(&def)).is_empty());
+
         let manager = ConnectionManager::new();
         let agent_type =
             AgentType::custom("missing-replacement-fence").expect("valid custom agent id");
@@ -15106,6 +15181,7 @@ mod tests {
             .teardown_unexposed_attempt(&reservation.attachment.connection_id)
             .await
             .unwrap();
+        assert!(hydrate(&[]).is_empty());
     }
 
     #[tokio::test]
@@ -16614,6 +16690,9 @@ mod tests {
         let agent_type = AgentType::custom("never-answers").unwrap();
 
         let mgr = ConnectionManager::new();
+        // The handshake never completes. Return the id once the process is
+        // registered so disconnect can stop it during initialize.
+        mgr.return_before_bootstrap_for_test();
         let dir = tempfile::tempdir().expect("tempdir");
         let id = mgr
             .spawn_agent(

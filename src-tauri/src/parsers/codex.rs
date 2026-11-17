@@ -12384,7 +12384,11 @@ earlier terminal context records.\n\
                 }),
             ),
         ];
-        let detail = parse_rollout("mcp-screenshot", &lines.join("\n"), "session-1");
+        // Rollout files end with a newline. Without it the last record, the
+        // function output that carries the screenshot, is not a complete line.
+        let mut body = lines.join("\n");
+        body.push('\n');
+        let detail = parse_rollout("mcp-screenshot", &body, "session-1");
         let results: Vec<_> = detail
             .turns
             .iter()

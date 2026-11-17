@@ -771,11 +771,16 @@ impl TerminalRuntime {
         // family rather than "did the user configure something" means picking
         // `/bin/sh` explicitly behaves exactly like leaving the setting on its
         // default, which is the only defensible reading of that choice.
-        let fallback_shell = self
-            .default_shell
-            .snapshot()
-            .await
-            .unwrap_or_else(default_platform_shell);
+        let fallback_shell = match self.default_shell.snapshot().await {
+            Some(shell) => shell,
+            // No live settings shell: shell lines use this connection's
+            // launch snapshot, not a hardcoded platform shell.
+            None => self
+                .terminal_shell
+                .executable
+                .to_string_lossy()
+                .into_owned(),
+        };
         // A structured ACP request normally names an executable plus argv, so
         // preserve direct execution for it. Reconstructing argv as shell text
         // needs shell-specific quoting, so argful requests never fall back.
@@ -1105,27 +1110,8 @@ async fn kill_released(removed: Vec<Arc<TerminalInstance>>) {
     .await;
 }
 
-#[cfg(not(windows))]
-fn default_platform_shell() -> String {
-    "/bin/sh".to_string()
-}
-
-#[cfg(windows)]
-fn default_platform_shell() -> String {
-    default_windows_platform_shell(std::env::var("COMSPEC").ok())
-}
-
-#[cfg(windows)]
-fn default_windows_platform_shell(comspec: Option<String>) -> String {
-    comspec
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
-        .unwrap_or_else(|| "cmd.exe".to_string())
-}
-
-/// Wrap a command line through the configured shell, or the legacy platform
-/// shell when no preference has been selected. The agent's line is always a
-/// single argv element, never concatenated into a larger script.
+/// Wrap a command line through the configured shell. The agent's line is
+/// always a single argv element, never concatenated into a larger script.
 fn shell_wrapped_command(shell: &str, line: &str) -> tokio::process::Command {
     let mut command = crate::process::tokio_command(shell);
 

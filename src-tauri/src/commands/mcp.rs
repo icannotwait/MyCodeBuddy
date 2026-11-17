@@ -3627,7 +3627,9 @@ pub fn agent_native_mcp_server_names(
 ) -> BTreeSet<String> {
     use crate::models::agent::AgentType;
     match agent_type {
-        AgentType::Pi => BTreeSet::new(),
+        // MiniMax's overlay file is codeg's wire store, not a CLI auto-load.
+        // Names in it still go out on `session/new.mcpServers`.
+        AgentType::Pi | AgentType::MiniMaxCode => BTreeSet::new(),
         AgentType::CodeBuddy => read_json_mcp_server_ids(&codebuddy_cli_mcp_json_path()),
         other => match read_servers_for_agent_type(other) {
             Ok(map) => map.into_keys().collect(),

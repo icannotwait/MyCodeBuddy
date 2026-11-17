@@ -1763,6 +1763,8 @@ impl SessionState {
             || title.is_some_and(extract::mentions_office_extension)
             || locations.is_some_and(|l| extract::mentions_office_extension(&l.to_string()));
         let assembled = just_settled.then(|| entry.raw_input.buffer.clone());
+        // A successful parse clears the raw buffer, so an extension split
+        // across streamed chunks is only visible on the parsed input.
         let settled_mentions = assembled.as_deref().is_some_and(|joined| {
             extract::mentions_office_extension(joined)
                 || extract::mentions_office_extension(&entry.label)
@@ -1770,7 +1772,11 @@ impl SessionState {
                     .locations
                     .as_ref()
                     .is_some_and(|l| extract::mentions_office_extension(&l.to_string()))
-        });
+        }) || (just_settled
+            && entry
+                .input
+                .as_ref()
+                .is_some_and(|value| extract::mentions_office_extension(&value.to_string())));
         if event_mentions || settled_mentions {
             let unparsed;
             let input = match (&entry.input, assembled) {

@@ -4992,28 +4992,16 @@ async fn drain_permissions_on_stop_then_emit<R: PermissionResponder>(
     emit_with_state(state, emitter, follow_up).await;
 }
 
-/// Shared body of the drains above. Emits the compensating
-/// `PermissionResolved` for whatever was on screen; queued cards were never
-/// published, so they need none.
+/// Shared body of the drains above. A published plan-review seed is failed
+/// before the visible card is retracted, so the terminal tool update is
+/// already in the event log when `PermissionResolved` arrives. Queued cards
+/// were never published, so they need no resolve event.
 async fn drain_permissions_locked<R: PermissionResponder>(
     queue: &mut PermissionQueue<R>,
     state: &Arc<RwLock<SessionState>>,
     emitter: &EventEmitter,
 ) {
     let drained = queue.drain();
-    if let Some(request_id) = drained.visible_request_id.as_ref() {
-        tracing::info!("[ACP] permission {request_id} cancelled by drain");
-        emit_with_state(
-            state,
-            emitter,
-            AcpEvent::PermissionResolved {
-                request_id: request_id.clone(),
-                option_id: None,
-                origin: None,
-            },
-        )
-        .await;
-    }
     let mut unsettled_plan_reviews = {
         let state = state.read().await;
         drained
@@ -5050,6 +5038,19 @@ async fn drain_permissions_locked<R: PermissionResponder>(
                 locations: None,
                 meta: None,
                 images: None,
+            },
+        )
+        .await;
+    }
+    if let Some(request_id) = drained.visible_request_id.as_ref() {
+        tracing::info!("[ACP] permission {request_id} cancelled by drain");
+        emit_with_state(
+            state,
+            emitter,
+            AcpEvent::PermissionResolved {
+                request_id: request_id.clone(),
+                option_id: None,
+                origin: None,
             },
         )
         .await;
@@ -19578,6 +19579,10 @@ async fn run_conversation_loop(
     // barrier has passed (see `CODEBUDDY_CANCEL_BARRIER`).
     let mut codebuddy_cancel: Option<CodeBuddyCancel> = None;
     let mut held_codebuddy: Option<HeldPrompt> = None;
+    // A Stop that lands while that prompt is held, or while it is still queued
+    // behind the barrier, must stop the prompt itself. Sending `session/cancel`
+    // to the idle session would consume the Stop and let the prompt run.
+    let mut cancel_released_prompt = false;
     loop {
         // Wait for either a user command or a session update (e.g. available_commands_update)
         let input = loop {
@@ -20492,7 +20497,13 @@ async fn run_conversation_loop(
                             disconnect_requested = true;
                             break;
                         }
-                        control = control_rx.recv(), if !control_lane_closed => {
+                        control = async {
+                            if std::mem::replace(&mut cancel_released_prompt, false) {
+                                Some(ConnectionControl::Cancel)
+                            } else {
+                                control_rx.recv().await
+                            }
+                        }, if !control_lane_closed => {
                             match control {
                                 Some(ConnectionControl::SuspendForDelegation {
                                     continuation_id,
@@ -21320,6 +21331,12 @@ async fn run_conversation_loop(
                 let _ = reply.send(Err(AcpError::NoActiveTurn));
             }
             ConversationInput::Control(ConnectionControl::Cancel) => {
+                // The next CodeBuddy prompt is waiting out the cancel barrier,
+                // or is about to be. Hold the Stop for that prompt.
+                if held_codebuddy.is_some() || codebuddy_cancel.is_some() {
+                    cancel_released_prompt = true;
+                    continue;
+                }
                 let held_generation = match held_prompt.take() {
                     Some(ConnectionCommand::Prompt {
                         turn_generation, ..
@@ -59402,6 +59419,13 @@ mod tests {
         );
         let mut servers: Vec<McpServer> = Vec::new();
         let plan = native_plan(AgentType::Codex);
+        // `submit_result` still needs a companion binary on disk. CI and this
+        // crate's tests point it at the test executable, the same stand-in the
+        // sibling injection test uses.
+        let prior_binary = std::env::var_os("CODEG_MCP_BIN");
+        unsafe {
+            std::env::set_var("CODEG_MCP_BIN", std::env::current_exe().unwrap());
+        }
         let (injected, _) = inject_codeg_mcp(
             &mut servers,
             &injection,
@@ -59431,6 +59455,12 @@ mod tests {
             .map(|i| server.args[i + 1].clone());
         assert_eq!(features.as_deref(), Some("result"));
         assert!(injection.tokens.lookup(&injected.token).await.is_some());
+        unsafe {
+            match prior_binary {
+                Some(value) => std::env::set_var("CODEG_MCP_BIN", value),
+                None => std::env::remove_var("CODEG_MCP_BIN"),
+            }
+        }
     }
 
     #[test]
