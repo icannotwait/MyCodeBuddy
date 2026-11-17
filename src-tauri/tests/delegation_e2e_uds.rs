@@ -884,11 +884,14 @@ async fn end_to_end_uds_assistant_delegation() {
     );
 
     // tools/call naming the assistant (the host also passed a stray agent).
+    // A host tool id is authoritative, so the call does not also need a
+    // correlation_id. Without either, the listener refuses before spawn.
     let call = json!({
         "jsonrpc": "2.0", "id": 2, "method": "tools/call",
         "params": {
             "name": "delegate_to_agent",
-            "arguments": {"assistant_id": 3, "agent_type": "claude_code", "task": "review the diff"}
+            "arguments": {"assistant_id": 3, "agent_type": "claude_code", "task": "review the diff"},
+            "_meta": {"tool_use_id": "pt-assistant"}
         }
     })
     .to_string();
@@ -898,7 +901,7 @@ async fn end_to_end_uds_assistant_delegation() {
     let result = spawned.future.await.response.unwrap().result.unwrap();
     listener_task.abort();
     let report = &result["structuredContent"];
-    assert_eq!(report["status"], "running");
+    assert_eq!(report["status"], "running", "{report}");
     assert_eq!(report["agent_type"], "codex");
     assert_eq!(report["assistant_id"], 3);
     assert_eq!(report["assistant_name"], "Reviewer");
