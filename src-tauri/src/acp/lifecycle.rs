@@ -6936,7 +6936,11 @@ mod tests {
             "the late lifecycle write was skipped"
         );
 
-        // The next turn is the worker's again, retries included.
+        // The next turn has started, so the row is in progress again. A
+        // delayed end_turn must not itself reopen a user-completed row.
+        conversation_service::update_status(&db.conn, conv.id, ConversationStatus::InProgress)
+            .await
+            .unwrap();
         handle_event(&db.conn, &mgr, &turn(9), None).await.unwrap();
         assert_eq!(
             read_row_status(&db, conv.id).await,

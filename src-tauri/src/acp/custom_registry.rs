@@ -728,6 +728,11 @@ fn fingerprint(def: &CustomAgentDef) -> String {
 /// other custom agent (or app startup). Returns the errors for callers that
 /// want to surface them.
 pub fn hydrate(defs: &[CustomAgentDef]) -> Vec<(String, CustomAgentError)> {
+    // Tests share one process-global map. Taking the guard here covers
+    // startup hydration, which replaces the map from an empty database and
+    // would otherwise wipe a fixture another test is launching.
+    #[cfg(test)]
+    let _hydrate_guard = hydrate_test_guard();
     let mut errors = Vec::new();
     let mut next: HashMap<&'static str, Entry> = HashMap::new();
     let previous = registry().read().unwrap_or_else(|e| e.into_inner());
@@ -916,18 +921,69 @@ pub fn all() -> Vec<AgentType> {
 /// two tests publishing different registries — or one calling `hydrate(&[])` to
 /// clean up — would otherwise clobber each other. Lives outside the test module
 /// because tests in other modules (e.g. chat-command agent parsing) need the
-/// same lock. Tests that only READ a uniquely-named id need no guard.
+/// same lock. The guard is reentrant on the calling thread: [`hydrate`] takes
+/// it itself, and a test that already holds it can still publish.
+/// Tests that only READ a uniquely-named id need no guard.
 #[cfg(test)]
-pub fn hydrate_test_guard() -> std::sync::MutexGuard<'static, ()> {
-    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-    LOCK.lock().unwrap_or_else(|e| e.into_inner())
+pub fn hydrate_test_guard() -> HydrateTestGuard {
+    hydrate_lock::enter()
+}
+
+/// RAII owner for [`hydrate_test_guard`]. Dropping the last guard on a thread
+/// releases the process-wide lock.
+#[cfg(test)]
+pub struct HydrateTestGuard;
+
+#[cfg(test)]
+impl Drop for HydrateTestGuard {
+    fn drop(&mut self) {
+        hydrate_lock::exit();
+    }
+}
+
+#[cfg(test)]
+mod hydrate_lock {
+    use std::cell::{Cell, RefCell};
+    use std::sync::{Mutex, MutexGuard};
+
+    use super::HydrateTestGuard;
+
+    static LOCK: Mutex<()> = Mutex::new(());
+
+    thread_local! {
+        static DEPTH: Cell<usize> = const { Cell::new(0) };
+        static HELD: RefCell<Option<MutexGuard<'static, ()>>> = const { RefCell::new(None) };
+    }
+
+    pub(super) fn enter() -> HydrateTestGuard {
+        DEPTH.with(|depth| {
+            if depth.get() == 0 {
+                let guard = LOCK.lock().unwrap_or_else(|error| error.into_inner());
+                HELD.with(|held| *held.borrow_mut() = Some(guard));
+            }
+            depth.set(depth.get() + 1);
+        });
+        HydrateTestGuard
+    }
+
+    pub(super) fn exit() {
+        DEPTH.with(|depth| {
+            let next = depth.get().saturating_sub(1);
+            depth.set(next);
+            if next == 0 {
+                HELD.with(|held| {
+                    held.borrow_mut().take();
+                });
+            }
+        });
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn hydrate_guard() -> std::sync::MutexGuard<'static, ()> {
+    fn hydrate_guard() -> HydrateTestGuard {
         hydrate_test_guard()
     }
 

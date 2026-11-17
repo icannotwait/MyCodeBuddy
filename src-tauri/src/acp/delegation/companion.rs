@@ -2067,40 +2067,34 @@ pub async fn dispatch_line(
                     if !ctx.features.coordination_v1 {
                         for tool in &mut filtered {
                             let name = tool.get("name").and_then(Value::as_str).unwrap_or("");
-                            match name {
-                                // delegate_to_agent keeps the embedded description
-                                // until the assistant probe. A parent that predates
-                                // assistants must see that schema unchanged; the
-                                // pre-Join text is applied only when the probe
-                                // does not say unsupported.
-                                "get_delegation_status" => {
-                                    if let Some(obj) = tool.as_object_mut() {
-                                        obj.insert(
-                                            "description".into(),
-                                            Value::String(LEGACY_STATUS_DESCRIPTION.into()),
-                                        );
-                                        if let Some(props) = obj
-                                            .get_mut("inputSchema")
-                                            .and_then(|s| s.get_mut("properties"))
-                                            .and_then(Value::as_object_mut)
+                            // delegate_to_agent keeps the embedded description
+                            // until the assistant probe. A parent that predates
+                            // assistants must see that schema unchanged; the
+                            // pre-Join text is applied only when the probe
+                            // does not say unsupported.
+                            if name == "get_delegation_status" {
+                                if let Some(obj) = tool.as_object_mut() {
+                                    obj.insert(
+                                        "description".into(),
+                                        Value::String(LEGACY_STATUS_DESCRIPTION.into()),
+                                    );
+                                    if let Some(props) = obj
+                                        .get_mut("inputSchema")
+                                        .and_then(|s| s.get_mut("properties"))
+                                        .and_then(Value::as_object_mut)
+                                    {
+                                        props.remove("return_when");
+                                        if let Some(wait_ms) =
+                                            props.get_mut("wait_ms").and_then(Value::as_object_mut)
                                         {
-                                            props.remove("return_when");
-                                            if let Some(wait_ms) = props
-                                                .get_mut("wait_ms")
-                                                .and_then(Value::as_object_mut)
-                                            {
-                                                wait_ms.remove("maximum");
-                                                wait_ms.insert(
-                                                    "description".into(),
-                                                    Value::String(
-                                                        LEGACY_WAIT_MS_DESCRIPTION.into(),
-                                                    ),
-                                                );
-                                            }
+                                            wait_ms.remove("maximum");
+                                            wait_ms.insert(
+                                                "description".into(),
+                                                Value::String(LEGACY_WAIT_MS_DESCRIPTION.into()),
+                                            );
                                         }
                                     }
                                 }
-                                _ => {}
                             }
                         }
                     }
