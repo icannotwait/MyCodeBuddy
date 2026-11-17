@@ -2844,18 +2844,12 @@ mod tests {
         );
     }
 
-    /// macOS holds what a person grants the server — Full Disk Access and the
-    /// other privacy permissions — to the designated requirement of the
-    /// executable at the path it was granted to, and an update puts another
-    /// build at that path. Ad-hoc signed, the requirement is the build's own
-    /// cdhash, so every update took the grant back (#1035). The release signs
-    /// the server's macOS executables with its Developer ID under fixed
-    /// identifiers — before they are archived, as the update installs the
-    /// archive — and leaves the computer-use helper out: one carrying a Team
-    /// ID without codeg's designated requirement compiled in refuses to
-    /// start, and the server build pins none.
+    /// This fork does not Apple-sign the server binaries. macOS privacy grants
+    /// stay with the ad-hoc identity, and the release workflow is not restored
+    /// to upstream's Developer ID step. Self-update still checks a signature:
+    /// each archive is signed with the Tauri minisign key after it is packed.
     #[test]
-    fn the_release_signs_the_macos_server_with_its_developer_id_before_archiving_it() {
+    fn the_release_signs_server_archives_with_the_tauri_key_and_does_not_apple_sign() {
         fn run_of(step: &serde_yaml::Value) -> &str {
             step["run"].as_str().unwrap_or_default()
         }
@@ -2871,42 +2865,42 @@ mod tests {
             .as_sequence()
             .expect("the build-server job's steps");
 
-        let sign = steps
-            .iter()
-            .position(|step| {
-                let run = run_of(step);
-                run.contains("codesign") && run.contains("--sign \"$APPLE_SIGNING_IDENTITY\"")
-            })
-            .expect("build-server signs nothing with the Developer ID");
-        let script = run_of(&steps[sign]);
-        assert_eq!(
-            steps[sign]["if"].as_str(),
-            Some("contains(matrix.target, 'apple-darwin')"),
-            "the signing step runs for the macOS targets"
-        );
-        for flag in ["--identifier \"$bin\"", "--options runtime", "--timestamp"] {
-            assert!(script.contains(flag), "codesign is not given {flag}");
-        }
-        let signed: Vec<&str> = script
-            .lines()
-            .find_map(|line| line.trim().strip_prefix("for bin in "))
-            .expect("the loop over the executables to sign")
-            .trim_end_matches("; do")
-            .split_whitespace()
-            .collect();
-        assert_eq!(signed, ["codeg-server", "codeg-mcp", "codeg-cli"]);
         assert!(
-            !script.contains("codeg-computer-helper"),
-            "the helper refuses to start with a Team ID and no peer requirement"
+            steps.iter().all(|step| {
+                let run = run_of(step);
+                !run.contains("codesign") && !run.contains("APPLE_SIGNING_IDENTITY")
+            }),
+            "build-server must not Apple-sign executables"
         );
 
         let archive = steps
             .iter()
-            .position(|step| run_of(step).contains("tar czf ${{ matrix.artifact }}.tar.gz"))
+            .position(|step| run_of(step).contains("tar czf \"${{ matrix.artifact }}.tar.gz\""))
             .expect("build-server makes no .tar.gz release archive");
+        let sign_unix = steps
+            .iter()
+            .position(|step| {
+                run_of(step).contains("pnpm tauri signer sign") && run_of(step).contains(".tar.gz")
+            })
+            .expect("unix archives are not signed with the tauri key");
         assert!(
-            sign < archive,
-            "the executables are signed after they went into the archive"
+            archive < sign_unix,
+            "the unix archive is signed before it is packed"
+        );
+
+        let zip = steps
+            .iter()
+            .position(|step| run_of(step).contains("Compress-Archive"))
+            .expect("build-server makes no Windows zip");
+        let sign_windows = steps
+            .iter()
+            .position(|step| {
+                run_of(step).contains("pnpm tauri signer sign") && run_of(step).contains(".zip")
+            })
+            .expect("windows archives are not signed with the tauri key");
+        assert!(
+            zip < sign_windows,
+            "the windows archive is signed before it is packed"
         );
     }
 }

@@ -2869,6 +2869,12 @@ export const ConversationSessionSurface = memo(
         sessionFailures={conn.sessionFailures}
         snapshotTruncation={conn.snapshotTruncation}
         onSessionFailureDismiss={handleSessionFailureDismiss}
+        asyncTasks={conn.asyncTasks}
+        onStopAsyncTask={
+          conn.connectionId !== null && !conn.isViewer && !interactionLocked
+            ? handleStopAsyncTask
+            : undefined
+        }
         pendingPermission={conn.pendingPermission}
         pendingQuestion={conn.pendingQuestion}
         pendingAskQuestion={conn.pendingAskQuestion}

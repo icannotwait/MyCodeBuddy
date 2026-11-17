@@ -36261,15 +36261,29 @@ mod tests {
         let emitter = Arc::new(MockEventEmitter::new());
         let broker = broker_with_emitter(mock.clone(), writer.clone(), emitter.clone()).await;
 
+        // An empty host id fails closed (`delegation_correlation_missing`) and
+        // never parks a call. The synthetic placeholder is the `delegation-`
+        // prefix: no card events, but the parent still hears child-running.
         let driver = {
             let broker = broker.clone();
-            tokio::spawn(async move { broker.handle_request(request(1, "")).await })
+            tokio::spawn(async move {
+                broker
+                    .handle_request(request(1, "delegation-synth-life"))
+                    .await
+            })
         };
-        let call_id = loop {
-            if let Some(id) = broker.peek_first_pending_call_id().await {
-                break id;
+        let call_id = {
+            let waited = std::time::Instant::now();
+            loop {
+                if let Some(id) = broker.peek_first_pending_call_id().await {
+                    break id;
+                }
+                assert!(
+                    waited.elapsed() < Duration::from_secs(5),
+                    "synthetic parent tool id never parked a call"
+                );
+                tokio::time::sleep(Duration::from_millis(5)).await;
             }
-            tokio::time::sleep(Duration::from_millis(5)).await;
         };
         assert_eq!(
             emitter.child_running_snapshot().await,

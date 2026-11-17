@@ -1571,9 +1571,13 @@ describe("opencode code-mode execute payloads", () => {
     expect(isCodeModeDelegationInput(interp)).toBe(true)
     expect(parseInput(interp)).toEqual({
       agentType: "zcode",
+      profileLabel: null,
       assistantId: null,
       task: null,
       workingDir: null,
+      workUnitKey: null,
+      targetTaskId: null,
+      replacesTaskId: null,
     })
 
     // An escape outside the minimal set bails the same way.

@@ -12,6 +12,7 @@ import type {
   PromptInputBlock,
   QuestionAnswer,
   SessionConfigOptionInfo,
+  AsyncTaskRecord,
   SessionFailureRecord,
   SnapshotTruncation,
   SessionModeInfo,
@@ -57,6 +58,11 @@ interface ConversationShellProps {
    *  dock draws only the in-flight retry incidents. Omit/empty renders
    *  nothing. */
   sessionFailures?: SessionFailureRecord[]
+  /** Background tasks and the owner stop handler. The running row is
+   *  MessageListView's live activity; the session and canvas surfaces also
+   *  pass these into the shell. */
+  asyncTasks?: AsyncTaskRecord[]
+  onStopAsyncTask?: (taskId: string) => Promise<boolean>
   /** Bounded-snapshot omission counts. Persistent status copy above the
    *  transcript — not a toast and not a refetch. `null` when the snapshot
    *  reported no omission. */

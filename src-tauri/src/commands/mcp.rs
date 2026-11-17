@@ -9332,7 +9332,7 @@ mod tests {
             ALL_MCP_APPS.len(),
             "ALL_MCP_APPS must not repeat an app"
         );
-        assert_eq!(ALL_MCP_APPS.len(), 14);
+        assert_eq!(ALL_MCP_APPS.len(), 19);
 
         // Every app the scan can ATTRIBUTE a server to must also be one the
         // write paths can reach; otherwise the UI shows an assignment codeg can

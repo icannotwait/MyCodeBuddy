@@ -2282,11 +2282,10 @@ export function buildStreamingTurnsFromLiveMessage(
   options?: {
     agentType?: AgentType | null
     /**
-     * When false (the COMPLETE_TURN promotion path), parented subagent
-     * text/thinking is still routed OUT of the main thread but no
-     * `agent_transcript` is attached — the transcript is transient live-only
-     * data and must not survive into promoted `localTurns` (the authoritative
-     * detail reload that replaces them has no counterpart for it).
+     * When false, parented subagent text/thinking is still routed out of the
+     * main thread but no `agent_transcript` is attached. COMPLETE_TURN
+     * promotion passes true: the settled card keeps the interleaved order it
+     * showed live until history reload supplies `agent_stats.timeline`.
      */
     attachAgentTranscripts?: boolean
   }
@@ -4094,15 +4093,14 @@ function reducer(
           : current.liveMessage
 
       // Convert liveMessage to completed MessageTurns (split into rounds).
-      // Parent transcripts stay live-only on promotion (`attachAgentTranscripts`
-      // false): the settled card keeps native activities, and the authoritative
-      // detail reload supplies `agent_stats.timeline` from the child's transcript.
+      // Promotion keeps the subagent transcript on the settled card. History
+      // reload later replaces that live order with `agent_stats.timeline`.
       const built = sourceLiveMessage
         ? buildStreamingTurnsForSession(
             current,
             sourceLiveMessage,
             undefined,
-            false
+            true
           )
         : null
       const streamingTurns = built?.turns ?? []
