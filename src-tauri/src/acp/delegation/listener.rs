@@ -15367,7 +15367,9 @@ mod tests {
                 TokenEntry {
                     agent_hosts_tools: false,
                     parent_connection_id: "parent-conn".into(),
-                    working_dir: PathBuf::from("/tmp"),
+                    // `/tmp` does not canonicalize on Windows, so the spawn
+                    // returns failed instead of running.
+                    working_dir: test_working_dir(),
                     bound_task_id: None,
                     completion_v2: false,
                     coordination_v1: false,

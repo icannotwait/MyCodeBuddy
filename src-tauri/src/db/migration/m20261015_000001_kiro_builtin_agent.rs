@@ -46,6 +46,7 @@
 
 use sea_orm::ConnectionTrait;
 use sea_orm_migration::prelude::*;
+use sea_orm_migration::sea_orm::{DbBackend, Statement};
 
 const CUSTOM_WIRE: &str = "custom:kiro-cli";
 const BUILTIN_WIRE: &str = "kiro";
@@ -61,7 +62,22 @@ pub struct Migration;
 impl MigrationTrait for Migration {
     async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
         let db = manager.get_connection();
+        // The delete retires a custom `kiro-cli` row. Databases that have not
+        // created `custom_agent` yet have nothing to retire; a normal upgrade
+        // creates that table in an earlier migration.
+        let has_custom_agent = db
+            .query_one(Statement::from_string(
+                DbBackend::Sqlite,
+                "SELECT 1 AS ok FROM sqlite_master \
+                 WHERE type = 'table' AND name = 'custom_agent'"
+                    .to_owned(),
+            ))
+            .await?
+            .is_some();
         for statement in statements() {
+            if !has_custom_agent && statement.starts_with("DELETE FROM custom_agent") {
+                continue;
+            }
             db.execute_unprepared(&statement).await?;
         }
         Ok(())
