@@ -8297,55 +8297,10 @@ impl DelegationBroker {
             .rebase_started_at(accepted.prompt_accepted_at);
 
         // The child is now running. Stamp the start so terminal paths can
-        // report a real `duration_ms`.
+        // report a real `duration_ms`. Running meta and DelegationStarted are
+        // published once, under publication_lock, after this call is registered
+        // — an earlier publish raced ahead of a terminal that won the park.
         let started_at = Instant::now();
-        let runtime_stats = runtime.projector.lock().await.snapshot();
-
-        // --- Mark the parent's tool call as in-flight -------------------------
-        // The frontend's DelegationContext seeds its `parent_tool_use_id`-keyed
-        // binding map from this meta on snapshot replay, so a page refresh
-        // mid-delegation can reconstruct the child connection / conversation
-        // ids without depending on the live `delegation_started` event having
-        // been received. Assistant identity rides the event, not this snapshot.
-        self.write_meta_if_real(
-            &req.parent_connection_id,
-            &req.parent_tool_use_id,
-            build_delegation_meta(&DelegationMetaSnapshot {
-                status: "running".into(),
-                task_preview: Some(task_preview.clone()),
-                task_id: call_id.clone(),
-                child_connection_id: Some(child_connection_id.clone()),
-                child_conversation_id,
-                error_code: None,
-                text_preview: None,
-                started_at: runtime_stats.started_at,
-                finished_at: None,
-                runtime_stats: Some(runtime_stats.clone()),
-                attention_request: None,
-            }),
-        )
-        .await;
-
-        // Announce the live delegation on the PARENT's event stream so the
-        // frontend `DelegationContext` binds the child inline and attaches its
-        // live sub-thread. Symmetric with the terminal `emit_completed_if_real`,
-        // and — unlike the removed child-stream emit in `send_prompt_linked` —
-        // delivered on a stream the parent is already attached to in web/server
-        // mode, carrying the real `parent_connection_id`.
-        self.emit_started_if_real(
-            &req.parent_connection_id,
-            &req.parent_tool_use_id,
-            &child_connection_id,
-            child_conversation_id,
-            req.agent_type,
-            identity.as_ref(),
-            &task_preview,
-            &call_id,
-            runtime_stats.started_at,
-            runtime_stats,
-            None,
-        )
-        .await;
 
         // --- Register pending, or resolve a terminal that beat us -------------
         // Under a single lock, decide this delegation's fate atomically against
@@ -9023,21 +8978,26 @@ impl DelegationBroker {
                 }
                 // Atomic settling → completed (or first completed insert for
                 // setup-window settles that never entered `running`).
+                // Snapshot tool progress now: the child session is about to
+                // go, and a later status read must still show where it ended.
+                let progress = self
+                    .live_reply_lookup
+                    .progress(&ctx.child_connection_id)
+                    .await;
                 {
                     let mut inner = self.pending.inner.lock().await;
                     inner.settling.remove(task_id);
                     let outcome = report_to_outcome_for_meta(&report, &ctx);
-                    inner.insert_completed(
-                        task_id,
-                        build_completed(
-                            &ctx.parent_connection_id,
-                            ctx.child_conversation_id,
-                            ctx.agent_type,
-                            ctx.assistant.as_ref(),
-                            ctx.duration_ms,
-                            &outcome,
-                        ),
+                    let mut completed = build_completed(
+                        &ctx.parent_connection_id,
+                        ctx.child_conversation_id,
+                        ctx.agent_type,
+                        ctx.assistant.as_ref(),
+                        ctx.duration_ms,
+                        &outcome,
                     );
+                    completed.progress = progress;
+                    inner.insert_completed(task_id, completed);
                 }
                 self.result_notify.notify_waiters();
                 // Terminal: drop observation cache entry and wake supervisor.

@@ -3486,6 +3486,9 @@ impl DelegationListener {
             Err(message) => return report_failed("invalid_replacement", &message),
         };
 
+        let assistant_ref = assistant
+            .as_ref()
+            .map(crate::acp::delegation::types::DelegationAssistant::identity);
         let delegation_req = DelegationRequest {
             parent_connection_id: req.parent_connection_id,
             parent_conversation_id,
@@ -3511,6 +3514,7 @@ impl DelegationListener {
         self.broker
             .start_delegation_for_incarnation(delegation_req, &connection_incarnation)
             .await
+            .with_assistant(assistant_ref.as_ref())
     }
 }
 

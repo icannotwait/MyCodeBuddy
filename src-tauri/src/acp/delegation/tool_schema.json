@@ -338,14 +338,14 @@
   },
   {
     "name": "check_user_feedback",
-    "description": "Messages are available only through this tool;non-blocking;before starting implementation;significant decision;after a meaningful sub-task;HIGH-PRIORITY;empty result means continue.",
+    "description": "Messages are available only through this tool;non-blocking;before starting implementation;significant decision;after a meaningful sub-task;HIGH-PRIORITY;empty result means continue;do not call again.",
     "inputSchema": {
       "type": "object"
     }
   },
   {
     "name": "ask_user_question",
-    "description": "Render interactive cards for 1-4 related multiple-choice questions and BLOCK until submitted or dismissed. Use only for a genuinely user-owned discrete decision that cannot be resolved from the request, code, or sensible defaults. Do not ask merely whether to proceed, confirm an obvious default, or collect open-ended input. Other is added automatically. Put a recommended choice first and append ' (Recommended)' to its label. Prefer one call for related questions.",
+    "description": "Render interactive cards for 1-4 related multiple-choice questions and BLOCK until submitted or dismissed. Use only for a genuinely user-owned discrete decision that cannot be resolved from the request, code, or sensible defaults. Do not ask merely whether to proceed, confirm an obvious default, or collect open-ended input. Other is added automatically. Put a recommended choice first and append ' (Recommended)' to its label. Prefer one call for related questions. Do not call again to confirm; execute the choice.",
     "inputSchema": {
       "type": "object",
       "required": ["questions"],

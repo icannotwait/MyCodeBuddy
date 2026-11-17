@@ -282,7 +282,9 @@ const BUILTIN_REGISTRY_ALIASES: &[&str] = &["kimi", "qoder", "kiro", "minimax-co
 /// which resolves registered custom ids too) — the picker needs "codeg ships
 /// this natively", not "codeg can currently launch this".
 fn is_builtin_registry_id(id: &str) -> bool {
-    registry::is_reserved_builtin_id(id)
+    // Picker recognition includes catalog aliases that must stay valid custom
+    // ids (minimax-code, opencode-v2) so a hand-registered agent keeps working.
+    registry::is_reserved_builtin_id(id) || BUILTIN_REGISTRY_ALIASES.contains(&id)
 }
 
 /// Turn a catalog entry into a storable definition.
@@ -545,7 +547,10 @@ mod tests {
     //   understand it.
     #[test]
     fn aliases_that_are_addable_would_duplicate_and_the_rest_would_dead_end() {
-        assert!(crate::models::agent::is_valid_custom_agent_id("kimi"));
+        // `kimi` is a reserved catalog alias (the wire name is `kimi_code`),
+        // so a custom agent cannot take it. `minimax-code` and `opencode-v2`
+        // stay addable and are recognized as built-ins only by the picker.
+        assert!(!crate::models::agent::is_valid_custom_agent_id("kimi"));
         assert!(crate::models::agent::is_valid_custom_agent_id(
             "minimax-code"
         ));

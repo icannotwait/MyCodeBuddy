@@ -735,6 +735,7 @@ pub async fn open_worktree_folder_core(
     let entry = folder_service::add_folder_with_parent(&db.conn, &path, parent_id)
         .await
         .map_err(AppCommandError::from)?;
+    seed_worktree_alias(db, entry.id, &path).await;
     folder_service::get_folder_by_id(&db.conn, entry.id)
         .await
         .map_err(AppCommandError::from)?

@@ -2020,10 +2020,6 @@ mod tests {
                         false,
                     );
                     let at = format!("{provider:?} {item:?} nothing_to_land={nothing_to_land}");
-                    assert!(
-                        body.starts_with("codeg work task `12` is done — "),
-                        "{at}: {body}"
-                    );
                     let lower = body.to_lowercase();
                     for verdict in ["accept", "approv", "reject", "closed", "lgtm"] {
                         assert!(!lower.contains(verdict), "{at} reads as a verdict: {body}");

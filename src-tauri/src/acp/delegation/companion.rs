@@ -2068,14 +2068,11 @@ pub async fn dispatch_line(
                         for tool in &mut filtered {
                             let name = tool.get("name").and_then(Value::as_str).unwrap_or("");
                             match name {
-                                "delegate_to_agent" => {
-                                    if let Some(obj) = tool.as_object_mut() {
-                                        obj.insert(
-                                            "description".into(),
-                                            Value::String(LEGACY_DELEGATE_DESCRIPTION.into()),
-                                        );
-                                    }
-                                }
+                                // delegate_to_agent keeps the embedded description
+                                // until the assistant probe. A parent that predates
+                                // assistants must see that schema unchanged; the
+                                // pre-Join text is applied only when the probe
+                                // does not say unsupported.
                                 "get_delegation_status" => {
                                     if let Some(obj) = tool.as_object_mut() {
                                         obj.insert(
@@ -2116,7 +2113,10 @@ pub async fn dispatch_line(
             }
             remove_disabled_agents_from_delegate_enum(&mut tools, &ctx.disabled_agents);
             append_custom_agents_to_delegate_enum(&mut tools, &ctx.custom_agents);
-            if ctx.features.allows_legacy_tool("delegate_to_agent") {
+            // The fixed Grok stdio budget cannot carry the assistant prose.
+            // Compact catalogs keep the embedded delegate schema.
+            if ctx.features.allows_legacy_tool("delegate_to_agent") && !ctx.features.compact_catalog
+            {
                 offer_assistants_in_delegate_schema(ctx, &mut tools).await;
             }
             // Not in the embedded schema: its input schema is the run's own.
@@ -2148,7 +2148,7 @@ fn compact_tools_for_fixed_stdio(tools: &mut Value) {
                     tool.insert(
                         "description".into(),
                         Value::String(
-                            "Resume only interrupted/canceled work under the same task_id, child session, and original task. No new task text: use delegate_to_agent for follow-up/retry. Running, completed, and failed tasks are refused; reason only explains the interruption."
+                            "Resume interrupted/canceled work under the same task_id. No new task text; use delegate_to_agent. Running, completed, and failed are refused."
                                 .into(),
                         ),
                     );
@@ -2290,6 +2290,21 @@ async fn offer_assistants_in_delegate_schema(ctx: &CompanionContext, tools: &mut
         // not depend on it.
         Err(_) => None,
     };
+    // Pre-Join text only when this parent might understand assistants. A
+    // parent known to predate them keeps the embedded description verbatim.
+    if !ctx.features.coordination_v1 {
+        if let Some(tool) = tools.as_array_mut().and_then(|arr| {
+            arr.iter_mut()
+                .find(|tool| tool.get("name").and_then(Value::as_str) == Some("delegate_to_agent"))
+        }) {
+            if let Some(obj) = tool.as_object_mut() {
+                obj.insert(
+                    "description".into(),
+                    Value::String(LEGACY_DELEGATE_DESCRIPTION.into()),
+                );
+            }
+        }
+    }
     describe_assistants_in_delegate_schema(tools, roster.as_deref());
 }
 
@@ -2438,6 +2453,7 @@ async fn build_tools_call_spawn(
             let allowed = if name == "delegate_to_agent" {
                 &[
                     "agent_type",
+                    "assistant_id",
                     "profile_id",
                     "profile_label",
                     "task",
@@ -9216,16 +9232,13 @@ mod tests {
                     || delegate_desc.contains("replaces_task_id")),
             "delegate_to_agent description must document admission recovery via replacement: {delegate_desc}"
         );
-        // correlation_id is required on both delegation entry points (fresh per
-        // invocation; server still accepts legacy missing when host tool id present).
+        // An unanswered assistant probe still offers assistant_id and collapses
+        // required to task. correlation_id stays a property; continue_delegation
+        // below still requires it.
         let corr = &delegate["inputSchema"]["properties"]["correlation_id"];
         assert!(corr.is_object());
         assert!(corr.as_object().unwrap().is_empty());
-        assert!(delegate["inputSchema"]["required"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|value| value == "correlation_id"));
+        assert_eq!(delegate["inputSchema"]["required"], json!(["task"]));
         let continue_tool = tools
             .iter()
             .find(|t| t["name"] == "continue_delegation")
@@ -16335,7 +16348,7 @@ mod tests {
         assert_eq!(delegate, embedded_delegate_schema());
         assert_eq!(
             delegate["inputSchema"]["required"],
-            json!(["agent_type", "task"])
+            json!(["agent_type", "task", "correlation_id"])
         );
         assert_eq!(
             *seen.lock().await,

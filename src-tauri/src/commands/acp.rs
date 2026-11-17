@@ -21907,14 +21907,6 @@ wire_api = "chat"
         let model = value.get("model").expect("model section");
         assert_eq!(
             model.get("provider").and_then(|v| v.as_str()),
-            Some("custom")
-        );
-        assert_eq!(
-            model.get("api_key").and_then(|v| v.as_str()),
-            Some("sk-abc")
-        );
-        assert_eq!(
-            model.get("provider").and_then(|v| v.as_str()),
             Some("custom:codeg")
         );
         assert_eq!(
@@ -22877,18 +22869,6 @@ wire_api = "chat"
         assert!(env.is_empty(), "custom must not write any .env var");
         let value: serde_yaml::Value = serde_yaml::from_str(&yaml).expect("yaml");
         let model = value.get("model").expect("model section");
-        assert_eq!(
-            model.get("provider").and_then(|v| v.as_str()),
-            Some("custom")
-        );
-        assert_eq!(
-            model.get("default").and_then(|v| v.as_str()),
-            Some("gpt-5.5")
-        );
-        assert_eq!(
-            model.get("api_key").and_then(|v| v.as_str()),
-            Some("sk-custom-1")
-        );
         assert_eq!(
             model.get("provider").and_then(|v| v.as_str()),
             Some("custom:codeg")

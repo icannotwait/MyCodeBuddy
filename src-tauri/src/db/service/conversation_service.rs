@@ -437,9 +437,11 @@ pub async fn update_status_if<C: ConnectionTrait>(
     )
 }
 
-/// Atomic end-of-turn CAS: transition `in_progress → pending_review` and
-/// optionally mint an `awaiting_reply_token` for eligible root conversations.
-/// Returns `None` when the CAS loses (row not in_progress / not found / deleted).
+/// Atomic end-of-turn CAS: transition `in_progress` or a user-`completed`
+/// row → `pending_review`, and optionally mint an `awaiting_reply_token` for
+/// eligible root conversations. A new turn's `end_turn` reopens a row the
+/// user had marked done; the same envelope claimed by the CLI fallback never
+/// reaches this write. Returns `None` when the CAS loses.
 ///
 /// Token is minted only when `parent_id IS NULL` AND `mark_awaiting_reply`.
 /// Child and background transitions never receive a generation.
@@ -470,7 +472,11 @@ pub async fn finish_end_turn_if_in_progress<C: ConnectionTrait>(
         .col_expr(conversation::Column::UpdatedAt, Expr::value(now))
         .filter(conversation::Column::Id.eq(conversation_id))
         .filter(conversation::Column::DeletedAt.is_null())
-        .filter(conversation::Column::Status.eq(conversation::ConversationStatus::InProgress))
+        .filter(
+            sea_orm::Condition::any()
+                .add(conversation::Column::Status.eq(conversation::ConversationStatus::InProgress))
+                .add(conversation::Column::Status.eq(conversation::ConversationStatus::Completed)),
+        )
         .exec(conn)
         .await?;
     Ok((result.rows_affected == 1).then(|| {

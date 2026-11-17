@@ -3126,7 +3126,7 @@ fn shell_word(name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::acp::connection::ConnectionCommand;
+    use crate::acp::connection::{ConnectionCommand, ConnectionControl};
     use crate::acp::types::{SessionConfigSelectInfo, SessionConfigSelectOptionInfo};
     use crate::acp::EventBusMetrics;
     use crate::db::test_helpers;
@@ -3233,6 +3233,28 @@ mod tests {
             let changed = Arc::clone(&self.changed);
             let answer = Arc::clone(&self.answer);
             let conn = id.clone();
+            if let Some(mut control_rx) = self.manager.observe_test_control_lane(&id).await {
+                let commands = Arc::clone(&commands);
+                let changed = Arc::clone(&changed);
+                let conn = conn.clone();
+                tokio::spawn(async move {
+                    while let Some(ctrl) = control_rx.recv().await {
+                        let name = match ctrl {
+                            ConnectionControl::Cancel | ConnectionControl::CancelTurn { .. } => {
+                                "cancel"
+                            }
+                            ConnectionControl::Disconnect => "disconnect",
+                            ConnectionControl::CancelTerminal { .. } => "cancel-terminal",
+                            ConnectionControl::SuspendForDelegation { .. } => "suspend",
+                        };
+                        commands
+                            .lock()
+                            .unwrap()
+                            .push((conn.clone(), name.to_string()));
+                        changed.notify_waiters();
+                    }
+                });
+            }
             tokio::spawn(async move {
                 while let Some(cmd) = rx.recv().await {
                     commands

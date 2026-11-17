@@ -3722,6 +3722,20 @@ impl ConnectionManager {
         rx
     }
 
+    /// Swap a synthetic connection's discarded control lane for one the test
+    /// can read. Cancel and disconnect moved off the command channel.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub async fn observe_test_control_lane(
+        &self,
+        id: &str,
+    ) -> Option<tokio::sync::mpsc::Receiver<ConnectionControl>> {
+        let mut connections = self.connections.lock().await;
+        let conn = connections.get_mut(id)?;
+        let (tx, rx, _liveness_rx) = connection_channel(32);
+        conn.control_tx = tx;
+        Some(rx)
+    }
+
     /// Bind controllable command/control lanes to the exact public state owned
     /// by a process-free shared spawn fixture. This keeps integration tests on
     /// the production dispatcher and control admission paths without launching

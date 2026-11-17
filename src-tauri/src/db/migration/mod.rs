@@ -91,7 +91,57 @@ pub(crate) async fn install_for_historical_completion_fixture(
     .await?;
     m20260827_000001_delegation_dispatch_intent::install_for_historical_completion_fixture(db)
         .await?;
-    m20260829_000001_folder_group::install_for_historical_completion_fixture(db).await
+    m20260829_000001_folder_group::install_for_historical_completion_fixture(db).await?;
+    // Current conversation inserts write assistant and source columns that
+    // landed after the historical cutoff. Install them out of order and record
+    // them so a later full migrate does not add the columns twice.
+    install_later_conversation_columns(db).await
+}
+
+#[cfg(any(test, feature = "test-utils"))]
+async fn install_later_conversation_columns(
+    db: &crate::db::AppDatabase,
+) -> Result<(), sea_orm::DbErr> {
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    use sea_orm::{ConnectionTrait, DbBackend, Statement};
+
+    let manager = SchemaManager::new(&db.conn);
+    let applied_at = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time after Unix epoch")
+        .as_secs() as i64;
+    if !manager.has_column("conversation", "assistant_id").await? {
+        m20261016_000002_conversation_assistant::Migration
+            .up(&manager)
+            .await?;
+    }
+    db.conn
+        .execute(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            "INSERT OR IGNORE INTO seaql_migrations (version, applied_at) VALUES (?, ?)",
+            vec![
+                "m20261016_000002_conversation_assistant".into(),
+                applied_at.into(),
+            ],
+        ))
+        .await?;
+    if !manager.has_column("conversation", "source").await? {
+        m20261017_000002_conversation_source::Migration
+            .up(&manager)
+            .await?;
+    }
+    db.conn
+        .execute(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            "INSERT OR IGNORE INTO seaql_migrations (version, applied_at) VALUES (?, ?)",
+            vec![
+                "m20261017_000002_conversation_source".into(),
+                applied_at.into(),
+            ],
+        ))
+        .await?;
+    Ok(())
 }
 
 mod m20261006_000001_conversation_tag;

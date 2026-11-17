@@ -2030,10 +2030,24 @@ async fn remove_connection_if_same_incarnation(
 
 impl<V: CleanupMapValue> Drop for ConnectionCleanupGuard<V> {
     fn drop(&mut self) {
-        let connections = self.connections.clone();
         let connection_id = std::mem::take(&mut self.connection_id);
         let incarnation = std::mem::take(&mut self.connection_incarnation);
         let registry = self.tool_lease_registry.clone();
+        // An uncontended map is cleared before drop returns. Deferring that
+        // to the runtime leaks the entry when nothing is driving the runtime.
+        if let Ok(mut map) = self.connections.try_lock() {
+            remove_cleanup_entry(&mut map, &connection_id, &incarnation);
+            drop(map);
+            if let Some(registry) = registry {
+                self.runtime.spawn(async move {
+                    let _ = registry
+                        .remove_connection(&connection_id, &incarnation)
+                        .await;
+                });
+            }
+            return;
+        }
+        let connections = self.connections.clone();
         self.runtime.spawn(async move {
             if let Some(registry) = registry {
                 let _ = registry
@@ -2041,17 +2055,23 @@ impl<V: CleanupMapValue> Drop for ConnectionCleanupGuard<V> {
                     .await;
             }
             let mut map = connections.lock().await;
-            let remove = match map.get(&connection_id) {
-                Some(value) if V::incarnation_gated() => {
-                    value.live_incarnation() == Some(incarnation.as_str())
-                }
-                Some(_) => true,
-                None => false,
-            };
-            if remove {
-                map.remove(&connection_id);
-            }
+            remove_cleanup_entry(&mut map, &connection_id, &incarnation);
         });
+    }
+}
+
+fn remove_cleanup_entry<V: CleanupMapValue>(
+    map: &mut HashMap<String, V>,
+    connection_id: &str,
+    incarnation: &str,
+) {
+    let remove = match map.get(connection_id) {
+        Some(value) if V::incarnation_gated() => value.live_incarnation() == Some(incarnation),
+        Some(_) => true,
+        None => false,
+    };
+    if remove {
+        map.remove(connection_id);
     }
 }
 
@@ -12594,7 +12614,42 @@ async fn run_connection(
                                 return Ok(());
                                 }
                             }
-                            SessionLoadErrorAction::ContinueDefaultFallthrough => {}
+                            SessionLoadErrorAction::ContinueDefaultFallthrough => {
+                                // String classification misses Claude's
+                                // `startupFailureReason`, which lives in
+                                // `data`. A busy or worktree-bound session
+                                // must still keep its history.
+                                if let Some(code) =
+                                    forgotten_session.filter(|_| !recovers_locally)
+                                {
+                                    tracing::warn!(
+                                        "[ACP] session/load failed ({err_str}); surfacing as session_load_failed={code}"
+                                    );
+                                    let frontend_message =
+                                        crate::acp::delegation::broker::sanitize_bootstrap_unresumable_message(
+                                            &err_str,
+                                        );
+                                    emit_with_state(
+                                        &state,
+                                        &emitter_clone,
+                                        AcpEvent::SessionLoadFailed {
+                                            session_id: sid.clone(),
+                                            message: frontend_message,
+                                            code: code.to_string(),
+                                        },
+                                    )
+                                    .await;
+                                    emit_with_state(
+                                        &state,
+                                        &emitter_clone,
+                                        AcpEvent::StatusChanged {
+                                            status: ConnectionStatus::Error,
+                                        },
+                                    )
+                                    .await;
+                                    return Ok(());
+                                }
+                            }
                         }
                         if attempted_load {
                             tracing::warn!(
@@ -12986,7 +13041,7 @@ async fn run_connection(
                     ),
                 );
             }
-            let acp_err = classify_connect_error_residual(&e.to_string());
+            let acp_err = classify_connect_error_residual(&agent_error_text(&e));
             send_bootstrap_outcome_once(
                 &route_bootstrap_tx,
                 bootstrap_outcome_from_acp_error(&acp_err),
@@ -49677,7 +49732,13 @@ mod tests {
         run.prompt("hello").await;
         agent.open_session.notify_one();
 
-        assert_eq!(agent.next_request().await, "session/prompt: hello");
+        let prompt = agent.next_request().await;
+        assert!(prompt.starts_with("session/prompt: hello"), "{prompt}");
+        assert!(
+            prompt.contains("<codeg_terminal_context version=\"1\">"),
+            "{prompt}"
+        );
+        assert!(prompt.contains("Selected shell: test-shell"), "{prompt}");
         // The agent reports the prompt before it answers, so let the answer
         // reach codeg before letting go (see `HandshakeAgent::closed`).
         run.turn_completed().await;
@@ -50907,7 +50968,7 @@ mod tests {
         assert!(config_option_already_holds(&options[0], model));
         assert_eq!(current_model_id_from_opts(&mapped).as_deref(), Some(model));
         assert_eq!(
-            serde_json::to_value(encode_config_option_value(false, model)).unwrap(),
+            serde_json::to_value(encode_config_option_value(false, model).unwrap()).unwrap(),
             serde_json::json!({"value": model})
         );
     }
@@ -64287,7 +64348,14 @@ mod tests {
         assert_eq!((forks.len(), resumes.len()), (1, 1));
         assert_eq!(forks[0]["mcpServers"][0]["name"], "codeg-mcp");
         assert_eq!(forks[0]["mcpServers"], resumes[0]["mcpServers"]);
-        assert!(forks[0].get("_meta").is_none());
+        // Terminal dialect rides `_meta` on every fork. It is not a server.
+        let meta = &forks[0]["_meta"];
+        assert!(meta.get("codeg.dev/terminal").is_some(), "{meta}");
+        assert_eq!(
+            meta.as_object().map(|object| object.len()),
+            Some(1),
+            "{meta}"
+        );
         fork.shutdown().await;
     }
 
@@ -64311,9 +64379,20 @@ mod tests {
         .await;
         let forks = fork.forks.lock().unwrap().clone();
         let resumes = fork.resumes.lock().unwrap().clone();
+        assert!(forks[0].get("mcpServers").is_none(), "{forks:?}");
+        let mut bare = forks[0].clone();
+        let meta = bare
+            .as_object_mut()
+            .and_then(|object| object.remove("_meta"));
+        assert!(
+            meta.as_ref()
+                .and_then(|value| value.get("codeg.dev/terminal"))
+                .is_some(),
+            "{forks:?}"
+        );
         assert_eq!(
-            forks,
-            vec![serde_json::json!({"sessionId": "parent", "cwd": "/tmp"})]
+            bare,
+            serde_json::json!({"sessionId": "parent", "cwd": "/tmp"})
         );
         assert_eq!(resumes.len(), 1);
         assert_eq!(resumes[0]["mcpServers"][0]["name"], "codeg-mcp");

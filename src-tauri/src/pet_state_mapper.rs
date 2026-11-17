@@ -110,8 +110,10 @@ impl PetGlobalState {
                 self.delegation_children.insert(child_connection_id.clone());
                 self.prompting.remove(child_connection_id);
                 self.erroring.remove(child_connection_id);
-                self.pending_permissions
-                    .retain(|_, cid| cid != child_connection_id);
+                // A permission that raced ahead of this announcement is the
+                // child's real block. Scrubbing it drops the sprite to Idle
+                // while the panel still says waiting. Work signals above are
+                // the ones that must not survive.
             }
             AcpEvent::DelegationCompleted {
                 child_connection_id,
