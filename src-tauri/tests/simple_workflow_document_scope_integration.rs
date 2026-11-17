@@ -578,7 +578,21 @@ async fn design_binding_migration_keeps_legacy_rows_unbound_and_is_reversible() 
     Migrator::up(&conn, Some(preceding)).await.unwrap();
     let db = AppDatabase { conn };
     let folder = seed_folder(&db, "/tmp/legacy-design-binding").await;
-    let parent = seed_conversation(&db, folder, AgentType::Codex).await;
+    // This schema stops before later conversation columns such as
+    // assistant_id, so the current entity insert cannot seed the parent.
+    db.conn
+        .execute(Statement::from_string(
+            DbBackend::Sqlite,
+            format!(
+                "INSERT INTO conversation (id, folder_id, title_locked, agent_type, status, kind, \
+                 message_count, created_at, updated_at) VALUES \
+                 (1, {folder}, 0, 'codex', 'in_progress', 'regular', 0, \
+                  '2026-10-03T00:00:00Z', '2026-10-03T00:00:00Z')"
+            ),
+        ))
+        .await
+        .expect("legacy conversation");
+    let parent = 1;
     db.conn.execute(Statement::from_sql_and_values(DbBackend::Sqlite,
         "INSERT INTO simple_workflows (parent_conversation_id, plan_rel_path, progress_rel_path, created_at, updated_at) VALUES (?, 'docs/plan.md', 'progress.md', '2026-10-03T00:00:00Z', '2026-10-03T00:00:00Z')",
         [parent.into()])).await.unwrap();
@@ -590,15 +604,24 @@ async fn design_binding_migration_keeps_legacy_rows_unbound_and_is_reversible() 
         .unwrap();
     assert!(legacy.design_rel_path.is_none());
     assert_eq!(legacy.plan_rel_path, "docs/plan.md");
-    register_simple_workflow_with_design(
-        &db.conn,
-        parent,
-        "docs/plan.md",
-        Some("progress.md"),
-        Some(Some("docs/design.md")),
-    )
-    .await
-    .unwrap();
+    // The register helper reads the current conversation entity, which includes
+    // columns this frozen schema does not have. The migration only needs a
+    // bound design path so down/up can prove the column is reversible.
+    db.conn
+        .execute(Statement::from_string(
+            DbBackend::Sqlite,
+            "UPDATE simple_workflows SET design_rel_path = 'docs/design.md' \
+             WHERE parent_conversation_id = 1"
+                .to_string(),
+        ))
+        .await
+        .unwrap();
+    let bound = simple_workflow::Entity::find_by_id(parent)
+        .one(&db.conn)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(bound.design_rel_path.as_deref(), Some("docs/design.md"));
     Migrator::down(&db.conn, Some(1)).await.unwrap();
     let row = db
         .conn

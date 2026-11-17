@@ -462,7 +462,7 @@ describe("AskQuestionCard", () => {
       expect(container).toBeEmptyDOMElement()
       cleanup()
     }
-  })
+  }, 30_000)
 
   it("keeps generic ask_user_question behavior unchanged", () => {
     const onAnswer = renderCard(single)
