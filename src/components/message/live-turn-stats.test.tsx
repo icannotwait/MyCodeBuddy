@@ -576,3 +576,33 @@ describe("LiveTurnStats request usage copy", () => {
     )
   })
 })
+
+describe("LiveTurnStats composer row", () => {
+  afterEach(() => {
+    vi.useRealTimers()
+  })
+
+  // The row above the composer keeps figures only when no agent banner is
+  // requested: no status word and no pulsing agent mark.
+  it("opens on the time when no agent banner is requested", () => {
+    vi.useFakeTimers()
+    vi.setSystemTime(65_000)
+    const view = render(
+      <NextIntlClientProvider locale="en" messages={enMessages}>
+        <LiveTurnStats
+          message={{
+            id: "m1",
+            role: "assistant",
+            content: [{ type: "thinking", text: "Checking the logs" }],
+            startedAt: 0,
+          }}
+        />
+      </NextIntlClientProvider>
+    )
+    const row = view.container.firstElementChild!.firstElementChild!
+    expect(row.querySelector("svg.lucide-timer")).toBeTruthy()
+    expect(row.querySelector(".animate-pulse")).toBeNull()
+    expect(row.textContent).toBe("1m 5s")
+    view.unmount()
+  })
+})

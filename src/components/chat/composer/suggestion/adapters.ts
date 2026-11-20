@@ -1,5 +1,6 @@
 import {
   type AcpAgentInfo,
+  type AssistantInfo,
   type DbConversationSummary,
   type DelegationProfile,
   type ReferenceCandidate,
@@ -109,7 +110,40 @@ export function agentToSuggestion(
   })
 }
 
-/** Conversation → the same stable session reference used by the @ catalogue. */
+/**
+ * Assistant → assistant reference, routed like an agent: it serializes inline
+ * as `[@name](codeg://assistant/<id>)`, from which the backend derives the
+ * delegation reminder at send time. The second line is the description the
+ * delegating agent also reads, or the agent it runs on when there is none; the
+ * agent's name and slug are searchable too.
+ */
+export function assistantToSuggestion(
+  assistant: AssistantInfo,
+  sourceOrdinal = 0
+): SuggestionItem {
+  const agentLabel = getAgentLabel(assistant.agent_type)
+  return withControllerDefaults({
+    reference: {
+      refType: "assistant",
+      id: String(assistant.id),
+      label: assistant.name,
+      uri: `codeg://assistant/${assistant.id}`,
+      meta: { assistantId: assistant.id },
+    },
+    detail: assistant.description || agentLabel,
+    keywords: `${agentLabel} ${assistant.agent_type}`,
+    sourceOrdinal,
+  })
+}
+
+/**
+ * Conversation → session reference. The serialization uri encodes codeg's
+ * internal numeric conversation id as `codeg://session/<conversation_id>` — the
+ * stable key the `get_session_info` MCP tool resolves directly (it then reads the
+ * row's bound `external_id` + `agent_type` server-side). The `@`-panel option row
+ * still shows the owning agent's icon via `meta.agentType`; the inline session
+ * badge shows a neutral conversation glyph, not the agent icon.
+ */
 export function sessionToSuggestion(
   conversation: DbConversationSummary
 ): SuggestionItem {

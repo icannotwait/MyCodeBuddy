@@ -36,7 +36,10 @@ import {
 } from "@/lib/ask-selection-handoff"
 import { useConnectionLifecycle } from "@/hooks/use-connection-lifecycle"
 import { useMessageQueue, type QueuedMessage } from "@/hooks/use-message-queue"
-import { MessageListView } from "@/components/message/message-list-view"
+import {
+  MessageListView,
+  type LiveRunsSource,
+} from "@/components/message/message-list-view"
 import {
   GoalControlProvider,
   type GoalControlValue,
@@ -907,7 +910,6 @@ export const ConversationSessionSurface = memo(
     useEffect(() => {
       isViewerRef.current = conn.isViewer
     }, [conn.isViewer])
-    const isConnecting = connStatus === "connecting"
     // The tab's connection is keyed by a stable tabId, but agent switching is
     // async — and for a not-installed target, connect()'s preflight throws BEFORE
     // it tears down the old connection. So `conn` can still describe the PREVIOUS
@@ -2698,6 +2700,26 @@ export const ConversationSessionSurface = memo(
       [openTab, refreshConversations]
     )
 
+    const runsAgentName = getAgentLabel(selectedAgent)
+    const liveRuns = useMemo<LiveRunsSource>(
+      () => ({
+        connectionId: conn.connectionId,
+        asyncTasks: conn.asyncTasks,
+        backgroundTasks: conn.backgroundTasks,
+        delegatedChildren: conn.delegatedChildren,
+        onStopAsyncTask: handleStopAsyncTask,
+        agentName: runsAgentName,
+      }),
+      [
+        conn.connectionId,
+        conn.asyncTasks,
+        conn.backgroundTasks,
+        conn.delegatedChildren,
+        handleStopAsyncTask,
+        runsAgentName,
+      ]
+    )
+
     const messageListNode = (
       <GoalControlProvider value={goalControlValue}>
         <MessageListView
@@ -2737,6 +2759,7 @@ export const ConversationSessionSurface = memo(
               : undefined
           }
           imageRoot={workingDirForConnection ?? null}
+          liveRuns={liveRuns}
         />
       </GoalControlProvider>
     )
@@ -2859,6 +2882,7 @@ export const ConversationSessionSurface = memo(
         onFocus={handleFocus}
         onSend={handleSend}
         sendClearMode={conn.sharedSession ? "after-admission" : "immediate"}
+        deliverWhilePrompting={conn.sharedSession != null}
         onCancel={handleCancel}
         onRespondPermission={handleRespondPermission}
         onAnswerQuestion={handleAnswerQuestion}
@@ -2986,7 +3010,7 @@ export const ConversationSessionSurface = memo(
                       )
                     }}
                     onOpenAgentsSettings={handleOpenAgentsSettings}
-                    disabled={isConnecting || dbConversationId != null}
+                    disabled={dbConversationId != null}
                   />
                 </div>
                 {composerBlockedMessage ? (
@@ -3073,7 +3097,7 @@ export const ConversationSessionSurface = memo(
                   )
                 }}
                 onOpenAgentsSettings={handleOpenAgentsSettings}
-                disabled={isConnecting || dbConversationId != null}
+                disabled={dbConversationId != null}
               />
               {composerBlockedMessage ? (
                 <div className="mt-2 flex w-full items-center gap-2 rounded-lg border border-destructive/30 bg-destructive/5 px-3 py-2 text-xs text-destructive">

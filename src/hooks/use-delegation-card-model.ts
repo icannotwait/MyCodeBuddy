@@ -5,7 +5,10 @@
  * child ids, title, and runtime projection — from a `delegate_to_agent`
  * tool call, in priority order:
  *   live `DelegationContext` binding → persisted `meta["codeg.delegation"]`
- *   → child projection cache → parsed tool input/output.
+ *   → child projection cache → parsed tool input/output. The same model
+ *   drives the timeline's delegation and resumed-delegation rows and the
+ *   top-right `SubAgentOverlay`, so they never disagree on what a sub-agent
+ *   is doing.
  *
  * Lifecycle (`running` | `ok` | `err`) is separate from badge status
  * (`active` | `stalled` | `waiting_input` | …). Ticker eligibility uses
@@ -33,6 +36,7 @@ import {
   type ConnectionState,
 } from "@/contexts/acp-connections-context"
 import { useDelegatedSubSession } from "@/hooks/use-delegated-sub-session"
+import { blockingPrompts } from "@/lib/blocking-prompts"
 import {
   buildEditRollupViewModel,
   computeDelegationElapsedMs,
@@ -64,11 +68,12 @@ import {
   retainRunningTicker,
   subscribeRunningTicker,
 } from "@/lib/delegation-running-ticker"
+import { taskEnding, type StatusReport } from "@/lib/delegation-status"
 
 const RUNNING_SNAPSHOT_REFRESH_MS = 15_000
 
-/** The raw inputs a `delegate_to_agent` tool call carries — the props
- *  `DelegatedSubThread` already receives, and the shape `SubAgentOverlay`
+/** The raw inputs a `delegate_to_agent` tool call carries — what the
+ *  delegation row reads off its call, and the shape `SubAgentOverlay`
  *  extracts from the last assistant turn's tool-call parts. */
 export interface DelegationCardSource {
   parentToolUseId: string
@@ -81,11 +86,34 @@ export interface DelegationCardSource {
   meta?: Record<string, unknown> | null
   /**
    * A broker task id to resolve the live binding by when `parentToolUseId`
-   * matches none. Set by `ResumedDelegationCard`: a resume re-binds the child
+   * matches none. Set by `DelegationResumeRow`: a resume re-binds the child
    * to the ORIGINAL `delegate_to_agent` call's tool_use_id, so the resume
    * call's own id is never a binding key — the task id in its arguments is.
    */
   taskIdHint?: string | null
+  /**
+   * The newest `get_delegation_status` report on this task that came after the
+   * call (the timeline hands it over): how the task ended, when no live binding
+   * or stored meta says.
+   */
+  laterReport?: StatusReport | null
+}
+
+/**
+ * Who a delegation card shows as running the task: an assistant (with the
+ * agent it ran on, when known) or a bare agent. Resolved once here and handed
+ * whole to every surface that draws it (`DelegationIdentityAvatar` /
+ * `DelegationIdentityName`), so none can fall back to the bare agent.
+ */
+export interface DelegationIdentity {
+  /** The agent that runs (ran) the task. For an assistant, taken only from the
+   *  backend's own evidence — never from the call's `agent_type` argument,
+   *  which the backend ignores — so it stays null until that arrives. */
+  agentType: AgentType | null
+  assistantId: number | null
+  /** The assistant's name when the delegation started: the fallback for a row
+   *  the assistants store does not hold. */
+  assistantName: string | null
 }
 
 export type DelegationLifecycleStatus = "running" | "ok" | "err"
@@ -93,6 +121,7 @@ export type DelegationLifecycleStatus = "running" | "ok" | "err"
 export interface DelegationCardModel {
   agentType: AgentType | null
   agentDisplayLabel: string | null
+  identity: DelegationIdentity
   task: string | null
   /** Short display id (tool-output task_id when present, else broker id). */
   taskId: string | null
@@ -242,6 +271,7 @@ function resolveLifecycleStatus(input: {
   toolOutput: ParsedToolOutput | null
   state?: ToolCallState
   errorText?: string | null
+  ended?: { status: "ok" | "err" } | null
 }): DelegationLifecycleStatus {
   const {
     binding,
@@ -251,6 +281,7 @@ function resolveLifecycleStatus(input: {
     toolOutput,
     state,
     errorText,
+    ended = null,
   } = input
 
   if (binding) return binding.status
@@ -273,6 +304,10 @@ function resolveLifecycleStatus(input: {
   if (toolOutput?.kind === "outcome") {
     return toolOutput.isError ? "err" : "ok"
   }
+  // A later status check is newer than the running ack when nothing live
+  // or stored says otherwise. Leaving the lifecycle on `running` makes the
+  // sticky work-unit projection paint a failed task as still running.
+  if (ended) return ended.status
   if (toolOutput?.kind === "ack") return "running"
   if (state === "output-available") return "ok"
   if (fromProj === "running") return "running"
@@ -552,6 +587,8 @@ export function buildDelegationCardModel(input: {
   runSnapshot?: DelegationRunSnapshot | null
   childProjection: ChildCardProjection | null
   childAwaitingPermission: boolean
+  childAwaitingUser?: boolean
+  ended?: { status: "ok" | "err"; errorCode?: string } | null
   state?: ToolCallState
   errorText?: string | null
   nowMs: number
@@ -566,6 +603,8 @@ export function buildDelegationCardModel(input: {
     runSnapshot = null,
     childProjection,
     childAwaitingPermission,
+    childAwaitingUser = false,
+    ended = null,
     state,
     errorText,
     nowMs,
@@ -605,6 +644,7 @@ export function buildDelegationCardModel(input: {
     toolOutput,
     state,
     errorText,
+    ended,
   })
 
   const status =
@@ -618,7 +658,9 @@ export function buildDelegationCardModel(input: {
           errorText,
           childAwaitingPermission:
             !uncorrelatedFailure && childAwaitingPermission,
+          childAwaitingUser: !uncorrelatedFailure && childAwaitingUser,
           childTaskStatus: runScopedProjection?.taskStatus ?? null,
+          ended,
         })
 
   const runtimeStats = pickRuntimeStats(
@@ -676,12 +718,30 @@ export function buildDelegationCardModel(input: {
       scopedChildProjection?.childConversationId ??
       null)
 
+  const assistantBinding = effectiveBinding as
+    | (DelegationBinding & {
+        assistantId?: number | null
+        assistantName?: string | null
+      })
+    | undefined
+  const assistantId =
+    assistantBinding?.assistantId ??
+    parsedInput.assistantId ??
+    toolOutput?.assistantId ??
+    effectiveMeta?.assistantId ??
+    null
+  const assistantName =
+    assistantBinding?.assistantName ??
+    toolOutput?.assistantName ??
+    effectiveMeta?.assistantName ??
+    null
   const agentType: AgentType | null =
     effectiveBinding?.agentType ??
-    parsedInput.agentType ??
+    (assistantId == null ? parsedInput.agentType : null) ??
     toolOutput?.agentType ??
     parsedMeta?.agentType ??
     agentTypeFromRunSnapshot(effectiveRunSnapshot)
+  const identity: DelegationIdentity = { agentType, assistantId, assistantName }
   // Cold recovery may only have summary error_code — fold projection last.
   // Correlation failures never mint a run snapshot; surface the wire code from
   // the parent tool outcome so the badge is not mislabeled as spawn/unresumable.
@@ -722,6 +782,7 @@ export function buildDelegationCardModel(input: {
   const hasModel = Boolean(
     binding ||
     parsedInput.agentType ||
+    parsedInput.assistantId ||
     parsedInput.task ||
     parsedMeta ||
     runSnapshot ||
@@ -732,6 +793,7 @@ export function buildDelegationCardModel(input: {
   return {
     agentType,
     agentDisplayLabel: parsedInput.profileLabel,
+    identity,
     task,
     taskId: displayTaskId ?? brokerTaskId,
     brokerTaskId,
@@ -986,6 +1048,7 @@ export function useDelegationCardModel(
     errorText,
     state,
     meta,
+    laterReport,
   } = source
 
   const parsedInput = useMemo(() => parseInput(input), [input])
@@ -1094,7 +1157,10 @@ export function useDelegationCardModel(
 
   const childProjection = useChildCardProjection(childConversationId)
   const childLive = useDelegationChildLive(childConnectionId)
-  const childAwaitingPermission = childLive?.pendingPermission != null
+  // Parked on ANY decision — a permission, a question, a plan approval — as
+  // the backend's `blocked_on` and the `get_delegation_status` row count it.
+  const childAwaitingUser = blockingPrompts(childLive) != null
+  const ended = useMemo(() => taskEnding(laterReport), [laterReport])
 
   const defaultWorkUnitSources = useMemo<readonly DelegationCardSource[]>(
     () => [
@@ -1133,7 +1199,9 @@ export function useDelegationCardModel(
       binding,
       runSnapshot,
       childProjection,
-      childAwaitingPermission,
+      childAwaitingPermission: childAwaitingUser,
+      childAwaitingUser,
+      ended,
       state,
       errorText,
       nowMs: previewNowMs,
@@ -1176,7 +1244,9 @@ export function useDelegationCardModel(
           binding,
           runSnapshot,
           childProjection,
-          childAwaitingPermission,
+          childAwaitingPermission: childAwaitingUser,
+          childAwaitingUser,
+          ended,
           state,
           errorText,
           nowMs,
@@ -1198,7 +1268,8 @@ export function useDelegationCardModel(
       binding,
       runSnapshot,
       childProjection,
-      childAwaitingPermission,
+      childAwaitingUser,
+      ended,
       state,
       errorText,
       displayTaskId,

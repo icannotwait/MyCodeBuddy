@@ -333,8 +333,9 @@ pub async fn send_notification(
         let _identity = resolve_notification_identity(&app);
 
         if let Some(aid) = click_action {
-            // wait_for_click blocks until interaction/timeout — run off the
-            // async runtime so the invoke returns immediately.
+            // `wait_for_click` blocks until interaction or timeout, and since
+            // mac-notification-sys 0.6.15 `send` also holds its thread until
+            // macOS confirms delivery. A dedicated thread, not an async worker.
             let app_for_click = app.clone();
             std::thread::spawn(move || {
                 let response = mac_notification_sys::Notification::default()
@@ -351,17 +352,25 @@ pub async fn send_notification(
                 }
             });
         } else {
-            mac_notification_sys::Notification::default()
-                .title(&title)
-                .message(&body)
-                .send()
-                .map_err(|err| {
-                    AppCommandError::new(
-                        AppErrorCode::ExternalCommandFailed,
-                        "Failed to post the system notification",
-                    )
-                    .with_detail(err.to_string())
-                })?;
+            // No click to wait for, but `send` still holds its thread for up
+            // to 2 s: a blocking-pool thread's to hold, not an async worker's.
+            tokio::task::spawn_blocking(move || {
+                mac_notification_sys::Notification::default()
+                    .title(&title)
+                    .message(&body)
+                    .send()
+                    .map(|_| ())
+                    .map_err(|err| err.to_string())
+            })
+            .await
+            .map_err(|err| AppCommandError::task_execution_failed(err.to_string()))?
+            .map_err(|detail| {
+                AppCommandError::new(
+                    AppErrorCode::ExternalCommandFailed,
+                    "Failed to post the system notification",
+                )
+                .with_detail(detail)
+            })?;
         }
     }
 

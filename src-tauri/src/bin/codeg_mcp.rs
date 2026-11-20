@@ -4,9 +4,12 @@
 //! (`request_parent_decision` / `reply_to_delegation`, role-gated),
 //! `check_user_feedback` (pull the user's mid-turn steering notes),
 //! `ask_user_question` (block on a multiple-choice card), and
-//! `get_session_info` (resolve a referenced session by id), gated by the
+//! `get_session_info` (resolve a referenced session by id), plus the
+//! chat-authoring tools (`create_automation` / `create_work_task`) and the
+//! `submit_result` of a `codeg-cli --output-schema` run, gated by the
 //! `--features` groups (`delegation` / `coordination_v1` / `feedback` /
-//! `ask` / `sessions` / `workflow_v2`) and `--role` (`root` | `delegation_child`).
+//! `ask` / `sessions` / `workflow_v2` / `tasks` / `result` / `automations` /
+//! `taskboard`) and `--role` (`root` | `delegation_child`).
 //!
 //! Service roundtable mode is a separate entry:
 //! `codeg-mcp --service-roundtable --socket-path <path> --incarnation <id>`.
@@ -42,17 +45,28 @@ use std::process::ExitCode;
 use std::sync::Arc;
 
 use codeg_lib::acp::delegation::companion::{
-    dispatch_line, drain_and_cancel_all, serialize_jsonrpc_line, InflightCalls, JsonRpcResponse,
-    LineAction,
+    dispatch_line, drain_and_cancel_all, serialize_jsonrpc_line, CompanionContext,
+    CompanionFeatures, InflightCalls, JsonRpcResponse, LineAction,
 };
 use codeg_lib::acp::delegation::parent_watcher::{wait_for_parent_exit, DEFAULT_POLL_INTERVAL};
 use codeg_lib::acp::delegation::transport::client_establish_ready_lease;
 use codeg_lib::roundtable::{
-    bind_service_process, legacy_companion_context, parse_companion_args, CompanionMode,
-    CompanionParse,
+    bind_service_process, parse_companion_args, CompanionMode, CompanionParse,
 };
 use tokio::io::{AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::sync::Mutex;
+
+/// Split an optional comma-joined arg value into its non-empty entries.
+fn parse_csv(raw: Option<&str>) -> Vec<String> {
+    raw.map(|csv| {
+        csv.split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .collect()
+    })
+    .unwrap_or_default()
+}
 
 /// Serialize a `JsonRpcResponse` and append a newline; small enough to keep
 /// inline so the write-mutex critical section stays tight.
@@ -143,7 +157,21 @@ async fn main() -> ExitCode {
         }
         CompanionParse::Launch(CompanionMode::LegacyParent(args)) => args,
     };
-    let ctx = legacy_companion_context(&args);
+    let ctx = CompanionContext {
+        parent_connection_id: args.parent_connection_id.clone(),
+        socket_path: args.socket_path.clone(),
+        token: args.token.clone(),
+        features: CompanionFeatures::parse(args.features.as_deref()),
+        role: args.role,
+        can_spawn_child: args.can_spawn_child,
+        connection_incarnation_id: args.connection_incarnation_id.clone(),
+        // `--custom-agents` stays accepted and ignored: the fork catalog does
+        // not grow delegate targets from launch argv.
+        custom_agents: Vec::new(),
+        disabled_agents: parse_csv(args.disabled_agents.as_deref()),
+        assistant_support: Default::default(),
+        result_schema: Default::default(),
+    };
 
     // When delegation is enabled, establish the authenticated ready lease
     // BEFORE serving stdio tools. Failure exits non-zero so the agent never
@@ -397,6 +425,7 @@ mod tests {
                 workflow_v2: true,
                 completion_v2: false,
                 tasks: false,
+                result: false,
                 automations: false,
                 taskboard: false,
                 browser: false,
@@ -408,7 +437,10 @@ mod tests {
             role: CompanionRole::Root,
             can_spawn_child: true,
             connection_incarnation_id: "test-incarnation".into(),
+            custom_agents: Vec::new(),
             disabled_agents: Vec::new(),
+            assistant_support: Default::default(),
+            result_schema: Default::default(),
         };
         let line = json!({
             "jsonrpc": "2.0",

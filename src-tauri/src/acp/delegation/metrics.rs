@@ -1845,6 +1845,11 @@ pub fn agent_type_label(agent: AgentType) -> &'static str {
         AgentType::DeepSeek => "deepseek",
         AgentType::Qoder => "qoder",
         AgentType::Antigravity => "antigravity",
+        AgentType::Kiro => "kiro",
+        AgentType::ZCode => "zcode",
+        AgentType::Trae => "trae",
+        AgentType::CommandCode => "command_code",
+        AgentType::MiniMaxCode => "minimax_code",
         AgentType::Custom(_) => "custom",
     }
 }

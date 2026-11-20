@@ -1891,7 +1891,7 @@ describe("buildStreamingTurnsFromLiveMessage — orphan status provenance", () =
   // The forward that lets the render layer drop an interrupted arg-less orphan
   // after it is promoted into localTurns at COMPLETE_TURN (see
   // dropEmptyInFlightToolCalls). Without it, the promoted block loses its ACP
-  // status and the orphan re-inflates the "运行 N 个命令" count post-completion.
+  // status and the orphan re-inflates the reply's command count post-completion.
   it("forwards the ACP tool status onto the promoted tool_use block", () => {
     const blocks = buildStreamingTurnsFromLiveMessage(1, {
       id: "lm-orphan",
@@ -1944,15 +1944,13 @@ describe("buildStreamingTurnsFromLiveMessage — subagent transcript routing (cl
     type: "tool_call",
     info: toolInfo({ tool_call_id: id, title: "Agent", kind: "other" }),
   })
-  const build = (
-    content: LiveContentBlock[],
-    opts?: { attachAgentTranscripts?: boolean }
-  ) =>
-    buildStreamingTurnsFromLiveMessage(
-      1,
-      { id: "lm-sub", role: "assistant", startedAt: 0, content },
-      opts
-    )
+  const build = (content: LiveContentBlock[]) =>
+    buildStreamingTurnsFromLiveMessage(1, {
+      id: "lm-sub",
+      role: "assistant",
+      startedAt: 0,
+      content,
+    })
 
   it("routes parented text/thinking out of the main thread and attaches them in order", () => {
     const result = build([
@@ -2025,23 +2023,6 @@ describe("buildStreamingTurnsFromLiveMessage — subagent transcript routing (cl
     expect(
       carrier?.type === "tool_result" ? carrier.agent_transcript : null
     ).toEqual([{ type: "text", text: "just prose" }])
-  })
-
-  it("attachAgentTranscripts:false (promotion) routes blocks out but attaches nothing", () => {
-    const result = build(
-      [
-        agentCall("toolu_agent"),
-        { type: "text", text: "sub prose", parentToolUseId: "toolu_agent" },
-      ],
-      { attachAgentTranscripts: false }
-    )
-    const blocks = result.turns.flatMap((t) => t.blocks)
-    expect(blocks.some((b) => b.type === "text")).toBe(false)
-    for (const b of blocks) {
-      if (b.type === "tool_result") {
-        expect(b.agent_transcript).toBeUndefined()
-      }
-    }
   })
 
   it("drops a parented block whose parent is not a classified agent", () => {
@@ -2154,6 +2135,9 @@ describe("buildStreamingTurnsFromLiveMessage — subagent transcript routing (cl
       carrier?.type === "tool_result" ? carrier.agent_transcript : null
     ).toEqual([
       { type: "thinking", text: "before" },
+      // The child tool call keeps its chronological position: a marker the
+      // capsule resolves back through `agent_stats.tool_calls` by ordinal.
+      { type: "tool_call", childIndex: 0 },
       { type: "thinking", text: "after" },
     ])
   })
@@ -2310,7 +2294,7 @@ describe("buildStreamingTurnsFromLiveMessage — Kimi TodoList suppression", () 
   const toolResults = (b: ContentBlock[]) =>
     b.filter((x) => x.type === "tool_result")
 
-  it("renders a PlanCard from the call's own todos before Kimi's plan arrives (no tool card, no flash)", () => {
+  it("renders a plan checklist from the call's own todos before Kimi's plan arrives (no tool row, no flash)", () => {
     const blocks = buildBlocks([
       kimiToolCall(
         write([
@@ -2331,7 +2315,7 @@ describe("buildStreamingTurnsFromLiveMessage — Kimi TodoList suppression", () 
     ])
   })
 
-  it("drops the redundant tool card once Kimi's own plan block is present (single PlanCard)", () => {
+  it("drops the redundant tool call once Kimi's own plan block is present (single plan)", () => {
     const blocks = buildBlocks([
       kimiToolCall(write([{ title: "A", status: "pending" }])),
       planBlock([{ content: "A", status: "pending", priority: "medium" }]),
@@ -2344,7 +2328,7 @@ describe("buildStreamingTurnsFromLiveMessage — Kimi TodoList suppression", () 
   it("shows the latest write's content, not an earlier write's stale plan block", () => {
     // Pre-plan window of a SECOND write: tool_call(write2 = {A,B}) is present,
     // but the reducer's collapsed plan block still reflects write1 ({A}) until
-    // write2's own `plan` update lands. The single PlanCard must reflect write2.
+    // write2's own `plan` update lands. The single plan must reflect write2.
     const blocks = buildBlocks([
       kimiToolCall(write([{ title: "A", status: "pending" }]), {
         tool_call_id: "w1",

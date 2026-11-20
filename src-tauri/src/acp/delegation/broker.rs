@@ -66,6 +66,8 @@ use chrono::{DateTime, Utc};
 use tokio::sync::oneshot;
 use tokio::sync::{Mutex, Notify};
 
+use crate::acp::agent_mentions::render_assistant_brief;
+use crate::acp::delegation::assistants::{AssistantLookup, AssistantRosterEntry, NoAssistants};
 use crate::acp::delegation::attention::{
     validate_attention_payload, AttentionOpenResult, AttentionRecord, AttentionResolutionCode,
     AttentionResolveResult, AttentionStoreError, DelegationAttentionStore, NewAttentionRequest,
@@ -111,12 +113,13 @@ use crate::acp::delegation::store::{
 use crate::acp::delegation::supervisor::SupervisorWake;
 use crate::acp::delegation::types::{
     cold_task_report_message, correlation_error_message, validate_correlation_id,
-    AdmissionIntentKind, AdmissionIntentV1, AgentDelegationDefaults, CorrelationEntryPoint,
-    CorrelationFailureKind, DelegationError, DelegationOutcome, DelegationProfile,
-    DelegationRecoveryProjection, DelegationReplyResult, DelegationRequest, DelegationStatusBatch,
-    DelegationTaskReport, DelegationTaskReportExtension, DelegationWakeReason, ObservationSnapshot,
-    ParentDecisionResult, ParentTurnEndReason, ResumeDelegationRequest, TaskObservation,
-    TaskStatus, TicketV1AdmissionCandidate, TicketV1PendingCall, WorkflowRetirementNavigation,
+    AdmissionIntentKind, AdmissionIntentV1, AgentDelegationDefaults, AssistantRef,
+    CorrelationEntryPoint, CorrelationFailureKind, DelegationAssistant, DelegationError,
+    DelegationOutcome, DelegationProfile, DelegationProgress, DelegationRecoveryProjection,
+    DelegationReplyResult, DelegationRequest, DelegationStatusBatch, DelegationTaskReport,
+    DelegationTaskReportExtension, DelegationWakeReason, ObservationSnapshot, ParentDecisionResult,
+    ParentTurnEndReason, ResumeDelegationRequest, TaskObservation, TaskStatus,
+    TicketV1AdmissionCandidate, TicketV1PendingCall, WorkflowRetirementNavigation,
     DELEGATE_TO_AGENT_TOOL,
 };
 use crate::acp::delegation::workflow::admission::append_admitted_completion_instruction;
@@ -302,6 +305,9 @@ pub struct ChildStatusRecord {
     /// Durable error code from `delegation_error_code` (not inferred from
     /// generic conversation status).
     pub error_code: Option<String>,
+    /// The assistant the child ran as, off its row; `None` for an agent
+    /// delegation.
+    pub assistant: Option<AssistantRef>,
 }
 
 /// Everything `resume_delegation` needs to know about an interrupted child
@@ -336,6 +342,40 @@ pub struct ChildResumeContext {
     /// The child row's title (originally seeded from the delegated task text) —
     /// bounded and reused as the resumed task's `task_preview` label.
     pub title: Option<String>,
+    /// The assistant the child ran as, AS IT WAS when the delegation started
+    /// (the row's `assistant_snapshot`), never the assistant's current row: it
+    /// may since have moved to another agent, while the session being resumed
+    /// is still the original agent's.
+    pub assistant: ResumeAssistant,
+}
+
+/// What a resume knows of the assistant a child ran as.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ResumeAssistant {
+    /// Not an assistant child: resume as the agent it is.
+    None,
+    /// The snapshot the child row was written with.
+    Snapshot(DelegationAssistant),
+    /// An assistant child whose snapshot cannot be read back — missing,
+    /// unparsable, or the read itself failed. Refused rather than resumed:
+    /// relaunching on anything else (the per-agent defaults, or nothing) would
+    /// run it on settings that were never the assistant's, and without its
+    /// instructions.
+    Unrecoverable { id: i32, name: Option<String> },
+}
+
+impl ResumeAssistant {
+    /// Who the resumed task runs as, for its reports and events.
+    pub fn identity(&self) -> Option<AssistantRef> {
+        match self {
+            ResumeAssistant::None => None,
+            ResumeAssistant::Snapshot(a) => Some(a.identity()),
+            ResumeAssistant::Unrecoverable { id, name } => Some(AssistantRef {
+                id: *id,
+                name: name.clone().unwrap_or_default(),
+            }),
+        }
+    }
 }
 
 /// DB fallback for `get_delegation_status` / `cancel_delegation` once a task's
@@ -417,6 +457,8 @@ struct RunningTask {
     agent_type: AgentType,
     /// Durable run generation for settlement fencing.
     generation: i64,
+    /// The assistant the task runs as, beside `agent_type`.
+    assistant: Option<AssistantRef>,
     /// Bounded preview of the delegated task text ([`TASK_PREVIEW_CAP`]).
     /// Carried so TERMINAL meta writes can keep labeling the parent card —
     /// meta is replace-wholesale on the ToolCallState, so a terminal write
@@ -445,6 +487,7 @@ struct CompletedTask {
     parent_connection_id: String,
     child_conversation_id: i32,
     agent_type: AgentType,
+    assistant: Option<AssistantRef>,
     status: TaskStatus,
     /// Result text for `Completed` (capped at [`COMPLETED_TEXT_CAP`]). `None`
     /// for failures/cancels.
@@ -452,6 +495,11 @@ struct CompletedTask {
     error_code: Option<String>,
     message: Option<String>,
     duration_ms: u64,
+    /// The child's tool-call progress when it finished (bounded: at most
+    /// `MAX_STEP_MARKS` marks and a one-line title, so it stays outside the
+    /// byte valve like `message`). `None` when the child called no tool or
+    /// finished on a path that never saw its session.
+    progress: Option<DelegationProgress>,
 }
 
 #[derive(Default)]
@@ -1635,6 +1683,7 @@ fn build_completed(
     parent_connection_id: &str,
     child_conversation_id: i32,
     agent_type: AgentType,
+    assistant: Option<&AssistantRef>,
     duration_ms: u64,
     outcome: &DelegationOutcome,
 ) -> CompletedTask {
@@ -1643,11 +1692,13 @@ fn build_completed(
         parent_connection_id: parent_connection_id.to_string(),
         child_conversation_id,
         agent_type,
+        assistant: assistant.cloned(),
         status,
         text,
         error_code,
         message,
         duration_ms,
+        progress: None,
     }
 }
 
@@ -1727,10 +1778,15 @@ fn completed_from_existing_report(
         }
         TaskStatus::Running | TaskStatus::Unknown => return None,
     };
+    let assistant = report.assistant_id.map(|id| AssistantRef {
+        id,
+        name: report.assistant_name.clone().unwrap_or_default(),
+    });
     Some(build_completed(
         parent_connection_id,
         child_conversation_id,
         agent_type,
+        assistant.as_ref(),
         duration_ms,
         &outcome,
     ))
@@ -1743,6 +1799,8 @@ struct SettleContext {
     child_connection_id: String,
     child_conversation_id: i32,
     agent_type: AgentType,
+    /// Assistant identity copied onto terminal events. `None` for an agent child.
+    assistant: Option<AssistantRef>,
     task_preview: String,
     duration_ms: u64,
     /// When true, cancel the child turn before disconnect (user/parent cancel).
@@ -1784,6 +1842,7 @@ impl SettleContext {
             child_connection_id: task.child_connection_id.clone(),
             child_conversation_id: task.child_conversation_id,
             agent_type: task.agent_type,
+            assistant: task.assistant.clone(),
             task_preview: task.task_preview.clone(),
             duration_ms,
             cancel_turn,
@@ -1845,6 +1904,10 @@ fn parent_end_setup_report(
         last_agent_activity_at: None,
         stalled_since: None,
         recovery: None,
+        blocked_on: None,
+        assistant_id: None,
+        assistant_name: None,
+        progress: None,
     }
 }
 
@@ -2473,6 +2536,11 @@ fn report_from_outcome(
         last_agent_activity_at: None,
         stalled_since: None,
         recovery: None,
+        // Terminal by construction — nothing is waiting on the user anymore.
+        blocked_on: None,
+        assistant_id: None,
+        assistant_name: None,
+        progress: None,
     }
 }
 
@@ -2833,6 +2901,10 @@ fn running_ack(
         last_agent_activity_at: None,
         stalled_since: None,
         recovery: None,
+        blocked_on: None,
+        assistant_id: None,
+        assistant_name: None,
+        progress: None,
     }
 }
 
@@ -2953,6 +3025,27 @@ fn continue_idempotent_ack(
     }
 }
 
+/// The mode and config values a delegation child launches with.
+///
+/// An assistant child runs on the assistant's own complete selection and
+/// nothing else: the per-agent `defaults` never fill in around it, not even
+/// for an option the agent added after the selection was saved — that one
+/// keeps the agent's own value. Any other child takes the per-agent defaults.
+fn launch_preferences(
+    assistant: Option<&DelegationAssistant>,
+    defaults: Option<&AgentDelegationDefaults>,
+) -> (Option<String>, BTreeMap<String, String>) {
+    match assistant {
+        Some(a) => (
+            a.agent_options.mode_id.clone(),
+            a.agent_options.config_values.clone(),
+        ),
+        None => defaults
+            .map(|d| (d.mode_id.clone(), d.config_values.clone()))
+            .unwrap_or((None, BTreeMap::new())),
+    }
+}
+
 /// Cap on the free-form `reason` a `resume_delegation` call may carry into the
 /// child's continuation prompt. The reason is interruption CONTEXT, not new
 /// instructions — the cap (shared with `TASK_PREVIEW_CAP`'s budget) keeps it
@@ -3023,6 +3116,10 @@ fn resume_ack(
         last_agent_activity_at: None,
         stalled_since: None,
         recovery: None,
+        blocked_on: None,
+        assistant_id: None,
+        assistant_name: None,
+        progress: None,
     }
 }
 
@@ -3057,6 +3154,10 @@ fn not_resumable_report(
         last_agent_activity_at: None,
         stalled_since: None,
         recovery: None,
+        blocked_on: None,
+        assistant_id: None,
+        assistant_name: None,
+        progress: None,
     }
 }
 
@@ -3175,7 +3276,12 @@ fn running_report(task_id: &str, task: &RunningTask) -> DelegationTaskReport {
         last_agent_activity_at: None,
         stalled_since: None,
         recovery: None,
+        blocked_on: None,
+        assistant_id: None,
+        assistant_name: None,
+        progress: None,
     }
+    .with_assistant(task.assistant.as_ref())
 }
 
 /// Status report from a cached completed result.
@@ -3195,7 +3301,12 @@ fn completed_report(task_id: &str, c: &CompletedTask) -> DelegationTaskReport {
         last_agent_activity_at: None,
         stalled_since: None,
         recovery: None,
+        blocked_on: None,
+        assistant_id: None,
+        assistant_name: None,
+        progress: c.progress.clone(),
     }
+    .with_assistant(c.assistant.as_ref())
 }
 
 /// Status report when a task id isn't known to the caller (never existed,
@@ -3220,6 +3331,10 @@ fn unknown_report(task_id: &str) -> DelegationTaskReport {
         last_agent_activity_at: None,
         stalled_since: None,
         recovery: None,
+        blocked_on: None,
+        assistant_id: None,
+        assistant_name: None,
+        progress: None,
     }
 }
 
@@ -3249,7 +3364,12 @@ fn db_report(task_id: &str, rec: &ChildStatusRecord) -> DelegationTaskReport {
         last_agent_activity_at: None,
         stalled_since: None,
         recovery: None,
+        blocked_on: None,
+        assistant_id: None,
+        assistant_name: None,
+        progress: None,
     }
+    .with_assistant(rec.assistant.as_ref())
 }
 
 /// Per-id classification captured under the pending lock during a (possibly
@@ -3574,6 +3694,14 @@ pub enum DelegationMatchKey {
     },
 }
 
+impl DelegationMatchKey {
+    pub fn task(&self) -> &str {
+        match self {
+            Self::Delegate { task, .. } | Self::Continue { task, .. } => task,
+        }
+    }
+}
+
 /// Outcome of the shared exact parent-tool claim resolver used by
 /// `delegate_to_agent` and `continue_delegation`. Never invents a parent id
 /// and never falls back to unkeyed FIFO for these two tools.
@@ -3754,6 +3882,10 @@ pub struct DelegationBroker {
     /// no-op ("no hint"); production wires `ConnectionManagerLiveReplyLookup` via
     /// `with_live_reply_lookup`.
     live_reply_lookup: Arc<dyn ChildLiveReplyLookup>,
+    /// Resolves the assistant a call names, at call time. Defaults to "no
+    /// assistants"; production wires `DbAssistantLookup` via
+    /// `with_assistants`.
+    assistants: Arc<dyn AssistantLookup>,
     pending: Arc<PendingCalls>,
     tool_calls: Arc<ToolCallTracker>,
     pre_canceled_handles: Arc<PreCanceledHandles>,
@@ -4079,6 +4211,7 @@ impl DelegationBroker {
             persistence_retry_inflight: Arc::new(std::sync::Mutex::new(HashSet::new())),
             pending_terminal_completion: Arc::new(Mutex::new(HashMap::new())),
             live_reply_lookup: Arc::new(NoopChildLiveReplyLookup),
+            assistants: Arc::new(NoAssistants),
             pending: Arc::new(PendingCalls::default()),
             tool_calls: Arc::new(ToolCallTracker::default()),
             pre_canceled_handles: Arc::new(PreCanceledHandles::default()),
@@ -5225,6 +5358,33 @@ impl DelegationBroker {
         Ok(task_count)
     }
 
+    /// Replace the assistant lookup (default: no assistants). Builder-style,
+    /// like `with_status_lookup`.
+    pub fn with_assistants(mut self, assistants: Arc<dyn AssistantLookup>) -> Self {
+        self.assistants = assistants;
+        self
+    }
+
+    /// The assistant a `delegate_to_agent` call may run as — with the agent
+    /// it runs on — read now, never frozen at session launch.
+    pub async fn resolve_assistant(&self, id: i32) -> Option<(AgentType, DelegationAssistant)> {
+        self.assistants
+            .delegatable(id)
+            .await
+            .map(|a| (a.agent_type, a.into()))
+    }
+
+    /// Every assistant a delegation may run as right now, for the companion's
+    /// schema roster and the not-found refusal.
+    pub async fn assistant_roster(&self) -> Vec<AssistantRosterEntry> {
+        self.assistants
+            .roster()
+            .await
+            .iter()
+            .map(AssistantRosterEntry::from)
+            .collect()
+    }
+
     /// Record a parent ACP `tool_call_id` whose title indicates the LLM is
     /// invoking `delegate_to_agent`. The next broker round-trip from the
     /// same `parent_connection_id` will claim this id as its
@@ -6069,6 +6229,64 @@ impl DelegationBroker {
         }
     }
 
+    /// One-line summaries of the keyed pending entries still unclaimed on
+    /// this parent, for the synthetic-fallback WARN: a budget expiry with
+    /// keyed entries present means their keys disagree with the request's key
+    /// (an ACP-side parse that doesn't match what the MCP call actually
+    /// carries), and the summaries make that mismatch visible in the log
+    /// without a reproducer. Keyed entries are never FIFO-claimed, so they
+    /// persist here until their own round-trip, a terminal tombstone, or
+    /// teardown.
+    #[allow(dead_code)]
+    pub(crate) async fn unmatched_pending_key_summaries(
+        &self,
+        parent_connection_id: &str,
+    ) -> Vec<String> {
+        let map = self.tool_calls.inner.lock().await;
+        let Some(bucket) = map.get(parent_connection_id) else {
+            return Vec::new();
+        };
+        bucket
+            .pending
+            .iter()
+            .filter_map(|p| {
+                let key = p.match_key.as_ref()?;
+                let summary = match key {
+                    DelegationMatchKey::Delegate {
+                        agent_type,
+                        task,
+                        working_dir,
+                        ..
+                    } => {
+                        let task_preview: String = task.chars().take(80).collect();
+                        let dir_preview: String = working_dir
+                            .as_deref()
+                            .unwrap_or("-")
+                            .chars()
+                            .take(120)
+                            .collect();
+                        format!(
+                            "id={} target={agent_type:?} task={task_preview:?} dir={dir_preview}",
+                            p.tool_call_id,
+                        )
+                    }
+                    DelegationMatchKey::Continue {
+                        target_task_id,
+                        task,
+                        ..
+                    } => {
+                        let task_preview: String = task.chars().take(80).collect();
+                        format!(
+                            "id={} target={target_task_id:?} task={task_preview:?} dir=-",
+                            p.tool_call_id,
+                        )
+                    }
+                };
+                Some(summary)
+            })
+            .collect()
+    }
+
     /// Remove `handle` from the pre-cancel set, returning whether it was
     /// present. Used by `handle_request` at two checkpoints (entry + just
     /// after pending registration) so a cancel that lost the race with the
@@ -6278,9 +6496,18 @@ impl DelegationBroker {
     /// `handle_request` is that "park a `oneshot` and await it" becomes "insert a
     /// [`RunningTask`] and return the ack."
     pub async fn start_delegation(&self, req: DelegationRequest) -> DelegationTaskReport {
+        let identity = req.assistant.as_ref().map(DelegationAssistant::identity);
         let connection_incarnation = req.parent_connection_id.clone();
-        self.start_delegation_for_incarnation(req, &connection_incarnation)
-            .await
+        let mut report = self
+            .start_delegation_for_incarnation(req, &connection_incarnation)
+            .await;
+        if let Some(assistant) = identity {
+            if report.status != TaskStatus::Unknown {
+                report.assistant_id = Some(assistant.id);
+                report.assistant_name = Some(assistant.name);
+            }
+        }
+        report
     }
 
     #[tracing::instrument(
@@ -6806,39 +7033,39 @@ impl DelegationBroker {
                 }
             }
         }
-        let (preferred_mode_id, preferred_config_values) =
-            if let Some(profile_id) = req.profile_id.as_deref() {
-                let Some(profile) = cfg.profiles.get(profile_id) else {
-                    self.drop_inflight(inflight_id).await;
-                    return report_err(
-                        req.agent_type,
-                        DelegationError::InvalidDelegationProfile(profile_id.into()),
-                        None,
-                    );
-                };
-                if !profile.enabled {
-                    self.drop_inflight(inflight_id).await;
-                    return report_err(
-                        req.agent_type,
-                        DelegationError::DelegationProfileDisabled(profile_id.into()),
-                        None,
-                    );
-                }
-                if profile.agent_type != req.agent_type {
-                    self.drop_inflight(inflight_id).await;
-                    return report_err(
-                        req.agent_type,
-                        DelegationError::DelegationProfileAgentMismatch(profile_id.into()),
-                        None,
-                    );
-                }
-                (profile.mode_id.clone(), profile.config_values.clone())
-            } else {
-                cfg.agent_defaults
-                    .get(&req.agent_type)
-                    .map(|d: &AgentDelegationDefaults| (d.mode_id.clone(), d.config_values.clone()))
-                    .unwrap_or((None, BTreeMap::new()))
+        let (preferred_mode_id, preferred_config_values) = if req.assistant.is_some() {
+            // An assistant runs on its own selection. Profile routing still
+            // ran above; it does not replace the assistant's options.
+            launch_preferences(req.assistant.as_ref(), None)
+        } else if let Some(profile_id) = req.profile_id.as_deref() {
+            let Some(profile) = cfg.profiles.get(profile_id) else {
+                self.drop_inflight(inflight_id).await;
+                return report_err(
+                    req.agent_type,
+                    DelegationError::InvalidDelegationProfile(profile_id.into()),
+                    None,
+                );
             };
+            if !profile.enabled {
+                self.drop_inflight(inflight_id).await;
+                return report_err(
+                    req.agent_type,
+                    DelegationError::DelegationProfileDisabled(profile_id.into()),
+                    None,
+                );
+            }
+            if profile.agent_type != req.agent_type {
+                self.drop_inflight(inflight_id).await;
+                return report_err(
+                    req.agent_type,
+                    DelegationError::DelegationProfileAgentMismatch(profile_id.into()),
+                    None,
+                );
+            }
+            (profile.mode_id.clone(), profile.config_values.clone())
+        } else {
+            launch_preferences(None, cfg.agent_defaults.get(&req.agent_type))
+        };
         // Live secret re-resolution: preferred_config_values may include
         // credentials. build_live_launch_config keeps them for spawn while
         // the durable snapshot stores allowlisted non-secret keys only.
@@ -6992,6 +7219,12 @@ impl DelegationBroker {
                     parent_conversation_id: req.parent_conversation_id,
                     parent_tool_use_id: req.parent_tool_use_id.clone(),
                     delegation_call_id: call_id.clone(),
+                    assistant: req.assistant.as_ref().map(|a| {
+                        crate::acp::delegation::spawner::AssistantLink {
+                            id: a.id,
+                            snapshot: a.run_snapshot(),
+                        }
+                    }),
                 }),
             )
             .await
@@ -7558,7 +7791,20 @@ impl DelegationBroker {
             parent_conversation_id: req.parent_conversation_id,
             parent_tool_use_id: req.parent_tool_use_id.clone(),
             delegation_call_id: call_id.clone(),
+            assistant: req.assistant.as_ref().map(|a| {
+                crate::acp::delegation::spawner::AssistantLink {
+                    id: a.id,
+                    snapshot: a.run_snapshot(),
+                }
+            }),
         };
+        // The assistant's standing instructions ride the child's first prompt
+        // as a trailing internal frame (see `render_assistant_brief`).
+        let identity = req.assistant.as_ref().map(DelegationAssistant::identity);
+        let brief = req
+            .assistant
+            .as_ref()
+            .and_then(|a| render_assistant_brief(&a.name, &a.instructions));
 
         // Reserve this delegation (both ids) BEFORE sending its first prompt.
         // `send_prompt_linked_for_delegation` persists the delegation link onto
@@ -7842,6 +8088,7 @@ impl DelegationBroker {
                 can_spawn_child,
                 link,
                 prebound_child,
+                brief,
             )
             .await
         {
@@ -7896,6 +8143,7 @@ impl DelegationBroker {
                         child_connection_id: child_connection_id.clone(),
                         child_conversation_id: cid,
                         agent_type: req.agent_type,
+                        assistant: identity.clone(),
                         task_preview: task_preview.clone(),
                         duration_ms: 0,
                         cancel_turn: false,
@@ -8049,7 +8297,9 @@ impl DelegationBroker {
             .rebase_started_at(accepted.prompt_accepted_at);
 
         // The child is now running. Stamp the start so terminal paths can
-        // report a real `duration_ms`.
+        // report a real `duration_ms`. Running meta and DelegationStarted are
+        // published once, under publication_lock, after this call is registered
+        // — an earlier publish raced ahead of a terminal that won the park.
         let started_at = Instant::now();
 
         // --- Register pending, or resolve a terminal that beat us -------------
@@ -8193,6 +8443,7 @@ impl DelegationBroker {
                                     parent_tool_use_id: req.parent_tool_use_id.clone(),
                                     agent_type: req.agent_type,
                                     generation: 1,
+                                    assistant: identity.clone(),
                                     task_preview: task_preview.clone(),
                                     external_handle: req.external_handle.clone(),
                                     started_at,
@@ -8233,6 +8484,7 @@ impl DelegationBroker {
                     child_connection_id: child_connection_id.clone(),
                     child_conversation_id,
                     agent_type: req.agent_type,
+                    assistant: identity.clone(),
                     task_preview: task_preview.clone(),
                     duration_ms: setup_duration_ms,
                     cancel_turn: false,
@@ -8268,6 +8520,7 @@ impl DelegationBroker {
                     child_connection_id: child_connection_id.clone(),
                     child_conversation_id,
                     agent_type: req.agent_type,
+                    assistant: identity.clone(),
                     task_preview: task_preview.clone(),
                     duration_ms: setup_duration_ms,
                     cancel_turn: true,
@@ -8295,6 +8548,7 @@ impl DelegationBroker {
                     child_connection_id: child_connection_id.clone(),
                     child_conversation_id,
                     agent_type: req.agent_type,
+                    assistant: identity.clone(),
                     task_preview: task_preview.clone(),
                     duration_ms: setup_duration_ms,
                     cancel_turn: true,
@@ -8352,6 +8606,7 @@ impl DelegationBroker {
                         &child_connection_id,
                         child_conversation_id,
                         req.agent_type,
+                        identity.as_ref(),
                         &task_preview,
                         &call_id,
                         started_at,
@@ -8397,6 +8652,7 @@ impl DelegationBroker {
                         child_connection_id: child_connection_id.clone(),
                         child_conversation_id,
                         agent_type: req.agent_type,
+                        assistant: identity.clone(),
                         task_preview: task_preview.clone(),
                         duration_ms,
                         cancel_turn: true,
@@ -8722,20 +8978,26 @@ impl DelegationBroker {
                 }
                 // Atomic settling → completed (or first completed insert for
                 // setup-window settles that never entered `running`).
+                // Snapshot tool progress now: the child session is about to
+                // go, and a later status read must still show where it ended.
+                let progress = self
+                    .live_reply_lookup
+                    .progress(&ctx.child_connection_id)
+                    .await;
                 {
                     let mut inner = self.pending.inner.lock().await;
                     inner.settling.remove(task_id);
                     let outcome = report_to_outcome_for_meta(&report, &ctx);
-                    inner.insert_completed(
-                        task_id,
-                        build_completed(
-                            &ctx.parent_connection_id,
-                            ctx.child_conversation_id,
-                            ctx.agent_type,
-                            ctx.duration_ms,
-                            &outcome,
-                        ),
+                    let mut completed = build_completed(
+                        &ctx.parent_connection_id,
+                        ctx.child_conversation_id,
+                        ctx.agent_type,
+                        ctx.assistant.as_ref(),
+                        ctx.duration_ms,
+                        &outcome,
                     );
+                    completed.progress = progress;
+                    inner.insert_completed(task_id, completed);
                 }
                 self.result_notify.notify_waiters();
                 // Terminal: drop observation cache entry and wake supervisor.
@@ -8825,6 +9087,13 @@ impl DelegationBroker {
                     last_agent_activity_at: None,
                     stalled_since: None,
                     recovery: None,
+                    blocked_on: None,
+                    assistant_id: ctx.assistant.as_ref().map(|assistant| assistant.id),
+                    assistant_name: ctx
+                        .assistant
+                        .as_ref()
+                        .map(|assistant| assistant.name.clone()),
+                    progress: None,
                 };
                 {
                     let mut inner = self.pending.inner.lock().await;
@@ -8835,11 +9104,13 @@ impl DelegationBroker {
                             parent_connection_id: ctx.parent_connection_id.clone(),
                             child_conversation_id: ctx.child_conversation_id,
                             agent_type: ctx.agent_type,
+                            assistant: ctx.assistant.clone(),
                             status: TaskStatus::Failed,
                             text: None,
                             error_code: Some("persistence_error".into()),
                             message: report.message.clone(),
                             duration_ms: ctx.duration_ms,
+                            progress: None,
                         },
                     );
                 }
@@ -8953,6 +9224,7 @@ impl DelegationBroker {
             &ctx.child_connection_id,
             ctx.child_conversation_id,
             ctx.agent_type,
+            ctx.assistant.as_ref(),
             task_id,
             runtime_stats,
             outcome_to_summary(&outcome_for_meta, ctx.duration_ms),
@@ -11036,6 +11308,7 @@ impl DelegationBroker {
             parent_conversation_id: req.parent_conversation_id,
             parent_tool_use_id: req.parent_tool_use_id.clone(),
             delegation_call_id: reserved.task_id.clone(),
+            assistant: None,
         };
         let accepted = match self
             .spawner
@@ -11045,6 +11318,7 @@ impl DelegationBroker {
                 can_spawn_child,
                 link,
                 Some((reserved.child_conversation_id, folder_id)),
+                None,
             )
             .await
         {
@@ -11365,6 +11639,7 @@ impl DelegationBroker {
                             parent_tool_use_id: req.parent_tool_use_id.clone(),
                             agent_type: reserved.agent_type,
                             generation: reserved.generation,
+                            assistant: None,
                             task_preview: task_preview.clone(),
                             external_handle: req.external_handle.clone(),
                             started_at,
@@ -11413,6 +11688,7 @@ impl DelegationBroker {
                 child_connection_id: child_connection_id.clone(),
                 child_conversation_id: reserved.child_conversation_id,
                 agent_type: reserved.agent_type,
+                assistant: None,
                 task_preview: task_preview.clone(),
                 duration_ms: started_at.elapsed().as_millis() as u64,
                 cancel_turn: matches!(
@@ -11474,6 +11750,7 @@ impl DelegationBroker {
                 &child_connection_id,
                 reserved.child_conversation_id,
                 reserved.agent_type,
+                None,
                 &task_preview,
                 &reserved.task_id,
                 started_wall,
@@ -11515,6 +11792,7 @@ impl DelegationBroker {
                         child_connection_id: child_connection_id.clone(),
                         child_conversation_id: reserved.child_conversation_id,
                         agent_type: reserved.agent_type,
+                        assistant: None,
                         task_preview: task_preview.clone(),
                         duration_ms,
                         cancel_turn: true,
@@ -12331,6 +12609,7 @@ impl DelegationBroker {
                                 parent_connection_id,
                                 child_conversation_id,
                                 agent_type,
+                                None,
                                 0,
                                 &adopted_outcome,
                             );
@@ -12954,6 +13233,7 @@ impl DelegationBroker {
                                 &id.parent_connection_id,
                                 id.child_conversation_id,
                                 id.agent_type,
+                                None,
                                 0,
                                 &outcome,
                             ),
@@ -13278,33 +13558,42 @@ impl DelegationBroker {
                 });
             if upgrade_overlay {
                 if let Some(acc) = accounting {
-                    let (parent_connection_id, child_conversation_id, agent_type, duration_ms) =
-                        if let Some(existing) = inner.completed.get(task_id) {
-                            (
-                                existing.parent_connection_id.clone(),
-                                existing.child_conversation_id,
-                                existing.agent_type,
-                                existing.duration_ms,
-                            )
-                        } else {
-                            (
-                                acc.parent_connection_id.clone(),
-                                acc.child_conversation_id,
-                                acc.agent_type,
-                                acc.duration_ms,
-                            )
-                        };
+                    let (
+                        parent_connection_id,
+                        child_conversation_id,
+                        agent_type,
+                        assistant,
+                        duration_ms,
+                    ) = if let Some(existing) = inner.completed.get(task_id) {
+                        (
+                            existing.parent_connection_id.clone(),
+                            existing.child_conversation_id,
+                            existing.agent_type,
+                            existing.assistant.clone(),
+                            existing.duration_ms,
+                        )
+                    } else {
+                        (
+                            acc.parent_connection_id.clone(),
+                            acc.child_conversation_id,
+                            acc.agent_type,
+                            None,
+                            acc.duration_ms,
+                        )
+                    };
                     inner.insert_completed(
                         task_id,
                         CompletedTask {
                             parent_connection_id,
                             child_conversation_id,
                             agent_type,
+                            assistant,
                             status: TaskStatus::Failed,
                             text: None,
                             error_code: Some("persistence_error".into()),
                             message: Some(persistence_message.clone()),
                             duration_ms,
+                            progress: None,
                         },
                     );
                 }
@@ -13568,6 +13857,7 @@ impl DelegationBroker {
                                 child_connection_id: String::new(),
                                 child_conversation_id: acc.child_conversation_id,
                                 agent_type: acc.agent_type,
+                                assistant: None,
                                 task_preview: String::new(),
                                 duration_ms: acc.duration_ms,
                                 cancel_turn: false,
@@ -13580,12 +13870,17 @@ impl DelegationBroker {
                                 completion_input: None,
                             },
                         );
+                        let assistant = report.assistant_id.map(|id| AssistantRef {
+                            id,
+                            name: report.assistant_name.clone().unwrap_or_default(),
+                        });
                         inner.insert_completed(
                             task_id,
                             build_completed(
                                 &acc.parent_connection_id,
                                 acc.child_conversation_id,
                                 acc.agent_type,
+                                assistant.as_ref(),
                                 acc.duration_ms,
                                 &outcome,
                             ),
@@ -13804,6 +14099,16 @@ impl DelegationBroker {
                             last_agent_activity_at: None,
                             stalled_since: None,
                             recovery: None,
+                            blocked_on: None,
+                            assistant_id: completed
+                                .assistant
+                                .as_ref()
+                                .map(|assistant| assistant.id),
+                            assistant_name: completed
+                                .assistant
+                                .as_ref()
+                                .map(|assistant| assistant.name.clone()),
+                            progress: completed.progress.clone(),
                         };
                         if report.agent_type.is_none() {
                             report.agent_type = Some(agent_type);
@@ -14074,7 +14379,8 @@ impl DelegationBroker {
     /// Mirror of `emit_completed_if_real`: same synthetic-id skip, and the
     /// event rides the parent's stream so the frontend `DelegationContext`
     /// receives it via the parent's per-connection attach stream in
-    /// web/server mode (not only via the desktop firehose).
+    /// web/server mode (not only via the desktop firehose). The lifecycle
+    /// `DelegationChildRunning` goes out first, for every delegation.
     #[allow(clippy::too_many_arguments)]
     async fn emit_started_if_real(
         &self,
@@ -14083,12 +14389,17 @@ impl DelegationBroker {
         child_connection_id: &str,
         child_conversation_id: i32,
         agent_type: AgentType,
+        assistant: Option<&AssistantRef>,
         task_preview: &str,
         task_id: &str,
         started_at: DateTime<Utc>,
         runtime_stats: DelegationRuntimeStats,
         attention_request: Option<crate::acp::delegation::attention::AttentionRequestSummary>,
     ) {
+        // Every delegation counts for the parent's lifecycle, card or not.
+        self.event_emitter
+            .emit_child_running(parent_connection_id, child_connection_id, true)
+            .await;
         if is_synthetic_parent_tool_use_id(parent_tool_use_id) {
             return;
         }
@@ -14099,6 +14410,7 @@ impl DelegationBroker {
                 child_connection_id,
                 child_conversation_id,
                 agent_type,
+                assistant,
                 task_preview,
                 task_id,
                 started_at,
@@ -14112,7 +14424,9 @@ impl DelegationBroker {
     /// stream iff the `parent_tool_use_id` refers to a real ACP tool_call.
     /// Synthetic ids (the `"delegation-<uuid>"` UUID fallback) map to no
     /// live UI binding, so the emit would be wasted noise — same skip
-    /// criterion as `write_meta_if_real`.
+    /// criterion as `write_meta_if_real`. The lifecycle
+    /// `DelegationChildRunning` is not skipped: the parent still has to know
+    /// the child is done.
     #[allow(clippy::too_many_arguments)]
     async fn emit_completed_if_real(
         &self,
@@ -14121,11 +14435,15 @@ impl DelegationBroker {
         child_connection_id: &str,
         child_conversation_id: i32,
         agent_type: AgentType,
+        assistant: Option<&AssistantRef>,
         task_id: &str,
         runtime_stats: DelegationRuntimeStats,
         result: DelegationResultSummary,
         card_summary: Option<CardSummary>,
     ) {
+        self.event_emitter
+            .emit_child_running(parent_connection_id, child_connection_id, false)
+            .await;
         if is_synthetic_parent_tool_use_id(parent_tool_use_id) {
             return;
         }
@@ -14136,6 +14454,7 @@ impl DelegationBroker {
                 child_connection_id,
                 child_conversation_id,
                 agent_type,
+                assistant,
                 task_id,
                 runtime_stats,
                 result,
@@ -15824,6 +16143,9 @@ impl DelegationBroker {
                     self.attach_live_reply(&mut report, &child_connection_id)
                         .await;
                     self.attach_observation(&mut report, id).await;
+                    // The steps it got through stay true while it waits, so
+                    // they ride along either way.
+                    report.progress = self.live_reply_lookup.progress(&child_connection_id).await;
                     report
                 }
                 StatusClass::NotInMemory => {
@@ -16025,6 +16347,13 @@ impl DelegationBroker {
                             last_agent_activity_at: None,
                             stalled_since: None,
                             recovery: None,
+                            blocked_on: None,
+                            assistant_id: task.assistant.as_ref().map(|assistant| assistant.id),
+                            assistant_name: task
+                                .assistant
+                                .as_ref()
+                                .map(|assistant| assistant.name.clone()),
+                            progress: None,
                         }
                     }
                 }
@@ -16157,9 +16486,10 @@ impl DelegationBroker {
         if let Some(handle) = req.external_handle.as_deref() {
             if self.take_pre_canceled_handle(handle).await {
                 self.drop_inflight(inflight_id).await;
+                let (agent_type, assistant) = self.owned_task_identity(&req).await;
                 return report_from_outcome(
                     Some(req.task_id.clone()),
-                    None,
+                    agent_type,
                     &DelegationOutcome::from_err(
                         DelegationError::Canceled {
                             reason: "canceled before resume".into(),
@@ -16167,15 +16497,17 @@ impl DelegationBroker {
                         None,
                     ),
                     None,
-                );
+                )
+                .with_assistant(assistant.as_ref());
             }
         }
         let cfg = self.config_snapshot().await;
         if !cfg.enabled {
             self.drop_inflight(inflight_id).await;
+            let (agent_type, assistant) = self.owned_task_identity(&req).await;
             return report_from_outcome(
                 Some(req.task_id.clone()),
-                None,
+                agent_type,
                 &DelegationOutcome::from_err(
                     DelegationError::Canceled {
                         reason: "delegation disabled".into(),
@@ -16183,7 +16515,8 @@ impl DelegationBroker {
                     None,
                 ),
                 None,
-            );
+            )
+            .with_assistant(assistant.as_ref());
         }
 
         // --- In-memory gate ---------------------------------------------------
@@ -16212,58 +16545,74 @@ impl DelegationBroker {
                 } else {
                     // Copy the report fields out so the `completed` borrow ends
                     // before the Canceled arm's mutable `resuming` claim.
-                    let (status, child_conversation_id, agent_type) =
-                        (c.status, c.child_conversation_id, c.agent_type);
+                    let (status, child_conversation_id, agent_type, assistant) = (
+                        c.status,
+                        c.child_conversation_id,
+                        c.agent_type,
+                        c.assistant.clone(),
+                    );
                     match status {
                         TaskStatus::Canceled => {
                             // Caller-owned — safe to name the contention.
                             if inner.resuming.insert(req.task_id.clone()) {
                                 MemGate::Proceed { claimed: true }
                             } else {
-                                MemGate::Refuse(Box::new(not_resumable_report(
-                                    &req.task_id,
-                                    status,
-                                    Some(child_conversation_id),
-                                    Some(agent_type),
-                                    "a resume of this task is already in progress.",
-                                )))
+                                MemGate::Refuse(Box::new(
+                                    not_resumable_report(
+                                        &req.task_id,
+                                        status,
+                                        Some(child_conversation_id),
+                                        Some(agent_type),
+                                        "a resume of this task is already in progress.",
+                                    )
+                                    .with_assistant(assistant.as_ref()),
+                                ))
                             }
                         }
-                        TaskStatus::Completed => MemGate::Refuse(Box::new(not_resumable_report(
-                            &req.task_id,
-                            status,
-                            Some(child_conversation_id),
-                            Some(agent_type),
-                            "the task already completed — resume only applies to a \
+                        TaskStatus::Completed => MemGate::Refuse(Box::new(
+                            not_resumable_report(
+                                &req.task_id,
+                                status,
+                                Some(child_conversation_id),
+                                Some(agent_type),
+                                "the task already completed — resume only applies to a \
                              canceled or interrupted task. Start a new \
                              delegate_to_agent call for follow-up work.",
-                        ))),
-                        _ => MemGate::Refuse(Box::new(not_resumable_report(
-                            &req.task_id,
-                            status,
-                            Some(child_conversation_id),
-                            Some(agent_type),
-                            "the task ended in failure rather than being \
+                            )
+                            .with_assistant(assistant.as_ref()),
+                        )),
+                        _ => MemGate::Refuse(Box::new(
+                            not_resumable_report(
+                                &req.task_id,
+                                status,
+                                Some(child_conversation_id),
+                                Some(agent_type),
+                                "the task ended in failure rather than being \
                              interrupted — resume only applies to a canceled or \
                              interrupted task. Start a new delegate_to_agent call \
                              to retry it.",
-                        ))),
+                            )
+                            .with_assistant(assistant.as_ref()),
+                        )),
                     }
                 }
             } else if let Some(r) = inner.running.get(&req.task_id) {
                 if r.parent_connection_id != req.parent_connection_id {
                     MemGate::Refuse(Box::new(unknown_report(&req.task_id)))
                 } else {
-                    MemGate::Refuse(Box::new(not_resumable_report(
-                        &req.task_id,
-                        TaskStatus::Running,
-                        Some(r.child_conversation_id),
-                        Some(r.agent_type),
-                        "the task is still running — resume only applies to a \
+                    MemGate::Refuse(Box::new(
+                        not_resumable_report(
+                            &req.task_id,
+                            TaskStatus::Running,
+                            Some(r.child_conversation_id),
+                            Some(r.agent_type),
+                            "the task is still running — resume only applies to a \
                          canceled or interrupted task. Poll it with \
                          get_delegation_status (or stop it with cancel_delegation) \
                          instead.",
-                    )))
+                        )
+                        .with_assistant(r.assistant.as_ref()),
+                    ))
                 }
             } else {
                 let claimed = inner.resuming.insert(req.task_id.clone());
@@ -16293,6 +16642,38 @@ impl DelegationBroker {
         report
     }
 
+    /// Whose task a resume refused before reaching its gates names: its agent
+    /// and assistant — but only when the caller owns it, in memory or on the
+    /// child's row. Nothing for anyone else's task, or an unknown one.
+    async fn owned_task_identity(
+        &self,
+        req: &ResumeDelegationRequest,
+    ) -> (Option<AgentType>, Option<AssistantRef>) {
+        {
+            let inner = self.pending.inner.lock().await;
+            if let Some(c) = inner.completed.get(&req.task_id) {
+                return if c.parent_connection_id == req.parent_connection_id {
+                    (Some(c.agent_type), c.assistant.clone())
+                } else {
+                    (None, None)
+                };
+            }
+            if let Some(r) = inner.running.get(&req.task_id) {
+                return if r.parent_connection_id == req.parent_connection_id {
+                    (Some(r.agent_type), r.assistant.clone())
+                } else {
+                    (None, None)
+                };
+            }
+        }
+        match self.status_lookup.find_by_call_id(&req.task_id).await {
+            Some(rec) if rec.parent_id == Some(req.parent_conversation_id) => {
+                (Some(rec.agent_type), rec.assistant)
+            }
+            _ => (None, None),
+        }
+    }
+
     /// The post-gate body of [`Self::resume_delegation`]: DB context + status
     /// gates, child re-spawn, continuation send, and registration. Split out so
     /// the caller can release the `resuming` claim at one exit point.
@@ -16316,6 +16697,26 @@ impl DelegationBroker {
             self.drop_inflight(inflight_id).await;
             return unknown_report(&req.task_id);
         };
+        // Every report from here on names the assistant the child ran as (an
+        // `Unknown` one excepted — see `with_assistant`).
+        let identity = ctx.assistant.identity();
+        self.resume_with_context(req, inflight_id, cfg, claimed, ctx)
+            .await
+            .with_assistant(identity.as_ref())
+    }
+
+    /// [`Self::resume_delegation_gated`] once the child row's context is in
+    /// hand: ownership and status gates, re-spawn, continuation send, and
+    /// registration.
+    async fn resume_with_context(
+        &self,
+        req: ResumeDelegationRequest,
+        inflight_id: u64,
+        cfg: DelegationConfig,
+        claimed: bool,
+        ctx: ChildResumeContext,
+    ) -> DelegationTaskReport {
+        let identity = ctx.assistant.identity();
         if ctx.parent_id != Some(req.parent_conversation_id) {
             self.drop_inflight(inflight_id).await;
             return unknown_report(&req.task_id);
@@ -16506,14 +16907,30 @@ impl DelegationBroker {
             );
         };
 
+        let assistant = match &ctx.assistant {
+            ResumeAssistant::None => None,
+            ResumeAssistant::Snapshot(assistant) => Some(assistant),
+            ResumeAssistant::Unrecoverable { .. } => {
+                self.drop_inflight(inflight_id).await;
+                return not_resumable_report(
+                    &req.task_id,
+                    ctx.status,
+                    Some(ctx.child_conversation_id),
+                    Some(ctx.agent_type),
+                    "the assistant settings this task ran with could not be read back, so \
+                     it cannot be resumed as that assistant. Start a new delegate_to_agent \
+                     call with its assistant_id instead.",
+                );
+            }
+        };
+
         // --- Re-spawn the child, resuming its agent session --------------------
-        // Same per-agent defaults as a fresh spawn; no depth re-check — the
-        // child row already exists at its chain position, resume adds no node.
-        let (preferred_mode_id, preferred_config_values) = cfg
-            .agent_defaults
-            .get(&ctx.agent_type)
-            .map(|d: &AgentDelegationDefaults| (d.mode_id.clone(), d.config_values.clone()))
-            .unwrap_or((None, BTreeMap::new()));
+        // Same launch preferences as a fresh spawn — an assistant child's come
+        // from its row's snapshot, never from the assistant's current row nor
+        // the per-agent defaults; no depth re-check — the child row already
+        // exists at its chain position, resume adds no node.
+        let (preferred_mode_id, preferred_config_values) =
+            launch_preferences(assistant, cfg.agent_defaults.get(&ctx.agent_type));
         // Checkpoint #1: a parent cancel during the gates — nothing spawned yet.
         if let Some(parent_end) = self.take_inflight_cancel(inflight_id).await {
             let mut report = parent_end_setup_report(
@@ -16759,6 +17176,10 @@ impl DelegationBroker {
                 build_resume_prompt(req.reason.as_deref()),
                 ctx.folder_id,
                 ctx.child_conversation_id,
+                // The brief rides every resume prompt too: a second copy of the
+                // instructions costs nothing, and an agent that lost the
+                // session's history would otherwise lose them with it.
+                assistant.and_then(|a| render_assistant_brief(&a.name, &a.instructions)),
             )
             .await
         {
@@ -16782,6 +17203,7 @@ impl DelegationBroker {
                 child_connection_id: child_connection_id.clone(),
                 child_conversation_id: ctx.child_conversation_id,
                 agent_type: ctx.agent_type,
+                assistant: identity.clone(),
                 task_preview: task_preview.clone(),
                 duration_ms: 0,
                 cancel_turn: false,
@@ -16803,6 +17225,42 @@ impl DelegationBroker {
         }
 
         let started_at = Instant::now();
+        let runtime_stats = runtime.projector.lock().await.snapshot();
+
+        // Re-mark the parent's original card in-flight and re-announce the live
+        // delegation so the frontend re-binds the child sub-thread.
+        self.write_meta_if_real(
+            &req.parent_connection_id,
+            &parent_tool_use_id,
+            build_delegation_meta(&DelegationMetaSnapshot {
+                status: "running".into(),
+                task_preview: Some(task_preview.clone()),
+                task_id: call_id.clone(),
+                child_connection_id: Some(child_connection_id.clone()),
+                child_conversation_id: ctx.child_conversation_id,
+                error_code: None,
+                text_preview: None,
+                started_at: runtime_stats.started_at,
+                finished_at: None,
+                runtime_stats: Some(runtime_stats.clone()),
+                attention_request: None,
+            }),
+        )
+        .await;
+        self.emit_started_if_real(
+            &req.parent_connection_id,
+            &parent_tool_use_id,
+            &child_connection_id,
+            ctx.child_conversation_id,
+            ctx.agent_type,
+            identity.as_ref(),
+            &task_preview,
+            &call_id,
+            runtime_stats.started_at,
+            runtime_stats,
+            None,
+        )
+        .await;
 
         // --- Register running, or resolve a terminal that beat us --------------
         // Same atomic disposition as `start_delegation` (see the long comment
@@ -16892,6 +17350,7 @@ impl DelegationBroker {
                                     parent_tool_use_id: parent_tool_use_id.clone(),
                                     agent_type: ctx.agent_type,
                                     generation,
+                                    assistant: identity.clone(),
                                     task_preview: task_preview.clone(),
                                     external_handle: req.external_handle.clone(),
                                     started_at,
@@ -16928,6 +17387,7 @@ impl DelegationBroker {
                     child_connection_id: child_connection_id.clone(),
                     child_conversation_id: ctx.child_conversation_id,
                     agent_type: ctx.agent_type,
+                    assistant: identity.clone(),
                     task_preview: task_preview.clone(),
                     duration_ms: setup_duration_ms,
                     cancel_turn: false,
@@ -16962,6 +17422,7 @@ impl DelegationBroker {
                     child_connection_id: child_connection_id.clone(),
                     child_conversation_id: ctx.child_conversation_id,
                     agent_type: ctx.agent_type,
+                    assistant: identity.clone(),
                     task_preview: task_preview.clone(),
                     duration_ms: setup_duration_ms,
                     cancel_turn: true,
@@ -16985,6 +17446,7 @@ impl DelegationBroker {
                     child_connection_id: child_connection_id.clone(),
                     child_conversation_id: ctx.child_conversation_id,
                     agent_type: ctx.agent_type,
+                    assistant: identity.clone(),
                     task_preview: task_preview.clone(),
                     duration_ms: setup_duration_ms,
                     cancel_turn: true,
@@ -17033,6 +17495,7 @@ impl DelegationBroker {
                         &child_connection_id,
                         ctx.child_conversation_id,
                         ctx.agent_type,
+                        identity.as_ref(),
                         &task_preview,
                         &call_id,
                         started_at,
@@ -17216,6 +17679,7 @@ impl DelegationBroker {
                 parent_tool_use_id: format!("pt-{task_id}"),
                 agent_type: AgentType::ClaudeCode,
                 generation: 1,
+                assistant: None,
                 task_preview: "test task".into(),
                 external_handle: None,
                 started_at: Instant::now(),
@@ -17401,6 +17865,10 @@ impl ChildStatusLookup for DbChildStatusLookup {
             agent_type: summary.agent_type,
             parent_id: summary.parent_id,
             error_code: summary.delegation_error_code.clone(),
+            assistant: summary.assistant_id.map(|id| AssistantRef {
+                id,
+                name: summary.assistant_name.clone().unwrap_or_default(),
+            }),
         })
     }
 
@@ -17421,6 +17889,40 @@ impl ChildStatusLookup for DbChildStatusLookup {
                 .ok()
                 .flatten()
                 .map(|f| f.path);
+        // The assistant AS IT WAS when the delegation started, off the row —
+        // never the assistant's current configuration. Whether the child IS an
+        // assistant child is the summary's say (`assistant_id`), so a failed or
+        // unreadable snapshot read cannot pass one off as a plain agent child.
+        let assistant = match summary.assistant_id {
+            None => ResumeAssistant::None,
+            Some(id) => match crate::db::service::conversation_service::get_assistant_run(
+                &self.db.conn,
+                summary.id,
+            )
+            .await
+            {
+                Ok(Some((_, Some(snapshot)))) => ResumeAssistant::Snapshot(DelegationAssistant {
+                    id,
+                    name: snapshot.name,
+                    agent_options: snapshot.agent_options,
+                    instructions: snapshot.instructions,
+                }),
+                Ok(_) => ResumeAssistant::Unrecoverable {
+                    id,
+                    name: summary.assistant_name.clone(),
+                },
+                Err(e) => {
+                    tracing::warn!(
+                        "[delegation] assistant snapshot read for child {} failed: {e}",
+                        summary.id
+                    );
+                    ResumeAssistant::Unrecoverable {
+                        id,
+                        name: summary.assistant_name.clone(),
+                    }
+                }
+            },
+        };
         Some(ChildResumeContext {
             child_conversation_id: summary.id,
             status: task_status_from_row(summary.delegation_task_status.as_ref(), &summary.status),
@@ -17431,6 +17933,7 @@ impl ChildStatusLookup for DbChildStatusLookup {
             folder_id: summary.folder_id,
             working_dir,
             title: summary.title,
+            assistant,
         })
     }
 }
@@ -17731,6 +18234,8 @@ mod tests {
                     parent_conversation_id: parent.id,
                     parent_tool_use_id: "telemetry-source-tool".into(),
                     delegation_call_id: source_task_id.clone(),
+
+                    assistant: None,
                 }),
             )
             .await
@@ -17822,6 +18327,8 @@ mod tests {
                     parent_conversation_id: parent.id,
                     parent_tool_use_id: "resume-source-tool".into(),
                     delegation_call_id: source_task_id.into(),
+
+                    assistant: None,
                 }),
             )
             .await
@@ -18185,6 +18692,8 @@ mod tests {
                     parent_conversation_id: parent.id,
                     parent_tool_use_id: "status-source-tool".into(),
                     delegation_call_id: source_task_id.into(),
+
+                    assistant: None,
                 }),
             )
             .await
@@ -18320,6 +18829,7 @@ mod tests {
             admission_ticket: None,
             recovery_authorization_id: None,
             orchestration_binding: None,
+            assistant: None,
         }
     }
 
@@ -18502,6 +19012,8 @@ mod tests {
                 parent_conversation_id: parent.id,
                 parent_tool_use_id: format!("ticket-v1-auth-{case}-source-tool"),
                 delegation_call_id: source_task_id.clone(),
+
+                assistant: None,
             }),
         )
         .await
@@ -19419,6 +19931,8 @@ mod tests {
                     parent_conversation_id: parent.id,
                     parent_tool_use_id: source_tool_id.clone(),
                     delegation_call_id: source_task_id.clone(),
+
+                    assistant: None,
                 }),
             )
             .await
@@ -19607,6 +20121,8 @@ mod tests {
                 parent_conversation_id: parent.id,
                 parent_tool_use_id: "binding-replacement-source-tool".into(),
                 delegation_call_id: source_task_id.clone(),
+
+                assistant: None,
             }),
         )
         .await
@@ -19929,6 +20445,72 @@ mod tests {
             report.message.as_deref(),
             Some("Running.\nLatest sub-agent reply: Reading config.rs")
         );
+    }
+
+    /// A running report carries the child's progress, and the finished one the
+    /// tally its session kept at the end — the parent's card draws both.
+    #[tokio::test]
+    async fn status_reports_carry_the_childs_progress() {
+        use crate::acp::delegation::live_reply::mock::MockChildLiveReplyLookup;
+        use crate::acp::delegation::types::StepMark;
+
+        let mock = Arc::new(MockSpawner::new());
+        mock.queue_spawn(Ok("child-conn-1".into())).await;
+        mock.queue_send(Ok(crate::acp::delegation::spawner::accepted(
+            42,
+            chrono::Utc::now(),
+        )))
+        .await;
+        let lookup = Arc::new(MockChildLiveReplyLookup::new(None));
+        let broker =
+            DelegationBroker::new(mock.clone() as Arc<dyn ConnectionSpawner>, shallow_lookup())
+                .with_live_reply_lookup(lookup.clone());
+        enable_delegation(&broker).await;
+        let task_id = broker
+            .start_delegation(request(1, "pt-1"))
+            .await
+            .task_id
+            .expect("running task carries an id");
+
+        let midway = DelegationProgress {
+            steps: 2,
+            marks: vec![StepMark::Ok, StepMark::Failed],
+            last_step: Some("pnpm test".into()),
+        };
+        lookup.set_progress(Some(midway.clone()));
+        let running = broker
+            .get_task_status("parent-conn", Some(1), &task_id, StatusWait::Snapshot)
+            .await;
+        assert_eq!(running.status, TaskStatus::Running);
+        assert_eq!(running.progress, Some(midway));
+
+        let done = DelegationProgress {
+            steps: 3,
+            marks: vec![StepMark::Ok, StepMark::Failed, StepMark::Ok],
+            last_step: Some("pnpm test".into()),
+        };
+        lookup.set_progress(Some(done.clone()));
+        broker
+            .complete_call(
+                &task_id,
+                DelegationOutcome::Ok(DelegationSuccess {
+                    text: "fixed".into(),
+                    child_conversation_id: 42,
+                    child_agent_type: AgentType::Codex,
+                    turn_count: 1,
+                    duration_ms: 0,
+                    token_usage: None,
+                }),
+            )
+            .await;
+        // The child is gone once it finished: the report keeps what it
+        // recorded at completion.
+        lookup.set_progress(None);
+        let finished = broker
+            .get_task_status("parent-conn", Some(1), &task_id, StatusWait::Snapshot)
+            .await;
+        assert_eq!(finished.status, TaskStatus::Completed);
+        assert_eq!(finished.progress, Some(done));
     }
 
     /// With no live reply (default Noop lookup / child produced nothing yet) the
@@ -20980,6 +21562,7 @@ mod tests {
             _child_connection_id: &str,
             _child_conversation_id: i32,
             _agent_type: AgentType,
+            _assistant: Option<&crate::acp::delegation::types::AssistantRef>,
             _task_preview: &str,
             _task_id: &str,
             _started_at: DateTime<Utc>,
@@ -20994,6 +21577,7 @@ mod tests {
             _child_connection_id: &str,
             _child_conversation_id: i32,
             _agent_type: AgentType,
+            _assistant: Option<&crate::acp::delegation::types::AssistantRef>,
             _task_id: &str,
             _runtime_stats: DelegationRuntimeStats,
             _result: crate::acp::types::DelegationResultSummary,
@@ -30492,6 +31076,7 @@ mod tests {
                 can_spawn_child: bool,
                 link: crate::acp::delegation::spawner::DelegationLink,
                 prebound: Option<(i32, i32)>,
+                brief: Option<String>,
             ) -> Result<AcceptedDelegationPrompt, SpawnerError> {
                 self.inner
                     .send_prompt_linked_for_delegation(
@@ -30500,6 +31085,7 @@ mod tests {
                         can_spawn_child,
                         link,
                         prebound,
+                        brief,
                     )
                     .await
             }
@@ -30529,9 +31115,10 @@ mod tests {
                 prompt: String,
                 folder_id: i32,
                 child_conversation_id: i32,
+                brief: Option<String>,
             ) -> Result<(), SpawnerError> {
                 self.inner
-                    .send_resume_prompt(conn_id, prompt, folder_id, child_conversation_id)
+                    .send_resume_prompt(conn_id, prompt, folder_id, child_conversation_id, brief)
                     .await
             }
             async fn has_live_connection_for_conversation(&self, conversation_id: i32) -> bool {
@@ -33315,6 +33902,11 @@ mod tests {
             last_agent_activity_at: None,
             stalled_since: None,
             recovery: None,
+
+            blocked_on: None,
+            assistant_id: None,
+            assistant_name: None,
+            progress: None,
         };
         let accounting = PersistenceRetryAccounting {
             parent_connection_id: parent_conn.clone(),
@@ -35612,6 +36204,78 @@ mod tests {
         assert_eq!(emitter.count().await, 1);
     }
 
+    /// A delegation whose parent tool call couldn't be identified has no card,
+    /// so its started/completed events are skipped — but it still dies with its
+    /// parent (`cancel_by_parent`), so the parent's lifecycle accounting must
+    /// hear about it from start to finish.
+    #[tokio::test]
+    async fn child_running_is_reported_for_a_synthetic_parent_tool_use_id() {
+        let mock = Arc::new(MockSpawner::new());
+        mock.queue_spawn(Ok("c-synth-life".into())).await;
+        mock.queue_send(Ok(crate::acp::delegation::spawner::accepted(
+            9,
+            chrono::Utc::now(),
+        )))
+        .await;
+        let writer = Arc::new(MockMetaWriter::new());
+        let emitter = Arc::new(MockEventEmitter::new());
+        let broker = broker_with_emitter(mock.clone(), writer.clone(), emitter.clone()).await;
+
+        // An empty host id fails closed (`delegation_correlation_missing`) and
+        // never parks a call. The synthetic placeholder is the `delegation-`
+        // prefix: no card events, but the parent still hears child-running.
+        let driver = {
+            let broker = broker.clone();
+            tokio::spawn(async move {
+                broker
+                    .handle_request(request(1, "delegation-synth-life"))
+                    .await
+            })
+        };
+        let call_id = {
+            let waited = std::time::Instant::now();
+            loop {
+                if let Some(id) = broker.peek_first_pending_call_id().await {
+                    break id;
+                }
+                assert!(
+                    waited.elapsed() < Duration::from_secs(5),
+                    "synthetic parent tool id never parked a call"
+                );
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        };
+        assert_eq!(
+            emitter.child_running_snapshot().await,
+            vec![("parent-conn".to_string(), "c-synth-life".to_string(), true)],
+            "the running child is reported while it runs"
+        );
+        broker
+            .complete_call(
+                &call_id,
+                DelegationOutcome::Ok(DelegationSuccess {
+                    text: "ok".into(),
+                    child_conversation_id: 9,
+                    child_agent_type: AgentType::Codex,
+                    turn_count: 1,
+                    duration_ms: 5,
+                    token_usage: None,
+                }),
+            )
+            .await;
+        driver.await.unwrap();
+
+        assert_eq!(
+            emitter.child_running_snapshot().await,
+            vec![
+                ("parent-conn".to_string(), "c-synth-life".to_string(), true),
+                ("parent-conn".to_string(), "c-synth-life".to_string(), false),
+            ]
+        );
+        assert_eq!(emitter.started_count().await, 0, "no card event");
+        assert_eq!(emitter.count().await, 0, "no card event");
+    }
+
     #[tokio::test]
     async fn emitter_skips_started_when_correlation_fails_closed() {
         let mock = Arc::new(MockSpawner::new());
@@ -36151,6 +36815,9 @@ mod tests {
         // The parent stream also carries setup-time DelegationStarted and the
         // winner-side ConversationStatusChanged (live sidebar); skip those to
         // the terminal DelegationCompleted.
+        // Also note DelegationChildRunning so the parent lifecycle frames
+        // are observable beside the card events.
+        let mut lifecycle = Vec::new();
         let envelope = loop {
             let env = tokio::time::timeout(Duration::from_millis(500), stream_rx.recv())
                 .await
@@ -36160,9 +36827,24 @@ mod tests {
                 AcpEvent::DelegationStarted { .. } | AcpEvent::ConversationStatusChanged { .. } => {
                     continue
                 }
+                AcpEvent::DelegationChildRunning {
+                    child_connection_id,
+                    running,
+                } => {
+                    lifecycle.push((child_connection_id.clone(), *running));
+                    continue;
+                }
                 _ => break env,
             }
         };
+        assert_eq!(
+            lifecycle,
+            vec![
+                ("child-conn-real".to_string(), true),
+                ("child-conn-real".to_string(), false),
+            ],
+            "the parent hears the child start and stop before the card settles"
+        );
         assert_eq!(envelope.connection_id, "parent-conn");
         match &envelope.payload {
             AcpEvent::DelegationCompleted {
@@ -36194,9 +36876,9 @@ mod tests {
                 .expect("InternalEventBus should receive DelegationCompleted within 500ms")
                 .expect("bus recv must not error");
             match &env.payload {
-                AcpEvent::DelegationStarted { .. } | AcpEvent::ConversationStatusChanged { .. } => {
-                    continue
-                }
+                AcpEvent::DelegationStarted { .. }
+                | AcpEvent::ConversationStatusChanged { .. }
+                | AcpEvent::DelegationChildRunning { .. } => continue,
                 _ => break env,
             }
         };
@@ -36267,6 +36949,21 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
 
+        // The lifecycle frame goes out first, for every delegation.
+        let lifecycle = tokio::time::timeout(Duration::from_millis(500), stream_rx.recv())
+            .await
+            .expect("per-connection stream should receive DelegationChildRunning within 500ms")
+            .expect("envelope recv must not error");
+        assert_eq!(lifecycle.connection_id, "parent-conn");
+        assert!(
+            matches!(
+                &lifecycle.payload,
+                AcpEvent::DelegationChildRunning { child_connection_id, running: true }
+                    if child_connection_id == "child-conn-started"
+            ),
+            "expected the child's running frame, got {:?}",
+            lifecycle.payload
+        );
         let envelope = tokio::time::timeout(Duration::from_millis(500), stream_rx.recv())
             .await
             .expect("per-connection stream should receive DelegationStarted within 500ms")
@@ -36298,10 +36995,16 @@ mod tests {
             other => panic!("expected DelegationStarted, got {other:?}"),
         }
 
-        let bus_envelope = tokio::time::timeout(Duration::from_millis(500), bus_rx.recv())
-            .await
-            .expect("InternalEventBus should receive DelegationStarted within 500ms")
-            .expect("bus recv must not error");
+        let bus_envelope = loop {
+            let env = tokio::time::timeout(Duration::from_millis(500), bus_rx.recv())
+                .await
+                .expect("InternalEventBus should receive DelegationStarted within 500ms")
+                .expect("bus recv must not error");
+            if matches!(env.payload, AcpEvent::DelegationChildRunning { .. }) {
+                continue;
+            }
+            break env;
+        };
         assert_eq!(bus_envelope.connection_id, "parent-conn");
         assert!(matches!(
             bus_envelope.payload,
@@ -36501,6 +37204,8 @@ mod tests {
             error_code: None,
             message: None,
             duration_ms: 0,
+            assistant: None,
+            progress: None,
         }
     }
 
@@ -36717,6 +37422,7 @@ mod tests {
                             parent_tool_use_id: "pt-1".into(),
                             agent_type: AgentType::ClaudeCode,
                             generation: 1,
+                            assistant: None,
                             task_preview: "test task".into(),
                             external_handle: None,
                             started_at: Instant::now(),
@@ -36746,6 +37452,10 @@ mod tests {
                     last_agent_activity_at: None,
                     stalled_since: None,
                     recovery: None,
+                    blocked_on: None,
+                    assistant_id: None,
+                    assistant_name: None,
+                    progress: None,
                 }
             }
         }
@@ -36897,6 +37607,7 @@ mod tests {
             child_connection_id: "wave3-retry-child".into(),
             child_conversation_id: 42,
             agent_type: AgentType::ClaudeCode,
+            assistant: None,
             task_preview: "pre-prompt send failure".into(),
             duration_ms: 0,
             cancel_turn: false,
@@ -37017,11 +37728,13 @@ mod tests {
                     parent_connection_id: "parent-conn".into(),
                     child_conversation_id: 100,
                     agent_type: AgentType::ClaudeCode,
+                    assistant: None,
                     status: TaskStatus::Completed,
                     text: Some("x".repeat(50)),
                     error_code: None,
                     message: None,
                     duration_ms: 1,
+                    progress: None,
                 },
             );
         }
@@ -37747,6 +38460,11 @@ mod tests {
                 last_agent_activity_at: None,
                 stalled_since: None,
                 recovery: None,
+
+                blocked_on: None,
+                assistant_id: None,
+                assistant_name: None,
+                progress: None,
             }))
             .await;
         let metrics = Arc::new(crate::acp::delegation::metrics::DelegationMetrics::default());
@@ -37980,6 +38698,11 @@ mod tests {
                 last_agent_activity_at: None,
                 stalled_since: None,
                 recovery: None,
+
+                blocked_on: None,
+                assistant_id: None,
+                assistant_name: None,
+                progress: None,
             }))
             .await;
 
@@ -38012,6 +38735,7 @@ mod tests {
                     "parent-conn",
                     9,
                     AgentType::ClaudeCode,
+                    None,
                     0,
                     &DelegationOutcome::from_err(
                         DelegationError::Unresumable("parked".into()),
@@ -38095,6 +38819,11 @@ mod tests {
                 last_agent_activity_at: None,
                 stalled_since: None,
                 recovery: None,
+
+                blocked_on: None,
+                assistant_id: None,
+                assistant_name: None,
+                progress: None,
             }))
             .await;
 
@@ -38292,6 +39021,10 @@ mod tests {
             last_agent_activity_at: Some(snap.last_agent_activity_at),
             stalled_since: snap.stalled_since,
             recovery: None,
+            blocked_on: None,
+            assistant_id: None,
+            assistant_name: None,
+            progress: None,
         }
     }
 
@@ -38319,6 +39052,8 @@ mod tests {
                 error_code: None,
                 message: None,
                 duration_ms: 10,
+                assistant: None,
+                progress: None,
             },
         )
     }
@@ -38350,6 +39085,8 @@ mod tests {
             agent_type: AgentType::ClaudeCode,
             parent_id: Some(1),
             error_code: Some("unresumable".into()),
+
+            assistant: None,
         };
         let report = db_report("task-unresumable", &rec);
         assert_eq!(report.status, TaskStatus::Failed);
@@ -38384,6 +39121,8 @@ mod tests {
             agent_type: AgentType::ClaudeCode,
             parent_id: Some(1),
             error_code: None,
+
+            assistant: None,
         };
         let report = db_report("task-canceled", &rec);
         assert_eq!(report.status, TaskStatus::Canceled);
@@ -40106,6 +40845,8 @@ mod tests {
                 parent_conversation_id: parent_id,
                 parent_tool_use_id: parent_tool_use_id.into(),
                 delegation_call_id: task_id.into(),
+
+                assistant: None,
             }),
         )
         .await
@@ -40761,6 +41502,8 @@ mod tests {
                 parent_conversation_id: parent.id,
                 parent_tool_use_id: "tu-comp-term".into(),
                 delegation_call_id: "call-comp-term".into(),
+
+                assistant: None,
             }),
         )
         .await
@@ -40834,6 +41577,8 @@ mod tests {
                 parent_conversation_id: parent.id,
                 parent_tool_use_id: "tu-comp-run".into(),
                 delegation_call_id: "call-comp-run".into(),
+
+                assistant: None,
             }),
         )
         .await
@@ -43596,6 +44341,8 @@ mod tests {
                 parent_conversation_id: parent.id,
                 parent_tool_use_id: "tu-adm-unk-idem-src".into(),
                 delegation_call_id: source_task_id.into(),
+
+                assistant: None,
             }),
         )
         .await
@@ -44178,6 +44925,7 @@ mod tests {
                 agent_type: c.agent_type,
                 parent_id: c.parent_id,
                 error_code: None,
+                assistant: c.assistant.identity(),
             })
         }
         async fn find_resume_context_by_call_id(
@@ -44199,6 +44947,7 @@ mod tests {
             folder_id: 7,
             working_dir: Some("/work".into()),
             title: Some("do x".into()),
+            assistant: ResumeAssistant::None,
         }
     }
 
@@ -44732,6 +45481,8 @@ mod tests {
                 parent_conversation_id: parent.id,
                 parent_tool_use_id: "cold-failed-tool".into(),
                 delegation_call_id: "cold-failed-task".into(),
+
+                assistant: None,
             }),
         )
         .await
@@ -47502,6 +48253,8 @@ mod tests {
                     parent_conversation_id: parent.id,
                     parent_tool_use_id: format!("wave4-{suffix}-tool"),
                     delegation_call_id: task_id.clone(),
+
+                    assistant: None,
                 }),
             )
             .await

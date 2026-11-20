@@ -32,6 +32,7 @@ use crate::parsers::grok::{
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Ownership {
     Idle,
+    #[allow(dead_code)]
     Foreground,
 }
 
@@ -49,6 +50,7 @@ impl GrokDispatchClaim {
         matches!(self, Self::AutonomousContent | Self::IdleTerminal)
     }
 
+    #[allow(dead_code)]
     pub(crate) fn is_idle_terminal(self) -> bool {
         matches!(self, Self::IdleTerminal)
     }

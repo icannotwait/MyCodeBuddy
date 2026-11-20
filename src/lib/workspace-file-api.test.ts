@@ -14,11 +14,7 @@ vi.mock("@tauri-apps/api/core", () => ({
   invoke: mocks.invoke,
 }))
 
-import {
-  cancelWorkspaceFileSearch,
-  getFileTree,
-  searchWorkspaceFiles,
-} from "@/lib/api"
+import { getFileTree, searchWorkspaceFiles } from "@/lib/api"
 import {
   cancelWorkspaceFileSearch as cancelWorkspaceFileSearchTauri,
   getFolderConversation as getFolderConversationTauri,
@@ -26,9 +22,9 @@ import {
   searchWorkspaceFiles as searchWorkspaceFilesTauri,
 } from "@/lib/tauri"
 
-const identity = {
-  searchSessionId: "session-1",
-  requestId: "request-1",
+const request = {
+  consumerId: "picker",
+  generation: 2,
 }
 
 describe("workspace file API payloads", () => {
@@ -45,18 +41,16 @@ describe("workspace file API payloads", () => {
       includeIgnored: true,
     })
 
-    await searchWorkspaceFiles("/repo", "foo", 50, identity)
-    expect(mocks.call).toHaveBeenLastCalledWith("search_workspace_files", {
-      path: "/repo",
-      query: "foo",
-      limit: 50,
-      ...identity,
-    })
-
-    await cancelWorkspaceFileSearch(identity)
+    await searchWorkspaceFiles("/repo", "foo", { limit: 50, request })
     expect(mocks.call).toHaveBeenLastCalledWith(
-      "cancel_workspace_file_search",
-      identity
+      "search_workspace_files",
+      {
+        path: "/repo",
+        query: "foo",
+        limit: 50,
+        request,
+      },
+      { timeoutMs: 330_000 }
     )
   })
 
@@ -68,14 +62,16 @@ describe("workspace file API payloads", () => {
       includeIgnored: false,
     })
 
-    await searchWorkspaceFiles("/repo")
-    expect(mocks.call).toHaveBeenLastCalledWith("search_workspace_files", {
-      path: "/repo",
-      query: "",
-      limit: 50,
-      searchSessionId: null,
-      requestId: null,
-    })
+    await searchWorkspaceFiles("/repo", "foo")
+    expect(mocks.call).toHaveBeenLastCalledWith(
+      "search_workspace_files",
+      {
+        path: "/repo",
+        query: "foo",
+        request: { consumerId: expect.any(String), generation: 0 },
+      },
+      { timeoutMs: 330_000 }
+    )
   })
 
   it("keeps direct Tauri wrappers in payload parity", async () => {
@@ -92,18 +88,18 @@ describe("workspace file API payloads", () => {
       includeIgnored: true,
     })
 
-    await searchWorkspaceFilesTauri("/repo", "foo", 50, identity)
+    await searchWorkspaceFilesTauri("/repo", "foo", { limit: 50, request })
     expect(mocks.invoke).toHaveBeenLastCalledWith("search_workspace_files", {
       path: "/repo",
       query: "foo",
       limit: 50,
-      ...identity,
+      request,
     })
 
-    await cancelWorkspaceFileSearchTauri(identity)
+    await cancelWorkspaceFileSearchTauri(request)
     expect(mocks.invoke).toHaveBeenLastCalledWith(
       "cancel_workspace_file_search",
-      identity
+      { request }
     )
   })
 

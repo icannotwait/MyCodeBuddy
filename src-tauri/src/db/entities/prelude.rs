@@ -2,6 +2,7 @@
 
 pub use super::agent_setting::Entity as AgentSetting;
 pub use super::app_metadata::Entity as AppMetadata;
+pub use super::assistant::Entity as Assistant;
 pub use super::automation::Entity as Automation;
 pub use super::automation_run::Entity as AutomationRun;
 pub use super::canvas_board::Entity as CanvasBoard;
@@ -42,8 +43,10 @@ pub use super::recovery_authorization::Entity as RecoveryAuthorization;
 pub use super::simple_workflow::Entity as SimpleWorkflow;
 pub use super::token_usage_sync::Entity as TokenUsageSync;
 pub use super::token_usage_turn::Entity as TokenUsageTurn;
+pub use super::tool_approval::Entity as ToolApproval;
 pub use super::turn_generation_stat::Entity as TurnGenerationStat;
 pub use super::work_task::Entity as WorkTask;
 pub use super::work_task_event::Entity as WorkTaskEvent;
 pub use super::work_task_settings::Entity as WorkTaskSettings;
+pub use super::work_task_source_key::Entity as WorkTaskSourceKey;
 pub use super::work_task_template::Entity as WorkTaskTemplate;

@@ -1,9 +1,18 @@
 import "@testing-library/jest-dom/vitest"
-import { afterEach } from "vitest"
+import { afterEach, beforeEach } from "vitest"
 import { __resetWebPopoutPresenceForTests } from "@/lib/conversation-popout-web-presence"
+import { resetDisclosureStore } from "@/components/message/activity/disclosure-store"
 
 afterEach(() => {
   __resetWebPopoutPresenceForTests()
+})
+
+// The activity timeline remembers which rows were opened in a module-level
+// store keyed by step (tool call) id, so it outlives a test's render: without
+// a reset, a row one test opened mounts already open in the next test that
+// reuses the id, and that test's click closes it instead.
+beforeEach(() => {
+  resetDisclosureStore()
 })
 
 const hasStorageMethods = (storage: Storage | undefined): storage is Storage =>

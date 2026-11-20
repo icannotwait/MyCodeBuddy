@@ -504,14 +504,99 @@ async fn ensure_folder_inner(
     Ok(to_entry(model))
 }
 
-/// Create a dedicated hidden folder backing a single chat-mode conversation.
-///
-/// Unlike [`add_folder`], the display name is a fixed sentinel ("Chat") rather
-/// than derived from the path, and `kind = chat` is set so the frontend routes
-/// this folder's conversations to the sidebar "Chat" group and hides
-/// folder-bound chrome. `path` is a freshly generated per-conversation scratch dir, so it
-/// never collides on the `UNIQUE(path)` constraint. Returns the full
-/// [`FolderDetail`] so the caller can hand it straight to the frontend.
+pub async fn ensure_folder_for_path(
+    conn: &DatabaseConnection,
+    path: &str,
+) -> Result<FolderHistoryEntry, DbError> {
+    ensure_closed_folder_inner(conn, path, None).await
+}
+
+/// [`ensure_folder_for_path`] for a worktree a background producer made under
+/// the root folder `root_id` (a `codeg-cli --worktree` run): a new row is
+/// recorded under that root — closed, as every row this family makes — and an
+/// existing live one is left as it is.
+pub async fn ensure_worktree_folder_closed(
+    conn: &DatabaseConnection,
+    path: &str,
+    root_id: i32,
+) -> Result<FolderHistoryEntry, DbError> {
+    ensure_closed_folder_inner(conn, path, Some(root_id)).await
+}
+
+/// Whether the live folder `folder_id` is open in the workspace.
+pub async fn is_open(conn: &DatabaseConnection, folder_id: i32) -> Result<bool, DbError> {
+    Ok(folder::Entity::find_by_id(folder_id)
+        .filter(folder::Column::DeletedAt.is_null())
+        .one(conn)
+        .await?
+        .is_some_and(|row| row.is_open))
+}
+
+async fn ensure_closed_folder_inner(
+    conn: &DatabaseConnection,
+    path: &str,
+    parent_on_insert: Option<i32>,
+) -> Result<FolderHistoryEntry, DbError> {
+    let now = Utc::now();
+
+    let existing = folder::Entity::find()
+        .filter(folder::Column::Path.eq(path))
+        .one(conn)
+        .await?;
+
+    let model = if let Some(row) = existing {
+        if row.deleted_at.is_none() {
+            return Ok(to_entry(row));
+        }
+        let mut active = row.into_active_model();
+        active.deleted_at = Set(None);
+        active.is_open = Set(false);
+        active.updated_at = Set(now);
+        active.update(conn).await?
+    } else {
+        let name = std::path::Path::new(path)
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| path.to_string());
+        let next_order = next_sort_order(conn).await?;
+        let active = folder::ActiveModel {
+            id: NotSet,
+            name: Set(name),
+            path: Set(path.to_string()),
+            git_branch: Set(None),
+            default_agent_type: Set(None),
+            last_agent_type: NotSet,
+            last_opened_at: Set(now),
+            created_at: Set(now),
+            updated_at: Set(now),
+            deleted_at: Set(None),
+            is_open: Set(false),
+            sort_order: Set(next_order),
+            color: Set(DEFAULT_FOLDER_COLOR.to_string()),
+            parent_id: Set(parent_on_insert),
+            kind: Set(FolderKind::Regular),
+            alias: Set(None),
+            group_id: Set(None),
+        };
+        match active.insert(conn).await {
+            Ok(model) => model,
+            // Another caller made the row meanwhile — the runs of one
+            // `codeg-cli -a x -a y` in a new workspace, started together, say
+            // (`UNIQUE(path)`): the row it made is this caller's too.
+            Err(err) => match folder::Entity::find()
+                .filter(folder::Column::Path.eq(path))
+                .one(conn)
+                .await?
+            {
+                Some(row) if row.deleted_at.is_none() => row,
+                _ => return Err(err.into()),
+            },
+        }
+    };
+
+    Ok(to_entry(model))
+}
+
 pub async fn add_chat_folder(
     conn: &DatabaseConnection,
     path: &str,
@@ -585,6 +670,75 @@ pub async fn update_folder_alias(
     active.updated_at = Set(Utc::now());
     let updated = active.update(conn).await?;
     Ok(Some(to_detail(updated)))
+}
+
+/// Fill in a folder's alias only when it has none — the worktree flow's
+/// "default the label to the branch name" write.
+///
+/// A single conditional UPDATE (`… WHERE alias IS NULL OR alias = ''`) rather
+/// than read-then-write: a worktree folder can be re-registered concurrently
+/// while its owner is renaming it in the sidebar, and the read-then-write shape
+/// would let the seed land on top of that rename. Returns whether a row was
+/// actually written, so the caller only re-reads / broadcasts on a real change.
+pub async fn seed_folder_alias(
+    conn: &DatabaseConnection,
+    folder_id: i32,
+    alias: &str,
+) -> Result<bool, DbError> {
+    use sea_orm::sea_query::Expr;
+    let alias = alias.trim();
+    if alias.is_empty() {
+        return Ok(false);
+    }
+    let res = folder::Entity::update_many()
+        .col_expr(folder::Column::Alias, Expr::value(alias))
+        .col_expr(folder::Column::UpdatedAt, Expr::value(Utc::now()))
+        .filter(folder::Column::Id.eq(folder_id))
+        .filter(folder::Column::DeletedAt.is_null())
+        .filter(
+            sea_orm::Condition::any()
+                .add(folder::Column::Alias.is_null())
+                .add(folder::Column::Alias.eq("")),
+        )
+        .exec(conn)
+        .await?;
+    Ok(res.rows_affected > 0)
+}
+
+/// `(id, path)` of every live worktree folder still without an alias.
+/// `parent_id IS NOT NULL` is "is a worktree folder" in this schema.
+pub async fn list_worktree_folders_missing_alias(
+    conn: &DatabaseConnection,
+) -> Result<Vec<(i32, String)>, DbError> {
+    let rows = folder::Entity::find()
+        .filter(folder::Column::DeletedAt.is_null())
+        .filter(folder::Column::ParentId.is_not_null())
+        .filter(
+            sea_orm::Condition::any()
+                .add(folder::Column::Alias.is_null())
+                .add(folder::Column::Alias.eq("")),
+        )
+        .order_by_asc(folder::Column::Id)
+        .all(conn)
+        .await?;
+
+    Ok(rows.into_iter().map(|m| (m.id, m.path)).collect())
+}
+
+/// Like [`get_folder_by_id`], but `None` unless the folder is currently open.
+/// A `folder://changed` Upsert means "insert-or-replace in the open folder
+/// list", so announcing a closed folder would put it back in the sidebar.
+pub async fn get_open_folder_by_id(
+    conn: &DatabaseConnection,
+    folder_id: i32,
+) -> Result<Option<FolderDetail>, DbError> {
+    let row = folder::Entity::find_by_id(folder_id)
+        .filter(folder::Column::DeletedAt.is_null())
+        .filter(folder::Column::IsOpen.eq(true))
+        .one(conn)
+        .await?;
+
+    Ok(row.map(to_detail))
 }
 
 pub async fn update_folder_default_agent(
@@ -1041,6 +1195,7 @@ mod tests {
                 parent_conversation_id: parent_conv,
                 parent_tool_use_id: "tu-1".into(),
                 delegation_call_id: "dc-1".into(),
+                assistant: None,
             }),
         )
         .await

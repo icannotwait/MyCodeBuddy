@@ -199,6 +199,32 @@ const enMessages = {
     colorizeCommandOutputDescription:
       "Force ANSI color out of the commands agents run, so their output renders in color in the transcript instead of as plain text. Takes effect on new sessions.",
   },
+  Folder: {
+    chat: {
+      messageInput: {
+        mentionGroupFile: "Files",
+        mentionGroupAgent: "Agents",
+        mentionGroupAssistant: "Assistants",
+        mentionGroupSession: "Sessions",
+        mentionGroupCommit: "Commits",
+        mentionGroupSkill: "Skills",
+        mentionEmpty: "No matches",
+        mentionLoading: "Searching",
+        mentionListLabel: "Mentions",
+        mentionMore: "More",
+        mentionCount: "{count} matches",
+      },
+    },
+  },
+  MentionPanelSettings: {
+    title: "Mention panel",
+    description: "Choose which tabs the @ panel shows.",
+    tabsLabel: "Mention panel tabs",
+    reset: "Reset",
+    alwaysShown: "Always shown",
+    moveTab: "Move {name}",
+    showTab: "Show {name}",
+  },
   DesktopNotificationSettings: {
     title: "Desktop notifications",
     description:
@@ -527,6 +553,7 @@ describe("GeneralSettings", () => {
       "Default Terminal",
       "Colorize command output",
       "Disable hardware acceleration",
+      "Mention panel",
       "Desktop notifications",
       "Notification sounds",
     ]) {

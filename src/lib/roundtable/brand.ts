@@ -120,6 +120,41 @@ export const ROUNDTABLE_BRANDS = {
     text: "#5636D8",
     textDark: "#BBAEFF",
   },
+  minimax_code: {
+    label: "MiniMax",
+    color: "#F23F5D",
+    colorDark: "#FF8AA0",
+    text: "#BE123C",
+    textDark: "#FECDD3",
+  },
+  kiro: {
+    label: "Kiro",
+    color: "#9046FF",
+    colorDark: "#C4B5FD",
+    text: "#6D28D9",
+    textDark: "#DDD6FE",
+  },
+  zcode: {
+    label: "ZCode",
+    color: "#111827",
+    colorDark: "#E5E7EB",
+    text: "#111827",
+    textDark: "#E5E7EB",
+  },
+  trae: {
+    label: "Trae",
+    color: "#059669",
+    colorDark: "#34D399",
+    text: "#047857",
+    textDark: "#6EE7B7",
+  },
+  command_code: {
+    label: "Command Code",
+    color: "#18181B",
+    colorDark: "#E4E4E7",
+    text: "#18181B",
+    textDark: "#E4E4E7",
+  },
   // Only reachable through a model hint (no built-in Qwen agent icon).
   qwen: {
     label: "Qwen",

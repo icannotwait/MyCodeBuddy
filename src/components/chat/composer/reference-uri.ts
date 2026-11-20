@@ -14,6 +14,9 @@ const DELEGATION_PROFILE_URI_TYPED =
   /^codeg:\/\/delegation-profile\/([a-z0-9_]+)\/([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})$/i
 const DELEGATION_PROFILE_URI_LEGACY =
   /^codeg:\/\/delegation-profile\/([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})$/i
+// Assistant ids are positive integers, never zero-padded — the shape the
+// backend's routing scan (`agent_mentions.rs`) accepts, and the adapter writes.
+const ASSISTANT_URI = /^codeg:\/\/assistant\/([1-9]\d{0,9})$/i
 const SESSION_URI = /^codeg:\/\/session\/(.+)$/i
 const COMMIT_URI = /^codeg:\/\/commit\/.*@(.+)$/i
 // command / skill / expert tokens, surfaced as badges in transcript user messages
@@ -141,6 +144,21 @@ export function parseCodegReferenceUri(
       label: (label || id).replace(/^@/, "") || id,
       uri,
       meta: { profileId: id, agentType: "code_buddy" },
+    }
+  }
+
+  const assistant = uri.match(ASSISTANT_URI)
+  if (assistant) {
+    const id = assistant[1]
+    return {
+      refType: "assistant",
+      id,
+      // The link text is `@name`, as for an agent: strip a single leading `@`.
+      // The label is the name the sender saw; the badge draws the current
+      // avatar from the store by id.
+      label: (label || `#${id}`).replace(/^@/, "") || `#${id}`,
+      uri,
+      meta: { assistantId: Number(id) },
     }
   }
 

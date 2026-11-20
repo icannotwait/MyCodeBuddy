@@ -800,10 +800,13 @@ describe("LiveTranscriptRow", () => {
       },
       false
     )
-    const group = historical.content.find((p) => p.type === "tool-group")
-    expect(group?.type).toBe("tool-group")
-    if (group?.type !== "tool-group") throw new Error("expected tool-group")
-    const histTool = group.items[0]
+    // Assistant turns stay flat tool calls. The activity timeline groups them
+    // when it draws; `adaptMessageTurn` no longer wraps a lone edit in a
+    // tool-group. `groupConsecutiveToolCalls` still does that for callers
+    // that want the classic tally.
+    const histTool = historical.content.find((p) => p.type === "tool-call")
+    expect(histTool?.type).toBe("tool-call")
+    if (histTool?.type !== "tool-call") throw new Error("expected a tool call")
     // Core fields match the historical adapted tool-call (displayTitle is live-only).
     expect({
       type: live.type,

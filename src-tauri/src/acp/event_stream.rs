@@ -179,6 +179,17 @@ impl RecentEventsBuffer {
         )
     }
 
+    /// Every buffered event with seq greater than `since_seq`, gap or not:
+    /// for a consumer that has its own way to cover what is older (a backstop
+    /// scan) and wants what is left rather than nothing.
+    pub fn retained_after(&self, since_seq: u64) -> Vec<Arc<EventEnvelope>> {
+        self.events
+            .iter()
+            .filter(|e| e.seq > since_seq)
+            .map(|e| e.envelope.clone())
+            .collect()
+    }
+
     #[cfg(test)]
     pub fn len(&self) -> usize {
         self.events.len()
@@ -445,6 +456,7 @@ fn estimate_envelope_size(envelope: &EventEnvelope) -> usize {
             session_id,
             turns,
             outstanding: _,
+            outstanding_tasks,
             settled,
             watermark: _,
             detail_refetch: _,
@@ -453,12 +465,24 @@ fn estimate_envelope_size(envelope: &EventEnvelope) -> usize {
             json_str_len(session_id)
                 + turns.len().saturating_sub(1)
                 + turns.iter().map(message_turn_size).sum::<usize>()
+                + outstanding_tasks
+                    .iter()
+                    .map(|t| {
+                        // Keys + braces + commas for every field (task_id,
+                        // kind, tool_use_id, description, started_at_ms — an
+                        // i64 is at most 20 bytes) plus the element comma and
+                        // the field's own key, fixed as generously as above.
+                        128 + json_str_len(&t.task_id)
+                            + opt_str_size(&t.tool_use_id)
+                            + opt_str_size(&t.description)
+                    })
+                    .sum::<usize>()
                 + settled
                     .iter()
                     .map(|s| {
                         // Keys + braces + commas for every field (task_id,
-                        // status, summary, tool_use_id, result) plus the
-                        // element comma — generously fixed so `estimate >=
+                        // status, summary, tool_use_id, result, interim) plus
+                        // the element comma — generously fixed so `estimate >=
                         // serialized` holds for every present/absent optional
                         // combination.
                         128 + json_str_len(&s.task_id)
@@ -485,6 +509,8 @@ fn estimate_envelope_size(envelope: &EventEnvelope) -> usize {
             started_at: _,
             runtime_stats,
             attention_request,
+            assistant_id: _,
+            assistant_name,
         } => {
             256 + json_str_len(parent_connection_id)
                 + json_str_len(parent_tool_use_id)
@@ -496,6 +522,7 @@ fn estimate_envelope_size(envelope: &EventEnvelope) -> usize {
                     .as_ref()
                     .map(attention_summary_size)
                     .unwrap_or(0)
+                + opt_str_size(assistant_name)
         }
         AcpEvent::DelegationRuntimeStatsChanged {
             parent_tool_use_id,
@@ -528,12 +555,15 @@ fn estimate_envelope_size(envelope: &EventEnvelope) -> usize {
             runtime_stats,
             result,
             card_summary: _,
+            assistant_id: _,
+            assistant_name,
         } => {
             256 + json_str_len(parent_connection_id)
                 + json_str_len(parent_tool_use_id)
                 + json_str_len(child_connection_id)
                 + json_str_len(task_id)
                 + runtime_stats_size(runtime_stats)
+                + opt_str_size(assistant_name)
                 + match result {
                     crate::acp::types::DelegationResultSummary::Ok {
                         duration_ms: _,
@@ -654,9 +684,12 @@ fn content_block_size(block: &crate::models::message::ContentBlock) -> usize {
             is_error: _,
             agent_stats,
             images,
+            exit_code,
         } => {
             128 + opt_str_size(tool_use_id)
                 + opt_str_size(output_preview)
+                // `,"exit_code":` plus up to 20 digits and a sign.
+                + exit_code.map_or(0, |_| 40)
                 + agent_stats.as_ref().map_or(0, agent_stats_size)
                 + images
                     .iter()
@@ -671,11 +704,15 @@ fn content_block_size(block: &crate::models::message::ContentBlock) -> usize {
 }
 
 /// Structural size for a `ToolResult`'s `agent_stats` object: a dozen optional
-/// numeric scalars (each ≤ ~40 B serialized with its key) plus the nested
-/// `tool_calls` array — 640 generously covers skeleton + every scalar.
+/// numeric scalars (each ≤ ~40 B serialized with its key), the optional
+/// strings, and the two nested arrays — `tool_calls` and `timeline`, the
+/// child's whole thinking/text activity, which is why every entry is counted.
+/// 640 generously covers skeleton + every scalar + every key.
 fn agent_stats_size(stats: &crate::models::message::AgentExecutionStats) -> usize {
     640 + opt_str_size(&stats.agent_type)
         + opt_str_size(&stats.status)
+        + opt_str_size(&stats.recovered_result)
+        + opt_str_size(&stats.child_session_id)
         + stats
             .tool_calls
             .iter()
@@ -684,6 +721,13 @@ fn agent_stats_size(stats: &crate::models::message::AgentExecutionStats) -> usiz
                     + opt_str_size(&c.input_preview)
                     + opt_str_size(&c.output_preview)
             })
+            .sum::<usize>()
+        // `{"type":…,"text":…}` or `{"type":…,"childIndex":<≤20 digits>}`
+        // plus the element comma: 64 covers keys, braces and the index.
+        + stats
+            .timeline
+            .iter()
+            .map(|e| 64 + json_str_len(&e.entry_type) + opt_str_size(&e.text))
             .sum::<usize>()
 }
 
@@ -1094,8 +1138,8 @@ mod tests {
         // nested tool calls, result images, plus settled entries — and assert
         // the structural estimate still covers the exact serialized length.
         use crate::models::message::{
-            AgentExecutionStats, AgentToolCall, ContentBlock, ImageData, MessageTurn, TurnRole,
-            TurnUsage,
+            AgentExecutionStats, AgentTimelineEntry, AgentToolCall, ContentBlock, ImageData,
+            MessageTurn, TurnRole, TurnUsage,
         };
 
         let image = ImageData {
@@ -1155,9 +1199,35 @@ mod tests {
                             output_preview: Some("line\n".repeat(40)),
                             is_error: false,
                         }],
+                        // The child's whole thinking/text activity rides
+                        // here (up to 16,384 characters per entry, any number
+                        // of entries), and so can the recovered report: both
+                        // must be counted, escape-aware like every other
+                        // string.
+                        timeline: (0..40)
+                            .map(|i| match i % 3 {
+                                0 => AgentTimelineEntry {
+                                    entry_type: "thinking".into(),
+                                    text: Some("思考 \"why\"\n\t".repeat(60)),
+                                    child_index: None,
+                                },
+                                1 => AgentTimelineEntry {
+                                    entry_type: "text".into(),
+                                    text: Some("report \\ line\n".repeat(60)),
+                                    child_index: None,
+                                },
+                                _ => AgentTimelineEntry {
+                                    entry_type: "tool_call".into(),
+                                    text: None,
+                                    child_index: Some(usize::MAX),
+                                },
+                            })
+                            .collect(),
+                        recovered_result: Some("The \"full\" report\n\t".repeat(400)),
                         child_session_id: Some("019fe6bf-0bcb-70c2-a02d-e5c006dfc32a".into()),
                     }),
                     images: vec![image],
+                    exit_code: Some(i64::MIN),
                 },
             ],
             timestamp: chrono::Utc::now(),
@@ -1184,6 +1254,23 @@ mod tests {
                 session_id: "1f8b332f-128a-4603-a5f4-f44d5a0bf932".into(),
                 turns: vec![turn.clone(), turn],
                 outstanding: u32::MAX,
+                outstanding_tasks: vec![
+                    crate::acp::types::BackgroundOutstandingTask {
+                        task_id: "ae6bd822f7a0e23a8".into(),
+                        kind: crate::acp::types::BackgroundTaskKind::Agent,
+                        tool_use_id: Some("toolu_01P782zHv8AMMpXYqaz39ijf".into()),
+                        // Escape-heavy, to exercise the estimate's escaping.
+                        description: Some("Run \"pnpm build\"\n\t".repeat(16)),
+                        started_at_ms: i64::MIN,
+                    },
+                    crate::acp::types::BackgroundOutstandingTask {
+                        task_id: "bipkee1pw".into(),
+                        kind: crate::acp::types::BackgroundTaskKind::Shell,
+                        tool_use_id: None,
+                        description: None,
+                        started_at_ms: i64::MAX,
+                    },
+                ],
                 settled: vec![
                     crate::acp::types::BackgroundSettledInfo {
                         task_id: "ae6bd822f7a0e23a8".into(),
@@ -1194,6 +1281,9 @@ mod tests {
                         // coverage of the (previously omitted) `result` field.
                         result: Some("Build \"log\"\n\t".repeat(2048)),
                         wire_visible: true,
+                        // Serialized only when set: the fixed per-entry
+                        // overhead must cover its key too.
+                        interim: true,
                     },
                     crate::acp::types::BackgroundSettledInfo {
                         task_id: "bipkee1pw".into(),
@@ -1202,6 +1292,7 @@ mod tests {
                         tool_use_id: None,
                         result: None,
                         wire_visible: false,
+                        interim: false,
                     },
                 ],
                 watermark: u64::MAX,
@@ -1219,6 +1310,7 @@ mod tests {
                 session_id: "s".into(),
                 turns: vec![],
                 outstanding: 0,
+                outstanding_tasks: vec![],
                 settled: vec![],
                 watermark: 0,
                 detail_refetch: false,
@@ -1226,6 +1318,59 @@ mod tests {
             },
         });
         assert_ge_serialized(&env);
+    }
+
+    #[test]
+    fn agent_stats_estimate_counts_each_variable_field_on_its_own() {
+        // The test above has fixed budgets to spare; here each variable-size
+        // field of `agent_stats` stands alone at a size no budget absorbs, so
+        // leaving any one of them out of the estimate fails by name.
+        use crate::models::message::{AgentExecutionStats, AgentTimelineEntry};
+
+        let big = "a \"quoted\" \\ line\n\t".repeat(200);
+        let entry = |entry_type: &str, text: Option<String>| AgentTimelineEntry {
+            entry_type: entry_type.into(),
+            text,
+            child_index: None,
+        };
+        let cases = [
+            (
+                "timeline text",
+                AgentExecutionStats {
+                    timeline: vec![entry("thinking", Some(big.clone()))],
+                    ..Default::default()
+                },
+            ),
+            (
+                "timeline type",
+                AgentExecutionStats {
+                    timeline: vec![entry(&big, None)],
+                    ..Default::default()
+                },
+            ),
+            (
+                "recovered_result",
+                AgentExecutionStats {
+                    recovered_result: Some(big.clone()),
+                    ..Default::default()
+                },
+            ),
+            (
+                "child_session_id",
+                AgentExecutionStats {
+                    child_session_id: Some(big.clone()),
+                    ..Default::default()
+                },
+            ),
+        ];
+        let undercounted: Vec<&str> = cases
+            .iter()
+            .filter(|(_, stats)| {
+                agent_stats_size(stats) < serde_json::to_string(stats).unwrap().len()
+            })
+            .map(|(field, _)| *field)
+            .collect();
+        assert!(undercounted.is_empty(), "undercounted: {undercounted:?}");
     }
 
     #[test]
@@ -1398,6 +1543,8 @@ mod tests {
                     started_at: started,
                     runtime_stats: stats.clone(),
                     attention_request: Some(attention.clone()),
+                    assistant_id: None,
+                    assistant_name: None,
                 },
             }),
             Arc::new(EventEnvelope {
@@ -1443,6 +1590,8 @@ mod tests {
                         text_preview: Some("done".into()),
                     },
                     card_summary: None,
+                    assistant_id: None,
+                    assistant_name: None,
                 },
             }),
         ];

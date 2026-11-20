@@ -7,6 +7,7 @@ use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
 use ignore::WalkBuilder;
+use notify::event::ModifyKind;
 use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use serde::Serialize;
 use tokio::sync::mpsc;
@@ -305,6 +306,9 @@ struct WorkspaceStreamEntry {
     // with repository size. Shared with the flush task via Arc.
     full_subscribers: Arc<AtomicUsize>,
     state: Arc<Mutex<WorkspaceStateCore>>,
+    // Registration with workspace file search while the watcher is live: its
+    // cached snapshot of this root is kept current from our batches.
+    search_watch: Option<u64>,
 }
 
 static WORKSPACE_STREAMS: LazyLock<Mutex<HashMap<String, WorkspaceStreamEntry>>> =
@@ -313,6 +317,9 @@ static WORKSPACE_STREAMS: LazyLock<Mutex<HashMap<String, WorkspaceStreamEntry>>>
 #[derive(Default)]
 struct WatchEventBatch {
     changed_paths: HashSet<String>,
+    // Subset created, removed or renamed (anything but a content/metadata
+    // change), for workspace file search.
+    structural_paths: HashSet<String>,
     has_create: bool,
     has_remove: bool,
     overflowed: bool,
@@ -321,6 +328,7 @@ struct WatchEventBatch {
 impl WatchEventBatch {
     fn clear(&mut self) {
         self.changed_paths.clear();
+        self.structural_paths.clear();
         self.has_create = false;
         self.has_remove = false;
         self.overflowed = false;
@@ -336,6 +344,16 @@ impl WatchEventBatch {
         git_watch_dirs: &[GitWatchDir],
         event: notify::Event,
     ) {
+        // The OS dropped events (inotify queue overflow, FSEvents
+        // must-scan-subdirs): notify reports that as a successful event with
+        // the rescan flag, usually of kind `Other`, so check before filtering.
+        if event.need_rescan() {
+            self.overflowed = true;
+            self.changed_paths.clear();
+            self.structural_paths.clear();
+            return;
+        }
+
         if !should_emit_watch_event(&event.kind) {
             return;
         }
@@ -344,17 +362,25 @@ impl WatchEventBatch {
             return;
         }
 
+        let structural = !matches!(
+            event.kind,
+            EventKind::Modify(ModifyKind::Data(_) | ModifyKind::Metadata(_))
+        );
         let mut has_relevant_path = false;
         for path in event.paths {
             let Some(relative) = classify_watch_path(&path, root_canonical, git_watch_dirs) else {
                 continue;
             };
 
+            if structural {
+                self.structural_paths.insert(relative.clone());
+            }
             self.changed_paths.insert(relative);
             has_relevant_path = true;
             if self.changed_paths.len() > WATCH_MAX_CHANGED_PATHS {
                 self.overflowed = true;
                 self.changed_paths.clear();
+                self.structural_paths.clear();
                 break;
             }
         }
@@ -1307,26 +1333,14 @@ fn normalize_git_status_path(path: &str) -> String {
     normalized.trim_end_matches('/').to_string()
 }
 
+/// The path `git status` gives the file numstat counted: for a rename, its new
+/// side (see [`folders::numstat_rename_sides`]).
 fn normalize_numstat_path(path: &str) -> String {
     let trimmed = path.trim().replace('\\', "/");
-
-    if let (Some(open), Some(close)) = (trimmed.find('{'), trimmed.rfind('}')) {
-        if open < close {
-            let prefix = &trimmed[..open];
-            let suffix = &trimmed[close + 1..];
-            let inner = &trimmed[open + 1..close];
-            if let Some(idx) = inner.find(" => ") {
-                let right = &inner[idx + 4..];
-                return format!("{prefix}{right}{suffix}");
-            }
-        }
+    match folders::numstat_rename_sides(&trimmed) {
+        Some((_, new)) => new,
+        None => trimmed,
     }
-
-    if let Some(index) = trimmed.rfind(" => ") {
-        return trimmed[index + 4..].to_string();
-    }
-
-    trimmed
 }
 
 fn parse_numstat_value(raw: &str) -> i32 {
@@ -1335,8 +1349,12 @@ fn parse_numstat_value(raw: &str) -> i32 {
 
 async fn git_numstat_map(path: &str) -> HashMap<String, (i32, i32)> {
     async fn run_numstat(path: &str, args: &[&str]) -> Option<HashMap<String, (i32, i32)>> {
+        // Unquoted paths, as `folders::git_status` asks for: these keys are
+        // looked up by its paths, and by default git prints a non-ASCII one
+        // C-quoted and octal-escaped (`"docs/\351\234\200..."`).
         let output = crate::process::tokio_command("git")
             .arg("--no-optional-locks")
+            .args(["-c", "core.quotePath=false"])
             .args(args)
             .current_dir(path)
             .output()
@@ -1432,6 +1450,13 @@ async fn flush_watch_batch(
     if batch.is_empty() {
         return;
     }
+
+    crate::commands::workspace_file_search::watch_changed(
+        root_canonical,
+        &batch.changed_paths,
+        &batch.structural_paths,
+        batch.overflowed,
+    );
 
     let event_kind_hint = batch.kind(root_canonical);
     let changed_paths = if batch.overflowed {
@@ -1879,6 +1904,7 @@ pub async fn start_workspace_state_stream_core(
     let (control_tx, control_rx) = mpsc::unbounded_channel::<WatchControlMessage>();
     let mut control_rx = Some(control_rx);
     let root_display_for_error = root_path.clone();
+    let root_canonical_for_error = root_canonical.clone();
     let dropped_events_for_callback = Arc::clone(&dropped_events);
     let root_canonical_for_callback = root_canonical.clone();
     let mut watcher = Some(
@@ -1904,6 +1930,14 @@ pub async fn start_workspace_state_stream_core(
                         "[workspace-state-watch] failed event for {}: {}",
                         root_display_for_error,
                         err
+                    );
+                    // Changes may have been lost: search must not trust its
+                    // event-maintained snapshot of this root.
+                    crate::commands::workspace_file_search::watch_changed(
+                        &root_canonical_for_error,
+                        &HashSet::new(),
+                        &HashSet::new(),
+                        true,
                     );
                 }
             },
@@ -1997,6 +2031,12 @@ pub async fn start_workspace_state_stream_core(
                     )
                 })?
                 .snapshot(None);
+            // Registered under the stream lock, after the watch is live, so
+            // any walk that search starts from here on misses no event.
+            // The watcher has already moved into the registration task when the
+            // root watch succeeded. Register search against that outcome.
+            let search_watch = root_registered
+                .then(|| crate::commands::workspace_file_search::watch_started(&root_canonical));
             streams.insert(
                 key,
                 WorkspaceStreamEntry {
@@ -2007,6 +2047,7 @@ pub async fn start_workspace_state_stream_core(
                     ref_count: 1,
                     full_subscribers: Arc::clone(&full_subscribers),
                     state: Arc::clone(&state),
+                    search_watch,
                 },
             );
             (false, snapshot, None)
@@ -2092,6 +2133,9 @@ pub async fn stop_workspace_state_stream_core(
     if let Some(mut entry) = removed_entry.take() {
         if let Some(control_task) = entry.control_task.take() {
             control_task.abort();
+        }
+        if let Some(token) = entry.search_watch.take() {
+            crate::commands::workspace_file_search::watch_stopped(&entry.root_canonical, token);
         }
         if let Some(task) = entry.task.take() {
             task.abort();
@@ -2688,6 +2732,79 @@ mod tests {
             git_slot.payload.as_slice(),
             [WorkspaceDelta::GitReplace { .. }]
         ));
+    }
+
+    #[test]
+    fn batch_separates_structural_paths_from_content_edits() {
+        let root = PathBuf::from("/repo");
+        let mut batch = WatchEventBatch::default();
+        let event =
+            |kind: EventKind, path: &str| notify::Event::new(kind).add_path(root.join(path));
+        batch.ingest_event(
+            &root,
+            &[],
+            event(
+                EventKind::Modify(ModifyKind::Data(notify::event::DataChange::Content)),
+                "edited.ts",
+            ),
+        );
+        batch.ingest_event(
+            &root,
+            &[],
+            event(
+                EventKind::Modify(ModifyKind::Metadata(notify::event::MetadataKind::Any)),
+                "chmod.ts",
+            ),
+        );
+        batch.ingest_event(
+            &root,
+            &[],
+            event(EventKind::Create(notify::event::CreateKind::File), "new.ts"),
+        );
+        batch.ingest_event(
+            &root,
+            &[],
+            event(
+                EventKind::Modify(ModifyKind::Name(notify::event::RenameMode::Any)),
+                "renamed.ts",
+            ),
+        );
+        batch.ingest_event(
+            &root,
+            &[],
+            event(EventKind::Remove(notify::event::RemoveKind::Any), "gone.ts"),
+        );
+        // Backends that cannot tell what changed count as structural.
+        batch.ingest_event(
+            &root,
+            &[],
+            event(EventKind::Modify(ModifyKind::Any), "any.ts"),
+        );
+        let mut structural: Vec<_> = batch.structural_paths.iter().cloned().collect();
+        structural.sort();
+        assert_eq!(structural, ["any.ts", "gone.ts", "new.ts", "renamed.ts"]);
+        assert_eq!(batch.changed_paths.len(), 6);
+        batch.clear();
+        assert!(batch.structural_paths.is_empty());
+    }
+
+    #[test]
+    fn os_rescan_notices_overflow_the_batch() {
+        let root = PathBuf::from("/repo");
+        let mut batch = WatchEventBatch::default();
+        batch.ingest_event(
+            &root,
+            &[],
+            notify::Event::new(EventKind::Create(notify::event::CreateKind::File))
+                .add_path(root.join("a.ts")),
+        );
+        batch.ingest_event(
+            &root,
+            &[],
+            notify::Event::new(EventKind::Other).set_flag(notify::event::Flag::Rescan),
+        );
+        assert!(batch.overflowed);
+        assert!(batch.changed_paths.is_empty() && batch.structural_paths.is_empty());
     }
 
     // ── Linked-worktree git-status watch coverage ───────────────────────────
@@ -3341,5 +3458,138 @@ mod tests {
         )));
         event.paths.push(PathBuf::from("/workspace/src/main.rs"));
         assert!(watch_control_messages(&event).is_empty());
+    }
+    /// Git with a fixed identity and no user config, like the work-task git
+    /// tests: the fixture must mean the same to this helper and to the code
+    /// under test.
+    fn git_run(dir: &Path, args: &[&str]) {
+        let out = std::process::Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .env("GIT_AUTHOR_NAME", "t")
+            .env("GIT_AUTHOR_EMAIL", "t@example.com")
+            .env("GIT_COMMITTER_NAME", "t")
+            .env("GIT_COMMITTER_EMAIL", "t@example.com")
+            .output()
+            .expect("spawn git");
+        assert!(
+            out.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        if args.first() == Some(&"init") {
+            git_run(dir, &["config", "core.autocrlf", "false"]);
+        }
+    }
+
+    #[test]
+    fn normalize_numstat_path_reads_the_new_side_of_a_rename() {
+        assert_eq!(normalize_numstat_path("src/main.rs"), "src/main.rs");
+        assert_eq!(normalize_numstat_path("old.rs => new.rs"), "new.rs");
+        assert_eq!(
+            normalize_numstat_path("src/{old => new}/main.rs"),
+            "src/new/main.rs"
+        );
+        assert_eq!(
+            normalize_numstat_path("src/{ => sub}/main.rs"),
+            "src/sub/main.rs"
+        );
+        // Moved up a directory: git leaves the new side empty.
+        assert_eq!(
+            normalize_numstat_path("src/{sub => }/main.rs"),
+            "src/main.rs"
+        );
+    }
+
+    /// The Git panel finds a file's counts under the path `git status` gave
+    /// it, so numstat has to spell that path the same way. By default git
+    /// prints a non-ASCII path C-quoted and octal-escaped, and such a file
+    /// showed no counts at all.
+    #[tokio::test]
+    async fn collect_git_snapshot_counts_a_non_ascii_path() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        let path = root.to_str().expect("utf-8 path");
+        git_run(root, &["init", "-q", "-b", "main"]);
+        // Git's default, set repo-local so the git the code under test runs
+        // reads it too: a developer's global `core.quotePath=false` must not
+        // hide the bug.
+        git_run(root, &["config", "core.quotePath", "true"]);
+        std::fs::create_dir(root.join("docs")).expect("mkdir");
+        std::fs::write(root.join("docs").join("需求.md"), "one\n").expect("write");
+        std::fs::write(root.join("plain.txt"), "one\n").expect("write");
+        git_run(root, &["add", "-A"]);
+        git_run(root, &["commit", "-q", "-m", "base"]);
+
+        std::fs::write(root.join("docs").join("需求.md"), "one\ntwo\n").expect("write");
+        std::fs::write(root.join("plain.txt"), "one\ntwo\n").expect("write");
+
+        let entries = collect_git_snapshot(path).await.expect("git snapshot");
+        let modified = |file: &str| WorkspaceGitEntry {
+            path: file.to_string(),
+            status: "M".to_string(),
+            additions: 1,
+            deletions: 0,
+        };
+        assert_eq!(
+            entries,
+            vec![modified("docs/需求.md"), modified("plain.txt")]
+        );
+    }
+
+    /// A staged rename is counted under its new path, which `git status` and
+    /// numstat each write their own way: status quotes a side with a space in
+    /// it (`"d/old name.txt" -> "d/new name.txt"`), numstat factors the shared
+    /// part out into braces (`d/{old name.txt => new name.txt}`) and keeps both
+    /// slashes around a side a move up a directory empties
+    /// (`docs/{sub => }/moved.txt`), and by default both octal-escape a
+    /// non-ASCII name.
+    #[tokio::test]
+    async fn collect_git_snapshot_counts_a_staged_rename() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        let path = root.to_str().expect("utf-8 path");
+        git_run(root, &["init", "-q", "-b", "main"]);
+        // Git's defaults, repo-local so the git the code under test runs reads
+        // them too, whatever the developer's global config says.
+        git_run(root, &["config", "core.quotePath", "true"]);
+        git_run(root, &["config", "diff.renames", "true"]);
+        git_run(root, &["config", "status.renames", "true"]);
+        std::fs::create_dir_all(root.join("docs").join("sub")).expect("mkdir");
+        std::fs::create_dir(root.join("d")).expect("mkdir");
+        let five = "1\n2\n3\n4\n5\n";
+        std::fs::write(root.join("docs/sub/moved.txt"), five).expect("write");
+        std::fs::write(root.join("d/old name.txt"), five).expect("write");
+        std::fs::write(root.join("d/旧.txt"), five).expect("write");
+        git_run(root, &["add", "-A"]);
+        git_run(root, &["commit", "-q", "-m", "base"]);
+
+        for (from, to) in [
+            ("docs/sub/moved.txt", "docs/moved.txt"),
+            ("d/old name.txt", "d/new name.txt"),
+            ("d/旧.txt", "d/新.txt"),
+        ] {
+            git_run(root, &["mv", from, to]);
+            std::fs::write(root.join(to), format!("{five}6\n")).expect("write");
+        }
+        git_run(root, &["add", "-A"]);
+
+        let entries = collect_git_snapshot(path).await.expect("git snapshot");
+        let renamed = |file: &str| WorkspaceGitEntry {
+            path: file.to_string(),
+            status: "R".to_string(),
+            additions: 1,
+            deletions: 0,
+        };
+        assert_eq!(
+            entries,
+            vec![
+                renamed("d/new name.txt"),
+                renamed("d/新.txt"),
+                renamed("docs/moved.txt"),
+            ]
+        );
     }
 }

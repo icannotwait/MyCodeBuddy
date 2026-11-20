@@ -384,6 +384,7 @@ mod tests {
                     parent_conversation_id: parent.id,
                     parent_tool_use_id: "tool-1".to_string(),
                     delegation_call_id: "call-1".to_string(),
+                    assistant: None,
                 }),
             )
             .await

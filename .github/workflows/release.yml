@@ -354,19 +354,27 @@ jobs:
         run: pnpm licenses:generate
 
       - name: Build frontend
+        env:
+          # The `next build` type-check needs more than the 2 GB heap Node
+          # defaults to on the 7 GB macOS runners. 4 GB is what Node already
+          # gets on the 16 GB Linux and Windows runners, so it changes nothing
+          # there.
+          NODE_OPTIONS: --max-old-space-size=4096
         run: pnpm build
 
-      - name: Build server + codeg-mcp companion + computer-use helper
+      - name: Build server + codeg-mcp companion + computer-use helper + codeg-cli
         working-directory: src-tauri
         # This fork gates `codeg-server` behind Cargo feature `server`
         # (release-policy tests search for `--features server`; upstream names
         # the same gate `server-bin`). `codeg-mcp` needs `mcp-bin`.
         # `codeg-computer-helper` serves computer use and ships beside the
-        # server. All three share the cross-compile env (Linux arm64).
+        # server. `codeg-cli` is the command-line client. All four share the
+        # cross-compile env (Linux arm64).
         run: |
           cargo build --release --bin codeg-server --no-default-features --features server --target ${{ matrix.target }}
           cargo build --release --bin codeg-mcp --no-default-features --features mcp-bin --target ${{ matrix.target }}
           cargo build --release --bin codeg-computer-helper --no-default-features --features computer-helper --target ${{ matrix.target }}
+          cargo build --release --bin codeg-cli --no-default-features --features cli-bin --target ${{ matrix.target }}
 
       - name: Package (Unix)
         if: runner.os != 'Windows'
@@ -376,7 +384,8 @@ jobs:
           cp "src-tauri/target/${{ matrix.target }}/release/codeg-server" "dist/${{ matrix.artifact }}/"
           cp "src-tauri/target/${{ matrix.target }}/release/codeg-mcp" "dist/${{ matrix.artifact }}/"
           cp "src-tauri/target/${{ matrix.target }}/release/codeg-computer-helper" "dist/${{ matrix.artifact }}/"
-          chmod +x "dist/${{ matrix.artifact }}/codeg-server" "dist/${{ matrix.artifact }}/codeg-mcp" "dist/${{ matrix.artifact }}/codeg-computer-helper"
+          cp "src-tauri/target/${{ matrix.target }}/release/codeg-cli" "dist/${{ matrix.artifact }}/"
+          chmod +x "dist/${{ matrix.artifact }}/codeg-server" "dist/${{ matrix.artifact }}/codeg-mcp" "dist/${{ matrix.artifact }}/codeg-computer-helper" "dist/${{ matrix.artifact }}/codeg-cli"
           cp -r out "dist/${{ matrix.artifact }}/web"
           cp LICENSE NOTICE "dist/${{ matrix.artifact }}/"
           cp src-tauri/resources/THIRD_PARTY_LICENSES.txt "dist/${{ matrix.artifact }}/"
@@ -384,6 +393,7 @@ jobs:
             "dist/${{ matrix.artifact }}/codeg-server" \
             "dist/${{ matrix.artifact }}/codeg-mcp" \
             "dist/${{ matrix.artifact }}/codeg-computer-helper" \
+            "dist/${{ matrix.artifact }}/codeg-cli" \
             "dist/${{ matrix.artifact }}/web/index.html" \
             "dist/${{ matrix.artifact }}/LICENSE" \
             "dist/${{ matrix.artifact }}/NOTICE" \
@@ -403,6 +413,7 @@ jobs:
           Copy-Item "src-tauri/target/${{ matrix.target }}/release/codeg-server.exe" "$bundleDir/codeg-server.exe"
           Copy-Item "src-tauri/target/${{ matrix.target }}/release/codeg-mcp.exe" "$bundleDir/codeg-mcp.exe"
           Copy-Item "src-tauri/target/${{ matrix.target }}/release/codeg-computer-helper.exe" "$bundleDir/codeg-computer-helper.exe"
+          Copy-Item "src-tauri/target/${{ matrix.target }}/release/codeg-cli.exe" "$bundleDir/codeg-cli.exe"
           Copy-Item -Recurse "out" "$bundleDir/web"
           Copy-Item "LICENSE" "$bundleDir/LICENSE"
           Copy-Item "NOTICE" "$bundleDir/NOTICE"
@@ -412,6 +423,7 @@ jobs:
             "$bundleDir/codeg-server.exe",
             "$bundleDir/codeg-mcp.exe",
             "$bundleDir/codeg-computer-helper.exe",
+            "$bundleDir/codeg-cli.exe",
             "$bundleDir/web/index.html",
             "$bundleDir/LICENSE",
             "$bundleDir/NOTICE",
@@ -431,6 +443,7 @@ jobs:
           test -x "dist/${{ matrix.artifact }}/codeg-server"
           test -x "dist/${{ matrix.artifact }}/codeg-mcp"
           test -x "dist/${{ matrix.artifact }}/codeg-computer-helper"
+          test -x "dist/${{ matrix.artifact }}/codeg-cli"
           # `codeg-mcp --help` exits 0 without flags and prints the usage
           # line. Only run it for native targets; cross-compiled arm64
           # binaries cannot execute on the x64 runner.
@@ -438,8 +451,10 @@ jobs:
              [ "${{ matrix.target }}" = "x86_64-apple-darwin" ] || \
              [ "${{ matrix.target }}" = "aarch64-apple-darwin" ]; then
             "dist/${{ matrix.artifact }}/codeg-mcp" --help | grep -F 'codeg-mcp --parent-connection-id'
+            "dist/${{ matrix.artifact }}/codeg-cli" --version | grep -F 'codeg-cli '
+            "dist/${{ matrix.artifact }}/codeg-cli" --help | grep -F 'Usage: codeg-cli'
           else
-            echo "skipping codeg-mcp --help on cross-target ${{ matrix.target }}"
+            echo "skipping codeg-mcp --help and codeg-cli --version on cross-target ${{ matrix.target }}"
           fi
 
       - name: Smoke test packaged artifact (Windows)
@@ -455,12 +470,19 @@ jobs:
           if (-not (Test-Path "dist/${{ matrix.artifact }}/codeg-computer-helper.exe")) {
             throw "codeg-computer-helper.exe missing from packaged artifact"
           }
+          if (-not (Test-Path "dist/${{ matrix.artifact }}/codeg-cli.exe")) {
+            throw "codeg-cli.exe missing from packaged artifact"
+          }
           $help = & "dist/${{ matrix.artifact }}/codeg-mcp.exe" --help
           if ($LASTEXITCODE -ne 0) {
             throw "codeg-mcp.exe --help failed with exit code $LASTEXITCODE"
           }
           if ($help -notlike "*codeg-mcp --parent-connection-id*") {
             throw "codeg-mcp --help output unexpected: $help"
+          }
+          $cliHelp = (& "dist/${{ matrix.artifact }}/codeg-cli.exe" --help) -join "`n"
+          if ($cliHelp -notlike "*Usage: codeg-cli*") {
+            throw "codeg-cli --help output unexpected: $cliHelp"
           }
 
       # Sign with the same minisign key as the desktop updater so
@@ -472,7 +494,7 @@ jobs:
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         run: |
           set -euo pipefail
-          pnpm tauri signer sign "dist/${{ matrix.artifact }}.tar.gz"
+          pnpm tauri signer sign --app-version "${GITHUB_REF_NAME#v}" "dist/${{ matrix.artifact }}.tar.gz"
           test -f "dist/${{ matrix.artifact }}.tar.gz.sig"
           ( cd dist && shasum -a 256 "${{ matrix.artifact }}.tar.gz" > "${{ matrix.artifact }}.tar.gz.sha256" )
 
@@ -483,7 +505,8 @@ jobs:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         run: |
-          pnpm tauri signer sign "dist/${{ matrix.artifact }}.zip"
+          $version = $env:GITHUB_REF_NAME.TrimStart('v')
+          pnpm tauri signer sign --app-version $version "dist/${{ matrix.artifact }}.zip"
           if (-not (Test-Path "dist/${{ matrix.artifact }}.zip.sig")) {
             throw "signature not produced for ${{ matrix.artifact }}.zip"
           }

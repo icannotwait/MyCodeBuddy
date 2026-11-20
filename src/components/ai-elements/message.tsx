@@ -38,8 +38,12 @@ import {
 import { GrokSessionImage } from "./grok-session-image"
 import { useGrokSessionImageScope } from "./grok-session-image-context"
 import { markdownLinkComponents } from "./markdown-link"
-import { messageBlockComponents } from "./json-render-pre"
+import { messageBlockComponents, useAssistantReply } from "./json-render-pre"
+import { useChatHtmlEnabled } from "@/lib/chat-html-prefs"
+import { createChatHtmlProcessor } from "@/lib/chat-html-markdown"
+import { scrollportComponents } from "./markdown-scrollport"
 import { maskLiteralSpans } from "./markdown-mask"
+import { normalizeInlineDollarMath } from "./inline-dollar-math"
 import { rehypePluginsAllowingCodeg } from "./rehype-allow-codeg"
 import { remarkAutolinkLocalPaths } from "./remark-autolink-local-paths"
 import { remarkTrimCjkAutolinkTail } from "./remark-cjk-autolink-tail"
@@ -54,6 +58,7 @@ import {
 } from "./streamdown-plugins"
 import { remarkRestoreWindowsPaths } from "./remark-windows-paths"
 import { remarkLocalImages } from "./remark-local-images"
+import { rehypeListDirection } from "./rehype-list-direction"
 import { markdownLocalImageComponents } from "./markdown-local-image"
 
 export type MessageProps = HTMLAttributes<HTMLDivElement> & {
@@ -92,8 +97,11 @@ export const MessageContent = ({
       // with a hairline ring (fixed `--ws-msg-alpha` + backdrop blur — see
       // globals.css, scoped to `.is-user`) so it stays legible over a busy
       // background. Off / assistant messages: inert (no base rule, no `.is-user`
-      // ancestor).
-      "group-[.is-user]:ml-auto group-[.is-user]:w-fit group-[.is-user]:max-w-full group-[.is-user]:rounded-lg group-[.is-user]:bg-secondary group-[.is-user]:px-4 group-[.is-user]:py-3 group-[.is-user]:text-foreground ws-msg-secondary",
+      // ancestor). Its radius is half a one-line bubble's height at the
+      // default `--radius` (2.2 × 0.625rem against 0.75rem + 1.25rem +
+      // 0.75rem), so a line is a capsule and a longer message keeps the same
+      // round corners.
+      "group-[.is-user]:ml-auto group-[.is-user]:w-fit group-[.is-user]:max-w-full group-[.is-user]:rounded-3xl group-[.is-user]:bg-secondary group-[.is-user]:px-4 group-[.is-user]:py-3 group-[.is-user]:text-foreground ws-msg-secondary",
       "group-[.is-assistant]:w-full group-[.is-assistant]:text-foreground",
       className
     )}
@@ -368,11 +376,14 @@ export type { RichContentState }
 export type MessageResponseProps = ComponentProps<typeof Streamdown> & {
   richContentState?: RichContentState
   autolinkLocalPaths?: boolean
+  /** Extend parsing while retaining the shared Markdown pipeline. */
+  additionalRemarkPlugins?: ComponentProps<typeof Streamdown>["remarkPlugins"]
 }
 
 // remark-math uses dollar delimiters. `\[...\]` / `\(...\)` are rewritten
 // to `$$...$$`. Single-dollar `$...$` is disabled (`singleDollarTextMath:
 // false`) so currency (`$9.99`) and shell vars (`$HOME`, `$1`) stay prose.
+// Only tightly delimited single-dollar formulas are normalized explicitly.
 //
 // A single-line `$$x$$` inside a paragraph stays *inline* math (mdast tags
 // every math-text node `math-inline` regardless of dollar count). The one
@@ -416,7 +427,7 @@ export function normalizeMathDelimiters(text: string): string {
       const open = atContentStart ? MATH_FENCE_PAD : ""
       return `${open}$$${inner}${MATH_FENCE_PAD}$$`
     })
-  return restore(normalized)
+  return normalizeInlineDollarMath(restore(normalized))
 }
 
 function isSpaceOrTab(code: number): boolean {
@@ -527,13 +538,16 @@ const remarkPluginsForGrokSessionImagesWithLocalPaths = [
 // Streamdown's default rehype pipeline strips `codeg://` reference hrefs in
 // sanitization (rendering them as "[blocked]"); re-derive it so they survive to
 // MarkdownLink → ReferenceBadge. See rehype-allow-codeg for the full rationale.
-const rehypePlugins = rehypePluginsAllowingCodeg(
-  withRelativeFileLinks(defaultRehypePlugins)
-)
-const grokSessionImageRehypePlugins = rehypePluginsAllowingCodeg(
-  withRelativeFileLinks(defaultRehypePlugins),
-  { grokSessionImages: true }
-)
+const rehypePlugins = [
+  ...rehypePluginsAllowingCodeg(withRelativeFileLinks(defaultRehypePlugins)),
+  rehypeListDirection,
+]
+const grokSessionImageRehypePlugins = [
+  ...rehypePluginsAllowingCodeg(withRelativeFileLinks(defaultRehypePlugins), {
+    grokSessionImages: true,
+  }),
+  rehypeListDirection,
+]
 
 type StreamdownComponents = NonNullable<
   ComponentProps<typeof Streamdown>["components"]
@@ -643,14 +657,22 @@ function MessageResponseImpl({
   mode = FINISHED_MODE,
   parseIncompleteMarkdown = FINISHED_PARSE_INCOMPLETE_MARKDOWN,
   remend,
+  additionalRemarkPlugins,
+  remarkPlugins: callerRemarkPlugins,
+  rehypePlugins: callerRehypePlugins,
   ...props
 }: MessageResponseProps) {
+  const inReply = useAssistantReply()
+  const htmlEnabled = useChatHtmlEnabled() && inReply
+  const processHtml = useMemo(() => createChatHtmlProcessor(), [])
   const normalized = useMemo(
     () =>
       typeof children === "string"
-        ? normalizeMathDelimiters(children)
+        ? htmlEnabled
+          ? processHtml(children, mode === "streaming", normalizeMathDelimiters)
+          : normalizeMathDelimiters(children)
         : children,
-    [children]
+    [children, htmlEnabled, mode, processHtml]
   )
   const text = typeof normalized === "string" ? normalized : undefined
   const needsMermaid =
@@ -668,21 +690,50 @@ function MessageResponseImpl({
     ? grokSessionImageComponents
     : linkComponents
   const components = useMemo(
-    () =>
-      props.components
-        ? { ...props.components, ...selectedAppComponents }
-        : selectedAppComponents,
+    () => ({
+      ...markdownLocalImageComponents,
+      ...props.components,
+      ...selectedAppComponents,
+      ...scrollportComponents,
+    }),
     [props.components, selectedAppComponents]
   )
   // Streamdown's outer memo ignores rehype/component changes. Remount only
   // when this security gate flips so stale scoped output cannot cross it.
   const pipelineKey = grokScope ? "grok-session-images" : "default-markdown"
+  const baseRemarkPlugins = grokScope
+    ? autolinkLocalPaths
+      ? remarkPluginsForGrokSessionImagesWithLocalPaths
+      : remarkPluginsForGrokSessionImages
+    : autolinkLocalPaths
+      ? remarkPluginsWithLocalPaths
+      : remarkPlugins
+  const combinedRemarkPlugins = useMemo(
+    () => [
+      ...baseRemarkPlugins,
+      ...(additionalRemarkPlugins ?? []),
+      ...(callerRemarkPlugins ?? []),
+    ],
+    [additionalRemarkPlugins, baseRemarkPlugins, callerRemarkPlugins]
+  )
+  const combinedRehypePlugins = useMemo(
+    () => [...selectedRehypePlugins, ...(callerRehypePlugins ?? [])],
+    [callerRehypePlugins, selectedRehypePlugins]
+  )
 
   return (
     <div ref={ref} className="min-w-0">
       <Streamdown
         className={cn(
-          "size-full [&>*:first-child]:mt-0 [&>*:last-child]:mb-0 [&_ul]:list-disc [&_ol]:list-decimal [&_ul]:pl-3 [&_ol]:pl-3",
+          // `chat-markdown`: while it streams, its blocks keep the spacing they
+          // settle with (globals.css).
+          "chat-markdown size-full [&>*:first-child]:mt-0 [&>*:last-child]:mb-0 [&_ul]:list-disc [&_ol]:list-decimal [&_ul]:ps-2 [&_ol]:ps-2",
+          // Each block takes the direction of its own text (`dir="auto"`
+          // below), so indents and rules go on the logical start side. An item
+          // re-states `text-align: start`: the UA gives <li>
+          // `-webkit-match-parent`, which would align an English item in an
+          // Arabic list (or the reverse) by the list's side, not its own.
+          "[&_li]:text-start",
           // Streamdown gives `blockquote` its own `border-l-4
           // border-muted-foreground/30 … italic`, but those class names live in
           // node_modules, which Tailwind v4 does not scan — so the two border
@@ -690,33 +741,28 @@ function MessageResponseImpl({
           // with no rule (the `pl-4`/`my-4`/`text-muted-foreground` on the same
           // element only survive because they happen to be used elsewhere in src).
           // Re-declare the rule here, where it IS scanned; the descendant selector
-          // also outranks Streamdown's plain utility class. No `pl-*` — its `pl-4`
-          // already works and a same-specificity duplicate would be a coin flip.
+          // also outranks Streamdown's plain utility class. Rule and indent sit
+          // on the quote's start side, which follows its text: in a left-to-right
+          // quote `ps-4` is Streamdown's own `pl-4`; in a right-to-left one `pe-0`
+          // drops that left padding.
           // Upright, not italic: CJK has no true italic, so a browser fakes it by
           // skewing, which looks broken.
-          "[&_blockquote]:border-l-2 [&_blockquote]:border-border [&_blockquote]:not-italic",
+          "[&_blockquote]:border-s-2 [&_blockquote]:border-border [&_blockquote]:ps-4 [&_blockquote]:pe-0 [&_blockquote]:not-italic",
           className
         )}
         plugins={plugins}
-        {...props}
-        remend={remend ? { ...remend, ...LIVE_REMEND } : LIVE_REMEND}
-        key={pipelineKey}
-        rehypePlugins={selectedRehypePlugins}
-        // App-selected remark plugins are authoritative so a caller's
-        // remarkPlugins array cannot disable autolinkLocalPaths opt-in.
-        remarkPlugins={
-          grokScope
-            ? autolinkLocalPaths
-              ? remarkPluginsForGrokSessionImagesWithLocalPaths
-              : remarkPluginsForGrokSessionImages
-            : autolinkLocalPaths
-              ? remarkPluginsWithLocalPaths
-              : remarkPlugins
-        }
+        remarkPlugins={combinedRemarkPlugins}
+        rehypePlugins={combinedRehypePlugins}
         mode={mode}
         parseIncompleteMarkdown={parseIncompleteMarkdown}
-        // Merge after spreading props so a caller can still override other
-        // elements, but app link routing, local images, and Mermaid always win.
+        remend={remend ? { ...remend, ...LIVE_REMEND } : LIVE_REMEND}
+        // Every paragraph, heading, list item, quote and cell takes the
+        // direction of its own text (code stays left-to-right): an English reply
+        // in the Arabic interface reads left-to-right with its full stop at the
+        // end, and an Arabic one in an English interface the other way.
+        dir="auto"
+        key={pipelineKey}
+        {...props}
         components={components}
       >
         {normalized}
@@ -734,7 +780,16 @@ export const MessageResponse = memo(
     (prevProps.mode ?? FINISHED_MODE) === (nextProps.mode ?? FINISHED_MODE) &&
     (prevProps.parseIncompleteMarkdown ??
       FINISHED_PARSE_INCOMPLETE_MARKDOWN) ===
-      (nextProps.parseIncompleteMarkdown ?? FINISHED_PARSE_INCOMPLETE_MARKDOWN)
+      (nextProps.parseIncompleteMarkdown ??
+        FINISHED_PARSE_INCOMPLETE_MARKDOWN) &&
+    // The prose being written wraps its new characters to fade them in
+    // (`animated` + `isAnimating`); done, it drops the wrapping.
+    (prevProps.isAnimating ?? false) === (nextProps.isAnimating ?? false) &&
+    prevProps.animated === nextProps.animated &&
+    prevProps.additionalRemarkPlugins === nextProps.additionalRemarkPlugins &&
+    prevProps.remarkPlugins === nextProps.remarkPlugins &&
+    prevProps.rehypePlugins === nextProps.rehypePlugins &&
+    prevProps.components === nextProps.components
 )
 
 MessageResponse.displayName = "MessageResponse"

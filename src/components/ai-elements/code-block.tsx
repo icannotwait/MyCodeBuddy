@@ -6,9 +6,11 @@ import type {
   BundledTheme,
   HighlighterGeneric,
   ThemedToken,
+  TokensResult,
 } from "shiki"
 
 import { Button } from "@/components/ui/button"
+import { ScrollArea } from "@/components/ui/scroll-area"
 import {
   Select,
   SelectContent,
@@ -19,6 +21,13 @@ import {
 import { WeightedLruCache } from "@/lib/cache/weighted-lru"
 import { cn, copyTextToClipboard } from "@/lib/utils"
 import { registerBackendScopedStoreReset } from "@/stores/backend-scoped-store-reset"
+import {
+  DEFAULT_CODE_THEMES,
+  getCachedHighlightedCode,
+  rawCodeTokens,
+  setHighlighterFactoryOverride,
+  subscribeHighlightedCode,
+} from "@/lib/code-highlighter"
 import { CheckIcon, CopyIcon } from "lucide-react"
 import {
   createContext,
@@ -62,7 +71,7 @@ const addKeysToTokens = (lines: ThemedToken[][]): KeyedLine[] =>
   }))
 
 // Token rendering component
-const TokenSpan = ({ token }: { token: ThemedToken }) => (
+export const TokenSpan = ({ token }: { token: ThemedToken }) => (
   <span
     className="dark:!bg-[var(--shiki-dark-bg)] dark:!text-[var(--shiki-dark)]"
     style={
@@ -119,6 +128,12 @@ const CodeBlockContext = createContext<CodeBlockContextType>({
   code: "",
 })
 
+const normalizeTokens = (result: TokensResult): TokenizedCode => ({
+  tokens: result.tokens,
+  fg: result.fg ?? "inherit",
+  bg: result.bg ?? "transparent",
+})
+
 type HighlighterFactory = (
   language: BundledLanguage
 ) => Promise<HighlighterGeneric<BundledLanguage, BundledTheme>>
@@ -169,9 +184,8 @@ function getTokensCacheKey(code: string, language: BundledLanguage): string {
 const defaultHighlighterFactory: HighlighterFactory = (language) =>
   // Load Shiki's engine lazily: a static `import` would pull it (and its
   // textmate machinery) into the first-paint bundle for every message list,
-  // even a text-only conversation. Highlighting is already async with an
-  // immediate raw-token fallback (see `createRawTokens`), so deferring the
-  // engine import only extends that existing pre-highlight window slightly.
+  // even a text-only conversation. Highlighting is already async, so
+  // deferring the engine import only extends that pre-highlight window slightly.
   import("shiki").then(({ createHighlighter }) =>
     createHighlighter({
       langs: [language],
@@ -193,22 +207,6 @@ const getHighlighter = (
   highlighterCache.set(language, highlighterPromise)
   return highlighterPromise
 }
-
-// Create raw tokens for immediate display while highlighting loads
-const createRawTokens = (code: string): TokenizedCode => ({
-  bg: "transparent",
-  fg: "inherit",
-  tokens: code.split("\n").map((line) =>
-    line === ""
-      ? []
-      : [
-          {
-            color: "inherit",
-            content: line,
-          } as ThemedToken,
-        ]
-  ),
-})
 
 function startHighlight(
   code: string,
@@ -326,6 +324,13 @@ export function __setHighlighterFactoryForTest(
 ): void {
   highlighterFactoryOverride = factory
   highlighterCache.clear()
+  // Shiki's `codeToTokens` overloads are not the structural factory the shared
+  // highlighter accepts. The test doubles and the real engine both expose it.
+  setHighlighterFactoryOverride(
+    (factory
+      ? (language: string) => factory(language as BundledLanguage)
+      : null) as Parameters<typeof setHighlighterFactoryOverride>[0]
+  )
 }
 
 /** Test-only: insert a completed token entry under an arbitrary key. */
@@ -358,6 +363,7 @@ export function __getHighlightCacheStatsForTest(): {
 /** Test-only: reset overrides, caches, and in-flight state. */
 export function __resetHighlightCachesForTest(): void {
   highlighterFactoryOverride = null
+  setHighlighterFactoryOverride(null)
   clearHighlightCaches()
 }
 
@@ -501,6 +507,52 @@ export const CodeBlockActions = ({
   </div>
 )
 
+/**
+ * `code` as lines of coloured tokens: plain text at once, then the highlighted
+ * tokens once shiki has them (cached by code and language). For code set
+ * outside a `CodeBlock`, with `TokenSpan` per token.
+ */
+export function useHighlightedTokens(
+  code: string,
+  language: BundledLanguage
+): TokenizedCode {
+  // Memoized raw tokens for immediate display
+  const rawTokens = useMemo(() => normalizeTokens(rawCodeTokens(code)), [code])
+
+  // Synchronous cached-or-raw value, recomputed when code/language changes
+  const syncTokenized = useMemo(() => {
+    const cached = getCachedHighlightedCode({
+      code,
+      language,
+      themes: DEFAULT_CODE_THEMES,
+    })
+    return cached ? normalizeTokens(cached) : rawTokens
+  }, [code, language, rawTokens])
+
+  // Async highlighted result, tagged with its source code/language
+  const [asyncState, setAsyncState] = useState<{
+    code: string
+    language: string
+    tokenized: TokenizedCode
+  } | null>(null)
+
+  useEffect(
+    () =>
+      subscribeHighlightedCode(
+        { code, language, themes: DEFAULT_CODE_THEMES },
+        (result) => {
+          setAsyncState({ code, language, tokenized: normalizeTokens(result) })
+        }
+      ),
+    [code, language]
+  )
+
+  // Use async result only if it matches current code/language
+  return asyncState?.code === code && asyncState?.language === language
+    ? asyncState.tokenized
+    : syncTokenized
+}
+
 export const CodeBlockContent = ({
   code,
   language,
@@ -510,45 +562,18 @@ export const CodeBlockContent = ({
   language: BundledLanguage
   showLineNumbers?: boolean
 }) => {
-  // Memoized raw tokens for immediate display
-  const rawTokens = useMemo(() => createRawTokens(code), [code])
+  const tokenized = useHighlightedTokens(code, language)
 
-  // Synchronous cached-or-raw value, recomputed when code/language changes
-  const syncTokenized = useMemo(
-    () => highlightCode(code, language) ?? rawTokens,
-    [code, language, rawTokens]
-  )
-
-  // Async highlighted result, tagged with its source code/language.
-  // An incrementing request version rejects stale callbacks after props change.
-  const [asyncState, setAsyncState] = useState<{
-    code: string
-    language: string
-    tokenized: TokenizedCode
-  } | null>(null)
-  const requestVersionRef = useRef(0)
-
-  useEffect(() => {
-    const requestVersion = ++requestVersionRef.current
-
-    // Subscribe to async highlighting result
-    highlightCode(code, language, (result) => {
-      if (requestVersion !== requestVersionRef.current) return
-      setAsyncState({ code, language, tokenized: result })
-    })
-  }, [code, language])
-
-  // Use async result only if it matches current code/language (stale
-  // versions never write asyncState, so code/language is sufficient here).
-  const tokenized =
-    asyncState?.code === code && asyncState?.language === language
-      ? asyncState.tokenized
-      : syncTokenized
-
+  // Sideways on the app's overlay scrollbars, like every other scroll area.
   return (
-    <div className="relative overflow-auto">
-      <CodeBlockBody showLineNumbers={showLineNumbers} tokenized={tokenized} />
-    </div>
+    <ScrollArea x="scroll" y="hidden">
+      <div className="relative">
+        <CodeBlockBody
+          showLineNumbers={showLineNumbers}
+          tokenized={tokenized}
+        />
+      </div>
+    </ScrollArea>
   )
 }
 

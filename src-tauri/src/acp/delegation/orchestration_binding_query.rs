@@ -1245,6 +1245,7 @@ mod tests {
                 parent_conversation_id: parent.id,
                 parent_tool_use_id: "query-parent-tool".into(),
                 delegation_call_id: "query-call".into(),
+                assistant: None,
             }),
         )
         .await

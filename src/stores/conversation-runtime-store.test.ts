@@ -242,6 +242,9 @@ afterEach(() => {
   __resetLiveTranscriptStoreForTests()
   resetJsonParseCacheForTests()
   vi.restoreAllMocks()
+  mockGetFolderConversation.mockReset()
+  vi.clearAllTimers()
+  vi.useRealTimers()
 })
 
 describe("completeLiveTranscriptTurn", () => {

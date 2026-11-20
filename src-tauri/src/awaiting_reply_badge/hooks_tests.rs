@@ -52,9 +52,15 @@ async fn hook_soft_delete_schedules() {
         .expect("create conversation");
     let coordinator = crate::auto_title::AutoTitleCoordinator::new_inert_for_test(db.conn.clone());
 
-    delete_conversation_with_cleanup_core(&EventEmitter::Noop, &db.conn, coordinator.as_ref(), id)
-        .await
-        .expect("soft-delete");
+    delete_conversation_with_cleanup_core(
+        &EventEmitter::Noop,
+        &db.conn,
+        coordinator.as_ref(),
+        &crate::acp::manager::ConnectionManager::new(),
+        id,
+    )
+    .await
+    .expect("soft-delete");
 
     assert!(
         schedule_call_count() >= 1,

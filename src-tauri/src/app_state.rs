@@ -138,6 +138,12 @@ pub struct AppState {
     /// One roundtable coordinator slot. Desktop and the embedded web server
     /// clone this handle; neither constructs a second service.
     pub roundtable: Arc<crate::roundtable::RoundtableSlot>,
+    /// Headless `codeg-cli` runs. Built in both runtimes at startup; its
+    /// routes are served under `/api` and on the loopback listener.
+    pub cli_runs: Arc<crate::cli_run::CliRunService>,
+    /// The loopback listener and discovery file the CLIs of this machine
+    /// come in by, and the setting that turns them on and off.
+    pub cli_access: Arc<crate::cli_run::CliAccess>,
 }
 
 pub fn default_system_op_lock() -> Arc<tokio::sync::Mutex<()>> {
@@ -243,6 +249,9 @@ pub fn build_delegation_stack(
     let agent_availability =
         Arc::new(crate::acp::connection::DbAgentAvailabilityLookup { db: db_arc.clone() })
             as Arc<dyn crate::acp::connection::AgentAvailabilityLookup>;
+    let assistants =
+        Arc::new(crate::acp::delegation::assistants::DbAssistantLookup { db: db_arc.clone() })
+            as Arc<dyn crate::acp::delegation::assistants::AssistantLookup>;
     let status_lookup = Arc::new(DbChildStatusLookup { db: db_arc }) as Arc<dyn ChildStatusLookup>;
     let meta_writer = Arc::new(ConnectionManagerMetaWriter {
         manager: cm_arc.clone(),
@@ -261,7 +270,8 @@ pub fn build_delegation_stack(
             .with_attention_store(attention_store)
             .with_status_lookup(status_lookup)
             .with_live_reply_lookup(live_reply_lookup)
-            .with_metrics(delegation_metrics.clone()),
+            .with_metrics(delegation_metrics.clone())
+            .with_assistants(assistants),
     );
     let continuation_port = Arc::new(
         crate::acp::delegation::continuation::coordinator::ManagerContinuationPort::new(cm_arc),
@@ -557,6 +567,15 @@ impl AppState {
                 db: db.conn.clone(),
             }),
         );
+        let cli_runs = crate::cli_run::CliRunService::new(
+            &db,
+            &connection_manager,
+            emitter.clone(),
+            acp_event_bus.clone(),
+            data_dir.clone(),
+            crate::cli_run::wire::RuntimeKind::Server,
+        );
+        let cli_access = crate::cli_run::CliAccess::new(cli_runs.clone(), data_dir.clone());
         Self {
             db,
             connection_manager,
@@ -596,6 +615,8 @@ impl AppState {
             system_op_lock: default_system_op_lock(),
             update_state: default_update_state(),
             roundtable: Arc::new(crate::roundtable::RoundtableSlot::new()),
+            cli_runs,
+            cli_access,
         }
     }
 }

@@ -287,6 +287,7 @@ fn classify_system_candidate(executable: PathBuf) -> Result<ResolvedShellSpec, S
 ///
 /// Used by the ACP terminal runtime and kept public so both interactive and
 /// non-interactive paths share one strategy table.
+#[allow(dead_code)]
 pub fn build_command_line(spec: &ResolvedShellSpec, line: &str) -> tokio::process::Command {
     let mut command = crate::process::tokio_command(&spec.executable);
     #[cfg(windows)]
@@ -502,20 +503,17 @@ fn looks_like_path(value: &str) -> bool {
 }
 
 fn is_usable_executable(path: &Path) -> bool {
-    if !path.is_file() {
-        return false;
-    }
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         match path.metadata() {
-            Ok(meta) => meta.permissions().mode() & 0o111 != 0,
+            Ok(meta) => meta.is_file() && meta.permissions().mode() & 0o111 != 0,
             Err(_) => false,
         }
     }
     #[cfg(not(unix))]
     {
-        true
+        path.is_file()
     }
 }
 

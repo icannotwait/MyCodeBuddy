@@ -255,6 +255,10 @@ impl PersistedTask {
             last_agent_activity_at: None,
             stalled_since: None,
             recovery: None,
+            blocked_on: None,
+            assistant_id: None,
+            assistant_name: None,
+            progress: None,
         }
     }
 }
@@ -886,6 +890,10 @@ fn report_from_terminal(
         last_agent_activity_at: None,
         stalled_since: None,
         recovery: None,
+        blocked_on: None,
+        assistant_id: None,
+        assistant_name: None,
+        progress: None,
     }
 }
 
@@ -1915,6 +1923,7 @@ mod tests {
             parent_conversation_id: parent.id,
             parent_tool_use_id: "tu-1".into(),
             delegation_call_id: task_id.into(),
+            assistant: None,
         };
         let child = conversation_service::create_with_delegation(
             &db.conn,
@@ -1951,6 +1960,7 @@ mod tests {
                 parent_conversation_id: parent.id,
                 parent_tool_use_id: format!("tu-{task_id}"),
                 delegation_call_id: (*task_id).into(),
+                assistant: None,
             };
             conversation_service::create_with_delegation(
                 &db.conn,
@@ -2412,6 +2422,7 @@ mod tests {
                 parent_conversation_id: foreign_parent.id,
                 parent_tool_use_id: "tu-foreign".into(),
                 delegation_call_id: foreign_task.into(),
+                assistant: None,
             }),
         )
         .await
@@ -2638,6 +2649,7 @@ mod tests {
             parent_conversation_id: parent.id,
             parent_tool_use_id: "tu-hist".into(),
             delegation_call_id: "hist-null".into(),
+            assistant: None,
         };
         let child = conversation_service::create_with_delegation(
             &db.conn,
@@ -2696,6 +2708,7 @@ mod tests {
                 parent_conversation_id: parent.id,
                 parent_tool_use_id: format!("tu-{task_id}"),
                 delegation_call_id: task_id.into(),
+                assistant: None,
             }),
         )
         .await

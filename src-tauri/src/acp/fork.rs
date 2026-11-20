@@ -7,9 +7,13 @@
 //! reply first.
 
 use agent_client_protocol::schema::v1::{
-    ForkSessionRequest, ForkSessionResponse, Meta, SessionId, AGENT_METHOD_NAMES,
+    ForkSessionRequest, ForkSessionResponse, McpServer, Meta, SessionId, AGENT_METHOD_NAMES,
 };
 use agent_client_protocol::{Agent, ConnectionTo};
+
+use crate::acp::connection::{
+    agent_error_text, claude_raw_sdk_session_meta, send_capturing_models, ClaudeSessionOptions,
+};
 
 use crate::acp::error::AcpError;
 use crate::models::agent::AgentType;
@@ -248,18 +252,69 @@ pub fn build_fork_session_request(
 /// is inert rather than an error wherever it isn't understood. An agent that
 /// DOES implement it but cannot resolve the point answers `invalid_params`,
 /// which surfaces as a fork failure the user can retry from a different turn.
+///
+/// What else the request names depends on the agent; see [`build_fork_request`].
+#[allow(clippy::too_many_arguments)]
 pub async fn fork_session(
     cx: &ConnectionTo<Agent>,
     session_id: &SessionId,
+    agent_type: AgentType,
     cwd: &str,
     mut terminal_meta: Meta,
+    mcp_servers: &[McpServer],
+    claude: &ClaudeSessionOptions,
     fork_point: Option<&ForkPoint>,
 ) -> Result<(ForkSessionResponse, Option<serde_json::Value>), AcpError> {
     merge_fork_point_meta(&mut terminal_meta, fork_point);
-    let req = build_fork_session_request(session_id.clone(), cwd, terminal_meta);
-    crate::acp::connection::send_capturing_models(cx, AGENT_METHOD_NAMES.session_fork, req)
-        .await
-        .map_err(|e| AcpError::protocol(format!("session/fork failed: {e}")))
+    send_capturing_models(
+        cx,
+        AGENT_METHOD_NAMES.session_fork,
+        build_fork_request(
+            session_id,
+            agent_type,
+            cwd,
+            mcp_servers,
+            claude,
+            None,
+            terminal_meta,
+        ),
+    )
+    .await
+    .map_err(|e| AcpError::protocol(format!("session/fork failed: {}", agent_error_text(&e))))
+}
+
+/// The `session/fork` request: the fork point, if any, plus — for Claude and
+/// Codex — the MCP servers the session runs with (and, for Claude, its
+/// `_meta.claudeCode`), plus the connection's terminal metadata.
+fn build_fork_request(
+    session_id: &SessionId,
+    agent_type: AgentType,
+    cwd: &str,
+    mcp_servers: &[McpServer],
+    claude: &ClaudeSessionOptions,
+    fork_point: Option<&ForkPoint>,
+    mut terminal_meta: Meta,
+) -> ForkSessionRequest {
+    let mut req = ForkSessionRequest::new(session_id.clone(), cwd);
+    let mut meta = fork_point.map(ForkPoint::to_meta).unwrap_or_default();
+    // Connection shell snapshot (terminal dialect) rides the same `_meta`.
+    // Fork-point keys already in `terminal_meta` replace the copy above.
+    meta.extend(std::mem::take(&mut terminal_meta));
+    let claude_meta = claude_raw_sdk_session_meta(agent_type, claude);
+    let names_servers = claude_meta.is_some() || agent_type == AgentType::Codex;
+    if let Some(session_meta) = claude_meta {
+        // Disjoint keys: the fork point lives under `jetbrains`, the session's
+        // own settings under `claudeCode`.
+        meta.extend(session_meta);
+    }
+    if names_servers && !mcp_servers.is_empty() {
+        req = req.mcp_servers(mcp_servers.to_vec());
+    }
+    if meta.is_empty() {
+        req
+    } else {
+        req.meta(meta)
+    }
 }
 
 #[cfg(test)]
@@ -327,23 +382,25 @@ mod tests {
     #[test]
     fn fork_request_carries_the_air_fork_block_as_its_meta() {
         let spec = test_pwsh_spec();
-        let mut meta =
+        let meta =
             terminal_metadata(Meta::default(), &spec, adapter_for(AgentType::Codex)).unwrap();
         let point = ForkPoint {
             message_id: "msg_01".into(),
             message_fingerprint: Some("sha256:ab".into()),
             message_occurrence: Some(2),
         };
-        merge_fork_point_meta(&mut meta, Some(&point));
-        let wire = serde_json::to_value(build_fork_session_request(
-            SessionId::new("sess-1"),
+        let wire = serde_json::to_value(build_fork_request(
+            &SessionId::new("sess-1"),
+            AgentType::Codex,
             "/work",
+            &[],
+            &ClaudeSessionOptions::new(true),
+            Some(&point),
             meta,
         ))
         .unwrap();
         assert_eq!(wire["sessionId"], "sess-1");
         assert_eq!(wire["cwd"], "/work");
-        assert!(wire.get("mcpServers").is_none());
         assert_terminal_meta(&wire, "powershell", &spec.executable.to_string_lossy());
         assert_eq!(
             wire["_meta"]["jetbrains"]["air"]["fork"],
@@ -352,6 +409,199 @@ mod tests {
                 "messageId": "msg_01",
                 "messageFingerprint": "sha256:ab",
                 "messageOccurrence": 2,
+            })
+        );
+    }
+
+    fn server(name: &str) -> McpServer {
+        McpServer::Stdio(agent_client_protocol::schema::v1::McpServerStdio::new(
+            name, "/bin/mcp",
+        ))
+    }
+
+    /// For DeepSeek and Grok a tail fork is the bare request: no fork point,
+    /// and no MCP servers — the resume that follows every fork is what mounts
+    /// them (see [`build_fork_request`]), so naming them here would start them
+    /// twice.
+    #[test]
+    fn deepseek_and_grok_tail_forks_omit_fork_point_and_mcp_servers() {
+        for agent_type in [AgentType::DeepSeek, AgentType::Grok] {
+            let wire = serde_json::to_value(build_fork_request(
+                &SessionId::new("sess-1"),
+                agent_type,
+                "/work",
+                &[server("codeg-mcp")],
+                &ClaudeSessionOptions::new(true),
+                None,
+                Meta::default(),
+            ))
+            .unwrap();
+            assert_eq!(
+                wire,
+                serde_json::json!({"sessionId": "sess-1", "cwd": "/work"}),
+                "{agent_type:?}"
+            );
+        }
+    }
+
+    /// Codex's fork names the servers its resume names (#1105): codex-acp
+    /// builds the forked thread's MCP config from the fork request alone, and
+    /// the resume of that still-subscribed thread cannot add any. It carries no
+    /// `_meta` of Claude's.
+    #[test]
+    fn a_codex_fork_names_the_servers_its_resume_sends() {
+        let servers = vec![server("codeg-mcp"), server("docs")];
+        let fork = serde_json::to_value(build_fork_request(
+            &SessionId::new("sess-1"),
+            AgentType::Codex,
+            "/work",
+            &servers,
+            &ClaudeSessionOptions::new(true),
+            None,
+            Meta::default(),
+        ))
+        .unwrap();
+        let resume = serde_json::to_value(crate::acp::connection::resume_session_request_for(
+            AgentType::Codex,
+            SessionId::new("sess-2"),
+            std::path::Path::new("/work"),
+            servers.clone(),
+            &ClaudeSessionOptions::new(true),
+        ))
+        .unwrap();
+        assert_eq!(fork["mcpServers"], resume["mcpServers"]);
+        assert_eq!(fork["mcpServers"].as_array().map(Vec::len), Some(2));
+        assert_eq!(fork["mcpServers"][0]["name"], "codeg-mcp");
+        assert!(fork.get("_meta").is_none());
+
+        // No servers: the bare request.
+        let bare = serde_json::to_value(build_fork_request(
+            &SessionId::new("sess-1"),
+            AgentType::Codex,
+            "/work",
+            &[],
+            &ClaudeSessionOptions::new(true),
+            None,
+            Meta::default(),
+        ))
+        .unwrap();
+        assert_eq!(
+            bare,
+            serde_json::json!({"sessionId": "sess-1", "cwd": "/work"})
+        );
+    }
+
+    /// Claude's fork names exactly the settings its resume names — the same
+    /// servers and the same `_meta.claudeCode` — because claude-agent-acp
+    /// 0.90.0 starts the forked session from the fork, and the resume reuses
+    /// that session only when the two agree (anything else restarts it).
+    #[test]
+    fn a_claude_fork_names_the_settings_its_resume_sends() {
+        let servers = vec![server("codeg-mcp"), server("docs")];
+        let fork = serde_json::to_value(build_fork_request(
+            &SessionId::new("sess-1"),
+            AgentType::ClaudeCode,
+            "/work",
+            &servers,
+            &ClaudeSessionOptions::new(true),
+            None,
+            Meta::default(),
+        ))
+        .unwrap();
+        let resume = serde_json::to_value(crate::acp::connection::resume_session_request_for(
+            AgentType::ClaudeCode,
+            SessionId::new("sess-2"),
+            std::path::Path::new("/work"),
+            servers.clone(),
+            &ClaudeSessionOptions::new(true),
+        ))
+        .unwrap();
+        assert_eq!(fork["cwd"], resume["cwd"]);
+        assert_eq!(fork["mcpServers"], resume["mcpServers"]);
+        assert_eq!(fork["_meta"], resume["_meta"]);
+        assert_eq!(
+            fork["_meta"],
+            serde_json::json!({"claudeCode": {"emitRawSDKMessages": true}})
+        );
+        assert_eq!(fork["mcpServers"].as_array().map(Vec::len), Some(2));
+
+        // No servers: none named on either request.
+        let bare = serde_json::to_value(build_fork_request(
+            &SessionId::new("sess-1"),
+            AgentType::ClaudeCode,
+            "/work",
+            &[],
+            &ClaudeSessionOptions::new(true),
+            None,
+            Meta::default(),
+        ))
+        .unwrap();
+        assert!(bare.get("mcpServers").is_none());
+        assert_eq!(
+            bare["_meta"],
+            serde_json::json!({"claudeCode": {"emitRawSDKMessages": true}})
+        );
+    }
+
+    /// A connection that asks for no predicted prompts (an automation run, a
+    /// chat-channel bot) says so on the fork as on the resume: the option is
+    /// part of the adapter's session fingerprint, so a fork that left it out
+    /// would make the resume restart the forked session.
+    #[test]
+    fn a_claude_fork_without_prompt_suggestions_matches_its_resume() {
+        let fork = serde_json::to_value(build_fork_request(
+            &SessionId::new("sess-1"),
+            AgentType::ClaudeCode,
+            "/work",
+            &[server("codeg-mcp")],
+            &ClaudeSessionOptions::new(false),
+            None,
+            Meta::default(),
+        ))
+        .unwrap();
+        let resume = serde_json::to_value(crate::acp::connection::resume_session_request_for(
+            AgentType::ClaudeCode,
+            SessionId::new("sess-2"),
+            std::path::Path::new("/work"),
+            vec![server("codeg-mcp")],
+            &ClaudeSessionOptions::new(false),
+        ))
+        .unwrap();
+        assert_eq!(fork["_meta"], resume["_meta"]);
+        assert_eq!(
+            fork["_meta"],
+            serde_json::json!({"claudeCode": {
+                "emitRawSDKMessages": true,
+                "options": {"promptSuggestions": false},
+            }})
+        );
+    }
+
+    /// The fork point and the session's settings ride the same `_meta`, side by
+    /// side: neither replaces the other, and the adapter's session fingerprint
+    /// reads only the `claudeCode` half.
+    #[test]
+    fn a_claude_fork_point_rides_beside_the_session_settings() {
+        let point = ForkPoint {
+            message_id: "msg_01".into(),
+            message_fingerprint: None,
+            message_occurrence: None,
+        };
+        let wire = serde_json::to_value(build_fork_request(
+            &SessionId::new("sess-1"),
+            AgentType::ClaudeCode,
+            "/work",
+            &[],
+            &ClaudeSessionOptions::new(true),
+            Some(&point),
+            Meta::default(),
+        ))
+        .unwrap();
+        assert_eq!(
+            wire["_meta"],
+            serde_json::json!({
+                "claudeCode": {"emitRawSDKMessages": true},
+                "jetbrains": {"air": {"fork": {"version": 1, "messageId": "msg_01"}}},
             })
         );
     }

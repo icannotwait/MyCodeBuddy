@@ -12,7 +12,9 @@ use crate::db::entities::conversation::ConversationKind;
 use crate::db::entities::{conversation, folder};
 use crate::db::error::DbError;
 use crate::db::service::conversation_tag_service;
-use crate::models::{AgentType, ConversationStatePatch, DbConversationSummary};
+use crate::models::{
+    AgentType, AssistantRunSnapshot, ConversationStatePatch, DbConversationSummary,
+};
 
 #[derive(Debug, Clone)]
 pub struct ClearAwaitingReplyOutcome {
@@ -213,21 +215,33 @@ async fn create_inner(
         .and_then(|v| v.as_str().map(String::from))
         .unwrap_or_default();
     let now = Utc::now();
-    let (parent_id, parent_tool_use_id, delegation_call_id, task_fields) = match delegation {
-        Some(link) => (
-            Some(link.parent_conversation_id),
-            Some(link.parent_tool_use_id),
-            Some(link.delegation_call_id),
-            // Accepted boundary: linked delegate rows are born running. Normal
-            // root/chat rows keep all four task fields null.
-            (
-                Some(conversation::DelegationTaskStatus::Running),
-                None::<String>,
-                Some(now),
-                None,
+    let (parent_id, parent_tool_use_id, delegation_call_id, task_fields, assistant) =
+        match delegation {
+            Some(link) => (
+                Some(link.parent_conversation_id),
+                Some(link.parent_tool_use_id),
+                Some(link.delegation_call_id),
+                // Accepted boundary: linked delegate rows are born running. Normal
+                // root/chat rows keep all four task fields null.
+                (
+                    Some(conversation::DelegationTaskStatus::Running),
+                    None::<String>,
+                    Some(now),
+                    None,
+                ),
+                link.assistant,
+            ),
+            None => (None, None, None, (None, None, None, None), None),
+        };
+    let (assistant_id, assistant_snapshot) = match assistant {
+        Some(a) => (
+            Some(a.id),
+            Some(
+                serde_json::to_string(&a.snapshot)
+                    .map_err(|e| DbError::Migration(format!("assistant snapshot: {e}")))?,
             ),
         ),
-        None => (None, None, None, (None, None, None, None)),
+        None => (None, None),
     };
     let (
         delegation_task_status,
@@ -273,6 +287,9 @@ async fn create_inner(
         last_termination_audit_json: Set(None),
 
         origin_cwd: Set(None),
+        assistant_id: Set(assistant_id),
+        assistant_snapshot: Set(assistant_snapshot),
+        source: Set(None),
     }
     .insert(&txn)
     .await?;
@@ -423,6 +440,8 @@ pub async fn update_status_if<C: ConnectionTrait>(
 /// Atomic end-of-turn CAS: transition `in_progress → pending_review` and
 /// optionally mint an `awaiting_reply_token` for eligible root conversations.
 /// Returns `None` when the CAS loses (row not in_progress / not found / deleted).
+/// A row the user already marked `completed` stays completed: a delayed
+/// `end_turn` must not reopen it.
 ///
 /// Token is minted only when `parent_id IS NULL` AND `mark_awaiting_reply`.
 /// Child and background transitions never receive a generation.
@@ -668,6 +687,23 @@ pub async fn seed_model_if_empty(
 /// conversation id is not knowable to any client until that broadcast, so
 /// locking first makes an auto-title backfill on this row impossible rather
 /// than merely unlikely.
+/// Record where conversation `conversation_id` was started from (see
+/// `conversation::Model::source`). Written once, right after the row is
+/// created and before it is announced, so the first upsert carries it.
+pub async fn set_source(
+    conn: &DatabaseConnection,
+    conversation_id: i32,
+    source: &str,
+) -> Result<(), DbError> {
+    use sea_orm::sea_query::Expr;
+    conversation::Entity::update_many()
+        .col_expr(conversation::Column::Source, Expr::value(source))
+        .filter(conversation::Column::Id.eq(conversation_id))
+        .exec(conn)
+        .await?;
+    Ok(())
+}
+
 pub async fn lock_title(conn: &DatabaseConnection, conversation_id: i32) -> Result<(), DbError> {
     use sea_orm::sea_query::Expr;
     conversation::Entity::update_many()
@@ -1347,6 +1383,9 @@ struct CarriedOverRow {
     created_at: chrono::DateTime<Utc>,
     updated_at: chrono::DateTime<Utc>,
     origin_cwd: Option<String>,
+    assistant_id: Option<i32>,
+    assistant_snapshot: Option<String>,
+    source: Option<String>,
 }
 
 impl CarriedOverRow {
@@ -1385,6 +1424,12 @@ impl CarriedOverRow {
             // `origin_cwd ?? folder.path`, so dropping this would break
             // history lookup for a re-parented conversation.
             origin_cwd: row.origin_cwd.clone(),
+            // Carried: the preserved history is what ran as that assistant,
+            // so it keeps drawing as it.
+            assistant_id: row.assistant_id,
+            assistant_snapshot: row.assistant_snapshot.clone(),
+            // Carried: the history was started where the conversation was.
+            source: row.source.clone(),
         }
     }
 
@@ -1430,6 +1475,9 @@ impl CarriedOverRow {
             delegation_run_generation: Set(None),
             last_termination_audit_json: Set(None),
             origin_cwd: Set(self.origin_cwd),
+            assistant_id: Set(self.assistant_id),
+            assistant_snapshot: Set(self.assistant_snapshot),
+            source: Set(self.source),
         }
     }
 }
@@ -1473,19 +1521,298 @@ pub async fn reparent_folder_conversations(
     to_folder_id: i32,
     origin_cwd: &str,
 ) -> Result<u64, DbError> {
+    let target_path = folder::Entity::find_by_id(to_folder_id)
+        .one(conn)
+        .await?
+        .map(|f| f.path)
+        .unwrap_or_default();
+    let outcome = relocate_conversations(
+        conn,
+        RelocateSelection::Folder {
+            from_folder_id,
+            from_path: origin_cwd.to_string(),
+        },
+        to_folder_id,
+        &target_path,
+        RelocateOptions {
+            touch_updated_at: true,
+        },
+    )
+    .await?;
+    Ok(match outcome {
+        RelocateOutcome::Moved(rows) => rows.len() as u64,
+        RelocateOutcome::Skipped(_) => 0,
+    })
+}
+
+/// The `origin_cwd` a conversation should carry after it moves from a folder at
+/// `from_path` to one at `to_path`.
+///
+/// `origin_cwd` names the directory the agent's session was actually recorded
+/// in, which is what the stale-id history fallback has to match. So:
+/// - empty → the source folder's path (the conversation ran where it lived);
+/// - already set → kept (it moved before; its session still lives at the
+///   first place, not at the folder it is leaving);
+/// - the destination IS that place → cleared (back home, nothing to remember).
+pub fn effective_origin_after_move(
+    existing: Option<&str>,
+    from_path: &str,
+    to_path: &str,
+) -> Option<String> {
+    let effective = existing.filter(|s| !s.is_empty()).unwrap_or(from_path);
+    if effective.is_empty() || crate::parsers::path_eq_for_matching(effective, to_path) {
+        None
+    } else {
+        Some(effective.to_string())
+    }
+}
+
+/// Which rows [`relocate_conversations`] moves.
+#[derive(Debug, Clone)]
+pub enum RelocateSelection {
+    /// Every live row in a folder, children included (a removed worktree).
+    /// `from_path` is the folder's own registered path.
+    Folder {
+        from_folder_id: i32,
+        from_path: String,
+    },
+    /// A root conversation plus its live delegation subtree that shares the
+    /// root's folder (a user's "move to project"). A child that was delegated
+    /// into a different folder stays where it is.
+    Tree { root_id: i32 },
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct RelocateOptions {
+    /// Stamp `updated_at` on the moved rows. Worktree re-parenting does (it
+    /// always has); a user's move does not — reorganizing is not activity.
+    pub touch_updated_at: bool,
+}
+
+/// One row [`relocate_conversations`] moved.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RelocatedRow {
+    pub id: i32,
+    pub from_folder_id: i32,
+    /// The row was a chat conversation and is now a regular one.
+    pub was_chat: bool,
+}
+
+/// Why a `Tree` relocation moved nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RelocateSkip {
+    /// No such row, or it is soft-deleted.
+    NotFound,
+    /// A loop or delegation row — only root regular/chat conversations move.
+    NotMovable,
+    /// Already in the target folder.
+    AlreadyThere,
+    /// A row changed folder (or was deleted) between the read and the write;
+    /// nothing was moved.
+    Conflict,
+    /// The target is no longer an open project folder (closed, removed, or not
+    /// a regular folder) — checked inside the transaction, so a folder removed
+    /// after the caller's own check never receives the rows.
+    TargetUnavailable,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RelocateOutcome {
+    Moved(Vec<RelocatedRow>),
+    Skipped(RelocateSkip),
+}
+
+/// Move conversations to `target_folder_id` (at `target_path`), in one
+/// transaction. Shared by the worktree re-parent and the user's "move to
+/// project", so the two cannot drift on what a move does to a row:
+///
+/// - `folder_id` → the target;
+/// - `origin_cwd` → [`effective_origin_after_move`];
+/// - `kind` chat → regular (a chat conversation that lands in a project is an
+///   ordinary project conversation from then on — the sidebar groups by the
+///   row's own kind, so it would otherwise stay in the Chat section);
+/// - `updated_at` only when [`RelocateOptions::touch_updated_at`].
+///
+/// Each row is written with a compare-and-set on the folder it was read in,
+/// so a concurrent move or delete is never overwritten. In `Tree` mode a lost
+/// CAS rolls the whole tree back (`Skipped(Conflict)`) — a tree is never split
+/// across folders; in `Folder` mode the row that changed is simply left alone.
+///
+/// The transaction opens with a self-assigning write, the same claim
+/// `bind_external_id` uses: it takes SQLite's writer lock up front instead of
+/// a read snapshot that could fail to upgrade ("database is locked").
+pub async fn relocate_conversations(
+    conn: &DatabaseConnection,
+    selection: RelocateSelection,
+    target_folder_id: i32,
+    target_path: &str,
+    opts: RelocateOptions,
+) -> Result<RelocateOutcome, DbError> {
     use sea_orm::sea_query::Expr;
-    let res = conversation::Entity::update_many()
-        .col_expr(conversation::Column::FolderId, Expr::value(to_folder_id))
-        .col_expr(
-            conversation::Column::OriginCwd,
-            Expr::value(Some(origin_cwd.to_string())),
-        )
-        .col_expr(conversation::Column::UpdatedAt, Expr::value(Utc::now()))
-        .filter(conversation::Column::FolderId.eq(from_folder_id))
+    use sea_orm::TransactionTrait;
+
+    let txn = conn.begin().await?;
+
+    // Claim the writer lock without changing anything.
+    let claim = conversation::Entity::update_many().col_expr(
+        conversation::Column::UpdatedAt,
+        Expr::col(conversation::Column::UpdatedAt).into(),
+    );
+    let claim = match &selection {
+        RelocateSelection::Folder { from_folder_id, .. } => {
+            claim.filter(conversation::Column::FolderId.eq(*from_folder_id))
+        }
+        RelocateSelection::Tree { root_id } => claim.filter(conversation::Column::Id.eq(*root_id)),
+    };
+    claim
         .filter(conversation::Column::DeletedAt.is_null())
-        .exec(conn)
+        .exec(&txn)
         .await?;
-    Ok(res.rows_affected)
+
+    let (rows, from_path, strict) = match &selection {
+        RelocateSelection::Folder {
+            from_folder_id,
+            from_path,
+        } => {
+            let rows = conversation::Entity::find()
+                .filter(conversation::Column::FolderId.eq(*from_folder_id))
+                .filter(conversation::Column::DeletedAt.is_null())
+                .all(&txn)
+                .await?;
+            (rows, from_path.clone(), false)
+        }
+        RelocateSelection::Tree { root_id } => {
+            let Some(root) = conversation::Entity::find_by_id(*root_id)
+                .filter(conversation::Column::DeletedAt.is_null())
+                .one(&txn)
+                .await?
+            else {
+                return Ok(RelocateOutcome::Skipped(RelocateSkip::NotFound));
+            };
+            if root.parent_id.is_some()
+                || !matches!(
+                    root.kind,
+                    ConversationKind::Regular | ConversationKind::Chat
+                )
+            {
+                return Ok(RelocateOutcome::Skipped(RelocateSkip::NotMovable));
+            }
+            if root.folder_id == target_folder_id {
+                return Ok(RelocateOutcome::Skipped(RelocateSkip::AlreadyThere));
+            }
+            // Re-validated under the writer lock: a target closed or removed
+            // since the caller looked must not end up holding the rows.
+            let target_open = folder::Entity::find_by_id(target_folder_id)
+                .one(&txn)
+                .await?
+                .is_some_and(|f| {
+                    f.deleted_at.is_none()
+                        && f.is_open
+                        && f.kind == crate::db::entities::folder::FolderKind::Regular
+                });
+            if !target_open {
+                return Ok(RelocateOutcome::Skipped(RelocateSkip::TargetUnavailable));
+            }
+            let from_path = folder::Entity::find_by_id(root.folder_id)
+                .one(&txn)
+                .await?
+                .map(|f| f.path)
+                .unwrap_or_default();
+            let rows = collect_same_folder_subtree(&txn, root).await?;
+            (rows, from_path, true)
+        }
+    };
+
+    let now = Utc::now();
+    let mut moved = Vec::with_capacity(rows.len());
+    for row in rows {
+        let origin =
+            effective_origin_after_move(row.origin_cwd.as_deref(), &from_path, target_path);
+        let was_chat = row.kind == ConversationKind::Chat;
+        let mut update = conversation::Entity::update_many()
+            .col_expr(
+                conversation::Column::FolderId,
+                Expr::value(target_folder_id),
+            )
+            .col_expr(conversation::Column::OriginCwd, Expr::value(origin));
+        if was_chat {
+            update = update.col_expr(
+                conversation::Column::Kind,
+                Expr::value(ConversationKind::Regular),
+            );
+        }
+        if opts.touch_updated_at {
+            update = update.col_expr(conversation::Column::UpdatedAt, Expr::value(now));
+        }
+        let res = update
+            .filter(conversation::Column::Id.eq(row.id))
+            .filter(conversation::Column::FolderId.eq(row.folder_id))
+            .filter(conversation::Column::DeletedAt.is_null())
+            .exec(&txn)
+            .await?;
+        if res.rows_affected == 0 {
+            if strict {
+                txn.rollback().await?;
+                return Ok(RelocateOutcome::Skipped(RelocateSkip::Conflict));
+            }
+            continue;
+        }
+        moved.push(RelocatedRow {
+            id: row.id,
+            from_folder_id: row.folder_id,
+            was_chat,
+        });
+    }
+    txn.commit().await?;
+    Ok(RelocateOutcome::Moved(moved))
+}
+
+/// `root` plus every live descendant (by `parent_id`) that sits in the root's
+/// folder. A descendant elsewhere is not followed: it was delegated into
+/// another folder on purpose, and so were its own children.
+async fn collect_same_folder_subtree<C: sea_orm::ConnectionTrait>(
+    conn: &C,
+    root: conversation::Model,
+) -> Result<Vec<conversation::Model>, DbError> {
+    let folder_id = root.folder_id;
+    let mut frontier = vec![root.id];
+    let mut seen: std::collections::HashSet<i32> = frontier.iter().copied().collect();
+    let mut out = vec![root];
+    while !frontier.is_empty() {
+        let children = conversation::Entity::find()
+            .filter(conversation::Column::ParentId.is_in(frontier.clone()))
+            .filter(conversation::Column::FolderId.eq(folder_id))
+            .filter(conversation::Column::DeletedAt.is_null())
+            .all(conn)
+            .await?;
+        frontier.clear();
+        for child in children {
+            if seen.insert(child.id) {
+                frontier.push(child.id);
+                out.push(child);
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Every non-empty `origin_cwd` a live conversation remembers. The chat
+/// scratch-dir GC keeps these: a chat conversation moved into a project still
+/// has its session — and whatever the agent wrote — in its old scratch dir.
+pub async fn list_live_origin_cwds(conn: &DatabaseConnection) -> Result<Vec<String>, DbError> {
+    let rows: Vec<Option<String>> = conversation::Entity::find()
+        .select_only()
+        .column(conversation::Column::OriginCwd)
+        .filter(conversation::Column::DeletedAt.is_null())
+        .filter(conversation::Column::OriginCwd.is_not_null())
+        .into_tuple()
+        .all(conn)
+        .await?;
+    Ok(rows
+        .into_iter()
+        .flatten()
+        .filter(|p| !p.is_empty())
+        .collect())
 }
 
 /// Soft-delete a conversation. Returns `true` when a pending auto-title job
@@ -1837,7 +2164,7 @@ pub async fn restore_soft_deleted(
     Ok(res.rows_affected > 0)
 }
 
-fn parse_agent_type(s: &str) -> AgentType {
+pub(crate) fn parse_agent_type(s: &str) -> AgentType {
     match AgentType::from_wire(s) {
         Some(at) => at,
         None => {
@@ -1917,6 +2244,12 @@ fn conv_to_summary(r: conversation::Model) -> DbConversationSummary {
         // `fill_open_delegation_attention` over the returned set.
         delegation_attention_request: None,
         origin_cwd: r.origin_cwd,
+        assistant_name: r
+            .assistant_snapshot
+            .as_deref()
+            .and_then(AssistantRunSnapshot::name_from_json),
+        assistant_id: r.assistant_id,
+        source: r.source,
         // Backfilled by `fill_summary_extras`, like `child_count`.
         tag_ids: Vec::new(),
     }
@@ -2119,6 +2452,36 @@ pub async fn get_by_delegation_call_id(
     Ok(conv.map(conv_to_summary))
 }
 
+/// The assistant a delegation child ran as, with the snapshot its row was
+/// written with. `None` for any row that is not an assistant child (or no
+/// row); `Some((id, None))` for an assistant child whose snapshot is missing or
+/// no longer parses — the caller must not mistake that for "no options".
+pub async fn get_assistant_run(
+    conn: &DatabaseConnection,
+    conversation_id: i32,
+) -> Result<Option<(i32, Option<AssistantRunSnapshot>)>, DbError> {
+    let Some(row) = conversation::Entity::find_by_id(conversation_id)
+        .one(conn)
+        .await?
+    else {
+        return Ok(None);
+    };
+    let Some(assistant_id) = row.assistant_id else {
+        return Ok(None);
+    };
+    let snapshot = row.assistant_snapshot.as_deref().and_then(|raw| {
+        serde_json::from_str::<AssistantRunSnapshot>(raw)
+            .map_err(|e| {
+                tracing::warn!(
+                    "[conversation_service] conversation {conversation_id}: unreadable \
+                     assistant snapshot: {e}"
+                );
+            })
+            .ok()
+    });
+    Ok(Some((assistant_id, snapshot)))
+}
+
 pub async fn list_by_folder(
     conn: &DatabaseConnection,
     folder_id: i32,
@@ -2299,6 +2662,7 @@ mod tests {
             parent_conversation_id: parent.id,
             parent_tool_use_id: "tu-1".into(),
             delegation_call_id: "call-1".into(),
+            assistant: None,
         };
         let child = create_with_delegation(
             conn,
@@ -2395,6 +2759,7 @@ mod tests {
                 parent_conversation_id: parent_b.id,
                 parent_tool_use_id: "tu-2".into(),
                 delegation_call_id: "call-2".into(),
+                assistant: None,
             }),
         )
         .await
@@ -2499,6 +2864,7 @@ mod tests {
                 parent_conversation_id: parent.id,
                 parent_tool_use_id: "tu-1".into(),
                 delegation_call_id: "call-1".into(),
+                assistant: None,
             }),
         )
         .await
@@ -2513,6 +2879,7 @@ mod tests {
                 parent_conversation_id: parent.id,
                 parent_tool_use_id: "tu-2".into(),
                 delegation_call_id: "call-2".into(),
+                assistant: None,
             }),
         )
         .await
@@ -2561,6 +2928,7 @@ mod tests {
             parent_conversation_id: child,
             parent_tool_use_id: "tu-2".into(),
             delegation_call_id: "call-2".into(),
+            assistant: None,
         };
         create_with_delegation(
             &db.conn,
@@ -4278,6 +4646,7 @@ mod tests {
                 parent_conversation_id: parent.id,
                 parent_tool_use_id: "tu-activity".into(),
                 delegation_call_id: "call-activity".into(),
+                assistant: None,
             }),
         )
         .await
@@ -4338,6 +4707,7 @@ mod tests {
                 parent_conversation_id: regular.id,
                 parent_tool_use_id: "tu-kind".into(),
                 delegation_call_id: "call-kind".into(),
+                assistant: None,
             }),
         )
         .await
@@ -4364,6 +4734,7 @@ mod tests {
                 parent_conversation_id: regular.id,
                 parent_tool_use_id: "tu-rollup".into(),
                 delegation_call_id: "call-rollup".into(),
+                assistant: None,
             }),
         )
         .await
@@ -4406,6 +4777,7 @@ mod tests {
                 parent_conversation_id: regular.id,
                 parent_tool_use_id: "tu-enroll".into(),
                 delegation_call_id: "call-enroll".into(),
+                assistant: None,
             }),
         )
         .await
@@ -4656,6 +5028,7 @@ mod tests {
                 parent_conversation_id: parent.id,
                 parent_tool_use_id: format!("tu-{call_id}"),
                 delegation_call_id: call_id.into(),
+                assistant: None,
             }),
         )
         .await
@@ -4929,5 +5302,310 @@ mod tests {
             .await
             .expect("second");
         assert_eq!(second, ProvisionalSoftDeleteOutcome::AlreadySoftDeleted);
+    }
+
+    // -- relocation (move to project / worktree re-parent) -------------------
+
+    async fn raw(conn: &DatabaseConnection, id: i32) -> conversation::Model {
+        conversation::Entity::find_by_id(id)
+            .one(conn)
+            .await
+            .expect("query")
+            .expect("row")
+    }
+
+    async fn tree_move(
+        conn: &DatabaseConnection,
+        root_id: i32,
+        target: i32,
+        target_path: &str,
+    ) -> RelocateOutcome {
+        relocate_conversations(
+            conn,
+            RelocateSelection::Tree { root_id },
+            target,
+            target_path,
+            RelocateOptions {
+                touch_updated_at: false,
+            },
+        )
+        .await
+        .expect("relocate")
+    }
+
+    #[test]
+    fn effective_origin_follows_the_session_not_the_folder() {
+        // Never moved: the session was recorded where the row lived.
+        assert_eq!(
+            effective_origin_after_move(None, "/x", "/y").as_deref(),
+            Some("/x")
+        );
+        // Moved before: the session is still at the first place.
+        assert_eq!(
+            effective_origin_after_move(Some("/x"), "/w", "/y").as_deref(),
+            Some("/x")
+        );
+        // Back where it started: nothing to remember (trailing slash ignored).
+        assert_eq!(effective_origin_after_move(Some("/x"), "/w", "/x/"), None);
+        assert_eq!(effective_origin_after_move(None, "/x", "/x"), None);
+        // An empty stored value counts as unset.
+        assert_eq!(
+            effective_origin_after_move(Some(""), "/x", "/y").as_deref(),
+            Some("/x")
+        );
+    }
+
+    #[tokio::test]
+    async fn tree_move_takes_the_same_folder_subtree_and_leaves_the_rest() {
+        let db = fresh_in_memory_db().await;
+        let from = seed_folder(&db, "/tmp/codeg-move-from").await;
+        let to = seed_folder(&db, "/tmp/codeg-move-to").await;
+        let elsewhere = seed_folder(&db, "/tmp/codeg-move-elsewhere").await;
+        let (root, child) = seed_parent_with_child(&db.conn, from).await;
+        // A grandchild in the same folder moves too.
+        let grandchild = create_with_delegation(
+            &db.conn,
+            from,
+            AgentType::Codex,
+            None,
+            None,
+            Some(DelegationLink {
+                parent_conversation_id: child,
+                parent_tool_use_id: "tu-2".into(),
+                delegation_call_id: "call-2".into(),
+                assistant: None,
+            }),
+        )
+        .await
+        .expect("grandchild")
+        .id;
+        // A child delegated into another folder stays there.
+        let remote = create_with_delegation(
+            &db.conn,
+            elsewhere,
+            AgentType::Codex,
+            None,
+            None,
+            Some(DelegationLink {
+                parent_conversation_id: root,
+                parent_tool_use_id: "tu-3".into(),
+                delegation_call_id: "call-3".into(),
+                assistant: None,
+            }),
+        )
+        .await
+        .expect("remote child")
+        .id;
+        let before = raw(&db.conn, root).await.updated_at;
+
+        let outcome = tree_move(&db.conn, root, to, "/tmp/codeg-move-to").await;
+        let RelocateOutcome::Moved(rows) = outcome else {
+            panic!("expected a move, got {outcome:?}");
+        };
+        let mut ids: Vec<i32> = rows.iter().map(|r| r.id).collect();
+        ids.sort_unstable();
+        let mut expected = vec![root, child, grandchild];
+        expected.sort_unstable();
+        assert_eq!(ids, expected);
+        assert!(rows.iter().all(|r| r.from_folder_id == from && !r.was_chat));
+
+        for id in [root, child, grandchild] {
+            let row = raw(&db.conn, id).await;
+            assert_eq!(row.folder_id, to);
+            assert_eq!(row.origin_cwd.as_deref(), Some("/tmp/codeg-move-from"));
+        }
+        assert_eq!(raw(&db.conn, child).await.kind, ConversationKind::Delegate);
+        assert_eq!(
+            raw(&db.conn, root).await.updated_at,
+            before,
+            "a user's move is not activity"
+        );
+        let remote_row = raw(&db.conn, remote).await;
+        assert_eq!(remote_row.folder_id, elsewhere);
+        assert_eq!(remote_row.origin_cwd, None);
+    }
+
+    #[tokio::test]
+    async fn tree_move_turns_a_chat_root_into_a_regular_conversation() {
+        let db = fresh_in_memory_db().await;
+        let chat_folder = crate::db::service::folder_service::add_chat_folder(
+            &db.conn,
+            "/data/chat-sessions/2026-11-12/abc",
+        )
+        .await
+        .expect("chat folder")
+        .id;
+        let to = seed_folder(&db, "/tmp/codeg-move-chat-to").await;
+        let chat = create_chat(&db.conn, chat_folder, AgentType::ClaudeCode, None, None)
+            .await
+            .expect("chat");
+
+        let RelocateOutcome::Moved(rows) =
+            tree_move(&db.conn, chat.id, to, "/tmp/codeg-move-chat-to").await
+        else {
+            panic!("chat root should move");
+        };
+        assert_eq!(
+            rows,
+            vec![RelocatedRow {
+                id: chat.id,
+                from_folder_id: chat_folder,
+                was_chat: true,
+            }]
+        );
+        let row = raw(&db.conn, chat.id).await;
+        assert_eq!(row.kind, ConversationKind::Regular);
+        assert_eq!(row.folder_id, to);
+        assert_eq!(
+            row.origin_cwd.as_deref(),
+            Some("/data/chat-sessions/2026-11-12/abc")
+        );
+    }
+
+    #[tokio::test]
+    async fn tree_move_skips_what_it_must_not_move() {
+        let db = fresh_in_memory_db().await;
+        let from = seed_folder(&db, "/tmp/codeg-move-skip-from").await;
+        let to = seed_folder(&db, "/tmp/codeg-move-skip-to").await;
+        let (_root, child) = seed_parent_with_child(&db.conn, from).await;
+        let deleted = create(&db.conn, from, AgentType::ClaudeCode, None, None)
+            .await
+            .unwrap()
+            .id;
+        soft_delete(&db.conn, deleted).await.unwrap();
+        let looped = create(&db.conn, from, AgentType::ClaudeCode, None, None)
+            .await
+            .unwrap();
+        let mut active: conversation::ActiveModel = looped.clone().into();
+        active.kind = Set(ConversationKind::Loop);
+        active.update(&db.conn).await.unwrap();
+        let home = create(&db.conn, to, AgentType::ClaudeCode, None, None)
+            .await
+            .unwrap()
+            .id;
+
+        let path = "/tmp/codeg-move-skip-to";
+        assert_eq!(
+            tree_move(&db.conn, 9999, to, path).await,
+            RelocateOutcome::Skipped(RelocateSkip::NotFound)
+        );
+        assert_eq!(
+            tree_move(&db.conn, deleted, to, path).await,
+            RelocateOutcome::Skipped(RelocateSkip::NotFound)
+        );
+        assert_eq!(
+            tree_move(&db.conn, child, to, path).await,
+            RelocateOutcome::Skipped(RelocateSkip::NotMovable)
+        );
+        assert_eq!(
+            tree_move(&db.conn, looped.id, to, path).await,
+            RelocateOutcome::Skipped(RelocateSkip::NotMovable)
+        );
+        assert_eq!(
+            tree_move(&db.conn, home, to, path).await,
+            RelocateOutcome::Skipped(RelocateSkip::AlreadyThere)
+        );
+        assert_eq!(raw(&db.conn, child).await.folder_id, from);
+        assert_eq!(raw(&db.conn, looped.id).await.folder_id, from);
+
+        // A target closed (or removed) after the caller checked it is refused
+        // inside the transaction; nothing moves.
+        let movable = create(&db.conn, from, AgentType::ClaudeCode, None, None)
+            .await
+            .unwrap()
+            .id;
+        crate::db::service::folder_service::set_folder_open(&db.conn, to, false)
+            .await
+            .unwrap();
+        assert_eq!(
+            tree_move(&db.conn, movable, to, path).await,
+            RelocateOutcome::Skipped(RelocateSkip::TargetUnavailable)
+        );
+        crate::db::service::folder_service::set_folder_open(&db.conn, to, true)
+            .await
+            .unwrap();
+        crate::db::service::folder_service::soft_delete_folder(&db.conn, to)
+            .await
+            .unwrap();
+        assert_eq!(
+            tree_move(&db.conn, movable, to, path).await,
+            RelocateOutcome::Skipped(RelocateSkip::TargetUnavailable)
+        );
+        assert_eq!(raw(&db.conn, movable).await.folder_id, from);
+    }
+
+    #[tokio::test]
+    async fn worktree_reparent_keeps_the_first_origin_and_clears_it_at_home() {
+        let db = fresh_in_memory_db().await;
+        let x = seed_folder(&db, "/tmp/codeg-origin-x").await;
+        let p = seed_folder(&db, "/tmp/codeg-origin-p").await;
+        let w = seed_folder(&db, "/tmp/codeg-origin-w").await;
+        let from_x = create(&db.conn, x, AgentType::ClaudeCode, None, None)
+            .await
+            .unwrap()
+            .id;
+        let from_p = create(&db.conn, p, AgentType::ClaudeCode, None, None)
+            .await
+            .unwrap()
+            .id;
+        let born_in_w = create(&db.conn, w, AgentType::ClaudeCode, None, None)
+            .await
+            .unwrap()
+            .id;
+        // X → W and P → W by the user…
+        tree_move(&db.conn, from_x, w, "/tmp/codeg-origin-w").await;
+        tree_move(&db.conn, from_p, w, "/tmp/codeg-origin-w").await;
+        let before = raw(&db.conn, born_in_w).await.updated_at;
+
+        // …then W is removed and everything in it goes back to P.
+        let moved = reparent_folder_conversations(&db.conn, w, p, "/tmp/codeg-origin-w")
+            .await
+            .unwrap();
+        assert_eq!(moved, 3);
+
+        let x_row = raw(&db.conn, from_x).await;
+        assert_eq!(x_row.folder_id, p);
+        assert_eq!(
+            x_row.origin_cwd.as_deref(),
+            Some("/tmp/codeg-origin-x"),
+            "the session is still where it was first recorded"
+        );
+        assert_eq!(
+            raw(&db.conn, from_p).await.origin_cwd,
+            None,
+            "back at its first folder, there is nothing to remember"
+        );
+        let w_row = raw(&db.conn, born_in_w).await;
+        assert_eq!(w_row.origin_cwd.as_deref(), Some("/tmp/codeg-origin-w"));
+        assert!(
+            w_row.updated_at >= before,
+            "the worktree re-parent keeps bumping updated_at"
+        );
+    }
+
+    #[tokio::test]
+    async fn live_origin_cwds_skip_deleted_rows() {
+        let db = fresh_in_memory_db().await;
+        let x = seed_folder(&db, "/tmp/codeg-origins-x").await;
+        let y = seed_folder(&db, "/tmp/codeg-origins-y").await;
+        let kept = create(&db.conn, x, AgentType::ClaudeCode, None, None)
+            .await
+            .unwrap()
+            .id;
+        let gone = create(&db.conn, x, AgentType::Codex, None, None)
+            .await
+            .unwrap()
+            .id;
+        create(&db.conn, x, AgentType::Gemini, None, None)
+            .await
+            .unwrap();
+        tree_move(&db.conn, kept, y, "/tmp/codeg-origins-y").await;
+        tree_move(&db.conn, gone, y, "/tmp/codeg-origins-y").await;
+        soft_delete(&db.conn, gone).await.unwrap();
+
+        assert_eq!(
+            list_live_origin_cwds(&db.conn).await.unwrap(),
+            vec!["/tmp/codeg-origins-x".to_string()]
+        );
     }
 }

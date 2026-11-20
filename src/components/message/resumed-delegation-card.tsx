@@ -116,6 +116,7 @@ export function ResumedDelegationCard({
 
   const {
     agentType,
+    identity,
     task,
     taskId,
     status,
@@ -217,7 +218,7 @@ export function ResumedDelegationCard({
           onOpenChange={setDialogOpen}
           childConversationId={childConversationId}
           childConnectionId={childConnectionId}
-          agentType={agentType}
+          identity={identity}
           kickoffTask={task}
         />
       )}

@@ -265,6 +265,8 @@ pub enum FileTreeNode {
         name: String,
         path: String,
         children: Vec<FileTreeNode>,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        symlink: bool,
     },
 }
 
@@ -650,17 +652,6 @@ pub async fn reconcile_empty_open_folders_core(
         .map_err(AppCommandError::from)
 }
 
-/// Label worktree folders that were registered before aliases were seeded.
-/// Upstream 0.25.0 implements this against `list_worktree_folders_missing_alias`;
-/// the fork folder_service does not yet expose that helper, so this is a no-op
-/// until that query is ported.
-pub async fn backfill_worktree_folder_aliases(
-    _emitter: &crate::web::event_bridge::EventEmitter,
-    _db: &AppDatabase,
-) -> usize {
-    0
-}
-
 pub async fn load_folder_history_core(
     db: &AppDatabase,
 ) -> Result<Vec<FolderHistoryEntry>, AppCommandError> {
@@ -744,10 +735,87 @@ pub async fn open_worktree_folder_core(
     let entry = folder_service::add_folder_with_parent(&db.conn, &path, parent_id)
         .await
         .map_err(AppCommandError::from)?;
+    seed_worktree_alias(db, entry.id, &path).await;
     folder_service::get_folder_by_id(&db.conn, entry.id)
         .await
         .map_err(AppCommandError::from)?
         .ok_or_else(|| AppCommandError::not_found("Folder not found after add"))
+}
+
+/// Default a worktree folder's alias to the branch checked out at `path`.
+///
+/// Best-effort in both directions, and deliberately silent:
+/// - The branch is read from the directory itself rather than threaded from the
+///   caller, so registrations that never knew a branch name (a pre-existing
+///   checkout the branch switcher just adopted) get labeled too, and the label
+///   can never disagree with what is actually checked out there.
+/// - A detached HEAD, a path that is gone, or git missing entirely all resolve to
+///   "no branch" and leave the folder unlabeled — the sidebar then falls back to
+///   the directory name exactly as before.
+/// - The write only lands when no alias is set yet (see
+///   [`folder_service::seed_folder_alias`]), so re-registering a worktree — a
+///   task retry, a re-created checkout — never overwrites a name the user chose.
+pub(crate) async fn seed_worktree_alias(db: &AppDatabase, folder_id: i32, path: &str) {
+    let Some(branch) = resolve_git_head(path).await.ok().and_then(|h| h.branch) else {
+        return;
+    };
+    if let Err(e) = folder_service::seed_folder_alias(&db.conn, folder_id, &branch).await {
+        tracing::warn!("[folders] could not seed folder {folder_id}'s alias from git: {e}");
+    }
+}
+
+/// Label every already-registered worktree folder that has no alias with the
+/// branch it currently has checked out — the one-shot startup counterpart of the
+/// seeding [`open_worktree_folder_core`] now does at registration time.
+///
+/// Without it the feature would only ever reach worktrees created from here on,
+/// leaving every worktree already in the sidebar showing its directory name.
+/// Each row is seeded through the same never-clobber path, so a worktree the
+/// user has already named is skipped, and one whose directory is gone (or is
+/// detached) simply stays unlabeled and is retried next launch — a handful of
+/// fast git failures, not a growing cost, since a successful seed removes the
+/// row from the work list for good.
+///
+/// Folders that are in the workspace when they get labeled are broadcast, so a
+/// client that fetched its folder list before this finished still updates in
+/// place. A closed folder is labeled just the same but deliberately NOT
+/// broadcast: `folder://changed` Upsert means "insert-or-replace in the open
+/// folder list", so announcing one would put a folder the user closed back in
+/// their sidebar. Whether it is open is read fresh at that moment rather than
+/// taken from the work list — walking every folder takes long enough (a git call
+/// each) for the user to close one in the middle — and reopening it later
+/// re-reads the row anyway, so the label still lands. Returns how many were
+/// labeled.
+pub async fn backfill_worktree_folder_aliases(emitter: &EventEmitter, db: &AppDatabase) -> usize {
+    let pending = match folder_service::list_worktree_folders_missing_alias(&db.conn).await {
+        Ok(rows) => rows,
+        Err(e) => {
+            tracing::warn!("[folders] worktree alias backfill could not list folders: {e}");
+            return 0;
+        }
+    };
+
+    let mut labeled = 0;
+    for (folder_id, path) in pending {
+        let Some(branch) = resolve_git_head(&path).await.ok().and_then(|h| h.branch) else {
+            continue;
+        };
+        match folder_service::seed_folder_alias(&db.conn, folder_id, &branch).await {
+            Ok(true) => {
+                labeled += 1;
+                if let Ok(Some(detail)) =
+                    folder_service::get_open_folder_by_id(&db.conn, folder_id).await
+                {
+                    emit_folder_upsert(emitter, detail);
+                }
+            }
+            Ok(false) => {}
+            Err(e) => {
+                tracing::warn!("[folders] worktree alias backfill failed for {folder_id}: {e}");
+            }
+        }
+    }
+    labeled
 }
 
 /// Open a folder into the workspace and announce it so the workspace window
@@ -2596,7 +2664,7 @@ pub async fn git_status(
         .filter(|l| !l.is_empty())
         .map(|line| {
             let status = line[..2].trim().to_string();
-            let file = unquote_git_path(&line[3..]);
+            let file = unquote_status_path(&line[3..]);
             GitStatusEntry { status, file }
         })
         .collect();
@@ -2628,7 +2696,11 @@ pub async fn git_diff(path: String, file: Option<String>) -> Result<String, AppC
         args.push(f.clone());
     }
 
+    // Unquoted paths, as `git_status` asks for: the overview's file list is
+    // read from these headers, and its "view diff" / "open file" ask for the
+    // file by the name found there — an octal-escaped one names no file.
     let output = crate::process::tokio_command("git")
+        .args(["-c", "core.quotePath=false"])
         .args(&args)
         .current_dir(&path)
         .output()
@@ -2643,6 +2715,7 @@ pub async fn git_diff(path: String, file: Option<String>) -> Result<String, AppC
             fallback_args.push(f.clone());
         }
         let fallback = crate::process::tokio_command("git")
+            .args(["-c", "core.quotePath=false"])
             .args(&fallback_args)
             .current_dir(&path)
             .output()
@@ -2680,7 +2753,9 @@ pub async fn git_diff_with_branch(
         args.push(f.clone());
     }
 
+    // Unquoted paths — see `git_diff`.
     let output = crate::process::tokio_command("git")
+        .args(["-c", "core.quotePath=false"])
         .args(&args)
         .current_dir(&path)
         .output()
@@ -2718,7 +2793,9 @@ pub async fn git_show_diff(
         args.push(f.clone());
     }
 
+    // Unquoted paths — see `git_diff`.
     let output = crate::process::tokio_command("git")
+        .args(["-c", "core.quotePath=false"])
         .args(&args)
         .current_dir(&path)
         .output()
@@ -2943,13 +3020,21 @@ pub(crate) async fn git_commit_core(
         .filter(|f| !staged_deletions.contains(f.as_str()))
         .collect();
 
+    let add_specs: Vec<String> = files_to_add
+        .iter()
+        .map(|file| to_git_literal_pathspec(file))
+        .collect();
+    // What the index holds for them before anything is staged here, so a
+    // refused commit can give back exactly what it staged itself.
+    let indexed_before = if add_specs.is_empty() {
+        None
+    } else {
+        index_entries(path, &add_specs).await
+    };
+
     if !files_to_add.is_empty() {
         let mut add_args = vec!["add".to_string(), "--".to_string()];
-        add_args.extend(
-            files_to_add
-                .iter()
-                .map(|file| to_git_literal_pathspec(file)),
-        );
+        add_args.extend(add_specs.iter().cloned());
 
         let add_output = crate::process::tokio_command("git")
             .args(&add_args)
@@ -2962,6 +3047,18 @@ pub(crate) async fn git_commit_core(
             return Err(git_command_error("add", &add_output.stderr));
         }
     }
+
+    // The files that add brought into the index, untracked until now, with
+    // what it staged for each.
+    let added: Option<HashMap<String, String>> = match indexed_before {
+        Some(before) => index_entries(path, &add_specs).await.map(|after| {
+            after
+                .into_iter()
+                .filter(|(file, _)| !before.contains_key(file))
+                .collect()
+        }),
+        None => None,
+    };
 
     // Resolve commit author from matching account (e.g. GitHub username)
     let author_override = crate::git_credential::resolve_commit_author(path, conn).await;
@@ -2981,6 +3078,13 @@ pub(crate) async fn git_commit_core(
     let commit_output = commit_cmd.output().await.map_err(AppCommandError::io)?;
 
     if !commit_output.status.success() {
+        match added {
+            Some(added) => unstage_added_files(path, &added).await,
+            None if !add_specs.is_empty() => tracing::warn!(
+                "[folders] can't tell which new files a refused commit staged in {path}"
+            ),
+            None => {}
+        }
         return Err(git_command_error("commit", &commit_output.stderr));
     }
 
@@ -3000,6 +3104,134 @@ pub(crate) async fn git_commit_core(
     }
 
     Ok(GitCommitResult { committed_files })
+}
+
+/// The index entries `pathspecs` match, as repository-relative path → staged
+/// object id; `None` when git can't tell.
+async fn index_entries(path: &str, pathspecs: &[String]) -> Option<HashMap<String, String>> {
+    let output = crate::process::tokio_command("git")
+        .args(["ls-files", "--stage", "--full-name", "-z", "--"])
+        .args(pathspecs)
+        .current_dir(path)
+        .output()
+        .await
+        .ok()
+        .filter(|output| output.status.success())?;
+    Some(
+        String::from_utf8_lossy(&output.stdout)
+            .split('\0')
+            .filter_map(|record| {
+                // `<mode> <object> <stage>\t<path>`
+                let (meta, file) = record.split_once('\t')?;
+                let object = meta.split(' ').nth(1)?;
+                Some((file.to_string(), object.to_string()))
+            })
+            .collect(),
+    )
+}
+
+/// After a refused commit (a pre-commit hook, say), take the files its
+/// `git add` brought into the index back out: they were untracked, and left
+/// staged a later commit would take them whatever was picked for it. Only
+/// while the index still holds what that add staged (`added`) and the
+/// working copy still matches it — restaged since (by a hook or an agent) or
+/// edited since, its staged content would be lost, so it stays. `git reset`
+/// puts back what HEAD holds, so a file another commit has taken in since
+/// stays as committed. Best effort: on a failure the index keeps what the
+/// refused commit staged.
+async fn unstage_added_files(path: &str, added: &HashMap<String, String>) {
+    if added.is_empty() {
+        return;
+    }
+    let specs: Vec<String> = added
+        .keys()
+        .map(|file| format!(":(top,literal){file}"))
+        .collect();
+    let (Some(now), Some(edited)) = (
+        index_entries(path, &specs).await,
+        edited_since_staged(path, &specs).await,
+    ) else {
+        tracing::warn!("[folders] can't tell what a refused commit left staged in {path}");
+        return;
+    };
+    let ours: Vec<String> = added
+        .iter()
+        .filter(|(file, object)| now.get(*file) == Some(*object) && !edited.contains(*file))
+        .map(|(file, _)| format!(":(top,literal){file}"))
+        .collect();
+    if ours.is_empty() {
+        return;
+    }
+    // `git reset` reads HEAD once: when a commit lands while it runs, reset
+    // again, so whatever that commit took in goes back as committed.
+    let mut head = head_commit(path).await;
+    let mut reset = reset_paths(path, &ours).await;
+    for _ in 0..3 {
+        let landed = head_commit(path).await;
+        if landed == head {
+            break;
+        }
+        head = landed;
+        reset = reset_paths(path, &ours).await;
+    }
+    if !reset {
+        tracing::warn!(
+            "[folders] a refused commit left {} new file(s) staged in {path}",
+            ours.len()
+        );
+    }
+}
+
+/// The commit HEAD names; `None` on an unborn branch or when git can't tell.
+async fn head_commit(path: &str) -> Option<String> {
+    let output = crate::process::tokio_command("git")
+        .args(["rev-parse", "-q", "--verify", "HEAD"])
+        .current_dir(path)
+        .output()
+        .await
+        .ok()
+        .filter(|output| output.status.success())?;
+    Some(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+/// Reset the index entries `pathspecs` match to HEAD's; whether git did.
+async fn reset_paths(path: &str, pathspecs: &[String]) -> bool {
+    crate::process::tokio_command("git")
+        .args(["reset", "-q", "--"])
+        .args(pathspecs)
+        .current_dir(path)
+        .output()
+        .await
+        .is_ok_and(|output| output.status.success())
+}
+
+/// Of the files `pathspecs` match, the ones whose working copy differs from
+/// what is staged, repository-relative; `None` when git can't tell.
+async fn edited_since_staged(path: &str, pathspecs: &[String]) -> Option<HashSet<String>> {
+    let output = crate::process::tokio_command("git")
+        .args([
+            "--no-optional-locks",
+            "-c",
+            "diff.relative=false",
+            "diff",
+            "--no-renames",
+            "--name-only",
+            "-z",
+            "--",
+        ])
+        .args(pathspecs)
+        .current_dir(path)
+        .output()
+        .await
+        .ok()
+        .filter(|output| output.status.success())?;
+    Some(
+        String::from_utf8_lossy(&output.stdout)
+            .split('\0')
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string())
+            .collect(),
+    )
 }
 
 #[cfg(feature = "tauri-runtime")]
@@ -3452,6 +3684,13 @@ async fn reparent_target(
     target.filter(|target| *target != worktree_folder_id)
 }
 
+/// Converge DB + clients once a worktree directory is off disk — the shared
+/// sequence in [`crate::commands::worktree_convergence`] — plus what only this
+/// path does: detach any to-do task that pointed at the folder and stop its
+/// office watches. Returns the number of conversations moved.
+///
+/// The work-task engine runs the same shared sequence for the worktree it
+/// minted (`converge_worktree_removal`), wrapped in its own task bookkeeping.
 async fn converge_removed_worktree_folder(
     db: &AppDatabase,
     emitter: &EventEmitter,
@@ -3459,45 +3698,17 @@ async fn converge_removed_worktree_folder(
     project_folder_id: i32,
     worktree_path: &str,
 ) -> u32 {
-    use crate::db::service::{conversation_service, tab_service, work_task_service};
+    use crate::commands::worktree_convergence;
+    use crate::db::service::work_task_service;
 
-    let moved = conversation_service::reparent_folder_conversations(
-        &db.conn,
+    let outcome = worktree_convergence::converge_db(
+        db,
+        emitter,
         worktree_folder_id,
         project_folder_id,
         worktree_path,
     )
-    .await
-    .unwrap_or(0) as u32;
-
-    match tab_service::delete_folder_tabs_and_bump(&db.conn, worktree_folder_id).await {
-        Ok(invalidation) => {
-            if let Some(tabs) = invalidation.emit {
-                crate::web::event_bridge::emit_event(
-                    emitter,
-                    crate::web::event_bridge::TABS_CHANGED_EVENT,
-                    crate::web::event_bridge::TabsChanged {
-                        version: invalidation.version,
-                        origin: "server".to_string(),
-                        tabs,
-                    },
-                );
-            }
-        }
-        Err(error) => {
-            tracing::warn!("[folders] tab cleanup failed for folder {worktree_folder_id}: {error}")
-        }
-    }
-
-    let folder_gone = match folder_service::soft_delete_folder(&db.conn, worktree_folder_id).await {
-        Ok(()) => true,
-        Err(error) => {
-            tracing::warn!(
-                "[folders] worktree folder {worktree_folder_id} soft-delete failed: {error}"
-            );
-            false
-        }
-    };
+    .await;
 
     let detached = work_task_service::clear_worktree_by_folder(&db.conn, worktree_folder_id)
         .await
@@ -3506,18 +3717,7 @@ async fn converge_removed_worktree_folder(
             Vec::new()
         });
 
-    crate::web::event_bridge::emit_event(
-        emitter,
-        crate::web::event_bridge::CONVERSATIONS_BULK_CHANGED_EVENT,
-        crate::web::event_bridge::ConversationsBulkChanged {
-            imported: 0,
-            updated: moved,
-            folder_ids: vec![project_folder_id],
-        },
-    );
-    if folder_gone {
-        emit_folder_deleted(emitter, worktree_folder_id);
-    }
+    worktree_convergence::announce(emitter, outcome, project_folder_id, worktree_folder_id);
     for task_id in detached {
         crate::web::event_bridge::emit_event(
             emitter,
@@ -3526,7 +3726,7 @@ async fn converge_removed_worktree_folder(
         );
     }
     crate::office_watch::stop_office_watches_under_root(worktree_path);
-    moved
+    outcome.moved as u32
 }
 
 #[cfg(feature = "tauri-runtime")]
@@ -4481,6 +4681,7 @@ pub(crate) fn build_file_tree_sync(
                     name,
                     path: rel_path,
                     children: vec![],
+                    symlink: entry.path_is_symlink(),
                 });
         } else {
             dir_children
@@ -4536,6 +4737,7 @@ pub(crate) fn build_file_tree_sync(
             if let FileTreeNode::Dir {
                 name,
                 path: rel_path,
+                symlink,
                 ..
             } = d
             {
@@ -4548,6 +4750,7 @@ pub(crate) fn build_file_tree_sync(
                     name,
                     path: rel_path,
                     children: sub_children,
+                    symlink,
                 });
             }
         }
@@ -4564,7 +4767,7 @@ const FILE_OPEN_HARD_LIMIT: usize = 50_000_000;
 /// Save limit: refuse to save content larger than 50 MB.
 const FILE_SAVE_HARD_LIMIT: usize = 50_000_000;
 
-fn to_git_literal_pathspec(path: &str) -> String {
+pub(crate) fn to_git_literal_pathspec(path: &str) -> String {
     format!(":(literal){path}")
 }
 
@@ -4580,6 +4783,76 @@ fn unquote_git_path(path: &str) -> String {
     } else {
         trimmed.to_string()
     }
+}
+
+/// [`unquote_git_path`] for the path field of a `git status --porcelain=v1`
+/// line, which for a rename or copy is `<from> -> <to>` with EACH side quoted
+/// on its own. Status quotes a path that has a space in it, so moving
+/// `my notes.md` reads `"my notes.md" -> "notes/my notes.md"`, and unquoting
+/// the field as one string would keep the inner quotes
+/// (`my notes.md" -> "notes/my notes.md`).
+fn unquote_status_path(field: &str) -> String {
+    let field = field.trim();
+    let sides = match field.strip_prefix('"') {
+        // The closing quote of a quoted `<from>`: inside the quotes git
+        // escapes `"` and `\` with a backslash, so skip whatever follows one.
+        Some(quoted) => {
+            let mut close = None;
+            let mut chars = quoted.char_indices();
+            while let Some((i, c)) = chars.next() {
+                match c {
+                    '\\' => {
+                        chars.next();
+                    }
+                    '"' => {
+                        close = Some(i + 2);
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+            close.and_then(|end| {
+                field[end..]
+                    .strip_prefix(" -> ")
+                    .map(|to| (&field[..end], to))
+            })
+        }
+        // An unquoted `<from>` has no space in it (status would have quoted
+        // it), so the first ` -> ` is the separator.
+        None => field.split_once(" -> "),
+    };
+    match sides {
+        Some((from, to)) => format!("{} -> {}", unquote_git_path(from), unquote_git_path(to)),
+        None => unquote_git_path(field),
+    }
+}
+
+/// Both sides of a rename as `git diff --numstat` prints it: `old => new`, or
+/// with the part they share factored out of braces, `src/{old => new}/main.rs`.
+/// `None` for a path that is not written as a rename.
+///
+/// Around the braces git keeps the `/` that ends the shared prefix and the one
+/// that starts the shared suffix, so a side left empty by a move up a directory
+/// (`docs/{sub => }/moved.txt`) would join them into `docs//moved.txt`.
+pub(crate) fn numstat_rename_sides(path: &str) -> Option<(String, String)> {
+    if let (Some(open), Some(close)) = (path.find('{'), path.rfind('}')) {
+        if open < close {
+            let (prefix, suffix) = (&path[..open], &path[close + 1..]);
+            if let Some((old, new)) = path[open + 1..close].split_once(" => ") {
+                let side = |middle: &str| {
+                    let suffix = if middle.is_empty() {
+                        suffix.strip_prefix('/').unwrap_or(suffix)
+                    } else {
+                        suffix
+                    };
+                    format!("{prefix}{middle}{suffix}")
+                };
+                return Some((side(old), side(new)));
+            }
+        }
+    }
+    path.rsplit_once(" => ")
+        .map(|(old, new)| (old.to_string(), new.to_string()))
 }
 
 pub(crate) fn resolve_tree_path(root: &Path, rel_path: &str) -> Result<PathBuf, AppCommandError> {
@@ -5022,6 +5295,73 @@ pub async fn list_directory_with_files(
     Ok(items)
 }
 
+/// Directories the user linked into `root`, as `(link name, canonical target)`
+/// pairs, restricted to entries that are actually a symlink on disk right now.
+///
+/// Only *authorized* links are returned (see [`crate::folder_links`]): a
+/// symlink that merely happens to sit in the tree — the `secrets -> ~/.ssh` a
+/// cloned repo might ship — is not one of them and stays unfollowed.
+pub(super) fn authorized_links_in(root: &Path) -> Vec<(String, PathBuf)> {
+    let Ok(canonical_root) = std::fs::canonicalize(root) else {
+        return Vec::new();
+    };
+    let targets = crate::folder_links::canonical_targets_for(&canonical_root);
+    if targets.is_empty() {
+        return Vec::new();
+    }
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return Vec::new();
+    };
+
+    let mut links = Vec::new();
+    for entry in entries.flatten() {
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if !file_type.is_symlink() {
+            continue;
+        }
+        let Ok(resolved) = std::fs::canonicalize(entry.path()) else {
+            continue;
+        };
+        if !resolved.is_dir() || !targets.contains(&resolved) {
+            continue;
+        }
+        links.push((entry.file_name().to_string_lossy().to_string(), resolved));
+    }
+    links.sort_by_key(|a| a.0.to_lowercase());
+    links
+}
+
+/// Rewrite every `path` in `nodes` (recursively) to `<prefix>/<path>`. Used when
+/// a subtree built against a different root is grafted into this one.
+#[allow(dead_code)]
+fn prefix_tree_paths(nodes: &mut [FileTreeNode], prefix: &str) {
+    for node in nodes {
+        match node {
+            FileTreeNode::File { path, .. } => *path = format!("{prefix}/{path}"),
+            FileTreeNode::Dir { path, children, .. } => {
+                *path = format!("{prefix}/{path}");
+                prefix_tree_paths(children, prefix);
+            }
+        }
+    }
+}
+
+///
+/// The directory walkers run with `follow_links` off, so a symlink's own
+/// `FileType` is `symlink` — never `dir` — and classifying on it alone turns a
+/// symlinked *directory* into a leaf file the panel then refuses to open
+/// ("Path is not a file"). Resolving costs one extra `stat`, and only for the
+/// entries that actually are links.
+fn entry_presents_as_dir(file_type: &std::fs::FileType, path: &Path) -> bool {
+    if file_type.is_symlink() {
+        path.is_dir()
+    } else {
+        file_type.is_dir()
+    }
+}
+
 #[cfg_attr(feature = "tauri-runtime", tauri::command)]
 pub async fn get_file_tree(
     path: String,
@@ -5040,9 +5380,6 @@ pub async fn get_file_tree(
         })?
 }
 
-/// On-demand workspace file search for `@` mentions and the command palette.
-/// Does **not** return a full tree — only up to `limit` flat hits (default 50).
-#[cfg_attr(feature = "tauri-runtime", tauri::command)]
 pub async fn search_workspace_files(
     path: String,
     query: Option<String>,
@@ -5065,7 +5402,6 @@ pub async fn search_workspace_files(
     result
 }
 
-#[cfg_attr(feature = "tauri-runtime", tauri::command)]
 pub async fn cancel_workspace_file_search(
     search_session_id: String,
     request_id: String,
@@ -5174,6 +5510,195 @@ pub async fn list_workspace_files(
     let root = PathBuf::from(path);
     run_file_io(move || collect_workspace_file_entries(&root, WORKSPACE_FILE_LIST_MAX_ENTRIES))
         .await
+}
+
+pub(super) fn visit_workspace_files(path: &str, mut visit: impl FnMut(WorkspaceFileEntry) -> bool) {
+    let root = PathBuf::from(path);
+    // Linked directories are walked separately below, rooted at the link so
+    // their own `.gitignore` applies. Excluded from the main pass because the
+    // walker reports a symlink as a leaf file.
+    let linked = authorized_links_in(&root);
+    let linked_names: HashSet<String> = linked.iter().map(|(name, _)| name.clone()).collect();
+    if !visit_workspace_main_pass(&root, linked_names, None, &mut visit) {
+        return;
+    }
+
+    for (link_name, target) in linked {
+        if !visit(WorkspaceFileEntry {
+            name: link_name.clone(),
+            path: link_name.clone(),
+            kind: WorkspaceEntryKind::Dir,
+        }) {
+            return;
+        }
+        // Rooted at the resolved target so the linked project's own ignore
+        // files apply, then re-prefixed with the link name so every path stays
+        // relative to the workspace root and resolves back through the link.
+        if !visit_files_under(&target, &link_name, &mut visit) {
+            return;
+        }
+    }
+}
+
+/// Relative-path predicate for [`visit_workspace_focused`]: entries it rejects
+/// are neither yielded nor descended.
+pub(super) type WalkFocus = Arc<dyn Fn(&str) -> bool + Send + Sync>;
+
+/// The main pass of [`visit_workspace_files`] restricted to the entries
+/// `focus` keeps. Descending through each kept ancestor reads that directory's
+/// ignore files exactly as a full walk would, so a handful of changed paths
+/// can be re-evaluated with full-walk semantics without walking everything.
+/// Authorized linked roots are not visited.
+pub(super) fn visit_workspace_focused(
+    path: &str,
+    focus: WalkFocus,
+    mut visit: impl FnMut(WorkspaceFileEntry) -> bool,
+) {
+    let root = PathBuf::from(path);
+    let linked_names = authorized_links_in(&root)
+        .into_iter()
+        .map(|(name, _)| name)
+        .collect();
+    visit_workspace_main_pass(&root, linked_names, Some(focus), &mut visit);
+}
+
+fn visit_workspace_main_pass(
+    root: &Path,
+    linked_names: HashSet<String>,
+    focus: Option<WalkFocus>,
+    visit: &mut impl FnMut(WorkspaceFileEntry) -> bool,
+) -> bool {
+    // Conservative gitignore parity with the previous client-side pass: respect
+    // in-tree `.gitignore`/`.ignore`/`.git/info/exclude`, but not the global
+    // gitignore or parent-directory ignores (the workspace root is the
+    // boundary). `require_git(false)` keeps `.gitignore` effective even outside
+    // a git repo. `hidden(false)` keeps dotfiles visible. The `filter_entry`
+    // mirrors `get_file_tree`'s hardcoded ignores exactly.
+    let filter_root = root.to_path_buf();
+    let walker = WalkBuilder::new(root)
+        .hidden(false)
+        .parents(false)
+        .ignore(true)
+        .git_ignore(true)
+        .git_exclude(true)
+        .git_global(false)
+        .require_git(false)
+        .sort_by_file_name(|a, b| a.cmp(b))
+        .filter_entry(move |e| {
+            if e.depth() == 0 {
+                return true;
+            }
+            let name = e.file_name().to_string_lossy();
+            if e.depth() == 1 && linked_names.contains(name.as_ref()) {
+                return false;
+            }
+            let kept = if e
+                .file_type()
+                .is_some_and(|t| entry_presents_as_dir(&t, e.path()))
+            {
+                !FILE_TREE_IGNORED_DIRS.contains(&name.as_ref())
+            } else {
+                name != ".DS_Store"
+            };
+            kept && focus.as_ref().is_none_or(|focus| {
+                let rel = e.path().strip_prefix(&filter_root).unwrap_or(e.path());
+                focus(&rel.to_string_lossy().replace('\\', "/"))
+            })
+        })
+        .build();
+
+    for result in walker {
+        // Skip unreadable entries (permission errors, transient races) rather
+        // than failing the whole search.
+        let Ok(entry) = result else { continue };
+        let entry_path = entry.path();
+
+        // Skip the root directory itself.
+        if entry_path == root {
+            continue;
+        }
+
+        // A symlinked directory is reported as a directory (the walker is not
+        // following it — only its own contents stay out of the index).
+        let is_dir = entry
+            .file_type()
+            .is_some_and(|t| entry_presents_as_dir(&t, entry_path));
+        let name = entry.file_name().to_string_lossy().to_string();
+        let rel_path = entry_path
+            .strip_prefix(root)
+            .unwrap_or(entry_path)
+            .to_string_lossy()
+            .replace('\\', "/");
+
+        if !visit(WorkspaceFileEntry {
+            name,
+            path: rel_path,
+            kind: if is_dir {
+                WorkspaceEntryKind::Dir
+            } else {
+                WorkspaceEntryKind::File
+            },
+        }) {
+            return false;
+        }
+    }
+    true
+}
+
+/// Flat listing of `root`, with every path prefixed by `prefix/`. Shares the
+/// ignore configuration of [`list_workspace_files`]; nested symlinks are not
+/// followed, so this cannot recurse.
+fn visit_files_under(
+    root: &Path,
+    prefix: &str,
+    visit: &mut impl FnMut(WorkspaceFileEntry) -> bool,
+) -> bool {
+    let walker = WalkBuilder::new(root)
+        .hidden(false)
+        .parents(false)
+        .ignore(true)
+        .git_ignore(true)
+        .git_exclude(true)
+        .git_global(false)
+        .require_git(false)
+        .sort_by_file_name(|a, b| a.cmp(b))
+        .filter_entry(|e| {
+            let name = e.file_name().to_string_lossy();
+            if e.file_type()
+                .is_some_and(|t| entry_presents_as_dir(&t, e.path()))
+            {
+                !FILE_TREE_IGNORED_DIRS.contains(&name.as_ref())
+            } else {
+                name != ".DS_Store"
+            }
+        })
+        .build();
+
+    for result in walker {
+        let Ok(entry) = result else { continue };
+        let entry_path = entry.path();
+        if entry_path == root {
+            continue;
+        }
+        let Ok(rel) = entry_path.strip_prefix(root) else {
+            continue;
+        };
+        let is_dir = entry
+            .file_type()
+            .is_some_and(|t| entry_presents_as_dir(&t, entry_path));
+        if !visit(WorkspaceFileEntry {
+            name: entry.file_name().to_string_lossy().to_string(),
+            path: format!("{prefix}/{}", rel.to_string_lossy().replace('\\', "/")),
+            kind: if is_dir {
+                WorkspaceEntryKind::Dir
+            } else {
+                WorkspaceEntryKind::File
+            },
+        }) {
+            return false;
+        }
+    }
+    true
 }
 
 #[cfg_attr(feature = "tauri-runtime", tauri::command)]
@@ -7439,6 +7964,142 @@ mod tests {
         String::from_utf8_lossy(&out.stdout).trim().to_string()
     }
 
+    /// What the hook `refusing_hook` installs writes to stderr as it refuses.
+    const HOOK_REFUSAL: &str = "refused by the test pre-commit hook";
+
+    /// Point the repository at a pre-commit hook that runs `script` and then
+    /// refuses the commit, whatever hooks path the user's own config names:
+    /// the repository's setting wins.
+    fn refusing_hook(root: &std::path::Path, script: &str) {
+        let hooks = root.join(".test-hooks");
+        std::fs::create_dir_all(&hooks).unwrap();
+        let hook = hooks.join("pre-commit");
+        std::fs::write(
+            &hook,
+            format!("#!/bin/sh\n{script}\necho '{HOOK_REFUSAL}' >&2\nexit 1\n"),
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        git_run(root, &["config", "core.hooksPath", hooks.to_str().unwrap()]);
+    }
+
+    /// Commit `files` as the app does and return git's stderr from the
+    /// refusal. `git_commit_core` runs git with this process's environment,
+    /// not `git_run`'s, and git looks for an author before it runs pre-commit:
+    /// without one in the repository's own config, a machine that has none
+    /// configured (a CI runner) would refuse every commit before the hook ran.
+    async fn refused_commit(path: &std::path::Path, files: &[&str]) -> String {
+        git_run(path, &["config", "user.name", "t"]);
+        git_run(path, &["config", "user.email", "t@example.com"]);
+        let db = fresh_in_memory_db().await;
+        let files: Vec<String> = files.iter().map(|f| f.to_string()).collect();
+        match git_commit_core(
+            &EventEmitter::Noop,
+            None,
+            &db.conn,
+            path.to_str().unwrap(),
+            "feat: refused",
+            &files,
+        )
+        .await
+        {
+            Ok(_) => panic!("the commit went through"),
+            Err(err) => err.detail.unwrap_or(err.message),
+        }
+    }
+
+    /// A commit refused after its `git add` gives back the files that add
+    /// brought into the index, so a later commit with another pick can't take
+    /// them. What the index held before stays; so does a new file restaged
+    /// (here by the hook) or edited since, whose staged content would be lost.
+    #[tokio::test]
+    async fn a_refused_commit_gives_back_the_new_files_it_staged() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        git_run(root, &["init", "-q", "-b", "main"]);
+        std::fs::write(root.join("tracked.txt"), "one\n").unwrap();
+        git_run(root, &["add", "tracked.txt"]);
+        git_run(root, &["commit", "-q", "-m", "base"]);
+        std::fs::write(root.join("tracked.txt"), "one\ntwo\n").unwrap();
+        for file in ["picked.txt", "restaged.txt", "edited.txt", "staged.txt"] {
+            std::fs::write(root.join(file), "new\n").unwrap();
+        }
+        git_run(root, &["add", "staged.txt"]);
+        refusing_hook(
+            root,
+            "echo changed > restaged.txt && git add restaged.txt\necho changed > edited.txt",
+        );
+
+        let files = [
+            "edited.txt",
+            "picked.txt",
+            "restaged.txt",
+            "staged.txt",
+            "tracked.txt",
+        ];
+        let refusal = refused_commit(root, &files).await;
+        assert!(refusal.contains(HOOK_REFUSAL), "{refusal}");
+
+        let status = git_capture(root, &["status", "--porcelain=v1", "-uall"]);
+        let lines: Vec<&str> = status.lines().collect();
+        assert!(lines.contains(&"?? picked.txt"), "{status}");
+        assert!(lines.contains(&"A  restaged.txt"), "{status}");
+        assert!(lines.contains(&"AM edited.txt"), "{status}");
+        assert!(lines.contains(&"A  staged.txt"), "{status}");
+        // A tracked file is never taken out of the index, only re-staged.
+        assert!(lines.contains(&"M  tracked.txt"), "{status}");
+    }
+
+    /// A file another process committed between the refusal and the clean-up
+    /// stays as committed: what goes back is HEAD's, never a deletion.
+    #[tokio::test]
+    async fn giving_back_a_file_committed_meanwhile_leaves_it_committed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        git_run(root, &["init", "-q", "-b", "main"]);
+        git_run(root, &["commit", "-q", "--allow-empty", "-m", "base"]);
+        std::fs::write(root.join("f.txt"), "x\n").unwrap();
+        git_run(root, &["add", "f.txt"]);
+        let path = root.to_str().unwrap();
+        let added = index_entries(path, &[to_git_literal_pathspec("f.txt")])
+            .await
+            .expect("index entries");
+        git_run(root, &["commit", "-q", "-m", "another process"]);
+
+        unstage_added_files(path, &added).await;
+        assert_eq!(
+            git_capture(root, &["status", "--porcelain=v1", "-uall"]),
+            ""
+        );
+    }
+
+    /// Below the repository root, what goes back is what the add actually
+    /// staged: its pathspecs resolve against the folder, the index's paths
+    /// against the root.
+    #[tokio::test]
+    async fn a_refused_commit_below_the_root_gives_back_what_its_add_staged() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        git_run(root, &["init", "-q", "-b", "main"]);
+        git_run(root, &["commit", "-q", "--allow-empty", "-m", "base"]);
+        let folder = root.join("pkg");
+        std::fs::create_dir_all(folder.join("src")).unwrap();
+        std::fs::write(folder.join("src/new.txt"), "new\n").unwrap();
+        refusing_hook(root, ":");
+
+        let refusal = refused_commit(&folder, &["src/new.txt"]).await;
+        assert!(refusal.contains(HOOK_REFUSAL), "{refusal}");
+        let status = git_capture(root, &["status", "--porcelain=v1", "-uall"]);
+        assert!(
+            status.lines().any(|l| l == "?? pkg/src/new.txt"),
+            "{status}"
+        );
+    }
+
     // All-branches push status: with no remote-tracking refs every listed commit
     // is a definite "not pushed" (never the old unknown/None), and the classified
     // set walks the same `--all` universe as the log so a tag-only commit shown in
@@ -8015,6 +8676,23 @@ mod tests {
         assert!(all.iter().any(|f| f.id == entry.id));
     }
 
+    /// Two callers making the row of one new path at once — the runs of a
+    /// `codeg-cli -a x -a y` in a new workspace, delegations into a new cwd —
+    /// both get it: the one that lost the insert reads the winner's.
+    #[tokio::test]
+    async fn ensure_folder_for_path_made_twice_at_once_is_one_row() {
+        let db = fresh_in_memory_db().await;
+        let path = "/tmp/codeg-ensure-race";
+        let (a, b) = tokio::join!(
+            folder_service::ensure_folder_for_path(&db.conn, path),
+            folder_service::ensure_folder_for_path(&db.conn, path),
+        );
+        let (a, b) = (a.expect("first"), b.expect("second"));
+        assert_eq!(a.id, b.id);
+        let all = list_all_folder_details_core(&db).await.expect("all list");
+        assert_eq!(all.iter().filter(|f| f.path == path).count(), 1);
+    }
+
     /// The overwhelmingly common case: the child runs in the same folder as its
     /// parent. That folder is already open and must stay exactly as it was —
     /// including `last_opened_at`, which orders the folder history and has no
@@ -8170,6 +8848,633 @@ mod tests {
             wt.parent_id, None,
             "non-positive / unknown source degrades to a top-level folder"
         );
+    }
+
+    /// The point of seeding: a worktree's directory name says far less about it
+    /// than the branch it holds, so registering one labels it by branch.
+    #[tokio::test]
+    async fn open_worktree_folder_core_labels_the_folder_with_its_branch() {
+        let db = fresh_in_memory_db().await;
+        let (_dir, repo, wt_path) = repo_with_worktree();
+        let root = open_folder_core(&db, repo).await.expect("root");
+
+        let wt = open_worktree_folder_core(&db, wt_path, root.id)
+            .await
+            .expect("worktree folder");
+
+        assert_eq!(
+            wt.alias.as_deref(),
+            Some("wt"),
+            "the fresh worktree folder is labeled with its checked-out branch"
+        );
+    }
+
+    /// Re-registering a worktree is routine — a task retry re-creating its
+    /// checkout, an automation re-resolving the same directory — and must never
+    /// undo the name the user gave it in the sidebar.
+    #[tokio::test]
+    async fn open_worktree_folder_core_keeps_a_user_alias_on_re_register() {
+        let db = fresh_in_memory_db().await;
+        let (_dir, repo, wt_path) = repo_with_worktree();
+        let root = open_folder_core(&db, repo).await.expect("root");
+        let wt = open_worktree_folder_core(&db, wt_path.clone(), root.id)
+            .await
+            .expect("worktree folder");
+        update_folder_alias_core(&db, wt.id, Some("Payment rewrite".into()))
+            .await
+            .expect("user renames it");
+
+        let again = open_worktree_folder_core(&db, wt_path, root.id)
+            .await
+            .expect("re-register the same worktree");
+
+        assert_eq!(again.id, wt.id, "same folder row");
+        assert_eq!(
+            again.alias.as_deref(),
+            Some("Payment rewrite"),
+            "the user's name survives re-registration"
+        );
+    }
+
+    /// The seed is best-effort: a directory git knows nothing about (or that is
+    /// gone entirely) still registers, just without a label — the sidebar then
+    /// falls back to the directory name as it always did.
+    #[tokio::test]
+    async fn open_worktree_folder_core_leaves_a_non_repo_unlabeled() {
+        let db = fresh_in_memory_db().await;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let plain = dir
+            .path()
+            .join("not-a-repo")
+            .to_str()
+            .expect("utf-8 path")
+            .to_string();
+        std::fs::create_dir_all(&plain).expect("mkdir");
+
+        let wt = open_worktree_folder_core(&db, plain, 0)
+            .await
+            .expect("registers anyway");
+
+        assert_eq!(wt.alias, None, "no branch to label it with");
+    }
+
+    /// Worktrees registered before seeding existed keep showing their directory
+    /// name forever without this — the whole reason the backfill exists.
+    #[tokio::test]
+    async fn backfill_labels_an_already_registered_worktree() {
+        let db = fresh_in_memory_db().await;
+        let (_dir, repo, wt_path) = repo_with_worktree();
+        let root = open_folder_core(&db, repo).await.expect("root");
+        let wt = open_worktree_folder_core(&db, wt_path, root.id)
+            .await
+            .expect("worktree folder");
+        // Back to the pre-seeding state: a worktree folder row with no alias.
+        update_folder_alias_core(&db, wt.id, None)
+            .await
+            .expect("clear the alias");
+
+        let labeled = backfill_worktree_folder_aliases(&test_emitter(), &db).await;
+
+        assert_eq!(labeled, 1);
+        assert_eq!(
+            get_folder_core(&db, wt.id)
+                .await
+                .expect("folder")
+                .alias
+                .as_deref(),
+            Some("wt")
+        );
+        assert_eq!(
+            get_folder_core(&db, root.id).await.expect("root").alias,
+            None,
+            "the root repo is not a worktree and is left alone"
+        );
+    }
+
+    /// A `folder://changed` Upsert means "insert-or-replace in the OPEN folder
+    /// list", so announcing a closed folder would put one the user removed from
+    /// the workspace back in their sidebar. Label it anyway — reopening it later
+    /// should already read as the branch — but stay silent about it.
+    #[tokio::test]
+    async fn backfill_labels_a_closed_worktree_without_announcing_it() {
+        use crate::web::event_bridge::WebEventBroadcaster;
+
+        let db = fresh_in_memory_db().await;
+        let (_dir, repo, wt_path) = repo_with_worktree();
+        let root = open_folder_core(&db, repo.clone()).await.expect("root");
+        let open_wt = open_worktree_folder_core(&db, wt_path, root.id)
+            .await
+            .expect("open worktree folder");
+        let (_dir2, repo2, wt_path2) = repo_with_worktree();
+        let root2 = open_folder_core(&db, repo2).await.expect("second root");
+        let closed_wt = open_worktree_folder_core(&db, wt_path2, root2.id)
+            .await
+            .expect("worktree folder to close");
+        // Back to the pre-seeding state for both, then close the second one the
+        // way the UI does (the row stays alive, just out of the workspace).
+        for id in [open_wt.id, closed_wt.id] {
+            update_folder_alias_core(&db, id, None)
+                .await
+                .expect("clear the alias");
+        }
+        let broadcaster = std::sync::Arc::new(WebEventBroadcaster::new());
+        let emitter = EventEmitter::test_web_only(broadcaster.clone());
+        remove_folder_from_workspace_core(&emitter, &db, closed_wt.id)
+            .await
+            .expect("close the folder");
+
+        // Subscribe only now, so the queue holds just the backfill's events.
+        let mut rx = broadcaster.subscribe();
+        let labeled = backfill_worktree_folder_aliases(&emitter, &db).await;
+
+        // Both rows get the label…
+        assert_eq!(labeled, 2);
+        for id in [open_wt.id, closed_wt.id] {
+            assert_eq!(
+                get_folder_core(&db, id).await.expect("folder").alias,
+                Some("wt".to_string()),
+                "every worktree row is labeled, open or not"
+            );
+        }
+        // …but only the open one is announced.
+        let mut announced = Vec::new();
+        while let Ok(evt) = rx.try_recv() {
+            if evt.channel == crate::web::event_bridge::FOLDER_CHANGED_EVENT {
+                let p = &*evt.payload;
+                if p["kind"] == "upsert" {
+                    announced.push(p["folder"]["id"].as_i64().unwrap_or(-1) as i32);
+                }
+            }
+        }
+        assert_eq!(
+            announced,
+            vec![open_wt.id],
+            "a closed folder must not be broadcast back into the sidebar"
+        );
+    }
+
+    /// The backfill decides whether to announce a folder by re-reading it, not
+    /// from the snapshot its work list was built from — otherwise closing a
+    /// folder while the backfill walks (one git call per folder, so the window is
+    /// real) still announces it and puts it back in the sidebar. This is that
+    /// re-read: the same id that was announceable a moment ago no longer is.
+    #[tokio::test]
+    async fn a_folder_closed_after_enumeration_is_no_longer_announceable() {
+        let db = fresh_in_memory_db().await;
+        let (_dir, repo, wt_path) = repo_with_worktree();
+        let root = open_folder_core(&db, repo).await.expect("root");
+        let wt = open_worktree_folder_core(&db, wt_path, root.id)
+            .await
+            .expect("worktree folder");
+
+        // Enumeration-time reading: open, so this row would be announced.
+        assert!(folder_service::get_open_folder_by_id(&db.conn, wt.id)
+            .await
+            .expect("query")
+            .is_some());
+
+        // The user closes it mid-walk.
+        remove_folder_from_workspace_core(&test_emitter(), &db, wt.id)
+            .await
+            .expect("close the folder");
+
+        assert!(
+            folder_service::get_open_folder_by_id(&db.conn, wt.id)
+                .await
+                .expect("query")
+                .is_none(),
+            "a folder closed since enumeration must not be announced"
+        );
+        // Still a live row the backfill may label — just silently.
+        assert!(get_folder_core(&db, wt.id).await.is_ok());
+    }
+
+    /// A second launch must be a no-op — both for folders it already labeled and
+    /// for ones the user has since named.
+    #[tokio::test]
+    async fn backfill_skips_folders_that_already_have_a_label() {
+        let db = fresh_in_memory_db().await;
+        let (_dir, repo, wt_path) = repo_with_worktree();
+        let root = open_folder_core(&db, repo).await.expect("root");
+        let wt = open_worktree_folder_core(&db, wt_path, root.id)
+            .await
+            .expect("worktree folder");
+        update_folder_alias_core(&db, wt.id, Some("Payment rewrite".into()))
+            .await
+            .expect("user renames it");
+
+        assert_eq!(
+            backfill_worktree_folder_aliases(&test_emitter(), &db).await,
+            0
+        );
+        assert_eq!(
+            get_folder_core(&db, wt.id)
+                .await
+                .expect("folder")
+                .alias
+                .as_deref(),
+            Some("Payment rewrite")
+        );
+    }
+
+    /// A repo with one commit on `main` plus a linked worktree at `<dir>/wt`
+    /// holding branch `wt`. Returns `(tempdir, repo_path, worktree_path)`.
+    fn repo_with_worktree() -> (tempfile::TempDir, String, String) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        git_run(dir.path(), &["init", "-q", "-b", "main"]);
+        git_run(dir.path(), &["commit", "-q", "--allow-empty", "-m", "base"]);
+        let wt_path = dir.path().join("wt");
+        let wt_str = wt_path.to_str().expect("utf-8 path").to_string();
+        git_run(dir.path(), &["worktree", "add", "-q", "-b", "wt", &wt_str]);
+        let repo = dir.path().to_str().expect("utf-8 path").to_string();
+        (dir, repo, wt_str)
+    }
+
+    fn test_emitter() -> EventEmitter {
+        EventEmitter::test_web_only(std::sync::Arc::new(
+            crate::web::event_bridge::WebEventBroadcaster::new(),
+        ))
+    }
+
+    /// Spell a path git printed and one we resolved ourselves the same way
+    /// before comparing them. git reports the fully resolved location (on
+    /// macOS `/var` is a symlink into `/private/var`) with `/` separators,
+    /// while `fs::canonicalize` on Windows hands back the verbatim
+    /// `\\?\C:\…` form of what git prints as `C:/…`. Resolve, drop the
+    /// verbatim prefix, settle on forward slashes.
+    fn comparable_path(path: &str) -> String {
+        let resolved = std::fs::canonicalize(path).unwrap_or_else(|_| PathBuf::from(path));
+        crate::paths::simplify_verbatim_path(&resolved)
+            .to_string_lossy()
+            .replace('\\', "/")
+    }
+
+    /// The bug this command exists for: git flatly refuses to delete a branch a
+    /// worktree has checked out, so the branch selector's "delete branch" could
+    /// only ever report an error. Removing the checkout first is the fix.
+    #[tokio::test]
+    async fn remove_worktree_deletes_a_branch_plain_delete_cannot() {
+        let db = fresh_in_memory_db().await;
+        let (_dir, repo, wt_path) = repo_with_worktree();
+
+        let refused = git_delete_branch(repo.clone(), "wt".into(), false)
+            .await
+            .expect_err("git refuses a branch held by a worktree");
+        assert!(
+            format!("{refused:?}").contains("used by worktree"),
+            "expected git's worktree refusal, got: {refused:?}"
+        );
+
+        // Resolve ours the way git resolves its own — while the directory is
+        // still there to resolve.
+        let canonical_wt = comparable_path(&wt_path);
+
+        let removal = git_remove_worktree_core(
+            &test_emitter(),
+            &db,
+            repo.clone(),
+            "wt".into(),
+            0,
+            true,
+            false,
+        )
+        .await
+        .expect("worktree + branch removal");
+
+        assert_eq!(
+            removal.worktree_path.as_deref().map(comparable_path),
+            Some(canonical_wt),
+            "reports the directory it removed"
+        );
+        assert!(removal.branch_deleted);
+        assert!(!Path::new(&wt_path).exists(), "worktree directory is gone");
+        let branches = git_list_all_branches(repo).await.expect("branches");
+        assert_eq!(branches.local, vec!["main".to_string()]);
+        assert!(branches.worktree_branches.is_empty());
+    }
+
+    /// The "worktree only" variant frees the checkout but is not a branch
+    /// delete: the commits — and the workspace folder you may want to recreate
+    /// the worktree under — survive.
+    #[tokio::test]
+    async fn remove_worktree_without_branch_keeps_branch_and_folder() {
+        let db = fresh_in_memory_db().await;
+        let (_dir, repo, wt_path) = repo_with_worktree();
+        let root = open_folder_core(&db, repo.clone()).await.expect("root");
+        let wt_folder = open_worktree_folder_core(&db, wt_path.clone(), root.id)
+            .await
+            .expect("worktree folder");
+
+        let removal = git_remove_worktree_core(
+            &test_emitter(),
+            &db,
+            repo.clone(),
+            "wt".into(),
+            root.id,
+            false,
+            false,
+        )
+        .await
+        .expect("worktree removal");
+
+        assert!(!removal.branch_deleted);
+        assert_eq!(removal.folder_id, None);
+        assert!(!Path::new(&wt_path).exists());
+        let branches = git_list_all_branches(repo).await.expect("branches");
+        assert!(
+            branches.local.contains(&"wt".to_string()),
+            "the branch outlives its worktree"
+        );
+        assert!(
+            folder_service::get_folder_by_id(&db.conn, wt_folder.id)
+                .await
+                .expect("lookup")
+                .is_some(),
+            "the workspace folder outlives its worktree"
+        );
+    }
+
+    /// Deleting everything also drops the workspace folder — and its sessions
+    /// have to land somewhere first, or they are orphaned under a folder no
+    /// client can fetch.
+    #[tokio::test]
+    async fn remove_worktree_with_branch_rehomes_sessions_then_drops_the_folder() {
+        use crate::db::service::conversation_service;
+        use crate::models::agent::AgentType;
+
+        let db = fresh_in_memory_db().await;
+        let (_dir, repo, wt_path) = repo_with_worktree();
+        let root = open_folder_core(&db, repo.clone()).await.expect("root");
+        let wt_folder = open_worktree_folder_core(&db, wt_path.clone(), root.id)
+            .await
+            .expect("worktree folder");
+        let conv =
+            conversation_service::create(&db.conn, wt_folder.id, AgentType::ClaudeCode, None, None)
+                .await
+                .expect("conversation");
+
+        let removal = git_remove_worktree_core(
+            &test_emitter(),
+            &db,
+            repo,
+            "wt".into(),
+            root.id,
+            true,
+            false,
+        )
+        .await
+        .expect("worktree + branch removal");
+
+        assert_eq!(removal.folder_id, Some(wt_folder.id));
+        assert_eq!(removal.reparented, 1);
+        assert!(
+            folder_service::get_folder_by_id(&db.conn, wt_folder.id)
+                .await
+                .expect("lookup")
+                .is_none(),
+            "the workspace folder goes with the branch"
+        );
+        let moved = conversation_service::get_by_id(&db.conn, conv.id)
+            .await
+            .expect("conversation row");
+        assert_eq!(moved.folder_id, root.id);
+        assert_eq!(
+            moved.origin_cwd.as_deref(),
+            Some(wt_path.as_str()),
+            "the session remembers where it actually ran"
+        );
+    }
+
+    /// The branch selector's removal runs the same shared convergence as the
+    /// task engine, with its own bookkeeping after the folder drop: closed tabs,
+    /// the conversations' refetch, the folder drop, then the detached task.
+    #[tokio::test]
+    async fn remove_worktree_announces_in_order_and_detaches_the_task_last() {
+        use crate::db::service::{conversation_service, tab_service};
+        use crate::models::agent::AgentType;
+        use crate::web::event_bridge::{
+            WebEventBroadcaster, CONVERSATIONS_BULK_CHANGED_EVENT, FOLDER_CHANGED_EVENT,
+            TABS_CHANGED_EVENT, WORK_TASK_CHANGED_EVENT,
+        };
+
+        let db = fresh_in_memory_db().await;
+        let (_dir, repo, wt_path) = repo_with_worktree();
+        let root = open_folder_core(&db, repo.clone()).await.expect("root");
+        let wt_folder = open_worktree_folder_core(&db, wt_path.clone(), root.id)
+            .await
+            .expect("worktree folder");
+        let conv =
+            conversation_service::create(&db.conn, wt_folder.id, AgentType::ClaudeCode, None, None)
+                .await
+                .expect("conversation");
+        tab_service::save_all_tabs_cas(
+            &db.conn,
+            vec![crate::models::OpenedTab {
+                id: 0,
+                folder_id: wt_folder.id,
+                conversation_id: Some(conv.id),
+                agent_type: AgentType::ClaudeCode,
+                position: 0,
+                is_active: true,
+                is_pinned: false,
+            }],
+            0,
+        )
+        .await
+        .expect("tabs");
+        seed_task_on_worktree(&db, root.id, wt_folder.id).await;
+
+        let broadcaster = std::sync::Arc::new(WebEventBroadcaster::new());
+        let mut rx = broadcaster.subscribe();
+        let emitter = EventEmitter::test_web_only(broadcaster.clone());
+        let removal =
+            git_remove_worktree_core(&emitter, &db, repo, "wt".into(), root.id, true, false)
+                .await
+                .expect("worktree + branch removal");
+        assert_eq!(removal.reparented, 1);
+
+        let channels: Vec<String> = std::iter::from_fn(|| rx.try_recv().ok())
+            .map(|ev| ev.channel.to_string())
+            .filter(|c| {
+                [
+                    TABS_CHANGED_EVENT,
+                    CONVERSATIONS_BULK_CHANGED_EVENT,
+                    FOLDER_CHANGED_EVENT,
+                    WORK_TASK_CHANGED_EVENT,
+                ]
+                .contains(&c.as_str())
+            })
+            .collect();
+        assert_eq!(
+            channels,
+            vec![
+                TABS_CHANGED_EVENT.to_string(),
+                CONVERSATIONS_BULK_CHANGED_EVENT.to_string(),
+                FOLDER_CHANGED_EVENT.to_string(),
+                WORK_TASK_CHANGED_EVENT.to_string(),
+            ]
+        );
+    }
+
+    /// Seed a to-do task that owns `wt_folder_id` as its worktree.
+    async fn seed_task_on_worktree(
+        db: &AppDatabase,
+        project_folder_id: i32,
+        wt_folder_id: i32,
+    ) -> i32 {
+        use crate::db::service::work_task_service;
+
+        let task = work_task_service::create(
+            &db.conn,
+            crate::models::WorkTaskDraft {
+                folder_id: project_folder_id,
+                title: "fix login".to_string(),
+                config: serde_json::json!({
+                    "display_text": "fix login",
+                    "prompt_blocks": [{ "type": "text", "text": "fix login" }],
+                }),
+            },
+        )
+        .await
+        .expect("task");
+        work_task_service::attach_worktree(&db.conn, task.id, wt_folder_id, "main", "abc", "wt")
+            .await
+            .expect("attach worktree");
+        task.id
+    }
+
+    /// The branch selector cannot tell a to-do task's worktree from any other,
+    /// so a task that has settled must not be left advertising a checkout that
+    /// is gone — its card would offer a cleanup and a diff that can only fail.
+    #[tokio::test]
+    async fn remove_worktree_detaches_the_task_that_owned_it() {
+        use crate::db::service::work_task_service;
+
+        let db = fresh_in_memory_db().await;
+        let (_dir, repo, wt_path) = repo_with_worktree();
+        let root = open_folder_core(&db, repo.clone()).await.expect("root");
+        let wt_folder = open_worktree_folder_core(&db, wt_path.clone(), root.id)
+            .await
+            .expect("worktree folder");
+        let task_id = seed_task_on_worktree(&db, root.id, wt_folder.id).await;
+
+        git_remove_worktree_core(
+            &test_emitter(),
+            &db,
+            repo,
+            "wt".into(),
+            root.id,
+            true,
+            false,
+        )
+        .await
+        .expect("worktree + branch removal");
+
+        let after = work_task_service::get_model(&db.conn, task_id)
+            .await
+            .expect("task row");
+        assert_eq!(after.worktree_folder_id, None);
+    }
+
+    /// A task mid-run is working inside that directory right now. `--force`
+    /// would happily delete it out from under the live agent, so the refusal
+    /// has to come before git is asked — exactly as the task card's own
+    /// "remove worktree" refuses these statuses.
+    #[tokio::test]
+    async fn remove_worktree_refuses_while_a_task_is_running_in_it() {
+        use crate::db::entities::work_task::WorkTaskStatus;
+
+        let db = fresh_in_memory_db().await;
+        let (_dir, repo, wt_path) = repo_with_worktree();
+        let root = open_folder_core(&db, repo.clone()).await.expect("root");
+        let wt_folder = open_worktree_folder_core(&db, wt_path.clone(), root.id)
+            .await
+            .expect("worktree folder");
+        let task_id = seed_task_on_worktree(&db, root.id, wt_folder.id).await;
+        // Straight to `running` — the real transition chain would need a live
+        // engine, and only the status matters here.
+        {
+            use sea_orm::{ActiveModelTrait, EntityTrait, IntoActiveModel, Set};
+            let row = crate::db::entities::work_task::Entity::find_by_id(task_id)
+                .one(&db.conn)
+                .await
+                .expect("query")
+                .expect("task row");
+            let mut active = row.into_active_model();
+            active.status = Set(WorkTaskStatus::Running);
+            active.update(&db.conn).await.expect("mark running");
+        }
+
+        // Even the destructive variant, which is the one that would succeed.
+        let err = git_remove_worktree_core(
+            &test_emitter(),
+            &db,
+            repo.clone(),
+            "wt".into(),
+            root.id,
+            true,
+            true,
+        )
+        .await
+        .expect_err("a running task must block the removal");
+        assert!(
+            format!("{err:?}").contains("still working in this worktree"),
+            "expected a busy-task refusal, got: {err:?}"
+        );
+        assert!(Path::new(&wt_path).exists(), "the working tree survives");
+        let branches = git_list_all_branches(repo).await.expect("branches");
+        assert!(branches.local.contains(&"wt".to_string()));
+    }
+
+    /// Seen from a linked worktree, the repo's own checkout is just another
+    /// entry in `worktree_branches` — and the branch selector would offer to
+    /// remove it. Naming it separately is what lets the UI leave it alone.
+    #[tokio::test]
+    async fn list_all_branches_names_the_main_working_tree_branch() {
+        let (_dir, repo, wt_path) = repo_with_worktree();
+
+        let from_main = git_list_all_branches(repo).await.expect("from main tree");
+        assert_eq!(from_main.worktree_branches, vec!["wt".to_string()]);
+        assert_eq!(
+            from_main.main_worktree_branch, None,
+            "the queried path IS the main tree — it is not one of the others"
+        );
+
+        let from_worktree = git_list_all_branches(wt_path)
+            .await
+            .expect("from linked worktree");
+        assert_eq!(from_worktree.worktree_branches, vec!["main".to_string()]);
+        assert_eq!(
+            from_worktree.main_worktree_branch.as_deref(),
+            Some("main"),
+            "and from over here it is the one entry that can't be removed"
+        );
+    }
+
+    /// The main working tree hosts the repo itself — removing it would take the
+    /// project with it, so it is refused before git is asked.
+    #[tokio::test]
+    async fn remove_worktree_refuses_the_main_working_tree() {
+        let db = fresh_in_memory_db().await;
+        let (_dir, repo, _wt_path) = repo_with_worktree();
+
+        let err = git_remove_worktree_core(
+            &test_emitter(),
+            &db,
+            repo.clone(),
+            "main".into(),
+            0,
+            true,
+            false,
+        )
+        .await
+        .expect_err("main working tree must be refused");
+        assert!(
+            format!("{err:?}").contains("main working tree"),
+            "expected a main-working-tree refusal, got: {err:?}"
+        );
+        let branches = git_list_all_branches(repo).await.expect("branches");
+        assert!(branches.local.contains(&"main".to_string()));
     }
 
     #[test]
@@ -8420,17 +9725,6 @@ branch refs/heads/main";
         assert_eq!(err.code, crate::app_error::AppErrorCode::InvalidInput);
     }
 
-    fn repo_with_worktree() -> (tempfile::TempDir, String, String) {
-        let dir = tempfile::tempdir().expect("tempdir");
-        git_run(dir.path(), &["init", "-q", "-b", "main"]);
-        git_run(dir.path(), &["commit", "-q", "--allow-empty", "-m", "base"]);
-        let wt_path = dir.path().join("wt");
-        let wt = wt_path.to_str().expect("utf-8 worktree").to_string();
-        git_run(dir.path(), &["worktree", "add", "-q", "-b", "wt", &wt]);
-        let repo = dir.path().to_str().expect("utf-8 repo").to_string();
-        (dir, repo, wt)
-    }
-
     /// Git porcelain on Windows emits `C:/...`; `canonicalize` emits `\\?\C:\...`.
     fn same_worktree_path(left: &str, right: &str) -> bool {
         let norm = |s: &str| {
@@ -8446,39 +9740,6 @@ branch refs/heads/main";
         EventEmitter::test_web_only(std::sync::Arc::new(
             crate::web::event_bridge::WebEventBroadcaster::new(),
         ))
-    }
-
-    async fn seed_task_on_worktree(
-        db: &AppDatabase,
-        project_folder_id: i32,
-        worktree_folder_id: i32,
-    ) -> i32 {
-        use crate::db::service::work_task_service;
-
-        let task = work_task_service::create(
-            &db.conn,
-            crate::models::WorkTaskDraft {
-                folder_id: project_folder_id,
-                title: "busy worktree".to_string(),
-                config: serde_json::json!({
-                    "display_text": "busy worktree",
-                    "prompt_blocks": [{ "type": "text", "text": "busy worktree" }],
-                }),
-            },
-        )
-        .await
-        .expect("create work task");
-        work_task_service::attach_worktree(
-            &db.conn,
-            task.id,
-            worktree_folder_id,
-            "main",
-            "base",
-            "wt",
-        )
-        .await
-        .expect("attach worktree");
-        task.id
     }
 
     #[tokio::test]
@@ -9247,6 +10508,148 @@ branch refs/heads/main";
         )
         .await;
         assert!(res.is_err(), "dest containing '..' must be rejected");
+    }
+
+    #[test]
+    fn unquote_status_path_unquotes_each_side_of_a_rename() {
+        assert_eq!(unquote_status_path("src/main.rs"), "src/main.rs");
+        assert_eq!(unquote_status_path("\"with space.txt\""), "with space.txt");
+        assert_eq!(
+            unquote_status_path("d/旧.txt -> d/新.txt"),
+            "d/旧.txt -> d/新.txt"
+        );
+        assert_eq!(
+            unquote_status_path("\"d/old name.txt\" -> \"d/new name.txt\""),
+            "d/old name.txt -> d/new name.txt"
+        );
+        assert_eq!(
+            unquote_status_path("plain.txt -> \"with space.txt\""),
+            "plain.txt -> with space.txt"
+        );
+        assert_eq!(
+            unquote_status_path("\"with space.txt\" -> plain.txt"),
+            "with space.txt -> plain.txt"
+        );
+        // An escaped quote inside the first side does not end it. (The sides
+        // keep git's escapes, as `unquote_git_path` always has.)
+        assert_eq!(
+            unquote_status_path(r#""q\" -> x.txt" -> "y z.txt""#),
+            r#"q\" -> x.txt -> y z.txt"#
+        );
+    }
+
+    #[test]
+    fn numstat_rename_sides_reads_both_sides() {
+        let sides = |raw: &str| numstat_rename_sides(raw);
+        let pair = |old: &str, new: &str| Some((old.to_string(), new.to_string()));
+        assert_eq!(sides("src/main.rs"), None);
+        assert_eq!(sides("src/{a}.rs"), None);
+        assert_eq!(sides("old.rs => new.rs"), pair("old.rs", "new.rs"));
+        assert_eq!(
+            sides("src/{old => new}/main.rs"),
+            pair("src/old/main.rs", "src/new/main.rs")
+        );
+        assert_eq!(
+            sides("d/{old name.txt => new name.txt}"),
+            pair("d/old name.txt", "d/new name.txt")
+        );
+        assert_eq!(sides("{a => b}/x.rs"), pair("a/x.rs", "b/x.rs"));
+        // An emptied side: into a directory, and up out of one.
+        assert_eq!(
+            sides("src/{ => sub}/main.rs"),
+            pair("src/main.rs", "src/sub/main.rs")
+        );
+        assert_eq!(
+            sides("src/{sub => }/main.rs"),
+            pair("src/sub/main.rs", "src/main.rs")
+        );
+    }
+
+    /// Init a repo for the tests below, with the config the code under test
+    /// would otherwise read from the developer's machine pinned repo-locally
+    /// (the one layer both this helper and that code read): git's default
+    /// `core.quotePath`, which a global `false` would hide the bugs behind,
+    /// and no CRLF conversion, which Git for Windows turns on system-wide.
+    fn init_quoting_fixture(root: &std::path::Path) {
+        git_run(root, &["init", "-q", "-b", "main"]);
+        git_run(root, &["config", "core.quotePath", "true"]);
+        git_run(root, &["config", "core.autocrlf", "false"]);
+        git_run(root, &["config", "status.renames", "true"]);
+    }
+
+    /// Status quotes a path that has a space in it, and a rename quotes its two
+    /// sides separately: the whole field unquoted as one string read
+    /// `d/old name.txt" -> "d/new name.txt`, so the Git panel showed the
+    /// rename as `"d/new name.txt` and asked for that file by that name.
+    #[tokio::test]
+    async fn git_status_unquotes_both_sides_of_a_rename() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        init_quoting_fixture(root);
+        std::fs::create_dir(root.join("d")).expect("mkdir");
+        std::fs::write(root.join("d").join("old name.txt"), "1\n2\n3\n").expect("write");
+        std::fs::write(root.join("d").join("旧.txt"), "1\n2\n3\n").expect("write");
+        git_run(root, &["add", "-A"]);
+        git_run(root, &["commit", "-q", "-m", "base"]);
+        git_run(root, &["mv", "d/old name.txt", "d/new name.txt"]);
+        git_run(root, &["mv", "d/旧.txt", "d/新.txt"]);
+
+        let entries = git_status(root.to_str().expect("utf-8 path").to_string(), Some(true))
+            .await
+            .expect("status");
+        let files: Vec<(&str, &str)> = entries
+            .iter()
+            .map(|e| (e.status.as_str(), e.file.as_str()))
+            .collect();
+        assert_eq!(
+            files,
+            [
+                ("R", "d/old name.txt -> d/new name.txt"),
+                ("R", "d/旧.txt -> d/新.txt"),
+            ]
+        );
+    }
+
+    /// The diff overviews (working tree, branch, commit) list their files by
+    /// the paths in the patch headers, and "view diff" / "open file" ask for a
+    /// file by that path — so a header has to name a non-ASCII file as itself,
+    /// not by git's default octal escapes.
+    #[tokio::test]
+    async fn diff_headers_name_a_non_ascii_path_as_itself() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        let path = root.to_str().expect("utf-8 path").to_string();
+        init_quoting_fixture(root);
+        std::fs::create_dir(root.join("docs")).expect("mkdir");
+        std::fs::write(root.join("docs").join("需求.md"), "one\n").expect("write");
+        git_run(root, &["add", "-A"]);
+        // Not a `+++ b/…` match: a developer's `diff.mnemonicPrefix` or
+        // `diff.noprefix` changes the prefix, and the name is the point here.
+        let names_itself = |patch: &str| patch.contains("docs/需求.md") && !patch.contains("\\351");
+
+        // No commit yet: `diff HEAD` fails and the `--cached` fallback answers.
+        let unborn = git_diff(path.clone(), None).await.expect("unborn diff");
+        assert!(names_itself(&unborn), "{unborn}");
+
+        git_run(root, &["commit", "-q", "-m", "base"]);
+        git_run(root, &["branch", "base"]);
+        std::fs::write(root.join("docs").join("需求.md"), "one\ntwo\n").expect("write");
+        let working = git_diff(path.clone(), None).await.expect("working diff");
+        assert!(names_itself(&working), "{working}");
+        let one = git_diff(path.clone(), Some("docs/需求.md".to_string()))
+            .await
+            .expect("file diff");
+        assert!(names_itself(&one), "{one}");
+
+        git_run(root, &["commit", "-q", "-am", "edit"]);
+        let commit = git_show_diff(path.clone(), "HEAD".to_string(), None)
+            .await
+            .expect("commit diff");
+        assert!(names_itself(&commit), "{commit}");
+        let branch = git_diff_with_branch(path, "base".to_string(), None)
+            .await
+            .expect("branch diff");
+        assert!(names_itself(&branch), "{branch}");
     }
 }
 

@@ -134,8 +134,8 @@ describe("conversation views across a strip reorder", () => {
     // CSS `order` and decides which tile goes without a left border, so the
     // view's position in the id-sorted list must never reach it.
     expect(panel).toMatch(
-      /stableTabViewOrder\(groupTabs\)\.map\(\(\{ tab, visualIndex \}\) =>\s*renderTabWrapper\(tab, visualIndex, groupId, canTileGroup\)/
+      /stableTabViewOrder\(groupTabs\)\.map\(\(\{ tab, visualIndex \}\) =>\s*renderTabWrapper\(tab, visualIndex, groupId, canTileG\)/
     )
-    expect(panel).toMatch(/style=\{canTileGroup \? \{ order: indexInGroup \}/)
+    expect(panel).toMatch(/style=\{canTileG \? \{ order: indexInGroup \}/)
   })
 })

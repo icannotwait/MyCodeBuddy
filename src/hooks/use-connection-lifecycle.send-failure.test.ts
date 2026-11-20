@@ -45,7 +45,11 @@ const sendPrompt = vi.fn()
 let sharedSession: { generation: number } | null = null
 
 vi.mock("@/contexts/acp-connections-context", () => ({
-  useAcpActions: () => ({ setActiveKey: vi.fn(), touchActivity: vi.fn() }),
+  useAcpActions: () => ({
+    setActiveKey: vi.fn(),
+    releaseActiveKey: vi.fn(),
+    touchActivity: vi.fn(),
+  }),
 }))
 
 vi.mock("@/contexts/task-context", () => ({
@@ -73,6 +77,9 @@ vi.mock("@/hooks/use-connection", () => ({
     isViewer: false,
     backgroundOutstanding: 0,
     sharedSession,
+    asyncTasks: [],
+    remoteControl: null,
+    delegatedChildren: [],
   }),
 }))
 

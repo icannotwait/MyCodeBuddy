@@ -253,6 +253,8 @@ fn build_events(final_text: &str, seed: u64) -> (Vec<AcpEvent>, usize, bool) {
             events.push(permission_request());
             events.push(AcpEvent::PermissionResolved {
                 request_id: "perf-permission".into(),
+                option_id: None,
+                origin: None,
             });
         }
         if index == 499 {

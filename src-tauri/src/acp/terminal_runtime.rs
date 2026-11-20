@@ -18,9 +18,7 @@ use crate::acp::terminal_adapter::{adapter_for, AcpTerminalAdapter};
 use crate::browser::service_url::ServiceScanner;
 use crate::browser::services::ServiceWatch;
 use crate::models::agent::AgentType;
-use crate::terminal::shell::{
-    build_command_line, ResolvedShellSpec, ShellCommandStrategy, ShellDialect, ShellSource,
-};
+use crate::terminal::shell::{ResolvedShellSpec, ShellCommandStrategy, ShellDialect, ShellSource};
 use crate::terminal::shell_flavor::{classify_shell_family, ShellFamily};
 
 type TerminalMap = HashMap<String, Arc<TerminalInstance>>;
@@ -730,6 +728,9 @@ impl TerminalRuntime {
         for env_var in &request.env {
             command.env(&env_var.name, &env_var.value);
         }
+        // The base env's PATH is built from codeg's own: an AppImage's
+        // launcher put the image in it (see `crate::appimage_env`).
+        crate::appimage_env::restore_tokio(command);
     }
 
     pub async fn create_terminal(
@@ -761,43 +762,62 @@ impl TerminalRuntime {
             ));
         }
 
-        let mode = self.classify_request(&request)?;
-        let mut command = match &mode {
-            ExecutionMode::DirectProgram(program) => {
-                let mut command = crate::process::tokio_command(program);
-                command.args(&request.args);
-                command
+        let mut direct = crate::process::tokio_command(&request.command);
+        direct.args(&request.args);
+        self.configure_command(&mut direct, &request);
+
+        // Resolve the fallback shell before the spawn attempt so the retry
+        // decision can depend on which dialect it speaks. Keying off the shell
+        // family rather than "did the user configure something" means picking
+        // `/bin/sh` explicitly behaves exactly like leaving the setting on its
+        // default, which is the only defensible reading of that choice.
+        let fallback_shell = match self.default_shell.snapshot().await {
+            Some(shell) => shell,
+            // No live settings shell: shell lines use this connection's
+            // launch snapshot, not a hardcoded platform shell.
+            None => self
+                .terminal_shell
+                .executable
+                .to_string_lossy()
+                .into_owned(),
+        };
+        // A structured ACP request normally names an executable plus argv, so
+        // preserve direct execution for it. Reconstructing argv as shell text
+        // needs shell-specific quoting, so argful requests never fall back.
+        let can_retry_through_shell = request.args.is_empty()
+            && (request.command.contains(char::is_whitespace)
+                || classify_shell_family(&fallback_shell).resolves_bare_builtins());
+        let spawned = crate::process::spawn_retrying_exec_busy(|| direct.spawn()).await;
+        let mut child = match spawned {
+            Ok(child) => child,
+            Err(err)
+                if matches!(
+                    err.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::InvalidFilename
+                ) && can_retry_through_shell =>
+            {
+                let mut shell = shell_wrapped_command(&fallback_shell, &request.command);
+                self.configure_command(&mut shell, &request);
+                crate::process::spawn_retrying_exec_busy(|| shell.spawn())
+                    .await
+                    .map_err(|err| TerminalRuntimeError::Spawn {
+                        code: "terminal_shell_spawn_failed",
+                        executable: fallback_shell.clone(),
+                        display_name: fallback_shell.clone(),
+                        mode: "shell_command_line",
+                        os_error: err.to_string(),
+                    })?
             }
-            ExecutionMode::ShellCommandLine => {
-                build_command_line(&self.terminal_shell, &request.command)
+            Err(err) => {
+                return Err(TerminalRuntimeError::Spawn {
+                    code: "terminal_program_spawn_failed",
+                    executable: request.command.clone(),
+                    display_name: self.terminal_shell.display_name.clone(),
+                    mode: "direct_program",
+                    os_error: err.to_string(),
+                });
             }
         };
-        self.configure_command(&mut command, &request);
-        command.kill_on_drop(true);
-
-        let mut child = crate::process::spawn_retrying_exec_busy(|| command.spawn())
-            .await
-            .map_err(|err| {
-                let (code, executable, mode_label) = match &mode {
-                    ExecutionMode::DirectProgram(program) => (
-                        "terminal_program_spawn_failed",
-                        program.display().to_string(),
-                        "direct_program",
-                    ),
-                    ExecutionMode::ShellCommandLine => (
-                        "terminal_shell_spawn_failed",
-                        self.terminal_shell.executable.display().to_string(),
-                        "shell_command_line",
-                    ),
-                };
-                TerminalRuntimeError::Spawn {
-                    code,
-                    executable,
-                    display_name: self.terminal_shell.display_name.clone(),
-                    mode: mode_label,
-                    os_error: err.to_string(),
-                }
-            })?;
 
         let stdout = child.stdout.take();
         let stderr = child.stderr.take();
@@ -831,7 +851,16 @@ impl TerminalRuntime {
         }
 
         if !handles.is_empty() {
-            terminal.reader_handles.lock().await.extend(handles);
+            // Without awaiting: from the spawn above to the owner below, this
+            // future must not yield — dropped there (its connection shutting
+            // down mid-request), it would drop `child`, which tokio does not
+            // kill. Nothing else holds this lock yet; its only other user is the
+            // owner task.
+            terminal
+                .reader_handles
+                .try_lock()
+                .expect("a new terminal's reader handles are not shared yet")
+                .extend(handles);
         }
 
         // Hand the child to its owner task only AFTER the reader handles are
@@ -840,10 +869,12 @@ impl TerminalRuntime {
         // list and leave the readers running past the published completion.
         tokio::spawn(own_terminal_process(terminal.clone(), child));
 
+        let unregistered = KillUnlessRegistered(Some(Arc::clone(&terminal)));
         self.terminals
             .lock()
             .await
             .insert(terminal_id.clone(), terminal);
+        unregistered.registered();
 
         Ok(CreateTerminalResponse::new(terminal_id))
     }
@@ -967,15 +998,22 @@ impl TerminalRuntime {
             removed
         };
 
-        // Kill concurrently. Sequentially, a session holding N terminals would
-        // cost up to N * KILL_REPORT_BUDGET to tear down, and this runs on the
-        // cancel path where the user is waiting.
-        futures::future::join_all(removed.into_iter().map(|terminal| async move {
-            if let Err(err) = terminal.kill_command().await {
-                tracing::error!("[ACP] Failed to release terminal during cleanup: {err:?}");
-            }
-        }))
-        .await;
+        kill_released(removed).await;
+    }
+
+    /// Kill every terminal still held here, whatever session it was started
+    /// for. For a connection that is ending: these are codeg's own children,
+    /// so ending the agent does not end them, and nothing else will once the
+    /// connection is gone.
+    pub async fn release_all(&self) {
+        let removed: Vec<_> = self
+            .terminals
+            .lock()
+            .await
+            .drain()
+            .map(|(_, terminal)| terminal)
+            .collect();
+        kill_released(removed).await;
     }
 
     pub async fn kill_all(&self) {
@@ -1038,6 +1076,57 @@ fn env_keys_equal(a: &str, b: &str) -> bool {
     {
         a == b
     }
+}
+
+/// Kills a new terminal if `create_terminal` is dropped before the terminal is
+/// in the map, which is where every later release looks for it — dropped, say,
+/// while waiting for the map as its connection shuts down mid-request. Its
+/// owner task does the killing, as for any other kill.
+struct KillUnlessRegistered(Option<Arc<TerminalInstance>>);
+
+impl KillUnlessRegistered {
+    fn registered(mut self) {
+        self.0 = None;
+    }
+}
+
+impl Drop for KillUnlessRegistered {
+    fn drop(&mut self) {
+        if let Some(terminal) = self.0.take() {
+            terminal.kill.notify_one();
+        }
+    }
+}
+
+/// Kill terminals taken out of the map, concurrently. Sequentially, N terminals
+/// would cost up to N * KILL_REPORT_BUDGET to tear down, and this runs on the
+/// cancel path where the user is waiting.
+async fn kill_released(removed: Vec<Arc<TerminalInstance>>) {
+    futures::future::join_all(removed.into_iter().map(|terminal| async move {
+        if let Err(err) = terminal.kill_command().await {
+            tracing::error!("[ACP] Failed to release terminal during cleanup: {err:?}");
+        }
+    }))
+    .await;
+}
+
+/// Wrap a command line through the configured shell. The agent's line is
+/// always a single argv element, never concatenated into a larger script.
+fn shell_wrapped_command(shell: &str, line: &str) -> tokio::process::Command {
+    let mut command = crate::process::tokio_command(shell);
+
+    match classify_shell_family(shell) {
+        ShellFamily::PowerShell => {
+            command.args(["-NoLogo", "-NoProfile", "-Command", line]);
+        }
+        ShellFamily::Cmd => {
+            command.args(["/D", "/S", "/C", line]);
+        }
+        ShellFamily::Posix => {
+            command.arg("-c").arg(line);
+        }
+    }
+    command
 }
 
 async fn read_stream<R>(mut reader: R, terminal: Arc<TerminalInstance>)
@@ -1344,6 +1433,52 @@ mod tests {
             .expect("get output");
         runtime.release_all_for_session(session_id.0.as_ref()).await;
         out.output
+    }
+
+    /// The shell handle is shared with a live connection, so changing General
+    /// Settings after the agent connects affects its next shell command.
+    ///
+    /// The configured shell is a script written just before it runs, so on
+    /// Linux it can hit a spurious `ETXTBSY` when a sibling test forks in that
+    /// window. The fallback spawn's retry keeps this deterministic — see
+    /// `shell_fallback_rides_out_a_transient_text_file_busy`.
+    #[tokio::test]
+    async fn shell_fallback_uses_the_live_selected_shell() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let shell = dir.path().join("selected-shell");
+        std::fs::write(
+            &shell,
+            "#!/bin/sh\nprintf '%s\\n' selected-shell\nexec /bin/sh \"$@\"\n",
+        )
+        .expect("write shell");
+        let mut permissions = std::fs::metadata(&shell)
+            .expect("shell metadata")
+            .permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&shell, permissions).expect("make shell executable");
+
+        let config = TerminalShellRuntimeConfig::new();
+        let runtime = TerminalRuntime::with_base_env(BTreeMap::new())
+            .with_default_shell_config(config.clone());
+        config.set(Some(shell.to_string_lossy().to_string())).await;
+
+        let session_id = SessionId::new("selected-shell".to_string());
+        let request = CreateTerminalRequest::new(
+            session_id.clone(),
+            "printf 'command-output\\n'".to_string(),
+        );
+        let output = run_and_capture(&runtime, &session_id, request).await;
+
+        assert!(
+            output.contains("selected-shell"),
+            "configured shell did not run; got:\n{output}"
+        );
+        assert!(
+            output.contains("command-output"),
+            "configured shell did not execute the command; got:\n{output}"
+        );
     }
 
     /// A `terminal/create` that omits `cwd` defaults to the runtime's
@@ -2007,6 +2142,101 @@ mod tests {
         );
     }
 
+    /// An ending connection ends every terminal it still holds, whatever
+    /// session each was started for — including the ones a handshake that
+    /// stopped early never got to release by session.
+    #[tokio::test]
+    async fn release_all_ends_every_terminal_whatever_its_session() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let runtime = Arc::new(TerminalRuntime::with_base_env(BTreeMap::new()));
+        let mut pids = Vec::new();
+        for session in ["first-session", "second-session"] {
+            let pid_file = dir.path().join(format!("{session}.pid"));
+            let command = format!("sh -c 'echo $$ > {}; exec sleep 120'", pid_file.display());
+            runtime
+                .create_terminal(CreateTerminalRequest::new(
+                    SessionId::new(session.to_string()),
+                    command,
+                ))
+                .await
+                .expect("create terminal");
+            let mut pid = None;
+            for _ in 0..200 {
+                pid = std::fs::read_to_string(&pid_file)
+                    .ok()
+                    .and_then(|raw| raw.trim().parse::<u32>().ok());
+                if pid.is_some() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+            pids.push(pid.expect("the terminal announced its pid"));
+        }
+        for &pid in &pids {
+            assert!(
+                pid_is_alive(pid),
+                "terminal process {pid} exited on its own"
+            );
+        }
+
+        runtime.release_all().await;
+
+        for pid in pids {
+            assert!(
+                wait_until_pid_gone(pid, Duration::from_secs(5)).await,
+                "terminal process {pid} outlived release_all"
+            );
+        }
+        assert!(runtime.terminals.lock().await.is_empty());
+    }
+
+    /// Until a new terminal is in the map, nothing that releases terminals can
+    /// find it. A `create_terminal` dropped while it waits to put it there — its
+    /// connection shutting down mid-request — must not leave the command
+    /// running for good.
+    #[tokio::test]
+    async fn a_terminal_whose_creation_is_dropped_before_registering_is_ended() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let pid_file = dir.path().join("terminal.pid");
+        let runtime = Arc::new(TerminalRuntime::with_base_env(BTreeMap::new()));
+        // Holding the map makes the creation wait right where it registers.
+        let map = runtime.terminals.lock().await;
+        let creating = tokio::spawn({
+            let runtime = Arc::clone(&runtime);
+            let command = format!("sh -c 'echo $$ > {}; exec sleep 120'", pid_file.display());
+            async move {
+                runtime
+                    .create_terminal(CreateTerminalRequest::new(
+                        SessionId::new("dropped-creation".to_string()),
+                        command,
+                    ))
+                    .await
+            }
+        });
+        let mut pid = None;
+        for _ in 0..200 {
+            pid = std::fs::read_to_string(&pid_file)
+                .ok()
+                .and_then(|raw| raw.trim().parse::<u32>().ok());
+            if pid.is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        let pid = pid.expect("the terminal announced its pid");
+        assert!(pid_is_alive(pid), "the command exited on its own");
+
+        creating.abort();
+        assert!(creating.await.is_err_and(|e| e.is_cancelled()));
+        drop(map);
+
+        assert!(
+            wait_until_pid_gone(pid, Duration::from_secs(10)).await,
+            "terminal process {pid} outlived its dropped creation"
+        );
+        assert!(runtime.terminals.lock().await.is_empty());
+    }
+
     /// Output is readable while the command is still running — the snapshot is
     /// not gated on the process finishing.
     #[tokio::test]
@@ -2122,6 +2352,56 @@ mod tests {
         assert!(
             output.contains("ran-after-busy"),
             "transient ETXTBSY was not retried; got:\n{output}"
+        );
+    }
+
+    /// The shell-fallback spawn rides out a transient `ETXTBSY` just like the
+    /// direct spawn. The configured shell is an executable too, and a shell
+    /// script written moments earlier is exposed to the same fork-inherited
+    /// write descriptor — the race that made
+    /// `shell_fallback_uses_the_live_selected_shell` fail on Linux CI.
+    ///
+    /// As above, Linux enforces `ETXTBSY` and macOS does not for script exec.
+    #[tokio::test]
+    async fn shell_fallback_rides_out_a_transient_text_file_busy() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let shell = dir.path().join("busy-shell");
+        std::fs::write(
+            &shell,
+            "#!/bin/sh\nprintf '%s\\n' busy-shell-ran\nexec /bin/sh \"$@\"\n",
+        )
+        .expect("write shell");
+        let mut perms = std::fs::metadata(&shell).expect("metadata").permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&shell, perms).expect("chmod");
+
+        let config = TerminalShellRuntimeConfig::new();
+        let runtime = TerminalRuntime::with_base_env(BTreeMap::new())
+            .with_default_shell_config(config.clone());
+        config.set(Some(shell.to_string_lossy().to_string())).await;
+
+        // Hold a write descriptor on the shell, then release it while the
+        // fallback spawn is still retrying.
+        let writer = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&shell)
+            .expect("hold write handle");
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            drop(writer);
+        });
+
+        let session_id = SessionId::new("busy-shell".to_string());
+        // A whole shell line: the direct exec fails with NotFound, so the
+        // configured shell is the spawn that has to ride out ETXTBSY.
+        let request =
+            CreateTerminalRequest::new(session_id.clone(), "printf 'line-ran\\n'".to_string());
+        let output = run_and_capture(&runtime, &session_id, request).await;
+        assert!(
+            output.contains("busy-shell-ran") && output.contains("line-ran"),
+            "transient ETXTBSY on the fallback shell was not retried; got:\n{output}"
         );
     }
 }

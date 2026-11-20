@@ -6991,6 +6991,7 @@ mod tests {
                 parent_conversation_id: parent.id,
                 parent_tool_use_id: format!("tu-{call_id}"),
                 delegation_call_id: call_id.into(),
+                assistant: None,
             }),
         )
         .await
@@ -8202,6 +8203,7 @@ mod tests {
                 parent_conversation_id: parent_a.id,
                 parent_tool_use_id: "tu-a".into(),
                 delegation_call_id: "6b8f8330-aaaa-4aaa-8aaa-aaaaaaaaaaaa".into(),
+                assistant: None,
             }),
         )
         .await
@@ -8217,6 +8219,7 @@ mod tests {
                 parent_tool_use_id: "tu-b".into(),
                 // Same 8-char prefix, different parent — must not collide.
                 delegation_call_id: "6b8f8330-bbbb-4bbb-8bbb-bbbbbbbbbbbb".into(),
+                assistant: None,
             }),
         )
         .await
@@ -9094,6 +9097,7 @@ mod tests {
                 parent_conversation_id: parent_id,
                 parent_tool_use_id: "tu-rp-2".into(),
                 delegation_call_id: "rp-2".into(),
+                assistant: None,
             }),
         )
         .await
@@ -9330,6 +9334,7 @@ mod tests {
                 parent_conversation_id: parent_id,
                 parent_tool_use_id: "tu-race-a".into(),
                 delegation_call_id: "race-a".into(),
+                assistant: None,
             }),
         )
         .await
@@ -9344,6 +9349,7 @@ mod tests {
                 parent_conversation_id: parent_id,
                 parent_tool_use_id: "tu-race-b".into(),
                 delegation_call_id: "race-b".into(),
+                assistant: None,
             }),
         )
         .await
@@ -9803,6 +9809,7 @@ mod tests {
                 parent_conversation_id: parent_id,
                 parent_tool_use_id: "tu-fence-b".into(),
                 delegation_call_id: "gen1-fence-b-4111-8111-111111111112".into(),
+                assistant: None,
             }),
         )
         .await
@@ -9893,6 +9900,7 @@ mod tests {
                 parent_conversation_id: parent_id,
                 parent_tool_use_id: "tu-run-2".into(),
                 delegation_call_id: "gen1-run-0002-4111-8111-111111111112".into(),
+                assistant: None,
             }),
         )
         .await
@@ -9958,6 +9966,7 @@ mod tests {
                 parent_conversation_id: parent_id,
                 parent_tool_use_id: "tu-est-2".into(),
                 delegation_call_id: "gen1-est-0002-4111-8111-111111111112".into(),
+                assistant: None,
             }),
         )
         .await
@@ -11566,6 +11575,7 @@ mod tests {
                 parent_conversation_id: parent_id,
                 parent_tool_use_id: "tu-continue-replacement-race".into(),
                 delegation_call_id: "continue-replacement-race-replacement".into(),
+                assistant: None,
             }),
         )
         .await
@@ -11648,6 +11658,7 @@ mod tests {
                 parent_conversation_id: parent_id,
                 parent_tool_use_id: "tu-replacement".into(),
                 delegation_call_id: "replacement-1".into(),
+                assistant: None,
             }),
         )
         .await
@@ -11692,6 +11703,7 @@ mod tests {
                 parent_conversation_id: parent_id,
                 parent_tool_use_id: "tu-replacement-retry".into(),
                 delegation_call_id: "replacement-retry".into(),
+                assistant: None,
             }),
         )
         .await
@@ -11728,6 +11740,7 @@ mod tests {
                 parent_conversation_id: parent_id,
                 parent_tool_use_id: "tu-replacement-second".into(),
                 delegation_call_id: "replacement-second".into(),
+                assistant: None,
             }),
         )
         .await
@@ -11940,6 +11953,7 @@ mod tests {
                 parent_conversation_id: parent_id,
                 parent_tool_use_id: tool.into(),
                 delegation_call_id: call_id.into(),
+                assistant: None,
             }),
         )
         .await
@@ -13458,6 +13472,7 @@ mod tests {
                 parent_conversation_id: parent_id,
                 parent_tool_use_id: "tu-pd-replacement".into(),
                 delegation_call_id: "pd-replacement-1".into(),
+                assistant: None,
             }),
         )
         .await
@@ -13526,6 +13541,7 @@ mod tests {
                 parent_conversation_id: parent_id,
                 parent_tool_use_id: "tu-bypass".into(),
                 delegation_call_id: "bypass-candidate".into(),
+                assistant: None,
             }),
         )
         .await
@@ -13546,6 +13562,7 @@ mod tests {
                 parent_conversation_id: parent_id,
                 parent_tool_use_id: "tu-never-running".into(),
                 delegation_call_id: "never-running".into(),
+                assistant: None,
             }),
         )
         .await
@@ -13576,6 +13593,7 @@ mod tests {
                 parent_conversation_id: parent_id,
                 parent_tool_use_id: "tu-never-running-retry".into(),
                 delegation_call_id: "never-running-retry".into(),
+                assistant: None,
             }),
         )
         .await
@@ -15810,6 +15828,7 @@ mod termination_audit {
                 parent_conversation_id: parent.id,
                 parent_tool_use_id: format!("tu-{task_id}"),
                 delegation_call_id: task_id.clone(),
+                assistant: None,
             }),
         )
         .await

@@ -908,6 +908,7 @@ vi.mock("@/contexts/acp-connections-context", async (importOriginal) => {
         }
       },
       getConnectPending: () => undefined,
+      getConnectError: () => undefined,
       getActiveKey: () => null,
       subscribeKey: () => () => undefined,
       subscribeActiveKey: () => () => undefined,
@@ -945,9 +946,12 @@ vi.mock("@/stores/app-workspace-store", () => {
   })
   // Match production Zustand: selector subscriptions re-render on notify +
   // getState() for delivery-time reads inside event callbacks.
-  const listeners = new Set<() => void>()
+  const listeners = new Set<
+    (next?: WorkspaceSlice, previous?: WorkspaceSlice) => void
+  >()
   surfaceH.notifyWorkspace = () => {
-    for (const listener of listeners) listener()
+    const slice = getWorkspaceSlice()
+    for (const listener of listeners) listener(slice, slice)
   }
   const useAppWorkspaceStore = Object.assign(
     (sel: (s: WorkspaceSlice) => unknown) => {

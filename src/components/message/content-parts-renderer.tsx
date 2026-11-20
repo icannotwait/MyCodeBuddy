@@ -1,3 +1,9 @@
+import { useCallback, useEffect, type RefObject } from "react"
+import { buildActivity } from "@/lib/activity/build-activity"
+import type { ActivityModel } from "@/lib/activity/types"
+import { useChatMotion } from "@/hooks/use-chat-motion"
+import { ActivityTimeline } from "./activity/activity-timeline"
+import type { ActivityFoot } from "./activity/timeline-foot"
 import {
   createContext,
   memo,
@@ -3593,7 +3599,13 @@ export const ContentPartsRenderer = memo(function ContentPartsRenderer(
         <GoalRunPart
           key={`goal-${keyId}`}
           part={part}
-          renderPart={(child, childKey) => renderPart(child, childKey, false)}
+          renderBody={() => (
+            <>
+              {part.items.map((item, idx) =>
+                renderPart(item, `${keyId}:${idx}`, false)
+              )}
+            </>
+          )}
         />
       )
     }
@@ -3654,9 +3666,375 @@ export const ContentPartsRenderer = memo(function ContentPartsRenderer(
     return null
   }
 
+  // Upstream draws an agent's tool activity as timeline rows. Prose that
+  // sits between those parts is a note on the same timeline. A turn that is
+  // only prose stays on the card renderer so autolink and Grok image scope
+  // keep their props. Tool groups, work units, and goal runs stay there too.
+  const hasProcessPart = parts.some((part) =>
+    TIMELINE_PART_TYPES.has(part.type)
+  )
+  if (
+    role !== "user" &&
+    role !== "system" &&
+    hasProcessPart &&
+    parts.every(
+      (part) => TIMELINE_PART_TYPES.has(part.type) || part.type === "text"
+    )
+  ) {
+    return <AssistantActivity parts={parts} isStreaming={isStreaming} />
+  }
+
   return (
     <div className="space-y-4">
       {parts.map((part, i) => renderPart(part, `${i}`, true))}
     </div>
+  )
+})
+
+const TIMELINE_PART_TYPES = new Set<AdaptedContentPart["type"]>([
+  "tool-call",
+  "tool-result",
+  "delegation-status-group",
+  "background-task-group",
+])
+
+const ActivityTextPart = memo(function TextPart({
+  text,
+  isUser = false,
+  isStreaming = false,
+  live = false,
+}: {
+  text: string
+  // User messages render as plain text + inline reference badges (no Markdown),
+  // matching the plain-text composer. Assistant / system text keeps full Markdown.
+  isUser?: boolean
+  isStreaming?: boolean
+  /** The prose the agent is writing right now: its words fade in. */
+  live?: boolean
+}) {
+  if (isUser) {
+    return (
+      <div className="break-words text-sm">
+        <PlainTextWithBadges text={text} />
+      </div>
+    )
+  }
+  return (
+    <ActivityAssistantText text={text} isStreaming={isStreaming} live={live} />
+  )
+})
+
+/**
+ * Assistant text, with its inline HTML previews:
+ * - explicit references — Codex's `visualize{…}` marker, Hermes'
+ *   `::preview{file=…}` — are cut out of the Markdown and rendered in place,
+ *   expanded;
+ * - any other local HTML file the reply mentions gets an on-demand "Preview"
+ *   row under it (not while streaming, so rows do not flicker in and out).
+ */
+function ActivityAssistantText({
+  text,
+  isStreaming,
+  live,
+}: {
+  text: string
+  isStreaming: boolean
+  live: boolean
+}) {
+  const segments = useMemo(
+    () => (hasCodexVisualizeRef(text) ? splitCodexVisualizeRefs(text) : null),
+    [text]
+  )
+  const mentions = useMemo(() => {
+    if (isStreaming) return []
+    const shown =
+      segments?.flatMap((s) => (s.kind === "visualize" ? [s.ref.path] : [])) ??
+      []
+    return findHtmlFileMentions(text, { exclude: shown })
+  }, [text, segments, isStreaming])
+
+  const hasInline = segments?.some((s) => s.kind === "visualize") ?? false
+  if (!hasInline && mentions.length === 0) {
+    return (
+      <ActivityMarkdownText text={text} isStreaming={isStreaming} live={live} />
+    )
+  }
+  return (
+    <div className="space-y-2">
+      {hasInline && segments ? (
+        segments.map((segment, index) =>
+          segment.kind === "visualize" ? (
+            <CodexVisualizeCard
+              key={`viz-${index}-${segment.ref.path}`}
+              path={segment.ref.path}
+              mode={segment.ref.mode}
+            />
+          ) : (
+            <ActivityMarkdownText
+              key={`md-${index}`}
+              text={segment.text}
+              isStreaming={isStreaming}
+              live={live && index === segments.length - 1}
+            />
+          )
+        )
+      ) : (
+        <ActivityMarkdownText
+          text={text}
+          isStreaming={isStreaming}
+          live={live}
+        />
+      )}
+      {mentions.length > 0 ? <HtmlFilePreviews paths={mentions} /> : null}
+    </div>
+  )
+}
+
+/**
+ * How the prose being written arrives: a character at a time, each fading in
+ * (globals.css, `[data-word-fade]`), a chunk's characters one after another so
+ * a burst of text flows in rather than landing at once. By character, not by
+ * word: a run of Chinese or Japanese has no spaces, and as one growing "word"
+ * it would never fade at all. Streamdown wraps each new character in a span
+ * and spaces their delays; the fade itself is ours, a transition from
+ * `@starting-style`, which a later render cannot cut short the way it re-times
+ * Streamdown's own keyframes.
+ */
+const LIVE_TEXT_ANIMATION = { sep: "char", stagger: 8 } as const
+
+/**
+ * Arms the fade a frame after the text mounts, so only characters that arrive
+ * after that fade in. Text that mounts already written — the prose being
+ * written, remounted as it moves onto or off the rail, or brought back by the
+ * virtual list — stays as it is instead of fading in all over again. (A
+ * starting style applies to an element's first style only: the characters
+ * already there were styled before the fade was armed.)
+ */
+function useFadeArmed(fade: boolean): boolean {
+  const [armed, setArmed] = useState(false)
+  const [wasFading, setWasFading] = useState(fade)
+  if (wasFading !== fade) {
+    setWasFading(fade)
+    if (!fade) setArmed(false)
+  }
+  useEffect(() => {
+    if (!fade || armed) return
+    const frame = requestAnimationFrame(() => setArmed(true))
+    return () => cancelAnimationFrame(frame)
+  }, [fade, armed])
+  return fade && armed
+}
+
+function ActivityMarkdownText({
+  text,
+  isStreaming,
+  live = false,
+}: {
+  text: string
+  isStreaming: boolean
+  live?: boolean
+}) {
+  const motion = useChatMotion()
+  const fade = live && isStreaming && motion
+  const armed = useFadeArmed(fade)
+  return (
+    <div
+      className='break-words text-sm prose prose-sm dark:prose-invert max-w-none [&_ul]:list-inside [&_ol]:list-inside [&_[data-streamdown="code-block-body"]]:max-h-96 [&_[data-streamdown="code-block-body"]]:overflow-auto'
+      data-word-fade={armed ? "" : undefined}
+    >
+      {/* An assistant reply's own text: the one place a ```spec fence may
+          render as a json-render card. */}
+      <JsonRenderScope>
+        <MessageResponse
+          mode={isStreaming ? "streaming" : "static"}
+          parseIncompleteMarkdown={isStreaming}
+          animated={fade ? LIVE_TEXT_ANIMATION : undefined}
+          isAnimating={fade}
+        >
+          {text}
+        </MessageResponse>
+      </JsonRenderScope>
+    </div>
+  )
+}
+
+// Codex Plan-mode `<proposed_plan>` block: free-form markdown plan document
+// rendered inside card chrome (distinct from the TodoWrite checklist).
+//
+// Renders through the SAME <PlanMarkdownCard> the live `plan_review` tool call
+// uses. The two carriers of a codex plan — this lifted block on reload, that
+// tool call live — previously had their own chrome, so the reloaded plan lost
+// the prose styling and the clamp/expand footer the live one had.
+const ActivityProposedPlanPart = memo(function ProposedPlanPart({
+  part,
+}: {
+  part: Extract<AdaptedContentPart, { type: "proposed-plan" }>
+}) {
+  const t = useTranslations("Folder.chat.proposedPlan")
+  return (
+    <PlanMarkdownCard
+      markdown={part.markdown.trim()}
+      label={t("title")}
+      emptyLabel={t("planning")}
+    />
+  )
+})
+
+type ActivityToolCallPart = Extract<AdaptedContentPart, { type: "tool-call" }>
+
+/**
+ * The tool call whose own card the timeline hosts on its rail: codex-acp's
+ * context compaction (tagged by `_meta.contextCompaction`, not by name).
+ */
+const ActivityHostedToolCall = memo(function HostedToolCall({
+  part,
+}: {
+  part: ActivityToolCallPart
+}) {
+  if (isContextCompactionMeta(part.meta)) {
+    return (
+      <ContextCompactionCard
+        state={part.state}
+        meta={part.meta}
+        summary={contextCompactionSummary(part.meta, part.output)}
+      />
+    )
+  }
+  return null
+})
+
+/**
+ * Draw one part outside the timeline's own rows. Module-level so the timeline
+ * can be handed it as its `renderPart`: the prose between steps, the reply's
+ * answer, the images and plans it shows in place, and the tool calls it hosts.
+ */
+function renderActivityPart(
+  part: AdaptedContentPart,
+  keyId: string,
+  role: MessageRole | undefined,
+  isStreaming: boolean,
+  live = false
+): ReactNode {
+  switch (part.type) {
+    case "text":
+      // An empty text part renders nothing but still earns a `space-y-4` gap
+      // below, which reads as a blank band inside the bubble. A user turn is
+      // final by the time it is rendered, so an empty one is always residue —
+      // never a stream that has not produced its first token yet, which is why
+      // this is scoped to `user` and assistant text is left to render as-is.
+      if (role === "user" && part.text.trim().length === 0) return null
+      return (
+        <ActivityTextPart
+          key={`text-${keyId}`}
+          text={part.text}
+          isUser={role === "user"}
+          isStreaming={isStreaming}
+          live={live}
+        />
+      )
+    case "tool-call":
+      return (
+        <ActivityHostedToolCall
+          key={`tc-${part.toolCallId ?? keyId}`}
+          part={part}
+        />
+      )
+    case "proposed-plan":
+      return (
+        <ActivityProposedPlanPart key={`proposed-plan-${keyId}`} part={part} />
+      )
+    case "generated-image":
+      return (
+        <GeneratedImagesBlock
+          key={`gimg-${keyId}`}
+          label={part.label}
+          revisedPrompt={part.revisedPrompt}
+          image={part.image}
+          status={part.status}
+        />
+      )
+    case "turn-error":
+      return (
+        <TurnErrorPart key={`turn-error-${keyId}`} message={part.message} />
+      )
+    default:
+      return null
+  }
+}
+
+function useAssistantRenderPart(isStreaming: boolean) {
+  return useCallback(
+    (part: AdaptedContentPart, key: string, live = false) =>
+      renderActivityPart(part, key, "assistant", isStreaming, live),
+    [isStreaming]
+  )
+}
+
+/** An agent's tool activity as its timeline, then any trailing answer. */
+const AssistantActivity = memo(function AssistantActivity({
+  parts,
+  isStreaming,
+}: {
+  parts: AdaptedContentPart[]
+  isStreaming: boolean
+}) {
+  const render = useAssistantRenderPart(isStreaming)
+  const model = useMemo(
+    () => buildActivity(parts, { isStreaming }),
+    [parts, isStreaming]
+  )
+  return (
+    <div className="space-y-4">
+      <ActivityTimeline
+        model={model}
+        isStreaming={isStreaming}
+        renderPart={render}
+      />
+      {model.answer.map((part, i) =>
+        render(
+          part,
+          `answer-${i}`,
+          isStreaming && i === model.answer.length - 1
+        )
+      )}
+    </div>
+  )
+})
+
+/**
+ * The activity timeline for an already-built model. `CompletedTurnContent`
+ * builds the model once for its header and hands it here for the body.
+ */
+export const ActivityParts = memo(function ActivityParts({
+  model,
+  isStreaming,
+  pinnedOnly = false,
+  foot,
+  headed = false,
+  revealRef,
+}: {
+  model: ActivityModel
+  isStreaming: boolean
+  /** Only the rows still running (see `ActivityTimeline`). */
+  pinnedOnly?: boolean
+  /** The capsule the rail ends on, which folds the reply's steps away (see
+   *  `ActivityTimeline`). */
+  foot?: ActivityFoot
+  /** Hung under the turn's header (see `ActivityTimeline`). */
+  headed?: boolean
+  /** Draws a step a long list has not (see `ActivityTimeline`). */
+  revealRef?: RefObject<((stepKey: string) => boolean) | null>
+}) {
+  const render = useAssistantRenderPart(isStreaming)
+  return (
+    <ActivityTimeline
+      model={model}
+      isStreaming={isStreaming}
+      renderPart={render}
+      pinnedOnly={pinnedOnly}
+      foot={foot}
+      headed={headed}
+      revealRef={revealRef}
+    />
   )
 })

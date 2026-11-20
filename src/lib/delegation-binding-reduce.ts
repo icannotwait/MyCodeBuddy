@@ -6,13 +6,14 @@
  * accepted (match or synthesize) so the provider can schedule detach safely.
  */
 
-import type {
-  AgentType,
-  AttentionRequestSummary,
-  CardSummary,
-  DelegationRuntimeStats,
-  EventEnvelope,
-  TaskObservation,
+import {
+  emptyRuntimeStats,
+  type AgentType,
+  type AttentionRequestSummary,
+  type CardSummary,
+  type DelegationRuntimeStats,
+  type EventEnvelope,
+  type TaskObservation,
 } from "@/lib/types"
 import { normalizeCardSummary } from "@/lib/delegation-run-snapshot"
 
@@ -146,6 +147,12 @@ export function applyDelegationEnvelope(
         return unchanged(prev)
       }
 
+      // A completion that arrives without a stats snapshot (a test fixture, or
+      // a broker that stamps identity only) keeps the binding's stats, or an
+      // empty table. Reading `runtime_stats.started_at` threw when the field
+      // was absent.
+      const stats =
+        envelope.runtime_stats ?? existing?.runtimeStats ?? emptyRuntimeStats()
       // Synthesize only when no binding exists (mid-flight mount / reconnect).
       const base: DelegationBinding = existing ?? {
         parentConnectionId: envelope.parent_connection_id,
@@ -156,8 +163,8 @@ export function applyDelegationEnvelope(
         status: "running",
         task: null,
         taskId: envelope.task_id,
-        startedAt: envelope.runtime_stats.started_at,
-        runtimeStats: envelope.runtime_stats,
+        startedAt: stats.started_at,
+        runtimeStats: stats,
       }
 
       const result = envelope.result
@@ -167,8 +174,8 @@ export function applyDelegationEnvelope(
               ...base,
               status: "ok",
               errorCode: undefined,
-              runtimeStats: envelope.runtime_stats,
-              finishedAt: envelope.runtime_stats.finished_at ?? null,
+              runtimeStats: stats,
+              finishedAt: stats.finished_at ?? null,
               completedDurationMs: result.duration_ms,
               attentionRequest: null,
               observation: null,
@@ -179,8 +186,8 @@ export function applyDelegationEnvelope(
               ...base,
               status: "err",
               errorCode: result.error_code,
-              runtimeStats: envelope.runtime_stats,
-              finishedAt: envelope.runtime_stats.finished_at ?? null,
+              runtimeStats: stats,
+              finishedAt: stats.finished_at ?? null,
               completedDurationMs: null,
               attentionRequest: null,
               observation: null,

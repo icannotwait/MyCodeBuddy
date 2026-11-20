@@ -10,7 +10,11 @@ import {
   useState,
 } from "react"
 import type { CSSProperties, ReactNode, RefObject } from "react"
-import { Virtualizer, type VirtualizerHandle } from "virtua"
+import {
+  Virtualizer,
+  type CustomContainerComponentProps,
+  type VirtualizerHandle,
+} from "virtua"
 import { useStickToBottomContext } from "use-stick-to-bottom"
 import { Loader2 } from "lucide-react"
 import {
@@ -34,6 +38,77 @@ import {
  * never scroll cannot auto-trigger a cascade of page loads.
  */
 const LOAD_OLDER_THRESHOLD_PX = 240
+
+/**
+ * How far below the viewport's top edge `onViewportTopChange` looks for the
+ * row on top: just inside it, so the row a jump aligned to the top
+ * (`scrollToIndex(…, { align: "start" })`) is the one reported.
+ */
+const VIEWPORT_TOP_PROBE_PX = 4
+
+/** Slack (px) under which the viewport counts as scrolled to the end. */
+const VIEWPORT_END_SLACK_PX = 2
+
+/** The loader row's place among the rows virtua draws (see `hasOlder`). */
+const LOAD_OLDER_ROW = Symbol("load-older-row")
+
+/** Room (rem, so it follows the app zoom) left above a part of a row that
+ *  `revealFromAbove` brings into view, so it does not land on the edge. */
+const REVEAL_ROOM_REM = 1
+
+/**
+ * The rows `keepMounted` holds near the end of the list: from the first one
+ * within the buffer above the viewport to the last — or none, while the end is
+ * more than a viewport below the view.
+ *
+ * Scrolling down, virtua drops the rows above the viewport and mounts them
+ * again once the scroll settles. A row that mounts at another height than it
+ * settles at — a clamped message before its toggle is measured, an image
+ * still loading — then resizes above the view twice, and the scroll
+ * correction for the pair can land a pixel off at a fractional zoom. Near the
+ * bottom the stick-to-bottom lock slides that pixel back down, which drops the
+ * rows again: the view shook up and down for as long as it rested there. Kept
+ * mounted near the end, the rows are not mounted again. Exported for unit
+ * tests.
+ */
+export function rowsKeptNearEnd(view: {
+  offset: number
+  viewportSize: number
+  scrollSize: number
+  bufferSize: number
+  findItemIndex: (offset: number) => number
+}): number | null {
+  if (view.offset + view.viewportSize * 2 < view.scrollSize) return null
+  return view.findItemIndex(Math.max(0, view.offset - view.bufferSize))
+}
+
+/**
+ * The virtualizer's container, without the `pointer-events: none` virtua puts
+ * on it while the list scrolls. The property is inherited, so turning it on as
+ * a scroll starts and off as it ends restyles everything the thread has drawn —
+ * in a reply with an opened timeline of hundreds of rows, a frame of hundreds
+ * of milliseconds each way. What it buys — rows under the pointer neither
+ * hover nor take a click while the list moves — is what any page does anyway.
+ */
+function ThreadContainer({
+  style,
+  children,
+  ref,
+}: CustomContainerComponentProps) {
+  return (
+    <div ref={ref} style={{ ...style, pointerEvents: undefined }}>
+      {children}
+    </div>
+  )
+}
+
+/** What `onViewportTopChange` reports. */
+export interface ViewportTop {
+  /** The `items` index of the row at the viewport's top. */
+  index: number
+  /** The viewport is scrolled to the end of the list. */
+  atEnd: boolean
+}
 
 /**
  * Keys the browser scrolls a focused viewport with. Modifiers don't matter:
@@ -132,6 +207,13 @@ interface VirtualizedMessageThreadProps<T> {
    */
   prependEpoch?: number
   prependScopeKey?: string | number
+  /**
+   * Told which row sits at the top of the viewport whenever that changes, and
+   * once on being passed — the message navigator highlights the message the
+   * transcript shows. Measured a frame after a scroll or an items change, so
+   * a fling costs a lookup per frame at most; omit it and nothing is measured.
+   */
+  onViewportTopChange?: (top: ViewportTop) => void
 }
 
 /**
@@ -173,6 +255,7 @@ function VirtualizedMessageThreadImpl<T>({
   loadingOlderLabel,
   prependEpoch = 0,
   prependScopeKey,
+  onViewportTopChange,
 }: VirtualizedMessageThreadProps<T>) {
   const { scrollRef, scrollToBottom, stopScroll, isAtBottom } =
     useStickToBottomContext()
@@ -199,13 +282,45 @@ function VirtualizedMessageThreadImpl<T>({
 
   const scrollToIndex = useCallback<MessageScrollContextValue["scrollToIndex"]>(
     (index, opts) => {
+      const handle = virtualizerHandleRef.current
+      if (!handle) return
+      const target = index + rowOffsetRef.current
       // Indices refer only to historical Virtua items — never the live footer.
-      virtualizerHandleRef.current?.scrollToIndex(
-        index + rowOffsetRef.current,
-        opts
-      )
+      // A jump up to a message leaves the bottom, so it releases the
+      // stick-to-bottom lock the way the user's own scroll would (see
+      // `EscapeLockOnUserScroll`). Left engaged, the lock scrolls back down
+      // on the next content growth, and it discards scroll events while a
+      // resize settles, so it never sees the jump: one made as content
+      // changes — the navigator paging history in, a reply streaming — was
+      // dragged straight back to the bottom. A jump that can't move up (to
+      // the message the view already rests on) keeps the lock, so a reply
+      // still streaming in stays followed.
+      if (handle.getItemOffset(target) < handle.scrollOffset) stopScroll()
+      handle.scrollToIndex(target, opts)
     },
-    []
+    [stopScroll]
+  )
+  // Up to a part of a row that is above the view — the header of a reply
+  // folding from the foot of its steps — with a little room above it. Like
+  // the jump above, it leaves the bottom and lets go of the lock first.
+  const revealFromAbove = useCallback<
+    MessageScrollContextValue["revealFromAbove"]
+  >(
+    (element) => {
+      const port = scrollRef.current
+      if (!port) return
+      const top =
+        element.getBoundingClientRect().top - port.getBoundingClientRect().top
+      // In view already, however close to the edge: left where it is.
+      if (top >= 0) return
+      const rem =
+        Number.parseFloat(
+          getComputedStyle(port.ownerDocument.documentElement).fontSize
+        ) || 16
+      stopScroll()
+      port.scrollTop += top - REVEAL_ROOM_REM * rem
+    },
+    [scrollRef, stopScroll]
   )
 
   // Render-local coordinator owned by the committed Context value — no shared
@@ -308,8 +423,9 @@ function VirtualizedMessageThreadImpl<T>({
     () => ({
       scrollToIndex,
       footerScroll: footerCoordinator ?? undefined,
+      revealFromAbove,
     }),
-    [scrollToIndex, footerCoordinator]
+    [scrollToIndex, footerCoordinator, revealFromAbove]
   )
 
   // Mirror the (stable) scroll handle into the caller-owned ref so a sibling
@@ -365,24 +481,127 @@ function VirtualizedMessageThreadImpl<T>({
   // post-commit so the scroll handler stays referentially stable across
   // streaming re-renders; scroll events only fire after commit.
   const loadOlderStateRef = useRef({ hasOlder, isLoadingOlder, onLoadOlder })
+  const viewportTopListenerRef = useRef(onViewportTopChange)
+  const itemsRef = useRef({ items, getItemKey })
   useEffect(() => {
     rowOffsetRef.current = rowOffset
     loadOlderStateRef.current = { hasOlder, isLoadingOlder, onLoadOlder }
+    viewportTopListenerRef.current = onViewportTopChange
+    itemsRef.current = { items, getItemKey }
   })
-  const prevScrollOffsetRef = useRef<number | null>(null)
-  const handleScroll = useCallback((offset: number) => {
-    const prev = prevScrollOffsetRef.current
-    prevScrollOffsetRef.current = offset
-    const s = loadOlderStateRef.current
-    if (!s.hasOlder || s.isLoadingOlder || !s.onLoadOlder) return
-    if (
-      offset < LOAD_OLDER_THRESHOLD_PX &&
-      prev !== null &&
-      prev >= LOAD_OLDER_THRESHOLD_PX
-    ) {
-      s.onLoadOlder()
-    }
+
+  // The row at the viewport's top, reported when it changes. Read a frame
+  // after whatever moved it, when virtua has laid the rows out.
+  const lastViewportTopRef = useRef<ViewportTop | null>(null)
+  const viewportTopFrameRef = useRef<number | null>(null)
+  const measureViewportTop = useCallback(() => {
+    viewportTopFrameRef.current = null
+    const report = viewportTopListenerRef.current
+    const handle = virtualizerHandleRef.current
+    if (!report || !handle) return
+    const offset = handle.scrollOffset
+    const index = Math.max(
+      0,
+      handle.findItemIndex(offset + VIEWPORT_TOP_PROBE_PX) -
+        rowOffsetRef.current
+    )
+    const atEnd =
+      offset + handle.viewportSize >= handle.scrollSize - VIEWPORT_END_SLACK_PX
+    const last = lastViewportTopRef.current
+    if (last && last.index === index && last.atEnd === atEnd) return
+    lastViewportTopRef.current = { index, atEnd }
+    report({ index, atEnd })
   }, [])
+  const scheduleViewportTop = useCallback(() => {
+    if (viewportTopFrameRef.current != null) return
+    if (!viewportTopListenerRef.current) return
+    viewportTopFrameRef.current = requestAnimationFrame(measureViewportTop)
+  }, [measureViewportTop])
+  useEffect(
+    () => () => {
+      if (viewportTopFrameRef.current != null) {
+        cancelAnimationFrame(viewportTopFrameRef.current)
+        viewportTopFrameRef.current = null
+      }
+    },
+    []
+  )
+  // A new listener hears where the view is without waiting for a scroll.
+  useEffect(() => {
+    lastViewportTopRef.current = null
+    if (onViewportTopChange) scheduleViewportTop()
+  }, [onViewportTopChange, scheduleViewportTop])
+  // Rows can move under a still viewport: history paged in above, a reply
+  // growing below.
+  useEffect(() => {
+    scheduleViewportTop()
+  }, [items, scheduleViewportTop])
+
+  // The first item `keepMounted` holds (see `rowsKeptNearEnd`), by key: an
+  // index would point elsewhere once history is paged in above it, or another
+  // conversation's items replace these.
+  const [keepFromKey, setKeepFromKey] = useState<string | null>(null)
+  const keepMounted = useMemo(() => {
+    if (keepFromKey === null) return undefined
+    for (let index = items.length - 1; index >= 0; index--) {
+      if (getItemKey(items[index]!, index) !== keepFromKey) continue
+      const rows: number[] = []
+      for (let row = index; row < items.length; row++) {
+        rows.push(row + rowOffset)
+      }
+      return rows
+    }
+    return undefined
+  }, [keepFromKey, items, getItemKey, rowOffset])
+
+  // Where the kept rows start with the view at `offset`.
+  const updateKeptRows = useCallback(
+    (offset: number) => {
+      const handle = virtualizerHandleRef.current
+      if (!handle) return
+      const row = rowsKeptNearEnd({
+        offset,
+        viewportSize: handle.viewportSize,
+        scrollSize: handle.scrollSize,
+        bufferSize,
+        findItemIndex: (at) => handle.findItemIndex(at),
+      })
+      const { items, getItemKey } = itemsRef.current
+      const index = row === null ? -1 : Math.max(0, row - rowOffsetRef.current)
+      const item = items[index]
+      const key = item === undefined ? null : getItemKey(item, index)
+      setKeepFromKey((current) => (current === key ? current : key))
+    },
+    [bufferSize]
+  )
+  // Rows appended under a still view move the end away from it. Read a frame
+  // later, once virtua has laid the rows out, like the viewport top.
+  useEffect(() => {
+    const frame = requestAnimationFrame(() =>
+      updateKeptRows(virtualizerHandleRef.current?.scrollOffset ?? 0)
+    )
+    return () => cancelAnimationFrame(frame)
+  }, [items, updateKeptRows])
+
+  const prevScrollOffsetRef = useRef<number | null>(null)
+  const handleScroll = useCallback(
+    (offset: number) => {
+      scheduleViewportTop()
+      updateKeptRows(offset)
+      const prev = prevScrollOffsetRef.current
+      prevScrollOffsetRef.current = offset
+      const s = loadOlderStateRef.current
+      if (!s.hasOlder || s.isLoadingOlder || !s.onLoadOlder) return
+      if (
+        offset < LOAD_OLDER_THRESHOLD_PX &&
+        prev !== null &&
+        prev >= LOAD_OLDER_THRESHOLD_PX
+      ) {
+        s.onLoadOlder()
+      }
+    },
+    [scheduleViewportTop, updateKeptRows]
+  )
 
   // Make the scroll viewport focusable so the browser's native keyboard
   // scrolling (Arrow keys, PageUp/PageDown, Home/End, Space) works — matching
@@ -475,6 +694,57 @@ function VirtualizedMessageThreadImpl<T>({
   }
 
   const showEmpty = items.length === 0 && footer == null
+  // The rows virtua draws, the loader first when there is one. Handed over as
+  // data with a function to draw one, so only the rows in view are drawn on a
+  // render — a reply streaming into a long thread re-renders the thread on
+  // every batch, and drawing every row of it each time only for virtua to
+  // drop all but the few on screen cost a pass over the whole thread.
+  const rows = useMemo<(T | typeof LOAD_OLDER_ROW)[]>(
+    () => (hasOlder ? [LOAD_OLDER_ROW, ...items] : items),
+    [hasOlder, items]
+  )
+  const total = items.length
+  const renderRow = (row: T | typeof LOAD_OLDER_ROW, index: number) => {
+    if (row === LOAD_OLDER_ROW) {
+      return (
+        <div key="load-older-row" style={styles.first}>
+          <div className={cn("mx-auto chat-content-w px-4", className)}>
+            <button
+              type="button"
+              onClick={isLoadingOlder ? undefined : onLoadOlder}
+              disabled={isLoadingOlder}
+              className="mx-auto flex items-center gap-2 rounded-full border border-border bg-muted/40 px-3 py-1 text-xs text-muted-foreground transition-colors hover:bg-muted disabled:cursor-default disabled:hover:bg-muted/40"
+            >
+              {isLoadingOlder ? (
+                <>
+                  <Loader2 className="h-3 w-3 animate-spin" />
+                  {loadingOlderLabel}
+                </>
+              ) : (
+                loadOlderLabel
+              )}
+            </button>
+          </div>
+        </div>
+      )
+    }
+    const itemIndex = index - rowOffset
+    return (
+      <div
+        key={getItemKey(row, itemIndex)}
+        style={itemStyle(itemIndex, total)}
+        // A long reply's steps, drawn a stretch at a time inside the row,
+        // leave keeping the view still to virtua once the row is above it
+        // (see `useTimelineWindow`).
+        data-thread-row=""
+        data-message-history-row=""
+      >
+        <div className={cn("mx-auto chat-content-w px-4", className)}>
+          {renderItem(row, itemIndex)}
+        </div>
+      </div>
+    )
+  }
 
   return (
     <MessageScrollProvider value={scrollContextValue}>
@@ -501,58 +771,18 @@ function VirtualizedMessageThreadImpl<T>({
             {items.length > 0 || hasOlder ? (
               <Virtualizer
                 ref={virtualizerHandleRef}
+                as={ThreadContainer}
                 scrollRef={
                   scrollRef as unknown as RefObject<HTMLElement | null>
                 }
                 itemSize={itemSize}
                 bufferSize={bufferSize}
                 shift={shift}
+                keepMounted={keepMounted}
                 onScroll={handleScroll}
-                startMargin={header ? 56 : 0}
+                data={rows}
               >
-                {[
-                  ...(hasOlder
-                    ? [
-                        <div key="load-older-row" style={styles.first}>
-                          <div
-                            className={cn(
-                              "mx-auto chat-content-w px-4",
-                              className
-                            )}
-                          >
-                            <button
-                              type="button"
-                              onClick={isLoadingOlder ? undefined : onLoadOlder}
-                              disabled={isLoadingOlder}
-                              className="mx-auto flex items-center gap-2 rounded-full border border-border bg-muted/40 px-3 py-1 text-xs text-muted-foreground transition-colors hover:bg-muted disabled:cursor-default disabled:hover:bg-muted/40"
-                            >
-                              {isLoadingOlder ? (
-                                <>
-                                  <Loader2 className="h-3 w-3 animate-spin" />
-                                  {loadingOlderLabel}
-                                </>
-                              ) : (
-                                loadOlderLabel
-                              )}
-                            </button>
-                          </div>
-                        </div>,
-                      ]
-                    : []),
-                  ...items.map((item, index) => (
-                    <div
-                      key={getItemKey(item, index)}
-                      style={itemStyle(index, items.length)}
-                      data-message-history-row
-                    >
-                      <div
-                        className={cn("mx-auto chat-content-w px-4", className)}
-                      >
-                        {renderItem(item, index)}
-                      </div>
-                    </div>
-                  )),
-                ]}
+                {renderRow}
               </Virtualizer>
             ) : null}
             {footer ? (

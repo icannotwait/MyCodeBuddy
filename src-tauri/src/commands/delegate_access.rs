@@ -404,6 +404,7 @@ mod tests {
                 parent_conversation_id: parent.id,
                 parent_tool_use_id: "tool-1".into(),
                 delegation_call_id: "task-1".into(),
+                assistant: None,
             }),
         )
         .await
@@ -542,6 +543,7 @@ mod tests {
                 parent_conversation_id: parent_id,
                 parent_tool_use_id: "tool-2".into(),
                 delegation_call_id: "task-2".into(),
+                assistant: None,
             }),
         )
         .await
@@ -959,6 +961,7 @@ mod tests {
                     ],
                     is_secret: false,
                     recovery: None,
+                    allow_other: true,
                 }],
             )
             .await

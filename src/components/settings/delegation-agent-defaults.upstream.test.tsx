@@ -1,18 +1,20 @@
-import { act, fireEvent, render, screen } from "@testing-library/react"
+import { act, fireEvent, render, screen, within } from "@testing-library/react"
 import { NextIntlClientProvider } from "next-intl"
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 
 import type {
+  AcpAgentInfo,
   AgentDelegationDefaults,
   AgentOptionsSnapshot,
   AgentType,
 } from "@/lib/types"
 
 const describeAgentOptions = vi.hoisted(() => vi.fn())
+const agents = vi.hoisted(() => ({ list: [] as AcpAgentInfo[] }))
 
 vi.mock("@/lib/api", () => ({ describeAgentOptions }))
 vi.mock("@/hooks/use-acp-agents", () => ({
-  useAcpAgents: () => ({ agents: [], fresh: true, refresh: () => {} }),
+  useAcpAgents: () => ({ agents: agents.list, fresh: true, refresh: () => {} }),
 }))
 
 import { DelegationAgentDefaultsPanel } from "./delegation-agent-defaults"
@@ -20,9 +22,29 @@ import enMessages from "@/i18n/messages/en.json"
 
 type Defaults = Partial<Record<AgentType, AgentDelegationDefaults>>
 
+function listedAgent(agentType: AgentType): AcpAgentInfo {
+  return {
+    agent_type: agentType,
+    name: agentType,
+    enabled: true,
+    available: true,
+    sort_order: 0,
+  } as AcpAgentInfo
+}
+
+/** Picks an agent with plain events, which a fake clock does not stall. */
+function chooseAgent(name: string) {
+  fireEvent.keyDown(screen.getByRole("combobox", { name: "Agent" }), {
+    key: "Enter",
+  })
+  fireEvent.click(
+    within(screen.getByRole("listbox")).getByRole("option", { name })
+  )
+}
+
 /** A probe answer whose effort default is named after `tag`, so the
- *  "Agent default: …" hint on screen says which answer is showing (MyCodeBuddy
- *  labels it with the option value, e.g. `<tag>-effort`). */
+ *  "Agent default: …" hint on screen says which answer is showing. The hint
+ *  uses the option's name (`<tag> effort`), not the stored value. */
 function answer(tag: string): AgentOptionsSnapshot {
   return {
     modes: null,
@@ -73,6 +95,7 @@ describe("DelegationAgentDefaultsPanel probes", () => {
   beforeEach(() => {
     vi.useFakeTimers()
     describeAgentOptions.mockReset()
+    agents.list = [listedAgent("claude_code"), listedAgent("codex")]
   })
 
   afterEach(() => {
@@ -98,7 +121,7 @@ describe("DelegationAgentDefaultsPanel probes", () => {
       model: first,
     })
     expect(
-      screen.getByText(`Agent default: ${first}-effort`)
+      screen.getByText(`Agent default: ${first} effort`)
     ).toBeInTheDocument()
 
     rerender(panel(saved(second)))
@@ -108,7 +131,7 @@ describe("DelegationAgentDefaultsPanel probes", () => {
       model: second,
     })
     expect(
-      screen.getByText(`Agent default: ${second}-effort`)
+      screen.getByText(`Agent default: ${second} effort`)
     ).toBeInTheDocument()
 
     // Back to a model probed moments ago: served from the cache, no new probe.
@@ -116,7 +139,7 @@ describe("DelegationAgentDefaultsPanel probes", () => {
     await settle()
     expect(describeAgentOptions).toHaveBeenCalledTimes(2)
     expect(
-      screen.getByText(`Agent default: ${first}-effort`)
+      screen.getByText(`Agent default: ${first} effort`)
     ).toBeInTheDocument()
   })
 
@@ -136,18 +159,18 @@ describe("DelegationAgentDefaultsPanel probes", () => {
     render(panel({ claude_code: { config_values: { model: claudeModel } } }))
     await settle()
     expect(
-      screen.getByText(`Agent default: ${claudeModel}-effort`)
+      screen.getByText(`Agent default: ${claudeModel} effort`)
     ).toBeInTheDocument()
 
     // Codex's probe is still running when the user goes back to Claude Code,
     // whose snapshot is cached.
-    fireEvent.click(screen.getByRole("tab", { name: "Codex" }))
+    chooseAgent("Codex")
     await settle()
     expect(describeAgentOptions).toHaveBeenLastCalledWith("codex", null, null)
-    fireEvent.click(screen.getByRole("tab", { name: "Claude Code" }))
+    chooseAgent("Claude Code")
     await settle()
     expect(
-      screen.getByText(`Agent default: ${claudeModel}-effort`)
+      screen.getByText(`Agent default: ${claudeModel} effort`)
     ).toBeInTheDocument()
 
     await act(async () => {
@@ -155,8 +178,8 @@ describe("DelegationAgentDefaultsPanel probes", () => {
       await vi.advanceTimersByTimeAsync(0)
     })
     expect(
-      screen.getByText(`Agent default: ${claudeModel}-effort`)
+      screen.getByText(`Agent default: ${claudeModel} effort`)
     ).toBeInTheDocument()
-    expect(screen.queryByText("Agent default: codex-effort")).toBeNull()
+    expect(screen.queryByText("Agent default: codex effort")).toBeNull()
   })
 })

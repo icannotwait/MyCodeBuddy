@@ -10,13 +10,30 @@ import {
 import type { ReactNode } from "react"
 
 import { AgentIcon } from "@/components/agent-icon"
+import { AssistantAvatar } from "@/components/assistants/assistant-avatar"
 import { type AgentType } from "@/lib/types"
 import { cn } from "@/lib/utils"
+import { useAssistant } from "@/stores/assistants-store"
 
 import { middleTruncateReferenceText } from "../reference-display"
 import type { ReferenceAttrs } from "../types"
 
 const ICON_CLASS = "size-3.5 shrink-0"
+/** `ICON_CLASS` in pixels, for the avatar, which takes a size. */
+const ICON_PX = 14
+
+/** An assistant's avatar, looked up by id in the store: its current look on
+ *  every badge, the generic glyph for an id this window does not know. */
+function AssistantReferenceIcon({ id, name }: { id: number; name: string }) {
+  const assistant = useAssistant(id)
+  return (
+    <AssistantAvatar
+      avatar={assistant?.avatar ?? null}
+      name={assistant?.name ?? name}
+      size={ICON_PX}
+    />
+  )
+}
 
 export function ReferenceIcon({
   data,
@@ -51,6 +68,14 @@ export function ReferenceIcon({
       )
       break
     }
+    case "assistant":
+      icon = (
+        <AssistantReferenceIcon
+          id={meta?.assistantId ?? Number(data.id)}
+          name={data.label}
+        />
+      )
+      break
     case "session":
       // The inline badge (composer + transcript) shows a neutral conversation
       // glyph: a session reference reads as "a conversation", not as the agent
@@ -107,6 +132,8 @@ function badgeColorClass(data: ReferenceAttrs): string {
     case "agent":
     case "delegation_profile":
       return "text-violet-700 dark:text-violet-400"
+    case "assistant":
+      return "text-teal-700 dark:text-teal-400"
     case "session":
       return "text-emerald-700 dark:text-emerald-400"
     case "commit":

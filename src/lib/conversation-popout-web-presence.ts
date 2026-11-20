@@ -115,6 +115,20 @@ function readRecord(conversationId: number): PresenceRecord | null {
   return record
 }
 
+/**
+ * Synchronous "a pop-out might already own this conversation".
+ *
+ * Callers that must not open a second main tab use this to decide whether
+ * they can insert the tab before the first await. No window handle and no
+ * presence record means the async ping cannot find an owner either.
+ */
+export function webPopoutMayOwn(conversationId: number): boolean {
+  if (conversationId <= 0) return false
+  const popup = windows.get(conversationId)
+  if (popup && !popup.closed) return true
+  return readRecord(conversationId) != null
+}
+
 function writeRecord(record: PresenceRecord): void {
   const file = readFile()
   file[String(record.conversationId)] = record

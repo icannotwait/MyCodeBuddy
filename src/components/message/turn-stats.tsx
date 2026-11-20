@@ -22,6 +22,7 @@ import {
 } from "@/components/ui/tooltip"
 import { useMessageScroll } from "@/components/message/message-scroll-context"
 import { useChatAnimationsEnabled } from "@/hooks/use-appearance"
+import { useArrivedOnCompletion } from "@/hooks/use-chat-motion"
 import { useModelLabel } from "@/components/message/model-label-context"
 import { useCreateTaskFromMessage } from "./use-create-task-from-message"
 import { formatElapsedLabel } from "@/lib/format-elapsed"
@@ -211,6 +212,8 @@ export function TurnStats({
     []
   )
 
+  const arrived = useArrivedOnCompletion(isResponseComplete)
+
   if (!isResponseComplete) return null
   if (
     !hasCopy &&
@@ -226,7 +229,12 @@ export function TurnStats({
     return null
 
   return (
-    <div className="mt-2 -ms-[0.3125rem] flex items-center justify-start gap-1 text-xs text-muted-foreground">
+    <div
+      className={cn(
+        "mt-2 -ms-[0.3125rem] flex items-center justify-start gap-1 text-xs text-muted-foreground",
+        arrived && "chat-enter"
+      )}
+    >
       <TooltipProvider delayDuration={150}>
         {hasCopy && (
           <Tooltip>

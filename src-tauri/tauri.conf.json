@@ -2,7 +2,7 @@
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "DrawCode",
   "mainBinaryName": "DrawCode",
-  "version": "0.35.1-mycodebuddy.1",
+  "version": "0.45.0-mycodebuddy.1",
   "identifier": "app.mycodebuddy",
   "build": {
     "beforeDevCommand": "pnpm tauri:before-dev",
@@ -12,7 +12,6 @@
   },
   "app": {
     "windows": [],
-    "macOSPrivateApi": true,
     "security": {
       "csp": null
     }
@@ -24,7 +23,9 @@
     "homepage": "https://github.com/icannotwait/MyCodeBuddy",
     "license": "Apache-2.0",
     "licenseFile": "../LICENSE",
-    "targets": ["nsis"],
+    "targets": [
+      "nsis"
+    ],
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",
@@ -38,7 +39,11 @@
       "../NOTICE": "licenses/NOTICE",
       "resources/THIRD_PARTY_LICENSES.txt": "licenses/THIRD_PARTY_LICENSES.txt"
     },
-    "externalBin": ["binaries/codeg-mcp", "binaries/codeg-computer-helper"],
+    "externalBin": [
+      "binaries/codeg-mcp",
+      "binaries/codeg-computer-helper",
+      "binaries/codeg-cli"
+    ],
     "windows": {
       "nsis": {
         "template": "./windows/installer.nsi",
@@ -57,7 +62,9 @@
   "plugins": {
     "deep-link": {
       "desktop": {
-        "schemes": ["codeg"]
+        "schemes": [
+          "codeg"
+        ]
       }
     },
     "updater": {
@@ -67,7 +74,8 @@
       ],
       "windows": {
         "installMode": "passive"
-      }
+      },
+      "requireSignedVersion": true
     }
   }
 }

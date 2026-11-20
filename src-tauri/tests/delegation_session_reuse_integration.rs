@@ -180,6 +180,7 @@ fn delegate_req_bound(
         admission_ticket: None,
         recovery_authorization_id: None,
         orchestration_binding,
+        assistant: None,
     }
 }
 
@@ -410,6 +411,7 @@ async fn seed_ticket_v1_dispatch_race(
             parent_conversation_id: req.parent_conversation_id,
             parent_tool_use_id: req.parent_tool_use_id.clone(),
             delegation_call_id: task_id.clone(),
+            assistant: None,
         }),
     )
     .await
@@ -604,6 +606,7 @@ async fn ticket_v1_lost_ack_adopts_first_continue_and_replacement_without_side_e
                 parent_conversation_id: parent.id,
                 parent_tool_use_id: case.original_correlation.into(),
                 delegation_call_id: case.task_id.into(),
+                assistant: None,
             }),
         )
         .await
@@ -3339,6 +3342,7 @@ async fn pre_admission_host_restart_allows_fresh_gen1_redispatch() {
             parent_conversation_id: parent.id,
             parent_tool_use_id: "tu-preadmit-fresh-source".into(),
             delegation_call_id: source_task_id.into(),
+            assistant: None,
         }),
     )
     .await
@@ -3462,6 +3466,7 @@ async fn pre_admission_host_restarted_reserving_inherits_and_allows_redispatch()
             parent_conversation_id: parent.id,
             parent_tool_use_id: "tu-preadmit-root".into(),
             delegation_call_id: root_task_id.into(),
+            assistant: None,
         }),
     )
     .await
@@ -3845,6 +3850,7 @@ async fn budget_race_allows_one_winner_for_final_unexpected_continue_slot() {
             parent_conversation_id: parent.id,
             parent_tool_use_id: "tu-budget-race-a".into(),
             delegation_call_id: "budget-race-a".into(),
+            assistant: None,
         }),
     )
     .await
@@ -3859,6 +3865,7 @@ async fn budget_race_allows_one_winner_for_final_unexpected_continue_slot() {
             parent_conversation_id: parent.id,
             parent_tool_use_id: "tu-budget-race-b".into(),
             delegation_call_id: "budget-race-b".into(),
+            assistant: None,
         }),
     )
     .await

@@ -1540,6 +1540,7 @@ mod tests {
                 parent_conversation_id: root.id,
                 parent_tool_use_id: "tool-1".into(),
                 delegation_call_id: "call-1".into(),
+                assistant: None,
             }),
         )
         .await
@@ -1613,6 +1614,7 @@ mod tests {
                 parent_conversation_id: regular.id,
                 parent_tool_use_id: "tu-enroll".into(),
                 delegation_call_id: "call-enroll".into(),
+                assistant: None,
             }),
         )
         .await

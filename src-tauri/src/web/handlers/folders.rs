@@ -409,24 +409,29 @@ pub async fn get_file_tree(
 #[serde(rename_all = "camelCase")]
 pub struct SearchWorkspaceFilesParams {
     pub path: String,
-    pub query: Option<String>,
+    pub query: String,
     pub limit: Option<usize>,
-    pub search_session_id: Option<String>,
-    pub request_id: Option<String>,
+    pub files_only: Option<bool>,
+    pub refresh: Option<bool>,
+    pub request: Option<crate::commands::workspace_file_search::SearchRequest>,
+    pub max_age_ms: Option<u64>,
 }
 
 pub async fn search_workspace_files(
     Json(params): Json<SearchWorkspaceFilesParams>,
-) -> Result<Json<folder_commands::WorkspaceFileSearchResult>, AppCommandError> {
-    let result = folder_commands::search_workspace_files(
-        params.path,
-        params.query,
-        params.limit,
-        params.search_session_id,
-        params.request_id,
-    )
-    .await?;
-    Ok(Json(result))
+) -> Result<Json<Vec<folder_commands::WorkspaceFileEntry>>, AppCommandError> {
+    Ok(Json(
+        crate::commands::workspace_file_search::search_workspace_files(
+            params.path,
+            params.query,
+            params.limit,
+            params.files_only,
+            params.refresh,
+            params.request,
+            params.max_age_ms,
+        )
+        .await?,
+    ))
 }
 
 #[derive(Deserialize)]
@@ -443,19 +448,22 @@ pub async fn list_workspace_files(
 }
 
 #[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct CancelWorkspaceFileSearchParams {
-    pub search_session_id: String,
-    pub request_id: String,
+    pub request: crate::commands::workspace_file_search::SearchRequest,
 }
 
 pub async fn cancel_workspace_file_search(
     Json(params): Json<CancelWorkspaceFileSearchParams>,
-) -> Result<Json<bool>, AppCommandError> {
-    Ok(Json(
-        folder_commands::cancel_workspace_file_search(params.search_session_id, params.request_id)
-            .await?,
-    ))
+) -> Result<Json<()>, AppCommandError> {
+    crate::commands::workspace_file_search::cancel_workspace_file_search(params.request).await?;
+    Ok(Json(()))
+}
+
+pub async fn prepare_workspace_file_search(
+    Json(params): Json<ListWorkspaceFilesParams>,
+) -> Json<()> {
+    crate::commands::workspace_file_search::prepare_workspace_file_search(params.path).await;
+    Json(())
 }
 
 #[derive(Deserialize)]

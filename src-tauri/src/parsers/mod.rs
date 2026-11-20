@@ -1,22 +1,27 @@
 pub mod acp_native;
+mod agent_env;
 pub mod antigravity;
 pub mod claude;
 pub mod cline;
 pub mod codebuddy;
 pub mod codex;
+mod codex_async_questions;
 pub mod codex_code_mode;
 mod codex_desktop_attachments;
+mod codex_file_citations;
 pub mod cursor;
 pub mod deepseek;
 pub mod gemini;
 pub mod grok;
 pub mod hermes;
 pub mod kimi_code;
+pub mod kiro;
 pub mod opencode;
 mod opencode_context_window;
 pub mod pi;
 pub mod qoder;
 mod summary_cache;
+mod trae_usage;
 
 use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -24,6 +29,8 @@ use std::path::PathBuf;
 use std::sync::OnceLock;
 
 use chrono::{DateTime, Utc};
+
+pub use agent_env::{AgentEnv, AgentEnvs};
 
 /// A root of external agent-CLI transcript data, archived under
 /// `external/<agent>/` by the optional "include conversation content" toggle.
@@ -179,8 +186,11 @@ pub(crate) fn external_transcript_sources_for_runtime_env(
             indexes: &[],
         },
         ExternalSource {
+            // The default file even when `$OPENCODE_DB` moves the database the
+            // history is read from: the archive keys this entry by file name,
+            // and only a `.db` name is snapshotted as SQLite.
             agent: "opencode",
-            root: opencode::resolve_opencode_base_dir().join("opencode.db"),
+            root: opencode::resolve_opencode_base_dir().join(opencode::OPENCODE_DB_FILE),
             is_file: true,
             sqlite: true,
             include_top: None,
@@ -320,6 +330,19 @@ pub(crate) fn external_transcript_sources_for_runtime_env(
             root: antigravity::resolve_antigravity_sessions_dir(),
             is_file: false,
             sqlite: true,
+            include_top: None,
+            indexes: &[],
+        },
+        ExternalSource {
+            // Kiro keeps each session as `<id>.jsonl` (event log) + `<id>.json`
+            // (metadata) under `<KIRO_HOME>/sessions/cli/` (default
+            // `~/.kiro/...`). The root is the `sessions/` subtree, never
+            // `<KIRO_HOME>` itself, whose `settings/`, `agents/` and MCP config
+            // are the user's configuration, not conversation content.
+            agent: "kiro",
+            root: kiro::resolve_kiro_sessions_root(),
+            is_file: false,
+            sqlite: false,
             include_top: None,
             indexes: &[],
         },
@@ -473,25 +496,40 @@ pub trait AgentParser {
 /// happens to know about it. `codeg-mcp` is injected into every MCP-capable
 /// agent, so the frame lands in each of their native transcripts; a per-parser
 /// fix would silently miss whichever parser was written next.
-pub fn build_agent_parser(agent_type: AgentType) -> Box<dyn AgentParser> {
+///
+/// `env` is the environment this agent is launched with — load it with
+/// `agent_setting_service::load_agent_env`. Each agent keeps its history where
+/// THAT environment points (`CLAUDE_CONFIG_DIR`, `CODEX_HOME`, …), and a
+/// relocation set in the agent's settings never reaches codeg's own process,
+/// so a parser handed [`AgentEnv::inherited`] instead reads the default
+/// directory while the agent writes elsewhere (#948).
+pub fn build_agent_parser(agent_type: AgentType, env: &AgentEnv) -> Box<dyn AgentParser> {
     let inner: Box<dyn AgentParser> = match agent_type {
-        AgentType::ClaudeCode => Box::new(claude::ClaudeParser::new()),
-        AgentType::Codex => Box::new(codex::CodexParser::new()),
-        AgentType::OpenCode => Box::new(opencode::OpenCodeParser::new()),
-        AgentType::Gemini => Box::new(gemini::GeminiParser::new()),
-        AgentType::Cline => Box::new(cline::ClineParser::new()),
-        AgentType::Hermes => Box::new(hermes::HermesParser::new()),
-        AgentType::CodeBuddy => Box::new(codebuddy::CodeBuddyParser::new()),
-        AgentType::KimiCode => Box::new(kimi_code::KimiCodeParser::new()),
-        AgentType::Pi => Box::new(pi::PiParser::new()),
-        AgentType::Grok => Box::new(grok::GrokParser::new()),
-        AgentType::Cursor => Box::new(cursor::CursorParser::new()),
-        AgentType::DeepSeek => Box::new(deepseek::DeepSeekParser::new()),
-        AgentType::Qoder => Box::new(qoder::QoderParser::new()),
-        AgentType::Antigravity => Box::new(antigravity::AntigravityParser::new()),
+        AgentType::ClaudeCode => Box::new(claude::ClaudeParser::for_env(env)),
+        AgentType::Codex => Box::new(codex::CodexParser::for_env(env)),
+        AgentType::OpenCode => Box::new(opencode::OpenCodeParser::for_env(env)),
+        AgentType::Gemini => Box::new(gemini::GeminiParser::for_env(env)),
+        AgentType::Cline => Box::new(cline::ClineParser::for_env(env)),
+        AgentType::Hermes => Box::new(hermes::HermesParser::for_env(env)),
+        AgentType::CodeBuddy => Box::new(codebuddy::CodeBuddyParser::for_env(env)),
+        AgentType::KimiCode => Box::new(kimi_code::KimiCodeParser::for_env(env)),
+        AgentType::Pi => Box::new(pi::PiParser::for_env(env)),
+        AgentType::Grok => Box::new(grok::GrokParser::for_env(env)),
+        AgentType::Cursor => Box::new(cursor::CursorParser::for_env(env)),
+        AgentType::DeepSeek => Box::new(deepseek::DeepSeekParser::for_env(env)),
+        AgentType::Qoder => Box::new(qoder::QoderParser::for_env(env)),
+        AgentType::Antigravity => Box::new(antigravity::AntigravityParser::for_env(env)),
+        AgentType::Kiro => Box::new(kiro::KiroParser::for_env(env)),
         // Custom ACP agents have no native store to reverse-engineer; their
-        // history is codeg's own ACP transcript.
-        AgentType::Custom(_) => Box::new(acp_native::AcpNativeParser::new(agent_type)),
+        // history is codeg's own ACP transcript. TRAE CLI takes the same route
+        // for message history, but AcpNativeParser enriches those turns from
+        // the precise token_usage_record rows in TRAE's native rollouts.
+        // Command Code's undocumented session tree remains ACP-only.
+        AgentType::Custom(_)
+        | AgentType::ZCode
+        | AgentType::Trae
+        | AgentType::CommandCode
+        | AgentType::MiniMaxCode => Box::new(acp_native::AcpNativeParser::for_env(agent_type, env)),
     };
     route_sanitized(inner)
 }
@@ -503,7 +541,10 @@ pub(crate) fn build_agent_parser_with_runtime_env(
     match agent_type {
         AgentType::DeepSeek => deepseek::DeepSeekParser::from_runtime_env(runtime_env)
             .map(|parser| route_sanitized(Box::new(parser))),
-        _ => Some(build_agent_parser(agent_type)),
+        _ => Some(build_agent_parser(
+            agent_type,
+            &AgentEnv::from_overrides(runtime_env.clone()),
+        )),
     }
 }
 
@@ -511,11 +552,19 @@ fn route_sanitized(inner: Box<dyn AgentParser>) -> Box<dyn AgentParser> {
     Box::new(RouteSanitized(inner))
 }
 
-/// Removes Codeg's internal `@agent` routing frame from whatever a parser read
-/// back out of an agent's own transcript.
+/// A parser wrapped the way [`build_agent_parser`] wraps every one, for tests
+/// that build their parser over a fixture directory.
+#[cfg(test)]
+pub(crate) fn sanitized(inner: impl AgentParser + 'static) -> Box<dyn AgentParser> {
+    Box::new(RouteSanitized(Box::new(inner)))
+}
+
+/// Removes Codeg's internal prompt frames — the `@agent` and `@assistant`
+/// routing frames and the assistant brief — from whatever a parser read back
+/// out of an agent's own transcript.
 ///
 /// Only complete frames that re-render byte-for-byte are touched (see
-/// [`crate::acp::agent_mentions::strip_internal_agent_routes`]), and the
+/// [`crate::acp::agent_mentions::strip_internal_frames`]), and the
 /// separator that opens one is scrubbed from every prompt at ingress, so
 /// look-alike user prose is never eligible. A BLOCK left with no content after
 /// stripping carried nothing but the frame and is dropped; a user turn left
@@ -644,17 +693,17 @@ fn sanitize_summary(summary: &mut ConversationSummary) {
 ///
 /// The trailing trim only runs when a frame WAS removed, and it is load-bearing
 /// for the agents that join a prompt's text blocks into one record with a blank
-/// line: `strip_internal_agent_routes` absorbs a single newline adjacent to the
+/// line: `strip_internal_frames` absorbs a single newline adjacent to the
 /// frame, so `"prose\n\n<frame>"` comes back as `"prose\n"` — which
 /// `whitespace-pre-wrap` paints as an extra blank line under the message. Text
 /// with no frame in it is never touched.
 fn sanitize_text(text: &mut String) -> bool {
     // Single scan short-circuit: history with no frame pays one memchr per
     // string, not a parse attempt.
-    if !crate::acp::agent_mentions::contains_internal_agent_routes(text) {
+    if !crate::acp::agent_mentions::contains_internal_frames(text) {
         return false;
     }
-    *text = crate::acp::agent_mentions::strip_internal_agent_routes(text);
+    *text = crate::acp::agent_mentions::strip_internal_frames(text);
     text.truncate(text.trim_end().len());
     true
 }
@@ -1350,8 +1399,12 @@ pub fn infer_context_window_max_tokens(model: Option<&str>) -> Option<u64> {
             // `effective_context_window_percent: 95`. gpt-6 shares that profile
             // byte for byte (see `resources/codex/bundled-catalog.json`), so it
             // rides the same lane rather than falling through to `None` and
-            // leaving those sessions with no context meter at all.
-            if normalized.starts_with("gpt-5") || normalized.starts_with("gpt-6") {
+            // leaving those sessions with no context meter at all. The one
+            // exception is GPT-6.1 Terra (codex 0.165): `context_window:
+            // 500000` at the same 95%.
+            if normalized.starts_with("gpt-6.1-terra") {
+                Some(475_000)
+            } else if normalized.starts_with("gpt-5") || normalized.starts_with("gpt-6") {
                 Some(258_000)
             } else if normalized.starts_with("gpt-4o")
                 || normalized.starts_with("gpt-4.1")
@@ -2126,7 +2179,7 @@ mod route_sanitizer_tests {
         let truncated = super::truncate_str(format!("hi{frame}").trim(), 80);
         assert!(
             truncated.contains('\u{001e}')
-                && !crate::acp::agent_mentions::contains_internal_agent_routes(&truncated),
+                && !crate::acp::agent_mentions::contains_internal_frames(&truncated),
             "fixture must straddle the frame, or it proves nothing"
         );
 
@@ -2336,6 +2389,52 @@ mod route_sanitizer_tests {
             detail.turns[0].blocks.as_slice(),
             [ContentBlock::Text { text }] if text == "real prompt"
         ));
+    }
+
+    /// A delegated assistant child's first prompt is the task plus the brief
+    /// frame. History shows the task alone — in its own block or joined into
+    /// the task's — the title carries no instruction text, and a record that
+    /// held only the brief is neither rendered nor counted.
+    #[test]
+    fn an_assistant_brief_never_surfaces_in_history() {
+        let task = "Review the diff in /repo and report findings";
+        let brief = crate::acp::agent_mentions::render_assistant_brief(
+            "Reviewer",
+            "Cite file and line.\n- Be terse",
+        )
+        .expect("brief");
+
+        let mut own_block = turn(TurnRole::User, task);
+        own_block.blocks.push(ContentBlock::Text {
+            text: brief.clone(),
+        });
+        let joined = turn(TurnRole::User, &format!("{task}\n\n{brief}"));
+        for user in [own_block, joined] {
+            let detail = sanitized(Fixture {
+                summary: summary(Some(&format!("{task} {brief}")[..120]), 2),
+                turns: vec![user, turn(TurnRole::Assistant, "found two issues")],
+            });
+            assert_eq!(detail.turns.len(), 2);
+            assert!(matches!(
+                detail.turns[0].blocks.as_slice(),
+                [ContentBlock::Text { text }] if text == task
+            ));
+            assert_eq!(detail.summary.message_count, 2);
+            let title = detail.summary.title.expect("title kept");
+            assert!(title.starts_with("Review the diff"));
+            assert!(!title.contains("codeg_internal") && !title.contains('\u{1e}'));
+        }
+
+        let detail = sanitized(Fixture {
+            summary: summary(Some(task), 3),
+            turns: vec![
+                turn(TurnRole::User, task),
+                turn(TurnRole::User, &brief),
+                turn(TurnRole::Assistant, "done"),
+            ],
+        });
+        assert_eq!(detail.turns.len(), 2, "the brief-only record is dropped");
+        assert_eq!(detail.summary.message_count, 2);
     }
 
     #[test]
@@ -2809,7 +2908,8 @@ earlier terminal context records.\n\
         );
         // Natively 1M models need no marker: Claude Code's baked catalog
         // (CLI 2.1.293) flags Opus from 4.7, Sonnet from 5, Haiku from 5.5 and
-        // every Fable and Mythos as `native_1m`.
+        // every Fable and Mythos as `native_1m` (CLI 2.1.321 adds Fable 5.2 and
+        // Mythos 5.2, both `native_1m`).
         for model in [
             "claude-haiku-5-5",
             "claude-sonnet-5",
@@ -2821,7 +2921,9 @@ earlier terminal context records.\n\
             "claude-opus-5-5",
             "claude-fable-5",
             "claude-fable-5-1",
+            "claude-fable-5-2",
             "claude-mythos-5-1",
+            "claude-mythos-5-2",
             "anthropic/claude-opus-4.7",
             "claude-opus-4-7@20260101",
         ] {
@@ -2892,6 +2994,19 @@ earlier terminal context records.\n\
         );
         assert_eq!(
             infer_context_window_max_tokens(Some("gpt-5.6-sol")),
+            Some(258_000)
+        );
+        // …bar GPT-6.1 Terra, whose catalog window is 500K at the same 95%.
+        assert_eq!(
+            infer_context_window_max_tokens(Some("gpt-6.1-terra")),
+            Some(475_000)
+        );
+        assert_eq!(
+            infer_context_window_max_tokens(Some("openai/gpt-6.1-terra")),
+            Some(475_000)
+        );
+        assert_eq!(
+            infer_context_window_max_tokens(Some("gpt-6.1-sol")),
             Some(258_000)
         );
         // Kimi's k3 family is the 1M lane; k2.x stays on 256K. The provider

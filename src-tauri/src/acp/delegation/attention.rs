@@ -1267,6 +1267,7 @@ mod tests {
                     parent_conversation_id: parent.id,
                     parent_tool_use_id: "tu-task-1".into(),
                     delegation_call_id: "task-1".into(),
+                    assistant: None,
                 }),
             )
             .await
@@ -1322,6 +1323,7 @@ mod tests {
                     parent_conversation_id: self.parent.id,
                     parent_tool_use_id: format!("tu-{task_id}"),
                     delegation_call_id: task_id.into(),
+                    assistant: None,
                 }),
             )
             .await
@@ -1815,6 +1817,7 @@ mod tests {
                     parent_conversation_id: parent.id,
                     parent_tool_use_id: format!("tu-{i}"),
                     delegation_call_id: task_id.clone(),
+                    assistant: None,
                 }),
             )
             .await

@@ -284,6 +284,7 @@ impl RecoveryAuthorizationService {
                     ],
                     is_secret: false,
                     recovery: Some(presentation),
+                    allow_other: false,
                 }];
                 let registration = match manager
                     .register_recovery_question(

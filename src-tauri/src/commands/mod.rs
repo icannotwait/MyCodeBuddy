@@ -1,6 +1,7 @@
 pub mod acp;
 #[cfg(feature = "tauri-runtime")]
 pub mod app_update;
+pub mod assistants;
 pub mod automation;
 pub mod background;
 pub mod backup;
@@ -12,10 +13,18 @@ pub mod browser_tools;
 pub mod canvas;
 pub mod chat_authoring;
 pub mod chat_channel;
+/// The `codeg-cli` access switch (desktop; the server's is a web handler).
+#[cfg(feature = "tauri-runtime")]
+pub mod cli_access;
 /// Files-onto-the-OS-clipboard. Only the command itself is desktop-gated; the
 /// path validation and URI encoding stay compiled in every mode so their tests
 /// run without the tauri stack.
 pub mod clipboard;
+/// Codex's model list: user saves through the commit coordinator, and the
+/// provider-list commands (both runtimes).
+pub mod codex_catalog;
+/// The ✨ commit message generator (both runtimes).
+pub mod commit_message;
 /// Computer use: sharing windows, the helper, the agent reads — the desktop
 /// app's, and codeg-server's where it is let share the screen it runs on.
 pub mod computer;
@@ -49,6 +58,10 @@ pub mod forge;
 pub mod generative_ui;
 pub mod grok_session_image;
 pub mod history_window;
+/// Folder commands set to run on the desktop's own machine ("Run on this
+/// computer"), even from a remote-desktop window. Desktop-only by design.
+#[cfg(feature = "tauri-runtime")]
+pub mod local_command;
 pub mod logging;
 pub mod mcp;
 pub mod mcp_service;
@@ -57,6 +70,9 @@ pub mod model_provider;
 pub mod notification;
 pub mod office_tools;
 pub mod open_in;
+/// OpenCode 2's provider credentials, through OpenCode's own API (both
+/// runtimes).
+pub mod opencode_credentials;
 pub mod pet;
 pub mod project_boot;
 pub mod question;
@@ -81,6 +97,10 @@ pub mod windows;
 pub mod work_task;
 pub mod workflow_completion;
 pub mod workflow_graph;
+pub mod workspace_file_search;
 pub mod workspace_state;
 #[cfg(feature = "tauri-runtime")]
 pub mod workspace_windows;
+/// What a removed worktree does to the workspace — shared by the branch
+/// selector's delete and the to-do task engine's cleanup.
+pub mod worktree_convergence;

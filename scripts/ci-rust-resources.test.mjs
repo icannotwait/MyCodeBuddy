@@ -10,7 +10,7 @@ const workflow = parse(
   )
 )
 
-test("Rust CI serializes desktop and small macOS builds without dropping targets", () => {
+test("Rust CI serializes desktop, server, and small macOS builds without dropping targets", () => {
   const rust = workflow.jobs.rust
   const matrix = rust.strategy.matrix
   assert.deepEqual(matrix.os, [
@@ -18,7 +18,7 @@ test("Rust CI serializes desktop and small macOS builds without dropping targets
     "macos-latest",
     "windows-latest",
   ])
-  assert.deepEqual(matrix.mode, ["desktop", "server"])
+  assert.deepEqual(matrix.mode, ["desktop", "server", "cli"])
 
   for (const os of matrix.os) {
     for (const mode of matrix.mode) {
@@ -30,7 +30,10 @@ test("Rust CI serializes desktop and small macOS builds without dropping targets
             (entry.mode === undefined || entry.mode === mode)
         )
       )
-      const expected = mode === "desktop" || os === "macos-latest" ? 1 : 4
+      // Server lib tests link one large binary. One rustc job keeps the
+      // 7 GiB Ubuntu runner from dropping the hosted connection.
+      const expected =
+        mode === "desktop" || mode === "server" || os === "macos-latest" ? 1 : 4
       assert.equal(settings.build_jobs ?? 4, expected, `${os} / ${mode}`)
     }
   }

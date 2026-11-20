@@ -318,7 +318,7 @@ describe("ConversationDetailPanel new conversation layout", () => {
     )
     // A backgrounded conversation tab behind the selected one.
     expect(panelSource).toContain(
-      "<OverlayHostHiddenProvider hidden={!canTileGroup && !visible}>"
+      "<OverlayHostHiddenProvider hidden={!visible}>"
     )
   })
 
@@ -434,12 +434,57 @@ describe("ConversationDetailPanel split-group render model", () => {
     expect(panelSource).not.toContain("<RenderGroupShell")
     expect(panelSource).not.toContain("<RenderTabWrapper")
     expect(panelSource).toContain("key={groupId}")
-    expect(panelSource).toContain("computeRects(groupLayout)")
+    expect(panelSource).toContain("computeRects(visibleLayout)")
+  })
+
+  // While tabs follow the folder, each folder has its own layout. A hidden
+  // tab must stay in its own view's shell, and the shells must keep one fixed
+  // order whatever folder is on screen: a switch that reparented a tab would
+  // remount it, and one that reordered the shells would move their nodes and
+  // reset every transcript inside.
+  it("keeps hidden tabs in their own view's shells, in a fixed order", () => {
+    expect(panelSource).toContain(": shellGroupOfTab(state, tab.id)")
+    expect(panelSource).toContain("[...tabsByGroup.keys()].sort()")
+  })
+
+  // A selected folder with nothing open is not a blank column: the panel says
+  // so and offers a first conversation, whether or not other folders have
+  // tabs, and the workspace keeps the strip (and its "+") up for it.
+  it("shows the empty-folder state instead of a blank column", () => {
+    expect(panelSource).toContain(
+      "return tabsFollowFolder ? <FolderTabsEmptyState /> : null"
+    )
+    expect(panelSource).toContain(
+      "{tabsFollowFolder && visibleTabs.length === 0 && ("
+    )
+    expect(workspaceLayoutSource).toContain(
+      "const showConvStrip = hasConvTabs || tabsFollowFolder"
+    )
+    expect(workspaceLayoutSource).toContain("{showConvStrip ? (")
+  })
+
+  // TileScrollContainer ignores mutations strictly inside a marked tile — that
+  // is what keeps a tiled group's streaming off its forced-layout path — which
+  // is only sound while the tile clips its content at a content-independent
+  // width. Pin the marker and that box together on the tile wrapper.
+  it("marks each tile wrapper for the tile scroller and keeps it clipping", () => {
+    const start = panelSource.indexOf("const renderTabWrapper = (")
+    const end = panelSource.indexOf("const renderGroupShell = (", start)
+    expect(start).toBeGreaterThan(-1)
+    expect(end).toBeGreaterThan(start)
+    const wrapper = panelSource.slice(start, end)
+    expect(wrapper).toContain('data-tile-scroll-item=""')
+    expect(wrapper).toContain(
+      '"relative h-full min-w-[24rem] flex-1 overflow-hidden"'
+    )
+    expect(panelSource).toMatch(
+      /<TileScrollContainer canTile=\{canTileG\}>[\s\S]*?renderTabWrapper\(tab, visualIndex, groupId, canTileG\)[\s\S]*?<\/TileScrollContainer>/
+    )
   })
 
   it("marks the active session whenever several are visible (split or tiled)", () => {
     expect(panelSource).toContain(
-      "showActiveFlow={(isSplit || canTileGroup) && active}"
+      "showActiveFlow={(isSplit || canTileG) && active}"
     )
   })
 
@@ -460,9 +505,9 @@ describe("ConversationDetailPanel split-group render model", () => {
   it("pairs every split group with its own title bar and gates the global one", () => {
     const shellStart = panelSource.indexOf("const renderGroupShell = (groupId")
     const shellBody = panelSource.slice(shellStart, shellStart + 6000)
-    expect(shellBody).toContain("{isSplit && selectedTab && (")
+    expect(shellBody).toContain("{isSplit && selTab && (")
     expect(shellBody).toContain("<ConversationDetailHeader")
-    expect(shellBody).toContain("tabId={selectedTab.id}")
+    expect(shellBody).toContain("tabId={selTab.id}")
     expect(panelSource).toContain("{!isSplit && activeTab && (")
   })
 
@@ -933,4 +978,16 @@ describe("ConversationDetailPanel session-load failure surface", () => {
       "detail?.summary.external_id ?? runtimeExternalId ?? undefined"
     )
   })
+})
+
+it("gates the no-tab draft creation effect on folder-tabs mode", () => {
+  // The no-tab seed stayed on the multi-tab shell when the session UI moved
+  // into ConversationSessionSurface.
+  const start = panelSource.indexOf("// Ensure no-tab state")
+  const end = panelSource.indexOf("const renderTabWrapper", start)
+  const effect = panelSource.slice(start, end)
+  expect(effect).toContain(
+    "shouldSeedConversation(useFolderTabsStore.getState().enabled, hasNoTabs)"
+  )
+  expect(effect).toContain("openNewConversationTab(")
 })

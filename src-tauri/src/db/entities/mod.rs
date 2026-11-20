@@ -1,5 +1,6 @@
 pub mod agent_setting;
 pub mod app_metadata;
+pub mod assistant;
 pub mod auto_title_job;
 pub mod automation;
 pub mod automation_run;
@@ -44,8 +45,10 @@ pub mod remote_workspace_connection;
 pub mod simple_workflow;
 pub mod token_usage_sync;
 pub mod token_usage_turn;
+pub mod tool_approval;
 pub mod turn_generation_stat;
 pub mod work_task;
 pub mod work_task_event;
 pub mod work_task_settings;
+pub mod work_task_source_key;
 pub mod work_task_template;

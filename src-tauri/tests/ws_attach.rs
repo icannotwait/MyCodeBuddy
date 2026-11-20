@@ -812,6 +812,8 @@ async fn ws_cold_attach_retains_watchdog_and_does_not_touch_activity_clocks() {
                 observation: Some(TaskObservation::Active),
                 last_agent_activity_at: Some(now),
                 stalled_since: None,
+                assistant_id: None,
+                assistant_name: None,
             },
         );
         s.tool_watchdog_projections.insert(

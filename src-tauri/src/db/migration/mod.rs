@@ -91,10 +91,70 @@ pub(crate) async fn install_for_historical_completion_fixture(
     .await?;
     m20260827_000001_delegation_dispatch_intent::install_for_historical_completion_fixture(db)
         .await?;
-    m20260829_000001_folder_group::install_for_historical_completion_fixture(db).await
+    m20260829_000001_folder_group::install_for_historical_completion_fixture(db).await?;
+    // Current conversation inserts write assistant and source columns that
+    // landed after the historical cutoff. Install them out of order and record
+    // them so a later full migrate does not add the columns twice.
+    install_later_conversation_columns(db).await
+}
+
+#[cfg(any(test, feature = "test-utils"))]
+async fn install_later_conversation_columns(
+    db: &crate::db::AppDatabase,
+) -> Result<(), sea_orm::DbErr> {
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    use sea_orm::{ConnectionTrait, DbBackend, Statement};
+
+    let manager = SchemaManager::new(&db.conn);
+    let applied_at = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time after Unix epoch")
+        .as_secs() as i64;
+    if !manager.has_column("conversation", "assistant_id").await? {
+        m20261016_000002_conversation_assistant::Migration
+            .up(&manager)
+            .await?;
+    }
+    db.conn
+        .execute(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            "INSERT OR IGNORE INTO seaql_migrations (version, applied_at) VALUES (?, ?)",
+            vec![
+                "m20261016_000002_conversation_assistant".into(),
+                applied_at.into(),
+            ],
+        ))
+        .await?;
+    if !manager.has_column("conversation", "source").await? {
+        m20261017_000002_conversation_source::Migration
+            .up(&manager)
+            .await?;
+    }
+    db.conn
+        .execute(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            "INSERT OR IGNORE INTO seaql_migrations (version, applied_at) VALUES (?, ?)",
+            vec![
+                "m20261017_000002_conversation_source".into(),
+                applied_at.into(),
+            ],
+        ))
+        .await?;
+    Ok(())
 }
 
 mod m20261006_000001_conversation_tag;
+mod m20261015_000001_kiro_builtin_agent;
+mod m20261015_000001_work_task_deferred_at;
+mod m20261016_000001_assistant;
+mod m20261016_000002_conversation_assistant;
+mod m20261017_000002_conversation_source;
+mod m20261020_000001_folder_command_run_local;
+mod m20261022_000001_tool_approval;
+mod m20261022_000001_work_task_delivery;
+mod m20261106_000001_work_task_source_key;
+mod m20261112_000001_work_task_writeback_drafts;
 pub struct Migrator;
 
 #[async_trait::async_trait]
@@ -126,9 +186,9 @@ impl MigratorTrait for Migrator {
             Box::new(m20260621_000001_automation::Migration),
             Box::new(m20260630_000001_conversation_parent_id_index::Migration),
             Box::new(m20260703_000001_chat_channel_thread_binding::Migration),
-            Box::new(m20260716_000001_conversation_awaiting_reply_token::Migration),
             Box::new(m20260716_000001_agent_show_thinking::Migration),
             Box::new(m20260716_000001_auto_title::Migration),
+            Box::new(m20260716_000001_conversation_awaiting_reply_token::Migration),
             Box::new(m20260716_000002_folder_last_agent::Migration),
             Box::new(m20260716_000003_delegation_route_reliability::Migration),
             Box::new(m20260717_000001_event_driven_delegation_join::Migration),
@@ -168,8 +228,8 @@ impl MigratorTrait for Migrator {
             Box::new(m20260817_000001_delegation_orchestration_bindings::Migration),
             Box::new(m20260817_000001_work_task_conversation_title::Migration),
             Box::new(m20260818_000001_work_task_source::Migration),
-            Box::new(m20260819_000001_work_task_completion_kind::Migration),
             Box::new(m20260819_000001_turn_generation_stat::Migration),
+            Box::new(m20260819_000001_work_task_completion_kind::Migration),
             Box::new(m20260825_000001_remote_workspace_connection_headers::Migration),
             Box::new(m20260827_000001_delegation_dispatch_intent::Migration),
             Box::new(m20260829_000001_folder_group::Migration),
@@ -178,9 +238,45 @@ impl MigratorTrait for Migrator {
             Box::new(m20260907_000001_canvas_node_path::Migration),
             Box::new(m20260929_000001_canvas_board::Migration),
             Box::new(m20260930_000001_agent_setting_drop_adapter_channel::Migration),
-            Box::new(m20261003_000001_simple_workflow_design_binding::Migration),
             Box::new(m20261003_000001_roundtable::Migration),
+            Box::new(m20261003_000001_simple_workflow_design_binding::Migration),
             Box::new(m20261006_000001_conversation_tag::Migration),
+            Box::new(m20261015_000001_kiro_builtin_agent::Migration),
+            Box::new(m20261015_000001_work_task_deferred_at::Migration),
+            Box::new(m20261016_000001_assistant::Migration),
+            Box::new(m20261016_000002_conversation_assistant::Migration),
+            Box::new(m20261017_000002_conversation_source::Migration),
+            Box::new(m20261020_000001_folder_command_run_local::Migration),
+            Box::new(m20261022_000001_tool_approval::Migration),
+            Box::new(m20261022_000001_work_task_delivery::Migration),
+            Box::new(m20261106_000001_work_task_source_key::Migration),
+            Box::new(m20261112_000001_work_task_writeback_drafts::Migration),
         ]
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use sea_orm_migration::MigratorTrait;
+
+    use crate::db::migration::Migrator;
+
+    /// A backup records the last migration here as its schema version, and a
+    /// build refuses a backup naming a migration it does not know. A new
+    /// migration listed ahead of a released one (an easy slip when a rebase
+    /// conflicts on this list) leaves the released name last, so that release
+    /// accepts the newer backup and then cannot start on the migration the
+    /// restore brought in. Names are dated when written, so name order keeps
+    /// the newest migration last. A new migration whose name sorts before a
+    /// released one needs a later name, not an earlier place in the list.
+    #[test]
+    fn migrations_are_listed_in_name_order() {
+        let names: Vec<String> = Migrator::migrations()
+            .iter()
+            .map(|m| m.name().to_string())
+            .collect();
+        let mut sorted = names.clone();
+        sorted.sort();
+        assert_eq!(names, sorted);
     }
 }
