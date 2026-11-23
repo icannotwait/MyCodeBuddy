@@ -1307,6 +1307,7 @@ export function FileTreeTab() {
     showIgnored,
     treeGeneration,
   })
+  // eslint-disable-next-line react-hooks/refs -- latest request config for the lazy loader, which runs outside render
   lazyRequestConfigRef.current = {
     rootPath: folder?.path ?? null,
     showIgnored,

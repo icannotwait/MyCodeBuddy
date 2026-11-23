@@ -3537,7 +3537,12 @@ pub async fn create_chat_conversation(
         delegation_route_override,
     )
     .await?;
-    emit_conversation_upsert(&EventEmitter::from_app(&app), &db.conn, result.conversation_id).await;
+    emit_conversation_upsert(
+        &EventEmitter::from_app(&app),
+        &db.conn,
+        result.conversation_id,
+    )
+    .await;
     Ok(result)
 }
 

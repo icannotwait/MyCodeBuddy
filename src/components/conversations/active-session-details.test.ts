@@ -3,7 +3,6 @@ import { shallow } from "zustand/shallow"
 
 import {
   pickModelFromTurns,
-  pickModelFromTurns,
   pickReasoningEffortFromTurns,
   projectRuntimeSessionDetails,
   resolveActiveSessionDetails,

@@ -503,14 +503,10 @@ fn an_entry_that_is_no_server_is_listed_with_the_reason() {
 fn listed_only_agents_are_read_and_never_written() {
     let sandbox = Sandbox::new();
     sandbox.write(
-        McpAppType::OpenClaw,
-        r#"{"mcp": {"servers": {"a": {"command": "a", "auth": "oauth"}}}}"#,
-    );
-    sandbox.write(
         McpAppType::Pi,
         r#"{"mcpServers": {"p": {"url": "https://p.test"}}}"#,
     );
-    for (app, key) in [(McpAppType::OpenClaw, "a"), (McpAppType::Pi, "p")] {
+    for (app, key) in [(McpAppType::Pi, "p")] {
         let agent = sandbox.agent(app);
         assert!(!agent.writable, "{app:?}");
         assert_eq!(agent.config.status, McpFileStatus::ReadOnly);

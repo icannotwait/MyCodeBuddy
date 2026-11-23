@@ -512,8 +512,14 @@ pub async fn mcp_upsert_local_server(
     shown_spec: Option<Value>,
     app: tauri::AppHandle,
 ) -> Result<LocalMcpServer, AppCommandError> {
-    mcp_upsert_local_server_core(&EventEmitter::from_app(&app), server_id, spec, apps, shown_spec)
-        .await
+    mcp_upsert_local_server_core(
+        &EventEmitter::from_app(&app),
+        server_id,
+        spec,
+        apps,
+        shown_spec,
+    )
+    .await
 }
 
 pub async fn mcp_upsert_local_server_core(

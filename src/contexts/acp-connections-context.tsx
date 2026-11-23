@@ -5929,7 +5929,15 @@ function prepareMappedEnvelope(
       // A verdict that the turn FAILED, or a prompt the agent rejected (no
       // code: the message is the agent's own), closes the turn with the
       // failure line (see `TURN_FAILED`); outside a turn the reducer ignores it.
-      if (isFailedTurnVerdict(e.code)) {
+      // A hook stop names the agent's reason, same as the live desktop path.
+      if (e.code === "turn_failed_empty_hook") {
+        actions.push({
+          type: "TURN_FAILED",
+          contextKey,
+          message: e.message,
+          fromAgent: true,
+        })
+      } else if (isFailedTurnVerdict(e.code)) {
         actions.push({
           type: "TURN_FAILED",
           contextKey,
@@ -11779,6 +11787,7 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
     },
     []
   )
+  // eslint-disable-next-line react-hooks/refs -- latest seeder for the snapshot path, which runs outside this render
   seedDelegationsFromSnapshotRef.current = seedDelegationsFromSnapshot
 
   const applyAcceptedEventEffects = useCallback(
@@ -12036,6 +12045,15 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
               : notice.title,
             description: notice.description,
           })
+          // An empty turn this notice accounts for ends on a verdict that
+          // restates it; that verdict takes this notification over.
+          if (notice.level !== "info") {
+            noteTurnNotice(
+              conn?.connectionId ?? event.connection_id,
+              notice.id,
+              notice.title
+            )
+          }
           break
         }
         case "config_option_rejected": {
@@ -12100,6 +12118,11 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
             notifyTurnFailure(connKey, {
               kind: "verdict",
               title: presented.text,
+              description: presented.reason,
+              explainedBy:
+                event.code === "turn_failed_empty_hook"
+                  ? event.message
+                  : undefined,
               evidence: presented.evidence,
               actions:
                 event.code === "turn_failed_auth_required" && signInAgentType
@@ -12171,6 +12194,7 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
       }
     },
     [
+      noteTurnNotice,
       notifyTurnFailure,
       rememberResolvedIdentity,
       retireTurnFailures,
@@ -12182,6 +12206,7 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
       vocabularyT,
     ]
   )
+  // eslint-disable-next-line react-hooks/refs -- latest event applier for the subscription callback
   applyAcceptedEventEffectsRef.current = applyAcceptedEventEffects
 
   // Present a snapshot's `last_error` the way the live `error` event would
@@ -12228,6 +12253,7 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
     },
     [t]
   )
+  // eslint-disable-next-line react-hooks/refs -- latest snapshot presenter for the subscription callback
   presentSnapshotPatchRef.current = presentSnapshotPatch
 
   // Open a Subscribe-with-Snapshot stream for `connectionId` and route its
@@ -12635,6 +12661,7 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
     },
     [dispatch, setupAttachSubscription]
   )
+  // eslint-disable-next-line react-hooks/refs -- latest retry for the attach timer, which fires after commit
   retryAttachRef.current = retryAttachNow
 
   const retryAttach = useCallback(

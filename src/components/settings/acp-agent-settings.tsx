@@ -6276,7 +6276,7 @@ export function AcpAgentSettings() {
       .finally(() => {
         setRemoveConfirmAgent(null)
       })
-  }, [handleRemoveCustomAgent, removeConfirmAgent])
+  }, [handleRemoveCustomAgent, removeConfirmAgent, setRemoveConfirmAgent])
 
   const confirmUninstall = useCallback(() => {
     if (!uninstallConfirmAgent) return
@@ -6288,7 +6288,7 @@ export function AcpAgentSettings() {
       .finally(() => {
         setUninstallConfirmAgent(null)
       })
-  }, [runUninstallAction, uninstallConfirmAgent])
+  }, [runUninstallAction, setUninstallConfirmAgent, uninstallConfirmAgent])
 
   const confirmCustomInstall = useCallback(() => {
     if (!customInstallAgent) return
@@ -6305,7 +6305,13 @@ export function AcpAgentSettings() {
       console.error("[Settings] custom install failed:", err)
     })
     setCustomInstallAgent(null)
-  }, [customInstallAgent, customVersionInput, runBinaryAction, runNpxAction])
+  }, [
+    customInstallAgent,
+    customVersionInput,
+    runBinaryAction,
+    runNpxAction,
+    setCustomInstallAgent,
+  ])
 
   // Custom install's path with the offered version filled in — the same clean
   // reinstall, never a fallback to the recommended version on failure.
@@ -6320,7 +6326,12 @@ export function AcpAgentSettings() {
       console.error("[Settings] upgrade to latest failed:", err)
     })
     setUpgradeLatestTarget(null)
-  }, [runBinaryAction, runNpxAction, upgradeLatestTarget])
+  }, [
+    runBinaryAction,
+    runNpxAction,
+    setUpgradeLatestTarget,
+    upgradeLatestTarget,
+  ])
 
   const persistReorder = useCallback(
     async (order: AgentType[]) => {
@@ -8013,6 +8024,8 @@ export function AcpAgentSettings() {
     openCodeDeleteProviderId,
     persistOpenCodeConfigNow,
     selectedAgent,
+    setOpenCodeCredentialBusy,
+    setOpenCodeDeleteProviderId,
     t,
   ])
 

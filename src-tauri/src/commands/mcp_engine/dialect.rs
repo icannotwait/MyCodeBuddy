@@ -56,7 +56,6 @@ fn family(app: McpAppType) -> Family {
     match app {
         McpAppType::ClaudeCode
         | McpAppType::CodeBuddy
-        | McpAppType::OpenClaw
         | McpAppType::Pi
         | McpAppType::DeepSeek
         | McpAppType::ZCode

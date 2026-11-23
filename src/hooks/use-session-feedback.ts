@@ -349,7 +349,10 @@ export function useSessionFeedback({
 
   // Close the dialog when access relocks so a stale open sheet cannot submit.
   useEffect(() => {
-    if (interactionLocked) setDialogOpen(false)
+    if (interactionLocked) {
+      // eslint-disable-next-line react-hooks/set-state-in-effect -- close a stale sheet when access relocks
+      setDialogOpen(false)
+    }
   }, [interactionLocked])
 
   // Converge the channel from a submit RESULT. Two signals:

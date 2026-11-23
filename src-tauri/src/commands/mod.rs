@@ -57,7 +57,6 @@ pub mod forge;
 /// The `ui-render` skill and the agents it is enabled for (Skill Packs > UI).
 pub mod generative_ui;
 pub mod grok_session_image;
-pub mod history_window;
 /// The Harness browse commands (Discover) and the SpaceRing image proxy
 /// (both runtimes).
 pub mod harness;
@@ -69,6 +68,7 @@ pub mod harness_mcp;
 pub mod harness_skills;
 /// The update check of what was installed from Harness (both runtimes).
 pub mod harness_updates;
+pub mod history_window;
 /// Folder commands set to run on the desktop's own machine ("Run on this
 /// computer"), even from a remote-desktop window. Desktop-only by design.
 #[cfg(feature = "tauri-runtime")]

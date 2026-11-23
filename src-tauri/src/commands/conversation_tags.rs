@@ -253,8 +253,14 @@ pub async fn update_conversation_tags(
     add: Vec<i32>,
     remove: Vec<i32>,
 ) -> Result<DbConversationSummary, AppCommandError> {
-    update_conversation_tags_core(&EventEmitter::from_app(&app), &db, conversation_id, add, remove)
-        .await
+    update_conversation_tags_core(
+        &EventEmitter::from_app(&app),
+        &db,
+        conversation_id,
+        add,
+        remove,
+    )
+    .await
 }
 
 #[cfg(feature = "tauri-runtime")]

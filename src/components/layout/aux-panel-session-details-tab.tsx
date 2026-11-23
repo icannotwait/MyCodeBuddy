@@ -61,8 +61,9 @@ export function SessionDetailsTab() {
         activeRuntimeId != null
           ? s.byConversationId.get(activeRuntimeId)
           : undefined
-      const { summary, model } = projectRuntimeSessionDetails(session)
-      return { summary, stats: null, model }
+      const { summary, model, reasoningEffort } =
+        projectRuntimeSessionDetails(session)
+      return { summary, stats: null, model, reasoningEffort }
     })
   )
   const conversations = useAppWorkspaceStore((s) => s.conversations)

@@ -2035,7 +2035,10 @@ describe("SidebarConversationList — time labels", () => {
       const firstCardCount = probes.card
 
       act(() => vi.advanceTimersByTime(MINUTE))
-      expect(rows()).toEqual(initial)
+      // Under ten hours the label keeps the minutes, so this tick changes
+      // the text and nothing else.
+      expect(rows().join(" ")).toContain("conv-411h59m")
+      expect(rows().join(" ")).toContain("conv-422d")
       expect(probes.card).toBe(firstCardCount)
       expect(probes.virtualizer).toBe(firstRenderCount)
 

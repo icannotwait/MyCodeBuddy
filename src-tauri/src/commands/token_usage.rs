@@ -1709,7 +1709,11 @@ mod tests {
                 Some(ts("2026-08-01T04:00:00Z")),
             ),
         );
-        let keys: Vec<&str> = report.series.iter().map(|p| p.bucket_key.as_str()).collect();
+        let keys: Vec<&str> = report
+            .series
+            .iter()
+            .map(|p| p.bucket_key.as_str())
+            .collect();
         assert_eq!(keys, ["2026-08-01T09", "2026-08-01T10", "2026-08-01T11"]);
         let tokens: Vec<u64> = report.series.iter().map(|p| p.total_tokens).collect();
         assert_eq!(tokens, [15, 0, 20]);
@@ -1720,13 +1724,20 @@ mod tests {
     #[test]
     fn hour_buckets_cross_local_midnight() {
         let labels = HashMap::new();
-        let rows = vec![row("2026-08-01T23:30:00Z", 10), row("2026-08-02T00:05:00Z", 20)];
+        let rows = vec![
+            row("2026-08-01T23:30:00Z", 10),
+            row("2026-08-02T00:05:00Z", 20),
+        ];
         let report = aggregate_report(
             &rows,
             &[],
             &opts(&labels, TokenUsageBucket::Hour, 0, None, None),
         );
-        let keys: Vec<&str> = report.series.iter().map(|p| p.bucket_key.as_str()).collect();
+        let keys: Vec<&str> = report
+            .series
+            .iter()
+            .map(|p| p.bucket_key.as_str())
+            .collect();
         assert_eq!(keys, ["2026-08-01T23", "2026-08-02T00"]);
     }
 

@@ -30,7 +30,6 @@ const APP_ORDER: Record<McpAppType, number> = {
   claude_code: 0,
   codex: 1,
   gemini: 2,
-  open_claw: 3,
   open_code: 4,
   cline: 5,
   hermes: 6,

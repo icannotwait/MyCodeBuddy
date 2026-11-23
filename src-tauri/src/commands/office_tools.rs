@@ -19,9 +19,9 @@ use std::time::Duration;
 use serde::Serialize;
 use tokio::sync::Mutex;
 
+use crate::app_error::AppCommandError;
 use crate::commands::acp::{resolve_command_on_path, skill_storage_spec, validate_skill_id};
 use crate::commands::experts::{central_experts_dir, ExpertInstallStatus, LinkOp, LinkOpResult};
-use crate::app_error::AppCommandError;
 use crate::commands::folders::resolve_tree_path;
 use crate::models::agent::AgentType;
 use crate::process::{collect_lines_lossy, tokio_command};
@@ -950,7 +950,9 @@ pub async fn officecli_uninstall_core(
 
     let ctx = SkillsCtx::user();
     let skills_guard = ctx.lock().await.map_err(|e| {
-        OfficeToolsError::Io(format!("binary removed but its skills were left in place: {e}"))
+        OfficeToolsError::Io(format!(
+            "binary removed but its skills were left in place: {e}"
+        ))
     })?;
     let task_ctx = ctx.clone();
     let (agents, cleanup_errors) = tokio::task::spawn_blocking(move || {
@@ -1151,7 +1153,9 @@ pub async fn officecli_sync_skills_core(
 
 #[cfg(feature = "tauri-runtime")]
 #[tauri::command]
-pub async fn officecli_sync_skills(app: tauri::AppHandle) -> Result<SkillSyncReport, OfficeToolsError> {
+pub async fn officecli_sync_skills(
+    app: tauri::AppHandle,
+) -> Result<SkillSyncReport, OfficeToolsError> {
     officecli_sync_skills_core(&EventEmitter::from_app(&app)).await
 }
 

@@ -263,12 +263,15 @@ function VirtualizedMessageThreadImpl<T>({
   const footerShellRef = useRef<HTMLDivElement | null>(null)
   const scrollToBottomRef = useRef(scrollToBottom)
   const stopScrollRef = useRef(stopScroll)
+  // eslint-disable-next-line react-hooks/refs -- latest scroll callbacks for handlers that run after commit
   scrollToBottomRef.current = scrollToBottom
+  // eslint-disable-next-line react-hooks/refs -- latest scroll callbacks for handlers that run after commit
   stopScrollRef.current = stopScroll
   const hasFooter = footer != null
   // Seed follow intent once when footer appears (not on every re-render).
   const initialFollowRef = useRef(true)
   if (!hasFooter) {
+    // eslint-disable-next-line react-hooks/refs -- re-arm follow intent when the live footer leaves the thread
     initialFollowRef.current = true
   }
 
@@ -328,13 +331,17 @@ function VirtualizedMessageThreadImpl<T>({
   // isAtBottom churn does not recreate the coordinator every frame.
   const footerCoordinator = useMemo<LiveFooterScrollCoordinator | null>(() => {
     if (!hasFooter) return null
+    // eslint-disable-next-line react-hooks/refs -- seed the coordinator from the committed scroller; scroll runs after commit
     const el = scrollRef.current
-    const initiallyFollowing =
-      typeof isAtBottom === "boolean"
-        ? isAtBottom
-        : el
-          ? isAtBottomElement(el)
-          : initialFollowRef.current
+    let initiallyFollowing = false
+    if (typeof isAtBottom === "boolean") {
+      initiallyFollowing = isAtBottom
+    } else if (el) {
+      initiallyFollowing = isAtBottomElement(el)
+    } else {
+      // eslint-disable-next-line react-hooks/refs -- follow intent captured for this committed frame
+      initiallyFollowing = initialFollowRef.current
+    }
     return createLiveFooterScrollCoordinator({
       scrollToBottom: (opts) => {
         void scrollToBottomRef.current(opts)

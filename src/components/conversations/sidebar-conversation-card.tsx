@@ -355,13 +355,16 @@ export const SidebarConversationCard = memo(function SidebarConversationCard({
   // subscription — and a re-render on every tab switch — to each of them for a
   // value only the context menu reads. This snapshot drives the DISABLED STATE
   // only; the click re-resolves (see `handleAttachToSession`).
-  const handleMenuOpenChange = useCallback((open: boolean) => {
-    if (!open) return
-    // The context menu takes the row over; drop the details bubble so the two
-    // don't stack on the same spot.
-    setHoverOpen(false)
-    setAttachTabId(resolveAttachTabId())
-  }, [])
+  const handleMenuOpenChange = useCallback(
+    (open: boolean) => {
+      if (!open) return
+      // The context menu takes the row over; drop the details bubble so the two
+      // don't stack on the same spot.
+      setHoverOpen(false)
+      setAttachTabId(resolveAttachTabId())
+    },
+    [setAttachTabId, setHoverOpen]
+  )
 
   // See `isKeyboardFocus`: suppress Radix's open-on-focus unless the focus
   // really came from the keyboard, so clicking a row doesn't pop the bubble.
@@ -384,7 +387,7 @@ export const SidebarConversationCard = memo(function SidebarConversationCard({
   const handleRenameOpen = useCallback(() => {
     setRenameValue(conversation.title || "")
     setRenameOpen(true)
-  }, [conversation.title])
+  }, [conversation.title, setRenameOpen, setRenameValue])
 
   const handleRenameConfirm = useCallback(async () => {
     const trimmed = renameValue.trim()
@@ -398,7 +401,14 @@ export const SidebarConversationCard = memo(function SidebarConversationCard({
       }
     }
     setRenameOpen(false)
-  }, [renameValue, conversation.id, conversation.title, onRename, t])
+  }, [
+    renameValue,
+    conversation.id,
+    conversation.title,
+    onRename,
+    setRenameOpen,
+    t,
+  ])
 
   const handleDeleteConfirm = useCallback(async () => {
     if (deleteInFlight.current) return
@@ -423,6 +433,8 @@ export const SidebarConversationCard = memo(function SidebarConversationCard({
     conversation.agent_type,
     conversation.folder_id,
     onDelete,
+    setDeleteOpen,
+    setIsDeleting,
     t,
   ])
 

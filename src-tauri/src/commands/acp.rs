@@ -14794,10 +14794,7 @@ pub(crate) async fn acp_install_uv_tool_core(
 
 #[cfg(feature = "tauri-runtime")]
 #[cfg_attr(feature = "tauri-runtime", tauri::command)]
-pub async fn acp_install_uv_tool(
-    task_id: String,
-    app: tauri::AppHandle,
-) -> Result<(), AcpError> {
+pub async fn acp_install_uv_tool(task_id: String, app: tauri::AppHandle) -> Result<(), AcpError> {
     let emitter = EventEmitter::from_app(&app);
     acp_install_uv_tool_core(task_id, &emitter).await
 }
@@ -15358,10 +15355,7 @@ pub(crate) async fn acp_install_pi_binary_core(
 
 #[cfg(feature = "tauri-runtime")]
 #[cfg_attr(feature = "tauri-runtime", tauri::command)]
-pub async fn acp_install_pi_binary(
-    task_id: String,
-    app: tauri::AppHandle,
-) -> Result<(), AcpError> {
+pub async fn acp_install_pi_binary(task_id: String, app: tauri::AppHandle) -> Result<(), AcpError> {
     let emitter = EventEmitter::from_app(&app);
     acp_install_pi_binary_core(task_id, &emitter).await
 }
@@ -15627,11 +15621,7 @@ pub async fn acp_read_agent_skill(
 }
 
 /// A Skills page error with its stable code.
-fn skill_page_error(
-    base: AppCommandError,
-    code: &str,
-    detail: Option<String>,
-) -> AppCommandError {
+fn skill_page_error(base: AppCommandError, code: &str, detail: Option<String>) -> AppCommandError {
     crate::skills::coded_error(base, code, detail)
 }
 
@@ -15815,7 +15805,13 @@ pub(crate) async fn acp_save_agent_skill_core(
     let ctx = crate::skills::SkillsCtx::user();
     // Checked now (an unsupported agent, a bad id), and worked out again
     // under the lock.
-    skill_page_dirs(&ctx, agent_type, scope, &skill_id, workspace_path.as_deref())?;
+    skill_page_dirs(
+        &ctx,
+        agent_type,
+        scope,
+        &skill_id,
+        workspace_path.as_deref(),
+    )?;
     let id = skill_id.clone();
     let target = move || {
         skill_page_dirs(
@@ -15827,15 +15823,7 @@ pub(crate) async fn acp_save_agent_skill_core(
         )
     };
     acp_save_agent_skill_in(
-        &ctx,
-        emitter,
-        agent_type,
-        scope,
-        skill_id,
-        content,
-        &target,
-        layout,
-        create,
+        &ctx, emitter, agent_type, scope, skill_id, content, &target, layout, create,
     )
     .await
 }
@@ -16063,7 +16051,13 @@ pub(crate) async fn acp_delete_agent_skill_core(
 ) -> Result<SkillPageDeleteResult, AppCommandError> {
     let ctx = crate::skills::SkillsCtx::user();
     // Checked now, and worked out again under the lock.
-    skill_page_dirs(&ctx, agent_type, scope, &skill_id, workspace_path.as_deref())?;
+    skill_page_dirs(
+        &ctx,
+        agent_type,
+        scope,
+        &skill_id,
+        workspace_path.as_deref(),
+    )?;
     let id = skill_id.clone();
     let target = move || {
         skill_page_dirs(
@@ -16662,77 +16656,81 @@ mod opencode_skills_tests {
                 ("USERPROFILE", Some(home.as_path())),
             ],
             async {
-            write_skill(&workspace.join(".opencode/skills"), "bundle", "a bundle");
-            fs::create_dir_all(workspace.join(".opencode/skill")).unwrap();
-            fs::write(workspace.join(".opencode/skill/flat.md"), "a flat file").unwrap();
-            write_skill(&workspace.join(".agents/skills"), "shared", "shared");
-            let ws = workspace.to_string_lossy().into_owned();
+                write_skill(&workspace.join(".opencode/skills"), "bundle", "a bundle");
+                fs::create_dir_all(workspace.join(".opencode/skill")).unwrap();
+                fs::write(workspace.join(".opencode/skill/flat.md"), "a flat file").unwrap();
+                write_skill(&workspace.join(".agents/skills"), "shared", "shared");
+                let ws = workspace.to_string_lossy().into_owned();
 
-            let dirs = scoped_skill_dirs(AgentType::OpenCode, AgentSkillScope::Project, Some(&ws))
+                let dirs =
+                    scoped_skill_dirs(AgentType::OpenCode, AgentSkillScope::Project, Some(&ws))
+                        .unwrap();
+                assert_eq!(
+                    dirs,
+                    vec![
+                        workspace.join(".opencode/skills"),
+                        workspace.join(".opencode/skill"),
+                        workspace.join(".agents/skills"),
+                    ]
+                );
+                let kind = SkillStorageKind::SkillDirectoryOrMarkdownFile;
+                let mut found: Vec<(String, AgentSkillLayout)> = dirs
+                    .iter()
+                    .flat_map(|dir| {
+                        list_skills_from_dir(AgentSkillScope::Project, dir, kind).unwrap()
+                    })
+                    .map(|skill| (skill.id, skill.layout))
+                    .collect();
+                found.sort_by(|a, b| a.0.cmp(&b.0));
+                assert_eq!(
+                    found,
+                    vec![
+                        ("bundle".to_string(), AgentSkillLayout::SkillDirectory),
+                        ("flat".to_string(), AgentSkillLayout::MarkdownFile),
+                        ("shared".to_string(), AgentSkillLayout::SkillDirectory),
+                    ]
+                );
+
+                let saved = acp_save_agent_skill(
+                    AgentType::OpenCode,
+                    AgentSkillScope::Project,
+                    "new-skill".into(),
+                    "---\nname: new-skill\ndescription: Test\n---\nbody".into(),
+                    Some(ws.clone()),
+                    Some(AgentSkillLayout::SkillDirectory),
+                )
+                .await
                 .unwrap();
-            assert_eq!(
-                dirs,
-                vec![
-                    workspace.join(".opencode/skills"),
-                    workspace.join(".opencode/skill"),
-                    workspace.join(".agents/skills"),
-                ]
-            );
-            let kind = SkillStorageKind::SkillDirectoryOrMarkdownFile;
-            let mut found: Vec<(String, AgentSkillLayout)> = dirs
-                .iter()
-                .flat_map(|dir| list_skills_from_dir(AgentSkillScope::Project, dir, kind).unwrap())
-                .map(|skill| (skill.id, skill.layout))
-                .collect();
-            found.sort_by(|a, b| a.0.cmp(&b.0));
-            assert_eq!(
-                found,
-                vec![
-                    ("bundle".to_string(), AgentSkillLayout::SkillDirectory),
-                    ("flat".to_string(), AgentSkillLayout::MarkdownFile),
-                    ("shared".to_string(), AgentSkillLayout::SkillDirectory),
-                ]
-            );
+                assert_eq!(
+                    Path::new(&saved.path),
+                    workspace.join(".opencode/skills/new-skill")
+                );
+                assert!(workspace
+                    .join(".opencode/skills/new-skill/SKILL.md")
+                    .is_file());
 
-            let saved = acp_save_agent_skill(
-                AgentType::OpenCode,
-                AgentSkillScope::Project,
-                "new-skill".into(),
-                "---\nname: new-skill\ndescription: Test\n---\nbody".into(),
-                Some(ws.clone()),
-                Some(AgentSkillLayout::SkillDirectory),
-            )
-            .await
-            .unwrap();
-            assert_eq!(
-                Path::new(&saved.path),
-                workspace.join(".opencode/skills/new-skill")
-            );
-            assert!(workspace
-                .join(".opencode/skills/new-skill/SKILL.md")
-                .is_file());
-
-            // A flat skill is found where it lives and edited in place.
-            let edited = acp_save_agent_skill(
-                AgentType::OpenCode,
-                AgentSkillScope::Project,
-                "flat".into(),
-                "edited".into(),
-                Some(ws),
-                None,
-            )
-            .await
-            .unwrap();
-            assert_eq!(edited.layout, AgentSkillLayout::MarkdownFile);
-            assert_eq!(
-                fs::read_to_string(workspace.join(".opencode/skill/flat.md")).unwrap(),
-                "edited"
-            );
-            assert!(
-                !config.exists(),
-                "project skills never touch the config dir"
-            );
-        })
+                // A flat skill is found where it lives and edited in place.
+                let edited = acp_save_agent_skill(
+                    AgentType::OpenCode,
+                    AgentSkillScope::Project,
+                    "flat".into(),
+                    "edited".into(),
+                    Some(ws),
+                    None,
+                )
+                .await
+                .unwrap();
+                assert_eq!(edited.layout, AgentSkillLayout::MarkdownFile);
+                assert_eq!(
+                    fs::read_to_string(workspace.join(".opencode/skill/flat.md")).unwrap(),
+                    "edited"
+                );
+                assert!(
+                    !config.exists(),
+                    "project skills never touch the config dir"
+                );
+            },
+        )
         .await;
     }
 }

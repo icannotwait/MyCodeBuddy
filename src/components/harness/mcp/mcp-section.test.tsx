@@ -254,7 +254,7 @@ function usualFiles(): McpInventory {
       },
     }),
     agent("kiro", [], { installed: false }),
-    agent("open_claw", [
+    agent("pi", [
       entry("github", remote("http", "https://api.github.test/mcp")),
     ]),
   ])
@@ -439,7 +439,7 @@ describe("MCP — by server", () => {
     expect(count(rowOf("fs"))).toBeUndefined()
     // In words, every one of them.
     expect(rowOf("shared")).toHaveTextContent(
-      "On in Claude Code, Codex, Gemini CLI, ZCode, OpenClaw."
+      "On in Claude Code, Codex, Gemini CLI, ZCode, Pi."
     )
   })
 
@@ -760,8 +760,7 @@ describe("MCP — what can be edited", () => {
   it("offers Edit only for a definition some agent that holds it can change", async () => {
     const user = userEvent.setup()
     render(<Harness />)
-    // GitHub: Claude Code's definition, and OpenClaw's, which Codeg only
-    // lists.
+    // GitHub: Claude Code's definition, and Pi's, which Codeg only lists.
     const detail = await openServer(user, "github")
     expect(within(detail).getByRole("button", { name: "Edit A" })).toBeEnabled()
     const editB = within(detail).getByRole("button", { name: "Edit B" })
@@ -775,9 +774,7 @@ describe("MCP — what can be edited", () => {
     const user = userEvent.setup()
     files = inventory([
       agent("claude_code"),
-      agent("open_claw", [
-        entry("notion", remote("http", "https://n.test/mcp")),
-      ]),
+      agent("pi", [entry("notion", remote("http", "https://n.test/mcp"))]),
     ])
     render(<Harness />)
     const detail = await openServer(user, "notion")
@@ -871,9 +868,7 @@ describe("MCP — a new server", () => {
     expect(
       within(editor).getByRole("checkbox", { name: /Cline/ })
     ).toBeDisabled()
-    expect(
-      within(editor).getByRole("checkbox", { name: /OpenClaw/ })
-    ).toBeDisabled()
+    expect(within(editor).getByRole("checkbox", { name: /Pi/ })).toBeDisabled()
 
     // SSE: Codex and ZCode cannot hold it.
     await user.click(within(editor).getByRole("radio", { name: "SSE" }))

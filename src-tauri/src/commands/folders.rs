@@ -9910,13 +9910,27 @@ branch refs/heads/main";
         let entry = add_folder_to_history_core(&db, "/tmp/codeg-agent-test".into())
             .await
             .expect("add");
-        let set = update_folder_default_agent_core(&EventEmitter::test_web_only(std::sync::Arc::new(crate::web::event_bridge::WebEventBroadcaster::new())), &db, entry.id, Some(AgentType::ClaudeCode))
-            .await
-            .expect("set agent");
+        let set = update_folder_default_agent_core(
+            &EventEmitter::test_web_only(std::sync::Arc::new(
+                crate::web::event_bridge::WebEventBroadcaster::new(),
+            )),
+            &db,
+            entry.id,
+            Some(AgentType::ClaudeCode),
+        )
+        .await
+        .expect("set agent");
         assert_eq!(set.default_agent_type, Some(AgentType::ClaudeCode));
-        let cleared = update_folder_default_agent_core(&EventEmitter::test_web_only(std::sync::Arc::new(crate::web::event_bridge::WebEventBroadcaster::new())), &db, entry.id, None)
-            .await
-            .expect("clear agent");
+        let cleared = update_folder_default_agent_core(
+            &EventEmitter::test_web_only(std::sync::Arc::new(
+                crate::web::event_bridge::WebEventBroadcaster::new(),
+            )),
+            &db,
+            entry.id,
+            None,
+        )
+        .await
+        .expect("clear agent");
         assert_eq!(cleared.default_agent_type, None);
     }
 

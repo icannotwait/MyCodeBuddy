@@ -48,8 +48,6 @@ enum Shape {
     RootKey(&'static str),
     /// `mcp.servers`, plus 1.x's direct `mcp.<id>` entries.
     OpenCode,
-    /// `mcp.servers`.
-    OpenClaw,
     /// `mcpServers`, or the root itself while that key is absent.
     Antigravity,
 }
@@ -57,7 +55,6 @@ enum Shape {
 fn shape(app: McpAppType) -> Shape {
     match app {
         McpAppType::OpenCode => Shape::OpenCode,
-        McpAppType::OpenClaw => Shape::OpenClaw,
         McpAppType::Antigravity => Shape::Antigravity,
         _ => Shape::RootKey("mcpServers"),
     }
@@ -106,15 +103,6 @@ pub(crate) fn read_view(app: McpAppType, text: &str) -> Result<ServersView, McpI
             None => {}
             Some(Value::Object(servers)) => view.entries.extend(entries_of(servers, false)),
             Some(_) => view.container_invalid = Some(key.to_string()),
-        },
-        Shape::OpenClaw => match root.get("mcp") {
-            None => {}
-            Some(Value::Object(mcp)) => match mcp.get("servers") {
-                None => {}
-                Some(Value::Object(servers)) => view.entries.extend(entries_of(servers, false)),
-                Some(_) => view.container_invalid = Some("mcp.servers".to_string()),
-            },
-            Some(_) => view.container_invalid = Some("mcp".to_string()),
         },
         Shape::Antigravity => match root.get("mcpServers") {
             // The loader falls back to the root only while the key is absent.
@@ -291,7 +279,6 @@ impl JsonStore {
         let root = self.root.object_value()?;
         match shape(self.app) {
             Shape::RootKey(key) => root.object_value(key),
-            Shape::OpenClaw => root.object_value("mcp")?.object_value("servers"),
             Shape::OpenCode => {
                 let servers = root.object_value("mcp")?.object_value("servers")?;
                 let value = node_value(&servers.clone().into())?;
@@ -319,7 +306,7 @@ impl JsonStore {
             Shape::Antigravity => root
                 .object_value_or_create("mcpServers")
                 .ok_or_else(|| not_a_map("mcpServers")),
-            Shape::OpenClaw | Shape::OpenCode => {
+            Shape::OpenCode => {
                 let mcp = root
                     .object_value_or_create("mcp")
                     .ok_or_else(|| not_a_map("mcp"))?;
@@ -580,7 +567,7 @@ impl EntryStore for JsonStore {
         let container = match shape(self.app) {
             Shape::RootKey(key) => twice(&root, key).then(|| key.to_string()),
             Shape::Antigravity => twice(&root, "mcpServers").then(|| "mcpServers".to_string()),
-            Shape::OpenClaw | Shape::OpenCode => {
+            Shape::OpenCode => {
                 if twice(&root, "mcp") {
                     Some("mcp".to_string())
                 } else {

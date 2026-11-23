@@ -9693,8 +9693,7 @@ fn load_mcp_servers_for_agent_with_env(
     if agent_reads_own_mcp_config(agent_type) {
         return Vec::new();
     }
-    let entries = match crate::commands::mcp_engine::session::servers_for_session(agent_type, env)
-    {
+    let entries = match crate::commands::mcp_engine::session::servers_for_session(agent_type, env) {
         Ok(map) => map,
         Err(err) => {
             tracing::error!(
@@ -12072,7 +12071,7 @@ async fn run_connection(
 
             // One startup-retry budget for the whole resume → load → new
             // chain below (see `retry_session_establishment`).
-            let _startup_deadline =
+            let startup_deadline =
                 tokio::time::Instant::now() + HANDSHAKE_STARTUP_RETRY_BUDGET;
 
             if let Some(sid) = session_id {
@@ -12103,7 +12102,11 @@ async fn run_connection(
                             );
                         }
                     };
-                    match unless_cancelled(&handshake, send_resume_session(&cx, resume_req)).await? {
+                    match retry_session_establishment(&handshake, startup_deadline, || {
+                        send_resume_session(&cx, resume_req.clone())
+                    })
+                    .await?
+                    {
                         Ok((resume_resp, models_raw, returned_session_id)) => {
                             match crate::acp::session_attach::gate_session_started_for_attach(
                                 session_attach_mode,
@@ -12326,8 +12329,7 @@ async fn run_connection(
                         }
                     };
                     if matches!(agent_type, AgentType::Kiro | AgentType::Hermes) {
-                        unless_cancelled(
-                            &handshake,
+                        retry_session_establishment(&handshake, startup_deadline, || {
                             send_session_response::<LoadSessionResponse>(
                                 &cx,
                                 AGENT_METHOD_NAMES.session_load,
@@ -12340,10 +12342,9 @@ async fn run_connection(
                             (resp, returned_id)
                         })
                     } else {
-                        unless_cancelled(
-                            &handshake,
-                            send_load_session_capturing_id(&cx, load_req),
-                        )
+                        retry_session_establishment(&handshake, startup_deadline, || {
+                            send_load_session_capturing_id(&cx, load_req.clone())
+                        })
                         .await?
                     }
                 } else {
@@ -12779,9 +12780,7 @@ async fn run_connection(
                                     "[ACP] session/load failed ({err_str}); surfacing as session_load_failed={code}"
                                 );
                                 let frontend_message =
-                                    crate::acp::delegation::broker::sanitize_bootstrap_unresumable_message(
-                                        &err_str,
-                                    );
+                                    session_load_failed_frontend_message(code, &e, &err_str);
                                 emit_with_state(
                                     &state,
                                     &emitter_clone,
@@ -12815,9 +12814,7 @@ async fn run_connection(
                                         "[ACP] session/load failed ({err_str}); surfacing as session_load_failed={code}"
                                     );
                                     let frontend_message =
-                                        crate::acp::delegation::broker::sanitize_bootstrap_unresumable_message(
-                                            &err_str,
-                                        );
+                                        session_load_failed_frontend_message(code, &e, &err_str);
                                     emit_with_state(
                                         &state,
                                         &emitter_clone,
@@ -12905,12 +12902,15 @@ async fn run_connection(
                                 new_session_req = new_session_req.meta(meta);
                             }
                         }
-                        let (new_resp, models_raw) = unless_cancelled(
+                        let (new_resp, models_raw) = retry_session_establishment(
                             &handshake,
-                            send_new_session_capturing_models(
-                                &cx,
-                                new_session_req,
-                            ),
+                            startup_deadline,
+                            || {
+                                send_new_session_capturing_models(
+                                    &cx,
+                                    new_session_req.clone(),
+                                )
+                            },
                         )
                         .await?
                         .map_err(|e| tag_new_session_failure(e, agent_type, &mcp_servers))?;
@@ -13074,15 +13074,18 @@ async fn run_connection(
                                 new_session_req = new_session_req.meta(meta);
                             }
                         }
-                        let (new_resp, models_raw) = unless_cancelled(
+                        let (new_resp, models_raw) = retry_session_establishment(
                             &handshake,
-                            send_new_session_capturing_models(
-                                &cx,
-                                new_session_req,
-                            ),
-                )
-                .await?
-                .map_err(|e| tag_new_session_failure(e, agent_type, &mcp_servers))?;
+                            startup_deadline,
+                            || {
+                                send_new_session_capturing_models(
+                                    &cx,
+                                    new_session_req.clone(),
+                                )
+                            },
+                        )
+                        .await?
+                        .map_err(|e| tag_new_session_failure(e, agent_type, &mcp_servers))?;
                 let sid = new_resp.session_id.0.to_string();
                 let initial_config_options = new_resp.config_options.clone();
                 let grok_meta = if agent_type == AgentType::Grok {
@@ -18870,7 +18873,6 @@ fn session_load_error_action(
 
 /// The agent's own words for an error: `data.details` (where codex-acp and the
 /// ACP SDK put the text of an internal error), when it is a non-blank string.
-#[allow(dead_code)]
 fn error_details_text(e: &agent_client_protocol::Error) -> Option<String> {
     e.data
         .as_ref()?
@@ -18942,6 +18944,24 @@ fn codex_provider_refusal_text(details: &str) -> &str {
     match sentence.find(" on resume.") {
         Some(end) => &sentence[..end + " on resume.".len()],
         None => sentence.lines().next().unwrap_or(sentence),
+    }
+}
+
+/// `SessionLoadFailed.message` for the UI. A provider refusal quotes codex's
+/// sentence (it names both providers, which the banner interpolates). Every
+/// other code stays on the stable unresumable text so raw ACP/SQLite bodies
+/// never reach the frontend.
+fn session_load_failed_frontend_message(
+    code: &str,
+    e: &agent_client_protocol::Error,
+    err_str: &str,
+) -> String {
+    if code == "provider_mismatch" {
+        error_details_text(e)
+            .map(|details| codex_provider_refusal_text(&details).to_string())
+            .unwrap_or_else(|| err_str.to_string())
+    } else {
+        crate::acp::delegation::broker::sanitize_bootstrap_unresumable_message(err_str)
     }
 }
 
@@ -51596,8 +51616,8 @@ mod tests {
 
         // Empty specs → the effort selector comes from the flat `x.ai/sessionConfig`
         // "mode" list (the no-`models` fallback path).
-        let opts =
-            synthesize_grok_config_options(Some(&meta), &HashMap::new(), None).expect("should synthesize");
+        let opts = synthesize_grok_config_options(Some(&meta), &HashMap::new(), None)
+            .expect("should synthesize");
         assert_eq!(opts.len(), 2, "model + effort selectors");
 
         let model = &opts[0];
@@ -51648,8 +51668,8 @@ mod tests {
         .unwrap();
         // Empty specs → the effort selector comes from the flat `x.ai/sessionConfig`
         // "mode" list (the no-`models` fallback path).
-        let opts =
-            synthesize_grok_config_options(Some(&meta), &HashMap::new(), None).expect("should synthesize");
+        let opts = synthesize_grok_config_options(Some(&meta), &HashMap::new(), None)
+            .expect("should synthesize");
         assert_eq!(opts.len(), 1);
         assert_eq!(opts[0].id, GROK_MODEL_OPTION_ID);
     }
@@ -52776,13 +52796,12 @@ mod tests {
         // Grok 1.0.89 resuming a session whose saved `[model.fake]` is gone
         // (captured live): `currentModelId` keeps "fake", no sessionConfig row
         // is `selected` and no effort rows come with it.
-        let meta: serde_json::Map<String, serde_json::Value> = serde_json::from_value(
-            serde_json::json!({"x.ai/sessionConfig": {"options": [
+        let meta: serde_json::Map<String, serde_json::Value> =
+            serde_json::from_value(serde_json::json!({"x.ai/sessionConfig": {"options": [
                 {"id": "grok-4.6", "category": "model", "label": "Grok 4.6", "selected": false},
                 {"id": "grok-4.5", "category": "model", "label": "Grok 4.5", "selected": false}
-            ]}}),
-        )
-        .unwrap();
+            ]}}))
+            .unwrap();
         let models = serde_json::json!({
             "currentModelId": "fake",
             "availableModels": [{
@@ -52796,8 +52815,8 @@ mod tests {
             }]
         });
         let specs = parse_grok_model_specs(Some(&models));
-        let opts = synthesize_grok_config_options(Some(&meta), &specs, Some("fake"))
-            .expect("synthesize");
+        let opts =
+            synthesize_grok_config_options(Some(&meta), &specs, Some("fake")).expect("synthesize");
         let model = opts
             .iter()
             .find(|o| o.id == GROK_MODEL_OPTION_ID)
@@ -52805,7 +52824,11 @@ mod tests {
         let model_sel = expect_select(&model.kind);
         assert_eq!(model_sel.current_value, "fake", "not the first row");
         assert_eq!(
-            model_sel.options.iter().map(|o| o.value.as_str()).collect::<Vec<_>>(),
+            model_sel
+                .options
+                .iter()
+                .map(|o| o.value.as_str())
+                .collect::<Vec<_>>(),
             ["grok-4.6", "grok-4.5", "fake"],
             "the saved model is listed after Grok's own"
         );
@@ -52816,13 +52839,12 @@ mod tests {
 
         // A `selected` row still wins over the reported id, and a listed
         // reported id is not added twice.
-        let selected: serde_json::Map<String, serde_json::Value> = serde_json::from_value(
-            serde_json::json!({"x.ai/sessionConfig": {"options": [
+        let selected: serde_json::Map<String, serde_json::Value> =
+            serde_json::from_value(serde_json::json!({"x.ai/sessionConfig": {"options": [
                 {"id": "grok-4.6", "category": "model", "label": "Grok 4.6", "selected": true},
                 {"id": "grok-4.5", "category": "model", "label": "Grok 4.5", "selected": false}
-            ]}}),
-        )
-        .unwrap();
+            ]}}))
+            .unwrap();
         for reported in [Some("fake"), Some("grok-4.5"), None] {
             let opts = synthesize_grok_config_options(Some(&selected), &HashMap::new(), reported)
                 .expect("synthesize");
@@ -52856,8 +52878,12 @@ mod tests {
                     "_meta": custom_meta
                 }]
             });
-            synthesize_grok_config_options(Some(&meta), &parse_grok_model_specs(Some(&models)), None)
-                .expect("synthesize")
+            synthesize_grok_config_options(
+                Some(&meta),
+                &parse_grok_model_specs(Some(&models)),
+                None,
+            )
+            .expect("synthesize")
         };
 
         let before = session(

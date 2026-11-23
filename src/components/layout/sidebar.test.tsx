@@ -602,7 +602,7 @@ describe("Sidebar — Harness row", () => {
     "Automations",
     "To-dos",
     "Repository panel",
-    "Infinite Canvas",
+    "Infinite Conversations",
     "Harness Engineering",
   ]
   const navRowTitles = () =>
@@ -612,7 +612,7 @@ describe("Sidebar — Harness row", () => {
       .filter((title) => NAV_ROWS.includes(title))
   const harnessRow = () => screen.getByRole("button", { name: /^Harness/ })
 
-  it("sits after Infinite Canvas, at the end of the nav block", () => {
+  it("sits after Infinite Conversations, at the end of the nav block", () => {
     renderSidebar()
     expect(navRowTitles()).toEqual(NAV_ROWS)
   })
@@ -633,7 +633,7 @@ describe("Sidebar — Harness row", () => {
     expect(harnessRow()).toHaveAttribute("aria-current", "page")
     // Control: marking follows the route, not the row that was added last.
     expect(
-      screen.getByRole("button", { name: "Infinite Canvas" })
+      screen.getByRole("button", { name: "Infinite Conversations" })
     ).not.toHaveAttribute("aria-current")
   })
 
@@ -678,7 +678,7 @@ describe("Sidebar — Harness row", () => {
       "Automations",
       "To-dos",
       "Repository panel",
-      "Infinite Canvas",
+      "Infinite Conversations",
       "Harness Engineering",
     ])
     const harness = toggles[toggles.length - 1]
@@ -701,7 +701,9 @@ describe("Sidebar — Harness row", () => {
 
     expect(screen.queryByRole("button", { name: /^Harness/ })).toBeNull()
     // Control: the row before it is still there.
-    expect(screen.getByRole("button", { name: "Infinite Canvas" })).toBeTruthy()
+    expect(
+      screen.getByRole("button", { name: "Infinite Conversations" })
+    ).toBeTruthy()
     expect(
       JSON.parse(localStorage.getItem("workspace:sidebar-nav-items") ?? "{}")
     ).toEqual({ harness: false })

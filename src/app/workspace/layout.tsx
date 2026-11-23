@@ -1598,7 +1598,7 @@ function WorkspaceLayoutInner({ children }: { children: React.ReactNode }) {
                                     <HarnessUpdatesSync />
                                     <WorkbenchRouteProvider>
                                       <WorkbenchRouteConversationSync />
-                                    <ConversationAwaitingReplyClearer />
+                                      <ConversationAwaitingReplyClearer />
                                       {/* The task editor a message's "create
                                             task" opens over the page it is on:
                                             a transcript shows in a tab, a canvas

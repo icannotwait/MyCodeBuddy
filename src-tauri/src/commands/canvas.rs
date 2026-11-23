@@ -919,8 +919,15 @@ pub async fn canvas_detach_member(
     x: f64,
     y: f64,
 ) -> Result<CanvasMutation<CanvasNode>, AppCommandError> {
-    canvas_detach_member_core(&EventEmitter::from_app(&app), &db, region_id, conversation_id, x, y)
-        .await
+    canvas_detach_member_core(
+        &EventEmitter::from_app(&app),
+        &db,
+        region_id,
+        conversation_id,
+        x,
+        y,
+    )
+    .await
 }
 
 #[cfg(feature = "tauri-runtime")]

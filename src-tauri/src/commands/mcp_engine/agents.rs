@@ -103,7 +103,6 @@ pub(crate) fn spec(app: McpAppType) -> AgentSpec {
         // (`mcp-server-enablement.json`), and an entry takes no key the
         // settings schema does not list.
         McpAppType::Gemini => (ALL_TRANSPORTS, CodegSession, DisableFlag::NONE, false),
-        McpAppType::OpenClaw => (ALL_TRANSPORTS, AgentFile, DisableFlag::NONE, true),
         // `disabled: true`; OpenCode 2 has no SSE client.
         McpAppType::OpenCode => (NO_SSE, AgentFile, DisableFlag::disabled_true(), false),
         McpAppType::Cline => (
@@ -191,7 +190,6 @@ pub(crate) fn agent_type_of(app: McpAppType) -> AgentType {
         McpAppType::ClaudeCode => AgentType::ClaudeCode,
         McpAppType::Codex => AgentType::Codex,
         McpAppType::Gemini => AgentType::Gemini,
-        McpAppType::OpenClaw => AgentType::OpenClaw,
         McpAppType::OpenCode => AgentType::OpenCode,
         McpAppType::Cline => AgentType::Cline,
         McpAppType::Hermes => AgentType::Hermes,
@@ -347,9 +345,6 @@ pub(crate) fn resolve_paths(app: McpAppType, env: &AgentEnv) -> AgentPaths {
         McpAppType::Gemini => {
             crate::parsers::gemini::resolve_gemini_base_dir_for_env(env).join("settings.json")
         }
-        // No override followed: the history parser reads a fixed
-        // `~/.openclaw` too.
-        McpAppType::OpenClaw => home_dir().join(".openclaw").join("openclaw.json"),
         McpAppType::OpenCode => opencode_servers_path(env),
         McpAppType::Cline => cline_servers_path(env),
         McpAppType::Hermes => {
@@ -661,9 +656,7 @@ mod tests {
                 );
             }
         }
-        // The two listed-only agents get nothing from codeg either way.
-        assert!(spec(McpAppType::OpenClaw).scan_only);
+        // Pi is listed only: the page reads it, and the session does not send it servers.
         assert!(spec(McpAppType::Pi).scan_only);
-        assert!(!crate::acp::registry::get_agent_meta(AgentType::OpenClaw).supports_mcp);
     }
 }

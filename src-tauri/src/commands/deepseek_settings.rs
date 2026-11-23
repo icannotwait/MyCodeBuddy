@@ -1549,10 +1549,7 @@ pub fn load_deepseek_provider_routes_core() -> DeepSeekProviderRoutes {
     load_deepseek_provider_routes_at(&pi_settings_path(), &legacy_pi_settings_paths())
 }
 
-fn load_deepseek_provider_routes_at(
-    path: &Path,
-    legacy: &[PathBuf],
-) -> DeepSeekProviderRoutes {
+fn load_deepseek_provider_routes_at(path: &Path, legacy: &[PathBuf]) -> DeepSeekProviderRoutes {
     let display = path.display().to_string();
     let unreadable = |exists: bool, message: String| DeepSeekProviderRoutes {
         path: display.clone(),
@@ -1604,12 +1601,7 @@ fn load_deepseek_provider_routes_at(
             Err(message) if legacy_pi_section_is_mapping(&raw) => Err(message),
             _ => continue,
         };
-        return provider_routes_view(
-            profiles,
-            display,
-            false,
-            Some(display_from(candidate)),
-        );
+        return provider_routes_view(profiles, display, false, Some(display_from(candidate)));
     }
 
     DeepSeekProviderRoutes {
@@ -1845,7 +1837,11 @@ fn patch_pi_providers(
     existing: &str,
     providers: Option<&serde_yaml::Mapping>,
 ) -> Result<String, String> {
-    let newline = if existing.contains("\r\n") { "\r\n" } else { "\n" };
+    let newline = if existing.contains("\r\n") {
+        "\r\n"
+    } else {
+        "\n"
+    };
 
     let before: Option<serde_yaml::Value> = if existing.trim().is_empty() {
         None
@@ -1888,7 +1884,10 @@ fn patch_pi_providers(
         .and_then(serde_yaml::Value::as_mapping)
         .and_then(|map| map.get(serde_yaml::Value::String(PI_SECTION_KEY.to_string())))
         .is_none_or(|value| {
-            value.is_null() || value.as_mapping().is_some_and(serde_yaml::Mapping::is_empty)
+            value.is_null()
+                || value
+                    .as_mapping()
+                    .is_some_and(serde_yaml::Mapping::is_empty)
         });
 
     let lines = split_lines(existing);
@@ -1965,10 +1964,7 @@ fn patch_pi_providers(
 
 /// Render the whole `llm-pi-ai` section at the top level, so a section that
 /// nests a mapping under its key stays readable in a hand-edited document.
-fn render_pi_section(
-    section: &serde_yaml::Mapping,
-    newline: &str,
-) -> Result<String, String> {
+fn render_pi_section(section: &serde_yaml::Mapping, newline: &str) -> Result<String, String> {
     let body = serde_yaml::to_string(&serde_yaml::Value::Mapping(section.clone()))
         .map_err(|err| format!("could not serialize the provider routes: {err}"))?;
     let mut out = format!("{PI_SECTION_KEY}:{newline}");
@@ -2001,14 +1997,12 @@ fn verify_pi_patch(
     let after: serde_yaml::Value = if patched.trim().is_empty() {
         serde_yaml::Value::Null
     } else {
-        serde_yaml::from_str(patched).map_err(|err| unsafe_edit(&format!("re-parse failed: {err}")))?
+        serde_yaml::from_str(patched)
+            .map_err(|err| unsafe_edit(&format!("re-parse failed: {err}")))?
     };
 
     let section_key = serde_yaml::Value::String(PI_SECTION_KEY.to_string());
-    let stored = match after
-        .as_mapping()
-        .and_then(|map| map.get(&section_key))
-    {
+    let stored = match after.as_mapping().and_then(|map| map.get(&section_key)) {
         None | Some(serde_yaml::Value::Null) => None,
         Some(value) => Some(value.clone()),
     };
@@ -2018,7 +2012,9 @@ fn verify_pi_patch(
         Some(serde_yaml::Value::Mapping(expected.clone()))
     };
     if stored != wanted {
-        return Err(unsafe_edit("the provider routes did not land where they were aimed"));
+        return Err(unsafe_edit(
+            "the provider routes did not land where they were aimed",
+        ));
     }
 
     // Nothing outside the section moved.
@@ -2067,8 +2063,7 @@ pub async fn acp_update_deepseek_model_catalog(
 /// directly.
 #[cfg(feature = "tauri-runtime")]
 #[cfg_attr(feature = "tauri-runtime", tauri::command)]
-pub async fn acp_load_deepseek_provider_routes(
-) -> Result<DeepSeekProviderRoutes, AcpError> {
+pub async fn acp_load_deepseek_provider_routes() -> Result<DeepSeekProviderRoutes, AcpError> {
     Ok(load_deepseek_provider_routes_core())
 }
 
@@ -2952,14 +2947,18 @@ mod tests {
 
     #[test]
     fn reads_routes_from_the_bridge_document() {
-        let raw = "llm-pi-ai:\n  providers:\n    opencode-go:\n      apiKeyEnv: OPENCODE_GO_API_KEY\n";
+        let raw =
+            "llm-pi-ai:\n  providers:\n    opencode-go:\n      apiKeyEnv: OPENCODE_GO_API_KEY\n";
         let profiles = read_pi_providers(raw)
             .expect("parses")
             .expect("section present");
         let routes = routes_from_profiles(&profiles).expect("routes");
         assert_eq!(routes.len(), 1);
         assert_eq!(routes[0].id, "opencode-go");
-        assert_eq!(routes[0].api_key_env.as_deref(), Some("OPENCODE_GO_API_KEY"));
+        assert_eq!(
+            routes[0].api_key_env.as_deref(),
+            Some("OPENCODE_GO_API_KEY")
+        );
         assert!(routes[0].api.is_none());
         assert!(routes[0].base_url.is_none());
 
@@ -2968,13 +2967,11 @@ mod tests {
         assert!(read_pi_providers("llm-pi-ai:\n  providers: nope\n").is_err());
         assert!(read_pi_providers("llm-pi-ai: 3\n").is_err());
         // A route profile that is a scalar cannot be edited blind.
-        assert!(
-            read_pi_providers("llm-pi-ai:\n  providers:\n    x: 1\n")
-                .expect("parses")
-                .map(|profiles| routes_from_profiles(&profiles))
-                .transpose()
-                .is_err()
-        );
+        assert!(read_pi_providers("llm-pi-ai:\n  providers:\n    x: 1\n")
+            .expect("parses")
+            .map(|profiles| routes_from_profiles(&profiles))
+            .transpose()
+            .is_err());
         // A field with the wrong type is reported rather than guessed at.
         assert!(
             read_pi_providers("llm-pi-ai:\n  providers:\n    x:\n      apiKeyEnv: [a]\n")
@@ -3082,14 +3079,8 @@ llm-deepseek:
         assert!(saved.contains("keep-me"));
 
         let doc: serde_yaml::Value = serde_yaml::from_str(&saved).expect("parses");
-        let profile = yaml_at(
-            &doc,
-            &["llm-pi-ai", "providers", "opencode-go"],
-        );
-        assert_eq!(
-            yaml_at(profile, &["apiKeyEnv"]).as_str(),
-            Some("NEW_KEY")
-        );
+        let profile = yaml_at(&doc, &["llm-pi-ai", "providers", "opencode-go"]);
+        assert_eq!(yaml_at(profile, &["apiKeyEnv"]).as_str(), Some("NEW_KEY"));
         // Fields this panel does not model ride along untouched.
         assert_eq!(
             yaml_at(profile, &["models", "0", "id"]).as_str(),
@@ -3114,11 +3105,7 @@ llm-deepseek:
         assert!(!cleared.contains("llm-pi-ai"));
 
         // A save that only edits a different document must not touch this one.
-        fs::write(
-            &path,
-            "llm-deepseek:\n  models:\n    - id: keep\n",
-        )
-        .expect("document");
+        fs::write(&path, "llm-deepseek:\n  models:\n    - id: keep\n").expect("document");
         update_deepseek_provider_routes_at(&path, &[], None).expect("no-op");
         assert_eq!(
             fs::read_to_string(&path).expect("document"),
@@ -3145,12 +3132,8 @@ llm-deepseek:
 
         let mut route = route("opencode-go");
         route.api_key_env = Some("OPENCODE_GO_API_KEY".to_string());
-        update_deepseek_provider_routes_at(
-            &bridge,
-            std::slice::from_ref(&legacy),
-            Some(&[route]),
-        )
-        .expect("write");
+        update_deepseek_provider_routes_at(&bridge, std::slice::from_ref(&legacy), Some(&[route]))
+            .expect("write");
 
         let saved = fs::read_to_string(&bridge).expect("bridge document");
         let doc: serde_yaml::Value = serde_yaml::from_str(&saved).expect("parses");
@@ -3165,9 +3148,7 @@ llm-deepseek:
             Some("deepseek")
         );
         // The legacy file is read-only to us.
-        assert!(!fs::read_to_string(&legacy)
-            .expect("legacy")
-            .is_empty());
+        assert!(!fs::read_to_string(&legacy).expect("legacy").is_empty());
     }
 
     #[test]
@@ -3276,7 +3257,11 @@ llm-deepseek:
         let saved = fs::read_to_string(&bridge).expect("bridge document");
         let doc: serde_yaml::Value = serde_yaml::from_str(&saved).expect("parses");
         assert_eq!(
-            yaml_at(&doc, &["llm-pi-ai", "providers", "azure", "headers", "x-team"]).as_str(),
+            yaml_at(
+                &doc,
+                &["llm-pi-ai", "providers", "azure", "headers", "x-team"]
+            )
+            .as_str(),
             Some("platform")
         );
         assert!(!saved.contains("azure-openai-responses"), "{saved}");
@@ -3317,11 +3302,14 @@ llm-deepseek:
         assert_eq!(ids, ["openrouter"]);
 
         // A null inline section is just as empty; a non-empty one stays refused.
-        let patched = patch_pi_providers("other: 1\nllm-pi-ai: ~\n", Some(&{
-            let mut providers = serde_yaml::Mapping::new();
-            providers.insert("xai".into(), serde_yaml::Value::Mapping(Default::default()));
-            providers
-        }))
+        let patched = patch_pi_providers(
+            "other: 1\nllm-pi-ai: ~\n",
+            Some(&{
+                let mut providers = serde_yaml::Mapping::new();
+                providers.insert("xai".into(), serde_yaml::Value::Mapping(Default::default()));
+                providers
+            }),
+        )
         .expect("null inline section");
         assert!(patched.starts_with("other: 1\nllm-pi-ai:\n"), "{patched}");
     }

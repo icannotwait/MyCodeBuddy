@@ -102,6 +102,7 @@ export function useReferenceSearchController({
   // Stable constructor identity: backend / folder / path / enabled / ready.
   useEffect(() => {
     if (!enabled || !catalogReady) {
+      // eslint-disable-next-line react-hooks/set-state-in-effect -- drops the controller when the catalog is not ready to search
       setController((prev) => {
         prev?.close()
         return null

@@ -1224,8 +1224,15 @@ pub async fn work_task_set_writeback(
     writeback: bool,
     drafts: std::collections::BTreeMap<i64, String>,
 ) -> Result<(), DbError> {
-    work_task_set_writeback_core(&EventEmitter::from_app(&app), &db, id, run_seq, writeback, drafts)
-        .await
+    work_task_set_writeback_core(
+        &EventEmitter::from_app(&app),
+        &db,
+        id,
+        run_seq,
+        writeback,
+        drafts,
+    )
+    .await
 }
 
 #[cfg(feature = "tauri-runtime")]

@@ -95,13 +95,10 @@ pub async fn custom_create_skill(
     Extension(state): Extension<Arc<AppState>>,
     Json(params): Json<CustomContentParams>,
 ) -> Result<Json<CustomSkillItem>, AppCommandError> {
-    let result = custom_skills_commands::custom_create_skill_core(
-        &state.emitter,
-        params.id,
-        params.content,
-    )
-    .await
-    .map_err(|e| AppCommandError::from(&e))?;
+    let result =
+        custom_skills_commands::custom_create_skill_core(&state.emitter, params.id, params.content)
+            .await
+            .map_err(|e| AppCommandError::from(&e))?;
     Ok(Json(result))
 }
 
@@ -109,13 +106,10 @@ pub async fn custom_save_skill(
     Extension(state): Extension<Arc<AppState>>,
     Json(params): Json<CustomContentParams>,
 ) -> Result<Json<CustomSkillItem>, AppCommandError> {
-    let result = custom_skills_commands::custom_save_skill_core(
-        &state.emitter,
-        params.id,
-        params.content,
-    )
-    .await
-    .map_err(|e| AppCommandError::from(&e))?;
+    let result =
+        custom_skills_commands::custom_save_skill_core(&state.emitter, params.id, params.content)
+            .await
+            .map_err(|e| AppCommandError::from(&e))?;
     Ok(Json(result))
 }
 

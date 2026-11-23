@@ -5610,7 +5610,7 @@ describe("AcpConnectionsProvider failed-turn line", () => {
     expect(lineOf()).toEqual([
       {
         type: "turn_error",
-        message: "backendErrors.turnFailedEmpty",
+        message: "backendErrors.turnFailedEmpty(agent=Claude Code)",
         fromAgent: false,
       },
     ])
@@ -5658,7 +5658,7 @@ describe("AcpConnectionsProvider failed-turn line", () => {
     const noticeKey =
       "acp-notice:spawned-conn:warning:UserPromptSubmit hook blocked the prompt"
     expect(h.toastWarning).toHaveBeenCalledWith(
-      "noticeTitle",
+      "noticeTitle(agent=Claude Code,title=UserPromptSubmit hook blocked the prompt)",
       expect.objectContaining({ id: noticeKey })
     )
 
@@ -5677,11 +5677,11 @@ describe("AcpConnectionsProvider failed-turn line", () => {
     ])
     // The session's standing error is the localized line alone.
     expect(h.store!.getConnection(TAB)!.error).toBe(
-      "backendErrors.turnFailedEmptyHook"
+      "backendErrors.turnFailedEmptyHook(agent=Claude Code)"
     )
     // Same key: the warning's toast and list entry become the error.
     expect(h.toastError).toHaveBeenCalledWith(
-      "backendErrors.turnFailedEmptyHook",
+      "backendErrors.turnFailedEmptyHook(agent=Claude Code)",
       expect.objectContaining({ id: noticeKey, description: agentWords })
     )
     const keys = h.recordAlert.mock.calls.map(([alert]) => alert.key)
@@ -5710,7 +5710,7 @@ describe("AcpConnectionsProvider failed-turn line", () => {
       code: "turn_failed_empty_hook",
     })
     expect(h.toastError).toHaveBeenCalledWith(
-      "backendErrors.turnFailedEmptyHook",
+      "backendErrors.turnFailedEmptyHook(agent=Claude Code)",
       expect.objectContaining({
         id: expect.stringMatching(/^acp-turn-failure:spawned-conn:/),
       })
@@ -24369,7 +24369,10 @@ describe("a `prompting` state whose connection is gone can always recover", () =
   })
 
   it("does not stack keepalive probes while the same connection is pending", async () => {
-    vi.useFakeTimers()
+    // Only the keepalive interval is faked. Connect and desktop delivery use
+    // setTimeout and animation frames, which must keep running while the tab
+    // is seeded into `prompting`.
+    vi.useFakeTimers({ toFake: ["setInterval", "clearInterval"] })
     try {
       await seedPromptingTab()
       act(() => h.actions!.registerLiveSurfaceKeys("canvas", new Set([TAB])))
@@ -24403,7 +24406,7 @@ describe("a `prompting` state whose connection is gone can always recover", () =
   })
 
   it("probes a replacement connection while the old probe is still pending", async () => {
-    vi.useFakeTimers()
+    vi.useFakeTimers({ toFake: ["setInterval", "clearInterval"] })
     try {
       await seedPromptingTab()
       act(() => h.actions!.registerLiveSurfaceKeys("canvas", new Set([TAB])))

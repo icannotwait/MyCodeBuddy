@@ -314,7 +314,11 @@ fn hash_disk_directory(path: &Path) -> Result<String, ExpertsError> {
 
 #[cfg(test)]
 fn extract_expert_to_disk(meta: &ExpertMetadata, target: &Path) -> Result<(), ExpertsError> {
-    Ok(packs::extract_bundle_skill(&EXPERTS_BUNDLE, &meta.id, target)?)
+    Ok(packs::extract_bundle_skill(
+        &EXPERTS_BUNDLE,
+        &meta.id,
+        target,
+    )?)
 }
 
 // ─── Link primitives (kept for the modules and tests that plant links) ──
@@ -340,7 +344,8 @@ pub(crate) fn classify_link(link_path: &Path, expected_target: &Path) -> ExpertL
     match inspect(link_path) {
         RawEntry::Absent | RawEntry::Unreadable(_) => ExpertLinkState::NotLinked,
         RawEntry::Dir | RawEntry::File => ExpertLinkState::BlockedByRealDirectory,
-        RawEntry::Link { resolved, .. } => match (resolved, fs::canonicalize(expected_target).ok()) {
+        RawEntry::Link { resolved, .. } => match (resolved, fs::canonicalize(expected_target).ok())
+        {
             (None, _) => ExpertLinkState::Broken,
             (Some(l), Some(e)) if crate::skills::fsio::same_path(&l, &e) => {
                 ExpertLinkState::LinkedToCodeg

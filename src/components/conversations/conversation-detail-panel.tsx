@@ -5,6 +5,7 @@ import {
   useFolderTabsStore,
 } from "@/stores/folder-tabs-store"
 import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react"
+import { useShallow } from "zustand/react/shallow"
 import {
   Copy,
   Download,

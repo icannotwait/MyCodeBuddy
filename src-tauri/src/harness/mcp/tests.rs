@@ -1632,10 +1632,6 @@ async fn the_plan_says_why_an_agent_cannot_be_written_and_who_owns_each_name() {
     let cursor = agent(McpAppType::Cursor);
     assert!(!cursor.writable);
     assert_eq!(cursor.reason.as_ref().unwrap().code, "invalid_json");
-    // listed only, and no file at all: still a reason
-    let open_claw = agent(McpAppType::OpenClaw);
-    assert!(!open_claw.writable);
-    assert_eq!(open_claw.reason.as_ref().unwrap().code, "managed_by_agent");
     // the wire: names only, no definitions
     let wire = serde_json::to_value(&plan).unwrap();
     let claude_wire = wire["agents"]

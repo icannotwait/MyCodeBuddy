@@ -261,7 +261,13 @@ mod tauri_commands {
         id: String,
         db: State<'_, AppDatabase>,
     ) -> Result<ConfigImportResult, AppCommandError> {
-        apply_rollback_core(&db.conn, &EventEmitter::from_app(&app), &rollback_dir(), &id).await
+        apply_rollback_core(
+            &db.conn,
+            &EventEmitter::from_app(&app),
+            &rollback_dir(),
+            &id,
+        )
+        .await
     }
 }
 
