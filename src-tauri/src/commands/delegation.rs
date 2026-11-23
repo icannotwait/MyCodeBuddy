@@ -993,7 +993,7 @@ pub async fn set_delegation_settings(
             settings,
         )
         .await?;
-        let emitter = EventEmitter::Tauri(app);
+        let emitter = EventEmitter::from_app(&app);
         emit_event(
             &emitter,
             DELEGATION_PROFILE_CATALOG_CHANGED_EVENT,

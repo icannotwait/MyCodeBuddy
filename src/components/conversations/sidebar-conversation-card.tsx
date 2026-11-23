@@ -75,6 +75,10 @@ import {
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { ConversationStatusDot } from "./conversation-status-dot"
+import {
+  SidebarRelativeTime,
+  type SidebarRelativeClock,
+} from "./sidebar-relative-time"
 import { SessionDetailsDialog } from "./session-details-dialog"
 import { SidebarConversationHoverDetails } from "./sidebar-conversation-hover-details"
 import { ConversationTagChips } from "./conversation-tag-chip"
@@ -201,6 +205,8 @@ interface SidebarConversationCardProps {
   /** Main-window tab count for last-tab pop-out disablement. */
   mainTabCount?: number
   timeLabel?: string
+  relativeTimeAt?: string
+  relativeTimeClock?: SidebarRelativeClock
   onSelect: (id: number, agentType: string, folderId: number) => void
   onDoubleClick?: (id: number, agentType: string, folderId: number) => void
   onRename: (id: number, newTitle: string) => Promise<void>
@@ -236,6 +242,8 @@ export const SidebarConversationCard = memo(function SidebarConversationCard({
   isOpenInTab = false,
   mainTabCount = 0,
   timeLabel,
+  relativeTimeAt,
+  relativeTimeClock,
   onSelect,
   onDoubleClick,
   onRename,
@@ -256,6 +264,12 @@ export const SidebarConversationCard = memo(function SidebarConversationCard({
   const tStatus = useTranslations("Folder.statusLabels")
   const tDetails = useTranslations("Folder.sessionDetails")
   const tPop = useTranslations("ConversationPopout")
+  const timeLabelClassName = cn(
+    "relative shrink-0 tabular-nums text-[0.71875rem]",
+    isSelected
+      ? "font-medium text-muted-foreground"
+      : "font-normal text-muted-foreground/70"
+  )
   const [renameOpen, setRenameOpen] = useState(false)
   const [deleteOpen, setDeleteOpen] = useState(false)
   const [isDeleting, setIsDeleting] = useState(false)
@@ -695,6 +709,12 @@ export const SidebarConversationCard = memo(function SidebarConversationCard({
                             {tSidebar("statusCancelledBadge")}
                           </span>
                         </span>
+                      ) : relativeTimeClock && relativeTimeAt !== undefined ? (
+                        <SidebarRelativeTime
+                          timestamp={relativeTimeAt}
+                          clock={relativeTimeClock}
+                          className={timeLabelClassName}
+                        />
                       ) : timeLabel ? (
                         <span
                           title={
@@ -703,13 +723,8 @@ export const SidebarConversationCard = memo(function SidebarConversationCard({
                               : undefined
                           }
                           className={cn(
-                            "relative shrink-0 tabular-nums",
-                            "text-[0.71875rem]",
-                            showAwaitingReply
-                              ? "font-medium text-destructive"
-                              : isSelected
-                                ? "font-medium text-muted-foreground"
-                                : "font-normal text-muted-foreground/70"
+                            timeLabelClassName,
+                            showAwaitingReply && "font-medium text-destructive"
                           )}
                         >
                           {showAwaitingReply && (
