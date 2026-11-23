@@ -3637,7 +3637,7 @@ pub async fn set_conversation_delegation_route(
             snap.enabled,
         )
         .await;
-    emit_conversation_upsert(&EventEmitter::Tauri(app), &db.conn, conversation_id).await;
+    emit_conversation_upsert(&EventEmitter::from_app(&app), &db.conn, conversation_id).await;
     Ok(summary)
 }
 
@@ -3898,7 +3898,7 @@ pub async fn clear_awaiting_reply(
 ) -> Result<ConversationStatePatch, AppCommandError> {
     clear_awaiting_reply_core(
         &db.conn,
-        &EventEmitter::Tauri(app),
+        &EventEmitter::from_app(&app),
         conversation_id,
         expected_token,
     )

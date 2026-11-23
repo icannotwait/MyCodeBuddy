@@ -1138,7 +1138,7 @@ pub async fn open_folder(
     path: String,
 ) -> Result<FolderDetail, AppCommandError> {
     let detail = open_folder_core(&db, path).await?;
-    emit_folder_upsert(&EventEmitter::Tauri(app), detail.clone());
+    emit_folder_upsert(&EventEmitter::from_app(&app), detail.clone());
     Ok(detail)
 }
 
@@ -1151,7 +1151,7 @@ pub async fn open_worktree_folder(
     source_folder_id: i32,
 ) -> Result<FolderDetail, AppCommandError> {
     let detail = open_worktree_folder_core(&db, path, source_folder_id).await?;
-    emit_folder_upsert(&EventEmitter::Tauri(app), detail.clone());
+    emit_folder_upsert(&EventEmitter::from_app(&app), detail.clone());
     Ok(detail)
 }
 
@@ -1174,7 +1174,7 @@ pub async fn open_folder_by_id(
     folder_id: i32,
 ) -> Result<FolderDetail, AppCommandError> {
     let detail = open_folder_by_id_core(&db, folder_id).await?;
-    emit_folder_upsert(&EventEmitter::Tauri(app), detail.clone());
+    emit_folder_upsert(&EventEmitter::from_app(&app), detail.clone());
     Ok(detail)
 }
 
@@ -1197,7 +1197,7 @@ pub async fn close_folder_if_empty(
     db: tauri::State<'_, AppDatabase>,
     folder_id: i32,
 ) -> Result<CloseFolderIfEmptyResult, AppCommandError> {
-    let closed = close_folder_if_empty_core(&db, &EventEmitter::Tauri(app), folder_id).await?;
+    let closed = close_folder_if_empty_core(&db, &EventEmitter::from_app(&app), folder_id).await?;
     Ok(CloseFolderIfEmptyResult { closed })
 }
 
@@ -1286,6 +1286,7 @@ pub async fn update_folder_alias(
 #[cfg(feature = "tauri-runtime")]
 #[cfg_attr(feature = "tauri-runtime", tauri::command)]
 pub async fn update_folder_default_agent(
+    app: tauri::AppHandle,
     db: tauri::State<'_, AppDatabase>,
     folder_id: i32,
     default_agent_type: Option<crate::models::agent::AgentType>,

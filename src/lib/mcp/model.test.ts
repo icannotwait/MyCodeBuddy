@@ -108,7 +108,7 @@ describe("one agent, one server", () => {
           reason: { code: "invalid_json", detail: "line 3" },
         },
       }),
-      agent("open_claw", [entry("github", remote("sse"))]),
+      agent("pi", [entry("github", remote("sse"))]),
       agent("cursor", [
         entry("github", remote("sse"), {
           read_only: true,
@@ -142,7 +142,7 @@ describe("one agent, one server", () => {
   })
 
   it("says why an entry takes no edits", () => {
-    expect(state("open_claw")).toMatchObject({
+    expect(state("pi")).toMatchObject({
       readOnly: {
         kind: "agent",
         block: { kind: "file", reason: { code: "managed_by_agent" } },
@@ -171,7 +171,7 @@ describe("one agent, one server", () => {
   })
 
   it("does not let a read-only, unreadable or unsuitable agent be switched", () => {
-    for (const id of ["open_claw", "cursor", "cline", "zcode"]) {
+    for (const id of ["pi", "cursor", "cline", "zcode"]) {
       expect(switchOf(state(id)).action).toBeNull()
     }
   })

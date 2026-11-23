@@ -1359,7 +1359,7 @@ describe("Harness install dialog — choices, agents and names", () => {
             basis: null,
             reason: { code: "invalid_json", detail: "line 3" },
           }),
-          rawPlanAgent("open_claw", {
+          rawPlanAgent("pi", {
             writable: false,
             status: "read_only",
             reason: { code: "managed_by_agent" },

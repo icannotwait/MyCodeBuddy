@@ -38,6 +38,7 @@ async fn emit_frames(agent_type: AgentType, frames: &[serde_json::Value]) -> (St
             None,
             &mut cache,
             &mut cb,
+            None,
         )
         .await;
     }

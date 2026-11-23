@@ -13571,7 +13571,7 @@ pub async fn acp_update_agent_display_preferences(
     db: State<'_, AppDatabase>,
     app: tauri::AppHandle,
 ) -> Result<(), AcpError> {
-    let emitter = EventEmitter::Tauri(app);
+    let emitter = EventEmitter::from_app(&app);
     acp_update_agent_display_preferences_core(agent_type, show_thinking, &db, &emitter).await
 }
 

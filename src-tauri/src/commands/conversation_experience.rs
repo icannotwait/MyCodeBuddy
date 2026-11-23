@@ -1099,7 +1099,7 @@ pub async fn set_auto_title_api_config(
 ) -> Result<ConversationExperienceSettings, AppCommandError> {
     #[cfg(feature = "tauri-runtime")]
     {
-        let emitter = EventEmitter::Tauri(app);
+        let emitter = EventEmitter::from_app(&app);
         set_auto_title_api_config_core(
             &db,
             &emitter,
@@ -1155,7 +1155,7 @@ pub async fn set_document_translate_agent(
 ) -> Result<ConversationExperienceSettings, AppCommandError> {
     #[cfg(feature = "tauri-runtime")]
     {
-        let emitter = EventEmitter::Tauri(app);
+        let emitter = EventEmitter::from_app(&app);
         set_document_translate_agent_core(&db, &emitter, &mutation_gate, agent).await
     }
     #[cfg(not(feature = "tauri-runtime"))]
@@ -1181,7 +1181,7 @@ pub async fn set_reference_search_limit(
 ) -> Result<ConversationExperienceSettings, AppCommandError> {
     #[cfg(feature = "tauri-runtime")]
     {
-        let emitter = EventEmitter::Tauri(app);
+        let emitter = EventEmitter::from_app(&app);
         set_reference_search_limit_core(&db.conn, &emitter, &registry, &mutation_gate, limit).await
     }
     #[cfg(not(feature = "tauri-runtime"))]

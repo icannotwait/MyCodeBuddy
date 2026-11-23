@@ -548,10 +548,7 @@ mod tauri_app {
                 crate::commands::custom_agents::acp_fetch_registry_catalog,
                 crate::commands::custom_agents::acp_add_registry_agent,
                 crate::commands::custom_agents::acp_current_platform,
-                acp_commands::acp_list_agent_skills,
                 acp_commands::acp_read_agent_skill,
-                acp_commands::acp_save_agent_skill,
-                acp_commands::acp_delete_agent_skill,
                 acp_commands::opencode_list_plugins,
                 acp_commands::opencode_provider_catalog,
                 acp_commands::codex_bundled_catalog,
@@ -1815,7 +1812,7 @@ mod tauri_app {
                     let cm = app.state::<ConnectionManager>().clone_ref();
                     let chat_channel_manager =
                         app.state::<ChatChannelManager>().clone_ref();
-                    let emitter = crate::web::event_bridge::EventEmitter::Tauri(app.handle().clone());
+                    let emitter = crate::web::event_bridge::EventEmitter::from_app(app.handle());
                     let conversation_experience_gate = std::sync::Arc::new(
                         crate::commands::conversation_experience::ConversationExperienceMutationGate::default(),
                     );
@@ -1988,7 +1985,7 @@ mod tauri_app {
                             std::sync::Arc::new(db::AppDatabase {
                                 conn: db_conn.clone(),
                             }),
-                            crate::web::event_bridge::EventEmitter::Tauri(app.handle().clone()),
+                            crate::web::event_bridge::EventEmitter::from_app(app.handle()),
                         )
                         .with_metrics(stack.metrics.clone()),
                     );
@@ -2129,7 +2126,7 @@ mod tauri_app {
 
                     let listener_broker = stack.broker.clone();
                     let workflow_emitter =
-                        crate::web::event_bridge::EventEmitter::Tauri(app.handle().clone());
+                        crate::web::event_bridge::EventEmitter::from_app(app.handle());
                     if let Some(runs) = stack.broker.run_store() {
                         runs.set_workflow_emitter(workflow_emitter.clone());
                     }
@@ -2173,9 +2170,7 @@ mod tauri_app {
                                 std::sync::Arc::new(db::AppDatabase {
                                     conn: db_conn.clone(),
                                 }),
-                                crate::web::event_bridge::EventEmitter::Tauri(
-                                    app.handle().clone(),
-                                ),
+                                crate::web::event_bridge::EventEmitter::from_app(app.handle()),
                                 stack.authoring.clone(),
                             ),
                         ),
