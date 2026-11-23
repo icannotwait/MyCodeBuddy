@@ -32,6 +32,9 @@ const withNextIntl = createNextIntlPlugin({
 
 const nextConfig: NextConfig = {
   output: "export",
+  experimental: {
+    agentUpgrade: "security",
+  },
   // Worktree sits under D:\MyCodeBuddy which also has a pnpm-lock.yaml;
   // pin turbopack root so typecheck/build do not resolve the parent tree.
   turbopack: {
