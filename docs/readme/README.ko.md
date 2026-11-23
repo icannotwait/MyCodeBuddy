@@ -269,7 +269,7 @@ Codeg는 모든 에이전트와 [Agent Client Protocol](https://agentclientproto
 # or:
 irm https://raw.githubusercontent.com/icannotwait/MyCodeBuddy/main/uninstall-server.ps1 | iex
 
-.\install.ps1 -Version v0.45.0-mycodebuddy.1
+.\install.ps1 -Version v0.47.0-mycodebuddy.1
 # or:
 irm https://raw.githubusercontent.com/icannotwait/MyCodeBuddy/main/install.ps1 | iex
 $env:CODEG_STATIC_DIR="$env:LOCALAPPDATA\codeg-server\web"; codeg-server

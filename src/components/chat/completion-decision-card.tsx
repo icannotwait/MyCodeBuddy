@@ -44,6 +44,7 @@ export function CompletionDecisionCard({
   const [error, setError] = useState<string | null>(null)
 
   useEffect(() => {
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- the card follows the request the parent just handed in
     setCurrent(request)
     setSelected(null)
     setError(null)

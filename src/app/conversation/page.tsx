@@ -56,6 +56,9 @@ function ConversationPageInner() {
   const searchParams = useSearchParams()
   const localDesktop = isLocalDesktop()
 
+  // The parsed query is an effect dependency. A fresh object every render
+  // refetches the conversation and rebinds the pop-out.
+  // eslint-disable-next-line react-hooks/preserve-manual-memoization
   const parsed = useMemo(
     () =>
       parseConversationPopoutQuery({
@@ -91,6 +94,7 @@ function ConversationPageInner() {
 
   useEffect(() => {
     if (routeMode === "unsupported") {
+      // eslint-disable-next-line react-hooks/set-state-in-effect -- route rejection is known only after the search params resolve
       setError(t("localDesktopOnly"))
     }
   }, [routeMode, t])

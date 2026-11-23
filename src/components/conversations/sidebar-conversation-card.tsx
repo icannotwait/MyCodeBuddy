@@ -75,6 +75,10 @@ import {
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { ConversationStatusDot } from "./conversation-status-dot"
+import {
+  SidebarRelativeTime,
+  type SidebarRelativeClock,
+} from "./sidebar-relative-time"
 import { SessionDetailsDialog } from "./session-details-dialog"
 import { SidebarConversationHoverDetails } from "./sidebar-conversation-hover-details"
 import { ConversationTagChips } from "./conversation-tag-chip"
@@ -201,6 +205,8 @@ interface SidebarConversationCardProps {
   /** Main-window tab count for last-tab pop-out disablement. */
   mainTabCount?: number
   timeLabel?: string
+  relativeTimeAt?: string
+  relativeTimeClock?: SidebarRelativeClock
   onSelect: (id: number, agentType: string, folderId: number) => void
   onDoubleClick?: (id: number, agentType: string, folderId: number) => void
   onRename: (id: number, newTitle: string) => Promise<void>
@@ -236,6 +242,8 @@ export const SidebarConversationCard = memo(function SidebarConversationCard({
   isOpenInTab = false,
   mainTabCount = 0,
   timeLabel,
+  relativeTimeAt,
+  relativeTimeClock,
   onSelect,
   onDoubleClick,
   onRename,
@@ -256,6 +264,12 @@ export const SidebarConversationCard = memo(function SidebarConversationCard({
   const tStatus = useTranslations("Folder.statusLabels")
   const tDetails = useTranslations("Folder.sessionDetails")
   const tPop = useTranslations("ConversationPopout")
+  const timeLabelClassName = cn(
+    "relative shrink-0 tabular-nums text-[0.71875rem]",
+    isSelected
+      ? "font-medium text-muted-foreground"
+      : "font-normal text-muted-foreground/70"
+  )
   const [renameOpen, setRenameOpen] = useState(false)
   const [deleteOpen, setDeleteOpen] = useState(false)
   const [isDeleting, setIsDeleting] = useState(false)
@@ -341,13 +355,16 @@ export const SidebarConversationCard = memo(function SidebarConversationCard({
   // subscription — and a re-render on every tab switch — to each of them for a
   // value only the context menu reads. This snapshot drives the DISABLED STATE
   // only; the click re-resolves (see `handleAttachToSession`).
-  const handleMenuOpenChange = useCallback((open: boolean) => {
-    if (!open) return
-    // The context menu takes the row over; drop the details bubble so the two
-    // don't stack on the same spot.
-    setHoverOpen(false)
-    setAttachTabId(resolveAttachTabId())
-  }, [])
+  const handleMenuOpenChange = useCallback(
+    (open: boolean) => {
+      if (!open) return
+      // The context menu takes the row over; drop the details bubble so the two
+      // don't stack on the same spot.
+      setHoverOpen(false)
+      setAttachTabId(resolveAttachTabId())
+    },
+    [setAttachTabId, setHoverOpen]
+  )
 
   // See `isKeyboardFocus`: suppress Radix's open-on-focus unless the focus
   // really came from the keyboard, so clicking a row doesn't pop the bubble.
@@ -370,7 +387,7 @@ export const SidebarConversationCard = memo(function SidebarConversationCard({
   const handleRenameOpen = useCallback(() => {
     setRenameValue(conversation.title || "")
     setRenameOpen(true)
-  }, [conversation.title])
+  }, [conversation.title, setRenameOpen, setRenameValue])
 
   const handleRenameConfirm = useCallback(async () => {
     const trimmed = renameValue.trim()
@@ -384,7 +401,14 @@ export const SidebarConversationCard = memo(function SidebarConversationCard({
       }
     }
     setRenameOpen(false)
-  }, [renameValue, conversation.id, conversation.title, onRename, t])
+  }, [
+    renameValue,
+    conversation.id,
+    conversation.title,
+    onRename,
+    setRenameOpen,
+    t,
+  ])
 
   const handleDeleteConfirm = useCallback(async () => {
     if (deleteInFlight.current) return
@@ -409,6 +433,8 @@ export const SidebarConversationCard = memo(function SidebarConversationCard({
     conversation.agent_type,
     conversation.folder_id,
     onDelete,
+    setDeleteOpen,
+    setIsDeleting,
     t,
   ])
 
@@ -695,6 +721,12 @@ export const SidebarConversationCard = memo(function SidebarConversationCard({
                             {tSidebar("statusCancelledBadge")}
                           </span>
                         </span>
+                      ) : relativeTimeClock && relativeTimeAt !== undefined ? (
+                        <SidebarRelativeTime
+                          timestamp={relativeTimeAt}
+                          clock={relativeTimeClock}
+                          className={timeLabelClassName}
+                        />
                       ) : timeLabel ? (
                         <span
                           title={
@@ -703,13 +735,8 @@ export const SidebarConversationCard = memo(function SidebarConversationCard({
                               : undefined
                           }
                           className={cn(
-                            "relative shrink-0 tabular-nums",
-                            "text-[0.71875rem]",
-                            showAwaitingReply
-                              ? "font-medium text-destructive"
-                              : isSelected
-                                ? "font-medium text-muted-foreground"
-                                : "font-normal text-muted-foreground/70"
+                            timeLabelClassName,
+                            showAwaitingReply && "font-medium text-destructive"
                           )}
                         >
                           {showAwaitingReply && (

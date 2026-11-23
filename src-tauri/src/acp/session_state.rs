@@ -2820,6 +2820,13 @@ impl SessionState {
         if self.has_live_async_task(now) {
             return true;
         }
+        self.watcher_counts_work(now)
+    }
+
+    /// Whether the transcript watcher (or another `BackgroundActivity`
+    /// producer) still counts work, and reported recently enough to believe
+    /// it — the watcher's half of [`Self::has_active_background_work`].
+    fn watcher_counts_work(&self, now: DateTime<Utc>) -> bool {
         if self.background_outstanding == 0 {
             return false;
         }
@@ -2834,6 +2841,19 @@ impl SessionState {
             .as_ref()
             .is_some_and(|live| !live.content.is_empty())
             || !self.active_tool_calls.is_empty()
+    }
+
+    /// Whether the watcher still counts a background SUB-AGENT
+    /// ([`BackgroundTaskKind::Agent`](crate::acp::types::BackgroundTaskKind)),
+    /// under the same age bound as its count. claude-agent-acp keeps every
+    /// sub-agent out of the AIR async-task table (its `isSubagentTask` filter),
+    /// so for Claude Code this is the only place a running sub-agent shows.
+    pub fn has_outstanding_background_agent(&self, now: DateTime<Utc>) -> bool {
+        self.watcher_counts_work(now)
+            && self
+                .background_outstanding_tasks
+                .iter()
+                .any(|t| t.kind == crate::acp::types::BackgroundTaskKind::Agent)
     }
 
     /// Whether any AIR async task is still non-terminal AND the adapter has

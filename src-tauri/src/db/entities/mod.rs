@@ -43,6 +43,8 @@ pub mod quick_message;
 pub mod recovery_authorization;
 pub mod remote_workspace_connection;
 pub mod simple_workflow;
+pub mod srn_web_login;
+pub mod srn_web_session;
 pub mod token_usage_sync;
 pub mod token_usage_turn;
 pub mod tool_approval;

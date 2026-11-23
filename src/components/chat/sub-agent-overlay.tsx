@@ -1357,7 +1357,12 @@ const NativeActivityRow = memo(function NativeActivityRow({
     () => 0
   )
   const elapsedMs = useMemo(
-    () => computeNativeElapsedMs(activity, Date.now()),
+    () =>
+      computeNativeElapsedMs(
+        activity,
+        // eslint-disable-next-line react-hooks/purity -- tickerVersion is the clock; this reads it when the ticker re-renders
+        Date.now()
+      ),
     // tickerVersion forces live recompute while running.
     // eslint-disable-next-line react-hooks/exhaustive-deps -- intentional
     [activity, tickerVersion]

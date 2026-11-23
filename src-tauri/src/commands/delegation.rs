@@ -993,7 +993,7 @@ pub async fn set_delegation_settings(
             settings,
         )
         .await?;
-        let emitter = EventEmitter::Tauri(app);
+        let emitter = EventEmitter::from_app(&app);
         emit_event(
             &emitter,
             DELEGATION_PROFILE_CATALOG_CHANGED_EVENT,
@@ -1048,7 +1048,7 @@ pub async fn set_delegation_profiles(
     {
         let mutation = set_delegation_profiles_core(&db.conn, broker.inner(), document).await?;
         emit_event(
-            &EventEmitter::Tauri(app),
+            &EventEmitter::from_app(&app),
             DELEGATION_PROFILE_CATALOG_CHANGED_EVENT,
             mutation.catalog,
         );
@@ -1083,7 +1083,7 @@ pub async fn set_delegation_bundle(
             bundle,
         )
         .await?;
-        let emitter = EventEmitter::Tauri(app);
+        let emitter = EventEmitter::from_app(&app);
         emit_event(
             &emitter,
             DELEGATION_PROFILE_CATALOG_CHANGED_EVENT,

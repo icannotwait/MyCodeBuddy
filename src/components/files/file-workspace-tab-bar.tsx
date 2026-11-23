@@ -266,7 +266,15 @@ export function FileWorkspaceTabBar() {
       saveAsBusyRef.current = false
       setSaveAsBusy(false)
     }
-  }, [activeFolder?.id, activeTab, closeFileTab, openFilePreview, t, tRoot])
+  }, [
+    activeFolder,
+    activeTab,
+    closeFileTab,
+    openFilePreview,
+    setSaveAsBusy,
+    t,
+    tRoot,
+  ])
 
   const lastTabActive =
     activeFileIndex >= 0 && activeFileIndex === fileTabs.length - 1

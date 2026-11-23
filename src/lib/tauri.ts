@@ -1128,8 +1128,6 @@ export type SettingsSection =
   | "general"
   | "appearance"
   | "agents"
-  | "mcp"
-  | "skills"
   | "shortcuts"
   | "system"
 

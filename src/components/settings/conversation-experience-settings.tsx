@@ -118,6 +118,7 @@ export function ConversationExperienceSettingsSection() {
         modelDraft !== titleBaseline.model)
 
     if (!titleFormDirty) {
+      // eslint-disable-next-line react-hooks/set-state-in-effect -- copy a stored title config into the form until the user edits it
       setUrlDraft(settings.auto_title_api_url)
       setModelDraft(settings.auto_title_model)
       setKeyDraft("")
@@ -141,6 +142,7 @@ export function ConversationExperienceSettingsSection() {
   useEffect(() => {
     if (settings == null) return
     if (limitRevision != null && settings.revision <= limitRevision) return
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- copy the stored search limit into the form until the user edits it
     setLimitDraft(String(settings.reference_search_limit))
     setLimitRevision(settings.revision)
   }, [settings, limitRevision])

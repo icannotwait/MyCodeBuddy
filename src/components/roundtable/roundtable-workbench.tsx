@@ -101,7 +101,10 @@ export function RoundtableWorkbench({
   // The create flow can switch workspace in place (keeping the form); an open
   // room stays bound to the workspace in its URL.
   const [workspaceId, setWorkspaceId] = useState(urlWorkspaceId)
-  useEffect(() => setWorkspaceId(urlWorkspaceId), [urlWorkspaceId])
+  useEffect(() => {
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- the create flow follows the workspace in the URL
+    setWorkspaceId(urlWorkspaceId)
+  }, [urlWorkspaceId])
   const [workspaces, setWorkspaces] = useState<FolderDetail[] | null>(null)
   const [workspacesLoading, setWorkspacesLoading] = useState(true)
   const [workspacesError, setWorkspacesError] = useState<string | null>(null)
@@ -245,12 +248,15 @@ export function RoundtableWorkbench({
   )
 
   useEffect(() => {
+    /* eslint-disable react-hooks/set-state-in-effect -- a workspace switch drops the previous room page */
     setRooms([])
     setListCursor(null)
     setListError(null)
+    /* eslint-enable react-hooks/set-state-in-effect */
   }, [workspaceId])
 
   useEffect(() => {
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- listRooms sets its loading flag before the request
     void listRooms()
     return () => {
       listGeneration.current += 1
@@ -297,6 +303,7 @@ export function RoundtableWorkbench({
   }, [])
 
   useEffect(() => {
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- loadWorkspaces sets its loading flag before the request
     void loadWorkspaces()
     return () => {
       workspacesGeneration.current += 1
@@ -304,6 +311,7 @@ export function RoundtableWorkbench({
   }, [loadWorkspaces])
 
   useEffect(() => {
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- loadProviders sets its loading flag before the request
     void loadProviders()
     return () => {
       providersGeneration.current += 1
@@ -335,6 +343,7 @@ export function RoundtableWorkbench({
   }, [roomId])
 
   useEffect(() => {
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- loadAgents sets its loading flag before the request
     void loadAgents()
     return () => {
       agentsGeneration.current += 1
@@ -348,10 +357,12 @@ export function RoundtableWorkbench({
     let syncing = false
     let previous: RoundtableProjection | null = null
     let unsubscribe: (() => void) | undefined
+    /* eslint-disable react-hooks/set-state-in-effect -- attaching a room resets its loading and error flags before the stream starts */
     setRoomLoading(true)
     setRoomError(null)
     setStreamError(null)
     setLiveOutput({})
+    /* eslint-enable react-hooks/set-state-in-effect */
     let liveState: RoundtableLiveState = {}
     let resyncing = false
     const transport = getTransport()
@@ -729,6 +740,7 @@ export function RoundtableWorkbench({
   // Keep the room list's status in step with the verified room snapshot.
   useEffect(() => {
     if (!roomId || !status) return
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- the open room's verified status is mirrored onto the list
     setRooms((current) =>
       current.some((room) => room.room_id === roomId && room.status !== status)
         ? current.map((room) =>

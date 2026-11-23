@@ -220,10 +220,10 @@ import {
   DeepSeekConfigPanel,
 } from "./deepseek-config-panel"
 import {
-  DeepSeekBuiltInCatalogNotice,
   DeepSeekModelListEditor,
   deepseekReadsHarnessCatalog,
 } from "./deepseek-model-list-editor"
+import { DeepSeekProviderRoutesEditor } from "./deepseek-provider-routes-editor"
 import { MiniMaxCodeConfigPanel } from "./minimax-code-config-panel"
 import { KimiCodeConfigPanel } from "./kimi-code-config-panel"
 import { PiConfigPanel } from "./pi-config-panel"
@@ -5008,6 +5008,10 @@ export function AcpAgentSettings() {
   const tCatalog = tCatalogScoped as unknown as CodexCatalogTranslator
   const tModels = useTranslations("ProviderModels")
   const rawTranslator = t as unknown as AcpTranslator
+  // The module-level helpers behind `acpText` are called while this component
+  // and its children render, so the translator must be published before they
+  // run; an effect would leave the first render on the English fallbacks.
+  // eslint-disable-next-line react-hooks/globals -- must be set before the render-time acpText readers
   acpTranslator = (key, values) => rawTranslator(key, values)
   const searchParams = useSearchParams()
   const codexCliRuntimeDefault = codexCliRuntimeDefaultOn()
@@ -5344,6 +5348,7 @@ export function AcpAgentSettings() {
       installStream.status === "failed"
     ) {
       if (streamAgentType) {
+        // eslint-disable-next-line react-hooks/set-state-in-effect -- re-checks the agent on disk after the install stream ends
         runPreflight(streamAgentType).catch(() => {})
       }
     }
@@ -5351,6 +5356,7 @@ export function AcpAgentSettings() {
   }, [installStream.status])
 
   useEffect(() => {
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- initial agent list fetch
     refreshAgents().catch((err) => {
       console.error("[Settings] refresh agents failed:", err)
     })
@@ -5359,6 +5365,7 @@ export function AcpAgentSettings() {
   useEffect(() => {
     if (loadingAgents || !agentTypesKey) return
     const agentTypes = agentTypesKey.split(",") as AgentType[]
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- preflight checks query the backend for each agent
     runAllPreflight(agentTypes).catch((err) => {
       console.error("[Settings] run all preflight failed:", err)
     })
@@ -5379,6 +5386,7 @@ export function AcpAgentSettings() {
       (agent) => agent.agent_type === requestedAgentType
     )
     if (matched) {
+      // eslint-disable-next-line react-hooks/set-state-in-effect -- applies the `?agent=` URL request once per value (ref-guarded)
       setSelectedAgentType(matched.agent_type)
     }
     handledSearchAgentRef.current = requestedAgentType
@@ -5400,8 +5408,11 @@ export function AcpAgentSettings() {
     selected.scrollIntoView({ block: "nearest", behavior: "smooth" })
   }, [loadingAgents, selectedAgentType])
 
+  // Ordered after the `?agent=` effect above: its queued selection is the
+  // `prev` this validates against the refreshed list.
   useEffect(() => {
     if (sortedAgents.length === 0) {
+      // eslint-disable-next-line react-hooks/set-state-in-effect -- keeps the selection valid after the `?agent=` effect of the same commit
       setSelectedAgentType(null)
       return
     }
@@ -5424,6 +5435,7 @@ export function AcpAgentSettings() {
       ? selectedAgent.agent_type
       : null
   useEffect(() => {
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- reset paired with the latest-release fetch below
     setVisitLatestRelease(null)
     if (!latestLookupTarget) return
     let current = true
@@ -6264,7 +6276,7 @@ export function AcpAgentSettings() {
       .finally(() => {
         setRemoveConfirmAgent(null)
       })
-  }, [handleRemoveCustomAgent, removeConfirmAgent])
+  }, [handleRemoveCustomAgent, removeConfirmAgent, setRemoveConfirmAgent])
 
   const confirmUninstall = useCallback(() => {
     if (!uninstallConfirmAgent) return
@@ -6276,7 +6288,7 @@ export function AcpAgentSettings() {
       .finally(() => {
         setUninstallConfirmAgent(null)
       })
-  }, [runUninstallAction, uninstallConfirmAgent])
+  }, [runUninstallAction, setUninstallConfirmAgent, uninstallConfirmAgent])
 
   const confirmCustomInstall = useCallback(() => {
     if (!customInstallAgent) return
@@ -6293,7 +6305,13 @@ export function AcpAgentSettings() {
       console.error("[Settings] custom install failed:", err)
     })
     setCustomInstallAgent(null)
-  }, [customInstallAgent, customVersionInput, runBinaryAction, runNpxAction])
+  }, [
+    customInstallAgent,
+    customVersionInput,
+    runBinaryAction,
+    runNpxAction,
+    setCustomInstallAgent,
+  ])
 
   // Custom install's path with the offered version filled in — the same clean
   // reinstall, never a fallback to the recommended version on failure.
@@ -6308,7 +6326,12 @@ export function AcpAgentSettings() {
       console.error("[Settings] upgrade to latest failed:", err)
     })
     setUpgradeLatestTarget(null)
-  }, [runBinaryAction, runNpxAction, upgradeLatestTarget])
+  }, [
+    runBinaryAction,
+    runNpxAction,
+    setUpgradeLatestTarget,
+    upgradeLatestTarget,
+  ])
 
   const persistReorder = useCallback(
     async (order: AgentType[]) => {
@@ -6775,8 +6798,11 @@ export function AcpAgentSettings() {
     return getAgentChecks(selectedAgent, selectedCurrent, selectedLatestRelease)
   }, [locale, selectedAgent, selectedCurrent, selectedLatestRelease])
 
+  // Seeds the fold state once per check: a check keeps the state it was first
+  // seen with even if its status changes later, so this cannot be derived.
   useEffect(() => {
     if (!selectedAgent || selectedChecks.length === 0) return
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- one-time seeding of per-check defaults, see above
     setExpandedChecks((prev) => {
       let next = prev
       for (const check of selectedChecks) {
@@ -6805,30 +6831,21 @@ export function AcpAgentSettings() {
     setExpandedChecks((prev) => (prev[key] ? prev : { ...prev, [key]: true }))
   }, [selectedAgent, selectedChecks])
 
-  useEffect(() => {
-    if (!selectedOpenCodeConfig) {
-      if (openCodeProviderId) setOpenCodeProviderId("")
-      return
-    }
-    if (!openCodeProviderId) return
-    if (selectedOpenCodeConfig.providerIds.includes(openCodeProviderId)) {
-      return
-    }
+  // Drop an expanded / pending-delete provider once it is no longer in the
+  // selected OpenCode config. Adjusted during render (each check clears its
+  // own condition, so it settles in one extra pass) rather than in an effect.
+  if (
+    openCodeProviderId &&
+    !selectedOpenCodeConfig?.providerIds.includes(openCodeProviderId)
+  ) {
     setOpenCodeProviderId("")
-  }, [openCodeProviderId, selectedOpenCodeConfig])
-
-  useEffect(() => {
-    if (!openCodeDeleteProviderId) return
-    if (!selectedOpenCodeConfig) {
-      setOpenCodeDeleteProviderId(null)
-      return
-    }
-    if (
-      !selectedOpenCodeConfig.providerIds.includes(openCodeDeleteProviderId)
-    ) {
-      setOpenCodeDeleteProviderId(null)
-    }
-  }, [openCodeDeleteProviderId, selectedOpenCodeConfig])
+  }
+  if (
+    openCodeDeleteProviderId &&
+    !selectedOpenCodeConfig?.providerIds.includes(openCodeDeleteProviderId)
+  ) {
+    setOpenCodeDeleteProviderId(null)
+  }
 
   const updateSelectedDraft = useCallback(
     (updater: (current: AgentDraft) => AgentDraft) => {
@@ -8007,6 +8024,8 @@ export function AcpAgentSettings() {
     openCodeDeleteProviderId,
     persistOpenCodeConfigNow,
     selectedAgent,
+    setOpenCodeCredentialBusy,
+    setOpenCodeDeleteProviderId,
     t,
   ])
 
@@ -8656,6 +8675,7 @@ export function AcpAgentSettings() {
 
   useEffect(() => {
     if (selectedAgent?.agent_type !== "codex" && codexLoginStatus !== "idle") {
+      // eslint-disable-next-line react-hooks/set-state-in-effect -- stops the external device-login polling when leaving Codex
       cancelCodexDeviceLogin()
     }
   }, [selectedAgent, codexLoginStatus, cancelCodexDeviceLogin])
@@ -9252,6 +9272,7 @@ export function AcpAgentSettings() {
                               selectedIsSavingInstructions || !instructionsDirty
                             }
                             onClick={() =>
+                              // eslint-disable-next-line react-hooks/refs -- runs on click, not during render; the enclosing IIFE hides that from the compiler
                               persistSystemInstructions(
                                 selectedAgent.agent_type,
                                 selectedDraft.systemInstructionsText,
@@ -9909,7 +9930,7 @@ export function AcpAgentSettings() {
                         onChange={(event) => {
                           handleCodexConfigTomlTextChange(event.target.value)
                         }}
-                        placeholder={`model = "gpt-6-astra"
+                        placeholder={`model = "gpt-6.2-sol"
 model_reasoning_effort = "high"
 model_provider = "codeg"
 
@@ -11947,14 +11968,16 @@ base_url = "https://api.openai.com/v1"`}
                         )
                       }
                     />
-                    {/* The deployment's model catalog. Through deepseek-acp
-                      0.9.0 it lives in the harness' own `settings.yaml`, not
-                      in the agent env, so it has its own section and its own
-                      save — and it is what the composer's per-session model
-                      selector gets to choose from. 0.10.0 builds it into the
-                      bridge and reads that file no more, so later releases
-                      get a notice instead of an editor that changes nothing.
-                      Judged on the installed release, else the pinned one. */}
+                    {/* What the composer's per-session model picker gets to
+                      choose from. Through deepseek-acp 0.9.0 that is an
+                      editable catalog in the harness' own `settings.yaml`
+                      (`llm-deepseek.models`), not the agent env, so it has its
+                      own section and its own save. 0.10.0 builds that catalog
+                      into the bridge and reads the file no more; the surface it
+                      does read is `llm-pi-ai.providers` in the bridge's own
+                      document, where each route adds a provider's catalog to
+                      the picker. Judged on the installed release, else the
+                      pinned one. */}
                     {deepseekReadsHarnessCatalog(
                       selectedAgent.installed_version ??
                         selectedAgent.registry_version
@@ -11972,7 +11995,7 @@ base_url = "https://api.openai.com/v1"`}
                         }}
                       />
                     ) : (
-                      <DeepSeekBuiltInCatalogNotice />
+                      <DeepSeekProviderRoutesEditor />
                     )}
                   </>
                 ) : selectedAgent.agent_type === "qoder" ? (
@@ -13262,7 +13285,7 @@ base_url = "https://api.openai.com/v1"`}
                                 event.target.value
                               )
                             }}
-                            placeholder="gpt-6-astra / claude-sonnet-5-5 / gemini-3.1-pro-preview"
+                            placeholder="gpt-6.2-sol / claude-sonnet-5-5 / gemini-3.1-pro-preview"
                           />
                         </div>
                       )
@@ -13280,7 +13303,7 @@ base_url = "https://api.openai.com/v1"`}
                         placeholder={`{
   "apiBaseUrl": "https://api.example.com",
   "apiKey": "sk-...",
-  "model": "gpt-6-astra",
+  "model": "gpt-6.2-sol",
   "env": {
     "CUSTOM_KEY": "VALUE"
   }

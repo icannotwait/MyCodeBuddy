@@ -1190,6 +1190,7 @@ export function useDelegationCardModel(
 
   // Build the same sticky merge used by the final model before subscribing;
   // recoverable terminal records must keep the shared ticker alive.
+  // eslint-disable-next-line react-hooks/purity -- elapsed time is refreshed when the running ticker re-renders
   const previewNowMs = Date.now()
   const previewModel = mergeDelegationWorkUnitModel({
     model: buildDelegationCardModel({
@@ -1235,6 +1236,7 @@ export function useDelegationCardModel(
 
   return useMemo(
     () => {
+      // eslint-disable-next-line react-hooks/purity -- tickerVersion is the clock; this reads it when the ticker re-renders
       const nowMs = Date.now()
       return mergeDelegationWorkUnitModel({
         model: buildDelegationCardModel({
