@@ -506,19 +506,18 @@ fn listed_only_agents_are_read_and_never_written() {
         McpAppType::Pi,
         r#"{"mcpServers": {"p": {"url": "https://p.test"}}}"#,
     );
-    for (app, key) in [(McpAppType::Pi, "p")] {
-        let agent = sandbox.agent(app);
-        assert!(!agent.writable, "{app:?}");
-        assert_eq!(agent.config.status, McpFileStatus::ReadOnly);
-        assert_eq!(
-            agent.config.reason.map(|reason| reason.code).as_deref(),
-            Some(codes::MANAGED_BY_AGENT)
-        );
-        assert_eq!(agent.delivery, McpDelivery::AgentFile);
-        assert!(!agent.codeg_mcp);
-        let entry = sandbox.entry(app, key);
-        assert!(entry.read_only && entry.definition.is_some());
-    }
+    let (app, key) = (McpAppType::Pi, "p");
+    let agent = sandbox.agent(app);
+    assert!(!agent.writable, "{app:?}");
+    assert_eq!(agent.config.status, McpFileStatus::ReadOnly);
+    assert_eq!(
+        agent.config.reason.map(|reason| reason.code).as_deref(),
+        Some(codes::MANAGED_BY_AGENT)
+    );
+    assert_eq!(agent.delivery, McpDelivery::AgentFile);
+    assert!(!agent.codeg_mcp);
+    let entry = sandbox.entry(app, key);
+    assert!(entry.read_only && entry.definition.is_some());
 }
 
 #[tokio::test]
